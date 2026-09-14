@@ -97,8 +97,42 @@ public final class LanceEngineFactory implements EngineFactory {
             SegmentInfos infos = getLastCommittedSegmentInfos();
             IndexCommit commit = Lucene.getIndexCommit(infos, directory);
             Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(tablePath).build();
-            LanceDirectoryReader reader = LanceDirectoryReader.open(directory, commit, dataset, field, shardId, numShards);
-            return OpenSearchDirectoryReader.wrap(reader, config().getShardId());
+            // If wrapping the dataset in a directory reader fails, close it
+            // here — otherwise the JNI-owned Dataset handle leaks and
+            // eventually starves the native allocator. `LanceDirectoryReader`
+            // takes ownership of `dataset` only on the happy path via its
+            // `doClose`.
+            OpenSearchDirectoryReader wrapped = null;
+            LanceDirectoryReader reader = null;
+            try {
+                reader = LanceDirectoryReader.open(directory, commit, dataset, field, shardId, numShards);
+                wrapped = OpenSearchDirectoryReader.wrap(reader, config().getShardId());
+                return wrapped;
+            } catch (Throwable t) {
+                if (reader != null) {
+                    try {
+                        reader.close();
+                    } catch (Throwable suppressed) {
+                        t.addSuppressed(suppressed);
+                    }
+                } else {
+                    try {
+                        dataset.close();
+                    } catch (Throwable suppressed) {
+                        t.addSuppressed(suppressed);
+                    }
+                }
+                if (t instanceof IOException io) {
+                    throw io;
+                }
+                if (t instanceof RuntimeException re) {
+                    throw re;
+                }
+                if (t instanceof Error err) {
+                    throw err;
+                }
+                throw new IOException(t);
+            }
         }
 
         @Override
@@ -297,6 +331,16 @@ public final class LanceEngineFactory implements EngineFactory {
 
         @Override
         protected OpenSearchDirectoryReader refreshIfNeeded(OpenSearchDirectoryReader referenceToRefresh) throws IOException {
+            // Lucene's ReferenceManager serialises calls into this method
+            // (refreshLock), so `servedVersion` does not need CAS: only one
+            // refresh advances it at a time. When we return a non-null
+            // reference, Lucene swaps it in as `current`, decRefs the old
+            // reference, and — because in-flight callers hold at least one
+            // additional refcount via `tryIncRef` — the old reader (and its
+            // Dataset) stays alive until the last search that acquired it
+            // releases. Setting servedVersion before returning is therefore
+            // safe: a concurrent `maybeRefresh()` blocks on refreshLock
+            // and will observe the updated version once we return.
             long latest;
             try (Dataset probe = Dataset.open().allocator(LanceRegistry.allocator()).uri(engine.tablePath).build()) {
                 latest = probe.version();
