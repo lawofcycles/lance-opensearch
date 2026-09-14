@@ -7,10 +7,12 @@ package org.opensearch.lance;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
 import org.apache.lucene.search.Query;
+import org.opensearch.core.common.ParsingException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -19,8 +21,33 @@ import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 
 /**
- * DSL query {@code lance_knn}: {"lance_knn": {"field": "vec", "vector": [...], "k": 5}}.
- * The shard level rewrite target for vector search over an attached table.
+ * DSL query {@code lance_knn}: shard-level nearest-neighbour search over a
+ * Lance vector column.
+ *
+ * <pre>{@code
+ * {
+ *   "lance_knn": {
+ *     "field": "vec",
+ *     "vector": [...],
+ *     "k": 5,
+ *     "nprobes": 10,
+ *     "refine_factor": 4,
+ *     "ef": 64,
+ *     "metric": "cosine",
+ *     "use_index": true,
+ *     "boost": 1.2,
+ *     "_name": "primary_knn"
+ *   }
+ * }
+ * }</pre>
+ *
+ * <p>{@code field}, {@code vector}, and {@code k} are required (k defaults
+ * to 10 if the client omits it). {@code nprobes}, {@code refine_factor},
+ * {@code ef}, {@code metric}, {@code use_index} are Lance search knobs
+ * forwarded to {@code org.lance.ipc.Query.Builder}; they control recall
+ * vs. cost and let the caller override the metric baked into the vector
+ * index. Unknown properties are rejected so typos surface as 400s
+ * instead of being silently ignored.
  */
 public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuilder> {
 
@@ -29,8 +56,22 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
     private final String field;
     private final float[] vector;
     private final int k;
+    private Integer nprobes;
+    private Integer refineFactor;
+    private Integer ef;
+    private String metric;
+    private Boolean useIndex;
 
     public LanceKnnQueryBuilder(String field, float[] vector, int k) {
+        if (field == null || field.isEmpty()) {
+            throw new IllegalArgumentException("field is required");
+        }
+        if (vector == null || vector.length == 0) {
+            throw new IllegalArgumentException("vector is required");
+        }
+        if (k <= 0) {
+            throw new IllegalArgumentException("k must be > 0, got " + k);
+        }
         this.field = field;
         this.vector = vector;
         this.k = k;
@@ -41,6 +82,11 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
         this.field = in.readString();
         this.vector = in.readFloatArray();
         this.k = in.readVInt();
+        this.nprobes = in.readOptionalVInt();
+        this.refineFactor = in.readOptionalVInt();
+        this.ef = in.readOptionalVInt();
+        this.metric = in.readOptionalString();
+        this.useIndex = in.readOptionalBoolean();
     }
 
     @Override
@@ -48,6 +94,77 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
         out.writeString(field);
         out.writeFloatArray(vector);
         out.writeVInt(k);
+        out.writeOptionalVInt(nprobes);
+        out.writeOptionalVInt(refineFactor);
+        out.writeOptionalVInt(ef);
+        out.writeOptionalString(metric);
+        out.writeOptionalBoolean(useIndex);
+    }
+
+    public LanceKnnQueryBuilder nprobes(int nprobes) {
+        if (nprobes <= 0) {
+            throw new IllegalArgumentException("nprobes must be > 0, got " + nprobes);
+        }
+        this.nprobes = nprobes;
+        return this;
+    }
+
+    public LanceKnnQueryBuilder refineFactor(int refineFactor) {
+        if (refineFactor <= 0) {
+            throw new IllegalArgumentException("refine_factor must be > 0, got " + refineFactor);
+        }
+        this.refineFactor = refineFactor;
+        return this;
+    }
+
+    public LanceKnnQueryBuilder ef(int ef) {
+        if (ef <= 0) {
+            throw new IllegalArgumentException("ef must be > 0, got " + ef);
+        }
+        this.ef = ef;
+        return this;
+    }
+
+    public LanceKnnQueryBuilder metric(String metric) {
+        this.metric = metric;
+        return this;
+    }
+
+    public LanceKnnQueryBuilder useIndex(boolean useIndex) {
+        this.useIndex = useIndex;
+        return this;
+    }
+
+    Integer nprobes() {
+        return nprobes;
+    }
+
+    Integer refineFactor() {
+        return refineFactor;
+    }
+
+    Integer ef() {
+        return ef;
+    }
+
+    String metric() {
+        return metric;
+    }
+
+    Boolean useIndex() {
+        return useIndex;
+    }
+
+    String field() {
+        return field;
+    }
+
+    float[] vector() {
+        return vector;
+    }
+
+    int k() {
+        return k;
     }
 
     @Override
@@ -56,35 +173,186 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
         builder.field("field", field);
         builder.field("vector", vector);
         builder.field("k", k);
+        if (nprobes != null) {
+            builder.field("nprobes", nprobes);
+        }
+        if (refineFactor != null) {
+            builder.field("refine_factor", refineFactor);
+        }
+        if (ef != null) {
+            builder.field("ef", ef);
+        }
+        if (metric != null) {
+            builder.field("metric", metric);
+        }
+        if (useIndex != null) {
+            builder.field("use_index", useIndex);
+        }
+        printBoostAndQueryName(builder);
         builder.endObject();
     }
 
     @SuppressWarnings("unchecked")
     public static LanceKnnQueryBuilder fromXContent(XContentParser parser) throws IOException {
+        // Parse the object as a Map so we can validate every property in one
+        // pass rather than juggling the streaming XContentParser state. The
+        // schema is small and does not benefit from ObjectParser here.
         Map<String, Object> map = parser.map();
-        String field = (String) map.get("field");
-        List<Number> values = (List<Number>) map.get("vector");
-        float[] vector = new float[values.size()];
-        for (int i = 0; i < vector.length; i++) {
-            vector[i] = values.get(i).floatValue();
+
+        String field = requireString(parser, map, "field");
+        float[] vector = requireFloatArray(parser, map, "vector");
+
+        int k = 10;
+        if (map.containsKey("k")) {
+            k = intValue(parser, map.get("k"), "k");
+            if (k <= 0) {
+                throw new ParsingException(parser.getTokenLocation(), "[lance_knn] k must be > 0, got " + k);
+            }
         }
-        int k = ((Number) map.getOrDefault("k", 10)).intValue();
-        return new LanceKnnQueryBuilder(field, vector, k);
+
+        LanceKnnQueryBuilder builder = new LanceKnnQueryBuilder(field, vector, k);
+
+        if (map.containsKey("nprobes")) {
+            builder.nprobes(intValue(parser, map.get("nprobes"), "nprobes"));
+        }
+        if (map.containsKey("refine_factor")) {
+            builder.refineFactor(intValue(parser, map.get("refine_factor"), "refine_factor"));
+        }
+        if (map.containsKey("ef")) {
+            builder.ef(intValue(parser, map.get("ef"), "ef"));
+        }
+        if (map.containsKey("metric")) {
+            Object m = map.get("metric");
+            if (!(m instanceof String)) {
+                throw new ParsingException(parser.getTokenLocation(), "[lance_knn] metric must be a string");
+            }
+            builder.metric((String) m);
+        }
+        if (map.containsKey("use_index")) {
+            Object u = map.get("use_index");
+            if (!(u instanceof Boolean)) {
+                throw new ParsingException(parser.getTokenLocation(), "[lance_knn] use_index must be a boolean");
+            }
+            builder.useIndex((Boolean) u);
+        }
+        if (map.containsKey("boost")) {
+            builder.boost(((Number) map.get("boost")).floatValue());
+        }
+        if (map.containsKey("_name")) {
+            Object name = map.get("_name");
+            if (!(name instanceof String)) {
+                throw new ParsingException(parser.getTokenLocation(), "[lance_knn] _name must be a string");
+            }
+            builder.queryName((String) name);
+        }
+
+        // Reject typos so silent property loss does not translate into wrong
+        // recall or a metric that was never applied.
+        for (String key : map.keySet()) {
+            if (!KNOWN_KEYS.contains(key)) {
+                throw new ParsingException(parser.getTokenLocation(), "[lance_knn] unknown parameter [" + key + "]");
+            }
+        }
+
+        return builder;
+    }
+
+    private static final java.util.Set<String> KNOWN_KEYS = java.util.Set.of(
+        "field",
+        "vector",
+        "k",
+        "nprobes",
+        "refine_factor",
+        "ef",
+        "metric",
+        "use_index",
+        "boost",
+        "_name"
+    );
+
+    private static String requireString(XContentParser parser, Map<String, Object> map, String key) {
+        Object value = map.get(key);
+        if (value == null) {
+            throw new ParsingException(parser.getTokenLocation(), "[lance_knn] [" + key + "] is required");
+        }
+        if (!(value instanceof String)) {
+            throw new ParsingException(parser.getTokenLocation(), "[lance_knn] [" + key + "] must be a string");
+        }
+        return (String) value;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static float[] requireFloatArray(XContentParser parser, Map<String, Object> map, String key) {
+        Object value = map.get(key);
+        if (value == null) {
+            throw new ParsingException(parser.getTokenLocation(), "[lance_knn] [" + key + "] is required");
+        }
+        if (!(value instanceof List<?>)) {
+            throw new ParsingException(parser.getTokenLocation(), "[lance_knn] [" + key + "] must be an array of numbers");
+        }
+        List<?> list = (List<?>) value;
+        if (list.isEmpty()) {
+            throw new ParsingException(parser.getTokenLocation(), "[lance_knn] [" + key + "] must not be empty");
+        }
+        float[] arr = new float[list.size()];
+        for (int i = 0; i < list.size(); i++) {
+            Object v = list.get(i);
+            if (!(v instanceof Number)) {
+                throw new ParsingException(parser.getTokenLocation(), "[lance_knn] [" + key + "] element " + i + " is not a number");
+            }
+            arr[i] = ((Number) v).floatValue();
+        }
+        return arr;
+    }
+
+    private static int intValue(XContentParser parser, Object value, String key) {
+        if (!(value instanceof Number)) {
+            throw new ParsingException(
+                parser.getTokenLocation(),
+                "[lance_knn] [" + key + "] must be a number, got " + (value == null ? "null" : value.getClass().getSimpleName())
+            );
+        }
+        return ((Number) value).intValue();
     }
 
     @Override
     protected Query doToQuery(QueryShardContext context) {
-        return new LanceKnnQuery(field, vector, k);
+        return new LanceKnnQuery(field, vector, k, nprobes, refineFactor, ef, parseDistance(metric), useIndex);
+    }
+
+    private static org.lance.index.DistanceType parseDistance(String metric) {
+        if (metric == null) {
+            return null;
+        }
+        switch (metric.toLowerCase(Locale.ROOT)) {
+            case "l2":
+                return org.lance.index.DistanceType.L2;
+            case "cosine":
+                return org.lance.index.DistanceType.Cosine;
+            case "dot":
+                return org.lance.index.DistanceType.Dot;
+            case "hamming":
+                return org.lance.index.DistanceType.Hamming;
+            default:
+                throw new IllegalArgumentException("[lance_knn] unknown metric [" + metric + "]");
+        }
     }
 
     @Override
     protected boolean doEquals(LanceKnnQueryBuilder other) {
-        return field.equals(other.field) && java.util.Arrays.equals(vector, other.vector) && k == other.k;
+        return field.equals(other.field)
+            && java.util.Arrays.equals(vector, other.vector)
+            && k == other.k
+            && Objects.equals(nprobes, other.nprobes)
+            && Objects.equals(refineFactor, other.refineFactor)
+            && Objects.equals(ef, other.ef)
+            && Objects.equals(metric, other.metric)
+            && Objects.equals(useIndex, other.useIndex);
     }
 
     @Override
     protected int doHashCode() {
-        return Objects.hash(field, java.util.Arrays.hashCode(vector), k);
+        return Objects.hash(field, java.util.Arrays.hashCode(vector), k, nprobes, refineFactor, ef, metric, useIndex);
     }
 
     @Override

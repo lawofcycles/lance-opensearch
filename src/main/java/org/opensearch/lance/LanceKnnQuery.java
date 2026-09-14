@@ -48,11 +48,34 @@ public final class LanceKnnQuery extends Query {
     private final String column;
     private final float[] vector;
     private final int k;
+    private final Integer nprobes;
+    private final Integer refineFactor;
+    private final Integer ef;
+    private final org.lance.index.DistanceType distanceType;
+    private final Boolean useIndex;
 
     public LanceKnnQuery(String column, float[] vector, int k) {
+        this(column, vector, k, null, null, null, null, null);
+    }
+
+    public LanceKnnQuery(
+        String column,
+        float[] vector,
+        int k,
+        Integer nprobes,
+        Integer refineFactor,
+        Integer ef,
+        org.lance.index.DistanceType distanceType,
+        Boolean useIndex
+    ) {
         this.column = column;
         this.vector = vector;
         this.k = k;
+        this.nprobes = nprobes;
+        this.refineFactor = refineFactor;
+        this.ef = ef;
+        this.distanceType = distanceType;
+        this.useIndex = useIndex;
     }
 
     @Override
@@ -150,9 +173,23 @@ public final class LanceKnnQuery extends Query {
                 return cached;
             }
             Map<Integer, FragmentHits> fresh = new HashMap<>();
-            ScanOptions options = new ScanOptions.Builder().nearest(
-                new org.lance.ipc.Query.Builder().setColumn(column).setKey(vector).setK(k).build()
-            ).withRowAddress(true).build();
+            org.lance.ipc.Query.Builder qb = new org.lance.ipc.Query.Builder().setColumn(column).setKey(vector).setK(k);
+            if (nprobes != null) {
+                qb.setNprobes(nprobes);
+            }
+            if (refineFactor != null) {
+                qb.setRefineFactor(refineFactor);
+            }
+            if (ef != null) {
+                qb.setEf(ef);
+            }
+            if (distanceType != null) {
+                qb.setDistanceType(distanceType);
+            }
+            if (useIndex != null) {
+                qb.setUseIndex(useIndex);
+            }
+            ScanOptions options = new ScanOptions.Builder().nearest(qb.build()).withRowAddress(true).build();
             try (LanceScanner scanner = leaf.dataset().newScan(options); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -195,11 +232,19 @@ public final class LanceKnnQuery extends Query {
 
     @Override
     public boolean equals(Object other) {
-        return other instanceof LanceKnnQuery q && column.equals(q.column) && java.util.Arrays.equals(vector, q.vector) && k == q.k;
+        return other instanceof LanceKnnQuery q
+            && column.equals(q.column)
+            && java.util.Arrays.equals(vector, q.vector)
+            && k == q.k
+            && Objects.equals(nprobes, q.nprobes)
+            && Objects.equals(refineFactor, q.refineFactor)
+            && Objects.equals(ef, q.ef)
+            && Objects.equals(distanceType, q.distanceType)
+            && Objects.equals(useIndex, q.useIndex);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(column, java.util.Arrays.hashCode(vector), k);
+        return Objects.hash(column, java.util.Arrays.hashCode(vector), k, nprobes, refineFactor, ef, distanceType, useIndex);
     }
 }

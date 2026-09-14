@@ -97,4 +97,74 @@ public class LanceKnnQueryBuilderTests extends OpenSearchTestCase {
             }
         }
     }
+
+    public void testStreamSerializationRoundTripWithExtras() throws Exception {
+        LanceKnnQueryBuilder original = new LanceKnnQueryBuilder(FIELD, VECTOR, K).nprobes(20)
+            .refineFactor(4)
+            .ef(64)
+            .metric("cosine")
+            .useIndex(false);
+        original.boost(1.5f);
+        original.queryName("named");
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceKnnQueryBuilder copy = new LanceKnnQueryBuilder(in);
+                assertEquals(original, copy);
+                assertEquals(original.hashCode(), copy.hashCode());
+            }
+        }
+    }
+
+    public void testFromXContentAcceptsAllTuningKnobs() throws Exception {
+        String json = "{\n"
+            + "  \"field\": \"embedding\",\n"
+            + "  \"vector\": [0.1, 0.2, 0.3, 0.4],\n"
+            + "  \"k\": 5,\n"
+            + "  \"nprobes\": 20,\n"
+            + "  \"refine_factor\": 4,\n"
+            + "  \"ef\": 64,\n"
+            + "  \"metric\": \"cosine\",\n"
+            + "  \"use_index\": false,\n"
+            + "  \"boost\": 1.5,\n"
+            + "  \"_name\": \"primary\"\n"
+            + "}";
+        try (XContentParser parser = JsonXContent.jsonXContent.createParser(NamedXContentRegistry.EMPTY, null, json)) {
+            LanceKnnQueryBuilder builder = LanceKnnQueryBuilder.fromXContent(parser);
+            assertEquals(Integer.valueOf(20), builder.nprobes());
+            assertEquals(Integer.valueOf(4), builder.refineFactor());
+            assertEquals(Integer.valueOf(64), builder.ef());
+            assertEquals("cosine", builder.metric());
+            assertEquals(Boolean.FALSE, builder.useIndex());
+            assertEquals(1.5f, builder.boost(), 0.0001f);
+            assertEquals("primary", builder.queryName());
+        }
+    }
+
+    public void testFromXContentRejectsUnknownParameter() throws Exception {
+        // A typo like `nprobe` (singular) should surface as 400 instead of
+        // silently degrading recall. Rejecting unknown keys is the whole point
+        // of the strict parser.
+        String json = "{\n" + "  \"field\": \"embedding\",\n" + "  \"vector\": [0.1, 0.2],\n" + "  \"nprobe\": 20\n" + "}";
+        try (XContentParser parser = JsonXContent.jsonXContent.createParser(NamedXContentRegistry.EMPTY, null, json)) {
+            Exception e = expectThrows(Exception.class, () -> LanceKnnQueryBuilder.fromXContent(parser));
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().contains("nprobe"));
+        }
+    }
+
+    public void testFromXContentRejectsNonStringMetric() throws Exception {
+        String json = "{\n" + "  \"field\": \"embedding\",\n" + "  \"vector\": [0.1, 0.2],\n" + "  \"metric\": 42\n" + "}";
+        try (XContentParser parser = JsonXContent.jsonXContent.createParser(NamedXContentRegistry.EMPTY, null, json)) {
+            Exception e = expectThrows(Exception.class, () -> LanceKnnQueryBuilder.fromXContent(parser));
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().contains("metric"));
+        }
+    }
+
+    public void testFromXContentRejectsZeroK() throws Exception {
+        String json = "{\n" + "  \"field\": \"embedding\",\n" + "  \"vector\": [0.1, 0.2],\n" + "  \"k\": 0\n" + "}";
+        try (XContentParser parser = JsonXContent.jsonXContent.createParser(NamedXContentRegistry.EMPTY, null, json)) {
+            Exception e = expectThrows(Exception.class, () -> LanceKnnQueryBuilder.fromXContent(parser));
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().contains("k must be"));
+        }
+    }
 }
