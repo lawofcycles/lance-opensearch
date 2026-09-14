@@ -55,11 +55,22 @@ The full walkthrough — install into OpenSearch, prepare a Lance table, registe
 
 - Nearest-neighbour queries scan once per shard. When the same Lance table is spread across N shards, the same underlying data is scanned N times.
 - Nearest-neighbour scores are `boost / (1 + distance)`, not metric-normalised. Compare scores within a single query, not across queries or engines.
+- `lance_knn` combined with a `bool.filter` runs as a post-filter, so a filter that removes hits from the returned top-K can leave fewer than K results.
+- `lance_knn` is limited to `Float32` element types. Lance vectors declared as `int8`, `uint8` / binary, or `float16` are surfaced in the attach notes but excluded from the mapping until the Java SDK gains a `setKey(byte[])` / `setKey(short[])` entry point.
+- GET `/_doc/{id}` only works when the index has a single shard. The plugin returns 400 for GET on multi-shard indices; use `_search` with a term query on the primary key column instead, or reattach the index with `number_of_shards: 1`.
+- GET by `_id` requires a primary key declared through the Lance `lance-schema:unenforced-primary-key` metadata. Tables without a declared PK expose an empty `primary_key_field` and GET returns 404.
 - Fragment distribution is not size-aware; fragments are assigned to shards by `fragment_id % number_of_shards`. Heavy fragments concentrate on some shards.
 - The engine is read-only. `_flush`, `_forcemerge`, `_settings` writes, `_close`, and `_open` on a Lance-backed index are either no-ops or unsupported; mutation happens on the Lance side.
-- Namespace registrations are held in process memory. They need to be reissued after a cluster restart.
-- REST catalogs (Glue, Unity, Iceberg REST) are not wired to the namespace endpoint yet; only the filesystem adapter is exercised today.
+- Namespace registrations are held in process memory on the node that received the request. They need to be reissued after a cluster restart, and other nodes in a multi-node cluster will not surface the same tables until they too register the path.
+- REST catalogs (Glue, Unity, Iceberg REST) are not wired to the namespace endpoint yet; only the filesystem adapter is exercised today. Tables placed under sub-directories (`root/sub/table.lance`) are not surfaced either — the poller lists top-level tables only.
 - If an OpenSearch index already exists under the same name as a surfaced Lance table, the plugin logs one warning and leaves the table alone on every subsequent poll. Rename, delete, or attach explicitly to resolve.
+- Automatic index builds are disabled by default. Attach and namespace registration do not create FTS / scalar / vector indexes on the Lance table; call `POST /_lance/build_indexes/{index}` explicitly to build them. Indexes created that way still block subsequent Lance `alter_columns` calls on the indexed column, so drop the index via `drop_index` before altering the type.
+- Each leaf reader eagerly materialises every scalar column of its fragment into heap on first refresh. Large tables therefore need JVM heap proportional to the working row count times the per-row footprint of the scalar columns.
+- S3-compatible storage is configured through node-level environment variables (`AWS_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `AWS_ALLOW_HTTP`). Per-table `storage_options` sent through attach or namespace bodies are not accepted yet.
+- Lance `blob` columns and `LargeBinary` / `Struct` / `Utf8` list / `Decimal` / `FloatingPoint(HALF|DOUBLE)` columns are stored in the table but not surfaced in the mapping or `_source`. The attach response notes them so operators can plan around the gap.
+- Version pinning (`version` / `tag` / `branch`) is not exposed at the OpenSearch layer yet; the plugin always reads the latest committed Lance version.
+- Lindera and Jieba tokenizers are not bundled with lance-jni. Only ICU-based tokenization is available for CJK text through the Lance FTS index.
+- Lance's index cache / metadata cache / Session sharing configuration is not exposed as node settings yet; the plugin uses SDK defaults.
 
 ## Feedback
 
