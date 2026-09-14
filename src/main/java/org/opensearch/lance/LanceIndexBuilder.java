@@ -290,6 +290,70 @@ public final class LanceIndexBuilder {
         }
     }
 
+    /**
+     * Extends the FTS index of every column in {@code columns} that already
+     * carries one (through {@link Dataset#optimizeIndices}), so an appended
+     * fragment is picked up before the reader sees the new manifest. Columns
+     * without an FTS index are ignored; a matching {@code ensureFtsIndexes}
+     * call is expected to create them separately.
+     */
+    public static List<String> optimizeExistingFtsIndexes(Dataset dataset, Set<String> columns, boolean retrain) {
+        if (columns.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> indexNames = new java.util.ArrayList<>();
+        for (String column : columns) {
+            for (IndexDescription desc : dataset.describeIndices(
+                new IndexCriteria.Builder().forColumn(column).mustSupportFts(true).build()
+            )) {
+                indexNames.add(desc.getName());
+            }
+        }
+        return optimizeIndexes(dataset, indexNames, retrain);
+    }
+
+    /**
+     * Same shape as {@link #optimizeExistingFtsIndexes(Dataset, Set, boolean)}
+     * but limited to scalar index types (BTree / Bitmap / LabelList / ZoneMap /
+     * NGram / BloomFilter). Vector and FTS indexes on the same column stay
+     * untouched.
+     */
+    public static List<String> optimizeExistingScalarIndexes(Dataset dataset, Set<String> columns, boolean retrain) {
+        if (columns.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> indexNames = new java.util.ArrayList<>();
+        for (String column : columns) {
+            for (IndexDescription desc : dataset.describeIndices(new IndexCriteria.Builder().forColumn(column).build())) {
+                if (SCALAR_INDEX_TYPES.contains(normaliseIndexType(desc.getIndexType()))) {
+                    indexNames.add(desc.getName());
+                }
+            }
+        }
+        return optimizeIndexes(dataset, indexNames, retrain);
+    }
+
+    /**
+     * Same shape as {@link #optimizeExistingFtsIndexes(Dataset, Set, boolean)}
+     * but limited to vector index types (IVF_*, Vector). Keeps the wait
+     * policy honest for KNN queries after an append.
+     */
+    public static List<String> optimizeExistingVectorIndexes(Dataset dataset, Set<String> columns, boolean retrain) {
+        if (columns.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> indexNames = new java.util.ArrayList<>();
+        for (String column : columns) {
+            for (IndexDescription desc : dataset.describeIndices(new IndexCriteria.Builder().forColumn(column).build())) {
+                String normalised = normaliseIndexType(desc.getIndexType());
+                if (normalised.startsWith("IVF") || "VECTOR".equals(normalised)) {
+                    indexNames.add(desc.getName());
+                }
+            }
+        }
+        return optimizeIndexes(dataset, indexNames, retrain);
+    }
+
     // Returns true if the column already carries any Lance scalar index type
     // (BTree, Bitmap, LabelList, ZoneMap, NGram, BloomFilter, Scalar). INVERTED
     // (FTS) is not counted here because {@link RestAttachAction}#derive routes

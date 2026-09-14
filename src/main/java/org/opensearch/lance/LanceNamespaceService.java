@@ -161,6 +161,26 @@ public final class LanceNamespaceService {
                         // re-run the index builder before exposing the new version, so
                         // the reader sees fully-covered indices for the newly appended
                         // fragments; an overwrite may have dropped indexes too.
+                        //
+                        // Two steps in tandem:
+                        // (1) optimize existing indexes so the appended fragments
+                        // are folded in via Lance's incremental merge, and
+                        // (2) ensure indexes on columns that still lack one.
+                        // Without step (1) the `wait` policy was equivalent to
+                        // `immediate` for any column that already carried an index
+                        // (the append never made it into the index, so the reader
+                        // saw the flat-scan fallback all the same).
+                        List<String> ftsOptimized = LanceIndexBuilder.optimizeExistingFtsIndexes(dataset, derivation.ftsColumns(), false);
+                        List<String> scalarOptimized = LanceIndexBuilder.optimizeExistingScalarIndexes(
+                            dataset,
+                            derivation.scalarColumns(),
+                            false
+                        );
+                        List<String> vectorOptimized = LanceIndexBuilder.optimizeExistingVectorIndexes(
+                            dataset,
+                            derivation.vectorColumns(),
+                            false
+                        );
                         List<String> ftsBuilt = LanceIndexBuilder.ensureFtsIndexes(
                             dataset,
                             derivation.ftsColumns(),
@@ -179,7 +199,12 @@ public final class LanceNamespaceService {
                             builderMaxRows,
                             Optional.empty()
                         );
-                        if (!ftsBuilt.isEmpty() || !scalarBuilt.isEmpty() || !vectorBuilt.isEmpty()) {
+                        if (!ftsBuilt.isEmpty()
+                            || !scalarBuilt.isEmpty()
+                            || !vectorBuilt.isEmpty()
+                            || !ftsOptimized.isEmpty()
+                            || !scalarOptimized.isEmpty()
+                            || !vectorOptimized.isEmpty()) {
                             latest = dataset.version();
                         }
                     }
