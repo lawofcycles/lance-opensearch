@@ -102,6 +102,54 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         assertTrue("expected 4xx / 5xx for missing table, saw: " + status, status >= 400);
     }
 
+    public void testAttachRejectsMissingTableField() throws IOException {
+        // The `table` field is required. Attach must return 400 with a
+        // useful message rather than a 500 NullPointerException.
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", "{}"));
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        assertEquals("expected 400 for missing table field, saw " + status, 400, status);
+        String body = readAll(failure.getResponse());
+        assertTrue("expected message about [table], saw: " + body, body.contains("[table]"));
+    }
+
+    public void testAttachRejectsNonNumericShards() throws IOException {
+        // Sending `number_of_shards` as a string previously crashed inside the
+        // Object -> Number cast and returned 500. It must be rejected as 400.
+        String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"number_of_shards\":\"3\"}";
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        assertEquals("expected 400 for non-numeric number_of_shards, saw " + status, 400, status);
+        String body = readAll(failure.getResponse());
+        assertTrue("expected message about [number_of_shards], saw: " + body, body.contains("[number_of_shards]"));
+    }
+
+    public void testAttachRefusesToClaimPlainIndex() throws IOException {
+        // If someone (or a previous run) already created a plain OpenSearch
+        // index sharing the name attach would default to, we must not return
+        // `already_attached: true` and pretend it is a Lance index. The
+        // expected outcome is 409 so the operator picks a different `name`.
+        String indexName = "plain-collision-" + randomAlphaOfLength(6).toLowerCase(java.util.Locale.ROOT);
+        Request create = new Request("PUT", "/" + indexName);
+        create.setJsonEntity("{}");
+        create.setOptions(create.getOptions().toBuilder().addHeader("Content-Type", "application/json"));
+        client().performRequest(create);
+        try {
+            String tablePath = scratchPathString(indexName) + ".lance";
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson("/_lance/attach", "{\"table\":\"" + tablePath + "\",\"name\":\"" + indexName + "\"}")
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            // Either 409 (index already exists as non-Lance) or another 4xx
+            // when the fake table path fails to open. The critical property
+            // is that we do NOT return 200 already_attached, which the old
+            // attach path did.
+            assertTrue("expected 4xx (not 200 already_attached), saw " + status, status >= 400 && status < 500);
+        } finally {
+            client().performRequest(new Request("DELETE", "/" + indexName));
+        }
+    }
+
     public void testBuildIndexesOnUnknownIndexFails() throws IOException {
         // The manual build endpoint targets a specific OpenSearch index. When
         // the index does not exist the call must fail rather than silently

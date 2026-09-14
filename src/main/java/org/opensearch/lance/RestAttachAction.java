@@ -14,17 +14,22 @@ import org.lance.index.IndexCriteria;
 import org.lance.schema.LanceField;
 import org.lance.schema.LanceSchema;
 import org.opensearch.ResourceAlreadyExistsException;
+import org.opensearch.action.admin.cluster.state.ClusterStateRequest;
+import org.opensearch.action.admin.cluster.state.ClusterStateResponse;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexResponse;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
-import org.opensearch.common.xcontent.XContentFactory;
-import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
+import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
@@ -37,11 +42,27 @@ import org.opensearch.transport.client.node.NodeClient;
  * primary key is detected from Lance field metadata. Optional overrides:
  * "name" (index name, defaults to the table directory name) and
  * "number_of_shards" (pins the derived count).
+ *
+ * <p>Threading: the JNI work ({@link Dataset#open}, schema and row counts)
+ * runs on {@link ThreadPool.Names#GENERIC}. The transport thread only
+ * validates the request body so a bad payload returns 400 immediately.
+ *
+ * <p>Existing-index handling: when the target index already exists we look
+ * up its settings and only report {@code already_attached: true} if the
+ * existing index is a Lance index pointing to the same table. Any other
+ * clash (plain index reusing the name, Lance index for a different table)
+ * returns 409 so the operator picks a different name explicitly.
  */
 public class RestAttachAction extends BaseRestHandler {
 
     private static final String PK_METADATA_KEY = "lance-schema:unenforced-primary-key";
     private static final long ROWS_PER_SHARD_TARGET = 500_000;
+
+    private final ThreadPool threadPool;
+
+    public RestAttachAction(ThreadPool threadPool) {
+        this.threadPool = threadPool;
+    }
 
     @Override
     public String getName() {
@@ -55,50 +76,113 @@ public class RestAttachAction extends BaseRestHandler {
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) {
-        Map<String, Object> body = XContentHelper.convertToMap(request.content(), false, request.getMediaType()).v2();
-        String table = (String) body.get("table");
-        String explicitName = (String) body.get("name");
-        Number pinnedShards = (Number) body.get("number_of_shards");
+        Map<String, Object> body = request.hasContent()
+            ? XContentHelper.convertToMap(request.content(), false, request.getMediaType()).v2()
+            : Map.of();
 
-        return channel -> {
-            String indexName = explicitName != null ? explicitName : tableName(table);
+        String table;
+        String explicitName;
+        Number pinnedShards;
+        try {
+            table = readOptionalString(body, "table");
+            if (table == null || table.isEmpty()) {
+                return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, "[table] is required"));
+            }
+            explicitName = readOptionalString(body, "name");
+            pinnedShards = readOptionalNumber(body, "number_of_shards");
+        } catch (IllegalArgumentException e) {
+            String message = e.getMessage();
+            return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
+        }
+
+        final String tableFinal = table;
+        final String indexName = explicitName != null ? explicitName : tableName(table);
+        final Number pinnedShardsFinal = pinnedShards;
+
+        // Dispatch the JNI work to the generic pool. Dataset.open blocks on
+        // native I/O and would trip the transport-thread assertion otherwise.
+        return channel -> threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             Derivation derivation;
-            try (Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(table).build()) {
-                derivation = derive(dataset, pinnedShards);
+            try (Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(tableFinal).build()) {
+                derivation = derive(dataset, pinnedShardsFinal);
+            } catch (Exception e) {
+                sendError(channel, e);
+                return;
+            }
+            createIndex(client, channel, indexName, tableFinal, derivation);
+        });
+    }
+
+    private static void createIndex(NodeClient client, RestChannel channel, String indexName, String table, Derivation derivation) {
+        CreateIndexRequest create = new CreateIndexRequest(indexName).settings(
+            Settings.builder()
+                .put("index.number_of_shards", derivation.shards)
+                .put("index.number_of_replicas", 0)
+                .put(LanceEngineFactory.TABLE_SETTING, table)
+                .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField)
+                .build()
+        ).mapping(derivation.mappingJson);
+
+        client.admin().indices().create(create, new ActionListener<CreateIndexResponse>() {
+            @Override
+            public void onResponse(CreateIndexResponse response) {
+                writeAttachResponse(channel, indexName, table, derivation, false);
             }
 
-            CreateIndexRequest create = new CreateIndexRequest(indexName).settings(
-                Settings.builder()
-                    .put("index.number_of_shards", derivation.shards)
-                    .put("index.number_of_replicas", 0)
-                    .put(LanceEngineFactory.TABLE_SETTING, table)
-                    .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField)
-                    .build()
-            ).mapping(derivation.mappingJson);
-
-            client.admin().indices().create(create, new ActionListener<CreateIndexResponse>() {
-                @Override
-                public void onResponse(CreateIndexResponse response) {
-                    writeAttachResponse(channel, indexName, table, derivation, false);
+            @Override
+            public void onFailure(Exception e) {
+                if (!isAlreadyExists(e)) {
+                    sendError(channel, e);
+                    return;
                 }
+                // The index already exists. Verify it is a Lance index for the
+                // same table before claiming success; otherwise attach would
+                // silently take credit for an unrelated index.
+                verifyExistingLanceIndex(client, channel, indexName, table, derivation);
+            }
+        });
+    }
 
-                @Override
-                public void onFailure(Exception e) {
-                    if (isAlreadyExists(e)) {
-                        // The RegistrIy entry has been refreshed on the way in, so we treat
-                        // repeated attach calls (either by the caller or after a cluster
-                        // restart that lost the in-memory registry) as success.
-                        writeAttachResponse(channel, indexName, table, derivation, true);
-                        return;
-                    }
-                    try {
-                        channel.sendResponse(new BytesRestResponse(channel, e));
-                    } catch (Exception inner) {
-                        // channel already closed
-                    }
+    private static void verifyExistingLanceIndex(
+        NodeClient client,
+        RestChannel channel,
+        String indexName,
+        String table,
+        Derivation derivation
+    ) {
+        ClusterStateRequest stateRequest = new ClusterStateRequest();
+        stateRequest.clear().metadata(true).indices(indexName);
+        client.admin().cluster().state(stateRequest, new ActionListener<ClusterStateResponse>() {
+            @Override
+            public void onResponse(ClusterStateResponse response) {
+                IndexMetadata md = response.getState().metadata().index(indexName);
+                if (md == null) {
+                    // Race: the index disappeared between create and state.
+                    // Treat as conflict rather than pretend attach succeeded.
+                    sendError(channel, RestStatus.CONFLICT, "index " + indexName + " conflicts with a concurrent request");
+                    return;
                 }
-            });
-        };
+                String existing = md.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+                if (existing == null) {
+                    sendError(
+                        channel,
+                        RestStatus.CONFLICT,
+                        "index " + indexName + " already exists and is not a Lance index; choose a different `name`"
+                    );
+                    return;
+                }
+                if (!existing.equals(table)) {
+                    sendError(channel, RestStatus.CONFLICT, "index " + indexName + " already attached to a different table: " + existing);
+                    return;
+                }
+                writeAttachResponse(channel, indexName, table, derivation, true);
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                sendError(channel, e);
+            }
+        });
     }
 
     private static boolean isAlreadyExists(Throwable e) {
@@ -113,7 +197,7 @@ public class RestAttachAction extends BaseRestHandler {
     }
 
     private static void writeAttachResponse(
-        org.opensearch.rest.RestChannel channel,
+        RestChannel channel,
         String indexName,
         String table,
         Derivation derivation,
@@ -138,11 +222,45 @@ public class RestAttachAction extends BaseRestHandler {
             b.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, b));
         } catch (Exception e) {
-            try {
-                channel.sendResponse(new BytesRestResponse(channel, e));
-            } catch (Exception inner) {
-                // channel already closed
-            }
+            sendError(channel, e);
+        }
+    }
+
+    private static String readOptionalString(Map<String, Object> body, String key) {
+        Object v = body.get(key);
+        if (v == null) {
+            return null;
+        }
+        if (!(v instanceof String)) {
+            throw new IllegalArgumentException("[" + key + "] must be a string, got " + v.getClass().getSimpleName());
+        }
+        return (String) v;
+    }
+
+    private static Number readOptionalNumber(Map<String, Object> body, String key) {
+        Object v = body.get(key);
+        if (v == null) {
+            return null;
+        }
+        if (!(v instanceof Number)) {
+            throw new IllegalArgumentException("[" + key + "] must be a number, got " + v.getClass().getSimpleName());
+        }
+        return (Number) v;
+    }
+
+    private static void sendError(RestChannel channel, Exception e) {
+        try {
+            channel.sendResponse(new BytesRestResponse(channel, e));
+        } catch (Exception inner) {
+            // channel already closed
+        }
+    }
+
+    private static void sendError(RestChannel channel, RestStatus status, String message) {
+        try {
+            channel.sendResponse(new BytesRestResponse(status, message));
+        } catch (Exception inner) {
+            // channel already closed
         }
     }
 
