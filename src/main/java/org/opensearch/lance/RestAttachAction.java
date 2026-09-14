@@ -59,9 +59,11 @@ public class RestAttachAction extends BaseRestHandler {
     private static final long ROWS_PER_SHARD_TARGET = 500_000;
 
     private final ThreadPool threadPool;
+    private final AllowedTableRoots allowedRoots;
 
-    public RestAttachAction(ThreadPool threadPool) {
+    public RestAttachAction(ThreadPool threadPool, AllowedTableRoots allowedRoots) {
         this.threadPool = threadPool;
+        this.allowedRoots = allowedRoots;
     }
 
     @Override
@@ -93,6 +95,16 @@ public class RestAttachAction extends BaseRestHandler {
         } catch (IllegalArgumentException e) {
             String message = e.getMessage();
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
+        }
+
+        if (!allowedRoots.allows(table)) {
+            String rejected = table;
+            return channel -> channel.sendResponse(
+                new BytesRestResponse(
+                    RestStatus.FORBIDDEN,
+                    "table [" + rejected + "] is not under any of the configured lance.allowed_table_roots"
+                )
+            );
         }
 
         final String tableFinal = table;

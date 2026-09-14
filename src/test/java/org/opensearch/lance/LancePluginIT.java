@@ -89,6 +89,26 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         assertEquals("registered path should appear exactly once, saw: " + body, 1, occurrences);
     }
 
+    public void testRegisterNamespaceRejectsMissingPath() throws IOException {
+        // The `path` field is required. Without validation, the code cast the
+        // body value to String and threw a 500. It must now be 400.
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/namespace", "{}"));
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        assertEquals("expected 400 for missing path, saw " + status, 400, status);
+        String body = readAll(failure.getResponse());
+        assertTrue("expected message about [path], saw: " + body, body.contains("[path]"));
+    }
+
+    public void testRegisterNamespaceRejectsNonStringPath() throws IOException {
+        // A numeric or boolean `path` used to trip a ClassCastException. The
+        // handler must catch the type mismatch and return 400.
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/namespace", "{\"path\":42}"));
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        assertEquals("expected 400 for non-string path, saw " + status, 400, status);
+        String body = readAll(failure.getResponse());
+        assertTrue("expected message about [path], saw: " + body, body.contains("[path]"));
+    }
+
     public void testAttachRejectsMissingTable() throws IOException {
         // POST /_lance/attach with a path that does not exist on disk lets
         // Dataset.open throw. The plugin must surface this as an HTTP error

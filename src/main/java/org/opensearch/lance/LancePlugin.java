@@ -76,6 +76,12 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         1L,
         Setting.Property.NodeScope
     );
+    public static final Setting<List<String>> ALLOWED_TABLE_ROOTS_SETTING = Setting.listSetting(
+        "lance.allowed_table_roots",
+        List.of(),
+        java.util.function.Function.identity(),
+        Setting.Property.NodeScope
+    );
 
     @Override
     public List<Setting<?>> getSettings() {
@@ -84,7 +90,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             PRIMARY_KEY_FIELD_SETTING,
             UNCOVERED_FRAGMENT_POLICY_SETTING,
             NAMESPACE_POLL_CADENCE_SETTING,
-            BUILDER_MAX_ROWS_SETTING
+            BUILDER_MAX_ROWS_SETTING,
+            ALLOWED_TABLE_ROOTS_SETTING
         );
     }
 
@@ -104,6 +111,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
 
     private LanceNamespaceService namespaceService;
     private org.opensearch.threadpool.ThreadPool threadPool;
+    private AllowedTableRoots allowedTableRoots;
 
     @Override
     public java.util.Collection<Object> createComponents(
@@ -122,6 +130,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         this.threadPool = threadPool;
         TimeValue cadence = NAMESPACE_POLL_CADENCE_SETTING.get(environment.settings());
         long builderMaxRows = BUILDER_MAX_ROWS_SETTING.get(environment.settings());
+        this.allowedTableRoots = new AllowedTableRoots(ALLOWED_TABLE_ROOTS_SETTING.get(environment.settings()));
         namespaceService = new LanceNamespaceService(client, threadPool, cadence, builderMaxRows);
         return List.of(namespaceService);
     }
@@ -136,6 +145,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<DiscoveryNodes> nodesInCluster
     ) {
-        return List.of(new RestAttachAction(threadPool), new RestNamespaceAction(namespaceService), new RestBuildIndexesAction(threadPool));
+        return List.of(
+            new RestAttachAction(threadPool, allowedTableRoots),
+            new RestNamespaceAction(namespaceService, allowedTableRoots),
+            new RestBuildIndexesAction(threadPool)
+        );
     }
 }

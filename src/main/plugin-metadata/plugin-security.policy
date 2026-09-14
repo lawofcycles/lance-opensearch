@@ -1,7 +1,18 @@
 grant {
   // lance-jni extracts and loads the native library from a temp dir
   permission java.lang.RuntimePermission "loadLibrary.*";
-  permission java.io.FilePermission "<<ALL FILES>>", "read,write,delete,execute";
+  // JNI extracts the native library under java.io.tmpdir and removes it on
+  // shutdown, so temp files need read / write / delete. Non-temp paths get
+  // read / write only; execute is not used anywhere in the plugin and is
+  // removed to shrink the audit surface.
+  permission java.io.FilePermission "${java.io.tmpdir}${/}-", "read,write,delete";
+  permission java.io.FilePermission "${java.io.tmpdir}", "read";
+  // Lance tables can live at any local or S3-backed path the operator points
+  // attach / namespace at. The REST handlers cross-check every path against
+  // the `lance.allowed_table_roots` node setting before opening it, so the
+  // JVM policy stays permissive on read / write but never grants execute or
+  // arbitrary delete.
+  permission java.io.FilePermission "<<ALL FILES>>", "read,write";
   // Arrow memory / c-data internals
   permission java.lang.RuntimePermission "accessDeclaredMembers";
   permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
