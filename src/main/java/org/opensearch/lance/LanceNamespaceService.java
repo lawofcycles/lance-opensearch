@@ -9,7 +9,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -158,18 +157,14 @@ public final class LanceNamespaceService {
                     rederivedMappingJson = derivation.mappingJson();
                     warnOnLanceFieldRename(indexName, dataset.getLanceSchema());
                     if ("wait".equals(policy)) {
-                        // re-run the index builder before exposing the new version, so
-                        // the reader sees fully-covered indices for the newly appended
-                        // fragments; an overwrite may have dropped indexes too.
-                        //
-                        // Two steps in tandem:
-                        // (1) optimize existing indexes so the appended fragments
-                        // are folded in via Lance's incremental merge, and
-                        // (2) ensure indexes on columns that still lack one.
-                        // Without step (1) the `wait` policy was equivalent to
-                        // `immediate` for any column that already carried an index
-                        // (the append never made it into the index, so the reader
-                        // saw the flat-scan fallback all the same).
+                        // Extend every existing index so appended fragments are
+                        // folded in before the new version is exposed. Creating
+                        // new indexes automatically is disabled (see C3 / C9):
+                        // the old auto path built an IVF_PQ with
+                        // numPartitions=1 that quietly degraded recall and
+                        // committed BTrees that then blocked subsequent
+                        // alter_columns. Operators trigger index builds
+                        // explicitly through POST /_lance/build_indexes.
                         List<String> ftsOptimized = LanceIndexBuilder.optimizeExistingFtsIndexes(dataset, derivation.ftsColumns(), false);
                         List<String> scalarOptimized = LanceIndexBuilder.optimizeExistingScalarIndexes(
                             dataset,
@@ -181,30 +176,7 @@ public final class LanceNamespaceService {
                             derivation.vectorColumns(),
                             false
                         );
-                        List<String> ftsBuilt = LanceIndexBuilder.ensureFtsIndexes(
-                            dataset,
-                            derivation.ftsColumns(),
-                            builderMaxRows,
-                            Optional.empty()
-                        );
-                        List<String> scalarBuilt = LanceIndexBuilder.ensureScalarIndexes(
-                            dataset,
-                            derivation.scalarColumns(),
-                            builderMaxRows,
-                            Optional.empty()
-                        );
-                        List<String> vectorBuilt = LanceIndexBuilder.ensureVectorIndexes(
-                            dataset,
-                            derivation.vectorColumns(),
-                            builderMaxRows,
-                            Optional.empty()
-                        );
-                        if (!ftsBuilt.isEmpty()
-                            || !scalarBuilt.isEmpty()
-                            || !vectorBuilt.isEmpty()
-                            || !ftsOptimized.isEmpty()
-                            || !scalarOptimized.isEmpty()
-                            || !vectorOptimized.isEmpty()) {
+                        if (!ftsOptimized.isEmpty() || !scalarOptimized.isEmpty() || !vectorOptimized.isEmpty()) {
                             latest = dataset.version();
                         }
                     }
@@ -238,26 +210,11 @@ public final class LanceNamespaceService {
     private void surface(String indexName, String table) throws Exception {
         RestAttachAction.Derivation derivation;
         try (Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(table).build()) {
-            // Derive first so the builder only sees the columns that derived to
-            // lance_text / scalar-eligible / vector-eligible; other columns stay
-            // untouched.
+            // Derive first so the CreateIndex settings and mapping reflect
+            // the current Lance schema. Automatic index creation is off by
+            // default (see C3 / C9); operators build indexes explicitly
+            // through POST /_lance/build_indexes.
             derivation = RestAttachAction.derive(dataset, null);
-            List<String> ftsBuilt = LanceIndexBuilder.ensureFtsIndexes(dataset, derivation.ftsColumns(), builderMaxRows, Optional.empty());
-            List<String> scalarBuilt = LanceIndexBuilder.ensureScalarIndexes(
-                dataset,
-                derivation.scalarColumns(),
-                builderMaxRows,
-                Optional.empty()
-            );
-            List<String> vectorBuilt = LanceIndexBuilder.ensureVectorIndexes(
-                dataset,
-                derivation.vectorColumns(),
-                builderMaxRows,
-                Optional.empty()
-            );
-            if (!ftsBuilt.isEmpty() || !scalarBuilt.isEmpty() || !vectorBuilt.isEmpty()) {
-                LOG.info("index builder created fts={} scalar={} vector={} for table {}", ftsBuilt, scalarBuilt, vectorBuilt, table);
-            }
         }
         client.admin()
             .indices()

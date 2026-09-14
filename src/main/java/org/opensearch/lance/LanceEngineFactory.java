@@ -25,6 +25,7 @@ import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.Bits;
 import org.lance.Dataset;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
@@ -187,6 +188,24 @@ public final class LanceEngineFactory implements EngineFactory {
                 // name to Lance and getting a 500 back.
                 return GetResult.NOT_EXISTS;
             }
+            if (numShards > 1) {
+                // OpenSearch routes GET /_doc/{id} to `hash(_id) % numShards`,
+                // but a Lance PK has no relationship to the fragment layout,
+                // so the request lands on the correct shard only by chance
+                // (verified against a 4-shard attach: 7/16 hits). Silent
+                // `found: false` on the miss shards is worse than a clean
+                // rejection. The proper fix — coordinator-side fan-out to
+                // every shard — is tracked as follow-up work; until then,
+                // fail loudly so operators know to fall back to `_search`
+                // or attach with `number_of_shards: 1`.
+                throw new IllegalArgumentException(
+                    "GET by _id is not supported on Lance indices with more than one shard (numShards="
+                        + numShards
+                        + "). Use `_search` with a term query on `"
+                        + field
+                        + "` instead, or reattach the index with `number_of_shards: 1`."
+                );
+            }
             long key;
             try {
                 key = Long.parseLong(get.id());
@@ -230,6 +249,17 @@ public final class LanceEngineFactory implements EngineFactory {
                             int offset = (int) (addr & 0xFFFFFFFFL);
                             LeafReaderContext ctx = leavesByFragment.get(fragmentId);
                             if (ctx == null) {
+                                continue;
+                            }
+                            // The wrapper reader that the security plugin
+                            // interposes for DLS applies its filter through
+                            // liveDocs. Consult it before returning the hit so
+                            // GET honours the same DLS predicate that
+                            // _search / _count already respect (otherwise a
+                            // user restricted to `rating >= 4` could still
+                            // GET a row with `rating = 1`).
+                            Bits liveDocs = ctx.reader().getLiveDocs();
+                            if (liveDocs != null && !liveDocs.get(offset)) {
                                 continue;
                             }
                             DocIdAndVersion dv = new DocIdAndVersion(offset, 1, 1, 1, ctx.reader(), ctx.docBase);
