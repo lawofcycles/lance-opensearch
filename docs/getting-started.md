@@ -202,6 +202,25 @@ Expected `hits.hits[0]._source.id = 2`, `hits.hits[1]._source.id = 3`.
 
 Scores are `boost / (1 + distance)`. Compare within one query, not across queries.
 
+`lance_knn` accepts an inner `filter` clause that Lance evaluates before applying the K-nearest cutoff (a pre-filter). Any `bool` combination of `match_all`, `term`, `terms`, `exists`, and `range` clauses works; anything else returns 400.
+
+```
+curl -s -X POST 'http://localhost:9200/demo/_search?size=2' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "query": {
+          "lance_knn": {
+            "field":"embedding",
+            "vector":[2.4,0,0,0,0,0,0,0],
+            "k":2,
+            "filter":{"range":{"id":{"gte":10}}}
+          }
+        }
+      }'
+```
+
+Expected `hits.hits[0]._source.id = 10`, `hits.hits[1]._source.id = 11` (`k=2` stays populated because the filter is applied before the cutoff).
+
 ### Aggregation combined with bool
 
 ```

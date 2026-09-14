@@ -53,9 +53,10 @@ public final class LanceKnnQuery extends Query {
     private final Integer ef;
     private final org.lance.index.DistanceType distanceType;
     private final Boolean useIndex;
+    private final String filter;
 
     public LanceKnnQuery(String column, float[] vector, int k) {
-        this(column, vector, k, null, null, null, null, null);
+        this(column, vector, k, null, null, null, null, null, null);
     }
 
     public LanceKnnQuery(
@@ -66,7 +67,8 @@ public final class LanceKnnQuery extends Query {
         Integer refineFactor,
         Integer ef,
         org.lance.index.DistanceType distanceType,
-        Boolean useIndex
+        Boolean useIndex,
+        String filter
     ) {
         this.column = column;
         this.vector = vector;
@@ -76,6 +78,7 @@ public final class LanceKnnQuery extends Query {
         this.ef = ef;
         this.distanceType = distanceType;
         this.useIndex = useIndex;
+        this.filter = filter;
     }
 
     @Override
@@ -189,8 +192,17 @@ public final class LanceKnnQuery extends Query {
             if (useIndex != null) {
                 qb.setUseIndex(useIndex);
             }
-            ScanOptions options = new ScanOptions.Builder().nearest(qb.build()).withRowAddress(true).build();
-            try (LanceScanner scanner = leaf.dataset().newScan(options); ArrowReader reader = scanner.scanBatches()) {
+            ScanOptions.Builder options = new ScanOptions.Builder().nearest(qb.build()).withRowAddress(true);
+            if (filter != null && !filter.isEmpty()) {
+                // Push the filter down as a pre-filter so Lance evaluates
+                // it BEFORE applying the k-nearest cutoff. Without this
+                // the post-filter path drops filter-mismatching hits from
+                // the top-K and can leave fewer than k results even when
+                // the table has plenty of matching rows.
+                options.filter(filter);
+                options.prefilter(true);
+            }
+            try (LanceScanner scanner = leaf.dataset().newScan(options.build()); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
                     UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
@@ -240,11 +252,12 @@ public final class LanceKnnQuery extends Query {
             && Objects.equals(refineFactor, q.refineFactor)
             && Objects.equals(ef, q.ef)
             && Objects.equals(distanceType, q.distanceType)
-            && Objects.equals(useIndex, q.useIndex);
+            && Objects.equals(useIndex, q.useIndex)
+            && Objects.equals(filter, q.filter);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(column, java.util.Arrays.hashCode(vector), k, nprobes, refineFactor, ef, distanceType, useIndex);
+        return Objects.hash(column, java.util.Arrays.hashCode(vector), k, nprobes, refineFactor, ef, distanceType, useIndex, filter);
     }
 }

@@ -61,6 +61,7 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
     private Integer ef;
     private String metric;
     private Boolean useIndex;
+    private org.opensearch.index.query.QueryBuilder filter;
 
     public LanceKnnQueryBuilder(String field, float[] vector, int k) {
         if (field == null || field.isEmpty()) {
@@ -87,6 +88,7 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
         this.ef = in.readOptionalVInt();
         this.metric = in.readOptionalString();
         this.useIndex = in.readOptionalBoolean();
+        this.filter = in.readOptionalNamedWriteable(org.opensearch.index.query.QueryBuilder.class);
     }
 
     @Override
@@ -99,6 +101,7 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
         out.writeOptionalVInt(ef);
         out.writeOptionalString(metric);
         out.writeOptionalBoolean(useIndex);
+        out.writeOptionalNamedWriteable(filter);
     }
 
     public LanceKnnQueryBuilder nprobes(int nprobes) {
@@ -135,6 +138,11 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
         return this;
     }
 
+    public LanceKnnQueryBuilder filter(org.opensearch.index.query.QueryBuilder filter) {
+        this.filter = filter;
+        return this;
+    }
+
     Integer nprobes() {
         return nprobes;
     }
@@ -153,6 +161,10 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
 
     Boolean useIndex() {
         return useIndex;
+    }
+
+    org.opensearch.index.query.QueryBuilder filter() {
+        return filter;
     }
 
     String field() {
@@ -187,6 +199,10 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
         }
         if (useIndex != null) {
             builder.field("use_index", useIndex);
+        }
+        if (filter != null) {
+            builder.field("filter");
+            filter.toXContent(builder, params);
         }
         printBoostAndQueryName(builder);
         builder.endObject();
@@ -245,6 +261,30 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
             }
             builder.queryName((String) name);
         }
+        if (map.containsKey("filter")) {
+            Object f = map.get("filter");
+            if (!(f instanceof Map<?, ?>)) {
+                throw new ParsingException(parser.getTokenLocation(), "[lance_knn] filter must be a query object");
+            }
+            // The rest of fromXContent operates on the Map view of the
+            // body; for `filter` we need to hand it back to
+            // AbstractQueryBuilder.parseInnerQueryBuilder, which is
+            // streaming. Serialise the sub-map to JSON and hand it a
+            // scoped XContentParser that inherits our registry.
+            try {
+                XContentBuilder tmp = org.opensearch.common.xcontent.XContentFactory.jsonBuilder();
+                tmp.map((Map<String, Object>) f);
+                try (
+                    XContentParser innerParser = org.opensearch.core.xcontent.MediaTypeRegistry.JSON.xContent()
+                        .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), tmp.toString())
+                ) {
+                    innerParser.nextToken();
+                    builder.filter(org.opensearch.index.query.AbstractQueryBuilder.parseInnerQueryBuilder(innerParser));
+                }
+            } catch (IOException e) {
+                throw new ParsingException(parser.getTokenLocation(), "[lance_knn] filter parse failed: " + e.getMessage(), e);
+            }
+        }
 
         // Reject typos so silent property loss does not translate into wrong
         // recall or a metric that was never applied.
@@ -266,6 +306,7 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
         "ef",
         "metric",
         "use_index",
+        "filter",
         "boost",
         "_name"
     );
@@ -341,7 +382,8 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
                     + ")"
             );
         }
-        return new LanceKnnQuery(field, vector, k, nprobes, refineFactor, ef, parseDistance(metric), useIndex);
+        String filterSql = filter == null ? null : LanceKnnFilterTranslator.toLanceSql(filter);
+        return new LanceKnnQuery(field, vector, k, nprobes, refineFactor, ef, parseDistance(metric), useIndex, filterSql);
     }
 
     private static org.lance.index.DistanceType parseDistance(String metric) {
@@ -371,12 +413,13 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
             && Objects.equals(refineFactor, other.refineFactor)
             && Objects.equals(ef, other.ef)
             && Objects.equals(metric, other.metric)
-            && Objects.equals(useIndex, other.useIndex);
+            && Objects.equals(useIndex, other.useIndex)
+            && Objects.equals(filter, other.filter);
     }
 
     @Override
     protected int doHashCode() {
-        return Objects.hash(field, java.util.Arrays.hashCode(vector), k, nprobes, refineFactor, ef, metric, useIndex);
+        return Objects.hash(field, java.util.Arrays.hashCode(vector), k, nprobes, refineFactor, ef, metric, useIndex, filter);
     }
 
     @Override

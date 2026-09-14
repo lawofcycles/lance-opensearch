@@ -55,7 +55,7 @@ The full walkthrough — install into OpenSearch, prepare a Lance table, registe
 
 - Nearest-neighbour queries scan once per shard. When the same Lance table is spread across N shards, the same underlying data is scanned N times.
 - Nearest-neighbour scores are `boost / (1 + distance)`, not metric-normalised. Compare scores within a single query, not across queries or engines.
-- `lance_knn` combined with a `bool.filter` runs as a post-filter, so a filter that removes hits from the returned top-K can leave fewer than K results.
+- `lance_knn` accepts an inner `filter` clause that Lance evaluates before applying the K-nearest cutoff (a pre-filter, so K matching rows are still returned when they exist). Supported filter clauses are `match_all`, `term`, `terms`, `exists`, `range`, and `bool` (`filter` / `must` / `must_not` / `should`). Other clauses such as `match`, geo queries, and scripts are rejected with 400. `lance_knn` combined with an outer `bool.filter` still runs the outer clause as a post-filter; wrap it inside `lance_knn.filter` to push it into Lance.
 - `lance_knn` is limited to `Float32` element types. Lance vectors declared as `int8`, `uint8` / binary, or `float16` are surfaced in the attach notes but excluded from the mapping until the Java SDK gains a `setKey(byte[])` / `setKey(short[])` entry point.
 - GET `/_doc/{id}` only works when the index has a single shard. The plugin returns 400 for GET on multi-shard indices; use `_search` with a term query on the primary key column instead, or reattach the index with `number_of_shards: 1`.
 - GET by `_id` requires a primary key declared through the Lance `lance-schema:unenforced-primary-key` metadata. Tables without a declared PK expose an empty `primary_key_field` and GET returns 404.

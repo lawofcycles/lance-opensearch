@@ -167,4 +167,37 @@ public class LanceKnnQueryBuilderTests extends OpenSearchTestCase {
             assertTrue("unexpected message: " + e.getMessage(), e.getMessage().contains("k must be"));
         }
     }
+
+    public void testFilterSetterAndGetterRoundTrip() {
+        LanceKnnQueryBuilder builder = new LanceKnnQueryBuilder(FIELD, VECTOR, K);
+        org.opensearch.index.query.RangeQueryBuilder range = org.opensearch.index.query.QueryBuilders.rangeQuery("rating").gte(4);
+        builder.filter(range);
+        assertSame(range, builder.filter());
+    }
+
+    public void testFilterAffectsEqualsAndHashCode() {
+        LanceKnnQueryBuilder a = new LanceKnnQueryBuilder(FIELD, VECTOR, K);
+        LanceKnnQueryBuilder b = new LanceKnnQueryBuilder(FIELD, VECTOR, K);
+        assertEquals(a, b);
+        b.filter(org.opensearch.index.query.QueryBuilders.rangeQuery("rating").gte(4));
+        assertNotEquals(a, b);
+        a.filter(org.opensearch.index.query.QueryBuilders.rangeQuery("rating").gte(4));
+        assertEquals(a, b);
+        assertEquals(a.hashCode(), b.hashCode());
+    }
+
+    public void testToXContentIncludesFilterClause() throws Exception {
+        // toXContent has to surface the filter under the `filter` key so
+        // that _explain and diagnostic dumps show what pre-filter Lance
+        // will actually apply.
+        LanceKnnQueryBuilder builder = new LanceKnnQueryBuilder(FIELD, VECTOR, K);
+        builder.filter(org.opensearch.index.query.QueryBuilders.rangeQuery("rating").gte(4));
+        try (XContentBuilder out = JsonXContent.contentBuilder()) {
+            builder.toXContent(out, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+            String json = out.toString();
+            assertTrue("json missing filter: " + json, json.contains("\"filter\""));
+            assertTrue("json missing range: " + json, json.contains("\"range\""));
+            assertTrue("json missing rating: " + json, json.contains("\"rating\""));
+        }
+    }
 }
