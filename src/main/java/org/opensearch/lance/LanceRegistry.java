@@ -5,35 +5,24 @@
 
 package org.opensearch.lance;
 
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
-import org.lance.Dataset;
 
-/** Node local registry of attached Lance tables. */
+/**
+ * Process-wide Arrow allocator shared by every plugin-owned code path that
+ * needs to open a Lance dataset. Historically this class also cached a
+ * per-index {@code Dataset} for two REST endpoints ({@code _scan} /
+ * {@code _query}); the endpoints were undocumented PoC leftovers and both
+ * they and the caching layer have been removed. The allocator remains and
+ * is the only public surface.
+ */
 public final class LanceRegistry {
 
     private static final BufferAllocator ALLOCATOR = new RootAllocator(Long.MAX_VALUE);
-    private static final Map<String, Dataset> TABLES = new ConcurrentHashMap<>();
 
     private LanceRegistry() {}
 
     public static BufferAllocator allocator() {
         return ALLOCATOR;
-    }
-
-    public static Dataset attach(String name, String tableUri) {
-        Dataset dataset = Dataset.open(tableUri, ALLOCATOR);
-        Dataset previous = TABLES.put(name, dataset);
-        if (previous != null) {
-            previous.close();
-        }
-        return dataset;
-    }
-
-    public static Dataset get(String name) {
-        return TABLES.get(name);
     }
 }

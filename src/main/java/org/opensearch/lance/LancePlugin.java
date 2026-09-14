@@ -131,12 +131,6 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<DiscoveryNodes> nodesInCluster
     ) {
-        return List.of(
-            new RestAttachAction(),
-            new RestScanAction(),
-            new RestQueryAction(),
-            new RestNamespaceAction(namespaceService),
-            new RestBuildIndexesAction(threadPool)
-        );
+        return List.of(new RestAttachAction(), new RestNamespaceAction(namespaceService), new RestBuildIndexesAction(threadPool));
     }
 }

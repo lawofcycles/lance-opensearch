@@ -66,7 +66,6 @@ public class RestAttachAction extends BaseRestHandler {
             try (Dataset dataset = Dataset.open(table, LanceRegistry.allocator())) {
                 derivation = derive(dataset, pinnedShards);
             }
-            LanceRegistry.attach(indexName, table);
 
             CreateIndexRequest create = new CreateIndexRequest(indexName).settings(
                 Settings.builder()

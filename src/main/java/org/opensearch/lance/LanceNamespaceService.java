@@ -234,7 +234,6 @@ public final class LanceNamespaceService {
                 LOG.info("index builder created fts={} scalar={} vector={} for table {}", ftsBuilt, scalarBuilt, vectorBuilt, table);
             }
         }
-        LanceRegistry.attach(indexName, table);
         client.admin()
             .indices()
             .create(
