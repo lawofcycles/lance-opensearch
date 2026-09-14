@@ -114,6 +114,42 @@ public final class LanceEngineFactory implements EngineFactory {
             }
         }
 
+        // OpenSearch's default docStats() / segmentsStats() implementations
+        // walk every leaf and call Lucene.segmentReader(reader) to extract a
+        // SegmentReader for byte-size and segment-name bookkeeping. Lance
+        // leaves are neither SegmentReaders nor Lucene segments, so those
+        // helpers throw on every stats API call and take out _stats /
+        // _cat/indices docs.count / _nodes/stats/indices / _cluster/stats
+        // across the whole node. Recompute the fields Lance can provide
+        // (numDocs / maxDoc from each leaf), leave the ones tied to Lucene
+        // segment files empty, and never delegate to Lucene.segmentReader.
+        @Override
+        public org.opensearch.index.shard.DocsStats docStats() {
+            try (Searcher searcher = acquireSearcher("docStats", SearcherScope.INTERNAL)) {
+                long numDocs = 0;
+                long numDeletedDocs = 0;
+                for (LeafReaderContext ctx : searcher.getIndexReader().leaves()) {
+                    numDocs += ctx.reader().numDocs();
+                    numDeletedDocs += ctx.reader().numDeletedDocs();
+                }
+                // sizeInBytes is unknown for Lance leaves; leave it at zero.
+                // Callers already expect this to be an estimate.
+                return new org.opensearch.index.shard.DocsStats.Builder().count(numDocs)
+                    .deleted(numDeletedDocs)
+                    .totalSizeInBytes(0L)
+                    .build();
+            }
+        }
+
+        @Override
+        public org.opensearch.index.engine.SegmentsStats segmentsStats(boolean includeSegmentFileSizes, boolean includeUnloadedSegments) {
+            ensureOpen();
+            // A Lance-backed index has no Lucene segments to report on. Return
+            // an empty stats object so the request completes with sane zeros
+            // instead of blowing up on Lucene.segmentReader(reader).
+            return new org.opensearch.index.engine.SegmentsStats();
+        }
+
         @Override
         public boolean maybeRefresh(String source) throws EngineException {
             try {

@@ -184,6 +184,33 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testStatsAPIsSucceedForLanceIndex() throws Exception {
+        // Regression for LanceReadOnlyEngine.docStats() / segmentsStats():
+        // OpenSearch's default implementations traverse leaves via
+        // Lucene.segmentReader(reader), which throws for Lance leaves and
+        // takes out _stats / _cat/indices docs.count / _nodes/stats /
+        // _cluster/stats node-wide. Confirm the plugin overrides succeed
+        // and the node-level stats aggregation runs without shard failures.
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "statsapi")) {
+            String indexName = fixture.indexName();
+
+            Response indexStats = client().performRequest(new Request("GET", "/" + indexName + "/_stats"));
+            assertEquals(RestStatus.OK.getStatus(), indexStats.getStatusLine().getStatusCode());
+            String body = readAll(indexStats);
+            int failed = extractIntPath(body, "_shards", "failed");
+            assertEquals("expected zero shard failures on _stats, saw: " + body, 0, failed);
+
+            Response segments = client().performRequest(new Request("GET", "/" + indexName + "/_segments"));
+            assertEquals(RestStatus.OK.getStatus(), segments.getStatusLine().getStatusCode());
+
+            Response nodesStats = client().performRequest(new Request("GET", "/_nodes/stats/indices/docs"));
+            assertEquals(RestStatus.OK.getStatus(), nodesStats.getStatusLine().getStatusCode());
+            String nodesBody = readAll(nodesStats);
+            int nodesFailed = extractIntPath(nodesBody, "_nodes", "failed");
+            assertEquals("expected zero node failures on _nodes/stats, saw: " + nodesBody, 0, nodesFailed);
+        }
+    }
+
     /**
      * Fixture that writes a Lance table into a scratch directory, registers
      * that directory as a Lance namespace, waits for the polling loop to
