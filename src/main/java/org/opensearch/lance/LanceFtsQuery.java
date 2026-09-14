@@ -56,6 +56,15 @@ public final class LanceFtsQuery extends Query {
                 if (!(org.apache.lucene.index.FilterLeafReader.unwrap(context.reader()) instanceof LanceFragmentLeafReader leaf)) {
                     return null;
                 }
+                // Security plugin FLS hides a field by dropping it from the
+                // wrapper reader's FieldInfos. If the wrapper reader we were
+                // handed no longer exposes `column`, the caller should not be
+                // able to use it as a search term either. Return an empty
+                // scorer supplier so the query contributes no hits, matching
+                // the standard `match` behaviour on a Lucene index.
+                if (context.reader().getFieldInfos().fieldInfo(column) == null) {
+                    return null;
+                }
                 int maxDoc = leaf.maxDoc();
                 float[] scores = new float[maxDoc];
                 org.apache.lucene.util.FixedBitSet matches = new org.apache.lucene.util.FixedBitSet(maxDoc);

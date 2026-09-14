@@ -431,6 +431,61 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 )
             );
         }
+        // Text and binary columns don't carry Lucene doc values (the FTS goes
+        // through Lance's own inverted index, and binary is fetched from
+        // _source), but they still need to appear in FieldInfos so the
+        // security plugin's FLS wrapper can drop them by name. Without the
+        // entry, `context.reader().getFieldInfos().fieldInfo(column)` looks
+        // identical to an FLS-excluded field, defeating the FLS bypass
+        // check in LanceFtsQuery.
+        for (String column : textColumns.keySet()) {
+            infos.add(
+                new FieldInfo(
+                    column,
+                    number++,
+                    false,
+                    true,
+                    false,
+                    IndexOptions.NONE,
+                    DocValuesType.NONE,
+                    DocValuesSkipIndexType.NONE,
+                    -1,
+                    Collections.emptyMap(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    VectorEncoding.FLOAT32,
+                    VectorSimilarityFunction.EUCLIDEAN,
+                    false,
+                    false
+                )
+            );
+        }
+        for (String column : binaryColumns.keySet()) {
+            infos.add(
+                new FieldInfo(
+                    column,
+                    number++,
+                    false,
+                    true,
+                    false,
+                    IndexOptions.NONE,
+                    DocValuesType.NONE,
+                    DocValuesSkipIndexType.NONE,
+                    -1,
+                    Collections.emptyMap(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    VectorEncoding.FLOAT32,
+                    VectorSimilarityFunction.EUCLIDEAN,
+                    false,
+                    false
+                )
+            );
+        }
         this.fieldInfos = new FieldInfos(infos.toArray(new FieldInfo[0]));
 
         ByteBuffersDirectory bridgeDir = new ByteBuffersDirectory();
