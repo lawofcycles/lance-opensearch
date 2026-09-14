@@ -26,6 +26,7 @@ import org.opensearch.action.admin.indices.exists.indices.IndicesExistsRequest;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.action.admin.indices.refresh.RefreshRequest;
 import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
@@ -275,21 +276,47 @@ public final class LanceNamespaceService {
             // through POST /_lance/build_indexes.
             derivation = RestAttachAction.derive(dataset, null);
         }
+        // Fire the CreateIndex asynchronously so a red shard on this table
+        // does not block the poll thread for 30 seconds waiting for ack.
+        // Every other table in the same namespace was previously stuck
+        // behind that block. See issue #29.
+        final long version = derivation.version();
+        final int shards = derivation.shards();
         client.admin()
             .indices()
             .create(
                 new CreateIndexRequest(indexName).settings(
                     Settings.builder()
-                        .put("index.number_of_shards", derivation.shards())
+                        .put("index.number_of_shards", shards)
                         .put("index.number_of_replicas", 0)
                         .put(LanceEngineFactory.TABLE_SETTING, table)
                         .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField())
                         .build()
-                ).mapping(derivation.mappingJson())
-            )
-            .actionGet();
-        servedVersions.put(indexName, derivation.version());
-        LOG.info("surfaced table {} as index {} (version {}, {} shards)", table, indexName, derivation.version(), derivation.shards());
+                ).mapping(derivation.mappingJson()),
+                new ActionListener<org.opensearch.action.admin.indices.create.CreateIndexResponse>() {
+                    @Override
+                    public void onResponse(org.opensearch.action.admin.indices.create.CreateIndexResponse response) {
+                        servedVersions.put(indexName, version);
+                        LOG.info("surfaced table {} as index {} (version {}, {} shards)", table, indexName, version, shards);
+                    }
+
+                    @Override
+                    public void onFailure(Exception e) {
+                        // ResourceAlreadyExistsException means another node
+                        // (or an earlier poll) already surfaced the table;
+                        // the syncTable path will pick it up next cycle.
+                        Throwable cursor = e;
+                        while (cursor != null) {
+                            if (cursor instanceof org.opensearch.ResourceAlreadyExistsException) {
+                                LOG.debug("surface for {} raced with an existing index", indexName);
+                                return;
+                            }
+                            cursor = cursor.getCause();
+                        }
+                        LOG.warn("surface failed for {} at version {}: {}", indexName, version, e.getMessage());
+                    }
+                }
+            );
     }
 
     void recordServedVersion(String indexName, long version) {

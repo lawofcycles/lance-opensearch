@@ -156,16 +156,41 @@ public class RestBuildIndexesAction extends BaseRestHandler {
         try (Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(tableUri).build()) {
             RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, null);
             Set<String> columnsFilter = columnsFilterRaw != null ? new LinkedHashSet<>(columnsFilterRaw) : null;
+            if (columnsFilter != null) {
+                // Reject unknown columns up front so callers don't get a 200
+                // response with `built: []` and no explanation for a typo
+                // (see issue #33). "Known" here means the column is
+                // FTS-eligible, scalar-eligible, or vector-eligible per
+                // derive; other columns are stored-only and cannot carry an
+                // index.
+                Set<String> known = new LinkedHashSet<>();
+                known.addAll(derivation.ftsColumns());
+                known.addAll(derivation.scalarColumns());
+                known.addAll(derivation.vectorColumns());
+                for (String c : columnsFilter) {
+                    if (!known.contains(c)) {
+                        sendError(
+                            channel,
+                            RestStatus.BAD_REQUEST,
+                            "column [" + c + "] is not indexable by build_indexes; known columns are " + known
+                        );
+                        return;
+                    }
+                }
+            }
             Set<String> ftsTarget = filter(derivation.ftsColumns(), columnsFilter);
             Set<String> scalarTarget = filter(derivation.scalarColumns(), columnsFilter);
             Set<String> vectorTarget = filter(derivation.vectorColumns(), columnsFilter);
             if (optimize) {
-                // Optimize path: existing indexes only. We look up the actual
-                // Lance index name (based on column) and hand them to Lance's
-                // OptimizeIndices, which merges out-of-index fragments in place.
-                ftsBuilt = optimizeByColumns(dataset, ftsTarget, "_fts", retrain);
-                scalarBuilt = optimizeByColumns(dataset, scalarTarget, "_btree", retrain);
-                vectorBuilt = optimizeByColumns(dataset, vectorTarget, "_vec", retrain);
+                // Optimize path: hand the ACTUAL Lance index names (via
+                // describeIndices) to OptimizeIndices instead of assuming the
+                // `<col>_fts` / `<col>_btree` / `<col>_vec` convention. Lance
+                // silently ignores unknown names, so the old convention path
+                // returned 200 with `built: [...]` even when nothing was
+                // touched (see issue #33).
+                ftsBuilt = LanceIndexBuilder.optimizeExistingFtsIndexes(dataset, ftsTarget, retrain);
+                scalarBuilt = LanceIndexBuilder.optimizeExistingScalarIndexes(dataset, scalarTarget, retrain);
+                vectorBuilt = LanceIndexBuilder.optimizeExistingVectorIndexes(dataset, vectorTarget, retrain);
             } else {
                 Optional<List<Integer>> fragmentIds = toIntList(fragmentIdsRaw);
                 ftsBuilt = LanceIndexBuilder.ensureFtsIndexes(dataset, ftsTarget, Long.MAX_VALUE, fragmentIds);
@@ -205,17 +230,6 @@ public class RestBuildIndexesAction extends BaseRestHandler {
             }
         }
         return result;
-    }
-
-    // Convention: LanceIndexBuilder names FTS as "<col>_fts", BTree as
-    // "<col>_btree", vector as "<col>_vec". Optimize path relies on this naming
-    // to map derivation columns back to Lance index names.
-    private static List<String> optimizeByColumns(Dataset dataset, Set<String> columns, String suffix, boolean retrain) {
-        List<String> indexNames = new ArrayList<>();
-        for (String c : columns) {
-            indexNames.add(c + suffix);
-        }
-        return LanceIndexBuilder.optimizeIndexes(dataset, indexNames, retrain);
     }
 
     private static Optional<List<Integer>> toIntList(List<Number> raw) {
