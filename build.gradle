@@ -1,0 +1,308 @@
+/*
+ *  Copyright OpenSearch Contributors
+ *  SPDX-License-Identifier: Apache-2.0
+ */
+
+buildscript {
+    ext {
+        opensearch_version = System.getProperty("opensearch.version", "3.8.0")
+        opensearch_group = "org.opensearch"
+    }
+
+    repositories {
+        mavenLocal()
+        maven { url "https://ci.opensearch.org/ci/dbc/snapshots/maven/" }
+        mavenCentral()
+        maven { url "https://plugins.gradle.org/m2/" }
+    }
+
+    dependencies {
+        classpath "${opensearch_group}.gradle:build-tools:${opensearch_version}"
+    }
+}
+
+plugins {
+    id 'java-library'
+    id 'idea'
+    id 'eclipse'
+    id 'com.diffplug.spotless' version '8.10.2' apply false
+}
+
+apply from: 'gradle/formatting.gradle'
+apply plugin: 'opensearch.opensearchplugin'
+apply plugin: 'opensearch.pluginzip'
+apply plugin: 'opensearch.rest-test'
+
+opensearchplugin {
+    name 'opensearch-lance'
+    description 'Distributed search layer over Lance tables for OpenSearch (RFC #22643)'
+    classname 'org.opensearch.lance.LancePlugin'
+    licenseFile = rootProject.file('LICENSE.txt')
+    noticeFile = rootProject.file('NOTICE.txt')
+}
+
+java {
+    targetCompatibility = JavaVersion.VERSION_21
+    sourceCompatibility = JavaVersion.VERSION_21
+}
+
+repositories {
+    mavenCentral()
+    maven { url "https://ci.opensearch.org/ci/dbc/snapshots/maven/" }
+}
+
+dependencies {
+    api "org.opensearch:opensearch:${opensearch_version}"
+
+    // Apache Arrow — bundle the modules needed at runtime because the
+    // arrow-base plugin is not distributed with the OpenSearch release
+    // image. arrow-memory-unsafe stays as the allocator (arrow-memory-netty
+    // does not work under OpenSearch's -Dio.netty.noUnsafe=true).
+    // TODO(pre-transfer): switch to extendedPlugins = ['arrow-base'] once
+    // opensearch-project ships arrow-base in the plugin distribution.
+    implementation "org.apache.arrow:arrow-vector:${arrow_version}"
+    implementation "org.apache.arrow:arrow-memory-core:${arrow_version}"
+    implementation "org.apache.arrow:arrow-dataset:${arrow_version}"
+    implementation "org.apache.arrow:arrow-format:${arrow_version}"
+    implementation "org.apache.arrow:arrow-c-data:${arrow_version}"
+    implementation "com.google.flatbuffers:flatbuffers-java:${flatbuffers_version}"
+    implementation "org.slf4j:slf4j-api:${slf4j_version}"
+    implementation "commons-codec:commons-codec:${commons_codec_version}"
+
+    // lance-core's JNI native library loader delegates to questdb's JarJniLoader.
+    // The dependency is declared in lance-core's POM but its ${arrow.version} /
+    // ${opentelemetry.version} properties are unresolved there, so Gradle drops
+    // the entire dependency block. Redeclare explicitly so it lands on the
+    // runtime classpath.
+    implementation "org.questdb:jar-jni:${questdb_jar_jni_version}"
+
+    // Lance native (JNI). Exclusions:
+    //   jackson-core: provided by OpenSearch core, bundling causes jar hell
+    //   arrow-memory-netty: OpenSearch runs Netty with -Dio.netty.noUnsafe=true,
+    //     which breaks the Netty allocation manager. Use arrow-memory-unsafe instead
+    //     (requires -Darrow.allocation.manager.type=Unsafe at runtime).
+    implementation("org.lance:lance-core:${lance_core_version}") {
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
+        exclude group: 'org.apache.arrow', module: 'arrow-memory-netty'
+    }
+    // Lance Namespace core library. The RFC's Attaching a table section
+    // describes registering a Lance Namespace catalog as the primary path
+    // for surfacing tables; DirectoryNamespace covers filesystem catalogs
+    // today and the same interface will accept REST catalogs (Glue, Unity,
+    // Iceberg REST) as the namespace ecosystem matures.
+    implementation("org.lance:lance-namespace-core:${lance_namespace_version}") {
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
+    }
+    // Provides the request and response model classes that DirectoryNamespace
+    // (in lance-core) refers to across the module boundary.
+    implementation("org.lance:lance-namespace-apache-client:${lance_namespace_version}") {
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
+    }
+    implementation "org.apache.arrow:arrow-memory-unsafe:${arrow_version}"
+
+    // Jackson databind + annotations are required at runtime by arrow-vector
+    // but are not shipped in the OpenSearch image (only jackson-core is).
+    // Bundle them here; jackson-core comes from OpenSearch core, so exclude it
+    // from the transitive graph to avoid jar hell.
+    implementation("com.fasterxml.jackson.core:jackson-databind:${jackson_databind_version}") {
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-annotations'
+    }
+    implementation "com.fasterxml.jackson.core:jackson-annotations:${jackson_annotations_version}"
+
+    testImplementation "org.opensearch.test:framework:${opensearch_version}"
+}
+
+// Collapse the Apache Arrow and Jackson jars into single license/notice entries.
+tasks.named("dependencyLicenses").configure {
+    mapping from: /arrow-.*/, to: 'arrow'
+    mapping from: /jackson-.*/, to: 'jackson'
+}
+
+// lance-core references API surface from libraries that are either provided
+// at runtime by other OpenSearch plugins (Apache Arrow through arrow-base)
+// or optional at compile time (metrics, alternate JNI loaders, the separately
+// distributed lance-namespace client). thirdPartyAudit is a static bytecode
+// scan and cannot see these facts on its own, so the references are enumerated
+// explicitly here.
+tasks.named('thirdPartyAudit').configure {
+    ignoreMissingClasses(
+        // Optional OpenTelemetry metrics instrumentation in lance-core.
+
+        // Optional OpenTelemetry metrics instrumentation in lance-core.
+        'io.opentelemetry.api.GlobalOpenTelemetry',
+        'io.opentelemetry.api.OpenTelemetry',
+        'io.opentelemetry.api.common.Attributes',
+        'io.opentelemetry.api.common.AttributesBuilder',
+        'io.opentelemetry.api.metrics.DoubleCounterBuilder',
+        'io.opentelemetry.api.metrics.DoubleGaugeBuilder',
+        'io.opentelemetry.api.metrics.LongCounterBuilder',
+        'io.opentelemetry.api.metrics.Meter',
+        'io.opentelemetry.api.metrics.MeterBuilder',
+        'io.opentelemetry.api.metrics.MeterProvider',
+        'io.opentelemetry.api.metrics.ObservableDoubleMeasurement',
+        'io.opentelemetry.api.metrics.ObservableMeasurement',
+
+        // Lance Namespace API model classes referenced by lance-core through
+        // a factory pattern. The bundled lance-namespace-core artifact
+        // supplies the LanceNamespace interface, DirectoryNamespace
+        // implementation, and the request/response models the plugin
+        // actually uses; the rest live in adapter artifacts that we do not
+        // bundle today.
+
+        // Apache HTTP client classes referenced by lance-namespace-apache-client
+        // only through the REST client path. DirectoryNamespace, the only Lance
+        // Namespace implementation the plugin exercises today, uses JNI to
+        // reach the Rust core and never touches these classes at runtime.
+        'org.apache.hc.client5.http.cookie.BasicCookieStore',
+        'org.apache.hc.client5.http.cookie.Cookie',
+        'org.apache.hc.client5.http.entity.mime.MultipartEntityBuilder',
+        'org.apache.hc.client5.http.impl.classic.CloseableHttpClient',
+        'org.apache.hc.client5.http.impl.classic.CloseableHttpResponse',
+        'org.apache.hc.client5.http.impl.classic.HttpClients',
+        'org.apache.hc.client5.http.impl.cookie.BasicClientCookie',
+        'org.apache.hc.client5.http.protocol.HttpClientContext',
+        'org.apache.hc.core5.http.ContentType',
+        'org.apache.hc.core5.http.Header',
+        'org.apache.hc.core5.http.HttpEntity',
+        'org.apache.hc.core5.http.HttpResponse',
+        'org.apache.hc.core5.http.io.entity.EntityUtils',
+        'org.apache.hc.core5.http.io.support.ClassicRequestBuilder',
+        'org.openapitools.jackson.nullable.JsonNullable',
+
+        // Internal helpers referenced by lance-core's shaded Guava on some JVMs.
+        'org.lance.shaded.guava.util.concurrent.internal.InternalFutureFailureAccess',
+        'org.lance.shaded.guava.util.concurrent.internal.InternalFutures'
+    )
+
+    ignoreViolations(
+        // arrow-memory-core's Unsafe-based MemoryUtil. Also enumerated as such
+        // by sandbox/plugins/parquet-data-format.
+        'org.apache.arrow.memory.util.MemoryUtil',
+        'org.apache.arrow.memory.util.MemoryUtil$1',
+        // Shaded Guava classes in lance-core that use sun.misc.Unsafe. These are
+        // standard Guava optimizations that the Guava project has shipped for
+        // years and are safe on the JVMs OpenSearch supports.
+        'org.lance.shaded.guava.cache.Striped64',
+        'org.lance.shaded.guava.cache.Striped64$1',
+        'org.lance.shaded.guava.cache.Striped64$Cell',
+        'org.lance.shaded.guava.hash.LittleEndianByteArray$UnsafeByteArray',
+        'org.lance.shaded.guava.hash.LittleEndianByteArray$UnsafeByteArray$1',
+        'org.lance.shaded.guava.hash.LittleEndianByteArray$UnsafeByteArray$2',
+        'org.lance.shaded.guava.hash.Striped64',
+        'org.lance.shaded.guava.hash.Striped64$1',
+        'org.lance.shaded.guava.hash.Striped64$Cell',
+        'org.lance.shaded.guava.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator',
+        'org.lance.shaded.guava.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator$1',
+        'org.lance.shaded.guava.util.concurrent.AbstractFuture$UnsafeAtomicHelper',
+        'org.lance.shaded.guava.util.concurrent.AbstractFuture$UnsafeAtomicHelper$1'
+    )
+}
+
+test {
+    // OpenSearch's BootstrapForTesting requires the javaagent-based
+    // AgentPolicy module to be loaded when the test SecurityManager is
+    // enabled. That module is not on the test classpath for external
+    // plugins, so the SecurityManager is disabled here, matching the
+    // setting used by opensearch-jvector.
+    systemProperty 'tests.security.manager', 'false'
+
+    // Match the runtime JVM options the plugin requires so tests that
+    // touch Arrow allocation or Lance native loading behave the same way
+    // as under a real OpenSearch node. Documented in the README as the
+    // canonical launch options.
+    systemProperty 'arrow.allocation.manager.type', 'Unsafe'
+    jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
+}
+
+publishing {
+    repositories {
+        maven {
+            name = "localRepo"
+            url = "${rootProject.buildDir}/repository"
+        }
+    }
+    publications {
+        pluginZip(MavenPublication) { publication ->
+            pom {
+                name = "opensearch-lance"
+                description = "Distributed search layer over Lance tables for OpenSearch (RFC #22643)"
+                groupId = "org.opensearch.plugin"
+            }
+        }
+        all {
+            pom {
+                name = "opensearch-lance"
+                description = "Distributed search layer over Lance tables for OpenSearch (RFC #22643)"
+            }
+            pom.withXml { XmlProvider xml ->
+                Node node = xml.asNode()
+                node.appendNode('inceptionYear', '2026')
+                if (!node.'description') {
+                    node.appendNode('description', description)
+                }
+
+                Node license = node.appendNode('licenses').appendNode('license')
+                license.appendNode('name',  "The Apache License, Version 2.0")
+                license.appendNode('url', "http://www.apache.org/licenses/LICENSE-2.0.txt")
+
+                Node developer = node.appendNode('developers').appendNode('developer')
+                developer.appendNode('name', 'OpenSearch')
+                developer.appendNode('url', 'https://github.com/lawofcycles/lance-opensearch')
+            }
+        }
+    }
+}
+
+// The loggerUsage precommit check requires org.opensearch.test:logger-usage,
+// which is an internal opensearch-project module that is not published to
+// Maven Central or the opensearch snapshot repository. External plugins
+// (opensearch-jvector, this repository) cannot resolve it. Once this project
+// is transferred into the opensearch-project organization and can reference
+// the module directly, this override should be removed.
+tasks.named('loggerUsageCheck').configure { enabled = false }
+
+// Wire spotless into the standard `check` chain so the formatting is enforced
+// alongside the rest of the precommit tasks. Use `./gradlew spotlessApply` to
+// apply the formatting locally.
+check.dependsOn spotlessCheck
+
+
+
+// Integration tests spin up an OpenSearch test cluster with the plugin
+// installed and drive it through REST. Standard opensearch-project pattern
+// via the opensearch.rest-test gradle plugin. The runtime JVM options are
+// the same set the README documents for a real node (Arrow c-data needs
+// java.nio open, and the Netty allocation manager clashes with Lance's
+// unsafe allocator).
+// The plugin IT writes Lance tables into a directory shared between the
+// test JVM and the cluster JVM. Anchoring it under project buildDir
+// matches the pattern OpenSearch itself uses in modules/repository-url
+// (see repositoryDir in that plugin's build.gradle) and lets `gradle
+// clean` wipe leftovers.
+File sharedTablesDir = new File(project.buildDir, "shared-tables")
+
+integTest {
+    systemProperty 'tests.security.manager', 'false'
+    systemProperty 'arrow.allocation.manager.type', 'Unsafe'
+    jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
+    doFirst {
+        sharedTablesDir.mkdirs()
+    }
+    systemProperty 'tests.lance.shared_tables_dir', sharedTablesDir.absolutePath
+}
+
+testClusters.integTest {
+    // ARCHIVE would pull the full release tarball, but darwin-arm64 is not
+    // published to artifacts.opensearch.org today (a 403 comes back on a
+    // HEAD request). INTEG_TEST is a slimmer distribution built for exactly
+    // this scenario and works on every platform.
+    testDistribution = 'INTEG_TEST'
+    plugin(project.tasks.bundlePlugin.archiveFile)
+    jvmArgs('--add-opens=java.base/java.nio=ALL-UNNAMED')
+    systemProperty('arrow.allocation.manager.type', 'Unsafe')
+    // Speed up namespace surface for the IT. The plugin default (10s) is
+    // fine for real deployments but wastes wall-clock time for tests that
+    // register a table then assertBusy for the index to appear.
+    setting 'lance.namespace.poll_cadence', '1s'
+}

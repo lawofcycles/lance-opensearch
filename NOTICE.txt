@@ -1,0 +1,2 @@
+OpenSearch Lance Plugin
+Copyright OpenSearch Contributors

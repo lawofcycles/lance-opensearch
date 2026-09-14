@@ -1,0 +1,16 @@
+grant {
+  // lance-jni extracts and loads the native library from a temp dir
+  permission java.lang.RuntimePermission "loadLibrary.*";
+  permission java.io.FilePermission "<<ALL FILES>>", "read,write,delete,execute";
+  // Arrow memory / c-data internals
+  permission java.lang.RuntimePermission "accessDeclaredMembers";
+  permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
+  permission java.lang.RuntimePermission "accessClassInPackage.sun.misc";
+  permission java.lang.RuntimePermission "createClassLoader";
+  permission java.lang.RuntimePermission "getClassLoader";
+  // tokio runtime threads inside lance core
+  permission java.lang.RuntimePermission "modifyThread";
+  permission java.lang.RuntimePermission "modifyThreadGroup";
+  // object storage access (S3 etc.) in later milestones
+  permission java.net.SocketPermission "*", "connect,resolve";
+};
