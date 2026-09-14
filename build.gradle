@@ -23,6 +23,7 @@ buildscript {
 
 plugins {
     id 'java-library'
+    id 'java-test-fixtures'
     id 'idea'
     id 'eclipse'
     id 'com.diffplug.spotless' version '8.10.2' apply false
@@ -111,6 +112,56 @@ dependencies {
     implementation "com.fasterxml.jackson.core:jackson-annotations:${jackson_annotations_version}"
 
     testImplementation "org.opensearch.test:framework:${opensearch_version}"
+
+    // Test-fixtures source set carries reusable Lance-writing helpers
+    // (e.g. LanceTableFactory) that both `test` and `integTest` consume
+    // without publishing them as production code. Arrow and Lance are
+    // needed at compile time; OpenSearch's test framework is not (the
+    // fixtures do not extend OpenSearchTestCase). Jackson / SLF4J
+    // exclusions mirror the main dependencies block so the test-fixtures
+    // classpath does not fail the opensearchplugin's strict version
+    // conflict check with a duplicated Jackson.
+    testFixturesImplementation("org.apache.arrow:arrow-vector:${arrow_version}") {
+        exclude group: 'com.fasterxml.jackson.core'
+        exclude group: 'com.fasterxml.jackson.datatype'
+        exclude group: 'com.fasterxml.jackson.module'
+        exclude group: 'com.fasterxml.jackson.jaxrs'
+        exclude group: 'com.fasterxml.jackson'
+        exclude group: 'org.slf4j'
+        exclude group: 'com.google.errorprone'
+        exclude group: 'com.google.guava'
+        exclude group: 'commons-codec'
+        exclude group: 'com.google.flatbuffers'
+        exclude group: 'org.apache.httpcomponents.client5'
+        exclude group: 'org.apache.httpcomponents.core5'
+    }
+    testFixturesImplementation("org.apache.arrow:arrow-memory-core:${arrow_version}") {
+        exclude group: 'org.slf4j'
+        exclude group: 'commons-codec'
+    }
+    testFixturesImplementation("org.apache.arrow:arrow-c-data:${arrow_version}") {
+        exclude group: 'com.fasterxml.jackson.core'
+        exclude group: 'com.fasterxml.jackson.datatype'
+        exclude group: 'com.fasterxml.jackson.module'
+        exclude group: 'org.slf4j'
+        exclude group: 'commons-codec'
+        exclude group: 'com.google.flatbuffers'
+    }
+    testFixturesImplementation("org.lance:lance-core:${lance_core_version}") {
+        exclude group: 'com.fasterxml.jackson.core'
+        exclude group: 'com.fasterxml.jackson.datatype'
+        exclude group: 'com.fasterxml.jackson.module'
+        exclude group: 'com.fasterxml.jackson.jaxrs'
+        exclude group: 'com.fasterxml.jackson'
+        exclude group: 'org.apache.arrow'
+        exclude group: 'org.slf4j'
+        exclude group: 'com.google.errorprone'
+        exclude group: 'com.google.guava'
+        exclude group: 'commons-codec'
+        exclude group: 'com.google.flatbuffers'
+        exclude group: 'org.apache.httpcomponents.client5'
+        exclude group: 'org.apache.httpcomponents.core5'
+    }
 }
 
 // Collapse the Apache Arrow and Jackson jars into single license/notice entries.
