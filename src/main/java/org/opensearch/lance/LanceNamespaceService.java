@@ -106,6 +106,16 @@ public final class LanceNamespaceService {
         return List.copyOf(uris);
     }
 
+    /**
+     * Stops polling a previously-registered namespace. Surfaced indexes are
+     * left in place — the operator can delete them separately if they want
+     * the tables to disappear. Returns true if a registration matched, false
+     * if the URI was not registered.
+     */
+    public boolean unregister(String rootUri) {
+        return namespaces.removeIf(ns -> ns.rootUri.equals(rootUri));
+    }
+
     private void poll() {
         for (RegisteredNamespace ns : namespaces) {
             try {

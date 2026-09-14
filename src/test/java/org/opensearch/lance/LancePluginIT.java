@@ -109,6 +109,32 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         assertTrue("expected message about [path], saw: " + body, body.contains("[path]"));
     }
 
+    public void testUnregisterNamespace() throws IOException {
+        // Register, then unregister, then verify it disappears from GET.
+        String path = scratchPathString("unregister");
+        Response register = postJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
+        assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
+
+        Response unregister = deleteJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
+        assertEquals(RestStatus.OK.getStatus(), unregister.getStatusLine().getStatusCode());
+        String unregBody = readAll(unregister);
+        assertTrue("expected unregistered:true, saw: " + unregBody, unregBody.contains("\"unregistered\":true"));
+
+        Response listing = client().performRequest(new Request("GET", "/_lance/namespace"));
+        String body = readAll(listing);
+        assertFalse("expected namespace " + path + " to be gone, saw: " + body, body.contains(path));
+    }
+
+    public void testUnregisterUnknownNamespaceReturns404() throws IOException {
+        String path = scratchPathString("neverreg") + "-x";
+        ResponseException failure = expectThrows(
+            ResponseException.class,
+            () -> deleteJson("/_lance/namespace", "{\"path\":\"" + path + "\"}")
+        );
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        assertEquals("expected 404 for unregister of unknown path, saw " + status, 404, status);
+    }
+
     public void testAttachRejectsMissingTable() throws IOException {
         // POST /_lance/attach with a path that does not exist on disk lets
         // Dataset.open throw. The plugin must surface this as an HTTP error
@@ -431,6 +457,12 @@ public class LancePluginIT extends OpenSearchRestTestCase {
 
     private static Response postJson(String path, String body) throws IOException {
         Request request = new Request("POST", path);
+        request.setJsonEntity(body);
+        return client().performRequest(request);
+    }
+
+    private static Response deleteJson(String path, String body) throws IOException {
+        Request request = new Request("DELETE", path);
         request.setJsonEntity(body);
         return client().performRequest(request);
     }

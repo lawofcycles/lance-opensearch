@@ -41,7 +41,11 @@ public class RestNamespaceAction extends BaseRestHandler {
 
     @Override
     public List<Route> routes() {
-        return List.of(new Route(RestRequest.Method.POST, "/_lance/namespace"), new Route(RestRequest.Method.GET, "/_lance/namespace"));
+        return List.of(
+            new Route(RestRequest.Method.POST, "/_lance/namespace"),
+            new Route(RestRequest.Method.GET, "/_lance/namespace"),
+            new Route(RestRequest.Method.DELETE, "/_lance/namespace")
+        );
     }
 
     @Override
@@ -70,6 +74,21 @@ public class RestNamespaceAction extends BaseRestHandler {
         if (path.isEmpty()) {
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, "[path] must not be empty"));
         }
+        if (request.method() == RestRequest.Method.DELETE) {
+            // DELETE only stops the polling of that path. Already-surfaced
+            // indexes stay; the operator can delete them via
+            // DELETE /{index} if they want the tables to disappear. This
+            // matches the "the namespace registration is separate from the
+            // OpenSearch index lifecycle" contract in the RFC.
+            return channel -> {
+                boolean removed = service.unregister(path);
+                try (XContentBuilder b = channel.newBuilder()) {
+                    b.startObject().field("unregistered", removed).field("path", path).endObject();
+                    channel.sendResponse(new BytesRestResponse(removed ? RestStatus.OK : RestStatus.NOT_FOUND, b));
+                }
+            };
+        }
+        // POST: register (with allowlist check).
         if (!allowedRoots.allows(path)) {
             return channel -> channel.sendResponse(
                 new BytesRestResponse(
