@@ -128,10 +128,37 @@ public final class LanceDirectoryReader extends DirectoryReader {
 
     @Override
     protected void doClose() throws IOException {
+        // Follow the StandardDirectoryReader pattern: decRef every sub-reader
+        // so the leaf CacheHelper's ClosedListener fires. Without this, the
+        // request cache / query cache keeps entries keyed on the old reader
+        // until the cache hits its size limit, holding on to memory long
+        // after the underlying Lance manifest has moved on.
+        IOException first = null;
+        for (org.apache.lucene.index.LeafReaderContext ctx : leaves()) {
+            try {
+                ctx.reader().decRef();
+            } catch (IOException e) {
+                if (first == null) {
+                    first = e;
+                }
+            }
+        }
         try {
             cacheLifetimeBridge.close();
-        } finally {
+        } catch (IOException e) {
+            if (first == null) {
+                first = e;
+            }
+        }
+        try {
             dataset.close();
+        } catch (Exception e) {
+            if (first == null && e instanceof IOException) {
+                first = (IOException) e;
+            }
+        }
+        if (first != null) {
+            throw first;
         }
     }
 
