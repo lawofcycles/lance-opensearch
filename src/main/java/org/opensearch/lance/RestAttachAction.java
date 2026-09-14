@@ -60,10 +60,12 @@ public class RestAttachAction extends BaseRestHandler {
 
     private final ThreadPool threadPool;
     private final AllowedTableRoots allowedRoots;
+    private final LanceNamespaceService namespaceService;
 
-    public RestAttachAction(ThreadPool threadPool, AllowedTableRoots allowedRoots) {
+    public RestAttachAction(ThreadPool threadPool, AllowedTableRoots allowedRoots, LanceNamespaceService namespaceService) {
         this.threadPool = threadPool;
         this.allowedRoots = allowedRoots;
+        this.namespaceService = namespaceService;
     }
 
     @Override
@@ -121,11 +123,18 @@ public class RestAttachAction extends BaseRestHandler {
                 sendError(channel, e);
                 return;
             }
-            createIndex(client, channel, indexName, tableFinal, derivation);
+            createIndex(client, channel, indexName, tableFinal, derivation, namespaceService);
         });
     }
 
-    private static void createIndex(NodeClient client, RestChannel channel, String indexName, String table, Derivation derivation) {
+    private static void createIndex(
+        NodeClient client,
+        RestChannel channel,
+        String indexName,
+        String table,
+        Derivation derivation,
+        LanceNamespaceService namespaceService
+    ) {
         CreateIndexRequest create = new CreateIndexRequest(indexName).settings(
             Settings.builder()
                 .put("index.number_of_shards", derivation.shards)
@@ -138,6 +147,11 @@ public class RestAttachAction extends BaseRestHandler {
         client.admin().indices().create(create, new ActionListener<CreateIndexResponse>() {
             @Override
             public void onResponse(CreateIndexResponse response) {
+                // Register the attach-created index with the namespace
+                // poller so subsequent appends surface without a manual
+                // /_refresh. Idempotent: repeated attaches with the same
+                // (name, table) just refresh the served version.
+                namespaceService.registerAttachedIndex(indexName, table, derivation.version);
                 writeAttachResponse(channel, indexName, table, derivation, false);
             }
 
@@ -150,7 +164,7 @@ public class RestAttachAction extends BaseRestHandler {
                 // The index already exists. Verify it is a Lance index for the
                 // same table before claiming success; otherwise attach would
                 // silently take credit for an unrelated index.
-                verifyExistingLanceIndex(client, channel, indexName, table, derivation);
+                verifyExistingLanceIndex(client, channel, indexName, table, derivation, namespaceService);
             }
         });
     }
@@ -160,7 +174,8 @@ public class RestAttachAction extends BaseRestHandler {
         RestChannel channel,
         String indexName,
         String table,
-        Derivation derivation
+        Derivation derivation,
+        LanceNamespaceService namespaceService
     ) {
         ClusterStateRequest stateRequest = new ClusterStateRequest();
         stateRequest.clear().metadata(true).indices(indexName);
@@ -187,6 +202,10 @@ public class RestAttachAction extends BaseRestHandler {
                     sendError(channel, RestStatus.CONFLICT, "index " + indexName + " already attached to a different table: " + existing);
                     return;
                 }
+                // Same table, so record the (index, table) pair with the
+                // namespace poller in case this node has forgotten it
+                // (cluster restart after attach, for example).
+                namespaceService.registerAttachedIndex(indexName, table, derivation.version);
                 writeAttachResponse(channel, indexName, table, derivation, true);
             }
 

@@ -146,7 +146,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Supplier<DiscoveryNodes> nodesInCluster
     ) {
         return List.of(
-            new RestAttachAction(threadPool, allowedTableRoots),
+            new RestAttachAction(threadPool, allowedTableRoots, namespaceService),
             new RestNamespaceAction(namespaceService, allowedTableRoots),
             new RestBuildIndexesAction(threadPool)
         );

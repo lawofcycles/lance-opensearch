@@ -53,6 +53,13 @@ public final class LanceNamespaceService {
     private final long builderMaxRows;
     private final List<RegisteredNamespace> namespaces = new CopyOnWriteArrayList<>();
     private final Map<String, Long> servedVersions = new ConcurrentHashMap<>();
+    // Index names created via /_lance/attach along with the absolute Lance
+    // table path they point at. Tracked here so poll() can extend append
+    // coverage to attach-only indexes and not just namespace-registered
+    // tables (see C6: the previous behaviour was that appending to a table
+    // whose index came from attach never surfaced through _search until the
+    // operator hit refresh manually).
+    private final Map<String, String> attachedIndexes = new ConcurrentHashMap<>();
     // Index names we've already flagged as unowned, so the poll doesn't shout
     // the same warning every ten seconds. Cleared if the collision resolves.
     private final Set<String> warnedUnowned = ConcurrentHashMap.newKeySet();
@@ -113,11 +120,32 @@ public final class LanceNamespaceService {
                 LOG.warn("namespace poll failed for {}", ns.rootUri, e);
             }
         }
+        // Sync attach-created indexes so append fragments surface on the
+        // same schedule as namespace-registered tables. attach records the
+        // (indexName -> tablePath) pair; the sync path is the same, just
+        // without the rootUri / tableName join namespace tables use.
+        for (Map.Entry<String, String> entry : attachedIndexes.entrySet()) {
+            try {
+                syncAttachedTable(entry.getKey(), entry.getValue());
+            } catch (Exception e) {
+                LOG.warn("attach poll failed for index {} at {}", entry.getKey(), entry.getValue(), e);
+            }
+        }
     }
 
     private void syncTable(String rootUri, String tableName) {
         String table = rootUri + "/" + tableName + ".lance";
-        String indexName = tableName;
+        runSyncCycle(table, tableName);
+    }
+
+    // Attach-created indexes carry the fully-qualified table path already,
+    // so the rootUri / tableName join namespace tables use doesn't apply.
+    // Everything downstream of the path resolution is identical.
+    private void syncAttachedTable(String indexName, String tablePath) {
+        runSyncCycle(tablePath, indexName);
+    }
+
+    private void runSyncCycle(String table, String indexName) {
         try {
             boolean exists = client.admin().indices().exists(new IndicesExistsRequest(indexName)).actionGet().isExists();
             if (!exists) {
@@ -196,7 +224,38 @@ public final class LanceNamespaceService {
                             .execute()
                             .actionGet();
                     } catch (Exception e) {
-                        LOG.warn("mapping re-derivation failed for {} at version {}: {}", indexName, latest, e.getMessage());
+                        String message = e.getMessage() == null ? "" : e.getMessage();
+                        if (message.contains("cannot be changed from type")) {
+                            // A Utf8 column has flipped between keyword and
+                            // lance_text after the user created / dropped an
+                            // FTS index on the Lance side. PutMapping refuses
+                            // the type change, but leaving the stale mapping
+                            // in place makes the column silently unsearchable.
+                            // Rebuild the index (delete + recreate with the
+                            // new mapping) so the reader sees the correct
+                            // field type. The underlying Lance table keeps
+                            // its data intact, so nothing is lost.
+                            LOG.warn(
+                                "mapping re-derivation for {} at version {} hit a keyword <-> lance_text type change ({}); "
+                                    + "rebuilding the OpenSearch index (Lance data is untouched)",
+                                indexName,
+                                latest,
+                                message
+                            );
+                            try {
+                                client.admin()
+                                    .indices()
+                                    .delete(new org.opensearch.action.admin.indices.delete.DeleteIndexRequest(indexName))
+                                    .actionGet();
+                                servedVersions.remove(indexName);
+                                surface(indexName, table);
+                                return;
+                            } catch (Exception rebuild) {
+                                LOG.warn("rebuild after type change failed for {}: {}", indexName, rebuild.getMessage());
+                            }
+                        } else {
+                            LOG.warn("mapping re-derivation failed for {} at version {}: {}", indexName, latest, message);
+                        }
                     }
                 }
                 client.admin().indices().refresh(new RefreshRequest(indexName)).actionGet();
@@ -234,6 +293,17 @@ public final class LanceNamespaceService {
     }
 
     void recordServedVersion(String indexName, long version) {
+        servedVersions.put(indexName, version);
+    }
+
+    /**
+     * Records an attach-created index and its Lance table path so poll()
+     * can pick up appends for it, just as it would for a namespace-registered
+     * table. Idempotent: repeated calls with the same (indexName, tablePath)
+     * are a no-op beyond overwriting the served version.
+     */
+    public void registerAttachedIndex(String indexName, String tablePath, long version) {
+        attachedIndexes.put(indexName, tablePath);
         servedVersions.put(indexName, version);
     }
 
