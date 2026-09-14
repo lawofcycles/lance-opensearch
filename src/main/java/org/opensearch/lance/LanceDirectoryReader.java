@@ -53,7 +53,11 @@ public final class LanceDirectoryReader extends DirectoryReader {
             if (fragment.getId() % numShards != shardId) {
                 continue;
             }
-            leaves.add(new LanceFragmentLeafReader(dataset, fragment.getId(), fragment.metadata().getPhysicalRows(), intField));
+            leaves.add(
+                LanceSequentialLeafReader.wrap(
+                    new LanceFragmentLeafReader(dataset, fragment.getId(), fragment.metadata().getPhysicalRows(), intField)
+                )
+            );
         }
         ByteBuffersDirectory bridgeDir = new ByteBuffersDirectory();
         try (IndexWriter writer = new IndexWriter(bridgeDir, new IndexWriterConfig())) {

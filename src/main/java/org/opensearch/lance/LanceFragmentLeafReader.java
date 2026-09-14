@@ -697,81 +697,91 @@ public final class LanceFragmentLeafReader extends LeafReader {
         return new StoredFields() {
             @Override
             public void document(int docID, StoredFieldVisitor visitor) throws IOException {
-                FieldInfo idInfo = storedOnly("_id", 1);
-                if (visitor.needsField(idInfo) == StoredFieldVisitor.Status.YES) {
-                    org.apache.lucene.util.BytesRef encoded = org.opensearch.index.mapper.Uid.encodeId(Long.toString(values[docID]));
-                    byte[] bytes = new byte[encoded.length];
-                    System.arraycopy(encoded.bytes, encoded.offset, bytes, 0, encoded.length);
-                    visitor.binaryField(idInfo, bytes);
-                }
-                FieldInfo sourceInfo = storedOnly("_source", 2);
-                if (visitor.needsField(sourceInfo) == StoredFieldVisitor.Status.YES) {
-                    StringBuilder json = new StringBuilder("{");
-                    for (Map.Entry<String, long[]> entry : numericColumns.entrySet()) {
-                        if (json.length() > 1) {
-                            json.append(',');
-                        }
-                        json.append('"').append(entry.getKey()).append("\":").append(entry.getValue()[docID]);
-                    }
-                    for (Map.Entry<String, long[]> entry : booleanColumns.entrySet()) {
-                        if (json.length() > 1) {
-                            json.append(',');
-                        }
-                        json.append('"').append(entry.getKey()).append("\":").append(entry.getValue()[docID] == 1 ? "true" : "false");
-                    }
-                    for (Map.Entry<String, String[]> entry : textColumns.entrySet()) {
-                        String value = entry.getValue()[docID];
-                        if (value == null) {
-                            continue;
-                        }
-                        if (json.length() > 1) {
-                            json.append(',');
-                        }
-                        json.append('"')
-                            .append(entry.getKey())
-                            .append("\":\"")
-                            .append(value.replace("\\", "\\\\").replace("\"", "\\\""))
-                            .append('"');
-                    }
-                    for (Map.Entry<String, String[][]> entry : keywordArrayValues.entrySet()) {
-                        String[] arr = entry.getValue()[docID];
-                        if (arr == null) {
-                            continue;
-                        }
-                        if (json.length() > 1) {
-                            json.append(',');
-                        }
-                        json.append('"').append(entry.getKey()).append("\":[");
-                        for (int k = 0; k < arr.length; k++) {
-                            if (k > 0) json.append(',');
-                            String v = arr[k];
-                            if (v == null) {
-                                json.append("null");
-                            } else {
-                                json.append('"').append(v.replace("\\", "\\\\").replace("\"", "\\\"")).append('"');
-                            }
-                        }
-                        json.append(']');
-                    }
-                    for (Map.Entry<String, byte[][]> entry : binaryColumns.entrySet()) {
-                        byte[] bytes = entry.getValue()[docID];
-                        if (bytes == null) {
-                            continue;
-                        }
-                        if (json.length() > 1) {
-                            json.append(',');
-                        }
-                        json.append('"')
-                            .append(entry.getKey())
-                            .append("\":\"")
-                            .append(java.util.Base64.getEncoder().encodeToString(bytes))
-                            .append('"');
-                    }
-                    json.append('}');
-                    visitor.binaryField(sourceInfo, json.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                }
+                materialiseStoredFields(docID, visitor);
             }
         };
+    }
+
+    /**
+     * Materialise stored fields for a single doc. Extracted from the {@code
+     * storedFields()} anonymous class so the sequential wrapper (see
+     * {@link LanceSequentialLeafReader}) can call the same routine when
+     * {@code FetchPhase} switches to the sequential stored-fields path.
+     */
+    void materialiseStoredFields(int docID, StoredFieldVisitor visitor) throws IOException {
+        FieldInfo idInfo = storedOnly("_id", 1);
+        if (visitor.needsField(idInfo) == StoredFieldVisitor.Status.YES) {
+            org.apache.lucene.util.BytesRef encoded = org.opensearch.index.mapper.Uid.encodeId(Long.toString(values[docID]));
+            byte[] bytes = new byte[encoded.length];
+            System.arraycopy(encoded.bytes, encoded.offset, bytes, 0, encoded.length);
+            visitor.binaryField(idInfo, bytes);
+        }
+        FieldInfo sourceInfo = storedOnly("_source", 2);
+        if (visitor.needsField(sourceInfo) == StoredFieldVisitor.Status.YES) {
+            StringBuilder json = new StringBuilder("{");
+            for (Map.Entry<String, long[]> entry : numericColumns.entrySet()) {
+                if (json.length() > 1) {
+                    json.append(',');
+                }
+                json.append('"').append(entry.getKey()).append("\":").append(entry.getValue()[docID]);
+            }
+            for (Map.Entry<String, long[]> entry : booleanColumns.entrySet()) {
+                if (json.length() > 1) {
+                    json.append(',');
+                }
+                json.append('"').append(entry.getKey()).append("\":").append(entry.getValue()[docID] == 1 ? "true" : "false");
+            }
+            for (Map.Entry<String, String[]> entry : textColumns.entrySet()) {
+                String value = entry.getValue()[docID];
+                if (value == null) {
+                    continue;
+                }
+                if (json.length() > 1) {
+                    json.append(',');
+                }
+                json.append('"')
+                    .append(entry.getKey())
+                    .append("\":\"")
+                    .append(value.replace("\\", "\\\\").replace("\"", "\\\""))
+                    .append('"');
+            }
+            for (Map.Entry<String, String[][]> entry : keywordArrayValues.entrySet()) {
+                String[] arr = entry.getValue()[docID];
+                if (arr == null) {
+                    continue;
+                }
+                if (json.length() > 1) {
+                    json.append(',');
+                }
+                json.append('"').append(entry.getKey()).append("\":[");
+                for (int k = 0; k < arr.length; k++) {
+                    if (k > 0) json.append(',');
+                    String v = arr[k];
+                    if (v == null) {
+                        json.append("null");
+                    } else {
+                        json.append('"').append(v.replace("\\", "\\\\").replace("\"", "\\\"")).append('"');
+                    }
+                }
+                json.append(']');
+            }
+            for (Map.Entry<String, byte[][]> entry : binaryColumns.entrySet()) {
+                byte[] bytes = entry.getValue()[docID];
+                if (bytes == null) {
+                    continue;
+                }
+                if (json.length() > 1) {
+                    json.append(',');
+                }
+                json.append('"')
+                    .append(entry.getKey())
+                    .append("\":\"")
+                    .append(java.util.Base64.getEncoder().encodeToString(bytes))
+                    .append('"');
+            }
+            json.append('}');
+            visitor.binaryField(sourceInfo, json.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
     }
 
     Dataset dataset() {

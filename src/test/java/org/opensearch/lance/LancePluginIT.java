@@ -163,6 +163,27 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testDefaultSearchReturnsAtLeastTenHits() throws Exception {
+        // Regression for the FetchPhase sequential-stored-fields path: with
+        // >= 10 adjacent doc ids and no deletions the fetch phase calls
+        // getSequentialStoredFieldsReader on the leaf reader. Before the
+        // LanceSequentialLeafReader wrapper this threw "requires a
+        // CodecReader or a SequentialStoredFieldsLeafReader", so GET
+        // /demo/_search with the default size=10 returned 500. Sixteen rows
+        // exercises the >= 10 hits case; every hit must materialise cleanly.
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "defaultsearch")) {
+            String indexName = fixture.indexName();
+
+            Response search = client().performRequest(new Request("GET", "/" + indexName + "/_search"));
+            String body = readAll(search);
+            int totalHits = extractIntPath(body, "hits", "total", "value");
+            assertEquals("expected 16 total hits, saw response: " + body, 16, totalHits);
+            // Default size is 10; hits array must be full and each entry
+            // must carry the Lance-backed _source.
+            assertTrue("expected hits[0]._source in response, saw: " + body, body.contains("\"_source\""));
+        }
+    }
+
     /**
      * Fixture that writes a Lance table into a scratch directory, registers
      * that directory as a Lance namespace, waits for the polling loop to
