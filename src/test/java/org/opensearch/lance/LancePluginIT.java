@@ -66,6 +66,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
 
     public void testRegisterNamespace() throws IOException {
         String path = scratchPathString("register");
+        java.nio.file.Files.createDirectories(java.nio.file.Path.of(path));
         Response post = postJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
         assertEquals(RestStatus.OK.getStatus(), post.getStatusLine().getStatusCode());
 
@@ -80,6 +81,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         // second POST is a no-op. If the polling loop scanned the same
         // catalog twice per cycle every table would surface twice as well.
         String path = scratchPathString("idempotent");
+        java.nio.file.Files.createDirectories(java.nio.file.Path.of(path));
         postJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
         postJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
 
@@ -109,9 +111,44 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         assertTrue("expected message about [path], saw: " + body, body.contains("[path]"));
     }
 
+    public void testRegisterNamespaceRejectsNonExistentPath() throws IOException {
+        // Registering a non-existent directory used to succeed silently and
+        // then the poll cycle would list nothing forever. Validate up front.
+        String phantom = sharedRoot().resolve("does-not-exist-" + randomAlphaOfLength(8)).toString();
+        ResponseException failure = expectThrows(
+            ResponseException.class,
+            () -> postJson("/_lance/namespace", "{\"path\":\"" + phantom + "\"}")
+        );
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        assertEquals("expected 400 for non-existent path, saw " + status, 400, status);
+        String body = readAll(failure.getResponse());
+        assertTrue("expected 'does not exist' message, saw: " + body, body.contains("does not exist"));
+    }
+
+    public void testRegisterNamespaceRejectsFilePath() throws IOException {
+        // A file path (not a directory) must also be rejected.
+        java.nio.file.Path base = sharedRoot();
+        java.nio.file.Path file = java.nio.file.Files.createFile(
+            base.resolve("not-a-dir-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT) + ".lance")
+        );
+        try {
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson("/_lance/namespace", "{\"path\":\"" + file.toString() + "\"}")
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            assertEquals("expected 400 for file path, saw " + status, 400, status);
+            String body = readAll(failure.getResponse());
+            assertTrue("expected 'not a directory' message, saw: " + body, body.contains("not a directory"));
+        } finally {
+            java.nio.file.Files.deleteIfExists(file);
+        }
+    }
+
     public void testUnregisterNamespace() throws IOException {
         // Register, then unregister, then verify it disappears from GET.
         String path = scratchPathString("unregister");
+        java.nio.file.Files.createDirectories(java.nio.file.Path.of(path));
         Response register = postJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
         assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
 

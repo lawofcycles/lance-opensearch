@@ -97,6 +97,32 @@ public class RestNamespaceAction extends BaseRestHandler {
                 )
             );
         }
+        // Path existence check for filesystem-scheme paths. Object-store
+        // schemes (s3://, gs://, azure://, ...) route through Lance's own
+        // storage layer and cannot be probed from here; skip the check for
+        // those and let Lance surface the error on the first list_tables
+        // call. Filesystem paths that do not exist as a directory are
+        // rejected up front so the poller does not spin against a
+        // typo'd path forever.
+        if (!path.contains("://")) {
+            try {
+                java.nio.file.Path fsPath = java.nio.file.Path.of(path);
+                if (!java.nio.file.Files.exists(fsPath)) {
+                    return channel -> channel.sendResponse(
+                        new BytesRestResponse(RestStatus.BAD_REQUEST, "path [" + path + "] does not exist")
+                    );
+                }
+                if (!java.nio.file.Files.isDirectory(fsPath)) {
+                    return channel -> channel.sendResponse(
+                        new BytesRestResponse(RestStatus.BAD_REQUEST, "path [" + path + "] exists but is not a directory")
+                    );
+                }
+            } catch (java.nio.file.InvalidPathException e) {
+                return channel -> channel.sendResponse(
+                    new BytesRestResponse(RestStatus.BAD_REQUEST, "path [" + path + "] is not a valid filesystem path: " + e.getReason())
+                );
+            }
+        }
         return channel -> {
             service.register(path);
             try (XContentBuilder b = channel.newBuilder()) {
