@@ -43,7 +43,12 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
 
     @Override
     public java.util.Map<String, Mapper.TypeParser> getMappers() {
-        return java.util.Map.of(LanceTextFieldMapper.CONTENT_TYPE, LanceTextFieldMapper.PARSER);
+        return java.util.Map.of(
+            LanceTextFieldMapper.CONTENT_TYPE,
+            LanceTextFieldMapper.PARSER,
+            LanceVectorFieldMapper.CONTENT_TYPE,
+            LanceVectorFieldMapper.PARSER
+        );
     }
 
     public static final Setting<String> TABLE_SETTING = Setting.simpleString(

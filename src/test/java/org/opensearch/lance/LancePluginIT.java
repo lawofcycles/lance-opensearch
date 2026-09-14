@@ -286,6 +286,63 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testLanceKnnRejectsUnknownField() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(4, "knnUnknown")) {
+            String indexName = fixture.indexName();
+            String queryVector = "[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]";
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"lance_knn\":{\"field\":\"noSuchField\",\"vector\":" + queryVector + ",\"k\":2}}}"
+                )
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            assertEquals("expected 400 for unknown field, saw " + status, 400, status);
+            String body = readAll(failure.getResponse());
+            assertTrue("expected message about noSuchField, saw: " + body, body.contains("noSuchField"));
+        }
+    }
+
+    public void testLanceKnnRejectsScalarField() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(4, "knnScalar")) {
+            String indexName = fixture.indexName();
+            String queryVector = "[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]";
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"lance_knn\":{\"field\":\"id\",\"vector\":" + queryVector + ",\"k\":2}}}"
+                )
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            assertEquals("expected 400 for scalar field, saw " + status, 400, status);
+            String body = readAll(failure.getResponse());
+            assertTrue("expected message about non-lance_vector, saw: " + body, body.contains("lance_vector"));
+        }
+    }
+
+    public void testLanceKnnRejectsDimensionMismatch() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(4, "knnDim")) {
+            String indexName = fixture.indexName();
+            // The fixture writes a FixedSizeList<Float32, 8>; a 3-element
+            // query vector must be rejected up front rather than reaching
+            // Lance.
+            String queryVector = "[0.1,0.2,0.3]";
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":" + queryVector + ",\"k\":2}}}"
+                )
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            assertEquals("expected 400 for dimension mismatch, saw " + status, 400, status);
+            String body = readAll(failure.getResponse());
+            assertTrue("expected message about dimension, saw: " + body, body.contains("dimension"));
+        }
+    }
+
     public void testDefaultSearchReturnsAtLeastTenHits() throws Exception {
         // Regression for the FetchPhase sequential-stored-fields path: with
         // >= 10 adjacent doc ids and no deletions the fetch phase calls

@@ -379,14 +379,26 @@ public class RestAttachAction extends BaseRestHandler {
                     scalarColumns.add(name);
                 }
             } else if (type instanceof ArrowType.FixedSizeList fsl) {
-                LanceField child = field.getChildren().isEmpty() ? null : field.getChildren().get(0);
-                ArrowType childType = child != null ? child.getType() : null;
+                // LanceField.getChildren() returns an empty list for
+                // FixedSizeList columns — the item type is carried through
+                // logicalType and materialised only when asArrowField() is
+                // called. Go through the Arrow representation so we can
+                // inspect the element type.
+                org.apache.arrow.vector.types.pojo.Field arrow = field.asArrowField();
+                ArrowType childType = arrow.getChildren().isEmpty() ? null : arrow.getChildren().get(0).getType();
                 boolean float32 = childType instanceof ArrowType.FloatingPoint fp
                     && fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE;
                 if (float32) {
-                    notes.add(
-                        name + ": vector column, dimension " + fsl.getListSize() + ", element type Float32, queryable through lance_knn"
-                    );
+                    // Surface the column through the `lance_vector` field type
+                    // so `LanceKnnQueryBuilder` can validate the field name
+                    // and dimension against the mapping. The `dimension`
+                    // parameter is required by the mapper; the query builder
+                    // will reject a knn call whose vector length does not
+                    // match.
+                    startFieldWithId(mapping, name, fieldId, "lance_vector");
+                    mapping.field("dimension", fsl.getListSize());
+                    mapping.field("element_type", "Float32");
+                    mapping.endObject();
                     vectorColumns.add(name);
                 } else {
                     // Lance itself supports int8 / uint8 / float16 vectors, but the

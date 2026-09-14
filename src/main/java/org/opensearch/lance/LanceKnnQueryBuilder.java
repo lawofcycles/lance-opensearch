@@ -317,6 +317,30 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
 
     @Override
     protected Query doToQuery(QueryShardContext context) {
+        // Reject queries against fields that aren't mapped as lance_vector.
+        // Without this check, a typo or a scalar field name reaches Lance
+        // and comes back as a 500. `context.fieldMapper` is null when the
+        // mapping has no entry for the requested field.
+        org.opensearch.index.mapper.MappedFieldType fieldType = context.fieldMapper(field);
+        if (fieldType == null) {
+            throw new IllegalArgumentException("[lance_knn] no such field [" + field + "]");
+        }
+        if (!(fieldType instanceof LanceVectorFieldMapper.LanceVectorFieldType vectorType)) {
+            throw new IllegalArgumentException(
+                "[lance_knn] field [" + field + "] is mapped as [" + fieldType.typeName() + "], not [lance_vector]"
+            );
+        }
+        if (vectorType.dimension() != vector.length) {
+            throw new IllegalArgumentException(
+                "[lance_knn] vector length "
+                    + vector.length
+                    + " does not match the dimension of field ["
+                    + field
+                    + "] ("
+                    + vectorType.dimension()
+                    + ")"
+            );
+        }
         return new LanceKnnQuery(field, vector, k, nprobes, refineFactor, ef, parseDistance(metric), useIndex);
     }
 
