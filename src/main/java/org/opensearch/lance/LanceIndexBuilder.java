@@ -291,24 +291,32 @@ public final class LanceIndexBuilder {
     }
 
     // Returns true if the column already carries any Lance scalar index type
-    // (BTREE, BITMAP, LABEL_LIST, ZONEMAP, NGRAM, BLOOM_FILTER, SCALAR). INVERTED
+    // (BTree, Bitmap, LabelList, ZoneMap, NGram, BloomFilter, Scalar). INVERTED
     // (FTS) is not counted here because {@link RestAttachAction}#derive routes
     // Utf8-with-FTS through ftsColumns and Utf8-without-FTS through scalarColumns,
     // so the scalar builder only sees keyword columns that never carry FTS.
+    //
+    // Lance's IndexDescription#getIndexType returns the Rust-side Display form
+    // (e.g. "BTree", "LabelList"). Compare in a normalised form so we tolerate
+    // both the Display and the shouty-snake spellings.
+    private static final Set<String> SCALAR_INDEX_TYPES = Set.of(
+        "BTREE",
+        "BITMAP",
+        "LABELLIST",
+        "ZONEMAP",
+        "NGRAM",
+        "BLOOMFILTER",
+        "SCALAR"
+    );
+
+    private static String normaliseIndexType(String type) {
+        return type == null ? "" : type.replace("_", "").toUpperCase(java.util.Locale.ROOT);
+    }
+
     private static boolean hasScalarIndex(Dataset dataset, String column) {
         List<IndexDescription> indexes = dataset.describeIndices(new IndexCriteria.Builder().forColumn(column).build());
         for (IndexDescription desc : indexes) {
-            String type = desc.getIndexType();
-            if (type == null) {
-                continue;
-            }
-            if ("BTREE".equals(type)
-                || "BITMAP".equals(type)
-                || "LABEL_LIST".equals(type)
-                || "ZONEMAP".equals(type)
-                || "NGRAM".equals(type)
-                || "BLOOM_FILTER".equals(type)
-                || "SCALAR".equals(type)) {
+            if (SCALAR_INDEX_TYPES.contains(normaliseIndexType(desc.getIndexType()))) {
                 return true;
             }
         }
@@ -316,16 +324,13 @@ public final class LanceIndexBuilder {
     }
 
     // Returns true if the column already carries any Lance vector index type
-    // (IVF_FLAT, IVF_PQ, IVF_SQ, IVF_HNSW_SQ, IVF_HNSW_PQ, IVF_HNSW_FLAT,
-    // IVF_RQ, VECTOR).
+    // (IVF_Flat, IVF_PQ, IVF_SQ, IVF_HNSW_SQ, IVF_HNSW_PQ, IVF_HNSW_FLAT,
+    // IVF_RQ, Vector). Uses the same normalisation as the scalar check.
     private static boolean hasVectorIndex(Dataset dataset, String column) {
         List<IndexDescription> indexes = dataset.describeIndices(new IndexCriteria.Builder().forColumn(column).build());
         for (IndexDescription desc : indexes) {
-            String type = desc.getIndexType();
-            if (type == null) {
-                continue;
-            }
-            if (type.startsWith("IVF_") || "VECTOR".equals(type)) {
+            String normalised = normaliseIndexType(desc.getIndexType());
+            if (normalised.startsWith("IVF") || "VECTOR".equals(normalised)) {
                 return true;
             }
         }
