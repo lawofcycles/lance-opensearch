@@ -718,69 +718,45 @@ public final class LanceFragmentLeafReader extends LeafReader {
         }
         FieldInfo sourceInfo = storedOnly("_source", 2);
         if (visitor.needsField(sourceInfo) == StoredFieldVisitor.Status.YES) {
-            StringBuilder json = new StringBuilder("{");
-            for (Map.Entry<String, long[]> entry : numericColumns.entrySet()) {
-                if (json.length() > 1) {
-                    json.append(',');
+            // Build _source through XContentBuilder so string values get the
+            // JSON escaping RFC 8259 requires (control characters U+0000
+            // through U+001F, quotes, backslashes). Hand-rolled string
+            // concatenation only escaped \" and \\, which meant a body
+            // containing a newline emitted invalid JSON and every client
+            // that parsed the response strictly (jackson, python json,
+            // Dashboards) rejected it.
+            try (org.opensearch.core.xcontent.XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+                builder.startObject();
+                for (Map.Entry<String, long[]> entry : numericColumns.entrySet()) {
+                    builder.field(entry.getKey(), entry.getValue()[docID]);
                 }
-                json.append('"').append(entry.getKey()).append("\":").append(entry.getValue()[docID]);
-            }
-            for (Map.Entry<String, long[]> entry : booleanColumns.entrySet()) {
-                if (json.length() > 1) {
-                    json.append(',');
+                for (Map.Entry<String, long[]> entry : booleanColumns.entrySet()) {
+                    builder.field(entry.getKey(), entry.getValue()[docID] == 1);
                 }
-                json.append('"').append(entry.getKey()).append("\":").append(entry.getValue()[docID] == 1 ? "true" : "false");
-            }
-            for (Map.Entry<String, String[]> entry : textColumns.entrySet()) {
-                String value = entry.getValue()[docID];
-                if (value == null) {
-                    continue;
-                }
-                if (json.length() > 1) {
-                    json.append(',');
-                }
-                json.append('"')
-                    .append(entry.getKey())
-                    .append("\":\"")
-                    .append(value.replace("\\", "\\\\").replace("\"", "\\\""))
-                    .append('"');
-            }
-            for (Map.Entry<String, String[][]> entry : keywordArrayValues.entrySet()) {
-                String[] arr = entry.getValue()[docID];
-                if (arr == null) {
-                    continue;
-                }
-                if (json.length() > 1) {
-                    json.append(',');
-                }
-                json.append('"').append(entry.getKey()).append("\":[");
-                for (int k = 0; k < arr.length; k++) {
-                    if (k > 0) json.append(',');
-                    String v = arr[k];
-                    if (v == null) {
-                        json.append("null");
-                    } else {
-                        json.append('"').append(v.replace("\\", "\\\\").replace("\"", "\\\"")).append('"');
+                for (Map.Entry<String, String[]> entry : textColumns.entrySet()) {
+                    String value = entry.getValue()[docID];
+                    if (value != null) {
+                        builder.field(entry.getKey(), value);
                     }
                 }
-                json.append(']');
-            }
-            for (Map.Entry<String, byte[][]> entry : binaryColumns.entrySet()) {
-                byte[] bytes = entry.getValue()[docID];
-                if (bytes == null) {
-                    continue;
+                for (Map.Entry<String, String[][]> entry : keywordArrayValues.entrySet()) {
+                    String[] arr = entry.getValue()[docID];
+                    if (arr != null) {
+                        builder.field(entry.getKey(), arr);
+                    }
                 }
-                if (json.length() > 1) {
-                    json.append(',');
+                for (Map.Entry<String, byte[][]> entry : binaryColumns.entrySet()) {
+                    byte[] bytes = entry.getValue()[docID];
+                    if (bytes != null) {
+                        builder.field(entry.getKey(), java.util.Base64.getEncoder().encodeToString(bytes));
+                    }
                 }
-                json.append('"')
-                    .append(entry.getKey())
-                    .append("\":\"")
-                    .append(java.util.Base64.getEncoder().encodeToString(bytes))
-                    .append('"');
+                builder.endObject();
+                byte[] json = org.opensearch.core.common.bytes.BytesReference.toBytes(
+                    org.opensearch.core.common.bytes.BytesReference.bytes(builder)
+                );
+                visitor.binaryField(sourceInfo, json);
             }
-            json.append('}');
-            visitor.binaryField(sourceInfo, json.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
         }
     }
 
