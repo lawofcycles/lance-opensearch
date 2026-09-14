@@ -96,8 +96,13 @@ public final class LanceFragmentLeafReader extends LeafReader {
     private final int fragmentId;
     // eagerly loaded column values for _source synthesis (PoC; production streams from Lance)
     private final Map<String, long[]> numericColumns = new LinkedHashMap<>();
+    // Per-column presence bitmap; bit set = value present, bit clear = Arrow null.
+    // NumericDocValues.advanceExact and _source materialisation both consult this
+    // to distinguish "value is 0" from "value is missing" for nullable Arrow columns.
+    private final Map<String, FixedBitSet> numericPresence = new LinkedHashMap<>();
     private final Map<String, String[]> textColumns = new LinkedHashMap<>();
     private final Map<String, long[]> booleanColumns = new LinkedHashMap<>();
+    private final Map<String, FixedBitSet> booleanPresence = new LinkedHashMap<>();
     // Utf8 columns without an FTS index surface as keyword. We keep them in
     // textColumns for _source synthesis and additionally build sorted term
     // dictionaries plus per-doc ordinals so getSortedSetDocValues can serve
@@ -141,7 +146,13 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 && field.getChildren().size() == 1
                 && field.getChildren().get(0).getType() instanceof ArrowType.Utf8;
             boolean isBinary = type instanceof ArrowType.Binary || type instanceof ArrowType.LargeBinary;
-            if (type instanceof ArrowType.Int
+            // Skip Arrow Int columns whose signed / bit-width combination we do
+            // not surface. Everything else goes through the type-specific loaders
+            // below. unsigned ints are dropped here to match RestAttachAction's
+            // derive() decision and to avoid loading a column the reader could
+            // not represent as a signed long safely.
+            boolean isSurfacedInt = type instanceof ArrowType.Int intType && intType.getIsSigned();
+            if (isSurfacedInt
                 || type instanceof ArrowType.Utf8
                 || type instanceof ArrowType.Bool
                 || type instanceof ArrowType.Date
@@ -151,6 +162,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 scanColumns.add(field.getName());
                 if (type instanceof ArrowType.Bool) {
                     booleanColumns.put(field.getName(), new long[maxDoc]);
+                    booleanPresence.put(field.getName(), new FixedBitSet(maxDoc));
                 } else if (type instanceof ArrowType.Utf8) {
                     textColumns.put(field.getName(), new String[maxDoc]);
                 } else if (isKeywordArray) {
@@ -158,8 +170,9 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 } else if (isBinary) {
                     binaryColumns.put(field.getName(), new byte[maxDoc][]);
                 } else {
-                    // Int, Date, Timestamp all backed by long
+                    // Signed Int (8/16/32/64), Date, Timestamp all backed by long.
                     numericColumns.put(field.getName(), new long[maxDoc]);
+                    numericPresence.put(field.getName(), new FixedBitSet(maxDoc));
                 }
             }
         }
@@ -178,11 +191,17 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     liveCount++;
                     for (Map.Entry<String, long[]> entry : numericColumns.entrySet()) {
                         FieldVector vector = root.getVector(entry.getKey());
-                        entry.getValue()[offset] = readAsLong(vector, i);
+                        if (!vector.isNull(i)) {
+                            entry.getValue()[offset] = readAsLong(vector, i);
+                            numericPresence.get(entry.getKey()).set(offset);
+                        }
                     }
                     for (Map.Entry<String, long[]> entry : booleanColumns.entrySet()) {
                         BitVector vector = (BitVector) root.getVector(entry.getKey());
-                        entry.getValue()[offset] = vector.isNull(i) ? 0 : vector.get(i);
+                        if (!vector.isNull(i)) {
+                            entry.getValue()[offset] = vector.get(i);
+                            booleanPresence.get(entry.getKey()).set(offset);
+                        }
                     }
                     for (Map.Entry<String, String[]> entry : textColumns.entrySet()) {
                         VarCharVector vector = (VarCharVector) root.getVector(entry.getKey());
@@ -424,8 +443,15 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
     @Override
     public NumericDocValues getNumericDocValues(String field) {
-        final long[] column = numericColumns.get(field) != null ? numericColumns.get(field) : booleanColumns.get(field);
-        if (column == null) {
+        final long[] column;
+        final FixedBitSet presence;
+        if (numericColumns.containsKey(field)) {
+            column = numericColumns.get(field);
+            presence = numericPresence.get(field);
+        } else if (booleanColumns.containsKey(field)) {
+            column = booleanColumns.get(field);
+            presence = booleanPresence.get(field);
+        } else {
             return null;
         }
         return new NumericDocValues() {
@@ -439,7 +465,13 @@ public final class LanceFragmentLeafReader extends LeafReader {
             @Override
             public boolean advanceExact(int target) {
                 doc = target;
-                return liveDocs == null || liveDocs.get(target);
+                if (liveDocs != null && !liveDocs.get(target)) {
+                    return false;
+                }
+                // presence bit is clear for Arrow-null docs; exists / term /
+                // range / agg / sort all check advanceExact and stop reading
+                // the value here.
+                return presence.get(target);
             }
 
             @Override
@@ -728,10 +760,14 @@ public final class LanceFragmentLeafReader extends LeafReader {
             try (org.opensearch.core.xcontent.XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
                 builder.startObject();
                 for (Map.Entry<String, long[]> entry : numericColumns.entrySet()) {
-                    builder.field(entry.getKey(), entry.getValue()[docID]);
+                    if (numericPresence.get(entry.getKey()).get(docID)) {
+                        builder.field(entry.getKey(), entry.getValue()[docID]);
+                    }
                 }
                 for (Map.Entry<String, long[]> entry : booleanColumns.entrySet()) {
-                    builder.field(entry.getKey(), entry.getValue()[docID] == 1);
+                    if (booleanPresence.get(entry.getKey()).get(docID)) {
+                        builder.field(entry.getKey(), entry.getValue()[docID] == 1);
+                    }
                 }
                 for (Map.Entry<String, String[]> entry : textColumns.entrySet()) {
                     String value = entry.getValue()[docID];
@@ -806,10 +842,17 @@ public final class LanceFragmentLeafReader extends LeafReader {
         );
     }
 
-    // Reads an Arrow scalar vector value as a long. Date/Timestamp vectors are
-    // normalized to epoch milliseconds so the DateFieldMapper reads them through
-    // the same numeric doc value path as integers.
+    // Reads an Arrow scalar vector value as a long. Callers guard against
+    // nulls; this method assumes the input index has a value. Date/Timestamp
+    // vectors are normalized to epoch milliseconds so the DateFieldMapper
+    // reads them through the same numeric doc value path as integers.
     private static long readAsLong(FieldVector v, int i) {
+        if (v instanceof org.apache.arrow.vector.TinyIntVector t) {
+            return t.get(i);
+        }
+        if (v instanceof org.apache.arrow.vector.SmallIntVector s) {
+            return s.get(i);
+        }
         if (v instanceof IntVector iv) {
             return iv.get(i);
         }

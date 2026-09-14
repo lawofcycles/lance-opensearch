@@ -174,8 +174,37 @@ public class RestAttachAction extends BaseRestHandler {
             if (declaredPk) {
                 keyField = name;
             }
-            if (type instanceof ArrowType.Int) {
-                startFieldWithId(mapping, name, fieldId, "integer");
+            if (type instanceof ArrowType.Int intType) {
+                int bitWidth = intType.getBitWidth();
+                if (!intType.getIsSigned()) {
+                    notes.add(
+                        "column "
+                            + name
+                            + ": unsigned int"
+                            + bitWidth
+                            + " not surfaced (OpenSearch has no unsigned equivalent for byte/short/int, and unsigned_long doc values require BigInteger which the reader does not synthesise yet)"
+                    );
+                    continue;
+                }
+                String osType;
+                switch (bitWidth) {
+                    case 8:
+                        osType = "byte";
+                        break;
+                    case 16:
+                        osType = "short";
+                        break;
+                    case 32:
+                        osType = "integer";
+                        break;
+                    case 64:
+                        osType = "long";
+                        break;
+                    default:
+                        notes.add("column " + name + ": unsupported int width " + bitWidth);
+                        continue;
+                }
+                startFieldWithId(mapping, name, fieldId, osType);
                 mapping.field("index", false).field("doc_values", true).endObject();
                 if (keyField == null) {
                     keyField = name;
