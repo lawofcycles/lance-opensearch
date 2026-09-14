@@ -6,6 +6,11 @@
 package org.opensearch.lance;
 
 import org.opensearch.common.settings.Setting;
+import org.opensearch.lance.engine.LanceEngineFactory;
+import org.opensearch.lance.mapper.LanceTextFieldMapper;
+import org.opensearch.lance.query.LanceKnnQueryBuilder;
+import org.opensearch.lance.query.LanceMatchPhraseQueryBuilder;
+import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.plugins.SearchPlugin.QuerySpec;
 import org.opensearch.test.OpenSearchTestCase;
 
