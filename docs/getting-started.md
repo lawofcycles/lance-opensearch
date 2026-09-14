@@ -172,6 +172,32 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
 
 Expected `hits.total.value`: 8 (every even row).
 
+### AND / OR match (lance_match)
+
+The stock `match` above passes the whole query text through Lance as one token, so `operator: and` on OpenSearch's built-in `match` is ignored. Use `lance_match` to push AND / OR control into Lance's own FTS engine:
+
+```
+curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"lance_match":{"field":"body","query":"hello lance","operator":"and"}}}'
+```
+
+Expected `hits.total.value`: 8 (every even row contains both `hello` and `lance`).
+
+Swapping the query text to `"hello quick"` returns 16 hits with the default operator (OR) and 0 hits with `operator: and`, because no row contains both `hello` and `quick`.
+
+### Phrase order (lance_match_phrase)
+
+The stock `match_phrase` collapses to a single token for the same reason and ignores order. Use `lance_match_phrase`:
+
+```
+curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"lance_match_phrase":{"field":"body","query":"hello lance"}}}'
+```
+
+Returns 8 hits. Reversing the phrase to `"lance hello"` returns 0. Non-zero slop lets tokens sit further apart: `{"field":"body","query":"quick fox","slop":1}` matches every `quick brown fox <i>` because `brown` sits one position between `quick` and `fox`.
+
 ### Primary key lookup
 
 ```

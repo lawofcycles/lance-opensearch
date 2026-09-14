@@ -28,8 +28,13 @@ public class LancePluginTests extends OpenSearchTestCase {
 
     public void testRegistersLanceKnnQuery() {
         List<QuerySpec<?>> queries = plugin.getQueries();
-        assertEquals(1, queries.size());
-        assertEquals(LanceKnnQueryBuilder.NAME, queries.get(0).getName().getPreferredName());
+        assertEquals(3, queries.size());
+        java.util.Set<String> names = queries.stream()
+            .map(q -> q.getName().getPreferredName())
+            .collect(java.util.stream.Collectors.toSet());
+        assertTrue("expected lance_knn in registered queries: " + names, names.contains(LanceKnnQueryBuilder.NAME));
+        assertTrue("expected lance_match in registered queries: " + names, names.contains(LanceMatchQueryBuilder.NAME));
+        assertTrue("expected lance_match_phrase in registered queries: " + names, names.contains(LanceMatchPhraseQueryBuilder.NAME));
     }
 
     public void testRegistersLanceTextMapper() {

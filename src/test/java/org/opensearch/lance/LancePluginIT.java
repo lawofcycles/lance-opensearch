@@ -343,6 +343,119 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testLanceMatchPhraseHonoursPhraseOrder() throws Exception {
+        // The custom lance_match_phrase DSL routes into Lance's
+        // FullTextQuery.phrase, which honours phrase order using the
+        // positions written into the FTS index (LanceTableFactory builds
+        // the body_fts index with with_position=true). Even rows say
+        // "hello lance i", so "hello lance" hits 8 rows and the reversed
+        // "lance hello" hits 0.
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lmphraseorder")) {
+            String indexName = fixture.indexName();
+
+            Response ordered = postJson(
+                "/" + indexName + "/_search",
+                "{\"query\":{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"hello lance\"}}}"
+            );
+            int orderedHits = extractIntPath(readAll(ordered), "hits", "total", "value");
+            assertEquals("expected 8 hits for 'hello lance' phrase", 8, orderedHits);
+
+            Response reversed = postJson(
+                "/" + indexName + "/_search",
+                "{\"query\":{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"lance hello\"}}}"
+            );
+            int reversedHits = extractIntPath(readAll(reversed), "hits", "total", "value");
+            assertEquals("expected 0 hits for 'lance hello' reversed phrase", 0, reversedHits);
+        }
+    }
+
+    public void testLanceMatchPhraseSlopBridgesGap() throws Exception {
+        // Odd rows say "quick brown fox i". "quick fox" with slop=0 must
+        // fail (brown between them), slop>=1 must succeed. Confirms the
+        // slop parameter reaches Lance.
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lmphraseslop")) {
+            String indexName = fixture.indexName();
+
+            Response strict = postJson(
+                "/" + indexName + "/_search",
+                "{\"query\":{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"quick fox\"}}}"
+            );
+            int strictHits = extractIntPath(readAll(strict), "hits", "total", "value");
+            assertEquals("expected 0 hits for tight 'quick fox' phrase", 0, strictHits);
+
+            Response withSlop = postJson(
+                "/" + indexName + "/_search",
+                "{\"query\":{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"quick fox\",\"slop\":1}}}"
+            );
+            int slopHits = extractIntPath(readAll(withSlop), "hits", "total", "value");
+            assertEquals("expected 8 hits for 'quick fox' phrase with slop=1", 8, slopHits);
+        }
+    }
+
+    public void testLanceMatchAndOperatorRestrictsToDocumentsMatchingAllTokens() throws Exception {
+        // Even rows say "hello lance i", odd rows say "quick brown fox i".
+        // OR "hello quick" would return 16 (every row has one). AND
+        // "hello quick" returns 0 because no row has both. lance_match
+        // must honour the operator via FullTextQuery.match's Operator
+        // parameter.
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lmatchand")) {
+            String indexName = fixture.indexName();
+
+            Response orQuery = postJson(
+                "/" + indexName + "/_search",
+                "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello quick\"}}}"
+            );
+            int orHits = extractIntPath(readAll(orQuery), "hits", "total", "value");
+            assertEquals("expected 16 hits for OR 'hello quick'", 16, orHits);
+
+            Response andQuery = postJson(
+                "/" + indexName + "/_search",
+                "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello quick\",\"operator\":\"and\"}}}"
+            );
+            int andHits = extractIntPath(readAll(andQuery), "hits", "total", "value");
+            assertEquals("expected 0 hits for AND 'hello quick'", 0, andHits);
+
+            // Same 'hello lance' AND both tokens present in even rows.
+            Response andSameRow = postJson(
+                "/" + indexName + "/_search",
+                "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello lance\",\"operator\":\"and\"}}}"
+            );
+            int andSameRowHits = extractIntPath(readAll(andSameRow), "hits", "total", "value");
+            assertEquals("expected 8 hits for AND 'hello lance'", 8, andSameRowHits);
+        }
+    }
+
+    public void testLanceMatchRejectsUnknownField() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(4, "lmatchnofield")) {
+            String indexName = fixture.indexName();
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"lance_match\":{\"field\":\"noSuchField\",\"query\":\"hello\"}}}"
+                )
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            assertEquals("expected 400 for unknown field, saw " + status, 400, status);
+            String body = readAll(failure.getResponse());
+            assertTrue("expected message about noSuchField: " + body, body.contains("noSuchField"));
+        }
+    }
+
+    public void testLanceMatchRejectsScalarField() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(4, "lmatchscalar")) {
+            String indexName = fixture.indexName();
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson("/" + indexName + "/_search", "{\"query\":{\"lance_match\":{\"field\":\"id\",\"query\":\"hello\"}}}")
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            assertEquals("expected 400 for scalar field, saw " + status, 400, status);
+            String body = readAll(failure.getResponse());
+            assertTrue("expected message about non-lance_text: " + body, body.contains("lance_text"));
+        }
+    }
+
     public void testLanceKnnAppliesFilterAsPreFilter() throws Exception {
         // With row i at coordinate (i, 0, ...), the two rows nearest to
         // (2.4, 0, ...) are id 2 and id 3. A pre-filter of id >= 10 must

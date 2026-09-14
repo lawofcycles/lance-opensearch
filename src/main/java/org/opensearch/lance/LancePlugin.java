@@ -38,7 +38,15 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
 
     @Override
     public List<QuerySpec<?>> getQueries() {
-        return List.of(new QuerySpec<>(LanceKnnQueryBuilder.NAME, LanceKnnQueryBuilder::new, LanceKnnQueryBuilder::fromXContent));
+        return List.of(
+            new QuerySpec<>(LanceKnnQueryBuilder.NAME, LanceKnnQueryBuilder::new, LanceKnnQueryBuilder::fromXContent),
+            new QuerySpec<>(LanceMatchQueryBuilder.NAME, LanceMatchQueryBuilder::new, LanceMatchQueryBuilder::fromXContent),
+            new QuerySpec<>(
+                LanceMatchPhraseQueryBuilder.NAME,
+                LanceMatchPhraseQueryBuilder::new,
+                LanceMatchPhraseQueryBuilder::fromXContent
+            )
+        );
     }
 
     @Override

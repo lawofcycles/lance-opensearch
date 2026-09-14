@@ -37,10 +37,44 @@ public final class LanceFtsQuery extends Query {
 
     private final String column;
     private final String text;
+    private final boolean phrase;
+    private final int slop;
+    private final FullTextQuery.Operator operator;
 
     public LanceFtsQuery(String column, String text) {
+        this(column, text, false, 0, FullTextQuery.Operator.OR);
+    }
+
+    /**
+     * Convenience for match queries with an explicit operator.
+     */
+    public LanceFtsQuery(String column, String text, FullTextQuery.Operator operator) {
+        this(column, text, false, 0, operator);
+    }
+
+    /**
+     * @param column Lance FTS-indexed column to query
+     * @param text raw query text; Lance runs its own tokenizer on it
+     * @param phrase true for phrase queries (Lance {@code FullTextQuery.phrase}),
+     *     false for term/match queries (Lance {@code FullTextQuery.match})
+     * @param slop phrase slop (allowed number of intervening tokens); ignored
+     *     when {@code phrase} is false
+     */
+    public LanceFtsQuery(String column, String text, boolean phrase, int slop) {
+        this(column, text, phrase, slop, FullTextQuery.Operator.OR);
+    }
+
+    /**
+     * Full constructor: match queries can specify AND / OR operator to
+     * control how Lance combines the tokens it derives from
+     * {@code text}. Ignored when {@code phrase} is true.
+     */
+    public LanceFtsQuery(String column, String text, boolean phrase, int slop, FullTextQuery.Operator operator) {
         this.column = column;
         this.text = text;
+        this.phrase = phrase;
+        this.slop = Math.max(0, slop);
+        this.operator = operator == null ? FullTextQuery.Operator.OR : operator;
     }
 
     @Override
@@ -69,7 +103,11 @@ public final class LanceFtsQuery extends Query {
                 float[] scores = new float[maxDoc];
                 org.apache.lucene.util.FixedBitSet matches = new org.apache.lucene.util.FixedBitSet(maxDoc);
                 ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(leaf.fragmentId()))
-                    .fullTextQuery(FullTextQuery.match(text, column))
+                    .fullTextQuery(
+                        phrase
+                            ? FullTextQuery.phrase(text, column, slop)
+                            : FullTextQuery.match(text, column, 1f, java.util.Optional.empty(), 50, operator, 0)
+                    )
                     .withRowAddress(true)
                     .limit((long) maxDoc)
                     .build();
@@ -124,7 +162,12 @@ public final class LanceFtsQuery extends Query {
 
     @Override
     public String toString(String field) {
-        return "LanceFtsQuery(" + column + ":" + text + ")";
+        return "LanceFtsQuery("
+            + column
+            + ":"
+            + (phrase ? "phrase[" + slop + "]=" : (operator == FullTextQuery.Operator.AND ? "and:" : ""))
+            + text
+            + ")";
     }
 
     @Override
@@ -134,11 +177,16 @@ public final class LanceFtsQuery extends Query {
 
     @Override
     public boolean equals(Object other) {
-        return other instanceof LanceFtsQuery q && column.equals(q.column) && text.equals(q.text);
+        return other instanceof LanceFtsQuery q
+            && column.equals(q.column)
+            && text.equals(q.text)
+            && phrase == q.phrase
+            && slop == q.slop
+            && operator == q.operator;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(column, text);
+        return Objects.hash(column, text, phrase, slop, operator);
     }
 }
