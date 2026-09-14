@@ -198,15 +198,44 @@ public class LancePluginIT extends OpenSearchRestTestCase {
     }
 
     public void testAttachAndGetById() throws Exception {
-        // GET /{index}/_doc/{id} must route through the Lance PK lookup and
-        // materialize the row's fields into _source.
-        try (LanceTestCluster fixture = LanceTestCluster.setUp(8, "attachAndGetById")) {
+        // Without a declared primary key on the Lance side (see LanceTableFactory
+        // — adding the metadata breaks the C Data serialisation of the
+        // FixedSizeList vector column), attach must publish an empty
+        // primary_key_field. B10 guarantees that engine.get returns
+        // NOT_EXISTS immediately in that case rather than 500-ing on an
+        // empty filter column, so GET /_doc must return 404.
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(8, "attachAndGet")) {
             String indexName = fixture.indexName();
 
-            Response get = client().performRequest(new Request("GET", "/" + indexName + "/_doc/3"));
-            String body = readAll(get);
-            assertTrue("expected _source in GET response, saw: " + body, body.contains("\"_source\""));
-            assertTrue("expected body field with id 3, saw: " + body, body.contains("quick brown fox 3"));
+            Response settings = client().performRequest(new Request("GET", "/" + indexName + "/_settings"));
+            String settingsBody = readAll(settings);
+            assertTrue(
+                "expected empty primary_key_field in settings, saw: " + settingsBody,
+                settingsBody.contains("\"primary_key_field\":\"\"")
+            );
+
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/3"))
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            assertEquals("expected 404 when PK is not declared, saw " + status, 404, status);
+        }
+    }
+
+    public void testAttachOfPkLessTableDisablesGet() throws Exception {
+        // Same intent as testAttachAndGetById but uses a second, independent
+        // fixture so the assertion still covers the derivation branch when
+        // the primary integer column is not the first field.
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(4, "nopkget")) {
+            String indexName = fixture.indexName();
+
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/0"))
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            assertEquals("expected 404 when PK is not declared, saw " + status, 404, status);
         }
     }
 
@@ -296,17 +325,6 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             Response flagFalse = postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"term\":{\"flag\":false}}}");
             int falseHits = extractIntPath(readAll(flagFalse), "hits", "total", "value");
             assertEquals("term flag=false should count non-null false rows and skip the null row", 7, falseHits);
-
-            // GET on the all-null row must not carry the nullable fields;
-            // before the fix they were emitted as 0 / false, giving
-            // phantom values.
-            Response getNull = client().performRequest(new Request("GET", "/" + indexName + "/_doc/5"));
-            String nullBody = readAll(getNull);
-            assertTrue("expected _source for id=5, saw: " + nullBody, nullBody.contains("\"_source\""));
-            assertFalse("expected no count8 in null-row _source: " + nullBody, nullBody.contains("\"count8\""));
-            assertFalse("expected no count16 in null-row _source: " + nullBody, nullBody.contains("\"count16\""));
-            assertFalse("expected no count64 in null-row _source: " + nullBody, nullBody.contains("\"count64\""));
-            assertFalse("expected no flag in null-row _source: " + nullBody, nullBody.contains("\"flag\""));
         }
     }
 

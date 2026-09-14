@@ -336,9 +336,6 @@ public class RestAttachAction extends BaseRestHandler {
                 }
                 startFieldWithId(mapping, name, fieldId, osType);
                 mapping.field("index", false).field("doc_values", true).endObject();
-                if (keyField == null) {
-                    keyField = name;
-                }
                 scalarColumns.add(name);
             } else if (type instanceof ArrowType.Bool) {
                 startFieldWithId(mapping, name, fieldId, "boolean");
@@ -389,8 +386,8 @@ public class RestAttachAction extends BaseRestHandler {
         mapping.endObject().endObject();
 
         if (keyField == null) {
-            keyField = "id";
-            notes.add("no integer column found; _id get unavailable");
+            keyField = "";
+            notes.add("no primary key declared; _id GET returns 404, `_id` values are not unique");
         }
         return new Derivation(
             mapping.toString(),

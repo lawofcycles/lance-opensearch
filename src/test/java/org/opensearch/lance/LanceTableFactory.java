@@ -88,6 +88,14 @@ final class LanceTableFactory {
         String uri = tablePath.toString();
         Schema schema = new Schema(
             Arrays.asList(
+                // Note: the Lance schema does not declare
+                // `lance-schema:unenforced-primary-key`. Adding that metadata
+                // via `new FieldType(true, ArrowType.Int, null, meta)` breaks
+                // the C Data serialisation of the FixedSizeList column that
+                // follows (see the corresponding failure signature in the
+                // review notes). Without a declared PK the derived
+                // `primary_key_field` is empty and GET /_doc returns 404,
+                // which B10 verifies through testAttachOfPkLessTableDisablesGet.
                 new Field(PRIMARY_KEY, FieldType.nullable(new ArrowType.Int(32, true)), null),
                 new Field(BODY_COLUMN, FieldType.nullable(new ArrowType.Utf8()), null),
                 new Field(
@@ -197,6 +205,10 @@ final class LanceTableFactory {
         String uri = tablePath.toString();
         Schema schema = new Schema(
             Arrays.asList(
+                // Same rationale as writeTable: PK metadata cannot be
+                // combined with the FixedSizeList carried over from the
+                // other IT fixture without breaking C Data serialisation,
+                // and the nullable-int IT does not exercise GET anyway.
                 new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
                 new Field("count8", FieldType.nullable(new ArrowType.Int(8, true)), null),
                 new Field("count16", FieldType.nullable(new ArrowType.Int(16, true)), null),

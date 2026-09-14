@@ -53,7 +53,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
     public static final Setting<String> PRIMARY_KEY_FIELD_SETTING = Setting.simpleString(
         LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING,
-        "id",
+        "",
         Setting.Property.IndexScope,
         Setting.Property.Final
     );

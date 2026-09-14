@@ -57,7 +57,7 @@ public final class LanceEngineFactory implements EngineFactory {
     @Override
     public Engine newReadWriteEngine(EngineConfig config) {
         String table = config.getIndexSettings().getSettings().get(TABLE_SETTING);
-        String field = config.getIndexSettings().getSettings().get(PRIMARY_KEY_FIELD_SETTING, "id");
+        String field = config.getIndexSettings().getSettings().get(PRIMARY_KEY_FIELD_SETTING, "");
         int shardId = config.getShardId().id();
         int numShards = config.getIndexSettings().getNumberOfShards();
         return new LanceReadOnlyEngine(config, table, field, shardId, numShards);
@@ -180,6 +180,13 @@ public final class LanceEngineFactory implements EngineFactory {
          */
         @Override
         public GetResult get(Get get, BiFunction<String, SearcherScope, Engine.Searcher> searcherFactory) {
+            if (field == null || field.isEmpty()) {
+                // The table did not declare a primary key. With no `_id`
+                // lookup column there is nothing to resolve, so return
+                // NOT_EXISTS immediately rather than passing an empty field
+                // name to Lance and getting a 500 back.
+                return GetResult.NOT_EXISTS;
+            }
             long key;
             try {
                 key = Long.parseLong(get.id());
