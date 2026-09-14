@@ -359,11 +359,34 @@ public class RestAttachAction extends BaseRestHandler {
                     mapping.field("index", false).field("doc_values", true).endObject();
                     scalarColumns.add(name);
                 }
-            } else if (type instanceof ArrowType.FixedSizeList) {
-                notes.add(
-                    name + ": vector column, dimension " + ((ArrowType.FixedSizeList) type).getListSize() + ", queryable through lance_knn"
-                );
-                vectorColumns.add(name);
+            } else if (type instanceof ArrowType.FixedSizeList fsl) {
+                LanceField child = field.getChildren().isEmpty() ? null : field.getChildren().get(0);
+                ArrowType childType = child != null ? child.getType() : null;
+                boolean float32 = childType instanceof ArrowType.FloatingPoint fp
+                    && fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE;
+                if (float32) {
+                    notes.add(
+                        name + ": vector column, dimension " + fsl.getListSize() + ", element type Float32, queryable through lance_knn"
+                    );
+                    vectorColumns.add(name);
+                } else {
+                    // Lance itself supports int8 / uint8 / float16 vectors, but the
+                    // Java SDK's Query.Builder.setKey only takes float[], so a
+                    // lance_knn call would hit a 500 inside Lance ("Column X has
+                    // element type Y and the query vector is Float32"). Surface the
+                    // column so the operator sees it, but leave it out of
+                    // vectorColumns so no auto vector index is attempted and
+                    // ensureVectorIndexes / optimizeExistingVectorIndexes skip it.
+                    String elementType = childType == null ? "unknown" : childType.toString();
+                    notes.add(
+                        name
+                            + ": vector column, dimension "
+                            + fsl.getListSize()
+                            + ", element type "
+                            + elementType
+                            + ", not queryable through lance_knn (Java SDK requires Float32)"
+                    );
+                }
             } else if (type instanceof ArrowType.List
                 && field.getChildren().size() == 1
                 && field.getChildren().get(0).getType() instanceof ArrowType.Utf8) {

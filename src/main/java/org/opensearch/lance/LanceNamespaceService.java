@@ -301,20 +301,48 @@ public final class LanceNamespaceService {
         if (mappingFieldIdToName.isEmpty()) {
             return;
         }
+        java.util.Set<Integer> lanceIds = new java.util.HashSet<>(lanceSchema.fields().size());
         for (LanceField field : lanceSchema.fields()) {
+            lanceIds.add(field.getId());
             String previousName = mappingFieldIdToName.get(field.getId());
             if (previousName == null || previousName.equals(field.getName())) {
                 continue;
             }
-            String key = indexName + ":" + field.getId() + ":" + previousName + "->" + field.getName();
+            String key = indexName + ":rename:" + field.getId() + ":" + previousName + "->" + field.getName();
             if (warnedRenamed.add(key)) {
                 LOG.warn(
-                    "Lance table for {} renamed field id {} from '{}' to '{}'; the mapping still exposes the old name, "
-                        + "queries against the new name will not match until the index is recreated",
+                    "Lance table for {} renamed field id {} from '{}' to '{}'. "
+                        + "The mapping still exposes both names; queries against the old name '{}' will now return 0 hits "
+                        + "because the underlying column no longer maps to it. Recreate the index to drop the stale mapping.",
                     indexName,
                     field.getId(),
                     previousName,
-                    field.getName()
+                    field.getName(),
+                    previousName
+                );
+            }
+        }
+        // drop_columns / overwrite on the Lance side removes a field id
+        // entirely. OpenSearch's PutMapping cannot remove properties, so
+        // the stale name lingers and queries against it fail silently with
+        // 0 hits (numeric doc values just return their default, term
+        // queries never match). Surface the drift so operators know to
+        // recreate the index.
+        for (Map.Entry<Integer, String> mapped : mappingFieldIdToName.entrySet()) {
+            int id = mapped.getKey();
+            if (lanceIds.contains(id)) {
+                continue;
+            }
+            String staleName = mapped.getValue();
+            String key = indexName + ":dropped:" + id + ":" + staleName;
+            if (warnedRenamed.add(key)) {
+                LOG.warn(
+                    "Lance table for {} no longer contains field id {} ('{}'). "
+                        + "The mapping still exposes '{}' so queries against it will silently return 0 hits; recreate the index to drop it.",
+                    indexName,
+                    id,
+                    staleName,
+                    staleName
                 );
             }
         }
