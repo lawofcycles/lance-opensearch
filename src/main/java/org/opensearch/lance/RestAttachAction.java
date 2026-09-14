@@ -63,7 +63,7 @@ public class RestAttachAction extends BaseRestHandler {
         return channel -> {
             String indexName = explicitName != null ? explicitName : tableName(table);
             Derivation derivation;
-            try (Dataset dataset = Dataset.open(table, LanceRegistry.allocator())) {
+            try (Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(table).build()) {
                 derivation = derive(dataset, pinnedShards);
             }
 

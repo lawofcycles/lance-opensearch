@@ -148,7 +148,7 @@ public final class LanceNamespaceService {
             String policy = readUncoveredFragmentPolicy(indexName);
             long latest;
             String rederivedMappingJson = null;
-            try (Dataset dataset = Dataset.open(table, LanceRegistry.allocator())) {
+            try (Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(table).build()) {
                 latest = dataset.version();
                 if (latest > served) {
                     // The RFC's Mapping interface states the mapping is re-derived at
@@ -212,7 +212,7 @@ public final class LanceNamespaceService {
 
     private void surface(String indexName, String table) throws Exception {
         RestAttachAction.Derivation derivation;
-        try (Dataset dataset = Dataset.open(table, LanceRegistry.allocator())) {
+        try (Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(table).build()) {
             // Derive first so the builder only sees the columns that derived to
             // lance_text / scalar-eligible / vector-eligible; other columns stay
             // untouched.

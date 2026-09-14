@@ -82,7 +82,7 @@ public final class LanceEngineFactory implements EngineFactory {
             try {
                 OpenSearchDirectoryReader initial = openLanceReader();
                 long initialVersion;
-                try (Dataset probe = Dataset.open(tablePath, LanceRegistry.allocator())) {
+                try (Dataset probe = Dataset.open().allocator(LanceRegistry.allocator()).uri(tablePath).build()) {
                     initialVersion = probe.version();
                 }
                 this.lanceReaderManager = new LanceReaderManager(initial, this, initialVersion);
@@ -95,7 +95,7 @@ public final class LanceEngineFactory implements EngineFactory {
             Directory directory = engineConfig.getStore().directory();
             SegmentInfos infos = getLastCommittedSegmentInfos();
             IndexCommit commit = Lucene.getIndexCommit(infos, directory);
-            Dataset dataset = Dataset.open(tablePath, LanceRegistry.allocator());
+            Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(tablePath).build();
             LanceDirectoryReader reader = LanceDirectoryReader.open(directory, commit, dataset, field, shardId, numShards);
             return OpenSearchDirectoryReader.wrap(reader, config().getShardId());
         }
@@ -225,7 +225,7 @@ public final class LanceEngineFactory implements EngineFactory {
         @Override
         protected OpenSearchDirectoryReader refreshIfNeeded(OpenSearchDirectoryReader referenceToRefresh) throws IOException {
             long latest;
-            try (Dataset probe = Dataset.open(engine.tablePath, LanceRegistry.allocator())) {
+            try (Dataset probe = Dataset.open().allocator(LanceRegistry.allocator()).uri(engine.tablePath).build()) {
                 latest = probe.version();
             }
             if (latest == servedVersion) {

@@ -28,7 +28,12 @@ import org.opensearch.plugins.SearchPlugin;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
 
-/** PoC plugin exposing Lance tables through REST endpoints and a read only engine. */
+/**
+ * Plugin entry point. Registers the reader-side surface for Lance tables:
+ * the REST endpoints for namespace / attach / build_indexes, the
+ * {@link LanceEngineFactory} that wraps each Lance-backed index in a
+ * read-only engine, mapping type parsers, and the {@code lance_knn} query.
+ */
 public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, MapperPlugin, SearchPlugin {
 
     @Override

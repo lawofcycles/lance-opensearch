@@ -153,7 +153,7 @@ public class RestBuildIndexesAction extends BaseRestHandler {
         List<String> ftsBuilt;
         List<String> scalarBuilt;
         List<String> vectorBuilt;
-        try (Dataset dataset = Dataset.open(tableUri, LanceRegistry.allocator())) {
+        try (Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(tableUri).build()) {
             RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, null);
             Set<String> columnsFilter = columnsFilterRaw != null ? new LinkedHashSet<>(columnsFilterRaw) : null;
             Set<String> ftsTarget = filter(derivation.ftsColumns(), columnsFilter);
