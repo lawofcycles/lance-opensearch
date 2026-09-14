@@ -486,7 +486,21 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
             @Override
             public int advance(int target) {
-                doc = target >= column.length ? NO_MORE_DOCS : target;
+                // Skip liveDocs holes and Arrow-null slots. DocValuesFieldExistsQuery
+                // iterates through the doc values with advance/nextDoc alone and does
+                // not call advanceExact, so the null bitmap must also be honoured here
+                // - otherwise exists / _field_names checks count every row regardless
+                // of presence.
+                for (int candidate = target; candidate < column.length; candidate++) {
+                    if (liveDocs != null && !liveDocs.get(candidate)) {
+                        continue;
+                    }
+                    if (presence.get(candidate)) {
+                        doc = candidate;
+                        return doc;
+                    }
+                }
+                doc = NO_MORE_DOCS;
                 return doc;
             }
 

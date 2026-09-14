@@ -16,8 +16,12 @@ import java.util.Map;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.FixedSizeListVector;
@@ -169,5 +173,99 @@ final class LanceTableFactory {
             }
             return out.toByteArray();
         }
+    }
+
+    /**
+     * Writes a Lance table exercising nullable numeric columns. Used by
+     * B4 regression tests to confirm the reader stops crashing on Arrow
+     * nulls, int8 / int16 / int64 all surface with the correct OpenSearch
+     * mapping type, and boolean nulls no longer collapse to false.
+     *
+     * <p>Row layout ({@code rowCount = 12}):
+     * <ul>
+     *   <li>{@code id}: int32 primary key, {@code i}</li>
+     *   <li>{@code count8}: int8 nullable, {@code (byte) i}</li>
+     *   <li>{@code count16}: int16 nullable, {@code (short) (i * 100)}</li>
+     *   <li>{@code count64}: int64 nullable, {@code 4_000_000_000L + i}
+     *       (exercises the >&nbsp;Integer.MAX_VALUE range)</li>
+     *   <li>{@code flag}: bool nullable, true when {@code i % 3 == 0}</li>
+     * </ul>
+     * Rows with {@code i == 5} set every nullable column to Arrow null.
+     */
+    static String writeNullableTable(Path parent, String name) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        Schema schema = new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("count8", FieldType.nullable(new ArrowType.Int(8, true)), null),
+                new Field("count16", FieldType.nullable(new ArrowType.Int(16, true)), null),
+                new Field("count64", FieldType.nullable(new ArrowType.Int(64, true)), null),
+                new Field("flag", FieldType.nullable(new ArrowType.Bool()), null)
+            ),
+            Map.of()
+        );
+
+        int rowCount = 12;
+        int nullRow = 5;
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            byte[] ipcBytes;
+            try (
+                VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                ByteArrayOutputStream out = new ByteArrayOutputStream()
+            ) {
+                IntVector idVector = (IntVector) root.getVector("id");
+                TinyIntVector count8 = (TinyIntVector) root.getVector("count8");
+                SmallIntVector count16 = (SmallIntVector) root.getVector("count16");
+                BigIntVector count64 = (BigIntVector) root.getVector("count64");
+                BitVector flag = (BitVector) root.getVector("flag");
+
+                idVector.allocateNew(rowCount);
+                count8.allocateNew(rowCount);
+                count16.allocateNew(rowCount);
+                count64.allocateNew(rowCount);
+                flag.allocateNew(rowCount);
+
+                for (int i = 0; i < rowCount; i++) {
+                    idVector.set(i, i);
+                    if (i == nullRow) {
+                        count8.setNull(i);
+                        count16.setNull(i);
+                        count64.setNull(i);
+                        flag.setNull(i);
+                    } else {
+                        count8.set(i, (byte) i);
+                        count16.set(i, (short) (i * 100));
+                        count64.set(i, 4_000_000_000L + i);
+                        flag.set(i, (i % 3 == 0) ? 1 : 0);
+                    }
+                }
+                idVector.setValueCount(rowCount);
+                count8.setValueCount(rowCount);
+                count16.setValueCount(rowCount);
+                count64.setValueCount(rowCount);
+                flag.setValueCount(rowCount);
+                root.setRowCount(rowCount);
+
+                try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                }
+                ipcBytes = out.toByteArray();
+            }
+
+            try (
+                ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+            ) {
+                Data.exportArrayStream(allocator, reader, stream);
+                WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
+                Dataset.create(allocator, stream, uri, writeParams).close();
+            }
+        }
+        return uri;
     }
 }

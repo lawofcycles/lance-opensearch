@@ -184,6 +184,64 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testNullableAndWideIntColumnsBehaveCorrectly() throws Exception {
+        // Regression for B4 (per-column presence bitmaps, int8/int16/int64
+        // mapping, boolean null). Before the fix a Lance table with any of
+        // - nullable int32 / date / timestamp column
+        // - int8 or int16 column
+        // - a null in a boolean column
+        // - int64 that exceeds Integer.MAX_VALUE
+        // took the shard red on recovery or produced silently wrong
+        // results. The nullable table has 12 rows; id=5 is all-null.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpNullable("nullableints")) {
+            String indexName = fixture.indexName();
+
+            // Mapping must reflect the Arrow int widths as byte / short / long.
+            Response mappingResp = client().performRequest(new Request("GET", "/" + indexName + "/_mapping"));
+            String mapping = readAll(mappingResp);
+            assertTrue("expected count8 as byte in mapping: " + mapping, mapping.contains("\"count8\":{\"type\":\"byte\""));
+            assertTrue("expected count16 as short in mapping: " + mapping, mapping.contains("\"count16\":{\"type\":\"short\""));
+            assertTrue("expected count64 as long in mapping: " + mapping, mapping.contains("\"count64\":{\"type\":\"long\""));
+
+            // Range on count64 must handle > Integer.MAX_VALUE values.
+            // count64 = 4_000_000_000 + i, so gte 4_000_000_006 hits i>=6.
+            // id=5 is null so exactly six rows should match.
+            Response gteResp = postJson(
+                "/" + indexName + "/_search",
+                "{\"size\":0,\"query\":{\"range\":{\"count64\":{\"gte\":4000000006}}}}"
+            );
+            int gteHits = extractIntPath(readAll(gteResp), "hits", "total", "value");
+            assertEquals("range count64 gte 4000000006 should hit rows i=6..11", 6, gteHits);
+
+            // exists on any nullable column must skip the all-null row.
+            Response existsResp = postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"exists\":{\"field\":\"count8\"}}}");
+            int existsHits = extractIntPath(readAll(existsResp), "hits", "total", "value");
+            assertEquals("exists count8 should count 11 present rows (12 minus one null)", 11, existsHits);
+
+            // flag=true holds when i in {0,3,6,9}: four rows.
+            Response flagTrue = postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"term\":{\"flag\":true}}}");
+            int trueHits = extractIntPath(readAll(flagTrue), "hits", "total", "value");
+            assertEquals("term flag=true should match i in {0,3,6,9}", 4, trueHits);
+
+            // flag=false must NOT include the null row (id=5). Non-null
+            // false rows are i in {1,2,4,7,8,10,11} = 7.
+            Response flagFalse = postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"term\":{\"flag\":false}}}");
+            int falseHits = extractIntPath(readAll(flagFalse), "hits", "total", "value");
+            assertEquals("term flag=false should count non-null false rows and skip the null row", 7, falseHits);
+
+            // GET on the all-null row must not carry the nullable fields;
+            // before the fix they were emitted as 0 / false, giving
+            // phantom values.
+            Response getNull = client().performRequest(new Request("GET", "/" + indexName + "/_doc/5"));
+            String nullBody = readAll(getNull);
+            assertTrue("expected _source for id=5, saw: " + nullBody, nullBody.contains("\"_source\""));
+            assertFalse("expected no count8 in null-row _source: " + nullBody, nullBody.contains("\"count8\""));
+            assertFalse("expected no count16 in null-row _source: " + nullBody, nullBody.contains("\"count16\""));
+            assertFalse("expected no count64 in null-row _source: " + nullBody, nullBody.contains("\"count64\""));
+            assertFalse("expected no flag in null-row _source: " + nullBody, nullBody.contains("\"flag\""));
+        }
+    }
+
     public void testStatsAPIsSucceedForLanceIndex() throws Exception {
         // Regression for LanceReadOnlyEngine.docStats() / segmentsStats():
         // OpenSearch's default implementations traverse leaves via
@@ -243,7 +301,19 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             Path scratchDir = Files.createDirectories(base.resolve("lance-it-" + suffix));
             String tableName = "demo-" + suffix;
             LanceTableFactory.writeTable(scratchDir, tableName, rowCount);
+            return registerAndWait(scratchDir, "demo-" + suffix);
+        }
 
+        static LanceTestCluster setUpNullable(String testHint) throws Exception {
+            Path base = sharedRoot();
+            String suffix = testHint.toLowerCase(java.util.Locale.ROOT) + "-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+            Path scratchDir = Files.createDirectories(base.resolve("lance-it-" + suffix));
+            String tableName = "demo-" + suffix;
+            LanceTableFactory.writeNullableTable(scratchDir, tableName);
+            return registerAndWait(scratchDir, "demo-" + suffix);
+        }
+
+        private static LanceTestCluster registerAndWait(Path scratchDir, String indexName) throws Exception {
             Response register = postJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             assertEquals(
                 "namespace register failed: " + readAll(register),
@@ -253,7 +323,6 @@ public class LancePluginIT extends OpenSearchRestTestCase {
 
             // Poll cadence is 1s (see build.gradle); the assertBusy default
             // (10s) leaves plenty of headroom for the surface path to run.
-            String indexName = "demo-" + suffix;
             assertBusy(() -> {
                 Response cat = client().performRequest(new Request("GET", "/_cat/indices?format=json"));
                 String body = readAll(cat);
