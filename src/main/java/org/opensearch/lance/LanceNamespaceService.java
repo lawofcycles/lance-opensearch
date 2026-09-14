@@ -13,6 +13,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.lance.Dataset;
@@ -29,7 +30,9 @@ import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 
@@ -346,45 +349,99 @@ public final class LanceNamespaceService {
 
     /**
      * Compare the Lance table's current schema against the OpenSearch mapping
-     * to spot column renames. Field ids are immutable on the Lance side, so a
-     * pairing of "same id, different name" means the writer renamed a column
-     * since we last checked out.
-     *
-     * <p>Reacting to the rename (rewriting the mapping to the new name) is a
-     * follow-up; today we log a warning per rename per session so operators
-     * see it and can decide whether to recreate the index.
+     * to detect column renames, schema resets (a field id reused with a
+     * different Arrow type), and drops. Reactions:
+     * <ul>
+     *   <li>Rename (same id, same Arrow type, different name): log a warning
+     *       once per session. The old name lingers because PutMapping cannot
+     *       remove properties.</li>
+     *   <li>Schema reset (same id, different Arrow type): log a drop + add
+     *       pair, mark the stale name as {@code lance_dropped}, and let the
+     *       mapping re-derivation add the new column.</li>
+     *   <li>Drop (id gone from Lance): log once and mark the stale name as
+     *       {@code lance_dropped}.</li>
+     * </ul>
+     * {@code lance_dropped} is stored in the field's {@code meta} so
+     * {@link LanceTextFieldMapper}, {@link LanceVectorFieldMapper}, and any
+     * future custom type can reject queries against it up front. Standard
+     * scalar mappers (integer / keyword / date / boolean) do not honour it
+     * yet — they still accept queries silently.
      */
     private void warnOnLanceFieldRename(String indexName, LanceSchema lanceSchema) {
-        Map<Integer, String> mappingFieldIdToName;
+        Map<Integer, MappingFieldInfo> mappingFieldIds;
         try {
-            mappingFieldIdToName = readMappingFieldIds(indexName);
+            mappingFieldIds = readMappingFieldIds(indexName);
         } catch (Exception e) {
             LOG.debug("could not inspect mapping meta for {}: {}", indexName, e.getMessage());
             return;
         }
-        if (mappingFieldIdToName.isEmpty()) {
+        if (mappingFieldIds.isEmpty()) {
             return;
         }
-        java.util.Set<Integer> lanceIds = new java.util.HashSet<>(lanceSchema.fields().size());
+        // Collect field names to mark as dropped after the loop so we can
+        // issue a single PutMapping call. Empty when no drift is observed.
+        Set<String> droppedFieldNames = new java.util.LinkedHashSet<>();
+
+        Map<Integer, LanceField> lanceFieldsById = new HashMap<>();
         for (LanceField field : lanceSchema.fields()) {
-            lanceIds.add(field.getId());
-            String previousName = mappingFieldIdToName.get(field.getId());
-            if (previousName == null || previousName.equals(field.getName())) {
+            lanceFieldsById.put(field.getId(), field);
+        }
+
+        for (LanceField field : lanceSchema.fields()) {
+            MappingFieldInfo mapped = mappingFieldIds.get(field.getId());
+            if (mapped == null || mapped.name.equals(field.getName())) {
                 continue;
             }
-            String key = indexName + ":rename:" + field.getId() + ":" + previousName + "->" + field.getName();
+            String currentArrowType = renameArrowType(field);
+            boolean typeChanged = mapped.arrowType != null && currentArrowType != null && !mapped.arrowType.equals(currentArrowType);
+            if (typeChanged) {
+                // Same id, different Arrow type: not a rename, the writer
+                // dropped the old column and reused the id for a new one.
+                String key = indexName
+                    + ":reset:"
+                    + field.getId()
+                    + ":"
+                    + mapped.name
+                    + "("
+                    + mapped.arrowType
+                    + ")->"
+                    + field.getName()
+                    + "("
+                    + currentArrowType
+                    + ")";
+                if (warnedRenamed.add(key)) {
+                    LOG.warn(
+                        "Lance table for {} reset field id {}: dropped '{}' ({}), added '{}' ({}). "
+                            + "The mapping still exposes '{}'; marking it lance_dropped so lance_text / lance_vector queries fail. "
+                            + "Standard scalar queries against '{}' still succeed silently — recreate the index to drop it.",
+                        indexName,
+                        field.getId(),
+                        mapped.name,
+                        mapped.arrowType,
+                        field.getName(),
+                        currentArrowType,
+                        mapped.name,
+                        mapped.name
+                    );
+                }
+                droppedFieldNames.add(mapped.name);
+                continue;
+            }
+            String key = indexName + ":rename:" + field.getId() + ":" + mapped.name + "->" + field.getName();
             if (warnedRenamed.add(key)) {
                 LOG.warn(
                     "Lance table for {} renamed field id {} from '{}' to '{}'. "
-                        + "The mapping still exposes both names; queries against the old name '{}' will now return 0 hits "
-                        + "because the underlying column no longer maps to it. Recreate the index to drop the stale mapping.",
+                        + "The mapping still exposes both names; marking the old name lance_dropped so lance_text / lance_vector "
+                        + "queries against it fail. Standard scalar queries against '{}' still succeed silently. Recreate the "
+                        + "index to drop the stale mapping.",
                     indexName,
                     field.getId(),
-                    previousName,
+                    mapped.name,
                     field.getName(),
-                    previousName
+                    mapped.name
                 );
             }
+            droppedFieldNames.add(mapped.name);
         }
         // drop_columns / overwrite on the Lance side removes a field id
         // entirely. OpenSearch's PutMapping cannot remove properties, so
@@ -392,34 +449,121 @@ public final class LanceNamespaceService {
         // 0 hits (numeric doc values just return their default, term
         // queries never match). Surface the drift so operators know to
         // recreate the index.
-        for (Map.Entry<Integer, String> mapped : mappingFieldIdToName.entrySet()) {
+        for (Map.Entry<Integer, MappingFieldInfo> mapped : mappingFieldIds.entrySet()) {
             int id = mapped.getKey();
-            if (lanceIds.contains(id)) {
+            if (lanceFieldsById.containsKey(id)) {
                 continue;
             }
-            String staleName = mapped.getValue();
+            String staleName = mapped.getValue().name;
             String key = indexName + ":dropped:" + id + ":" + staleName;
             if (warnedRenamed.add(key)) {
                 LOG.warn(
                     "Lance table for {} no longer contains field id {} ('{}'). "
-                        + "The mapping still exposes '{}' so queries against it will silently return 0 hits; recreate the index to drop it.",
+                        + "Marking the mapping field lance_dropped so lance_text / lance_vector queries against it fail. "
+                        + "Standard scalar queries against '{}' still succeed silently; recreate the index to drop it.",
                     indexName,
                     id,
                     staleName,
                     staleName
                 );
             }
+            droppedFieldNames.add(staleName);
+        }
+        if (!droppedFieldNames.isEmpty()) {
+            markFieldsDropped(indexName, droppedFieldNames, mappingFieldIds);
         }
     }
 
     /**
-     * Read the {@code meta.lance_field_id} value out of every top-level field
-     * in the current mapping. Returns a map from Lance field id to the name
-     * the field currently has in the OpenSearch mapping. Fields without
-     * {@code meta.lance_field_id} (older indexes, non-Lance mappings) are
-     * skipped.
+     * Best-effort encoding of a Lance field's Arrow type that matches the
+     * strings stored under {@code meta.lance_arrow_type} at derivation
+     * time. Returns {@code null} when the type is not one the deriver
+     * fingerprints (unmapped columns).
      */
-    private Map<Integer, String> readMappingFieldIds(String indexName) {
+    private static String renameArrowType(LanceField field) {
+        ArrowType type = field.getType();
+        if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.FixedSizeList fsl) {
+            org.apache.arrow.vector.types.pojo.Field arrow = field.asArrowField();
+            ArrowType child = arrow.getChildren().isEmpty() ? null : arrow.getChildren().get(0).getType();
+            if (child instanceof org.apache.arrow.vector.types.pojo.ArrowType.FloatingPoint fp
+                && fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE) {
+                return "fixed_size_list<float32>[" + fsl.getListSize() + "]";
+            }
+            return null;
+        }
+        if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.List) {
+            if (field.getChildren().size() == 1
+                && field.getChildren().get(0).getType() instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8) {
+                return "list<utf8>";
+            }
+            return null;
+        }
+        return type.toString();
+    }
+
+    /**
+     * Persist {@code meta.lance_dropped = "true"} on each supplied field
+     * name via PutMapping. Silently no-ops when the underlying mapping
+     * update fails — the WARN log entries in the caller are the source of
+     * truth, this is a best-effort assist so custom Lance mappers can
+     * reject queries at the query builder layer.
+     */
+    private void markFieldsDropped(String indexName, Set<String> droppedNames, Map<Integer, MappingFieldInfo> mappingFieldIds) {
+        try {
+            XContentBuilder builder = XContentFactory.jsonBuilder().startObject().startObject("properties");
+            // Extra map from name → info so we can preserve type / meta
+            // when re-emitting each field.
+            Map<String, MappingFieldInfo> byName = new HashMap<>(mappingFieldIds.size());
+            for (MappingFieldInfo info : mappingFieldIds.values()) {
+                byName.put(info.name, info);
+            }
+            for (String name : droppedNames) {
+                MappingFieldInfo info = byName.get(name);
+                if (info == null) {
+                    continue;
+                }
+                // PutMapping requires "type" to be present when updating an
+                // existing field's meta, otherwise the whole field is
+                // rejected. Emit the existing type and the merged meta.
+                builder.startObject(name);
+                if (info.osType != null) {
+                    builder.field("type", info.osType);
+                }
+                if (info.opts != null) {
+                    for (Map.Entry<String, Object> opt : info.opts.entrySet()) {
+                        builder.field(opt.getKey(), opt.getValue());
+                    }
+                }
+                builder.startObject("meta");
+                builder.field("lance_field_id", Integer.toString(info.fieldId));
+                if (info.arrowType != null) {
+                    builder.field("lance_arrow_type", info.arrowType);
+                }
+                builder.field("lance_dropped", "true");
+                builder.endObject();
+                builder.endObject();
+            }
+            builder.endObject().endObject();
+            client.admin()
+                .indices()
+                .preparePutMapping(indexName)
+                .setSource(builder.toString(), MediaTypeRegistry.JSON)
+                .execute()
+                .actionGet();
+        } catch (Exception e) {
+            LOG.debug("could not update lance_dropped meta on {}: {}", indexName, e.getMessage());
+        }
+    }
+
+    /**
+     * Read Lance-related meta off every top-level field in the current
+     * mapping. Fields without {@code meta.lance_field_id} (older indexes,
+     * non-Lance mappings) are skipped. Returns a map from Lance field id
+     * to the field's OpenSearch name, type, Arrow type identifier, and
+     * remaining top-level options (so a subsequent update can round-trip
+     * the field unchanged).
+     */
+    private Map<Integer, MappingFieldInfo> readMappingFieldIds(String indexName) {
         GetMappingsResponse response = client.admin().indices().prepareGetMappings(indexName).execute().actionGet();
         MappingMetadata mapping = response.mappings().get(indexName);
         if (mapping == null) {
@@ -430,7 +574,7 @@ public final class LanceNamespaceService {
         if (!(properties instanceof Map<?, ?> propsMap)) {
             return Map.of();
         }
-        Map<Integer, String> result = new HashMap<>();
+        Map<Integer, MappingFieldInfo> result = new HashMap<>();
         for (Map.Entry<?, ?> entry : propsMap.entrySet()) {
             if (!(entry.getKey() instanceof String name) || !(entry.getValue() instanceof Map<?, ?> field)) {
                 continue;
@@ -439,17 +583,43 @@ public final class LanceNamespaceService {
             if (!(meta instanceof Map<?, ?> metaMap)) {
                 continue;
             }
-            Object raw = metaMap.get("lance_field_id");
-            if (!(raw instanceof String s)) {
+            Object rawId = metaMap.get("lance_field_id");
+            if (!(rawId instanceof String s)) {
                 continue;
             }
+            int fieldId;
             try {
-                result.put(Integer.parseInt(s), name);
+                fieldId = Integer.parseInt(s);
             } catch (NumberFormatException e) {
                 // A hand-crafted mapping may put anything here; skip malformed entries.
+                continue;
             }
+            String osType = field.get("type") instanceof String t ? t : null;
+            String arrowType = metaMap.get("lance_arrow_type") instanceof String at ? at : null;
+            // Preserve any per-type options (e.g. lance_vector's dimension /
+            // element_type) so a subsequent PutMapping to update meta round
+            // trips the field unchanged.
+            Map<String, Object> opts = new HashMap<>();
+            for (Map.Entry<?, ?> optEntry : field.entrySet()) {
+                if (!(optEntry.getKey() instanceof String optName)) {
+                    continue;
+                }
+                if ("type".equals(optName) || "meta".equals(optName)) {
+                    continue;
+                }
+                opts.put(optName, optEntry.getValue());
+            }
+            result.put(fieldId, new MappingFieldInfo(fieldId, name, osType, arrowType, opts));
         }
         return result;
+    }
+
+    /**
+     * Snapshot of one top-level mapping field, kept around so drift
+     * handling and lance_dropped updates can round-trip the field without
+     * losing type-specific options.
+     */
+    private record MappingFieldInfo(int fieldId, String name, String osType, String arrowType, Map<String, Object> opts) {
     }
 
     private String readUncoveredFragmentPolicy(String indexName) {

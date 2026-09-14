@@ -456,6 +456,66 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testDropColumnMarksLanceTextFieldDroppedAndRejectsQuery() throws Exception {
+        // Drop the body column on the Lance side. The polling loop must
+        // detect the dropped Lance field id, add lance_dropped=true to
+        // the mapping meta, and cause subsequent lance_match queries
+        // against `body` to fail with 400 instead of silently returning
+        // zero hits.
+        //
+        // Note: LanceTableFactory.writeTable occasionally fails with
+        // "The FixedSizeList type requires an integer parameter" on
+        // Lance 11.0.0 when the FFI schema handoff races the first
+        // native table creation of a JVM under certain random seeds
+        // (observed at seed 2519BC84C706C3F8 and 3CFD7BCD1F5069CD).
+        // Retry the setUp once to swallow that flake; a persistent
+        // failure still surfaces on the second attempt.
+        LanceTestCluster fixture;
+        try {
+            fixture = LanceTestCluster.setUp(16, "dropbody");
+        } catch (RuntimeException e) {
+            if (e.getMessage() != null && e.getMessage().contains("FixedSizeList type requires an integer parameter")) {
+                fixture = LanceTestCluster.setUp(16, "dropbody");
+            } else {
+                throw e;
+            }
+        }
+        try (LanceTestCluster f = fixture) {
+            String indexName = f.indexName();
+
+            Response baseline = postJson(
+                "/" + indexName + "/_search",
+                "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}}"
+            );
+            int baselineHits = extractIntPath(readAll(baseline), "hits", "total", "value");
+            assertEquals("expected 8 baseline hits for body:hello", 8, baselineHits);
+
+            LanceTableFactory.dropColumns(f.tableUri(), java.util.List.of("body"));
+
+            // Wait for the poll to detect the version bump and PutMapping
+            // lance_dropped=true. Poll cadence is 1s in build.gradle; the
+            // mapping update fires on the next syncTable that sees the
+            // dropped id.
+            assertBusy(() -> {
+                Response mapping = client().performRequest(new Request("GET", "/" + indexName + "/_mapping"));
+                String body = readAll(mapping);
+                assertTrue(
+                    "expected lance_dropped meta on body after drop, saw: " + body,
+                    body.contains("\"body\"") && body.contains("\"lance_dropped\":\"true\"")
+                );
+            });
+
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson("/" + indexName + "/_search", "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}}")
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            assertEquals("expected 400 after body dropped, saw " + status, 400, status);
+            String body = readAll(failure.getResponse());
+            assertTrue("expected 'no longer exists' message, saw: " + body, body.contains("no longer exists"));
+        }
+    }
+
     public void testLanceKnnAppliesFilterAsPreFilter() throws Exception {
         // With row i at coordinate (i, 0, ...), the two rows nearest to
         // (2.4, 0, ...) are id 2 and id 3. A pre-filter of id >= 10 must
@@ -640,6 +700,15 @@ public class LancePluginIT extends OpenSearchRestTestCase {
 
         String indexName() {
             return indexName;
+        }
+
+        /**
+         * Absolute filesystem URI of the underlying Lance table. Tests that
+         * need to mutate the table (drop columns, append rows) can hand
+         * this to {@link LanceTableFactory}.
+         */
+        String tableUri() {
+            return scratchDir.resolve("demo-" + scratchDir.getFileName().toString().substring("lance-it-".length()) + ".lance").toString();
         }
 
         static LanceTestCluster setUp(int rowCount, String testHint) throws Exception {

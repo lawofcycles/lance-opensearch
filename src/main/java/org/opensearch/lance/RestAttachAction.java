@@ -353,28 +353,28 @@ public class RestAttachAction extends BaseRestHandler {
                         notes.add("column " + name + ": unsupported int width " + bitWidth);
                         continue;
                 }
-                startFieldWithId(mapping, name, fieldId, osType);
+                startFieldWithId(mapping, name, fieldId, osType, arrowTypeIdentity(intType));
                 mapping.field("index", false).field("doc_values", true).endObject();
                 scalarColumns.add(name);
             } else if (type instanceof ArrowType.Bool) {
-                startFieldWithId(mapping, name, fieldId, "boolean");
+                startFieldWithId(mapping, name, fieldId, "boolean", arrowTypeIdentity(type));
                 mapping.field("index", false).field("doc_values", true).endObject();
                 scalarColumns.add(name);
             } else if (type instanceof ArrowType.Date || type instanceof ArrowType.Timestamp) {
                 // Date32/Date64 and every Timestamp unit are normalized to epoch millis
                 // by the reader, so the default epoch_millis-friendly format applies.
-                startFieldWithId(mapping, name, fieldId, "date");
+                startFieldWithId(mapping, name, fieldId, "date", arrowTypeIdentity(type));
                 mapping.field("index", false).field("doc_values", true).endObject();
                 scalarColumns.add(name);
             } else if (type instanceof ArrowType.Utf8) {
                 boolean hasFts = !dataset.describeIndices(new IndexCriteria.Builder().forColumn(name).mustSupportFts(true).build())
                     .isEmpty();
                 if (hasFts) {
-                    startFieldWithId(mapping, name, fieldId, "lance_text");
+                    startFieldWithId(mapping, name, fieldId, "lance_text", arrowTypeIdentity(type));
                     mapping.endObject();
                     ftsColumns.add(name);
                 } else {
-                    startFieldWithId(mapping, name, fieldId, "keyword");
+                    startFieldWithId(mapping, name, fieldId, "keyword", arrowTypeIdentity(type));
                     mapping.field("index", false).field("doc_values", true).endObject();
                     scalarColumns.add(name);
                 }
@@ -395,7 +395,7 @@ public class RestAttachAction extends BaseRestHandler {
                     // parameter is required by the mapper; the query builder
                     // will reject a knn call whose vector length does not
                     // match.
-                    startFieldWithId(mapping, name, fieldId, "lance_vector");
+                    startFieldWithId(mapping, name, fieldId, "lance_vector", "fixed_size_list<float32>[" + fsl.getListSize() + "]");
                     mapping.field("dimension", fsl.getListSize());
                     mapping.field("element_type", "Float32");
                     mapping.endObject();
@@ -424,14 +424,14 @@ public class RestAttachAction extends BaseRestHandler {
                     // List<Utf8> maps to keyword. OpenSearch's keyword is multi-valued
                     // through SortedSetDocValues, and Lance stores the element list per
                     // row in a ListVector, so no additional mapping option is needed.
-                    startFieldWithId(mapping, name, fieldId, "keyword");
+                    startFieldWithId(mapping, name, fieldId, "keyword", "list<utf8>");
                     mapping.field("index", false).field("doc_values", true).endObject();
                     scalarColumns.add(name);
                 } else if (type instanceof ArrowType.Binary || type instanceof ArrowType.LargeBinary) {
                     // Binary / LargeBinary map to OpenSearch's binary type: the value is
                     // base64-encoded in _source and neither indexed nor loaded into doc
                     // values. Users can still retrieve raw bytes through _source.
-                    startFieldWithId(mapping, name, fieldId, "binary");
+                    startFieldWithId(mapping, name, fieldId, "binary", arrowTypeIdentity(type));
                     mapping.endObject();
                 } else {
                     notes.add(name + ": " + type + ", stored only");
@@ -463,16 +463,43 @@ public class RestAttachAction extends BaseRestHandler {
     }
 
     /**
-     * Emit the leading portion of a field mapping and stash the Lance field id in the
-     * OpenSearch field meta so subsequent checkouts can spot a rename on the Lance
-     * side (see {@link LanceNamespaceService#syncTable}). Callers finish the field
-     * with any type specific options and a matching {@code endObject()}.
+     * Emit the leading portion of a field mapping and stash the Lance field id
+     * plus the Arrow type name in the OpenSearch field meta so subsequent
+     * checkouts can distinguish a column rename (same id, same type, different
+     * name) from a schema reset (same id, different type) and mark stale
+     * mappings as {@code lance_dropped}. See
+     * {@link LanceNamespaceService#syncTable}. Callers finish the field with
+     * any type specific options and a matching {@code endObject()}.
      *
-     * <p>OpenSearch's field {@code meta} only accepts string values, so the id is
-     * stringified.
+     * <p>OpenSearch's field {@code meta} only accepts string values, so both
+     * fields are stringified.
      */
+    private static String arrowTypeIdentity(ArrowType type) {
+        // Return a stable, comparable string that identifies an Arrow type
+        // to the degree that matters for column identity across schema
+        // revisions. Two same-id fields whose {@link #arrowTypeIdentity}
+        // agree are treated as the same column; a mismatch signals a
+        // schema reset (drop + re-add reusing the field id).
+        //
+        // {@link ArrowType#toString()} already covers Int width and
+        // signedness, Timestamp unit, Date width, and the FloatingPoint
+        // precision, which are the parts of the type that alter the
+        // OpenSearch mapping. FixedSizeList and List identities are built
+        // by the callers because their identity includes the child type.
+        return type.toString();
+    }
+
     private static void startFieldWithId(XContentBuilder mapping, String name, int fieldId, String type) throws Exception {
+        startFieldWithId(mapping, name, fieldId, type, null);
+    }
+
+    private static void startFieldWithId(XContentBuilder mapping, String name, int fieldId, String type, String arrowType)
+        throws Exception {
         mapping.startObject(name).field("type", type);
-        mapping.startObject("meta").field("lance_field_id", Integer.toString(fieldId)).endObject();
+        mapping.startObject("meta").field("lance_field_id", Integer.toString(fieldId));
+        if (arrowType != null) {
+            mapping.field("lance_arrow_type", arrowType);
+        }
+        mapping.endObject();
     }
 }

@@ -79,6 +79,7 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
 
         @Override
         public Query termQuery(Object value, QueryShardContext context) {
+            rejectIfDropped();
             String column = tokensColumn != null ? tokensColumn : name();
             String text = value instanceof org.apache.lucene.util.BytesRef b ? b.utf8ToString() : value.toString();
             return new LanceFtsQuery(column, text);
@@ -86,12 +87,31 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
 
         @Override
         public Query existsQuery(QueryShardContext context) {
+            rejectIfDropped();
             return new MatchAllDocsQuery();
         }
 
         @Override
         public ValueFetcher valueFetcher(QueryShardContext context, SearchLookup lookup, String format) {
             return SourceValueFetcher.toString(name(), context, format);
+        }
+
+        /**
+         * Reject queries against this field type when
+         * {@link LanceNamespaceService} has marked it {@code lance_dropped}
+         * after the Lance schema dropped or reset the underlying column.
+         * The mapping is kept for backwards compatibility with existing
+         * caches, but returning matches from a column that no longer
+         * exists would silently give wrong answers.
+         */
+        private void rejectIfDropped() {
+            if ("true".equals(meta().get("lance_dropped"))) {
+                throw new IllegalArgumentException(
+                    "[lance_text] field ["
+                        + name()
+                        + "] no longer exists in the underlying Lance table; recreate the OpenSearch index to drop it"
+                );
+            }
         }
     }
 

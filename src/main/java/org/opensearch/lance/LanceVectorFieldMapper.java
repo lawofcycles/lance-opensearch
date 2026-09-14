@@ -111,6 +111,17 @@ public class LanceVectorFieldMapper extends ParametrizedFieldMapper {
             return elementType;
         }
 
+        /**
+         * True when {@link LanceNamespaceService} has marked this field
+         * {@code lance_dropped} after the Lance schema removed or reset
+         * the underlying vector column. {@link LanceKnnQueryBuilder}
+         * checks this before ever reaching Lance so a stale mapping does
+         * not silently return zero hits or a 500 from the native scan.
+         */
+        public boolean isDropped() {
+            return "true".equals(meta().get("lance_dropped"));
+        }
+
         @Override
         public Query termQuery(Object value, QueryShardContext context) {
             // Vector similarity does not go through term / match query builders.

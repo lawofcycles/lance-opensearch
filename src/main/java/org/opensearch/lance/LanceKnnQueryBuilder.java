@@ -371,6 +371,11 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
                 "[lance_knn] field [" + field + "] is mapped as [" + fieldType.typeName() + "], not [lance_vector]"
             );
         }
+        if (vectorType.isDropped()) {
+            throw new IllegalArgumentException(
+                "[lance_knn] field [" + field + "] no longer exists in the underlying Lance table; recreate the OpenSearch index to drop it"
+            );
+        }
         if (vectorType.dimension() != vector.length) {
             throw new IllegalArgumentException(
                 "[lance_knn] vector length "

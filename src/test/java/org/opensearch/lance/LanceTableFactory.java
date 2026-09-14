@@ -280,4 +280,20 @@ final class LanceTableFactory {
         }
         return uri;
     }
+
+    /**
+     * Drop columns from an existing Lance table. Simulates
+     * {@code dataset.drop_columns([...])} from Python / Rust; used by
+     * integration tests that exercise mapping-drift detection when the
+     * writer removes columns from a table the plugin has already
+     * surfaced.
+     */
+    static void dropColumns(String tableUri, java.util.List<String> columns) throws Exception {
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
+        ) {
+            dataset.dropColumns(columns);
+        }
+    }
 }

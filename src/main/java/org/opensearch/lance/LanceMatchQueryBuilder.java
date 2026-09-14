@@ -183,9 +183,16 @@ public class LanceMatchQueryBuilder extends AbstractQueryBuilder<LanceMatchQuery
         if (fieldType == null) {
             throw new IllegalArgumentException("[lance_match] no such field [" + field + "]");
         }
-        if (!(fieldType instanceof LanceTextFieldMapper.LanceTextFieldType)) {
+        if (!(fieldType instanceof LanceTextFieldMapper.LanceTextFieldType textType)) {
             throw new IllegalArgumentException(
                 "[lance_match] field [" + field + "] is mapped as [" + fieldType.typeName() + "], not [lance_text]"
+            );
+        }
+        if ("true".equals(textType.meta().get("lance_dropped"))) {
+            throw new IllegalArgumentException(
+                "[lance_match] field ["
+                    + field
+                    + "] no longer exists in the underlying Lance table; recreate the OpenSearch index to drop it"
             );
         }
         return new LanceFtsQuery(field, query, operator);

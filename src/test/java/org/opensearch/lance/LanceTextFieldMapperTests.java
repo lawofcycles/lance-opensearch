@@ -59,6 +59,30 @@ public class LanceTextFieldMapperTests extends OpenSearchTestCase {
         assertTrue("expected MatchAllDocsQuery, got " + query.getClass(), query instanceof MatchAllDocsQuery);
     }
 
+    public void testTermQueryRejectsDroppedField() {
+        // LanceNamespaceService marks fields dropped in the mapping meta
+        // when the Lance schema drops the underlying column. lance_text
+        // queries against such a field must throw a 400 rather than
+        // silently return zero hits from a column that no longer exists.
+        LanceTextFieldMapper.LanceTextFieldType dropped = new LanceTextFieldMapper.LanceTextFieldType(
+            "body",
+            null,
+            Map.of("lance_dropped", "true")
+        );
+        Exception e = expectThrows(IllegalArgumentException.class, () -> dropped.termQuery("hello", null));
+        assertTrue("unexpected message: " + e.getMessage(), e.getMessage().contains("no longer exists"));
+    }
+
+    public void testExistsQueryRejectsDroppedField() {
+        LanceTextFieldMapper.LanceTextFieldType dropped = new LanceTextFieldMapper.LanceTextFieldType(
+            "body",
+            null,
+            Map.of("lance_dropped", "true")
+        );
+        Exception e = expectThrows(IllegalArgumentException.class, () -> dropped.existsQuery(null));
+        assertTrue("unexpected message: " + e.getMessage(), e.getMessage().contains("no longer exists"));
+    }
+
     public void testContentTypeConstantIsLanceText() {
         // The string is referenced from LancePlugin.getMappers(); guard against
         // an accidental rename.
