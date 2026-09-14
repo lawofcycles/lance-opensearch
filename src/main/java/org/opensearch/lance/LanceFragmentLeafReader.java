@@ -812,7 +812,16 @@ public final class LanceFragmentLeafReader extends LeafReader {
     void materialiseStoredFields(int docID, StoredFieldVisitor visitor) throws IOException {
         FieldInfo idInfo = storedOnly("_id", 1);
         if (visitor.needsField(idInfo) == StoredFieldVisitor.Status.YES) {
-            org.apache.lucene.util.BytesRef encoded = org.opensearch.index.mapper.Uid.encodeId(Long.toString(values[docID]));
+            // When the Lance table declares a primary key column, values[] holds
+            // its per-row content and _id echoes that. When it doesn't, values[]
+            // is all zeros and every row would collapse to the same _id "0",
+            // silently breaking sort-by-_id and _mget dedup. Fall back to a
+            // synthesised address `<fragment>-<offset>` so at least the _id is
+            // unique inside the shard. GET /_doc/{id} still returns 404 for
+            // these tables (see LanceReadOnlyEngine.get); this synthesis is
+            // strictly for _search response fidelity.
+            String idString = fieldName.isEmpty() ? (fragmentId + "-" + docID) : Long.toString(values[docID]);
+            org.apache.lucene.util.BytesRef encoded = org.opensearch.index.mapper.Uid.encodeId(idString);
             byte[] bytes = new byte[encoded.length];
             System.arraycopy(encoded.bytes, encoded.offset, bytes, 0, encoded.length);
             visitor.binaryField(idInfo, bytes);

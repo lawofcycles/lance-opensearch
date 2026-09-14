@@ -302,6 +302,35 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testPkLessTableSynthesisesUniqueIdsInSearchResults() throws Exception {
+        // Regression for #24: a table with no declared primary key used to
+        // emit _id: "0" for every hit because the reader's values[] array
+        // stayed at its default long[] zeros. Every hit collapsed to the
+        // same id and any client that dedup'd by _id (Dashboards result
+        // grids, _mget by hits, etc.) silently lost rows. Synthesised ids
+        // must at least be unique within the shard.
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(6, "nopksearch")) {
+            String indexName = fixture.indexName();
+
+            Response search = postJson("/" + indexName + "/_search", "{\"size\":6}");
+            String body = readAll(search);
+            int totalHits = extractIntPath(body, "hits", "total", "value");
+            assertEquals("expected 6 hits, saw response: " + body, 6, totalHits);
+            java.util.Set<String> ids = new java.util.HashSet<>();
+            try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, body)) {
+                java.util.Map<String, Object> map = parser.map();
+                @SuppressWarnings("unchecked")
+                java.util.List<Object> hits = (java.util.List<Object>) ((java.util.Map<String, Object>) map.get("hits")).get("hits");
+                for (Object hitObj : hits) {
+                    @SuppressWarnings("unchecked")
+                    java.util.Map<String, Object> hit = (java.util.Map<String, Object>) hitObj;
+                    ids.add((String) hit.get("_id"));
+                }
+            }
+            assertEquals("expected 6 unique synthesised ids, saw: " + ids + " (body=" + body + ")", 6, ids.size());
+        }
+    }
+
     public void testAttachAndKnn() throws Exception {
         // Row i sits at coordinate (i, 0, 0, ...) so the nearest neighbour
         // of (2.4, 0, ...) is row 2 followed by row 3. Vector index build is
