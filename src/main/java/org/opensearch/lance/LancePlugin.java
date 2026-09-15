@@ -5,10 +5,13 @@
 
 package org.opensearch.lance;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Supplier;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.common.settings.ClusterSettings;
@@ -49,6 +52,8 @@ import org.opensearch.rest.RestHandler;
  * read-only engine, mapping type parsers, and the {@code lance_knn} query.
  */
 public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, MapperPlugin, SearchPlugin {
+
+    private static final Logger LOGGER = LogManager.getLogger(LancePlugin.class);
 
     @Override
     public List<QuerySpec<?>> getQueries() {
@@ -130,6 +135,28 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.Final
     );
 
+    /**
+     * Node-scoped upper bound on the memory that Lance's shared
+     * {@link org.lance.Session} may consume for its index and metadata
+     * caches. Accepts either an absolute {@link org.opensearch.core.common.unit.ByteSizeValue}
+     * (for example {@code "10gb"}) or a percentage of the memory left on
+     * the host once the JVM heap is subtracted (for example {@code "40%"}).
+     *
+     * <p>The default of {@code "40%"} lets Lance scale with the node's
+     * physical memory rather than a fixed byte count, and leaves room
+     * for the k-NN plugin's own {@code knn.memory.circuit_breaker.limit}
+     * (default {@code "50%"}) on nodes that host both plugins. Layer 2
+     * of the native-memory design will make this dynamic; for now the
+     * setting is node-scoped only, so a change requires a rolling
+     * restart to take effect.
+     */
+    public static final Setting<String> NATIVE_MEMORY_LIMIT_SETTING = Setting.simpleString(
+        "lance.native_memory.limit",
+        "40%",
+        LancePlugin::validateNativeMemoryLimit,
+        Setting.Property.NodeScope
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -139,7 +166,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             NAMESPACE_POLL_CADENCE_SETTING,
             BUILDER_MAX_ROWS_SETTING,
             ALLOWED_TABLE_ROOTS_SETTING,
-            STORAGE_OPTIONS_SETTING
+            STORAGE_OPTIONS_SETTING,
+            NATIVE_MEMORY_LIMIT_SETTING
         );
     }
 
@@ -147,6 +175,15 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         if (!"wait".equals(value) && !"immediate".equals(value)) {
             throw new IllegalArgumentException("index.lance.uncovered_fragment_policy must be 'wait' or 'immediate', got '" + value + "'");
         }
+    }
+
+    private static void validateNativeMemoryLimit(String value) {
+        // Delegate to the parser so validation and resolution stay in
+        // one place. The parser throws OpenSearchParseException /
+        // IllegalArgumentException on malformed input, which
+        // Setting.simpleString surfaces back to the operator as a
+        // 400-style validation error.
+        NativeMemoryLimit.parse(value, "lance.native_memory.limit");
     }
 
     @Override
@@ -179,8 +216,40 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         TimeValue cadence = NAMESPACE_POLL_CADENCE_SETTING.get(environment.settings());
         long builderMaxRows = BUILDER_MAX_ROWS_SETTING.get(environment.settings());
         this.allowedTableRoots = new AllowedTableRoots(ALLOWED_TABLE_ROOTS_SETTING.get(environment.settings()));
+
+        // Install the node-scoped Lance Session before any Dataset is
+        // opened. LanceEngineFactory and the REST attach / namespace
+        // handlers all route their Dataset.open calls through
+        // LanceRegistry.openDataset, so once the Session is set here
+        // every shard on the node will share its index and metadata
+        // caches instead of each shard allocating its own 6 GiB / 1 GiB
+        // budget out of native memory.
+        String rawLimit = NATIVE_MEMORY_LIMIT_SETTING.get(environment.settings());
+        long totalBytes = NativeMemoryLimit.parse(rawLimit, NATIVE_MEMORY_LIMIT_SETTING.getKey());
+        long indexCacheBytes = NativeMemoryLimit.indexCacheBytes(totalBytes);
+        long metadataCacheBytes = NativeMemoryLimit.metadataCacheBytes(totalBytes);
+        LanceRegistry.initSession(indexCacheBytes, metadataCacheBytes);
+        LOGGER.info(
+            "installed shared Lance Session: limit [{}] -> index cache [{}], metadata cache [{}] (from lance.native_memory.limit [{}])",
+            NativeMemoryLimit.humanReadable(totalBytes),
+            NativeMemoryLimit.humanReadable(indexCacheBytes),
+            NativeMemoryLimit.humanReadable(metadataCacheBytes),
+            rawLimit
+        );
+
         namespaceService = new LanceNamespaceService(client, threadPool, cadence, builderMaxRows);
         return List.of(namespaceService);
+    }
+
+    @Override
+    public void close() throws IOException {
+        // Release the shared native Session so a test-framework restart
+        // within the same JVM doesn't accumulate stale Session handles.
+        // Existing Dataset handles keep their own Arc reference to the
+        // underlying native session, so this call is safe even if some
+        // shards are still open at the moment of shutdown.
+        LanceRegistry.closeSession();
+        super.close();
     }
 
     @Override

@@ -410,6 +410,17 @@ Force a faster poll by lowering `lance.namespace.poll_cadence` (node-level setti
 lance.namespace.poll_cadence: 1s
 ```
 
+### Cap Lance's native memory footprint
+
+Lance keeps its inverted-index and metadata caches in native memory, outside the JVM heap. The plugin installs a single Lance `Session` at startup so every table on a node shares the same caches. The upper bound is set by `lance.native_memory.limit`, a node-level setting that accepts either a byte value or a percentage of the memory left after the JVM heap is subtracted from physical memory. The default is `40%`, which scales with instance size and leaves room for the k-NN plugin's own memory budget on nodes that host both plugins.
+
+```
+lance.native_memory.limit: 40%      # default; percent of (physical - heap)
+lance.native_memory.limit: 10gb     # or an absolute byte value
+```
+
+The parsed value is split 6:1 between the index cache and the metadata cache, mirroring Lance's own default ratio. On startup the plugin logs the resolved sizes so the operator can confirm the split, for example `installed shared Lance Session: limit [10gb] -> index cache [8.5gb], metadata cache [1.4gb] (from lance.native_memory.limit [10gb])`. This is a static setting today, so a change requires a rolling restart to take effect.
+
 ## 7. Cleanup and restart
 
 The namespace registry is held in process memory. Restarting OpenSearch clears the registrations, and any Lance-backed indices survive as regular OpenSearch indices without a live sync loop. To resume auto-surface after a restart:
