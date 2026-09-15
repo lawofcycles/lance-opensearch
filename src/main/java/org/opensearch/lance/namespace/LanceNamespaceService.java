@@ -34,6 +34,7 @@ import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceIndexBuilder;
 import org.opensearch.lance.rest.RestAttachAction;
@@ -62,12 +63,12 @@ public final class LanceNamespaceService {
     private final List<RegisteredNamespace> namespaces = new CopyOnWriteArrayList<>();
     private final Map<String, Long> servedVersions = new ConcurrentHashMap<>();
     // Index names created via /_lance/attach along with the absolute Lance
-    // table path they point at. Tracked here so poll() can extend append
-    // coverage to attach-only indexes and not just namespace-registered
-    // tables (see C6: the previous behaviour was that appending to a table
-    // whose index came from attach never surfaced through _search until the
-    // operator hit refresh manually).
-    private final Map<String, String> attachedIndexes = new ConcurrentHashMap<>();
+    // table path and storage_options they point at. Tracked here so poll()
+    // can extend append coverage to attach-only indexes and not just
+    // namespace-registered tables (see C6: the previous behaviour was that
+    // appending to a table whose index came from attach never surfaced
+    // through _search until the operator hit refresh manually).
+    private final Map<String, AttachedIndex> attachedIndexes = new ConcurrentHashMap<>();
     // Index names we've already flagged as unowned, so the poll doesn't shout
     // the same warning every ten seconds. Cleared if the collision resolves.
     private final Set<String> warnedUnowned = ConcurrentHashMap.newKeySet();
@@ -89,6 +90,10 @@ public final class LanceNamespaceService {
     }
 
     public void register(String rootUri) {
+        register(rootUri, StorageOptions.empty());
+    }
+
+    public void register(String rootUri, StorageOptions storageOptions) {
         for (RegisteredNamespace ns : namespaces) {
             if (ns.rootUri.equals(rootUri)) {
                 return;
@@ -99,7 +104,7 @@ public final class LanceNamespaceService {
             Map<String, String> config = new HashMap<>();
             config.put("root", rootUri);
             namespace.initialize(config, LanceRegistry.allocator());
-            namespaces.add(new RegisteredNamespace(rootUri, namespace));
+            namespaces.add(new RegisteredNamespace(rootUri, namespace, storageOptions));
         } catch (Exception e) {
             LOG.warn("failed to initialise namespace {} through DirectoryNamespace", rootUri, e);
         }
@@ -132,7 +137,7 @@ public final class LanceNamespaceService {
                     continue;
                 }
                 for (String tableName : tables) {
-                    syncTable(ns.rootUri, tableName);
+                    syncTable(ns.rootUri, tableName, ns.storageOptions);
                 }
             } catch (Exception e) {
                 LOG.warn("namespace poll failed for {}", ns.rootUri, e);
@@ -142,32 +147,33 @@ public final class LanceNamespaceService {
         // same schedule as namespace-registered tables. attach records the
         // (indexName -> tablePath) pair; the sync path is the same, just
         // without the rootUri / tableName join namespace tables use.
-        for (Map.Entry<String, String> entry : attachedIndexes.entrySet()) {
+        for (Map.Entry<String, AttachedIndex> entry : attachedIndexes.entrySet()) {
+            AttachedIndex attached = entry.getValue();
             try {
-                syncAttachedTable(entry.getKey(), entry.getValue());
+                syncAttachedTable(entry.getKey(), attached.tablePath, attached.storageOptions);
             } catch (Exception e) {
-                LOG.warn("attach poll failed for index {} at {}", entry.getKey(), entry.getValue(), e);
+                LOG.warn("attach poll failed for index {} at {}", entry.getKey(), attached.tablePath, e);
             }
         }
     }
 
-    private void syncTable(String rootUri, String tableName) {
+    private void syncTable(String rootUri, String tableName, StorageOptions storageOptions) {
         String table = rootUri + "/" + tableName + ".lance";
-        runSyncCycle(table, tableName);
+        runSyncCycle(table, tableName, storageOptions);
     }
 
     // Attach-created indexes carry the fully-qualified table path already,
     // so the rootUri / tableName join namespace tables use doesn't apply.
     // Everything downstream of the path resolution is identical.
-    private void syncAttachedTable(String indexName, String tablePath) {
-        runSyncCycle(tablePath, indexName);
+    private void syncAttachedTable(String indexName, String tablePath, StorageOptions storageOptions) {
+        runSyncCycle(tablePath, indexName, storageOptions);
     }
 
-    private void runSyncCycle(String table, String indexName) {
+    private void runSyncCycle(String table, String indexName, StorageOptions storageOptions) {
         try {
             boolean exists = client.admin().indices().exists(new IndicesExistsRequest(indexName)).actionGet().isExists();
             if (!exists) {
-                surface(indexName, table);
+                surface(indexName, table, storageOptions);
                 return;
             }
             Long served = servedVersions.get(indexName);
@@ -193,7 +199,7 @@ public final class LanceNamespaceService {
             String policy = readUncoveredFragmentPolicy(indexName);
             long latest;
             String rederivedMappingJson = null;
-            try (Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(table).build()) {
+            try (Dataset dataset = LanceRegistry.openDataset(table, storageOptions)) {
                 latest = dataset.version();
                 if (latest > served) {
                     // The RFC's Mapping interface states the mapping is re-derived at
@@ -266,7 +272,7 @@ public final class LanceNamespaceService {
                                     .delete(new org.opensearch.action.admin.indices.delete.DeleteIndexRequest(indexName))
                                     .actionGet();
                                 servedVersions.remove(indexName);
-                                surface(indexName, table);
+                                surface(indexName, table, storageOptions);
                                 return;
                             } catch (Exception rebuild) {
                                 LOG.warn("rebuild after type change failed for {}: {}", indexName, rebuild.getMessage());
@@ -284,9 +290,9 @@ public final class LanceNamespaceService {
         }
     }
 
-    private void surface(String indexName, String table) throws Exception {
+    private void surface(String indexName, String table, StorageOptions storageOptions) throws Exception {
         RestAttachAction.Derivation derivation;
-        try (Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(table).build()) {
+        try (Dataset dataset = LanceRegistry.openDataset(table, storageOptions)) {
             // Derive first so the CreateIndex settings and mapping reflect
             // the current Lance schema. Automatic index creation is off by
             // default (see C3 / C9); operators build indexes explicitly
@@ -299,17 +305,16 @@ public final class LanceNamespaceService {
         // behind that block. See issue #29.
         final long version = derivation.version();
         final int shards = derivation.shards();
+        Settings.Builder settings = Settings.builder()
+            .put("index.number_of_shards", shards)
+            .put("index.number_of_replicas", 0)
+            .put(LanceEngineFactory.TABLE_SETTING, table)
+            .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField());
+        storageOptions.writeToSettings(settings);
         client.admin()
             .indices()
             .create(
-                new CreateIndexRequest(indexName).settings(
-                    Settings.builder()
-                        .put("index.number_of_shards", shards)
-                        .put("index.number_of_replicas", 0)
-                        .put(LanceEngineFactory.TABLE_SETTING, table)
-                        .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField())
-                        .build()
-                ).mapping(derivation.mappingJson()),
+                new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson()),
                 new ActionListener<org.opensearch.action.admin.indices.create.CreateIndexResponse>() {
                     @Override
                     public void onResponse(org.opensearch.action.admin.indices.create.CreateIndexResponse response) {
@@ -347,7 +352,11 @@ public final class LanceNamespaceService {
      * are a no-op beyond overwriting the served version.
      */
     public void registerAttachedIndex(String indexName, String tablePath, long version) {
-        attachedIndexes.put(indexName, tablePath);
+        registerAttachedIndex(indexName, tablePath, version, StorageOptions.empty());
+    }
+
+    public void registerAttachedIndex(String indexName, String tablePath, long version, StorageOptions storageOptions) {
+        attachedIndexes.put(indexName, new AttachedIndex(tablePath, storageOptions));
         servedVersions.put(indexName, version);
     }
 
@@ -640,6 +649,9 @@ public final class LanceNamespaceService {
         }
     }
 
-    private record RegisteredNamespace(String rootUri, DirectoryNamespace namespace) {
+    private record RegisteredNamespace(String rootUri, DirectoryNamespace namespace, StorageOptions storageOptions) {
+    }
+
+    private record AttachedIndex(String tablePath, StorageOptions storageOptions) {
     }
 }

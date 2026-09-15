@@ -35,10 +35,11 @@ import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.common.lucene.uid.VersionsAndSeqNoResolver.DocIdAndVersion;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
-import org.opensearch.lance.LanceRegistry;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.ReadOnlyEngine;
+import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.StorageOptions;
 
 /**
  * Engine factory producing a read-only engine backed by a Lance table.
@@ -62,7 +63,8 @@ public final class LanceEngineFactory implements EngineFactory {
         String field = config.getIndexSettings().getSettings().get(PRIMARY_KEY_FIELD_SETTING, "");
         int shardId = config.getShardId().id();
         int numShards = config.getIndexSettings().getNumberOfShards();
-        return new LanceReadOnlyEngine(config, table, field, shardId, numShards);
+        StorageOptions storageOptions = StorageOptions.fromIndexSettings(config.getIndexSettings().getSettings());
+        return new LanceReadOnlyEngine(config, table, field, shardId, numShards, storageOptions);
     }
 
     static final class LanceReadOnlyEngine extends ReadOnlyEngine {
@@ -73,18 +75,20 @@ public final class LanceEngineFactory implements EngineFactory {
         final String field;
         final int shardId;
         final int numShards;
+        final StorageOptions storageOptions;
         private final LanceReaderManager lanceReaderManager;
 
-        LanceReadOnlyEngine(EngineConfig config, String table, String field, int shardId, int numShards) {
+        LanceReadOnlyEngine(EngineConfig config, String table, String field, int shardId, int numShards, StorageOptions storageOptions) {
             super(config, null, null, true, Function.identity(), true);
             this.tablePath = table;
             this.field = field;
             this.shardId = shardId;
             this.numShards = numShards;
+            this.storageOptions = storageOptions;
             try {
                 OpenSearchDirectoryReader initial = openLanceReader();
                 long initialVersion;
-                try (Dataset probe = Dataset.open().allocator(LanceRegistry.allocator()).uri(tablePath).build()) {
+                try (Dataset probe = LanceRegistry.openDataset(tablePath, storageOptions)) {
                     initialVersion = probe.version();
                 }
                 this.lanceReaderManager = new LanceReaderManager(initial, this, initialVersion);
@@ -97,7 +101,7 @@ public final class LanceEngineFactory implements EngineFactory {
             Directory directory = engineConfig.getStore().directory();
             SegmentInfos infos = getLastCommittedSegmentInfos();
             IndexCommit commit = Lucene.getIndexCommit(infos, directory);
-            Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(tablePath).build();
+            Dataset dataset = LanceRegistry.openDataset(tablePath, storageOptions);
             // If wrapping the dataset in a directory reader fails, close it
             // here — otherwise the JNI-owned Dataset handle leaks and
             // eventually starves the native allocator. `LanceDirectoryReader`
@@ -343,7 +347,7 @@ public final class LanceEngineFactory implements EngineFactory {
             // safe: a concurrent `maybeRefresh()` blocks on refreshLock
             // and will observe the updated version once we return.
             long latest;
-            try (Dataset probe = Dataset.open().allocator(LanceRegistry.allocator()).uri(engine.tablePath).build()) {
+            try (Dataset probe = LanceRegistry.openDataset(engine.tablePath, engine.storageOptions)) {
                 latest = probe.version();
             }
             if (latest == servedVersion) {

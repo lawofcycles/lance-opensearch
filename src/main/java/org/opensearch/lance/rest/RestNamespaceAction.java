@@ -11,6 +11,7 @@ import java.util.Map;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.namespace.AllowedTableRoots;
 import org.opensearch.lance.namespace.LanceNamespaceService;
 import org.opensearch.rest.BaseRestHandler;
@@ -99,6 +100,13 @@ public class RestNamespaceAction extends BaseRestHandler {
                 )
             );
         }
+        StorageOptions storageOptions;
+        try {
+            storageOptions = StorageOptions.parseFromRequestField(body.get("storage_options"), "[lance_namespace]");
+        } catch (IllegalArgumentException e) {
+            String message = e.getMessage();
+            return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
+        }
         // Path existence check for filesystem-scheme paths. Object-store
         // schemes (s3://, gs://, azure://, ...) route through Lance's own
         // storage layer and cannot be probed from here; skip the check for
@@ -125,8 +133,9 @@ public class RestNamespaceAction extends BaseRestHandler {
                 );
             }
         }
+        final StorageOptions storageOptionsFinal = storageOptions;
         return channel -> {
-            service.register(path);
+            service.register(path, storageOptionsFinal);
             try (XContentBuilder b = channel.newBuilder()) {
                 b.startObject().field("registered", path).field("note", "tables surface as indexes within the poll cadence").endObject();
                 channel.sendResponse(new BytesRestResponse(RestStatus.OK, b));

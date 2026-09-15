@@ -163,6 +163,35 @@ curl -X POST http://localhost:9200/_lance/attach \
 
 The call is idempotent; a second attach on the same table returns `already_attached: true`.
 
+### Point at S3, GCS, or Azure with storage_options
+
+For tables that live in an object store, add a `storage_options` map on either the attach body or the namespace body. Keys follow Lance's Rust `object_store` names, so what you write is exactly what Lance receives.
+
+```
+curl -X POST http://localhost:9200/_lance/attach \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "table": "s3://my-bucket/tables/demo.lance",
+        "storage_options": {
+          "aws_region": "us-east-1",
+          "aws_access_key_id": "AKIA...",
+          "aws_secret_access_key": "..."
+        }
+      }'
+```
+
+The same shape works on `POST /_lance/namespace`; every table auto-surfaced under that namespace inherits the map. Common keys:
+
+| Provider | Keys |
+|---|---|
+| AWS S3 | `aws_region`, `aws_endpoint`, `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token`, `aws_virtual_hosted_style_request`, `allow_http` |
+| GCS | `gcs_bucket`, `gcs_service_account_key`, `gcs_application_credentials` |
+| Azure | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_token` |
+
+Values must be strings. The plugin does not enumerate a fixed allowlist; whatever keys Lance's Rust `object_store` recognises for the URI scheme reach it verbatim. When `storage_options` is omitted, Lance falls back to its normal environment-variable path (`AWS_*` / `GCS_*` / `AZURE_*`).
+
+Options are persisted as `index.lance.storage_options.<key>` on the created index, so a single node can address two buckets with different credentials at the same time. They are stored in plain index settings today; treat them the way you would treat any other index setting.
+
 ## 5. Verify: run the four query shapes
 
 Each command below assumes the index name `demo` from step 4.

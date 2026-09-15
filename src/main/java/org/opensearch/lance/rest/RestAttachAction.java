@@ -26,6 +26,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.namespace.AllowedTableRoots;
 import org.opensearch.lance.namespace.LanceNamespaceService;
@@ -91,6 +92,7 @@ public class RestAttachAction extends BaseRestHandler {
         String table;
         String explicitName;
         Number pinnedShards;
+        StorageOptions storageOptions;
         try {
             table = readOptionalString(body, "table");
             if (table == null || table.isEmpty()) {
@@ -98,6 +100,7 @@ public class RestAttachAction extends BaseRestHandler {
             }
             explicitName = readOptionalString(body, "name");
             pinnedShards = readOptionalNumber(body, "number_of_shards");
+            storageOptions = StorageOptions.parseFromRequestField(body.get("storage_options"), "[lance_attach]");
         } catch (IllegalArgumentException e) {
             String message = e.getMessage();
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
@@ -116,18 +119,19 @@ public class RestAttachAction extends BaseRestHandler {
         final String tableFinal = table;
         final String indexName = explicitName != null ? explicitName : tableName(table);
         final Number pinnedShardsFinal = pinnedShards;
+        final StorageOptions storageOptionsFinal = storageOptions;
 
         // Dispatch the JNI work to the generic pool. Dataset.open blocks on
         // native I/O and would trip the transport-thread assertion otherwise.
         return channel -> threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             Derivation derivation;
-            try (Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(tableFinal).build()) {
+            try (Dataset dataset = LanceRegistry.openDataset(tableFinal, storageOptionsFinal)) {
                 derivation = derive(dataset, pinnedShardsFinal);
             } catch (Exception e) {
                 sendError(channel, e);
                 return;
             }
-            createIndex(client, channel, indexName, tableFinal, derivation, namespaceService);
+            createIndex(client, channel, indexName, tableFinal, derivation, namespaceService, storageOptionsFinal);
         });
     }
 
@@ -137,16 +141,16 @@ public class RestAttachAction extends BaseRestHandler {
         String indexName,
         String table,
         Derivation derivation,
-        LanceNamespaceService namespaceService
+        LanceNamespaceService namespaceService,
+        StorageOptions storageOptions
     ) {
-        CreateIndexRequest create = new CreateIndexRequest(indexName).settings(
-            Settings.builder()
-                .put("index.number_of_shards", derivation.shards)
-                .put("index.number_of_replicas", 0)
-                .put(LanceEngineFactory.TABLE_SETTING, table)
-                .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField)
-                .build()
-        ).mapping(derivation.mappingJson);
+        Settings.Builder settings = Settings.builder()
+            .put("index.number_of_shards", derivation.shards)
+            .put("index.number_of_replicas", 0)
+            .put(LanceEngineFactory.TABLE_SETTING, table)
+            .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField);
+        storageOptions.writeToSettings(settings);
+        CreateIndexRequest create = new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson);
 
         client.admin().indices().create(create, new ActionListener<CreateIndexResponse>() {
             @Override
@@ -155,7 +159,7 @@ public class RestAttachAction extends BaseRestHandler {
                 // poller so subsequent appends surface without a manual
                 // /_refresh. Idempotent: repeated attaches with the same
                 // (name, table) just refresh the served version.
-                namespaceService.registerAttachedIndex(indexName, table, derivation.version);
+                namespaceService.registerAttachedIndex(indexName, table, derivation.version, storageOptions);
                 writeAttachResponse(channel, indexName, table, derivation, false);
             }
 
@@ -168,7 +172,7 @@ public class RestAttachAction extends BaseRestHandler {
                 // The index already exists. Verify it is a Lance index for the
                 // same table before claiming success; otherwise attach would
                 // silently take credit for an unrelated index.
-                verifyExistingLanceIndex(client, channel, indexName, table, derivation, namespaceService);
+                verifyExistingLanceIndex(client, channel, indexName, table, derivation, namespaceService, storageOptions);
             }
         });
     }
@@ -179,7 +183,8 @@ public class RestAttachAction extends BaseRestHandler {
         String indexName,
         String table,
         Derivation derivation,
-        LanceNamespaceService namespaceService
+        LanceNamespaceService namespaceService,
+        StorageOptions storageOptions
     ) {
         ClusterStateRequest stateRequest = new ClusterStateRequest();
         stateRequest.clear().metadata(true).indices(indexName);
@@ -209,7 +214,7 @@ public class RestAttachAction extends BaseRestHandler {
                 // Same table, so record the (index, table) pair with the
                 // namespace poller in case this node has forgotten it
                 // (cluster restart after attach, for example).
-                namespaceService.registerAttachedIndex(indexName, table, derivation.version);
+                namespaceService.registerAttachedIndex(indexName, table, derivation.version, storageOptions);
                 writeAttachResponse(channel, indexName, table, derivation, true);
             }
 

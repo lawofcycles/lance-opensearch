@@ -233,6 +233,152 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testAttachAcceptsStorageOptionsAndPersistsInSettings() throws Exception {
+        // Local FS tables ignore Lance's object-store credentials, so the
+        // payload here is a syntactic smoke test: the plugin has to parse
+        // storage_options, persist every entry under
+        // index.lance.storage_options.<key>, and still open the dataset
+        // successfully. The values (aws_region / aws_endpoint) don't
+        // affect the local scan.
+        String suffix = "attachso-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson(
+                "/_lance/attach",
+                "{\"table\":\""
+                    + tableUri
+                    + "\",\"storage_options\":{\"aws_region\":\"us-east-1\",\"aws_endpoint\":\"https://s3.example.internal\"}}"
+            );
+            assertEquals(
+                "attach with storage_options failed: " + readAll(attach),
+                RestStatus.OK.getStatus(),
+                attach.getStatusLine().getStatusCode()
+            );
+
+            Response settings = client().performRequest(new Request("GET", "/" + indexName + "/_settings"));
+            String settingsBody = readAll(settings);
+            assertTrue(
+                "expected persisted aws_region: " + settingsBody,
+                settingsBody.contains("\"aws_region\":\"us-east-1\"")
+            );
+            assertTrue(
+                "expected persisted aws_endpoint: " + settingsBody,
+                settingsBody.contains("\"aws_endpoint\":\"https://s3.example.internal\"")
+            );
+
+            // Sanity: the persisted options do not prevent the engine from
+            // serving reads against the local table.
+            Response search = postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}");
+            int hits = extractIntPath(readAll(search), "hits", "total", "value");
+            assertEquals("expected 4 hits", 4, hits);
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testAttachOmittingStorageOptionsPersistsNothing() throws Exception {
+        // No storage_options field on the request must not seed any
+        // index.lance.storage_options.* entry. Callers depend on this to
+        // detect whether a Lance-backed index carries per-table options.
+        String suffix = "attachnoso-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 2);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            Response settings = client().performRequest(new Request("GET", "/" + indexName + "/_settings"));
+            String settingsBody = readAll(settings);
+            assertFalse(
+                "did not expect any storage_options in settings: " + settingsBody,
+                settingsBody.contains("\"storage_options\"")
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testAttachRejectsNonObjectStorageOptions() throws IOException {
+        // Sending storage_options as a string used to slip past parse into
+        // Lance and surface as a confusing "map required" native error.
+        // Reject at 400 with a message pointing at storage_options.
+        String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"storage_options\":\"not-an-object\"}";
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        assertEquals("expected 400 for non-object storage_options, saw " + status, 400, status);
+        String body = readAll(failure.getResponse());
+        assertTrue("expected message about storage_options: " + body, body.contains("storage_options"));
+        assertTrue("expected message about JSON object: " + body, body.contains("JSON object"));
+    }
+
+    public void testAttachRejectsNestedStorageOptionsValue() throws IOException {
+        // Values must be strings; nested objects would silently
+        // toString() at the JNI boundary. Reject up front.
+        String payload = "{\"table\":\"/tmp/does-not-matter.lance\","
+            + "\"storage_options\":{\"aws_config\":{\"nested\":\"value\"}}}";
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        assertEquals("expected 400 for nested storage_options value, saw " + status, 400, status);
+        String body = readAll(failure.getResponse());
+        assertTrue("expected message about aws_config: " + body, body.contains("aws_config"));
+        assertTrue("expected message about must be a string: " + body, body.contains("must be a string"));
+    }
+
+    public void testNamespaceRegisterPropagatesStorageOptionsToAutoSurfacedIndex() throws Exception {
+        // Namespace-level storage_options must ride into every auto-
+        // surfaced index's settings — that is how a namespace pointing at
+        // an S3 root gives every table under it the same credentials
+        // without repeating them per table.
+        String suffix = "nsso-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 2);
+        String indexName = tableName;
+        try {
+            Response register = postJson(
+                "/_lance/namespace",
+                "{\"path\":\""
+                    + scratchDir.toString()
+                    + "\",\"storage_options\":{\"aws_region\":\"eu-west-1\"}}"
+            );
+            assertEquals(
+                "namespace register failed: " + readAll(register),
+                RestStatus.OK.getStatus(),
+                register.getStatusLine().getStatusCode()
+            );
+            assertBusy(() -> {
+                Response cat = client().performRequest(new Request("GET", "/_cat/indices?format=json"));
+                String body = readAll(cat);
+                assertTrue("waiting for index " + indexName + ", saw: " + body, body.contains("\"" + indexName + "\""));
+            });
+
+            Response settings = client().performRequest(new Request("GET", "/" + indexName + "/_settings"));
+            String settingsBody = readAll(settings);
+            assertTrue(
+                "expected namespace aws_region to propagate: " + settingsBody,
+                settingsBody.contains("\"aws_region\":\"eu-west-1\"")
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+            try {
+                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testBuildIndexesOnUnknownIndexFails() throws IOException {
         // The manual build endpoint targets a specific OpenSearch index. When
         // the index does not exist the call must fail rather than silently

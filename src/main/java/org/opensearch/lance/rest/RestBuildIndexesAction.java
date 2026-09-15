@@ -24,6 +24,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceIndexBuilder;
 import org.opensearch.rest.BaseRestHandler;
@@ -127,11 +128,22 @@ public class RestBuildIndexesAction extends BaseRestHandler {
                         sendError(channel, RestStatus.BAD_REQUEST, "index " + indexName + " is not a Lance index");
                         return;
                     }
+                    StorageOptions storageOptions = StorageOptions.fromIndexSettings(metadata.getSettings());
                     // Dispatch the JNI work to the generic pool. Dataset.open
                     // and optimizeIndices block on native I/O and would trip
                     // the transport-thread assertion otherwise.
                     threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
-                        runBuildAndRefresh(client, channel, indexName, tableUri, columnsFilterRaw, fragmentIdsRaw, optimize, retrain);
+                        runBuildAndRefresh(
+                            client,
+                            channel,
+                            indexName,
+                            tableUri,
+                            columnsFilterRaw,
+                            fragmentIdsRaw,
+                            optimize,
+                            retrain,
+                            storageOptions
+                        );
                     });
                 }
 
@@ -151,12 +163,13 @@ public class RestBuildIndexesAction extends BaseRestHandler {
         List<String> columnsFilterRaw,
         List<Number> fragmentIdsRaw,
         boolean optimize,
-        boolean retrain
+        boolean retrain,
+        StorageOptions storageOptions
     ) {
         List<String> ftsBuilt;
         List<String> scalarBuilt;
         List<String> vectorBuilt;
-        try (Dataset dataset = Dataset.open().allocator(LanceRegistry.allocator()).uri(tableUri).build()) {
+        try (Dataset dataset = LanceRegistry.openDataset(tableUri, storageOptions)) {
             RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, null);
             Set<String> columnsFilter = columnsFilterRaw != null ? new LinkedHashSet<>(columnsFilterRaw) : null;
             if (columnsFilter != null) {

@@ -124,6 +124,11 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         java.util.function.Function.identity(),
         Setting.Property.NodeScope
     );
+    public static final Setting<Settings> STORAGE_OPTIONS_SETTING = Setting.groupSetting(
+        StorageOptions.INDEX_SETTING_PREFIX,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
 
     @Override
     public List<Setting<?>> getSettings() {
@@ -133,7 +138,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             UNCOVERED_FRAGMENT_POLICY_SETTING,
             NAMESPACE_POLL_CADENCE_SETTING,
             BUILDER_MAX_ROWS_SETTING,
-            ALLOWED_TABLE_ROOTS_SETTING
+            ALLOWED_TABLE_ROOTS_SETTING,
+            STORAGE_OPTIONS_SETTING
         );
     }
 
