@@ -18,6 +18,8 @@ import org.opensearch.index.mapper.SourceValueFetcher;
 import org.opensearch.index.mapper.TextSearchInfo;
 import org.opensearch.index.mapper.ValueFetcher;
 import org.opensearch.index.query.QueryShardContext;
+import org.opensearch.lance.namespace.LanceNamespaceService;
+import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.search.lookup.SearchLookup;
 
 /**

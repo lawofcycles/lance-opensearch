@@ -26,6 +26,7 @@ import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.index.vector.VectorIndexParams;
+import org.opensearch.lance.rest.RestAttachAction;
 
 /**
  * The RFC's index builder role, minimal form. Builds the FTS, scalar and
