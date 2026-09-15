@@ -30,6 +30,7 @@ import org.apache.lucene.search.Weight;
 import org.lance.ipc.FullTextQuery;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.opensearch.lance.LanceCircuitBreaker;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 
 /**
@@ -141,6 +142,12 @@ public final class LanceFtsQuery extends Query {
                         return null;
                     }
                 }
+                // Bail out early if the shared native Session has caught
+                // up to the configured limit: dataset.newScan below is
+                // exactly the call that loads the inverted index into
+                // native memory, so running it after the breaker trips
+                // would be the growth path we are trying to prevent.
+                LanceCircuitBreaker.checkAndTrip("lance_fts_query");
                 int maxDoc = leaf.maxDoc();
                 float[] scores = new float[maxDoc];
                 org.apache.lucene.util.FixedBitSet matches = new org.apache.lucene.util.FixedBitSet(maxDoc);

@@ -20,9 +20,11 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.mapper.Mapper;
+import org.opensearch.indices.breaker.BreakerSettings;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
 import org.opensearch.lance.mapper.LanceVectorFieldMapper;
@@ -38,12 +40,15 @@ import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.lance.rest.RestBuildIndexesAction;
 import org.opensearch.lance.rest.RestNamespaceAction;
 import org.opensearch.plugins.ActionPlugin;
+import org.opensearch.plugins.CircuitBreakerPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.MapperPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchPlugin;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
+import org.opensearch.threadpool.Scheduler.Cancellable;
+import org.opensearch.threadpool.ThreadPool;
 
 /**
  * Plugin entry point. Registers the reader-side surface for Lance tables:
@@ -51,7 +56,7 @@ import org.opensearch.rest.RestHandler;
  * {@link LanceEngineFactory} that wraps each Lance-backed index in a
  * read-only engine, mapping type parsers, and the {@code lance_knn} query.
  */
-public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, MapperPlugin, SearchPlugin {
+public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, MapperPlugin, SearchPlugin, CircuitBreakerPlugin {
 
     private static final Logger LOGGER = LogManager.getLogger(LancePlugin.class);
 
@@ -157,6 +162,40 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.NodeScope
     );
 
+    /**
+     * Toggles the circuit breaker that rejects FTS and knn queries when
+     * Lance's shared {@link org.lance.Session} caches have caught up to
+     * the limit configured by {@link #NATIVE_MEMORY_LIMIT_SETTING}. Left
+     * on by default; operators may temporarily disable it if the check
+     * itself gets in the way of an investigation. The breaker's byte
+     * limit is not configurable through this setting; it always mirrors
+     * the Session cache limit so operators have one number to reason
+     * about. Independent headroom is deferred to a follow-up.
+     */
+    public static final Setting<Boolean> NATIVE_MEMORY_CB_ENABLED_SETTING = Setting.boolSetting(
+        "lance.native_memory.circuit_breaker.enabled",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * How often the plugin samples {@link org.lance.Session#sizeBytes()}
+     * and forwards the reading to the {@code lance_native} circuit
+     * breaker's accounting. Kept intentionally short (five seconds by
+     * default) because a single 100M-row FTS query can grow the cache
+     * by several GiB, and a slower cadence would let the breaker lag
+     * far behind the real footprint. Node scoped and dynamic so
+     * operators can tune it without a restart.
+     */
+    public static final Setting<TimeValue> NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING = Setting.timeSetting(
+        "lance.native_memory.circuit_breaker.poll_interval",
+        TimeValue.timeValueSeconds(5),
+        TimeValue.timeValueSeconds(1),
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -167,7 +206,9 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             BUILDER_MAX_ROWS_SETTING,
             ALLOWED_TABLE_ROOTS_SETTING,
             STORAGE_OPTIONS_SETTING,
-            NATIVE_MEMORY_LIMIT_SETTING
+            NATIVE_MEMORY_LIMIT_SETTING,
+            NATIVE_MEMORY_CB_ENABLED_SETTING,
+            NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING
         );
     }
 
@@ -197,6 +238,54 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     private LanceNamespaceService namespaceService;
     private org.opensearch.threadpool.ThreadPool threadPool;
     private AllowedTableRoots allowedTableRoots;
+
+    /**
+     * Cancellable handle for the scheduled task that samples the shared
+     * Lance Session and updates the {@code lance_native} circuit breaker's
+     * accounting. Held so {@link #close()} can stop the task, and so the
+     * settings-change listener can restart it with a new poll interval.
+     */
+    private volatile Cancellable circuitBreakerPollTask;
+
+    /**
+     * Current poll interval used by the scheduled task above. Kept
+     * separately from the setting so the listener can compare and
+     * avoid restarting the task when an unrelated cluster setting
+     * update fires.
+     */
+    private volatile TimeValue circuitBreakerPollInterval;
+
+    @Override
+    public BreakerSettings getCircuitBreaker(Settings settings) {
+        // Register a plugin-owned breaker keyed on {@link
+        // LanceCircuitBreaker#NAME}. The byte limit mirrors
+        // lance.native_memory.limit so operators have one number to
+        // configure, and the overhead is 1.0 because the accounting we
+        // push in from the polling loop is already actual usage, not
+        // an estimate that needs scaling. TRANSIENT durability tells
+        // OpenSearch that the condition is expected to resolve without
+        // operator intervention (LRU eviction or another polling
+        // cycle), which surfaces as a 429 response category rather
+        // than a stuck cluster-level error.
+        String rawLimit = NATIVE_MEMORY_LIMIT_SETTING.get(settings);
+        long limitBytes = NativeMemoryLimit.parse(rawLimit, NATIVE_MEMORY_LIMIT_SETTING.getKey());
+        return new BreakerSettings(
+            LanceCircuitBreaker.NAME,
+            limitBytes,
+            1.0,
+            CircuitBreaker.Type.MEMORY,
+            CircuitBreaker.Durability.TRANSIENT
+        );
+    }
+
+    @Override
+    public void setCircuitBreaker(CircuitBreaker circuitBreaker) {
+        // OpenSearch calls this once at node startup with the breaker
+        // it built from getCircuitBreaker's BreakerSettings. Hand the
+        // reference to the static helper so the FTS / knn scorers can
+        // reach it from query paths that only see a QueryShardContext.
+        LanceCircuitBreaker.setBreaker(circuitBreaker);
+    }
 
     @Override
     public java.util.Collection<Object> createComponents(
@@ -237,12 +326,71 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             rawLimit
         );
 
+        // Prime the circuit-breaker helper with the current cluster
+        // settings and start the polling loop that keeps its accounting
+        // aligned with Session.sizeBytes(). The listener below picks up
+        // dynamic changes to both the enabled flag and the poll
+        // cadence; the breaker itself has already been handed to
+        // LanceCircuitBreaker by setCircuitBreaker earlier in the node
+        // lifecycle.
+        LanceCircuitBreaker.setEnabled(NATIVE_MEMORY_CB_ENABLED_SETTING.get(environment.settings()));
+        this.circuitBreakerPollInterval = NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING.get(environment.settings());
+        this.circuitBreakerPollTask = scheduleCircuitBreakerPoll(threadPool, circuitBreakerPollInterval);
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(NATIVE_MEMORY_CB_ENABLED_SETTING, LanceCircuitBreaker::setEnabled);
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING, this::updatePollInterval);
+
         namespaceService = new LanceNamespaceService(client, threadPool, cadence, builderMaxRows);
         return List.of(namespaceService);
     }
 
+    /**
+     * Schedule the periodic sampler that reads the current
+     * {@code Session.sizeBytes()} and pushes the reading into the
+     * circuit breaker via {@link LanceCircuitBreaker#updateUsage(long)}.
+     * Runs on the generic thread pool so it does not steal capacity
+     * from the search or write executors.
+     */
+    private Cancellable scheduleCircuitBreakerPoll(ThreadPool pool, TimeValue interval) {
+        Runnable sampler = () -> {
+            try {
+                org.lance.Session session = LanceRegistry.currentSession();
+                if (session == null || session.isClosed()) {
+                    return;
+                }
+                long bytes = session.sizeBytes();
+                LanceCircuitBreaker.updateUsage(bytes);
+            } catch (Throwable t) {
+                // Never let a poll iteration throw out of the
+                // scheduler; a failed reading just means the breaker's
+                // accounting stays as it was for one more cycle.
+                LOGGER.warn("lance_native circuit breaker poll iteration failed", t);
+            }
+        };
+        return pool.scheduleWithFixedDelay(sampler, interval, ThreadPool.Names.GENERIC);
+    }
+
+    private synchronized void updatePollInterval(TimeValue newInterval) {
+        if (newInterval.equals(circuitBreakerPollInterval)) {
+            return;
+        }
+        if (circuitBreakerPollTask != null) {
+            circuitBreakerPollTask.cancel();
+        }
+        circuitBreakerPollInterval = newInterval;
+        circuitBreakerPollTask = scheduleCircuitBreakerPoll(threadPool, newInterval);
+        LOGGER.info("lance_native circuit breaker poll interval updated to [{}]", newInterval);
+    }
+
     @Override
     public void close() throws IOException {
+        // Cancel the polling loop before releasing the Session so the
+        // sampler can never observe a half-closed Session on its way
+        // out.
+        Cancellable task = circuitBreakerPollTask;
+        if (task != null) {
+            task.cancel();
+            circuitBreakerPollTask = null;
+        }
         // Release the shared native Session so a test-framework restart
         // within the same JVM doesn't accumulate stale Session handles.
         // Existing Dataset handles keep their own Arc reference to the

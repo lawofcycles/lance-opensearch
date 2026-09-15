@@ -30,6 +30,7 @@ import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.FixedBitSet;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.opensearch.lance.LanceCircuitBreaker;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 
 /**
@@ -176,6 +177,11 @@ public final class LanceKnnQuery extends Query {
             if (cached != null) {
                 return cached;
             }
+            // First scan on this shard is where Lance loads the vector
+            // index into native memory. Refuse to start it if the
+            // breaker has already tripped so we do not push the cache
+            // past its budget mid-query.
+            LanceCircuitBreaker.checkAndTrip("lance_knn_query");
             Map<Integer, FragmentHits> fresh = new HashMap<>();
             org.lance.ipc.Query.Builder qb = new org.lance.ipc.Query.Builder().setColumn(column).setKey(vector).setK(k);
             if (nprobes != null) {

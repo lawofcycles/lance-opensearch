@@ -54,6 +54,19 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         assertTrue("expected opensearch-lance in _cat/plugins, saw: " + body, body.contains("opensearch-lance"));
     }
 
+    public void testCircuitBreakerIsRegistered() throws IOException {
+        // The plugin registers a lance_native breaker via
+        // CircuitBreakerPlugin.getCircuitBreaker so operators can see
+        // the native memory footprint through the standard
+        // _nodes/stats/breaker API without a plugin-specific stats
+        // endpoint. Assert that the breaker name and non-zero limit
+        // show up on every node in a fresh cluster.
+        Response response = client().performRequest(new Request("GET", "/_nodes/stats/breaker"));
+        assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
+        String body = readAll(response);
+        assertTrue("expected lance_native breaker in _nodes/stats/breaker, saw: " + body, body.contains("lance_native"));
+    }
+
     public void testNamespaceEndpointIsRegistered() throws IOException {
         // GET /_lance/namespace lists registered namespaces. On a fresh
         // cluster it returns an empty list, but the important assertion is

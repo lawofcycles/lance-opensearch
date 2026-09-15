@@ -421,6 +421,25 @@ lance.native_memory.limit: 10gb     # or an absolute byte value
 
 The parsed value is split 6:1 between the index cache and the metadata cache, mirroring Lance's own default ratio. On startup the plugin logs the resolved sizes so the operator can confirm the split, for example `installed shared Lance Session: limit [10gb] -> index cache [8.5gb], metadata cache [1.4gb] (from lance.native_memory.limit [10gb])`. This is a static setting today, so a change requires a rolling restart to take effect.
 
+### Circuit breaker for Lance native memory
+
+The plugin registers a `lance_native` circuit breaker with OpenSearch's standard breaker service, so operators can watch native cache usage through `GET /_nodes/stats/breaker` alongside `fielddata`, `request`, and the other built-in breakers.
+
+```
+curl -sS localhost:9200/_nodes/stats/breaker | jq '.nodes[].breakers.lance_native'
+```
+
+The breaker's byte limit mirrors `lance.native_memory.limit`, and the plugin samples `Session.sizeBytes()` on a background scheduler (every 5 seconds by default) to keep the breaker's accounting close to the real footprint. FTS and knn query paths call the breaker before starting a native scan; if the usage has caught up to the limit the query is rejected with a `CircuitBreakingException` (HTTP 429), which stays transient because the next polling tick or an LRU eviction will let the next request through.
+
+Two cluster settings tune this:
+
+```
+lance.native_memory.circuit_breaker.enabled: true       # default; toggle enforcement
+lance.native_memory.circuit_breaker.poll_interval: 5s   # default; how fast the sampler catches up
+```
+
+Both are dynamic, so changes take effect without a restart. The byte limit itself is not directly configurable through the breaker; it always follows `lance.native_memory.limit` so operators reason about one number.
+
 ## 7. Cleanup and restart
 
 The namespace registry is held in process memory. Restarting OpenSearch clears the registrations, and any Lance-backed indices survive as regular OpenSearch indices without a live sync loop. To resume auto-surface after a restart:
