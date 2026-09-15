@@ -55,6 +55,14 @@ produces the plugin zip at `build/distributions/opensearch-lance-0.1.0.zip`.
 
 The full walkthrough — install into OpenSearch, prepare a Lance table, register a namespace, and run the four supported query shapes — is in [docs/getting-started.md](docs/getting-started.md).
 
+## Hybrid search
+
+Full-text and vector sub-queries compose inside compound queries at the shard level. `bool.should` with an FTS clause (`lance_match`, stock `match` on a `lance_text` field, `lance_match_phrase`, `lance_multi_match`) and `lance_knn` returns the union of hits, and the sum-of-child-scores puts docs that satisfy both sub-queries at the top. Integration tests `testBoolShouldComposesLanceMatchWithLanceKnn` and `testBoolShouldComposesStockMatchOnLanceTextWithLanceKnn` exercise this end-to-end.
+
+OpenSearch's dedicated [hybrid search](https://opensearch.org/docs/latest/search-plugins/hybrid-search/) (the `hybrid` query and its `normalization-processor` / `combination-processor` search pipeline) is served by the `neural-search` plugin. That plugin's `HybridQueryWeight` calls `createWeight` on every sub-query and composes their `Scorer` outputs the same way `bool.should` does per shard, and the coordinator normalises per-sub-query top-K on top. The Lance queries in this plugin implement the standard Lucene `Query` / `Weight` / `ScorerSupplier` / `Scorer` contract, so a hybrid query mixing `match` on `lance_text` (or `lance_match`) with `lance_knn` runs through the same shard-side path the bool.should ITs cover. To use it, install `neural-search` alongside this plugin and follow the hybrid search docs; coordinator-side score normalisation and pipeline behaviour are agnostic to the Lance shard implementation.
+
+An end-to-end IT with the `neural-search` plugin installed alongside this plugin is tracked separately.
+
 ## Known limitations
 
 - Nearest-neighbour queries scan once per shard. When the same Lance table is spread across N shards, the same underlying data is scanned N times.

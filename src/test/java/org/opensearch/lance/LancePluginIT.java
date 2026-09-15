@@ -1144,6 +1144,76 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testBoolShouldComposesLanceMatchWithLanceKnn() throws Exception {
+        // Hybrid-shape query at the shard level: two independent Lance
+        // sub-queries fan out inside a bool.should. lance_match:body:hello
+        // matches every even row (0, 2, 4, ..., 14; 8 rows). lance_knn
+        // near (0.5, 0, ..., 0) with k=2 returns the two closest rows
+        // by Euclidean distance, which are id 0 (distance 0.5) and id 1
+        // (distance 0.5). The union is 9 rows: id 1 is the only knn hit
+        // not already in the match set.
+        //
+        // This is the same per-shard plumbing neural-search's `hybrid`
+        // query relies on: HybridQuery.createWeight iterates the
+        // sub-queries, calls createWeight on each, and composes their
+        // scorers. As long as our Lance queries honour the Lucene
+        // Weight / ScorerSupplier / Scorer contract inside a compound
+        // query (as this test proves for bool.should), the hybrid query
+        // will drive them identically.
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "hybridboolshould")) {
+            String indexName = fixture.indexName();
+            String queryVector = "[0.5,0,0,0,0,0,0,0]";
+            Response search = postJson(
+                "/" + indexName + "/_search",
+                "{\"size\":16,\"query\":{\"bool\":{\"should\":["
+                    + "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},"
+                    + "{\"lance_knn\":{\"field\":\"embedding\",\"vector\":"
+                    + queryVector
+                    + ",\"k\":2}}"
+                    + "]}}}"
+            );
+            String body = readAll(search);
+            int hits = extractIntPath(body, "hits", "total", "value");
+            assertEquals("expected 9 unique rows from union(match, knn): " + body, 9, hits);
+            // Row 0 satisfies both sub-queries and must score highest of
+            // any single-sub-query hit, so the sort by _score lands it
+            // first. This is Lucene's bool.should sum-of-child-scores
+            // behaviour; hybrid replaces the sum with per-sub-query
+            // top-K + coordinator-side normalisation, but the shard-side
+            // requirement is the same: each sub-query yields the same
+            // scored docs it would on its own.
+            int topId = extractIntPath(body, "hits", "hits", "0", "_source", "id");
+            assertEquals("expected row 0 (matches both sub-queries) at top of hits: " + body, 0, topId);
+        }
+    }
+
+    public void testBoolShouldComposesStockMatchOnLanceTextWithLanceKnn() throws Exception {
+        // Stock OpenSearch `match` on a lance_text field goes through
+        // LanceTextFieldMapper.termQuery, which builds a LanceFtsQuery
+        // for the single-token case. Confirm the composition works the
+        // same way when the FTS clause uses the plain match DSL rather
+        // than the lance_match DSL: the shard-side composition contract
+        // that hybrid depends on does not vary between them.
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "hybridstockmatchknn")) {
+            String indexName = fixture.indexName();
+            String queryVector = "[0.5,0,0,0,0,0,0,0]";
+            Response search = postJson(
+                "/" + indexName + "/_search",
+                "{\"size\":16,\"query\":{\"bool\":{\"should\":["
+                    + "{\"match\":{\"body\":\"hello\"}},"
+                    + "{\"lance_knn\":{\"field\":\"embedding\",\"vector\":"
+                    + queryVector
+                    + ",\"k\":2}}"
+                    + "]}}}"
+            );
+            String body = readAll(search);
+            int hits = extractIntPath(body, "hits", "total", "value");
+            assertEquals("expected 9 unique rows from union(match, knn): " + body, 9, hits);
+            int topId = extractIntPath(body, "hits", "hits", "0", "_source", "id");
+            assertEquals("expected row 0 at top: " + body, 0, topId);
+        }
+    }
+
     public void testDefaultSearchReturnsAtLeastTenHits() throws Exception {
         // Regression for the FetchPhase sequential-stored-fields path: with
         // >= 10 adjacent doc ids and no deletions the fetch phase calls

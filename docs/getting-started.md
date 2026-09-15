@@ -371,6 +371,35 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=0' \
 
 Expected: one bucket per distinct `rating` value seen in matching rows.
 
+### Hybrid shape (bool.should combining FTS and vector)
+
+FTS and vector sub-queries compose inside `bool.should`. Row `i` has body-token "hello" only on even `i`, and its vector coordinate on the first axis is `i`. `lance_match` on "hello" hits every even row, `lance_knn` near `(0.5, 0, ..., 0)` with `k=2` hits rows 0 and 1. The union has 9 rows; row 0 satisfies both clauses and sums to the highest `_score`.
+
+```
+curl -s -X POST 'http://localhost:9200/demo/_search?size=16' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "query": {
+          "bool": {
+            "should": [
+              { "lance_match": { "field": "body", "query": "hello" } },
+              { "lance_knn": {
+                  "field": "embedding",
+                  "vector": [0.5, 0, 0, 0, 0, 0, 0, 0],
+                  "k": 2
+              }}
+            ]
+          }
+        }
+      }'
+```
+
+Expected `hits.total.value`: 9, with `hits[0]._source.id = 0`.
+
+The same shape works with stock `match` on `body` in place of `lance_match`: on a `lance_text` field, `match` is rewritten to Lance FTS, so per-shard composition is identical.
+
+For OpenSearch's dedicated `hybrid` query (per-sub-query top-K with a score-normalising search pipeline), install the [`neural-search`](https://opensearch.org/docs/latest/search-plugins/hybrid-search/) plugin alongside this one and follow its docs. Per-shard sub-query execution goes through the same Lucene `createWeight` / `Scorer` path the `bool.should` example above exercises.
+
 ## 6. Refresh behaviour when Lance moves forward
 
 If you rewrite the table externally (Python `dataset.append`, `dataset.update`, `merge_insert`, or a Ray / Spark writer), the poll picks up the new manifest version within one cadence period and issues an internal refresh. Queries reflect the new data after the next poll fires. No `_refresh`, `_close`, or shard reallocation is needed.
