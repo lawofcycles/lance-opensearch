@@ -143,7 +143,10 @@ public class LanceFtsBoostQueryBuilder extends AbstractQueryBuilder<LanceFtsBoos
                 } else if ("negative".equals(currentFieldName)) {
                     negative = parseInnerQueryBuilder(parser);
                 } else {
-                    throw new ParsingException(parser.getTokenLocation(), "[lance_fts_boost] unknown object parameter [" + currentFieldName + "]");
+                    throw new ParsingException(
+                        parser.getTokenLocation(),
+                        "[lance_fts_boost] unknown object parameter [" + currentFieldName + "]"
+                    );
                 }
             } else if (token.isValue()) {
                 if ("negative_boost".equals(currentFieldName)) {

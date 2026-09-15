@@ -135,11 +135,7 @@ public class LanceMultiMatchQueryBuilder extends AbstractQueryBuilder<LanceMulti
         }
         if (boosts.size() != fields.size()) {
             throw new IllegalArgumentException(
-                "[lance_multi_match] boosts must have one entry per field (fields="
-                    + fields.size()
-                    + ", boosts="
-                    + boosts.size()
-                    + ")"
+                "[lance_multi_match] boosts must have one entry per field (fields=" + fields.size() + ", boosts=" + boosts.size() + ")"
             );
         }
         for (Float b : boosts) {

@@ -90,10 +90,7 @@ public class LanceCircuitBreakerTests extends OpenSearchTestCase {
         assertEquals(CircuitBreaker.Durability.TRANSIENT, e.getDurability());
 
         LanceCircuitBreaker.updateUsage(recording.getLimit() + 10_000);
-        expectThrows(
-            CircuitBreakingException.class,
-            () -> LanceCircuitBreaker.checkAndTrip("lance_knn_query")
-        );
+        expectThrows(CircuitBreakingException.class, () -> LanceCircuitBreaker.checkAndTrip("lance_knn_query"));
     }
 
     public void testCheckAndTripDisabledSkipsCheck() {

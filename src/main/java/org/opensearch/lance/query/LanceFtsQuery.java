@@ -79,8 +79,10 @@ public final class LanceFtsQuery extends Query {
      * Convenience for a {@code match} query with an explicit operator.
      */
     public LanceFtsQuery(String column, String text, FullTextQuery.Operator operator) {
-        this(FullTextQuery.match(text, column, 1f, Optional.empty(), 50, operator == null ? FullTextQuery.Operator.OR : operator, 0),
-            Set.of(column));
+        this(
+            FullTextQuery.match(text, column, 1f, Optional.empty(), 50, operator == null ? FullTextQuery.Operator.OR : operator, 0),
+            Set.of(column)
+        );
     }
 
     /**
@@ -99,15 +101,7 @@ public final class LanceFtsQuery extends Query {
         this(
             phrase
                 ? FullTextQuery.phrase(text, column, Math.max(0, slop))
-                : FullTextQuery.match(
-                    text,
-                    column,
-                    1f,
-                    Optional.empty(),
-                    50,
-                    operator == null ? FullTextQuery.Operator.OR : operator,
-                    0
-                ),
+                : FullTextQuery.match(text, column, 1f, Optional.empty(), 50, operator == null ? FullTextQuery.Operator.OR : operator, 0),
             Set.of(column)
         );
     }

@@ -110,8 +110,7 @@ public class LanceFtsBoolQueryBuilderTests extends OpenSearchTestCase {
     }
 
     public void testFromXContentRejectsUnknownScalar() throws Exception {
-        String json = "{\"must\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}],"
-            + "\"minimum_should_match\":1}";
+        String json = "{\"must\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}]," + "\"minimum_should_match\":1}";
         try (XContentParser parser = positionedParser(json)) {
             Exception e = expectThrows(Exception.class, () -> LanceFtsBoolQueryBuilder.fromXContent(parser));
             assertTrue("unexpected: " + e.getMessage(), e.getMessage().contains("minimum_should_match"));

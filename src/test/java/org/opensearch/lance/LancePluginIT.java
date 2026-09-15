@@ -274,10 +274,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
 
             Response settings = client().performRequest(new Request("GET", "/" + indexName + "/_settings"));
             String settingsBody = readAll(settings);
-            assertTrue(
-                "expected persisted aws_region: " + settingsBody,
-                settingsBody.contains("\"aws_region\":\"us-east-1\"")
-            );
+            assertTrue("expected persisted aws_region: " + settingsBody, settingsBody.contains("\"aws_region\":\"us-east-1\""));
             assertTrue(
                 "expected persisted aws_endpoint: " + settingsBody,
                 settingsBody.contains("\"aws_endpoint\":\"https://s3.example.internal\"")
@@ -311,10 +308,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
 
             Response settings = client().performRequest(new Request("GET", "/" + indexName + "/_settings"));
             String settingsBody = readAll(settings);
-            assertFalse(
-                "did not expect any storage_options in settings: " + settingsBody,
-                settingsBody.contains("\"storage_options\"")
-            );
+            assertFalse("did not expect any storage_options in settings: " + settingsBody, settingsBody.contains("\"storage_options\""));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
@@ -338,8 +332,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
     public void testAttachRejectsNestedStorageOptionsValue() throws IOException {
         // Values must be strings; nested objects would silently
         // toString() at the JNI boundary. Reject up front.
-        String payload = "{\"table\":\"/tmp/does-not-matter.lance\","
-            + "\"storage_options\":{\"aws_config\":{\"nested\":\"value\"}}}";
+        String payload = "{\"table\":\"/tmp/does-not-matter.lance\"," + "\"storage_options\":{\"aws_config\":{\"nested\":\"value\"}}}";
         ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for nested storage_options value, saw " + status, 400, status);
@@ -361,9 +354,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         try {
             Response register = postJson(
                 "/_lance/namespace",
-                "{\"path\":\""
-                    + scratchDir.toString()
-                    + "\",\"storage_options\":{\"aws_region\":\"eu-west-1\"}}"
+                "{\"path\":\"" + scratchDir.toString() + "\",\"storage_options\":{\"aws_region\":\"eu-west-1\"}}"
             );
             assertEquals(
                 "namespace register failed: " + readAll(register),
@@ -784,8 +775,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
 
             Response search = postJson(
                 "/" + indexName + "/_search",
-                "{\"query\":{\"lance_multi_match\":{\"fields\":[\"body\",\"title\"],"
-                    + "\"query\":\"hello sunny\",\"boosts\":[2.0,1.0]}}}"
+                "{\"query\":{\"lance_multi_match\":{\"fields\":[\"body\",\"title\"]," + "\"query\":\"hello sunny\",\"boosts\":[2.0,1.0]}}}"
             );
             int hits = extractIntPath(readAll(search), "hits", "total", "value");
             assertEquals("expected 8 hits for even rows matching hello+sunny", 8, hits);
@@ -878,10 +868,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             int boostedHits = extractIntPath(boostedBody, "hits", "total", "value");
             assertEquals("boosted expects 8 hits (same positive set)", 8, boostedHits);
             double boostedScore = extractDoublePath(boostedBody, "hits", "hits", "0", "_score");
-            assertTrue(
-                "expected boosted score < baseline (" + boostedScore + " vs " + baselineScore + ")",
-                boostedScore < baselineScore
-            );
+            assertTrue("expected boosted score < baseline (" + boostedScore + " vs " + baselineScore + ")", boostedScore < baselineScore);
         }
     }
 
@@ -920,8 +907,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
 
             Response search = postJson(
                 "/" + indexName + "/_search",
-                "{\"query\":{\"lance_fts_bool\":{"
-                    + "\"must\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}]}}}"
+                "{\"query\":{\"lance_fts_bool\":{" + "\"must\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}]}}}"
             );
             int hits = extractIntPath(readAll(search), "hits", "total", "value");
             assertEquals("expected 8 hits from must body:hello", 8, hits);
@@ -997,8 +983,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
                 ResponseException.class,
                 () -> postJson(
                     "/" + indexName + "/_search",
-                    "{\"query\":{\"lance_fts_bool\":{"
-                        + "\"must\":[{\"match\":{\"body\":\"hello\"}}]}}}"
+                    "{\"query\":{\"lance_fts_bool\":{" + "\"must\":[{\"match\":{\"body\":\"hello\"}}]}}}"
                 )
             );
             int status = failure.getResponse().getStatusLine().getStatusCode();

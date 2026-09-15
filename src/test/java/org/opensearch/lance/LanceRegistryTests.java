@@ -89,16 +89,12 @@ public class LanceRegistryTests extends OpenSearchTestCase {
         String uriOne = LanceTableFactory.writeTable(scratch, "one", 1);
         String uriTwo = LanceTableFactory.writeTable(scratch, "two", 1);
 
-        try (Dataset first = LanceRegistry.openDataset(uriOne, StorageOptions.empty());
-             Dataset second = LanceRegistry.openDataset(uriTwo, StorageOptions.empty())) {
-            assertTrue(
-                "both Datasets should be backed by the installed Session",
-                first.session().isSameAs(installed)
-            );
-            assertTrue(
-                "the two Datasets should observe the same native Session",
-                first.session().isSameAs(second.session())
-            );
+        try (
+            Dataset first = LanceRegistry.openDataset(uriOne, StorageOptions.empty());
+            Dataset second = LanceRegistry.openDataset(uriTwo, StorageOptions.empty())
+        ) {
+            assertTrue("both Datasets should be backed by the installed Session", first.session().isSameAs(installed));
+            assertTrue("the two Datasets should observe the same native Session", first.session().isSameAs(second.session()));
         }
     }
 

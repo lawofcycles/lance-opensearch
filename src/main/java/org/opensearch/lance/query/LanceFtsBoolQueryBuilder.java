@@ -195,10 +195,7 @@ public class LanceFtsBoolQueryBuilder extends AbstractQueryBuilder<LanceFtsBoolQ
                 } else if (NAME_FIELD.match(currentFieldName, parser.getDeprecationHandler())) {
                     queryName = parser.text();
                 } else {
-                    throw new ParsingException(
-                        parser.getTokenLocation(),
-                        "[lance_fts_bool] unknown parameter [" + currentFieldName + "]"
-                    );
+                    throw new ParsingException(parser.getTokenLocation(), "[lance_fts_bool] unknown parameter [" + currentFieldName + "]");
                 }
             }
         }

@@ -73,10 +73,7 @@ public final class LanceRegistry {
         if (SESSION != null && !SESSION.isClosed()) {
             SESSION.close();
         }
-        SESSION = Session.builder()
-            .indexCacheSizeBytes(indexCacheBytes)
-            .metadataCacheSizeBytes(metadataCacheBytes)
-            .build();
+        SESSION = Session.builder().indexCacheSizeBytes(indexCacheBytes).metadataCacheSizeBytes(metadataCacheBytes).build();
     }
 
     /**

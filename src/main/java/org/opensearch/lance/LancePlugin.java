@@ -70,21 +70,9 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
                 LanceMatchPhraseQueryBuilder::new,
                 LanceMatchPhraseQueryBuilder::fromXContent
             ),
-            new QuerySpec<>(
-                LanceMultiMatchQueryBuilder.NAME,
-                LanceMultiMatchQueryBuilder::new,
-                LanceMultiMatchQueryBuilder::fromXContent
-            ),
-            new QuerySpec<>(
-                LanceFtsBoostQueryBuilder.NAME,
-                LanceFtsBoostQueryBuilder::new,
-                LanceFtsBoostQueryBuilder::fromXContent
-            ),
-            new QuerySpec<>(
-                LanceFtsBoolQueryBuilder.NAME,
-                LanceFtsBoolQueryBuilder::new,
-                LanceFtsBoolQueryBuilder::fromXContent
-            )
+            new QuerySpec<>(LanceMultiMatchQueryBuilder.NAME, LanceMultiMatchQueryBuilder::new, LanceMultiMatchQueryBuilder::fromXContent),
+            new QuerySpec<>(LanceFtsBoostQueryBuilder.NAME, LanceFtsBoostQueryBuilder::new, LanceFtsBoostQueryBuilder::fromXContent),
+            new QuerySpec<>(LanceFtsBoolQueryBuilder.NAME, LanceFtsBoolQueryBuilder::new, LanceFtsBoolQueryBuilder::fromXContent)
         );
     }
 

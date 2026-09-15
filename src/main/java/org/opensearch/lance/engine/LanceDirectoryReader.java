@@ -128,27 +128,31 @@ public final class LanceDirectoryReader extends DirectoryReader {
 
     @Override
     protected void doClose() throws IOException {
-        // Follow the StandardDirectoryReader pattern: decRef every sub-reader
-        // so the leaf CacheHelper's ClosedListener fires. Without this, the
-        // request cache / query cache keeps entries keyed on the old reader
-        // until the cache hits its size limit, holding on to memory long
-        // after the underlying Lance manifest has moved on.
+        // a3be9f6 introduced an explicit decRef of every leaf here so
+        // OpenSearch's IndicesRequestCache would drop entries keyed on
+        // the departed leaves as soon as the DirectoryReader was
+        // swapped out. That backfired in two ways at once: the
+        // build-tools' forbiddenApis pass flags any direct call to
+        // IndexReader#decRef / incRef / tryIncRef ("Reference
+        // management is tricky, leave it to SearcherManager") so
+        // ./gradlew build stopped short of running tests, and a
+        // TransportShardRefreshAction that landed after the swap
+        // could still hold a reference to one of the just-closed
+        // leaves. That inbound refresh then observed
+        // AlreadyClosedException and the replication retry loop
+        // waited its full 60-second budget before giving up, which
+        // in turn stalled the namespace poll thread that was queued
+        // behind the same refresh call. Cache invalidation at the
+        // fragment level now waits for the JVM to reclaim the leaf
+        // via GC, which is acceptable because the composite-level
+        // cacheLifetimeBridge below still fires the CacheHelper
+        // listeners the request cache actually keys off at the
+        // DirectoryReader level.
         IOException first = null;
-        for (org.apache.lucene.index.LeafReaderContext ctx : leaves()) {
-            try {
-                ctx.reader().decRef();
-            } catch (IOException e) {
-                if (first == null) {
-                    first = e;
-                }
-            }
-        }
         try {
             cacheLifetimeBridge.close();
         } catch (IOException e) {
-            if (first == null) {
-                first = e;
-            }
+            first = e;
         }
         try {
             dataset.close();

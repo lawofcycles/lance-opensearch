@@ -48,32 +48,20 @@ public class NativeMemoryLimitTests extends OpenSearchTestCase {
         // Above 100% would exceed the host's eligible memory and is a
         // configuration error, so surface the malformed input rather
         // than silently clamp.
-        OpenSearchParseException high = expectThrows(
-            OpenSearchParseException.class,
-            () -> NativeMemoryLimit.parse("150%", KEY)
-        );
+        OpenSearchParseException high = expectThrows(OpenSearchParseException.class, () -> NativeMemoryLimit.parse("150%", KEY));
         assertTrue(high.getMessage(), high.getMessage().contains("percentage must be in [0, 100]"));
 
-        OpenSearchParseException low = expectThrows(
-            OpenSearchParseException.class,
-            () -> NativeMemoryLimit.parse("-1%", KEY)
-        );
+        OpenSearchParseException low = expectThrows(OpenSearchParseException.class, () -> NativeMemoryLimit.parse("-1%", KEY));
         assertTrue(low.getMessage(), low.getMessage().contains("percentage must be in [0, 100]"));
     }
 
     public void testPercentageMustBeNumeric() {
-        OpenSearchParseException e = expectThrows(
-            OpenSearchParseException.class,
-            () -> NativeMemoryLimit.parse("abc%", KEY)
-        );
+        OpenSearchParseException e = expectThrows(OpenSearchParseException.class, () -> NativeMemoryLimit.parse("abc%", KEY));
         assertTrue(e.getMessage(), e.getMessage().contains("percentage must be numeric"));
     }
 
     public void testNullValueRejected() {
-        OpenSearchParseException e = expectThrows(
-            OpenSearchParseException.class,
-            () -> NativeMemoryLimit.parse(null, KEY)
-        );
+        OpenSearchParseException e = expectThrows(OpenSearchParseException.class, () -> NativeMemoryLimit.parse(null, KEY));
         assertTrue(e.getMessage(), e.getMessage().contains("cannot be null"));
     }
 
