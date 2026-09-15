@@ -54,7 +54,7 @@ import org.opensearch.lance.mapper.LanceTextFieldMapper;
  * to 0 (strict phrase order). Unknown properties are rejected so typos
  * surface as 400s.
  */
-public class LanceMatchPhraseQueryBuilder extends AbstractQueryBuilder<LanceMatchPhraseQueryBuilder> {
+public class LanceMatchPhraseQueryBuilder extends AbstractQueryBuilder<LanceMatchPhraseQueryBuilder> implements LanceFtsQueryBuilder {
 
     public static final String NAME = "lance_match_phrase";
 
@@ -172,10 +172,7 @@ public class LanceMatchPhraseQueryBuilder extends AbstractQueryBuilder<LanceMatc
     }
 
     @Override
-    protected Query doToQuery(QueryShardContext context) {
-        // Reject queries against fields that are not lance_text so a
-        // typo surfaces as 400 rather than executing a no-op or reaching
-        // Lance with an unknown column name.
+    public org.lance.ipc.FullTextQuery toLanceFullTextQuery(QueryShardContext context) {
         MappedFieldType fieldType = context.fieldMapper(field);
         if (fieldType == null) {
             throw new IllegalArgumentException("[lance_match_phrase] no such field [" + field + "]");
@@ -192,7 +189,13 @@ public class LanceMatchPhraseQueryBuilder extends AbstractQueryBuilder<LanceMatc
                     + "] no longer exists in the underlying Lance table; recreate the OpenSearch index to drop it"
             );
         }
-        return new LanceFtsQuery(field, query, true, slop);
+        return org.lance.ipc.FullTextQuery.phrase(query, field, slop);
+    }
+
+    @Override
+    protected Query doToQuery(QueryShardContext context) {
+        org.lance.ipc.FullTextQuery ftq = toLanceFullTextQuery(context);
+        return new LanceFtsQuery(ftq, java.util.Set.of(field));
     }
 
     @Override

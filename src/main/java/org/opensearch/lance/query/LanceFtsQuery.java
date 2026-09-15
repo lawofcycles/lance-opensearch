@@ -7,7 +7,11 @@ package org.opensearch.lance.query;
 
 import java.io.IOException;
 import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
 
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.UInt8Vector;
@@ -29,53 +33,90 @@ import org.lance.ipc.ScanOptions;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 
 /**
- * Lucene query that executes Lance FTS per leaf (fragment) and streams back
- * matching docids with Lance BM25 scores. This is the RFC's shard-level
- * rewrite of text queries to native Lance queries, surfaced through the real
- * search phase.
+ * Lucene query that executes a Lance {@link FullTextQuery} tree per leaf
+ * (fragment) and streams back matching docids with Lance BM25 scores.
+ * This is the RFC's shard-level rewrite of text queries to native Lance
+ * queries, surfaced through the real search phase.
+ *
+ * <p>The query carries the {@link FullTextQuery} tree Lance should
+ * evaluate together with the set of columns it references. The column
+ * set drives the FLS visibility check that runs once per leaf: if the
+ * security plugin has hidden any referenced column from the wrapper
+ * reader, the query contributes no hits (matching the standard
+ * {@code match} behaviour on a Lucene index).
  */
 public final class LanceFtsQuery extends Query {
 
-    private final String column;
-    private final String text;
-    private final boolean phrase;
-    private final int slop;
-    private final FullTextQuery.Operator operator;
+    private final FullTextQuery fullTextQuery;
+    private final Set<String> columns;
+    private final String canonical;
 
-    public LanceFtsQuery(String column, String text) {
-        this(column, text, false, 0, FullTextQuery.Operator.OR);
+    /**
+     * Primary constructor. {@code columns} is the set of Lance columns
+     * the {@code fullTextQuery} references transitively. All of them
+     * must be visible on the leaf reader (i.e., not hidden by FLS)
+     * for the query to run against that leaf.
+     */
+    public LanceFtsQuery(FullTextQuery fullTextQuery, Set<String> columns) {
+        this.fullTextQuery = Objects.requireNonNull(fullTextQuery, "fullTextQuery must not be null");
+        this.columns = Set.copyOf(Objects.requireNonNull(columns, "columns must not be null"));
+        if (this.columns.isEmpty()) {
+            throw new IllegalArgumentException("columns must not be empty");
+        }
+        this.canonical = canonicalString(fullTextQuery);
     }
 
     /**
-     * Convenience for match queries with an explicit operator.
+     * Convenience for a simple {@code match} query (single column,
+     * default operator, no fuzziness).
+     */
+    public LanceFtsQuery(String column, String text) {
+        this(FullTextQuery.match(text, column), Set.of(column));
+    }
+
+    /**
+     * Convenience for a {@code match} query with an explicit operator.
      */
     public LanceFtsQuery(String column, String text, FullTextQuery.Operator operator) {
-        this(column, text, false, 0, operator);
+        this(FullTextQuery.match(text, column, 1f, Optional.empty(), 50, operator == null ? FullTextQuery.Operator.OR : operator, 0),
+            Set.of(column));
     }
 
     /**
-     * @param column Lance FTS-indexed column to query
-     * @param text raw query text; Lance runs its own tokenizer on it
-     * @param phrase true for phrase queries (Lance {@code FullTextQuery.phrase}),
-     *     false for term/match queries (Lance {@code FullTextQuery.match})
-     * @param slop phrase slop (allowed number of intervening tokens); ignored
-     *     when {@code phrase} is false
+     * Convenience for a match / phrase query switch. Kept for the two
+     * existing single-column DSLs.
      */
     public LanceFtsQuery(String column, String text, boolean phrase, int slop) {
         this(column, text, phrase, slop, FullTextQuery.Operator.OR);
     }
 
     /**
-     * Full constructor: match queries can specify AND / OR operator to
-     * control how Lance combines the tokens it derives from
-     * {@code text}. Ignored when {@code phrase} is true.
+     * Convenience for a match / phrase query with explicit operator.
+     * {@code operator} is ignored when {@code phrase} is true.
      */
     public LanceFtsQuery(String column, String text, boolean phrase, int slop, FullTextQuery.Operator operator) {
-        this.column = column;
-        this.text = text;
-        this.phrase = phrase;
-        this.slop = Math.max(0, slop);
-        this.operator = operator == null ? FullTextQuery.Operator.OR : operator;
+        this(
+            phrase
+                ? FullTextQuery.phrase(text, column, Math.max(0, slop))
+                : FullTextQuery.match(
+                    text,
+                    column,
+                    1f,
+                    Optional.empty(),
+                    50,
+                    operator == null ? FullTextQuery.Operator.OR : operator,
+                    0
+                ),
+            Set.of(column)
+        );
+    }
+
+    FullTextQuery fullTextQuery() {
+        return fullTextQuery;
+    }
+
+    Set<String> columns() {
+        return columns;
     }
 
     @Override
@@ -92,23 +133,19 @@ public final class LanceFtsQuery extends Query {
                     return null;
                 }
                 // Security plugin FLS hides a field by dropping it from the
-                // wrapper reader's FieldInfos. If the wrapper reader we were
-                // handed no longer exposes `column`, the caller should not be
-                // able to use it as a search term either. Return an empty
-                // scorer supplier so the query contributes no hits, matching
-                // the standard `match` behaviour on a Lucene index.
-                if (context.reader().getFieldInfos().fieldInfo(column) == null) {
-                    return null;
+                // wrapper reader's FieldInfos. If any referenced column is
+                // missing on the wrapper reader, contribute no hits so the
+                // caller cannot use it as a search term either.
+                for (String col : columns) {
+                    if (context.reader().getFieldInfos().fieldInfo(col) == null) {
+                        return null;
+                    }
                 }
                 int maxDoc = leaf.maxDoc();
                 float[] scores = new float[maxDoc];
                 org.apache.lucene.util.FixedBitSet matches = new org.apache.lucene.util.FixedBitSet(maxDoc);
                 ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(leaf.fragmentId()))
-                    .fullTextQuery(
-                        phrase
-                            ? FullTextQuery.phrase(text, column, slop)
-                            : FullTextQuery.match(text, column, 1f, java.util.Optional.empty(), 50, operator, 0)
-                    )
+                    .fullTextQuery(fullTextQuery)
                     .withRowAddress(true)
                     .limit((long) maxDoc)
                     .build();
@@ -163,12 +200,7 @@ public final class LanceFtsQuery extends Query {
 
     @Override
     public String toString(String field) {
-        return "LanceFtsQuery("
-            + column
-            + ":"
-            + (phrase ? "phrase[" + slop + "]=" : (operator == FullTextQuery.Operator.AND ? "and:" : ""))
-            + text
-            + ")";
+        return "LanceFtsQuery(" + canonical + ")";
     }
 
     @Override
@@ -178,16 +210,125 @@ public final class LanceFtsQuery extends Query {
 
     @Override
     public boolean equals(Object other) {
-        return other instanceof LanceFtsQuery q
-            && column.equals(q.column)
-            && text.equals(q.text)
-            && phrase == q.phrase
-            && slop == q.slop
-            && operator == q.operator;
+        return other instanceof LanceFtsQuery q && columns.equals(q.columns) && canonical.equals(q.canonical);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(column, text, phrase, slop, operator);
+        return Objects.hash(columns, canonical);
+    }
+
+    /**
+     * Canonical string representation of a {@link FullTextQuery} tree.
+     * Only {@link FullTextQuery.MatchQuery}, {@link FullTextQuery.PhraseQuery},
+     * and {@link FullTextQuery.MultiMatchQuery} override
+     * {@link Object#toString}; {@link FullTextQuery.BoostQuery} and
+     * {@link FullTextQuery.BooleanQuery} format their children via
+     * {@code Object.toString} which brings identity strings into the mix.
+     * We recurse ourselves so the string is stable across instances and
+     * usable as an equality key.
+     */
+    static String canonicalString(FullTextQuery q) {
+        switch (q.getType()) {
+            case MATCH: {
+                FullTextQuery.MatchQuery m = (FullTextQuery.MatchQuery) q;
+                return "match{column="
+                    + m.getColumn()
+                    + ",text="
+                    + m.getQueryText()
+                    + ",boost="
+                    + m.getBoost()
+                    + ",fuzziness="
+                    + m.getFuzziness()
+                    + ",maxExpansions="
+                    + m.getMaxExpansions()
+                    + ",operator="
+                    + m.getOperator()
+                    + ",prefixLength="
+                    + m.getPrefixLength()
+                    + "}";
+            }
+            case MATCH_PHRASE: {
+                FullTextQuery.PhraseQuery p = (FullTextQuery.PhraseQuery) q;
+                return "phrase{column=" + p.getColumn() + ",text=" + p.getQueryText() + ",slop=" + p.getSlop() + "}";
+            }
+            case MULTI_MATCH: {
+                FullTextQuery.MultiMatchQuery mm = (FullTextQuery.MultiMatchQuery) q;
+                return "multiMatch{columns="
+                    + mm.getColumns()
+                    + ",text="
+                    + mm.getQueryText()
+                    + ",boosts="
+                    + mm.getBoosts()
+                    + ",operator="
+                    + mm.getOperator()
+                    + "}";
+            }
+            case BOOST: {
+                FullTextQuery.BoostQuery b = (FullTextQuery.BoostQuery) q;
+                return "boost{positive="
+                    + canonicalString(b.getPositive())
+                    + ",negative="
+                    + canonicalString(b.getNegative())
+                    + ",negativeBoost="
+                    + b.getNegativeBoost()
+                    + "}";
+            }
+            case BOOLEAN: {
+                FullTextQuery.BooleanQuery bq = (FullTextQuery.BooleanQuery) q;
+                StringBuilder sb = new StringBuilder("bool{clauses=[");
+                List<FullTextQuery.BooleanClause> clauses = bq.getClauses();
+                for (int i = 0; i < clauses.size(); i++) {
+                    FullTextQuery.BooleanClause c = clauses.get(i);
+                    if (i > 0) {
+                        sb.append(",");
+                    }
+                    sb.append(c.getOccur()).append("=").append(canonicalString(c.getQuery()));
+                }
+                sb.append("]}");
+                return sb.toString();
+            }
+            default:
+                return q.toString();
+        }
+    }
+
+    /**
+     * Walk a {@link FullTextQuery} tree and collect every column it
+     * references. Handy for building the {@code columns} parameter of
+     * {@link #LanceFtsQuery(FullTextQuery, Set)} from a nested tree.
+     */
+    public static Set<String> collectColumns(FullTextQuery q) {
+        Set<String> out = new LinkedHashSet<>();
+        collectColumns(q, out);
+        return out;
+    }
+
+    private static void collectColumns(FullTextQuery q, Set<String> out) {
+        switch (q.getType()) {
+            case MATCH:
+                out.add(((FullTextQuery.MatchQuery) q).getColumn());
+                return;
+            case MATCH_PHRASE:
+                out.add(((FullTextQuery.PhraseQuery) q).getColumn());
+                return;
+            case MULTI_MATCH:
+                out.addAll(((FullTextQuery.MultiMatchQuery) q).getColumns());
+                return;
+            case BOOST: {
+                FullTextQuery.BoostQuery b = (FullTextQuery.BoostQuery) q;
+                collectColumns(b.getPositive(), out);
+                collectColumns(b.getNegative(), out);
+                return;
+            }
+            case BOOLEAN: {
+                FullTextQuery.BooleanQuery bq = (FullTextQuery.BooleanQuery) q;
+                for (FullTextQuery.BooleanClause c : bq.getClauses()) {
+                    collectColumns(c.getQuery(), out);
+                }
+                return;
+            }
+            default:
+        }
     }
 }

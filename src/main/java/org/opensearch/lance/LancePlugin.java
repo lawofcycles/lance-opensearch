@@ -25,9 +25,12 @@ import org.opensearch.lance.mapper.LanceTextFieldMapper;
 import org.opensearch.lance.mapper.LanceVectorFieldMapper;
 import org.opensearch.lance.namespace.AllowedTableRoots;
 import org.opensearch.lance.namespace.LanceNamespaceService;
+import org.opensearch.lance.query.LanceFtsBoolQueryBuilder;
+import org.opensearch.lance.query.LanceFtsBoostQueryBuilder;
 import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.lance.query.LanceMatchPhraseQueryBuilder;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
+import org.opensearch.lance.query.LanceMultiMatchQueryBuilder;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.lance.rest.RestBuildIndexesAction;
 import org.opensearch.lance.rest.RestNamespaceAction;
@@ -56,6 +59,21 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
                 LanceMatchPhraseQueryBuilder.NAME,
                 LanceMatchPhraseQueryBuilder::new,
                 LanceMatchPhraseQueryBuilder::fromXContent
+            ),
+            new QuerySpec<>(
+                LanceMultiMatchQueryBuilder.NAME,
+                LanceMultiMatchQueryBuilder::new,
+                LanceMultiMatchQueryBuilder::fromXContent
+            ),
+            new QuerySpec<>(
+                LanceFtsBoostQueryBuilder.NAME,
+                LanceFtsBoostQueryBuilder::new,
+                LanceFtsBoostQueryBuilder::fromXContent
+            ),
+            new QuerySpec<>(
+                LanceFtsBoolQueryBuilder.NAME,
+                LanceFtsBoolQueryBuilder::new,
+                LanceFtsBoolQueryBuilder::fromXContent
             )
         );
     }

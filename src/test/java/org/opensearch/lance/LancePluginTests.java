@@ -8,9 +8,12 @@ package org.opensearch.lance;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
+import org.opensearch.lance.query.LanceFtsBoolQueryBuilder;
+import org.opensearch.lance.query.LanceFtsBoostQueryBuilder;
 import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.lance.query.LanceMatchPhraseQueryBuilder;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
+import org.opensearch.lance.query.LanceMultiMatchQueryBuilder;
 import org.opensearch.plugins.SearchPlugin.QuerySpec;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -33,13 +36,16 @@ public class LancePluginTests extends OpenSearchTestCase {
 
     public void testRegistersLanceKnnQuery() {
         List<QuerySpec<?>> queries = plugin.getQueries();
-        assertEquals(3, queries.size());
+        assertEquals(6, queries.size());
         java.util.Set<String> names = queries.stream()
             .map(q -> q.getName().getPreferredName())
             .collect(java.util.stream.Collectors.toSet());
         assertTrue("expected lance_knn in registered queries: " + names, names.contains(LanceKnnQueryBuilder.NAME));
         assertTrue("expected lance_match in registered queries: " + names, names.contains(LanceMatchQueryBuilder.NAME));
         assertTrue("expected lance_match_phrase in registered queries: " + names, names.contains(LanceMatchPhraseQueryBuilder.NAME));
+        assertTrue("expected lance_multi_match in registered queries: " + names, names.contains(LanceMultiMatchQueryBuilder.NAME));
+        assertTrue("expected lance_fts_boost in registered queries: " + names, names.contains(LanceFtsBoostQueryBuilder.NAME));
+        assertTrue("expected lance_fts_bool in registered queries: " + names, names.contains(LanceFtsBoolQueryBuilder.NAME));
     }
 
     public void testRegistersLanceTextMapper() {

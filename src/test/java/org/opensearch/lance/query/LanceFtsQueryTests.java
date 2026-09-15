@@ -5,6 +5,9 @@
 
 package org.opensearch.lance.query;
 
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.lucene.search.QueryVisitor;
@@ -71,7 +74,7 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
         assertNotEquals(orQuery, andQuery);
         assertNotEquals(orQuery.hashCode(), andQuery.hashCode());
         String andText = andQuery.toString("body");
-        assertTrue("AND toString should mention the operator, saw: " + andText, andText.contains("and"));
+        assertTrue("AND toString should mention the operator, saw: " + andText, andText.contains("AND"));
     }
 
     public void testNullOperatorFallsBackToOr() {
@@ -81,5 +84,39 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
         LanceFtsQuery a = new LanceFtsQuery("body", "camera", false, 0, null);
         LanceFtsQuery b = new LanceFtsQuery("body", "camera", false, 0, FullTextQuery.Operator.OR);
         assertEquals(a, b);
+    }
+
+    public void testDirectFullTextQueryConstructorAndColumnsCollection() {
+        // A LanceFtsQuery built from a MatchQuery with fuzziness must not
+        // compare equal to one without it, because the parameter change
+        // reaches Lance and can change the result set. Documenting this
+        // through equality keeps _explain output honest for callers who
+        // rely on canonical DSL representations.
+        FullTextQuery plain = FullTextQuery.match("hello", "body");
+        FullTextQuery fuzzy = FullTextQuery.match("hello", "body", 1f, Optional.of(1), 50, FullTextQuery.Operator.OR, 0);
+        LanceFtsQuery plainQuery = new LanceFtsQuery(plain, Set.of("body"));
+        LanceFtsQuery fuzzyQuery = new LanceFtsQuery(fuzzy, Set.of("body"));
+        assertNotEquals(plainQuery, fuzzyQuery);
+    }
+
+    public void testCollectColumnsWalksBooleanTree() {
+        FullTextQuery bodyMatch = FullTextQuery.match("hello", "body");
+        FullTextQuery titleMatch = FullTextQuery.match("world", "title");
+        FullTextQuery combined = FullTextQuery.booleanQuery(
+            List.of(
+                new FullTextQuery.BooleanClause(FullTextQuery.Occur.MUST, bodyMatch),
+                new FullTextQuery.BooleanClause(FullTextQuery.Occur.SHOULD, titleMatch)
+            )
+        );
+        Set<String> columns = LanceFtsQuery.collectColumns(combined);
+        assertEquals(Set.of("body", "title"), columns);
+    }
+
+    public void testCollectColumnsWalksBoostTree() {
+        FullTextQuery pos = FullTextQuery.match("hello", "body");
+        FullTextQuery neg = FullTextQuery.match("stale", "title");
+        FullTextQuery boosted = FullTextQuery.boost(pos, neg, 0.5f);
+        Set<String> columns = LanceFtsQuery.collectColumns(boosted);
+        assertEquals(Set.of("body", "title"), columns);
     }
 }

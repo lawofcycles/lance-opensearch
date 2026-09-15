@@ -1,6 +1,6 @@
 # Getting started
 
-Walkthrough for building the plugin, installing it into OpenSearch, and driving it through the four query shapes it supports (match, GET, vector kNN, aggregation). Aimed at people evaluating the plugin against their own Lance tables and at reviewers who want to reproduce the behaviour claimed in the RFC.
+Walkthrough for building the plugin, installing it into OpenSearch, and driving it through the query shapes it supports (match, phrase, multi-field match, score-composing boost / bool, GET, vector kNN, aggregation). Aimed at people evaluating the plugin against their own Lance tables and at reviewers who want to reproduce the behaviour claimed in the RFC.
 
 ## Prerequisites
 
@@ -25,7 +25,7 @@ If you only want to check tests pass:
 ./gradlew test integTest
 ```
 
-`test` runs the 36 unit tests. `integTest` boots a single-node OpenSearch test cluster with the plugin installed and runs 9 REST tests (route smoke checks plus end-to-end attach → match / GET / kNN over a Lance table written from Java).
+`test` runs the unit tests. `integTest` boots a single-node OpenSearch test cluster with the plugin installed and runs the REST integration suite (route smoke checks plus end-to-end attach → match / GET / kNN / phrase / fuzziness / multi_match / boost / bool over a Lance table written from Java).
 
 ## 2. Install into OpenSearch
 
@@ -84,6 +84,7 @@ Place the table under the directory you mounted in step 2. The rest of this walk
 
 - `id: int32` — used as the primary key
 - `body: string` with a Lance FTS index — matched by the `match` query
+- `title: string` with a Lance FTS index — used together with `body` by the `lance_multi_match` / `lance_fts_boost` / `lance_fts_bool` examples
 - `embedding: fixed_size_list<float>[8]` — used by the `lance_knn` query
 - `rating: int32` — used by the aggregation example
 
@@ -99,6 +100,7 @@ import lance
 schema = pa.schema([
     pa.field("id", pa.int32()),
     pa.field("body", pa.string()),
+    pa.field("title", pa.string()),
     pa.field("rating", pa.int32()),
     pa.field("embedding", pa.list_(pa.float32(), 8)),
 ])
@@ -110,6 +112,10 @@ data = {
         f"hello lance {i}" if i % 2 == 0 else f"quick brown fox {i}"
         for i in range(rows)
     ],
+    "title": [
+        f"sunny morning {i}" if i % 2 == 0 else f"cloudy morning {i}"
+        for i in range(rows)
+    ],
     "rating": [(i % 5) + 1 for i in range(rows)],
     "embedding": [[float(i)] + [0.0] * 7 for i in range(rows)],
 }
@@ -117,6 +123,7 @@ data = {
 table = pa.table(data, schema=schema)
 dataset = lance.write_dataset(table, "/absolute/path/to/tables/demo.lance", mode="create")
 dataset.create_scalar_index("body", index_type="INVERTED")
+dataset.create_scalar_index("title", index_type="INVERTED")
 print(f"wrote {dataset.count_rows()} rows to {dataset.uri}")
 ```
 
@@ -197,6 +204,81 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
 ```
 
 Returns 8 hits. Reversing the phrase to `"lance hello"` returns 0. Non-zero slop lets tokens sit further apart: `{"field":"body","query":"quick fox","slop":1}` matches every `quick brown fox <i>` because `brown` sits one position between `quick` and `fox`.
+
+### Fuzziness (lance_match)
+
+`lance_match` accepts `fuzziness` (non-negative integer edit distance), `prefix_length`, and `max_expansions`. OpenSearch's `AUTO` fuzziness is not supported because Lance takes an explicit integer.
+
+```
+curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"lance_match":{"field":"body","query":"helo","fuzziness":1}}}'
+```
+
+Expected `hits.total.value`: 8. `helo` is edit distance 1 from `hello`, so the eight even rows still match. Without `fuzziness` the same query returns 0.
+
+### Multi-field match (lance_multi_match)
+
+Push a single query text across multiple `lance_text` fields with optional per-field boosts. Even rows have `title = "sunny morning i"`; odd rows have `title = "cloudy morning i"`.
+
+```
+curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "query": {
+          "lance_multi_match": {
+            "fields": ["body","title"],
+            "query": "hello cloudy",
+            "boosts": [1.0, 2.0]
+          }
+        }
+      }'
+```
+
+Expected `hits.total.value`: 16. `hello` hits every even row on `body`; `cloudy` hits every odd row on `title`; the OR default unions them. Restricting to `["body"]` drops the odd-row matches; adding `"operator":"and"` returns 0 hits because no row contains both terms.
+
+### Score composition (lance_fts_boost)
+
+Compose two Lance FTS clauses so hits are defined by `positive` and hits that also match `negative` get their score multiplied by `negative_boost`. All hits still come from the positive set.
+
+```
+curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "query": {
+          "lance_fts_boost": {
+            "positive": {"lance_match": {"field": "body", "query": "hello"}},
+            "negative": {"lance_match": {"field": "body", "query": "lance"}},
+            "negative_boost": 0.1
+          }
+        }
+      }'
+```
+
+Expected `hits.total.value`: 8. The positive `hello` matches every even row; every even row also matches the negative `lance`, so each hit's score is multiplied by `0.1`. Compare `_score` against the plain `lance_match {"field":"body","query":"hello"}` to see the reduction. Both `positive` and `negative` must themselves be Lance FTS DSLs (`lance_match`, `lance_match_phrase`, `lance_multi_match`, or a nested `lance_fts_boost` / `lance_fts_bool`); passing a stock `match` returns 400.
+
+### Bool composition (lance_fts_bool)
+
+Compose FTS clauses using `must` / `should` / `must_not` lists. Every clause must itself be a Lance FTS DSL.
+
+```
+curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "query": {
+          "lance_fts_bool": {
+            "must": [
+              {"lance_match": {"field": "body", "query": "hello"}}
+            ],
+            "must_not": [
+              {"lance_match": {"field": "body", "query": "lance"}}
+            ]
+          }
+        }
+      }'
+```
+
+Expected `hits.total.value`: 0. `must` on `body:hello` selects the eight even rows; `must_not` on `body:lance` removes every row that also contains `lance`, which is all of them. Replace the `must_not` with a `should` on `title:sunny` to see the intersection (`must ∩ should` = eight even rows) and score composition on Lance's side.
 
 ### Primary key lookup
 

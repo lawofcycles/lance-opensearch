@@ -63,6 +63,7 @@ final class LanceTableFactory {
     static final String VECTOR_COLUMN = "embedding";
     static final int VECTOR_DIM = 8;
     static final String BODY_COLUMN = "body";
+    static final String TITLE_COLUMN = "title";
     static final String PRIMARY_KEY = "id";
 
     private LanceTableFactory() {}
@@ -73,12 +74,18 @@ final class LanceTableFactory {
      *   <li>{@code id = i}</li>
      *   <li>{@code body = "hello lance " + i} for even {@code i},
      *       {@code "quick brown fox " + i} for odd {@code i}</li>
+     *   <li>{@code title = "sunny morning " + i} for even {@code i},
+     *       {@code "cloudy morning " + i} for odd {@code i}. Chosen so
+     *       {@code body} and {@code title} share no tokens except the row
+     *       index, letting multi_match tests distinguish which field a hit
+     *       came from</li>
      *   <li>{@code embedding[0] = i}, other coordinates 0</li>
      * </ul>
-     * After writing, an INVERTED index is created on {@code body} so
-     * the plugin's {@link RestAttachAction#derive} maps it to
-     * {@code lance_text}. Without the index the derivation falls back
-     * to {@code keyword} and match queries lose their analyzer step.
+     * After writing, INVERTED indexes are created on {@code body} and
+     * {@code title} so the plugin's {@link RestAttachAction#derive}
+     * maps them to {@code lance_text}. Without the index the derivation
+     * falls back to {@code keyword} and match queries lose their analyzer
+     * step.
      *
      * @return absolute URI of the table (usable as-is for
      *         {@code /_lance/attach} or namespace register).
@@ -98,6 +105,7 @@ final class LanceTableFactory {
                 // which B10 verifies through testAttachOfPkLessTableDisablesGet.
                 new Field(PRIMARY_KEY, FieldType.nullable(new ArrowType.Int(32, true)), null),
                 new Field(BODY_COLUMN, FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field(TITLE_COLUMN, FieldType.nullable(new ArrowType.Utf8()), null),
                 new Field(
                     VECTOR_COLUMN,
                     FieldType.nullable(new ArrowType.FixedSizeList(VECTOR_DIM)),
@@ -123,8 +131,8 @@ final class LanceTableFactory {
                 Data.exportArrayStream(allocator, reader, stream);
                 WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
                 try (Dataset dataset = Dataset.create(allocator, stream, uri, writeParams)) {
-                    // Build the INVERTED index on body so derive() maps it
-                    // to lance_text. Match the parameters
+                    // Build INVERTED indexes on body and title so derive()
+                    // maps them to lance_text. Match the parameters
                     // LanceScannerFullTextSearchTest uses upstream.
                     ScalarIndexParams scalarParams = ScalarIndexParams.create(
                         "inverted",
@@ -134,6 +142,11 @@ final class LanceTableFactory {
                     dataset.createIndex(
                         IndexOptions.builder(Collections.singletonList(BODY_COLUMN), IndexType.INVERTED, indexParams)
                             .withIndexName(BODY_COLUMN + "_fts")
+                            .build()
+                    );
+                    dataset.createIndex(
+                        IndexOptions.builder(Collections.singletonList(TITLE_COLUMN), IndexType.INVERTED, indexParams)
+                            .withIndexName(TITLE_COLUMN + "_fts")
                             .build()
                     );
                 }
@@ -146,11 +159,13 @@ final class LanceTableFactory {
         try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             IntVector idVector = (IntVector) root.getVector(PRIMARY_KEY);
             VarCharVector bodyVector = (VarCharVector) root.getVector(BODY_COLUMN);
+            VarCharVector titleVector = (VarCharVector) root.getVector(TITLE_COLUMN);
             FixedSizeListVector vecVector = (FixedSizeListVector) root.getVector(VECTOR_COLUMN);
             Float4Vector vecItems = (Float4Vector) vecVector.getDataVector();
 
             idVector.allocateNew(rowCount);
             bodyVector.allocateNew();
+            titleVector.allocateNew();
             vecVector.allocateNew();
             vecItems.allocateNew(rowCount * VECTOR_DIM);
 
@@ -158,6 +173,8 @@ final class LanceTableFactory {
                 idVector.set(i, i);
                 String body = (i % 2 == 0 ? "hello lance " : "quick brown fox ") + i;
                 bodyVector.setSafe(i, body.getBytes(StandardCharsets.UTF_8));
+                String title = (i % 2 == 0 ? "sunny morning " : "cloudy morning ") + i;
+                titleVector.setSafe(i, title.getBytes(StandardCharsets.UTF_8));
                 for (int j = 0; j < VECTOR_DIM; j++) {
                     // Row i lives at coordinate (i, 0, 0, ...). Distances
                     // between two rows become |i - k| so nearest-neighbour
@@ -170,6 +187,7 @@ final class LanceTableFactory {
 
             idVector.setValueCount(rowCount);
             bodyVector.setValueCount(rowCount);
+            titleVector.setValueCount(rowCount);
             vecItems.setValueCount(rowCount * VECTOR_DIM);
             vecVector.setValueCount(rowCount);
             root.setRowCount(rowCount);
