@@ -438,7 +438,19 @@ public final class LanceFragmentLeafReader extends LeafReader {
         // entry, `context.reader().getFieldInfos().fieldInfo(column)` looks
         // identical to an FLS-excluded field, defeating the FLS bypass
         // check in LanceFtsQuery.
+        //
+        // Utf8 columns without an FTS index are already exposed via the
+        // keyword loop above (they carry SortedSet doc values through
+        // keywordOrds / keywordTerms), so a second entry here would
+        // produce `IllegalArgumentException: duplicate field names`
+        // during FieldInfos construction and mark the shard red.
+        // e21bf3c introduced this loop for FLS-only text columns and
+        // did not account for that overlap, which took every
+        // FTS-less string-column table red on SHA 403576c.
         for (String column : textColumns.keySet()) {
+            if (keywordOrds.containsKey(column)) {
+                continue;
+            }
             infos.add(
                 new FieldInfo(
                     column,

@@ -314,4 +314,72 @@ final class LanceTableFactory {
             dataset.dropColumns(columns);
         }
     }
+
+    /**
+     * Writes a Lance table with a Utf8 column that has no FTS index, so
+     * {@code RestAttachAction.derive} maps the column to
+     * {@code keyword} rather than {@code lance_text}. The leaf reader
+     * used to build a duplicate {@code FieldInfo} for that column
+     * (once through the keyword doc values path and once through the
+     * text-column-for-FLS loop), which tripped
+     * {@code IllegalArgumentException: duplicate field names} and
+     * left every FTS-less string-column table red. The regression
+     * fixture is a two-column table so no other loader touches the
+     * problem column: {@code id} int32 primary key and {@code label}
+     * Utf8 without an inverted index.
+     *
+     * @return absolute URI of the table, usable as-is for
+     *         {@code /_lance/attach} or namespace register.
+     */
+    static String writeKeywordOnlyTable(Path parent, String name, int rowCount) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        Schema schema = new Schema(
+            Arrays.asList(
+                // Same rationale as writeTable: no PK metadata in the
+                // schema, because Arrow C Data serialisation cannot
+                // carry it alongside our other fixtures.
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("label", FieldType.nullable(new ArrowType.Utf8()), null)
+            ),
+            Map.of()
+        );
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            byte[] ipcBytes;
+            try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+                IntVector idVector = (IntVector) root.getVector("id");
+                VarCharVector labelVector = (VarCharVector) root.getVector("label");
+                idVector.allocateNew(rowCount);
+                labelVector.allocateNew();
+                for (int i = 0; i < rowCount; i++) {
+                    idVector.set(i, i);
+                    labelVector.setSafe(i, ("row-" + i).getBytes(StandardCharsets.UTF_8));
+                }
+                idVector.setValueCount(rowCount);
+                labelVector.setValueCount(rowCount);
+                root.setRowCount(rowCount);
+                try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                }
+                ipcBytes = out.toByteArray();
+            }
+
+            try (
+                ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+            ) {
+                Data.exportArrayStream(allocator, reader, stream);
+                WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
+                // Deliberately no createIndex call: leaving the Utf8
+                // column without an inverted index is what triggers
+                // the keyword code path in LanceFragmentLeafReader.
+                Dataset.create(allocator, stream, uri, writeParams).close();
+            }
+        }
+        return uri;
+    }
 }

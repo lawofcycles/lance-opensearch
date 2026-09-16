@@ -316,6 +316,57 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testAttachKeywordOnlyUtf8TableGoesGreen() throws Exception {
+        // Regression for the SHA 403576c FieldInfos-duplicate bug: a
+        // Utf8 column with no inverted index is loaded through the
+        // keyword doc-values path AND through the text-column loop
+        // that e21bf3c added for FLS visibility, and the old code
+        // added both to the leaf reader's FieldInfos. Shard recovery
+        // then failed with IllegalArgumentException: duplicate field
+        // names and every FTS-less string-column table was red.
+        // Verify the attach succeeds, the shard settles green, and a
+        // term-level search against the keyword column returns hits
+        // instead of a shards.failed response.
+        String suffix = "keywordonly-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeKeywordOnlyTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(
+                "attach on keyword-only Utf8 table failed: " + readAll(attach),
+                RestStatus.OK.getStatus(),
+                attach.getStatusLine().getStatusCode()
+            );
+
+            // Health must not stay red. The recovery previously threw
+            // IllegalArgumentException during LanceFragmentLeafReader
+            // construction and marked the shard failed permanently.
+            Response health = client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s"));
+            String healthBody = readAll(health);
+            assertFalse("index went red: " + healthBody, healthBody.contains("\"status\":\"red\""));
+
+            // Confirm derive() surfaced the column as keyword by
+            // running a term query, which only works on keyword doc
+            // values. If FieldInfos was duplicated the shard wouldn't
+            // respond at all.
+            Response search = postJson("/" + indexName + "/_search", "{\"query\":{\"term\":{\"label\":\"row-3\"}}}");
+            String searchBody = readAll(search);
+            int hits = extractIntPath(searchBody, "hits", "total", "value");
+            assertEquals("expected exactly one match for label=row-3, saw: " + searchBody, 1, hits);
+
+            Response mapping = client().performRequest(new Request("GET", "/" + indexName + "/_mapping"));
+            String mappingBody = readAll(mapping);
+            assertTrue("expected label mapped as keyword: " + mappingBody, mappingBody.contains("\"label\":{\"type\":\"keyword\""));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testAttachRejectsNonObjectStorageOptions() throws IOException {
         // Sending storage_options as a string used to slip past parse into
         // Lance and surface as a confusing "map required" native error.
