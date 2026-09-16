@@ -44,7 +44,6 @@ import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
-import org.opensearch.transport.client.node.NodeClient;
 
 /**
  * Coordinator handler for shard-free dispatch. Receives a
@@ -70,21 +69,18 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     private final TransportService transportService;
     private final ClusterService clusterService;
     private final IndexNameExpressionResolver indexNameExpressionResolver;
-    private final NodeClient client;
 
     @Inject
     public TransportLanceCoordinatorAction(
         TransportService transportService,
         ClusterService clusterService,
         IndexNameExpressionResolver indexNameExpressionResolver,
-        ActionFilters actionFilters,
-        NodeClient client
+        ActionFilters actionFilters
     ) {
         super(LanceCoordinatorAction.NAME, transportService, actionFilters, SearchRequest::new);
         this.transportService = transportService;
         this.clusterService = clusterService;
         this.indexNameExpressionResolver = indexNameExpressionResolver;
-        this.client = client;
     }
 
     @Override
@@ -231,12 +227,41 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 nodeTarget.getId(),
                 fragmentsForNode
             );
-            client.executeLocally(LanceFragmentQueryAction.INSTANCE, fragmentRequest, gathered);
-            // Milestone 5-C3 uses local execution against the
-            // registered action so the per-node handler runs in-
-            // process. Milestone 5-C4 will replace this with
-            // transportService.sendRequest(nodeTarget, ...) once
-            // multi-node dispatch is exercised through the IT.
+            // Milestone 5-C4: dispatch through TransportService so
+            // remote data nodes actually receive the request. For
+            // the local node this still executes in-process because
+            // TransportService's request handler dispatch is loopback
+            // aware, but any other node in the cluster picks up its
+            // slice through the network. The handler wraps the
+            // GroupedActionListener so per-node failures propagate
+            // through GroupedActionListener.onFailure and abort the
+            // fan-out cleanly.
+            transportService.sendRequest(
+                nodeTarget,
+                LanceFragmentQueryAction.NAME,
+                fragmentRequest,
+                new org.opensearch.transport.TransportResponseHandler<LanceFragmentQueryResponse>() {
+                    @Override
+                    public LanceFragmentQueryResponse read(org.opensearch.core.common.io.stream.StreamInput in) throws java.io.IOException {
+                        return new LanceFragmentQueryResponse(in);
+                    }
+
+                    @Override
+                    public void handleResponse(LanceFragmentQueryResponse response) {
+                        gathered.onResponse(response);
+                    }
+
+                    @Override
+                    public void handleException(org.opensearch.transport.TransportException exp) {
+                        gathered.onFailure(exp);
+                    }
+
+                    @Override
+                    public String executor() {
+                        return org.opensearch.threadpool.ThreadPool.Names.SEARCH;
+                    }
+                }
+            );
         }
     }
 

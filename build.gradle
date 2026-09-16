@@ -349,6 +349,12 @@ testClusters.integTest {
     // HEAD request). INTEG_TEST is a slimmer distribution built for exactly
     // this scenario and works on every platform.
     testDistribution = 'INTEG_TEST'
+    // Single-node cluster for now. Milestone 5-C4 exercises the
+    // coordinator's TransportService.sendRequest fan-out through
+    // the local loopback path; a multi-node IT is deferred until
+    // LanceNamespaceService moves from per-node CopyOnWriteArrayList
+    // storage to cluster-state so REST namespace registrations
+    // propagate across data nodes.
     plugin(project.tasks.bundlePlugin.archiveFile)
     jvmArgs('--add-opens=java.base/java.nio=ALL-UNNAMED')
     systemProperty('arrow.allocation.manager.type', 'Unsafe')
