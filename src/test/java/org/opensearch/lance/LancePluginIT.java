@@ -344,7 +344,9 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             // Health must not stay red. The recovery previously threw
             // IllegalArgumentException during LanceFragmentLeafReader
             // construction and marked the shard failed permanently.
-            Response health = client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s"));
+            Response health = client().performRequest(
+                new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s")
+            );
             String healthBody = readAll(health);
             assertFalse("index went red: " + healthBody, healthBody.contains("\"status\":\"red\""));
 

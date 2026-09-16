@@ -36,7 +36,6 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
-import org.opensearch.lance.engine.LanceIndexBuilder;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
@@ -76,6 +75,11 @@ public final class LanceNamespaceService {
     // logged on every poll. Keyed by "indexName:fieldId:oldName->newName" so
     // the same rename fires once, but a later re-rename still warns.
     private final Set<String> warnedRenamed = ConcurrentHashMap.newKeySet();
+    // Track which indexes we've already told the operator that the
+    // `wait` uncovered-fragment policy is a no-op today. Set once per
+    // index for the lifetime of the plugin instance; a poll every few
+    // seconds would otherwise flood the log.
+    private final Set<String> warnedWaitPolicy = ConcurrentHashMap.newKeySet();
 
     public LanceNamespaceService(Client client, ThreadPool threadPool, TimeValue cadence, long builderMaxRows) {
         this.client = client;
@@ -209,32 +213,38 @@ public final class LanceNamespaceService {
                     rederivedMappingJson = derivation.mappingJson();
                     warnOnLanceFieldRename(indexName, dataset.getLanceSchema());
                     if ("wait".equals(policy)) {
-                        // Extend every existing index so appended fragments are
-                        // folded in before the new version is exposed. Creating
-                        // new indexes automatically is disabled (see C3 / C9):
-                        // the old auto path built an IVF_PQ with
-                        // numPartitions=1 that quietly degraded recall and
-                        // committed BTrees that then blocked subsequent
-                        // alter_columns. Operators trigger index builds
-                        // explicitly through POST /_lance/build_indexes.
-                        List<String> ftsOptimized = LanceIndexBuilder.optimizeExistingFtsIndexes(dataset, derivation.ftsColumns(), false);
-                        List<String> scalarOptimized = LanceIndexBuilder.optimizeExistingScalarIndexes(
-                            dataset,
-                            derivation.scalarColumns(),
-                            false
-                        );
-                        List<String> vectorOptimized = LanceIndexBuilder.optimizeExistingVectorIndexes(
-                            dataset,
-                            derivation.vectorColumns(),
-                            false
-                        );
-                        if (!ftsOptimized.isEmpty() || !scalarOptimized.isEmpty() || !vectorOptimized.isEmpty()) {
-                            latest = dataset.version();
-                        }
+                        // The wait policy used to run Lance's incremental
+                        // optimize here so appended fragments were folded
+                        // into every existing index before the new version
+                        // became visible. That behaviour committed extra
+                        // versions to the user's Lance table (violating
+                        // the "plugin never writes to a user table without
+                        // permission" principle established by cf74c21) and
+                        // pushed append visibility above nineteen minutes
+                        // on 100M-row / 200-shard tables. The plugin now
+                        // treats indexes as an external concern: they are
+                        // expected to be built by the same writer that
+                        // produced the table (Python, Ray, Spark, or the
+                        // Lance Java SDK), and the plugin only helps out
+                        // through the explicit
+                        // `POST /_lance/build_indexes/{index}` endpoint.
+                        // The wait value is still accepted so the setting
+                        // shape can host a future async-optimize
+                        // implementation; today it converges with the
+                        // immediate branch. Log the observation once per
+                        // index so an operator who set `wait` on purpose
+                        // sees why nothing is happening.
+                        warnDeprecatedWaitPolicyOnce(indexName);
                     }
-                    // else "immediate": expose the new version at once and let Lance
-                    // fall back to scan evaluation on any fragment the index does not
-                    // cover yet; the builder catches up on a subsequent overwrite.
+                    // Either branch now exposes the new version at once
+                    // and lets Lance fall back to scan evaluation on any
+                    // fragment that the existing indexes have not yet
+                    // caught up to. Lance's own scanner produces a mixed
+                    // execution plan for FTS and knn (index for covered
+                    // fragments, flat scan for uncovered fragments,
+                    // unioned) so an incremental append never slows down
+                    // the queries hitting the previously-covered
+                    // fragments.
                 }
             }
             if (latest > served) {
@@ -640,12 +650,23 @@ public final class LanceNamespaceService {
             var state = client.admin().cluster().prepareState().execute().actionGet().getState();
             var metadata = state.metadata().index(indexName);
             if (metadata == null) {
-                return "wait";
+                return "immediate";
             }
-            return metadata.getSettings().get("index.lance.uncovered_fragment_policy", "wait");
+            return metadata.getSettings().get("index.lance.uncovered_fragment_policy", "immediate");
         } catch (Exception e) {
             LOG.warn("failed to read uncovered_fragment_policy for {}: {}", indexName, e.getMessage());
-            return "wait";
+            return "immediate";
+        }
+    }
+
+    private void warnDeprecatedWaitPolicyOnce(String indexName) {
+        if (warnedWaitPolicy.add(indexName)) {
+            LOG.info(
+                "index [{}] has index.lance.uncovered_fragment_policy=wait, but the plugin no longer runs auto-optimize on the user's Lance table. "
+                    + "Index maintenance is expected to happen outside OpenSearch (Python, Ray, Spark, or the Lance Java SDK) or via "
+                    + "an explicit POST /_lance/build_indexes/{{index}} call. The wait value is accepted for a future async-optimize implementation.",
+                indexName
+            );
         }
     }
 

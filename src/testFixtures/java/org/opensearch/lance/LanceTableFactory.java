@@ -347,7 +347,10 @@ final class LanceTableFactory {
 
         try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
             byte[] ipcBytes;
-            try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            try (
+                VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                ByteArrayOutputStream out = new ByteArrayOutputStream()
+            ) {
                 IntVector idVector = (IntVector) root.getVector("id");
                 VarCharVector labelVector = (VarCharVector) root.getVector("label");
                 idVector.allocateNew(rowCount);

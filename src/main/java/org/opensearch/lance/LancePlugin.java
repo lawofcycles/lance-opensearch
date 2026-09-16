@@ -99,7 +99,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
     public static final Setting<String> UNCOVERED_FRAGMENT_POLICY_SETTING = Setting.simpleString(
         "index.lance.uncovered_fragment_policy",
-        "wait",
+        "immediate",
         LancePlugin::validateUncoveredFragmentPolicy,
         Setting.Property.IndexScope,
         Setting.Property.Dynamic

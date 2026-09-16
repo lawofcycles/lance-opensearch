@@ -410,6 +410,36 @@ Force a faster poll by lowering `lance.namespace.poll_cadence` (node-level setti
 lance.namespace.poll_cadence: 1s
 ```
 
+### How the plugin thinks about indexes
+
+Indexes on the Lance table (FTS, scalar, vector) are treated as an external concern. The recommended flow is to build them from the same writer that produced the table, using `dataset.create_index` in Python, the Lance Java SDK, or a Ray / Spark job. The plugin never creates or optimises indexes on its own poll cycle; that principle is what keeps the plugin from writing new versions to the user's Lance table behind their back.
+
+For operators who want to trigger a build from the cluster, `POST /_lance/build_indexes/{index}` is the auxiliary path. It supports two modes.
+
+```
+POST /demo/_lance/build_indexes
+{
+  "columns": ["body"]
+}
+```
+
+Runs FTS, scalar, or vector index builds for the requested columns.
+
+```
+POST /demo/_lance/build_indexes
+{
+  "optimize": true
+}
+```
+
+Runs `Dataset.optimizeIndices` so every existing index folds in fragments that appended since the last build. Use this after a batch of appends, or on a schedule, to keep the fraction of uncovered fragments from growing.
+
+### Append visibility
+
+When Lance advances to a new version, the plugin exposes it as soon as the next poll observes the change. The appended fragments do not have to be covered by every existing index first: Lance's own scanner produces a mixed execution plan for FTS and knn (covered fragments use the existing index, uncovered fragments run a flat scan, and the results are unioned by the query engine), so an incremental append never slows down queries hitting the previously-covered fragments. Whenever uncovered fragments accumulate to the point that flat-scan latency becomes noticeable, call `POST /_lance/build_indexes/{index}` with `{"optimize": true}` to fold them into the existing indexes.
+
+The `index.lance.uncovered_fragment_policy` setting still accepts `wait` alongside the default `immediate`. Both values currently expose the new version immediately; `wait` is reserved for a future async-optimize implementation, and setting it today logs an informational message so operators are aware that the plugin does not run auto-optimize.
+
 ### Cap Lance's native memory footprint
 
 Lance keeps its inverted-index and metadata caches in native memory, outside the JVM heap. The plugin installs a single Lance `Session` at startup so every table on a node shares the same caches. The upper bound is set by `lance.native_memory.limit`, a node-level setting that accepts either a byte value or a percentage of the memory left after the JVM heap is subtracted from physical memory. The default is `40%`, which scales with instance size and leaves room for the k-NN plugin's own memory budget on nodes that host both plugins.
