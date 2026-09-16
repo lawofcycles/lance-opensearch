@@ -574,8 +574,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
                 String filteredBody = readAll(
                     postJson(
                         "/" + indexName + "/_search",
-                        "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":2}}},"
-                            + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
+                        "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":2}}}," + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
                     )
                 );
                 assertEquals("filtered aggregation must count filtered rows", 4, extractIntPath(filteredBody, "hits", "total", "value"));
@@ -592,10 +591,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
                     )
                 );
                 assertEquals("total unchanged when hits also requested", 6, extractIntPath(hitsPlusAggs, "hits", "total", "value"));
-                assertTrue(
-                    "hits section must carry the synthesised _id: " + hitsPlusAggs,
-                    hitsPlusAggs.contains("\"_id\":\"0-0\"")
-                );
+                assertTrue("hits section must carry the synthesised _id: " + hitsPlusAggs, hitsPlusAggs.contains("\"_id\":\"0-0\""));
                 assertEquals(
                     "sum unchanged when hits also requested",
                     15.0d,
@@ -609,10 +605,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
                 // well-formed and carry the terms bucket, which is
                 // the shard aggregator's shape.
                 String bucketBody = readAll(
-                    postJson(
-                        "/" + indexName + "/_search",
-                        "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\"}}}}"
-                    )
+                    postJson("/" + indexName + "/_search", "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\"}}}}")
                 );
                 assertTrue(
                     "terms aggregation must fall through to shard path and carry buckets: " + bucketBody,

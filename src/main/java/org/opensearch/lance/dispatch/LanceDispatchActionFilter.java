@@ -279,12 +279,23 @@ public class LanceDispatchActionFilter implements ActionFilter {
                     hits.addAll(scanTopHits(dataset, effectiveSize - hits.size(), filterSql));
                 }
                 if (!metrics.isEmpty()) {
-                    // apply() guarantees single-index dispatch when
-                    // metrics is non-empty, so overwriting the local
-                    // is safe: the loop only executes once for the
-                    // metrics-carrying request. Cross-index partial
-                    // reduce is Milestone 5-C / 5-D work.
-                    aggregations = LanceMetricAggregator.aggregate(dataset, filterSql, metrics);
+                    // Milestone 5-C1 routes the aggregation through
+                    // the partial + merge API even in the single-node
+                    // case: aggregatePartials scans every fragment in
+                    // the dataset (fragmentIds = null shorthand) and
+                    // mergePartials folds the resulting single group
+                    // into the final InternalAggregations. This
+                    // exercises the code path the multi-node handler
+                    // will drive in 5-C2 without changing single-node
+                    // semantics: one group's partials collapse to the
+                    // same numbers a whole-dataset scan would produce.
+                    List<LanceMetricAggregator.PartialState> partials = LanceMetricAggregator.aggregatePartials(
+                        dataset,
+                        /* fragmentIds */ null,
+                        filterSql,
+                        metrics
+                    );
+                    aggregations = LanceMetricAggregator.mergePartials(metrics, List.of(partials));
                 }
                 LOGGER.info(
                     "lance.dispatch.mode=fragment: index [{}] table [{}] filter [{}] resolved [{}] fragment(s), [{}] row(s), returning [{}] hit(s), aggregations [{}]",
