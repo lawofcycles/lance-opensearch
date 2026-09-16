@@ -25,6 +25,8 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.mapper.Mapper;
 import org.opensearch.indices.breaker.BreakerSettings;
+import org.opensearch.lance.dispatch.LanceDispatchActionFilter;
+import org.opensearch.lance.dispatch.LanceDispatchMode;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
 import org.opensearch.lance.mapper.LanceVectorFieldMapper;
@@ -39,6 +41,7 @@ import org.opensearch.lance.query.LanceMultiMatchQueryBuilder;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.lance.rest.RestBuildIndexesAction;
 import org.opensearch.lance.rest.RestNamespaceAction;
+import org.opensearch.action.support.ActionFilter;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.CircuitBreakerPlugin;
 import org.opensearch.plugins.EnginePlugin;
@@ -184,6 +187,28 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.Dynamic
     );
 
+    /**
+     * Selects between the two dispatch models for Lance-backed indexes.
+     * {@code shard} (default) keeps the standard OpenSearch shard
+     * fan-out: each shard opens its own {@code LanceReadOnlyEngine}
+     * over a fragment partition determined at attach time.
+     * {@code fragment} routes queries through an {@code ActionFilter}
+     * that intercepts {@code indices:data/read/search} before shard
+     * fan-out and (in later milestones) dispatches per-fragment work
+     * directly to data nodes.
+     *
+     * <p>Node scoped and dynamic so operators can flip between the two
+     * paths without a restart while the shard-free prototype is under
+     * construction.
+     */
+    public static final Setting<String> LANCE_DISPATCH_MODE_SETTING = Setting.simpleString(
+        "lance.dispatch.mode",
+        "shard",
+        LancePlugin::validateDispatchMode,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -196,7 +221,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             STORAGE_OPTIONS_SETTING,
             NATIVE_MEMORY_LIMIT_SETTING,
             NATIVE_MEMORY_CB_ENABLED_SETTING,
-            NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING
+            NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING,
+            LANCE_DISPATCH_MODE_SETTING
         );
     }
 
@@ -215,6 +241,13 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         NativeMemoryLimit.parse(value, "lance.native_memory.limit");
     }
 
+    private static void validateDispatchMode(String value) {
+        // LanceDispatchMode.parse throws IllegalArgumentException on
+        // malformed input, which Setting.simpleString surfaces back to
+        // the operator as a 400-style validation error.
+        LanceDispatchMode.parse(value);
+    }
+
     @Override
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
         if (indexSettings.getSettings().get(LanceEngineFactory.TABLE_SETTING) != null) {
@@ -226,6 +259,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     private LanceNamespaceService namespaceService;
     private org.opensearch.threadpool.ThreadPool threadPool;
     private AllowedTableRoots allowedTableRoots;
+    private LanceDispatchActionFilter dispatchActionFilter;
 
     /**
      * Cancellable handle for the scheduled task that samples the shared
@@ -327,6 +361,14 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         clusterService.getClusterSettings().addSettingsUpdateConsumer(NATIVE_MEMORY_CB_ENABLED_SETTING, LanceCircuitBreaker::setEnabled);
         clusterService.getClusterSettings().addSettingsUpdateConsumer(NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING, this::updatePollInterval);
 
+        // Register the shard-free dispatch ActionFilter. The filter is
+        // a no-op while lance.dispatch.mode is `shard` (default). Wire
+        // the settings listener before the filter is exposed through
+        // getActionFilters so dynamic updates take effect immediately.
+        LanceDispatchMode initialMode = LanceDispatchMode.parse(LANCE_DISPATCH_MODE_SETTING.get(environment.settings()));
+        this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, initialMode);
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(LANCE_DISPATCH_MODE_SETTING, dispatchActionFilter::setMode);
+
         namespaceService = new LanceNamespaceService(client, threadPool, cadence, builderMaxRows);
         return List.of(namespaceService);
     }
@@ -386,6 +428,21 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // shards are still open at the moment of shutdown.
         LanceRegistry.closeSession();
         super.close();
+    }
+
+    @Override
+    public List<ActionFilter> getActionFilters() {
+        // The filter is created lazily in createComponents, so return
+        // an empty list until then. In practice OpenSearch calls
+        // createComponents before it consults getActionFilters, so the
+        // filter is always present when the search machinery starts
+        // routing through it; the null guard exists purely for the
+        // test framework's out-of-order invocations.
+        LanceDispatchActionFilter filter = dispatchActionFilter;
+        if (filter == null) {
+            return List.of();
+        }
+        return List.of(filter);
     }
 
     @Override

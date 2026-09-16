@@ -369,6 +369,77 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeShortCircuitsLanceSearch() throws Exception {
+        // Milestone 1 of the shard-free dispatch prototype: setting
+        // lance.dispatch.mode = fragment must route _search on a
+        // Lance-backed index through the ActionFilter short-circuit
+        // instead of the standard shard fan-out. The current stub
+        // returns 0 hits, so the assertion is a discriminator between
+        // fragment mode (0 hits from the stub) and shard mode (real
+        // hits from Lance). Non-Lance indices are unaffected in either
+        // mode.
+        String suffix = "dispatch-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // Baseline: shard mode returns the six rows Lance table
+            // factory wrote. If this fails the standard path is broken
+            // independently of the intercept.
+            int baselineHits = extractIntPath(
+                readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}")),
+                "hits",
+                "total",
+                "value"
+            );
+            assertEquals("baseline shard mode should surface the six rows", 6, baselineHits);
+
+            // Flip the cluster to fragment mode and assert the stub
+            // response fires.
+            updateClusterSetting("lance.dispatch.mode", "fragment");
+            try {
+                int stubHits = extractIntPath(
+                    readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}")),
+                    "hits",
+                    "total",
+                    "value"
+                );
+                assertEquals("fragment mode Milestone 1 returns the stub response with zero hits", 0, stubHits);
+            } finally {
+                updateClusterSetting("lance.dispatch.mode", "shard");
+            }
+
+            // Post-recovery: reverting to shard mode brings back real
+            // Lance hits without another restart.
+            int recoveredHits = extractIntPath(
+                readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}")),
+                "hits",
+                "total",
+                "value"
+            );
+            assertEquals("recovered shard mode should surface the six rows again", 6, recoveredHits);
+        } finally {
+            try {
+                updateClusterSetting("lance.dispatch.mode", "shard");
+            } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private static void updateClusterSetting(String key, String value) throws IOException {
+        Request request = new Request("PUT", "/_cluster/settings");
+        request.setJsonEntity("{\"transient\":{\"" + key + "\":\"" + value + "\"}}");
+        Response response = client().performRequest(request);
+        assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
+    }
+
     public void testAttachRejectsNonObjectStorageOptions() throws IOException {
         // Sending storage_options as a string used to slip past parse into
         // Lance and surface as a confusing "map required" native error.
