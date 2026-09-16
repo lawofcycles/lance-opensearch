@@ -516,6 +516,121 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeAnswersMetricAggregations() throws Exception {
+        // Milestone 5-B of the shard-free dispatch prototype: setting
+        // lance.dispatch.mode = fragment must let the plugin's own
+        // executor answer the five metric aggregations
+        // LanceMetricAggregator supports (value_count, sum, avg, min,
+        // max), possibly combined with a filter query. The count,
+        // hits, and aggregation branches all share the same filter
+        // push-down, so a filter query narrows the aggregation the
+        // same way it narrows the count. Bucket aggregations, script
+        // metrics, and multi-index aggregation continue to route
+        // through the standard shard fan-out.
+        String suffix = "aggs-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            updateClusterSetting("lance.dispatch.mode", "fragment");
+            try {
+                // The fixture writes six rows with id = 0..5, so the
+                // canonical aggregates are: count = 6, sum = 15,
+                // avg = 2.5, min = 0, max = 5. size=0 is standard for
+                // aggregation-only requests and avoids paying the
+                // hits scan on the same request.
+                String body = readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":0,\"aggs\":{"
+                            + "\"c\":{\"value_count\":{\"field\":\"id\"}},"
+                            + "\"s\":{\"sum\":{\"field\":\"id\"}},"
+                            + "\"a\":{\"avg\":{\"field\":\"id\"}},"
+                            + "\"m\":{\"min\":{\"field\":\"id\"}},"
+                            + "\"M\":{\"max\":{\"field\":\"id\"}}"
+                            + "}}"
+                    )
+                );
+                assertEquals(
+                    "aggregation must count matching rows via Dataset.countRows",
+                    6,
+                    extractIntPath(body, "hits", "total", "value")
+                );
+                assertEquals("value_count on id must equal row count", 6, extractIntPath(body, "aggregations", "c", "value"));
+                assertEquals("sum(id) 0..5 == 15", 15.0d, extractDoublePath(body, "aggregations", "s", "value"), 0.0d);
+                assertEquals("avg(id) 0..5 == 2.5", 2.5d, extractDoublePath(body, "aggregations", "a", "value"), 0.0d);
+                assertEquals("min(id) == 0", 0.0d, extractDoublePath(body, "aggregations", "m", "value"), 0.0d);
+                assertEquals("max(id) == 5", 5.0d, extractDoublePath(body, "aggregations", "M", "value"), 0.0d);
+
+                // Filter query pushes the same SQL predicate into
+                // Dataset.countRows and ScanOptions.filter, so
+                // sum(id where id >= 2) must equal 2+3+4+5 = 14 with
+                // total = 4.
+                String filteredBody = readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":2}}},"
+                            + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
+                    )
+                );
+                assertEquals("filtered aggregation must count filtered rows", 4, extractIntPath(filteredBody, "hits", "total", "value"));
+                assertEquals("sum(id) with id>=2 == 14", 14.0d, extractDoublePath(filteredBody, "aggregations", "s", "value"), 0.0d);
+
+                // Hits + aggregation in the same request must both
+                // come from the fragment executor: hits carry the
+                // synthesised _rowaddr id, aggregations carry the
+                // computed value.
+                String hitsPlusAggs = readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":2,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
+                    )
+                );
+                assertEquals("total unchanged when hits also requested", 6, extractIntPath(hitsPlusAggs, "hits", "total", "value"));
+                assertTrue(
+                    "hits section must carry the synthesised _id: " + hitsPlusAggs,
+                    hitsPlusAggs.contains("\"_id\":\"0-0\"")
+                );
+                assertEquals(
+                    "sum unchanged when hits also requested",
+                    15.0d,
+                    extractDoublePath(hitsPlusAggs, "aggregations", "s", "value"),
+                    0.0d
+                );
+
+                // Bucket aggregations continue to route through the
+                // shard fan-out because LanceMetricAggregator does not
+                // implement them yet. The response must still be
+                // well-formed and carry the terms bucket, which is
+                // the shard aggregator's shape.
+                String bucketBody = readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\"}}}}"
+                    )
+                );
+                assertTrue(
+                    "terms aggregation must fall through to shard path and carry buckets: " + bucketBody,
+                    bucketBody.contains("\"buckets\":")
+                );
+            } finally {
+                updateClusterSetting("lance.dispatch.mode", "shard");
+            }
+        } finally {
+            try {
+                updateClusterSetting("lance.dispatch.mode", "shard");
+            } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     private static void updateClusterSetting(String key, String value) throws IOException {
         Request request = new Request("PUT", "/_cluster/settings");
         request.setJsonEntity("{\"transient\":{\"" + key + "\":\"" + value + "\"}}");

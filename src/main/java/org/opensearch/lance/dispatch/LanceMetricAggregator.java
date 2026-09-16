@@ -1,0 +1,303 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package org.opensearch.lance.dispatch;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+
+import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.Float4Vector;
+import org.apache.arrow.vector.Float8Vector;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TinyIntVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.lance.Dataset;
+import org.lance.ipc.LanceScanner;
+import org.lance.ipc.ScanOptions;
+import org.opensearch.search.DocValueFormat;
+import org.opensearch.search.aggregations.AggregationBuilder;
+import org.opensearch.search.aggregations.InternalAggregation;
+import org.opensearch.search.aggregations.InternalAggregations;
+import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.InternalAvg;
+import org.opensearch.search.aggregations.metrics.InternalMax;
+import org.opensearch.search.aggregations.metrics.InternalMin;
+import org.opensearch.search.aggregations.metrics.InternalSum;
+import org.opensearch.search.aggregations.metrics.InternalValueCount;
+import org.opensearch.search.aggregations.metrics.MaxAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.MinAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.SumAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.ValueCountAggregationBuilder;
+import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
+import org.opensearch.search.builder.SearchSourceBuilder;
+
+/**
+ * Computes fragment-mode metric aggregations. Called from
+ * {@link LanceDispatchActionFilter} when a request's aggregations
+ * block only contains metric aggregations this class supports.
+ *
+ * <p>Supported types:
+ * <ul>
+ *   <li>{@code value_count} — non-null count of the field</li>
+ *   <li>{@code sum} — sum of the field's numeric values</li>
+ *   <li>{@code avg} — sum divided by non-null count</li>
+ *   <li>{@code min} / {@code max} — extremes of the field's values</li>
+ * </ul>
+ *
+ * <p>Unsupported shapes (bucket aggregations, script metrics, missing
+ * value handling, sub-aggregations, or metric aggregations on
+ * non-numeric fields) return {@link Optional#empty()} from
+ * {@link #parseSupported(SearchSourceBuilder)} so the caller can fall
+ * back to the standard shard-based path instead of failing the
+ * request.
+ *
+ * <p>Computation runs in a single Lance scan pass with the same filter
+ * SQL the count and hits paths use, so all three response sections
+ * (total, hits, aggregations) agree on which rows they see.
+ */
+public final class LanceMetricAggregator {
+
+    private LanceMetricAggregator() {}
+
+    /** Supported metric aggregation kinds. */
+    public enum MetricType {
+        VALUE_COUNT,
+        SUM,
+        AVG,
+        MIN,
+        MAX
+    }
+
+    /**
+     * The subset of an {@link org.opensearch.search.aggregations.AggregationBuilder}
+     * the aggregator needs. Extracted so the aggregator does not
+     * depend on the full builder graph and can be constructed
+     * defensively at parse time.
+     */
+    public record MetricSpec(String name, MetricType type, String field) {
+    }
+
+    /**
+     * Extract the list of supported metrics from the request source.
+     *
+     * <p>Returns:
+     * <ul>
+     *   <li>{@link Optional#empty()} if any aggregation is outside the
+     *       supported set (bucket, sub-aggs, script, missing values,
+     *       non-{@code ValuesSourceAggregationBuilder} builder). The
+     *       caller falls through to the shard path so those shapes
+     *       still get an answer.</li>
+     *   <li>{@code Optional.of(emptyList)} when the request has no
+     *       aggregations block. This is the common hits-only case.</li>
+     *   <li>{@code Optional.of(list)} for a supported combination of
+     *       metrics ready to feed to {@link #aggregate}.</li>
+     * </ul>
+     */
+    public static Optional<List<MetricSpec>> parseSupported(SearchSourceBuilder source) {
+        if (source == null || source.aggregations() == null) {
+            return Optional.of(Collections.emptyList());
+        }
+        List<MetricSpec> specs = new ArrayList<>();
+        for (AggregationBuilder builder : source.aggregations().getAggregatorFactories()) {
+            if (!builder.getSubAggregations().isEmpty()) {
+                // Fragment aggregation does not run its own bucket
+                // pipeline; nested aggregations require the standard
+                // aggregator tree to hand child buckets around.
+                return Optional.empty();
+            }
+            MetricType type = resolveType(builder);
+            if (type == null) {
+                return Optional.empty();
+            }
+            if (!(builder instanceof ValuesSourceAggregationBuilder<?> valuesSource)) {
+                return Optional.empty();
+            }
+            String field = valuesSource.field();
+            if (field == null || field.isEmpty()) {
+                // Script-based metrics or field-less builders route
+                // through the shard path. Fragment mode has no
+                // scripting sandbox.
+                return Optional.empty();
+            }
+            specs.add(new MetricSpec(builder.getName(), type, field));
+        }
+        return Optional.of(specs);
+    }
+
+    private static MetricType resolveType(AggregationBuilder builder) {
+        if (builder instanceof SumAggregationBuilder) {
+            return MetricType.SUM;
+        }
+        if (builder instanceof AvgAggregationBuilder) {
+            return MetricType.AVG;
+        }
+        if (builder instanceof MinAggregationBuilder) {
+            return MetricType.MIN;
+        }
+        if (builder instanceof MaxAggregationBuilder) {
+            return MetricType.MAX;
+        }
+        if (builder instanceof ValueCountAggregationBuilder) {
+            return MetricType.VALUE_COUNT;
+        }
+        return null;
+    }
+
+    /**
+     * Run a full scan of {@code dataset} under {@code filterSql} and
+     * produce {@link InternalAggregations} matching {@code specs}. When
+     * {@code specs} is empty the method returns {@code null} so the
+     * caller can skip attaching an aggregations block to the response.
+     *
+     * <p>The scan projects only the fields the metrics need. The
+     * filter goes into {@link ScanOptions.Builder#filter(String)} when
+     * non-null, keeping the aggregation totals aligned with
+     * {@link Dataset#countRows(String)} in the same request.
+     */
+    public static InternalAggregations aggregate(Dataset dataset, String filterSql, List<MetricSpec> specs) throws Exception {
+        if (specs.isEmpty()) {
+            return null;
+        }
+        Map<String, State> stateByName = new LinkedHashMap<>();
+        Set<String> requestedColumns = new HashSet<>();
+        for (MetricSpec spec : specs) {
+            stateByName.put(spec.name(), new State());
+            requestedColumns.add(spec.field());
+        }
+
+        ScanOptions.Builder builder = new ScanOptions.Builder().columns(new ArrayList<>(requestedColumns));
+        if (filterSql != null) {
+            builder.filter(filterSql);
+        }
+
+        try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                int rowCount = root.getRowCount();
+                for (MetricSpec spec : specs) {
+                    FieldVector vector = (FieldVector) root.getVector(spec.field());
+                    if (vector == null) {
+                        // Field absent from the scan schema. Skip this
+                        // metric: shard mode would surface a mapping
+                        // error, but here we just leave the metric at
+                        // its default (0 / +-Infinity) so the response
+                        // stays well-formed. The caller has already
+                        // whitelisted the field via parseSupported.
+                        continue;
+                    }
+                    State state = stateByName.get(spec.name());
+                    updateState(spec, vector, rowCount, state);
+                }
+            }
+        }
+
+        List<InternalAggregation> aggregations = new ArrayList<>(specs.size());
+        for (MetricSpec spec : specs) {
+            State state = stateByName.get(spec.name());
+            aggregations.add(toInternalAggregation(spec, state));
+        }
+        return InternalAggregations.from(aggregations);
+    }
+
+    private static void updateState(MetricSpec spec, FieldVector vector, int rowCount, State state) {
+        for (int i = 0; i < rowCount; i++) {
+            if (vector.isNull(i)) {
+                continue;
+            }
+            switch (spec.type()) {
+                case VALUE_COUNT -> state.count++;
+                case SUM -> {
+                    state.sum += readAsDouble(vector, i);
+                    state.count++;
+                }
+                case AVG -> {
+                    state.sum += readAsDouble(vector, i);
+                    state.count++;
+                }
+                case MIN -> {
+                    double v = readAsDouble(vector, i);
+                    if (v < state.min) {
+                        state.min = v;
+                    }
+                    state.count++;
+                }
+                case MAX -> {
+                    double v = readAsDouble(vector, i);
+                    if (v > state.max) {
+                        state.max = v;
+                    }
+                    state.count++;
+                }
+            }
+        }
+    }
+
+    private static InternalAggregation toInternalAggregation(MetricSpec spec, State state) {
+        // Map<String, Object> metadata is nullable on every Internal*
+        // constructor. DocValueFormat.RAW matches the standard metric
+        // aggregator output for numeric fields without a mapping-time
+        // formatter override.
+        return switch (spec.type()) {
+            case VALUE_COUNT -> new InternalValueCount(spec.name(), state.count, null);
+            case SUM -> new InternalSum(spec.name(), state.sum, DocValueFormat.RAW, null);
+            case AVG -> new InternalAvg(spec.name(), state.sum, state.count, DocValueFormat.RAW, null);
+            case MIN -> new InternalMin(spec.name(), state.min, DocValueFormat.RAW, null);
+            case MAX -> new InternalMax(spec.name(), state.max, DocValueFormat.RAW, null);
+        };
+    }
+
+    /**
+     * Coerce a numeric Arrow value to double. Only the integer and
+     * floating-point widths Lance surfaces on typical text / numeric
+     * columns are handled; other types cause the aggregator to
+     * silently skip the row rather than throw, matching the
+     * "skip unsupported cells" behaviour of
+     * {@link LanceRowSourceRenderer}.
+     */
+    private static double readAsDouble(FieldVector vector, int rowIndex) {
+        if (vector instanceof TinyIntVector v) {
+            return v.get(rowIndex);
+        }
+        if (vector instanceof SmallIntVector v) {
+            return v.get(rowIndex);
+        }
+        if (vector instanceof IntVector v) {
+            return v.get(rowIndex);
+        }
+        if (vector instanceof BigIntVector v) {
+            return v.get(rowIndex);
+        }
+        if (vector instanceof Float4Vector v) {
+            return v.get(rowIndex);
+        }
+        if (vector instanceof Float8Vector v) {
+            return v.get(rowIndex);
+        }
+        return 0.0d;
+    }
+
+    /**
+     * Per-metric running state. Initialised so that min / max on an
+     * empty group produce the same {@code +/- Infinity} sentinel the
+     * standard aggregator emits, keeping the fragment path's response
+     * shape identical to shard mode's.
+     */
+    private static final class State {
+        long count = 0L;
+        double sum = 0.0d;
+        double min = Double.POSITIVE_INFINITY;
+        double max = Double.NEGATIVE_INFINITY;
+    }
+}
