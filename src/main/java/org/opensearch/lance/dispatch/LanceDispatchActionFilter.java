@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.search.TotalHits;
+import org.lance.Dataset;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
@@ -22,35 +23,40 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
-import org.opensearch.common.SetOnce;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.index.Index;
+import org.opensearch.index.query.MatchAllQueryBuilder;
+import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
+import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
 
 /**
  * ActionFilter that intercepts {@code indices:data/read/search} for
  * Lance-backed indexes when {@code lance.dispatch.mode} is set to
- * {@code fragment}, and short-circuits the standard shard fan-out.
+ * {@code fragment}, and routes execution through the plugin's own
+ * shard-free dispatch path instead of OpenSearch's standard shard
+ * fan-out.
  *
- * <p>Milestone 1 of the shard-free dispatch prototype. The filter's job
- * at this milestone is deliberately narrow: prove that the intercept
- * fires, that non-Lance indexes and mixed requests are left untouched,
- * and that the short-circuited response can be returned through the
- * standard {@link ActionListener}. Real fragment dispatch and
- * per-node execution land in the next milestones; this class currently
- * emits an empty {@link SearchResponse} so the intercept can be
- * exercised end-to-end.
- *
- * <p>The filter reads {@link org.opensearch.lance.LancePlugin#LANCE_DISPATCH_MODE_SETTING}
- * on every call so runtime updates via cluster settings take effect
- * without a restart. When the mode is {@code shard} (default) or the
- * request touches even one non-Lance index, the filter simply calls
- * {@code chain.proceed(...)} and lets OpenSearch's normal machinery
- * run.
+ * <p>Milestone 2 of the shard-free dispatch prototype. The filter now
+ * opens the Lance {@code Dataset} directly through the shared
+ * {@link LanceRegistry}, enumerates its fragments, and answers
+ * {@code match_all} queries with the real row count sourced from
+ * {@link Dataset#countRows()}. Other query shapes and every query
+ * that ships aggregations, sort clauses, or pagination are still
+ * delegated to the standard shard-based path via
+ * {@code chain.proceed(...)}, because their dispatch logic lands in
+ * later milestones (per-fragment executor, coordinator merge, fetch
+ * phase). The point of Milestone 2 is to prove that the plugin can
+ * reach real Lance data from inside an {@link ActionFilter} and
+ * emit a valid {@link SearchResponse} without touching the
+ * shard-scoped machinery, not to be feature-complete.
  */
 public class LanceDispatchActionFilter implements ActionFilter {
 
@@ -120,57 +126,123 @@ public class LanceDispatchActionFilter implements ActionFilter {
         }
 
         SearchRequest searchRequest = (SearchRequest) request;
-        if (!allTargetIndexesAreLanceBacked(searchRequest)) {
+        Index[] concrete = resolveConcreteIndexes(searchRequest);
+        if (concrete == null || concrete.length == 0 || !allLanceBacked(concrete)) {
             // Mixed and non-Lance requests continue on the standard
             // shard fan-out. Fragment-level dispatch for mixed queries
-            // is deferred to a later milestone; the current milestone
-            // is only concerned with fully Lance-backed requests.
+            // is deferred to a later milestone; Milestone 2 is only
+            // concerned with fully Lance-backed requests.
             chain.proceed(task, action, request, listener);
             return;
         }
 
-        LOGGER.info("lance.dispatch.mode=fragment: intercepting search for Lance-backed indices {}", (Object) searchRequest.indices());
+        if (!isMatchAllOrEmpty(searchRequest)) {
+            // Milestone 2 only implements the match_all path. Anything
+            // that carries a real query, an aggregation, a sort, a
+            // pagination clause, or a highlighter routes through the
+            // standard path where the existing shard-based machinery
+            // still handles the request end-to-end. Later milestones
+            // grow the fragment executor to cover these shapes.
+            chain.proceed(task, action, request, listener);
+            return;
+        }
 
-        @SuppressWarnings("unchecked")
-        Response response = (Response) buildStubResponse();
-        listener.onResponse(response);
+        try {
+            SearchResponse response = executeMatchAll(concrete, searchRequest);
+            @SuppressWarnings("unchecked")
+            Response typed = (Response) response;
+            listener.onResponse(typed);
+        } catch (Exception e) {
+            LOGGER.warn("fragment dispatch failed for {}; falling back to shard path", (Object) searchRequest.indices(), e);
+            chain.proceed(task, action, request, listener);
+        }
     }
 
     /**
-     * Check whether every concrete index resolved from the request is
-     * Lance-backed. A concrete index is Lance-backed if its metadata
-     * carries a non-empty {@link LanceEngineFactory#TABLE_SETTING}
-     * value; that setting is where {@code RestAttachAction} and the
-     * namespace poller stamp the Lance table URI onto the OpenSearch
-     * index at creation time.
-     *
-     * <p>The check runs against a {@link SetOnce}-captured cluster
-     * state snapshot so a state change mid-request does not swap the
-     * answer under us. On failure to resolve any index (deleted between
-     * request submission and this filter running) we conservatively
-     * return {@code false} so the standard code path can produce the
-     * appropriate {@code IndexNotFoundException}.
+     * Milestone 2 executor. Opens the Lance dataset through the
+     * shared {@link LanceRegistry}, records how many fragments the
+     * table has (for the log that operators will lean on while the
+     * prototype matures), and emits a {@link SearchResponse} whose
+     * {@code hits.total.value} matches {@link Dataset#countRows()}.
+     * The hits array itself is empty because rendering an actual
+     * {@link SearchHit} requires Arrow-to-JSON conversion for
+     * {@code _source}, which is deferred to Milestone 3.
      */
-    private boolean allTargetIndexesAreLanceBacked(SearchRequest searchRequest) {
+    private SearchResponse executeMatchAll(Index[] concrete, SearchRequest searchRequest) {
+        long start = System.currentTimeMillis();
+        long total = 0L;
+        int fragmentCount = 0;
         Metadata metadata = clusterService.state().metadata();
-        Index[] concrete;
+        for (Index index : concrete) {
+            IndexMetadata indexMetadata = metadata.index(index);
+            if (indexMetadata == null) {
+                continue;
+            }
+            String tableUri = indexMetadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+            if (tableUri == null || tableUri.isEmpty()) {
+                continue;
+            }
+            StorageOptions storageOptions = StorageOptions.fromIndexSettings(indexMetadata.getSettings());
+            try (Dataset dataset = LanceRegistry.openDataset(tableUri, storageOptions)) {
+                int fragments = dataset.getFragments().size();
+                fragmentCount += fragments;
+                long rows = dataset.countRows();
+                total += rows;
+                LOGGER.info(
+                    "lance.dispatch.mode=fragment: match_all over index [{}] table [{}] resolved [{}] fragment(s), [{}] row(s)",
+                    index.getName(),
+                    tableUri,
+                    fragments,
+                    rows
+                );
+            }
+        }
+
+        long took = System.currentTimeMillis() - start;
+        SearchHits emptyHits = new SearchHits(new SearchHit[0], new TotalHits(total, TotalHits.Relation.EQUAL_TO), Float.NaN);
+        SearchResponseSections sections = new SearchResponseSections(emptyHits, null, null, false, false, null, 1);
+        return new SearchResponse(
+            sections,
+            null,
+            /* totalShards */ fragmentCount,
+            /* successfulShards */ fragmentCount,
+            /* skippedShards */ 0,
+            took,
+            ShardSearchFailure.EMPTY_ARRAY,
+            SearchResponse.Clusters.EMPTY
+        );
+    }
+
+    /**
+     * Resolve the request's index expressions against the current
+     * cluster state, returning {@code null} on failure so the caller
+     * can drop back to the standard code path and surface the usual
+     * OpenSearch error rather than a silent no-op.
+     */
+    private Index[] resolveConcreteIndexes(SearchRequest searchRequest) {
         try {
-            concrete = indexNameExpressionResolver.concreteIndices(clusterService.state(), searchRequest);
+            return indexNameExpressionResolver.concreteIndices(clusterService.state(), searchRequest);
         } catch (Exception e) {
-            // Unresolvable indices (missing, closed, etc.) drop us to
-            // the standard path so the user sees the usual OpenSearch
-            // error, not a silent no-op.
-            return false;
+            return null;
         }
-        if (concrete.length == 0) {
-            return false;
-        }
+    }
+
+    /**
+     * True when every concrete index is Lance-backed, judged by the
+     * presence of {@link LanceEngineFactory#TABLE_SETTING} on the
+     * index metadata. That setting is stamped by
+     * {@code RestAttachAction} and the namespace poller at index
+     * creation time.
+     */
+    private boolean allLanceBacked(Index[] concrete) {
+        Metadata metadata = clusterService.state().metadata();
         for (Index index : concrete) {
             IndexMetadata indexMetadata = metadata.index(index);
             if (indexMetadata == null) {
                 return false;
             }
-            String tableSetting = indexMetadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+            Settings settings = indexMetadata.getSettings();
+            String tableSetting = settings.get(LanceEngineFactory.TABLE_SETTING);
             if (tableSetting == null || tableSetting.isEmpty()) {
                 return false;
             }
@@ -179,24 +251,33 @@ public class LanceDispatchActionFilter implements ActionFilter {
     }
 
     /**
-     * Empty response used for Milestone 1 of the shard-free prototype.
-     * Real query dispatch and result aggregation land in later
-     * milestones; this exists purely so the intercept can be exercised
-     * end-to-end and integration tests can distinguish a fragment-mode
-     * response from a shard-mode response.
+     * True when the request's source either has no {@code source} block
+     * at all (default match_all) or its {@code query} clause is exactly
+     * {@link MatchAllQueryBuilder}. Any other query builder, or the
+     * presence of aggregations / sort / from / size / highlight /
+     * suggest, keeps the request on the standard shard path because
+     * Milestone 2 does not yet implement those semantics in the
+     * fragment executor.
      */
-    private SearchResponse buildStubResponse() {
-        SearchHits emptyHits = new SearchHits(new SearchHit[0], new TotalHits(0, TotalHits.Relation.EQUAL_TO), Float.NaN);
-        SearchResponseSections sections = new SearchResponseSections(emptyHits, null, null, false, false, null, 1);
-        return new SearchResponse(
-            sections,
-            null,
-            /* totalShards */ 1,
-            /* successfulShards */ 1,
-            /* skippedShards */ 0,
-            /* tookInMillis */ 0L,
-            ShardSearchFailure.EMPTY_ARRAY,
-            SearchResponse.Clusters.EMPTY
-        );
+    private boolean isMatchAllOrEmpty(SearchRequest searchRequest) {
+        SearchSourceBuilder source = searchRequest.source();
+        if (source == null) {
+            return true;
+        }
+        if (source.aggregations() != null
+            || source.sorts() != null
+            || source.suggest() != null
+            || source.highlighter() != null
+            || source.postFilter() != null
+            || source.searchAfter() != null
+            || source.from() > 0
+            || source.size() != -1) {
+            return false;
+        }
+        QueryBuilder query = source.query();
+        if (query == null) {
+            return true;
+        }
+        return query instanceof MatchAllQueryBuilder;
     }
 }

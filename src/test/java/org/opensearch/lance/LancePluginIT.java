@@ -369,15 +369,15 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
-    public void testFragmentDispatchModeShortCircuitsLanceSearch() throws Exception {
-        // Milestone 1 of the shard-free dispatch prototype: setting
-        // lance.dispatch.mode = fragment must route _search on a
-        // Lance-backed index through the ActionFilter short-circuit
-        // instead of the standard shard fan-out. The current stub
-        // returns 0 hits, so the assertion is a discriminator between
-        // fragment mode (0 hits from the stub) and shard mode (real
-        // hits from Lance). Non-Lance indices are unaffected in either
-        // mode.
+    public void testFragmentDispatchModeReturnsRealCountForMatchAll() throws Exception {
+        // Milestone 2 of the shard-free dispatch prototype: setting
+        // lance.dispatch.mode = fragment must route match_all queries
+        // on Lance-backed indices through the plugin's own executor
+        // and return hits.total.value sourced from
+        // Dataset.countRows(). Non-Lance indices, and any Lance
+        // request that carries a non-trivial query / aggregation /
+        // sort / pagination clause, still route through the standard
+        // shard fan-out; those shapes are for later milestones.
         String suffix = "dispatch-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -399,17 +399,32 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             );
             assertEquals("baseline shard mode should surface the six rows", 6, baselineHits);
 
-            // Flip the cluster to fragment mode and assert the stub
-            // response fires.
+            // Flip the cluster to fragment mode and confirm match_all
+            // now goes through the plugin's own executor. The executor
+            // reads the row count directly from the Lance dataset, so
+            // hits.total.value must equal the row count regardless of
+            // shard state.
             updateClusterSetting("lance.dispatch.mode", "fragment");
             try {
-                int stubHits = extractIntPath(
+                int matchAllHits = extractIntPath(
                     readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}")),
                     "hits",
                     "total",
                     "value"
                 );
-                assertEquals("fragment mode Milestone 1 returns the stub response with zero hits", 0, stubHits);
+                assertEquals("fragment mode match_all must return the true row count", 6, matchAllHits);
+
+                // Any non-match_all shape still exercises the standard
+                // shard-based path. Milestone 2 only handles match_all;
+                // the passthrough path must produce the same result as
+                // the baseline.
+                int termHits = extractIntPath(
+                    readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"term\":{\"id\":0}}}")),
+                    "hits",
+                    "total",
+                    "value"
+                );
+                assertEquals("fragment mode falls back to shard path for non-match_all queries", 1, termHits);
             } finally {
                 updateClusterSetting("lance.dispatch.mode", "shard");
             }
