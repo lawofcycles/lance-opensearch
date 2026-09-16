@@ -5,26 +5,15 @@
 
 package org.opensearch.lance.dispatch;
 
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
-import org.apache.arrow.vector.UInt8Vector;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.lucene.search.TotalHits;
-import org.lance.Dataset;
-import org.lance.ipc.LanceScanner;
-import org.lance.ipc.ScanOptions;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
-import org.opensearch.action.search.SearchResponseSections;
-import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.support.ActionRequestMetadata;
@@ -35,7 +24,6 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
-import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.index.Index;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
@@ -44,39 +32,48 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
-import org.opensearch.lance.LanceRegistry;
-import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricSpec;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
-import org.opensearch.search.SearchHit;
-import org.opensearch.search.SearchHits;
-import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
+import org.opensearch.transport.client.Client;
 
 /**
  * ActionFilter that intercepts {@code indices:data/read/search} for
  * Lance-backed indexes when {@code lance.dispatch.mode} is set to
- * {@code fragment}, and routes execution through the plugin's own
- * shard-free dispatch path instead of OpenSearch's standard shard
+ * {@code fragment}, and hands the request off to the plugin's own
+ * shard-free coordinator instead of OpenSearch's standard shard
  * fan-out.
  *
- * <p>Milestone 5-B of the shard-free dispatch prototype. The filter
- * now supports every query type
- * {@link org.opensearch.lance.query.LanceKnnFilterTranslator} can
- * lower to a Lance SQL filter ({@code match_all}, {@code term},
- * {@code terms}, {@code exists}, {@code range}, and any {@code bool}
- * combination of those) and the metric aggregations
- * {@link LanceMetricAggregator} handles ({@code value_count},
- * {@code sum}, {@code avg}, {@code min}, {@code max}). The count,
- * hits, and aggregation branches all share the same filter push-down,
- * so the three sections of the response agree on which rows they
- * see. Bucket aggregations, script metrics, sort clauses,
- * pagination, and multi-index aggregation still route through the
- * standard shard path via {@code chain.proceed(...)}: those shapes
- * either need a partial-reduce path (Milestone 5-C / 5-D) or the
- * shard aggregator's execution model.
+ * <p>Milestone 5-C3 of the shard-free dispatch prototype. The
+ * filter now owns three responsibilities:
+ * <ul>
+ *   <li>Recognise whether the request is fragment-dispatchable by
+ *       checking the target indexes ({@link #allLanceBacked}), the
+ *       top-level query ({@link LanceKnnFilterTranslator}), the
+ *       aggregations block ({@link LanceMetricAggregator#parseSupported}),
+ *       and the presence of features the coordinator does not yet
+ *       handle (sorts, from &gt; 0, search_after, highlighter,
+ *       suggester, post_filter, or cross-index metrics).</li>
+ *   <li>Delegate the request to {@link LanceCoordinatorAction} via
+ *       {@link Client#execute(org.opensearch.action.ActionType,
+ *       org.opensearch.action.ActionRequest, ActionListener)}.
+ *       The coordinator has {@code TransportService} injected and
+ *       can fan out the fragment-level work to every data node;
+ *       single-node clusters take the same path with a fan-out of
+ *       one local hop.</li>
+ *   <li>Fall through to the standard shard fan-out via
+ *       {@code chain.proceed} for anything else (dispatch mode
+ *       {@code shard}, non-Lance targets, unsupported query or
+ *       aggregation shapes, or cross-index requests with metrics).</li>
+ * </ul>
+ *
+ * <p>The heavy lifting — opening the Lance dataset, enumerating
+ * fragments, grouping them by node, scanning, and merging partials
+ * — moves to {@link TransportLanceCoordinatorAction} and
+ * {@link TransportLanceFragmentQueryAction}. The filter is now
+ * effectively a routing switch.
  */
 public class LanceDispatchActionFilter implements ActionFilter {
 
@@ -87,6 +84,7 @@ public class LanceDispatchActionFilter implements ActionFilter {
 
     private final ClusterService clusterService;
     private final IndexNameExpressionResolver indexNameExpressionResolver;
+    private final Client client;
 
     /**
      * Current dispatch mode. Held as {@link AtomicReference} so the
@@ -98,10 +96,12 @@ public class LanceDispatchActionFilter implements ActionFilter {
     public LanceDispatchActionFilter(
         ClusterService clusterService,
         IndexNameExpressionResolver indexNameExpressionResolver,
+        Client client,
         LanceDispatchMode initialMode
     ) {
         this.clusterService = clusterService;
         this.indexNameExpressionResolver = indexNameExpressionResolver;
+        this.client = client;
         this.mode = new AtomicReference<>(initialMode);
     }
 
@@ -149,249 +149,52 @@ public class LanceDispatchActionFilter implements ActionFilter {
         Index[] concrete = resolveConcreteIndexes(searchRequest);
         if (concrete == null || concrete.length == 0 || !allLanceBacked(concrete)) {
             // Mixed and non-Lance requests continue on the standard
-            // shard fan-out. Fragment-level dispatch for mixed queries
-            // is deferred to a later milestone; Milestone 2 is only
-            // concerned with fully Lance-backed requests.
+            // shard fan-out.
             chain.proceed(task, action, request, listener);
             return;
         }
 
         Optional<String> filter = resolveDispatchFilter(searchRequest);
         if (filter.isEmpty()) {
-            // Milestone 5-A: the request either ships features the
-            // fragment executor cannot answer yet (sorts, from > 0,
-            // search_after, highlighter, suggester, post_filter) or
-            // its top-level query builder is outside the
-            // LanceKnnFilterTranslator whitelist. Delegate to the
-            // standard shard-based path so the request still gets an
-            // answer. Extending the whitelist is safe as long as
-            // LanceKnnFilterTranslator can translate the new type.
+            // Sorts / from > 0 / search_after / highlighter /
+            // suggester / post_filter, or a top-level query builder
+            // outside the LanceKnnFilterTranslator whitelist. Fall
+            // through so the standard path can still answer.
             chain.proceed(task, action, request, listener);
             return;
         }
 
         Optional<List<MetricSpec>> metrics = LanceMetricAggregator.parseSupported(searchRequest.source());
         if (metrics.isEmpty()) {
-            // Milestone 5-B: the request carries at least one
-            // aggregation the fragment executor cannot answer yet
-            // (bucket, script, missing-value, sub-aggregation, or a
-            // metric on a non-{@link
-            // ValuesSourceAggregationBuilder} builder). Fall through
-            // to the shard path so those shapes still get an answer.
+            // Aggregation shape the fragment executor cannot answer
+            // yet (bucket, script, missing-value, sub-aggregation,
+            // or a metric on a non-ValuesSource builder).
             chain.proceed(task, action, request, listener);
             return;
         }
 
         if (!metrics.get().isEmpty() && concrete.length > 1) {
-            // Milestone 5-B only handles metric aggregations against a
-            // single Lance-backed index. Cross-index aggregation needs
-            // a partial-reduce path (Milestone 5-C / 5-D) so the
-            // partials from each index can be merged; without that
-            // the loop below would silently overwrite the result with
-            // the last index scanned.
+            // Cross-index metric aggregation needs a partial-reduce
+            // path (Milestone 5-D) that merges partials across
+            // independent Lance datasets. Until then multi-index
+            // metric requests route through the shard path.
             chain.proceed(task, action, request, listener);
             return;
         }
 
         try {
-            // Empty string marker inside the Optional means "match_all,
-            // no SQL filter needed". Everything else goes to the
-            // filter-aware path.
-            String sql = filter.get();
-            String pushedFilter = sql.isEmpty() ? null : sql;
-            SearchResponse response = executeQuery(concrete, searchRequest, pushedFilter, metrics.get());
+            // Delegate to the coordinator transport action. It has
+            // TransportService injected and can fan out fragment
+            // queries to every data node. In single-node clusters
+            // the fan-out reduces to a local executeLocally hop so
+            // the same code path serves both.
             @SuppressWarnings("unchecked")
-            Response typed = (Response) response;
-            listener.onResponse(typed);
+            ActionListener<SearchResponse> typedListener = (ActionListener<SearchResponse>) listener;
+            client.execute(LanceCoordinatorAction.INSTANCE, searchRequest, typedListener);
         } catch (Exception e) {
             LOGGER.warn("fragment dispatch failed for {}; falling back to shard path", (Object) searchRequest.indices(), e);
             chain.proceed(task, action, request, listener);
         }
-    }
-
-    /**
-     * Default {@code size} the standard search path resolves when the
-     * request does not set one. Mirrors OpenSearch's
-     * {@code SearchService.DEFAULT_SIZE} so an operator observing a
-     * fragment-mode response sees the same hit count they would have
-     * seen through shard mode.
-     */
-    private static final int DEFAULT_SIZE = 10;
-
-    /**
-     * Milestone 5-B executor. Opens the Lance dataset through the
-     * shared {@link LanceRegistry}, enumerates fragments, and returns
-     * up to {@code size} rows as {@link SearchHit hits} whose
-     * {@code _source} is rendered from the Arrow batch. When
-     * {@code metrics} is non-empty the executor also runs
-     * {@link LanceMetricAggregator} under the same filter so the
-     * response carries aggregations that agree with
-     * {@code hits.total.value} row-for-row.
-     *
-     * <p>When {@code filterSql} is {@code null} the executor is
-     * answering {@code match_all}: it uses {@link Dataset#countRows()}
-     * for the total and an unfiltered scan. When {@code filterSql} is
-     * non-null the executor pushes it down twice — through
-     * {@link Dataset#countRows(String)} for the total and through
-     * {@link org.lance.ipc.ScanOptions.Builder#filter(String)} for the
-     * hits scan — so the count and the returned hits are guaranteed
-     * to agree. The SQL string comes from
-     * {@link org.opensearch.lance.query.LanceKnnFilterTranslator} which
-     * already handles literal escaping and boolean nesting.
-     *
-     * <p>The hit's {@code _id} is synthesised from the row's
-     * {@code _rowaddr} (fragment id in the upper 32 bits, offset in
-     * the lower 32 bits) so the identifier is unique within the table
-     * without depending on the primary-key column, and matches the
-     * value {@link org.opensearch.lance.engine.LanceFragmentLeafReader}
-     * emits in shard mode for tables without a declared primary key.
-     */
-    private SearchResponse executeQuery(Index[] concrete, SearchRequest searchRequest, String filterSql, List<MetricSpec> metrics)
-        throws Exception {
-        long start = System.currentTimeMillis();
-        int effectiveSize = effectiveSize(searchRequest);
-        long total = 0L;
-        int fragmentCount = 0;
-        List<SearchHit> hits = new ArrayList<>();
-        InternalAggregations aggregations = null;
-        Metadata metadata = clusterService.state().metadata();
-        for (Index index : concrete) {
-            IndexMetadata indexMetadata = metadata.index(index);
-            if (indexMetadata == null) {
-                continue;
-            }
-            String tableUri = indexMetadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
-            if (tableUri == null || tableUri.isEmpty()) {
-                continue;
-            }
-            StorageOptions storageOptions = StorageOptions.fromIndexSettings(indexMetadata.getSettings());
-            try (Dataset dataset = LanceRegistry.openDataset(tableUri, storageOptions)) {
-                int fragments = dataset.getFragments().size();
-                fragmentCount += fragments;
-                // Push the filter into countRows so hits.total.value
-                // stays consistent with what a full scan under the
-                // same filter would return. Match_all takes the
-                // no-argument overload because Lance rejects an empty
-                // filter string.
-                long rows = (filterSql == null) ? dataset.countRows() : dataset.countRows(filterSql);
-                total += rows;
-                if (hits.size() < effectiveSize && rows > 0) {
-                    hits.addAll(scanTopHits(dataset, effectiveSize - hits.size(), filterSql));
-                }
-                if (!metrics.isEmpty()) {
-                    // Milestone 5-C1 routes the aggregation through
-                    // the partial + merge API even in the single-node
-                    // case: aggregatePartials scans every fragment in
-                    // the dataset (fragmentIds = null shorthand) and
-                    // mergePartials folds the resulting single group
-                    // into the final InternalAggregations. This
-                    // exercises the code path the multi-node handler
-                    // will drive in 5-C2 without changing single-node
-                    // semantics: one group's partials collapse to the
-                    // same numbers a whole-dataset scan would produce.
-                    List<LanceMetricAggregator.PartialState> partials = LanceMetricAggregator.aggregatePartials(
-                        dataset,
-                        /* fragmentIds */ null,
-                        filterSql,
-                        metrics
-                    );
-                    aggregations = LanceMetricAggregator.mergePartials(metrics, List.of(partials));
-                }
-                LOGGER.info(
-                    "lance.dispatch.mode=fragment: index [{}] table [{}] filter [{}] resolved [{}] fragment(s), [{}] row(s), returning [{}] hit(s), aggregations [{}]",
-                    index.getName(),
-                    tableUri,
-                    filterSql == null ? "<match_all>" : filterSql,
-                    fragments,
-                    rows,
-                    hits.size(),
-                    metrics.isEmpty() ? "<none>" : metrics.size()
-                );
-            }
-        }
-
-        long took = System.currentTimeMillis() - start;
-        SearchHits searchHits = new SearchHits(
-            hits.toArray(new SearchHit[0]),
-            new TotalHits(total, TotalHits.Relation.EQUAL_TO),
-            hits.isEmpty() ? Float.NaN : 1.0f
-        );
-        SearchResponseSections sections = new SearchResponseSections(searchHits, aggregations, null, false, false, null, 1);
-        return new SearchResponse(
-            sections,
-            null,
-            /* totalShards */ fragmentCount,
-            /* successfulShards */ fragmentCount,
-            /* skippedShards */ 0,
-            took,
-            ShardSearchFailure.EMPTY_ARRAY,
-            SearchResponse.Clusters.EMPTY
-        );
-    }
-
-    /**
-     * Read up to {@code remaining} rows from {@code dataset} and turn
-     * them into {@link SearchHit hits}. Each hit carries the
-     * synthesised identifier {@code "<fragmentId>-<offsetInFragment>"}
-     * matching {@link org.opensearch.lance.engine.LanceFragmentLeafReader}'s
-     * fallback naming for PK-less tables, so callers who compare _id
-     * across shard mode and fragment mode see the same value on tables
-     * without a declared primary key.
-     *
-     * <p>When {@code filterSql} is non-null the scan pushes the filter
-     * into Lance so only matching rows are read. The count path passed
-     * the same string to {@link Dataset#countRows(String)}, so
-     * {@code hits.total.value} and the actual number of matching hits
-     * are guaranteed to agree.
-     */
-    private List<SearchHit> scanTopHits(Dataset dataset, int remaining, String filterSql) throws Exception {
-        if (remaining <= 0) {
-            return Collections.emptyList();
-        }
-        List<SearchHit> out = new ArrayList<>();
-        // withRowAddress=true asks Lance to project a synthetic _rowaddr
-        // column whose upper 32 bits encode the fragment id and lower
-        // 32 bits encode the offset within the fragment. That is enough
-        // to build a unique _id per row without picking a column, and
-        // matches the identifier LanceFragmentLeafReader emits in
-        // shard mode for tables without a declared primary key.
-        // No columns filter: the scan projects every column so the
-        // renderer can populate _source with the same fields the
-        // shard-mode reader would surface. Unsupported types (Float,
-        // Struct, etc.) are dropped in the renderer, matching the
-        // mapping-time decisions in RestAttachAction.derive.
-        ScanOptions.Builder optionsBuilder = new ScanOptions.Builder().withRowAddress(true).limit((long) remaining);
-        if (filterSql != null) {
-            optionsBuilder.filter(filterSql);
-        }
-        ScanOptions options = optionsBuilder.build();
-        try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
-            while (out.size() < remaining && reader.loadNextBatch()) {
-                VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                int rowCount = root.getRowCount();
-                for (int i = 0; i < rowCount && out.size() < remaining; i++) {
-                    long addr = rowAddr.get(i);
-                    int fragmentId = (int) (addr >>> 32);
-                    int offset = (int) (addr & 0xFFFFFFFFL);
-                    String idString = fragmentId + "-" + offset;
-                    SearchHit hit = new SearchHit(i, idString, Collections.emptyMap(), Collections.emptyMap());
-                    hit.score(1.0f);
-                    byte[] source = LanceRowSourceRenderer.renderJson(root, i);
-                    hit.sourceRef(new BytesArray(source));
-                    out.add(hit);
-                }
-            }
-        }
-        return out;
-    }
-
-    private int effectiveSize(SearchRequest searchRequest) {
-        SearchSourceBuilder source = searchRequest.source();
-        if (source == null || source.size() < 0) {
-            return DEFAULT_SIZE;
-        }
-        return source.size();
     }
 
     /**
@@ -438,28 +241,25 @@ public class LanceDispatchActionFilter implements ActionFilter {
      * <p>The three possible outcomes are:
      * <ul>
      *   <li>{@link Optional#empty()} — the request carries features
-     *       the fragment executor cannot answer yet (aggregations,
-     *       sorts, from &gt; 0, search_after, highlighter, suggester,
+     *       the fragment executor cannot answer yet (sorts,
+     *       from &gt; 0, search_after, highlighter, suggester,
      *       post_filter) or its top-level query is outside the
      *       {@link LanceKnnFilterTranslator} whitelist. The caller
      *       falls through to the standard shard path.</li>
      *   <li>{@code Optional.of("")} — match_all or an empty request
-     *       body. The caller uses {@link Dataset#countRows()} and
-     *       an unfiltered scan. An empty string is chosen as the
-     *       sentinel because Lance rejects an empty filter string,
-     *       so it cannot collide with a translatable filter.</li>
+     *       body. Signals to the coordinator that no filter needs to
+     *       be pushed into Lance.</li>
      *   <li>{@code Optional.of(sql)} — the top-level query is a
      *       {@code term}, {@code terms}, {@code exists},
      *       {@code range}, or {@code bool} combination of those,
-     *       already translated to Lance SQL and ready to feed to
-     *       {@link Dataset#countRows(String)} and
-     *       {@link org.lance.ipc.ScanOptions.Builder#filter(String)}.</li>
+     *       already translated to Lance SQL and ready for the
+     *       coordinator to feed to {@code Dataset.countRows(sql)}
+     *       and {@code ScanOptions.filter(sql)}.</li>
      * </ul>
      *
      * <p>A translator failure on a nested clause is treated as
      * "not dispatchable" rather than a request error: the shard path
-     * can still answer the query. The failure is logged at debug so
-     * an operator can see which requests declined fragment dispatch.
+     * can still answer the query.
      */
     private Optional<String> resolveDispatchFilter(SearchRequest searchRequest) {
         SearchSourceBuilder source = searchRequest.source();
@@ -478,11 +278,6 @@ public class LanceDispatchActionFilter implements ActionFilter {
         if (query == null || query instanceof MatchAllQueryBuilder) {
             return Optional.of("");
         }
-        // Whitelist the top-level query types the translator supports.
-        // Others fall through so the shard path can still answer them
-        // (match, geo, nested, script, etc.). Extending this list is
-        // safe as long as LanceKnnFilterTranslator supports the new
-        // type.
         if (query instanceof TermQueryBuilder
             || query instanceof TermsQueryBuilder
             || query instanceof ExistsQueryBuilder
@@ -491,10 +286,6 @@ public class LanceDispatchActionFilter implements ActionFilter {
             try {
                 return Optional.of(LanceKnnFilterTranslator.toLanceSql(query));
             } catch (IllegalArgumentException e) {
-                // Translator rejected a nested clause (unsupported
-                // value type, mixed date range, etc.). Fall through
-                // so the shard path can answer the request instead
-                // of failing it.
                 LOGGER.debug("fragment dispatch declined for query [{}]: {}", query.getName(), e.getMessage());
                 return Optional.empty();
             }

@@ -366,7 +366,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // the settings listener before the filter is exposed through
         // getActionFilters so dynamic updates take effect immediately.
         LanceDispatchMode initialMode = LanceDispatchMode.parse(LANCE_DISPATCH_MODE_SETTING.get(environment.settings()));
-        this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, initialMode);
+        this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client, initialMode);
         clusterService.getClusterSettings().addSettingsUpdateConsumer(LANCE_DISPATCH_MODE_SETTING, dispatchActionFilter::setMode);
 
         namespaceService = new LanceNamespaceService(client, threadPool, cadence, builderMaxRows);
@@ -456,6 +456,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             new org.opensearch.plugins.ActionPlugin.ActionHandler<>(
                 org.opensearch.lance.dispatch.LanceFragmentQueryAction.INSTANCE,
                 org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction.class
+            ),
+            new org.opensearch.plugins.ActionPlugin.ActionHandler<>(
+                org.opensearch.lance.dispatch.LanceCoordinatorAction.INSTANCE,
+                org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.class
             )
         );
     }
