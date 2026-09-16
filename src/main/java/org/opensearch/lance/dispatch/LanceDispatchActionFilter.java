@@ -5,12 +5,20 @@
 
 package org.opensearch.lance.dispatch;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.search.TotalHits;
 import org.lance.Dataset;
+import org.lance.ipc.LanceScanner;
+import org.lance.ipc.ScanOptions;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
@@ -159,19 +167,35 @@ public class LanceDispatchActionFilter implements ActionFilter {
     }
 
     /**
-     * Milestone 2 executor. Opens the Lance dataset through the
-     * shared {@link LanceRegistry}, records how many fragments the
-     * table has (for the log that operators will lean on while the
-     * prototype matures), and emits a {@link SearchResponse} whose
-     * {@code hits.total.value} matches {@link Dataset#countRows()}.
-     * The hits array itself is empty because rendering an actual
-     * {@link SearchHit} requires Arrow-to-JSON conversion for
-     * {@code _source}, which is deferred to Milestone 3.
+     * Default {@code size} the standard search path resolves when the
+     * request does not set one. Mirrors OpenSearch's
+     * {@code SearchService.DEFAULT_SIZE} so an operator observing a
+     * fragment-mode response sees the same hit count they would have
+     * seen through shard mode.
      */
-    private SearchResponse executeMatchAll(Index[] concrete, SearchRequest searchRequest) {
+    private static final int DEFAULT_SIZE = 10;
+
+    /**
+     * Milestone 3 executor. Opens the Lance dataset through the
+     * shared {@link LanceRegistry}, enumerates fragments, and returns
+     * up to {@code size} rows as {@link SearchHit hits}. The total row
+     * count still comes from {@link Dataset#countRows()} because a
+     * bounded scan cannot compute it. The hit's {@code _id} is
+     * synthesised from the row's {@code _rowaddr} (fragment id in the
+     * upper 32 bits, offset in the lower 32 bits) so the identifier is
+     * unique within the table without depending on the primary-key
+     * column. {@code _source} is not populated yet: rendering it needs
+     * the Arrow-to-JSON conversion that lives in
+     * {@link org.opensearch.lance.engine.LanceFragmentLeafReader} and
+     * has to be extracted into a shared helper before it can be
+     * reused here; that extraction is Milestone 4 work.
+     */
+    private SearchResponse executeMatchAll(Index[] concrete, SearchRequest searchRequest) throws Exception {
         long start = System.currentTimeMillis();
+        int effectiveSize = effectiveSize(searchRequest);
         long total = 0L;
         int fragmentCount = 0;
+        List<SearchHit> hits = new ArrayList<>();
         Metadata metadata = clusterService.state().metadata();
         for (Index index : concrete) {
             IndexMetadata indexMetadata = metadata.index(index);
@@ -188,19 +212,27 @@ public class LanceDispatchActionFilter implements ActionFilter {
                 fragmentCount += fragments;
                 long rows = dataset.countRows();
                 total += rows;
+                if (hits.size() < effectiveSize && rows > 0) {
+                    hits.addAll(scanTopHits(dataset, effectiveSize - hits.size()));
+                }
                 LOGGER.info(
-                    "lance.dispatch.mode=fragment: match_all over index [{}] table [{}] resolved [{}] fragment(s), [{}] row(s)",
+                    "lance.dispatch.mode=fragment: match_all over index [{}] table [{}] resolved [{}] fragment(s), [{}] row(s), returning [{}] hit(s)",
                     index.getName(),
                     tableUri,
                     fragments,
-                    rows
+                    rows,
+                    hits.size()
                 );
             }
         }
 
         long took = System.currentTimeMillis() - start;
-        SearchHits emptyHits = new SearchHits(new SearchHit[0], new TotalHits(total, TotalHits.Relation.EQUAL_TO), Float.NaN);
-        SearchResponseSections sections = new SearchResponseSections(emptyHits, null, null, false, false, null, 1);
+        SearchHits searchHits = new SearchHits(
+            hits.toArray(new SearchHit[0]),
+            new TotalHits(total, TotalHits.Relation.EQUAL_TO),
+            hits.isEmpty() ? Float.NaN : 1.0f
+        );
+        SearchResponseSections sections = new SearchResponseSections(searchHits, null, null, false, false, null, 1);
         return new SearchResponse(
             sections,
             null,
@@ -211,6 +243,58 @@ public class LanceDispatchActionFilter implements ActionFilter {
             ShardSearchFailure.EMPTY_ARRAY,
             SearchResponse.Clusters.EMPTY
         );
+    }
+
+    /**
+     * Read up to {@code remaining} rows from {@code dataset} and turn
+     * them into stub {@link SearchHit hits}. Each hit carries the
+     * synthesised identifier {@code "<fragmentId>-<offsetInFragment>"}
+     * matching {@link org.opensearch.lance.engine.LanceFragmentLeafReader}'s
+     * fallback naming for PK-less tables, so callers who compare _id
+     * across shard mode and fragment mode see the same value on tables
+     * without a declared primary key. Populating {@code _source} is
+     * still deferred; today the hit body is an empty object.
+     */
+    private List<SearchHit> scanTopHits(Dataset dataset, int remaining) throws Exception {
+        if (remaining <= 0) {
+            return Collections.emptyList();
+        }
+        List<SearchHit> out = new ArrayList<>();
+        // withRowAddress=true asks Lance to project a synthetic _rowaddr
+        // column whose upper 32 bits encode the fragment id and lower
+        // 32 bits encode the offset within the fragment. That is enough
+        // to build a unique _id per row without picking a column, and
+        // matches the identifier LanceFragmentLeafReader emits in
+        // shard mode for tables without a declared primary key.
+        ScanOptions options = new ScanOptions.Builder().columns(Collections.emptyList())
+            .withRowAddress(true)
+            .limit((long) remaining)
+            .build();
+        try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+            while (out.size() < remaining && reader.loadNextBatch()) {
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                int rowCount = root.getRowCount();
+                for (int i = 0; i < rowCount && out.size() < remaining; i++) {
+                    long addr = rowAddr.get(i);
+                    int fragmentId = (int) (addr >>> 32);
+                    int offset = (int) (addr & 0xFFFFFFFFL);
+                    String idString = fragmentId + "-" + offset;
+                    SearchHit hit = new SearchHit(i, idString, Collections.emptyMap(), Collections.emptyMap());
+                    hit.score(1.0f);
+                    out.add(hit);
+                }
+            }
+        }
+        return out;
+    }
+
+    private int effectiveSize(SearchRequest searchRequest) {
+        SearchSourceBuilder source = searchRequest.source();
+        if (source == null || source.size() < 0) {
+            return DEFAULT_SIZE;
+        }
+        return source.size();
     }
 
     /**
@@ -270,8 +354,7 @@ public class LanceDispatchActionFilter implements ActionFilter {
             || source.highlighter() != null
             || source.postFilter() != null
             || source.searchAfter() != null
-            || source.from() > 0
-            || source.size() != -1) {
+            || source.from() > 0) {
             return false;
         }
         QueryBuilder query = source.query();

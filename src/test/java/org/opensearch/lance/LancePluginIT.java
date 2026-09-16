@@ -370,14 +370,16 @@ public class LancePluginIT extends OpenSearchRestTestCase {
     }
 
     public void testFragmentDispatchModeReturnsRealCountForMatchAll() throws Exception {
-        // Milestone 2 of the shard-free dispatch prototype: setting
+        // Milestone 3 of the shard-free dispatch prototype: setting
         // lance.dispatch.mode = fragment must route match_all queries
-        // on Lance-backed indices through the plugin's own executor
-        // and return hits.total.value sourced from
-        // Dataset.countRows(). Non-Lance indices, and any Lance
-        // request that carries a non-trivial query / aggregation /
-        // sort / pagination clause, still route through the standard
-        // shard fan-out; those shapes are for later milestones.
+        // on Lance-backed indices through the plugin's own executor,
+        // return hits.total.value sourced from Dataset.countRows(),
+        // and populate the hits array with synthesised _id values
+        // sourced from Lance's _rowaddr. Non-Lance indices, and any
+        // Lance request that carries a non-trivial query /
+        // aggregation / sort / from clause, still route through the
+        // standard shard fan-out; those shapes are for later
+        // milestones.
         String suffix = "dispatch-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -403,19 +405,33 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             // now goes through the plugin's own executor. The executor
             // reads the row count directly from the Lance dataset, so
             // hits.total.value must equal the row count regardless of
-            // shard state.
+            // shard state. Milestone 3 also populates the hits array
+            // with synthesised {@code _id}s sourced from Lance's
+            // _rowaddr, so the response now looks like a standard
+            // OpenSearch search response instead of an empty-hits
+            // stub.
             updateClusterSetting("lance.dispatch.mode", "fragment");
             try {
-                int matchAllHits = extractIntPath(
-                    readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}")),
-                    "hits",
-                    "total",
-                    "value"
-                );
+                String matchAllBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
+                int matchAllHits = extractIntPath(matchAllBody, "hits", "total", "value");
                 assertEquals("fragment mode match_all must return the true row count", 6, matchAllHits);
+                // Default size is 10 so a 6-row table returns all six
+                // hits. Each hit carries a synthesised _id in the form
+                // "<fragmentId>-<offset>".
+                assertTrue(
+                    "fragment mode match_all must populate the hits array: " + matchAllBody,
+                    matchAllBody.contains("\"_id\":\"0-0\"")
+                );
+
+                // A size=2 request returns only two hits but keeps the
+                // total row count at six.
+                String sizeBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}},\"size\":2}"));
+                assertEquals("size clause must not affect total", 6, extractIntPath(sizeBody, "hits", "total", "value"));
+                int returnedHits = countOccurrences(sizeBody, "\"_id\":");
+                assertEquals("size=2 must return exactly two hits: " + sizeBody, 2, returnedHits);
 
                 // Any non-match_all shape still exercises the standard
-                // shard-based path. Milestone 2 only handles match_all;
+                // shard-based path. Milestone 3 only handles match_all;
                 // the passthrough path must produce the same result as
                 // the baseline.
                 int termHits = extractIntPath(
