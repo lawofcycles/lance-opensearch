@@ -369,17 +369,18 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
-    public void testFragmentDispatchModeReturnsRealCountForMatchAll() throws Exception {
-        // Milestone 3 of the shard-free dispatch prototype: setting
-        // lance.dispatch.mode = fragment must route match_all queries
-        // on Lance-backed indices through the plugin's own executor,
-        // return hits.total.value sourced from Dataset.countRows(),
-        // and populate the hits array with synthesised _id values
-        // sourced from Lance's _rowaddr. Non-Lance indices, and any
-        // Lance request that carries a non-trivial query /
-        // aggregation / sort / from clause, still route through the
-        // standard shard fan-out; those shapes are for later
-        // milestones.
+    public void testFragmentDispatchModeAnswersFilterQueries() throws Exception {
+        // Milestone 5-A of the shard-free dispatch prototype: setting
+        // lance.dispatch.mode = fragment must route match_all *and*
+        // filter queries (term / terms / exists / range / bool) on
+        // Lance-backed indices through the plugin's own executor.
+        // The count and the returned hits both come from Lance via
+        // LanceKnnFilterTranslator, so hits.total.value stays in sync
+        // with the number of matching hits regardless of shard state.
+        // Query shapes outside the translator's whitelist (match on a
+        // text field, geo, script, aggregations, sort, pagination)
+        // still route through the standard shard fan-out; those
+        // shapes are for later milestones.
         String suffix = "dispatch-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -442,17 +443,56 @@ public class LancePluginIT extends OpenSearchRestTestCase {
                 int returnedHits = countOccurrences(sizeBody, "\"_id\":");
                 assertEquals("size=2 must return exactly two hits: " + sizeBody, 2, returnedHits);
 
-                // Any non-match_all shape still exercises the standard
-                // shard-based path. Milestone 3 only handles match_all;
-                // the passthrough path must produce the same result as
-                // the baseline.
-                int termHits = extractIntPath(
-                    readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"term\":{\"id\":0}}}")),
+                // Milestone 5-A: term queries on numeric columns are
+                // now answered by the fragment executor itself, not
+                // the shard fall-through. The count and hit metadata
+                // both come from the plugin's own path via
+                // LanceKnnFilterTranslator -> Dataset.countRows(sql) +
+                // ScanOptions.filter(sql).
+                String termBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"term\":{\"id\":3}}}"));
+                assertEquals("fragment mode term must match exactly one row", 1, extractIntPath(termBody, "hits", "total", "value"));
+                // The synthesised _id sourced from _rowaddr is the
+                // signal that the fragment executor answered the
+                // request; shard mode would emit the same value but
+                // via a different code path. What matters is that we
+                // see the offset of the matching row (id = 3 lives at
+                // offset 3 in fragment 0) and its _source column.
+                assertTrue("fragment mode term must return the id=3 hit: " + termBody, termBody.contains("\"_id\":\"0-3\""));
+                assertTrue("fragment mode term must render the matching row: " + termBody, termBody.contains("\"id\":3"));
+
+                // A numeric range covers three rows (id in {2, 3, 4}).
+                // Total must be 3 and the returned hits must include
+                // id 2 and id 4 (id 3 is proven separately above).
+                String rangeBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"id\":{\"gte\":2,\"lt\":5}}}}"));
+                assertEquals("fragment mode range must count matching rows", 3, extractIntPath(rangeBody, "hits", "total", "value"));
+                assertTrue("fragment mode range must include id=2: " + rangeBody, rangeBody.contains("\"id\":2"));
+                assertTrue("fragment mode range must include id=4: " + rangeBody, rangeBody.contains("\"id\":4"));
+
+                // Bool AND of two filters proves nested translation
+                // works end-to-end. id >= 2 intersects id = 3, so the
+                // response must count and return exactly the id=3 row.
+                String boolBody = readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"query\":{\"bool\":{\"filter\":[{\"range\":{\"id\":{\"gte\":2}}},{\"term\":{\"id\":3}}]}}}"
+                    )
+                );
+                assertEquals("fragment mode bool must count the intersection", 1, extractIntPath(boolBody, "hits", "total", "value"));
+                assertTrue("fragment mode bool must return the id=3 hit: " + boolBody, boolBody.contains("\"_id\":\"0-3\""));
+
+                // Query shapes outside the translator's whitelist
+                // (match on a text field) still fall through to the
+                // shard-based path. The baseline hit count comes from
+                // shard mode, so this proves the fall-through is
+                // wired correctly. Milestone 5-A intentionally leaves
+                // full-text search on the shard executor.
+                int matchHits = extractIntPath(
+                    readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}}}")),
                     "hits",
                     "total",
                     "value"
                 );
-                assertEquals("fragment mode falls back to shard path for non-match_all queries", 1, termHits);
+                assertTrue("match query must fall through to shard path and still return hits (got " + matchHits + ")", matchHits > 0);
             } finally {
                 updateClusterSetting("lance.dispatch.mode", "shard");
             }

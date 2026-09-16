@@ -19,10 +19,20 @@ import org.opensearch.index.query.TermsQueryBuilder;
 /**
  * Translates a subset of OpenSearch {@link QueryBuilder}s to a Lance SQL
  * expression that {@link org.lance.ipc.ScanOptions.Builder#filter(String)}
- * accepts. The translation is used by {@code lance_knn} to push a pre-filter
- * into the Lance scanner: without it, {@code lance_knn} returns the top-K
- * rows first and the OpenSearch layer filters afterwards, which can leave
- * fewer than K matching results.
+ * accepts. The translation has two callers today:
+ * <ul>
+ *   <li>{@code lance_knn} uses it to push a pre-filter into the Lance
+ *       scanner. Without it, {@code lance_knn} returns the top-K rows
+ *       first and the OpenSearch layer filters afterwards, which can
+ *       leave fewer than K matching results.</li>
+ *   <li>{@code LanceDispatchActionFilter} uses it in fragment dispatch
+ *       mode to translate the request's top-level query into a filter
+ *       fed directly to {@link org.lance.Dataset#countRows(String)} and
+ *       to the {@link org.lance.ipc.ScanOptions} that populate
+ *       {@code hits}. That path bypasses the shard executor entirely
+ *       and needs the same subset of query types this translator
+ *       already covers.</li>
+ * </ul>
  *
  * <p>Supported clauses are the ones that are safe to lower into Lance's
  * DataFusion SQL parser:
@@ -39,11 +49,12 @@ import org.opensearch.index.query.TermsQueryBuilder;
  * </ul>
  *
  * <p>Any other builder — {@code match}, geo queries, script queries,
- * nested / has_parent, etc. — throws {@link IllegalArgumentException} so
- * the REST layer returns 400. Adding a clause here later is preferable to
- * silently degrading to the post-filter path.
+ * nested / has_parent, etc. — throws {@link IllegalArgumentException}.
+ * The {@code lance_knn} caller lets this bubble as a 400 to the REST
+ * layer, while the dispatch filter catches it and falls back to the
+ * standard shard path so the request still gets an answer.
  */
-final class LanceKnnFilterTranslator {
+public final class LanceKnnFilterTranslator {
 
     private LanceKnnFilterTranslator() {}
 
@@ -53,7 +64,7 @@ final class LanceKnnFilterTranslator {
      * @throws IllegalArgumentException when the builder or one of its
      *     sub-builders is not supported.
      */
-    static String toLanceSql(QueryBuilder builder) {
+    public static String toLanceSql(QueryBuilder builder) {
         if (builder == null) {
             throw new IllegalArgumentException("[lance_knn] filter must not be null");
         }
