@@ -34,6 +34,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.index.Index;
 import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
@@ -266,10 +267,12 @@ public class LanceDispatchActionFilter implements ActionFilter {
         // to build a unique _id per row without picking a column, and
         // matches the identifier LanceFragmentLeafReader emits in
         // shard mode for tables without a declared primary key.
-        ScanOptions options = new ScanOptions.Builder().columns(Collections.emptyList())
-            .withRowAddress(true)
-            .limit((long) remaining)
-            .build();
+        // No columns filter: the scan projects every column so the
+        // renderer can populate _source with the same fields the
+        // shard-mode reader would surface. Unsupported types (Float,
+        // Struct, etc.) are dropped in the renderer, matching the
+        // mapping-time decisions in RestAttachAction.derive.
+        ScanOptions options = new ScanOptions.Builder().withRowAddress(true).limit((long) remaining).build();
         try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
             while (out.size() < remaining && reader.loadNextBatch()) {
                 VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -282,6 +285,8 @@ public class LanceDispatchActionFilter implements ActionFilter {
                     String idString = fragmentId + "-" + offset;
                     SearchHit hit = new SearchHit(i, idString, Collections.emptyMap(), Collections.emptyMap());
                     hit.score(1.0f);
+                    byte[] source = LanceRowSourceRenderer.renderJson(root, i);
+                    hit.sourceRef(new BytesArray(source));
                     out.add(hit);
                 }
             }

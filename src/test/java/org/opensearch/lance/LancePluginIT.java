@@ -417,10 +417,22 @@ public class LancePluginIT extends OpenSearchRestTestCase {
                 assertEquals("fragment mode match_all must return the true row count", 6, matchAllHits);
                 // Default size is 10 so a 6-row table returns all six
                 // hits. Each hit carries a synthesised _id in the form
-                // "<fragmentId>-<offset>".
+                // "<fragmentId>-<offset>" and a _source rendered from
+                // the Arrow batch. The LanceTableFactory fixture puts
+                // "hello lance " at even offsets and "quick brown fox"
+                // at odd offsets in the body column; both must show
+                // up in the response.
                 assertTrue(
                     "fragment mode match_all must populate the hits array: " + matchAllBody,
                     matchAllBody.contains("\"_id\":\"0-0\"")
+                );
+                assertTrue(
+                    "fragment mode match_all must render _source with the body column: " + matchAllBody,
+                    matchAllBody.contains("hello lance")
+                );
+                assertTrue(
+                    "fragment mode match_all must render _source with the id column: " + matchAllBody,
+                    matchAllBody.contains("\"id\":0")
                 );
 
                 // A size=2 request returns only two hits but keeps the
