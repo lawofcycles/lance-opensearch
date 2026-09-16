@@ -103,8 +103,23 @@ public final class LanceMetricAggregator {
      * the aggregator needs. Extracted so the aggregator does not
      * depend on the full builder graph and can be constructed
      * defensively at parse time.
+     *
+     * <p>{@link Writeable} so per-node dispatch requests can carry
+     * the spec list from coordinator to nodes without depending on
+     * server-side re-parsing.
      */
-    public record MetricSpec(String name, MetricType type, String field) {
+    public record MetricSpec(String name, MetricType type, String field) implements Writeable {
+
+        public MetricSpec(StreamInput in) throws IOException {
+            this(in.readString(), MetricType.values()[in.readVInt()], in.readString());
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeString(name);
+            out.writeVInt(type.ordinal());
+            out.writeString(field);
+        }
     }
 
     /**

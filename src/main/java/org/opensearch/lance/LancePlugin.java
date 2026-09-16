@@ -446,6 +446,21 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     }
 
     @Override
+    public
+        List<
+            org.opensearch.plugins.ActionPlugin.ActionHandler<
+                ? extends org.opensearch.action.ActionRequest,
+                ? extends org.opensearch.core.action.ActionResponse>>
+        getActions() {
+        return List.of(
+            new org.opensearch.plugins.ActionPlugin.ActionHandler<>(
+                org.opensearch.lance.dispatch.LanceFragmentQueryAction.INSTANCE,
+                org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction.class
+            )
+        );
+    }
+
+    @Override
     public List<RestHandler> getRestHandlers(
         Settings settings,
         RestController restController,
