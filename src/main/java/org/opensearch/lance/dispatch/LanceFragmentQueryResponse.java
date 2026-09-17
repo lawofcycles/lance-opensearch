@@ -12,8 +12,8 @@ import java.util.List;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
-import org.opensearch.lance.dispatch.LanceMetricAggregator.PartialState;
 import org.opensearch.search.SearchHit;
+import org.opensearch.search.aggregations.InternalAggregations;
 
 /**
  * Per-node dispatch response. Carries the partial numbers the
@@ -31,10 +31,20 @@ import org.opensearch.search.SearchHit;
  *   <li>{@link #hits()} — top-{@code size} hits from the node's
  *       fragment subset. Coordinator concatenates all node lists
  *       and truncates to the request's {@code size}.</li>
- *   <li>{@link #partials()} — one {@link PartialState} per metric
- *       spec (parallel to the request's {@code metrics}), ready to
- *       feed into
- *       {@link LanceMetricAggregator#mergePartials(List, List)}.</li>
+ *   <li>{@link #aggregations()} — per-node
+ *       {@link InternalAggregations} produced by driving OpenSearch's
+ *       stock aggregator machinery against a per-fragment
+ *       {@link org.apache.lucene.index.DirectoryReader}
+ *       (see {@link TransportLanceFragmentQueryAction}). Every
+ *       {@link org.opensearch.search.aggregations.InternalAggregation}
+ *       inside is already Writeable, so the transport layer
+ *       serialises the whole tree in one call. Coordinator merges
+ *       them with
+ *       {@link InternalAggregations#topLevelReduce(java.util.List,
+ *       org.opensearch.search.aggregations.InternalAggregation.ReduceContext)}
+ *       — the same reduction path the shard fan-out uses. May be
+ *       {@code null} for hits-only requests where no aggregations
+ *       were requested.</li>
  * </ul>
  *
  * <p>{@link SearchHit} is already {@link org.opensearch.core.common.io.stream.Writeable
@@ -47,13 +57,13 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
     private final long matched;
     private final int fragmentCount;
     private final List<SearchHit> hits;
-    private final List<PartialState> partials;
+    private final InternalAggregations aggregations;
 
-    public LanceFragmentQueryResponse(long matched, int fragmentCount, List<SearchHit> hits, List<PartialState> partials) {
+    public LanceFragmentQueryResponse(long matched, int fragmentCount, List<SearchHit> hits, InternalAggregations aggregations) {
         this.matched = matched;
         this.fragmentCount = fragmentCount;
         this.hits = List.copyOf(hits);
-        this.partials = List.copyOf(partials);
+        this.aggregations = aggregations;
     }
 
     public LanceFragmentQueryResponse(StreamInput in) throws IOException {
@@ -66,12 +76,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
             readHits.add(new SearchHit(in));
         }
         this.hits = List.copyOf(readHits);
-        int partialCount = in.readVInt();
-        List<PartialState> readPartials = new ArrayList<>(partialCount);
-        for (int i = 0; i < partialCount; i++) {
-            readPartials.add(new PartialState(in));
-        }
-        this.partials = List.copyOf(readPartials);
+        this.aggregations = in.readBoolean() ? InternalAggregations.readFrom(in) : null;
     }
 
     @Override
@@ -82,9 +87,11 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         for (SearchHit hit : hits) {
             hit.writeTo(out);
         }
-        out.writeVInt(partials.size());
-        for (PartialState partial : partials) {
-            partial.writeTo(out);
+        if (aggregations == null) {
+            out.writeBoolean(false);
+        } else {
+            out.writeBoolean(true);
+            aggregations.writeTo(out);
         }
     }
 
@@ -100,7 +107,14 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         return hits;
     }
 
-    public List<PartialState> partials() {
-        return partials;
+    /**
+     * Per-node aggregation results. May be {@code null} when the
+     * request carried no aggregations. Never returns an empty
+     * {@link InternalAggregations} — a request with aggregations
+     * always produces at least one {@link
+     * org.opensearch.search.aggregations.InternalAggregation}.
+     */
+    public InternalAggregations aggregations() {
+        return aggregations;
     }
 }

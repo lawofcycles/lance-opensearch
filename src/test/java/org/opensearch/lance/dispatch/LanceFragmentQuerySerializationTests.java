@@ -9,13 +9,17 @@ import java.util.Collections;
 import java.util.List;
 
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
+import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricSpec;
 import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricType;
 import org.opensearch.lance.dispatch.LanceMetricAggregator.PartialState;
 import org.opensearch.search.SearchHit;
+import org.opensearch.search.SearchModule;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -25,6 +29,10 @@ import org.opensearch.test.OpenSearchTestCase;
  * developed independently without breaking each other.
  */
 public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
+
+    private static final NamedWriteableRegistry AGG_REGISTRY = new NamedWriteableRegistry(
+        new SearchModule(Settings.EMPTY, java.util.Collections.emptyList()).getNamedWriteables()
+    );
 
     public void testMetricSpecRoundTrip() throws Exception {
         MetricSpec original = new MetricSpec("total", MetricType.SUM, "amount");
@@ -125,12 +133,53 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         hit.score(1.0f);
         hit.sourceRef(new BytesArray("{\"id\":3}"));
 
+        // Wire format now carries InternalAggregations (see Direction 1
+        // Stage 2). We build a real InternalSum so the round-trip exercises
+        // the aggregator's own StreamInput/StreamOutput code path rather
+        // than an empty container: an empty InternalAggregations would not
+        // catch bugs in per-aggregation serialisation.
+        org.opensearch.search.aggregations.InternalAggregations aggregations =
+            org.opensearch.search.aggregations.InternalAggregations.from(
+                List.<org.opensearch.search.aggregations.InternalAggregation>of(
+                    new org.opensearch.search.aggregations.metrics.InternalSum("s", 3.0d,
+                        org.opensearch.search.DocValueFormat.RAW, java.util.Map.of())
+                )
+            );
+
         LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(
             1L,
             1,
             List.of(hit),
-            List.of(new PartialState(1L, 3.0d, 3.0d, 3.0d))
+            aggregations
         );
+
+        LanceFragmentQueryResponse restored;
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (
+                StreamInput raw = out.bytes().streamInput();
+                NamedWriteableAwareStreamInput in = new NamedWriteableAwareStreamInput(raw, AGG_REGISTRY)
+            ) {
+                restored = new LanceFragmentQueryResponse(in);
+            }
+        }
+
+        assertEquals(original.matched(), restored.matched());
+        assertEquals(original.fragmentCount(), restored.fragmentCount());
+        assertEquals(1, restored.hits().size());
+        assertEquals("0-3", restored.hits().get(0).getId());
+        assertEquals("{\"id\":3}", restored.hits().get(0).getSourceAsString());
+        assertNotNull(restored.aggregations());
+        org.opensearch.search.aggregations.metrics.InternalSum restoredSum =
+            (org.opensearch.search.aggregations.metrics.InternalSum) restored.aggregations().get("s");
+        assertEquals(3.0d, restoredSum.getValue(), 0.0d);
+    }
+
+    public void testResponseRoundTripWithNoAggregations() throws Exception {
+        SearchHit hit = new SearchHit(0, "0-3", Collections.emptyMap(), Collections.emptyMap());
+        hit.score(1.0f);
+
+        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(1L, 1, List.of(hit), null);
 
         LanceFragmentQueryResponse restored;
         try (BytesStreamOutput out = new BytesStreamOutput()) {
@@ -141,10 +190,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         }
 
         assertEquals(original.matched(), restored.matched());
-        assertEquals(original.fragmentCount(), restored.fragmentCount());
         assertEquals(1, restored.hits().size());
-        assertEquals("0-3", restored.hits().get(0).getId());
-        assertEquals("{\"id\":3}", restored.hits().get(0).getSourceAsString());
-        assertEquals(original.partials(), restored.partials());
+        assertNull(restored.aggregations());
     }
 }

@@ -33,16 +33,18 @@ import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
+import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.Index;
 import org.opensearch.lance.LanceRegistry;
-import org.opensearch.lance.StorageOptions;
+import org.opensearch.script.ScriptService;import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricSpec;
 import org.opensearch.lance.dispatch.LanceMetricAggregator.PartialState;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
+import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
@@ -72,18 +74,24 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     private final TransportService transportService;
     private final ClusterService clusterService;
     private final IndexNameExpressionResolver indexNameExpressionResolver;
+    private final BigArrays bigArrays;
+    private final ScriptService scriptService;
 
     @Inject
     public TransportLanceCoordinatorAction(
         TransportService transportService,
         ClusterService clusterService,
         IndexNameExpressionResolver indexNameExpressionResolver,
-        ActionFilters actionFilters
+        ActionFilters actionFilters,
+        BigArrays bigArrays,
+        ScriptService scriptService
     ) {
         super(LanceCoordinatorAction.NAME, transportService, actionFilters, SearchRequest::new);
         this.transportService = transportService;
         this.clusterService = clusterService;
         this.indexNameExpressionResolver = indexNameExpressionResolver;
+        this.bigArrays = bigArrays;
+        this.scriptService = scriptService;
     }
 
     @Override
@@ -397,13 +405,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * final response state. Not thread-safe: guarded by the
      * sequential index loop.
      */
-    private static final class MergeState {
+    private final class MergeState {
 
         private final List<MetricSpec> metrics;
         private final int effectiveSize;
         private long totalMatched = 0L;
         private final List<SearchHit> hits = new ArrayList<>();
-        private final List<List<PartialState>> perGroupPartials = new ArrayList<>();
+        private final List<InternalAggregations> perNodeAggregations = new ArrayList<>();
 
         MergeState(List<MetricSpec> metrics, int effectiveSize) {
             this.metrics = metrics;
@@ -418,8 +426,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                         hits.add(hit);
                     }
                 }
-                if (!response.partials().isEmpty()) {
-                    perGroupPartials.add(response.partials());
+                if (response.aggregations() != null) {
+                    perNodeAggregations.add(response.aggregations());
                 }
             }
         }
@@ -431,7 +439,22 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 new TotalHits(totalMatched, TotalHits.Relation.EQUAL_TO),
                 hits.isEmpty() ? Float.NaN : 1.0f
             );
-            InternalAggregations aggregations = metrics.isEmpty() ? null : LanceMetricAggregator.mergePartials(metrics, perGroupPartials);
+            InternalAggregations aggregations = null;
+            if (!metrics.isEmpty() && !perNodeAggregations.isEmpty()) {
+                // Feed every per-node InternalAggregations tree into the
+                // stock reduce path so cross-node reduction lives in
+                // OpenSearch's aggregator code rather than in the Lance
+                // plugin. Direction 1 Stage 2 wire format: nodes ship
+                // InternalAggregations, coordinator calls topLevelReduce,
+                // no plugin-specific merge logic in the middle.
+                InternalAggregation.ReduceContext ctx = InternalAggregation.ReduceContext.forFinalReduction(
+                    bigArrays,
+                    scriptService,
+                    /* multiBucketConsumer */ n -> {},
+                    org.opensearch.search.aggregations.pipeline.PipelineAggregator.PipelineTree.EMPTY
+                );
+                aggregations = InternalAggregations.topLevelReduce(perNodeAggregations, ctx);
+            }
             SearchResponseSections sections = new SearchResponseSections(searchHits, aggregations, null, false, false, null, 1);
             // Hide the Lance fragment fan-out from the response
             // shape. The user's mental model is one logical dataset,

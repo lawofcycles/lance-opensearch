@@ -7,9 +7,7 @@ package org.opensearch.lance.dispatch;
 
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -42,8 +40,6 @@ import org.opensearch.index.shard.IndexShard;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricSpec;
-import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricType;
-import org.opensearch.lance.dispatch.LanceMetricAggregator.PartialState;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.search.SearchHit;
@@ -51,15 +47,12 @@ import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.BucketCollector;
 import org.opensearch.search.aggregations.InternalAggregation;
+import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.MultiBucketCollector;
 import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer;
 import org.opensearch.search.aggregations.SearchContextAggregations;
 import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
-import org.opensearch.search.aggregations.metrics.InternalAvg;
-import org.opensearch.search.aggregations.metrics.InternalMax;
-import org.opensearch.search.aggregations.metrics.InternalMin;
-import org.opensearch.search.aggregations.metrics.InternalSum;
-import org.opensearch.search.aggregations.metrics.InternalValueCount;
+import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.MaxAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.MinAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.SumAggregationBuilder;
@@ -166,10 +159,10 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             for (Fragment fragment : dataset.getFragments()) {
                 allFragmentIds.add(fragment.getId());
             }
-            List<PartialState> partials = aggregateViaIndexSearcher(request, allFragmentIds);
+            InternalAggregations aggregations = aggregateViaIndexSearcher(request, allFragmentIds);
 
-            long matched = computeMatched(dataset, request, partials);
-            return new LanceFragmentQueryResponse(matched, fragmentCount, hits, partials);
+            long matched = computeMatched(dataset, request);
+            return new LanceFragmentQueryResponse(matched, fragmentCount, hits, aggregations);
         }
     }
 
@@ -223,14 +216,20 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * / {@code MaxAggregator} / {@code ValueCountAggregator} — the same
      * aggregator machinery the shard path uses — via a
      * {@link LanceFragmentSearchContext} substitute. The per-aggregator
-     * result is converted back to a {@link PartialState} so the wire
-     * format between coordinator and per-node handler stays unchanged
-     * from earlier milestones.
+     * results are wrapped in an {@link InternalAggregations} instance
+     * so the coordinator can call
+     * {@link InternalAggregations#topLevelReduce} on the collected
+     * per-node results, matching the shard fan-out reduce path.
+     *
+     * <p>Returns {@code null} when the request carries no metric
+     * specs; the response carries {@code aggregations == null} in
+     * that case.
      */
-    private List<PartialState> aggregateViaIndexSearcher(LanceFragmentQueryRequest request, List<Integer> allFragmentIds) throws Exception {
+    private InternalAggregations aggregateViaIndexSearcher(LanceFragmentQueryRequest request, List<Integer> allFragmentIds)
+        throws Exception {
         List<MetricSpec> metrics = request.metrics();
         if (metrics.isEmpty()) {
-            return Collections.emptyList();
+            return null;
         }
         Metadata metadata = clusterService.state().metadata();
         IndexMetadata indexMetadata = metadata.index(request.indexName());
@@ -289,43 +288,26 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 QueryShardContext qsc = indexService.newQueryShardContext(0, searcher, System::currentTimeMillis, null);
                 searchContext.withQueryShardContext(qsc);
 
-                // Build AggregatorFactories: per-metric-spec, map to one or
-                // two stock aggregators. For Sum / Min / Max / ValueCount a
-                // single stock aggregator carries all the state we need. For
-                // Avg we run Sum + ValueCount side by side because
-                // InternalAvg's raw count and sum are package-private, then
-                // rejoin them into the PartialState after collection.
+                // Build AggregatorFactories: one stock aggregator per
+                // metric spec. Every supported metric type has a native
+                // InternalAggregation representation that InternalAggregations
+                // reduces natively, so we drop the previous
+                // Sum+ValueCount synthetic AVG workaround: InternalAvg
+                // carries its own count internally and reduces on its own.
                 AggregatorFactories.Builder factoriesBuilder = new AggregatorFactories.Builder();
-                Map<String, List<String>> specToInternal = new LinkedHashMap<>();
                 for (MetricSpec spec : metrics) {
-                    List<String> internalNames = new ArrayList<>(2);
                     switch (spec.type()) {
-                        case SUM -> {
+                        case SUM ->
                             factoriesBuilder.addAggregator(new SumAggregationBuilder(spec.name()).field(spec.field()));
-                            internalNames.add(spec.name());
-                        }
-                        case AVG -> {
-                            String sumName = spec.name() + "$sum";
-                            String countName = spec.name() + "$count";
-                            factoriesBuilder.addAggregator(new SumAggregationBuilder(sumName).field(spec.field()));
-                            factoriesBuilder.addAggregator(new ValueCountAggregationBuilder(countName).field(spec.field()));
-                            internalNames.add(sumName);
-                            internalNames.add(countName);
-                        }
-                        case MIN -> {
+                        case AVG ->
+                            factoriesBuilder.addAggregator(new AvgAggregationBuilder(spec.name()).field(spec.field()));
+                        case MIN ->
                             factoriesBuilder.addAggregator(new MinAggregationBuilder(spec.name()).field(spec.field()));
-                            internalNames.add(spec.name());
-                        }
-                        case MAX -> {
+                        case MAX ->
                             factoriesBuilder.addAggregator(new MaxAggregationBuilder(spec.name()).field(spec.field()));
-                            internalNames.add(spec.name());
-                        }
-                        case VALUE_COUNT -> {
+                        case VALUE_COUNT ->
                             factoriesBuilder.addAggregator(new ValueCountAggregationBuilder(spec.name()).field(spec.field()));
-                            internalNames.add(spec.name());
-                        }
                     }
-                    specToInternal.put(spec.name(), internalNames);
                 }
                 AggregatorFactories factories = factoriesBuilder.build(qsc, null);
 
@@ -340,17 +322,12 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     agg.postCollection();
                 }
 
-                Map<String, InternalAggregation> byInternalName = new LinkedHashMap<>();
+                List<InternalAggregation> results = new ArrayList<>(aggregators.length);
                 for (Aggregator agg : aggregators) {
-                    InternalAggregation[] results = agg.buildAggregations(new long[] { 0L });
-                    byInternalName.put(agg.name(), results[0]);
+                    InternalAggregation[] built = agg.buildAggregations(new long[] { 0L });
+                    results.add(built[0]);
                 }
-
-                List<PartialState> partials = new ArrayList<>(metrics.size());
-                for (MetricSpec spec : metrics) {
-                    partials.add(toPartialState(spec, byInternalName, specToInternal.get(spec.name())));
-                }
-                return partials;
+                return InternalAggregations.from(results);
             }
         }
     }
@@ -384,72 +361,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
-     * Fold stock {@link InternalAggregation} results back into the
-     * {@link PartialState} shape the coordinator's merge phase
-     * consumes. The wire format across coordinator and per-node
-     * handlers stays unchanged from earlier milestones; switching
-     * that format to a native {@link InternalAggregation} carrier is
-     * a later cleanup step.
-     *
-     * <p>Unused {@code PartialState} fields for a given metric type
-     * are set to the neutral {@link PartialState#EMPTY} values so the
-     * associative {@link PartialState#merge} stays correct across
-     * multiple per-node responses that mix metric types on the same
-     * field.
-     *
-     * <p>AVG carries synthetic sum + count aggregators (see
-     * {@link #aggregateViaIndexSearcher}), so its raw state is
-     * reconstructed from the two internal names.
-     */
-    private PartialState toPartialState(MetricSpec spec, Map<String, InternalAggregation> byInternalName, List<String> internalNames) {
-        return switch (spec.type()) {
-            case SUM -> new PartialState(
-                0L,
-                ((InternalSum) byInternalName.get(internalNames.get(0))).getValue(),
-                Double.POSITIVE_INFINITY,
-                Double.NEGATIVE_INFINITY
-            );
-            case AVG -> {
-                double sum = ((InternalSum) byInternalName.get(internalNames.get(0))).getValue();
-                long count = (long) ((InternalValueCount) byInternalName.get(internalNames.get(1))).getValue();
-                yield new PartialState(count, sum, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY);
-            }
-            case MIN -> new PartialState(
-                0L,
-                0.0d,
-                ((InternalMin) byInternalName.get(internalNames.get(0))).getValue(),
-                Double.NEGATIVE_INFINITY
-            );
-            case MAX -> new PartialState(
-                0L,
-                0.0d,
-                Double.POSITIVE_INFINITY,
-                ((InternalMax) byInternalName.get(internalNames.get(0))).getValue()
-            );
-            case VALUE_COUNT -> new PartialState(
-                (long) ((InternalValueCount) byInternalName.get(internalNames.get(0))).getValue(),
-                0.0d,
-                Double.POSITIVE_INFINITY,
-                Double.NEGATIVE_INFINITY
-            );
-        };
-    }
-
-    /**
      * Determine the number of rows in this node's fragment subset
-     * that satisfy the filter.
-     *
-     * <p>When at least one metric spec is present the aggregator scan
-     * already visited every matching row; we can reuse its result
-     * because every supported metric type increments {@code count}
-     * per non-null row. VALUE_COUNT specs preserve the count directly,
-     * so we look for one first. If the spec list has no VALUE_COUNT we
-     * pick any spec and derive count from it if possible; when none
-     * of the specs happens to carry a count (Sum / Min / Max return
-     * only their own value), fall through to the metadata-only path.
-     *
-     * <p>Without metrics we take a shortcut appropriate to the
-     * filter:
+     * that satisfy the filter. Uses Lance's metadata-only counting
+     * whenever possible:
      * <ul>
      *   <li>No filter: sum {@link org.lance.Fragment#countRows()}
      *       across the assigned fragments (Lance metadata, no
@@ -459,18 +373,17 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *   <li>Filter set, subset of fragments: run a bounded scan
      *       over the subset and count matching rows.</li>
      * </ul>
+     *
+     * <p>Earlier revisions piggy-backed the count off a
+     * {@code VALUE_COUNT} / {@code AVG} aggregator when the request
+     * happened to include one, saving the metadata call. That
+     * shortcut required carrying the raw count through the wire
+     * format, which the {@link InternalAggregations} switch made
+     * awkward (InternalAvg's raw count is package-private). Since
+     * Lance's countRows is already metadata-only, we drop the
+     * shortcut in favour of the cleaner wire format.
      */
-    private long computeMatched(Dataset dataset, LanceFragmentQueryRequest request, List<PartialState> partials) throws Exception {
-        if (!partials.isEmpty()) {
-            for (int i = 0; i < request.metrics().size(); i++) {
-                MetricSpec spec = request.metrics().get(i);
-                if (spec.type() == MetricType.VALUE_COUNT || spec.type() == MetricType.AVG) {
-                    // These fill PartialState.count exactly.
-                    return partials.get(i).count();
-                }
-            }
-            // Fall through: no count-carrying metric in the specs.
-        }
+    private long computeMatched(Dataset dataset, LanceFragmentQueryRequest request) throws Exception {
         List<Integer> fragmentIds = request.fragmentIdsOrNull();
         String filterSql = request.filterSql();
         if (filterSql == null) {
