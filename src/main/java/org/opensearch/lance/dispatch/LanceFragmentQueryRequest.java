@@ -15,7 +15,7 @@ import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.lance.StorageOptions;
-import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricSpec;
+import org.opensearch.search.aggregations.AggregatorFactories;
 
 /**
  * Per-node dispatch request. The coordinator groups the target
@@ -24,10 +24,14 @@ import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricSpec;
  * shared registry with the same {@link StorageOptions} the
  * coordinator resolved, scans only the given fragments (or every
  * fragment when {@link #fragmentIds()} is empty as a shorthand for
- * "all"), and honours the filter and metric specs alongside the
+ * "all"), and honours the filter and aggregations alongside the
  * hits {@code size} allowance.
  *
- * <p>{@link Writeable} so it survives the transport hop.
+ * <p>Aggregations flow as an
+ * {@link AggregatorFactories.Builder} (native OpenSearch shape,
+ * NamedWriteable-compatible), so any aggregation type the OpenSearch
+ * aggregator machinery understands can travel across the fragment
+ * dispatch wire without a plugin-specific projection.
  */
 public final class LanceFragmentQueryRequest extends ActionRequest {
 
@@ -36,7 +40,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     private final StorageOptions storageOptions;
     private final String filterSql;
     private final int size;
-    private final List<MetricSpec> metrics;
+    private final AggregatorFactories.Builder aggregations;
     private final List<Integer> fragmentIds;
 
     /**
@@ -54,8 +58,10 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
      *     match_all
      * @param size max hits the node should return; the coordinator
      *     may over-fetch across nodes and truncate on merge
-     * @param metrics metric specs to compute; empty list = no
-     *     aggregations
+     * @param aggregations top-level aggregator specs; {@code null}
+     *     when the request carries no aggregations. Preserved as
+     *     the native OpenSearch shape so the receiving node feeds it
+     *     straight into {@code factoriesBuilder.build(qsc, null)}.
      * @param fragmentIds fragment ids the node should scan; an
      *     empty list is shorthand for "every fragment on this
      *     dataset" and is used by single-node dispatch or by tests
@@ -66,7 +72,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         StorageOptions storageOptions,
         String filterSql,
         int size,
-        List<MetricSpec> metrics,
+        AggregatorFactories.Builder aggregations,
         List<Integer> fragmentIds
     ) {
         this.tableUri = tableUri;
@@ -74,7 +80,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.storageOptions = storageOptions;
         this.filterSql = filterSql;
         this.size = size;
-        this.metrics = List.copyOf(metrics);
+        this.aggregations = aggregations;
         this.fragmentIds = List.copyOf(fragmentIds);
     }
 
@@ -85,12 +91,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.storageOptions = StorageOptions.readFromStream(in);
         this.filterSql = in.readOptionalString();
         this.size = in.readVInt();
-        int metricCount = in.readVInt();
-        List<MetricSpec> readMetrics = new ArrayList<>(metricCount);
-        for (int i = 0; i < metricCount; i++) {
-            readMetrics.add(new MetricSpec(in));
-        }
-        this.metrics = List.copyOf(readMetrics);
+        this.aggregations = in.readBoolean() ? new AggregatorFactories.Builder(in) : null;
         int fragmentCount = in.readVInt();
         List<Integer> readFragments = new ArrayList<>(fragmentCount);
         for (int i = 0; i < fragmentCount; i++) {
@@ -107,9 +108,11 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         storageOptions.writeTo(out);
         out.writeOptionalString(filterSql);
         out.writeVInt(size);
-        out.writeVInt(metrics.size());
-        for (MetricSpec spec : metrics) {
-            spec.writeTo(out);
+        if (aggregations == null) {
+            out.writeBoolean(false);
+        } else {
+            out.writeBoolean(true);
+            aggregations.writeTo(out);
         }
         out.writeVInt(fragmentIds.size());
         for (Integer id : fragmentIds) {
@@ -145,8 +148,12 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         return size;
     }
 
-    public List<MetricSpec> metrics() {
-        return metrics;
+    /**
+     * Top-level aggregations to run on the per-fragment reader, or
+     * {@code null} when the request has no aggregations.
+     */
+    public AggregatorFactories.Builder aggregations() {
+        return aggregations;
     }
 
     /**
@@ -177,7 +184,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         StorageOptions storageOptions,
         String filterSql,
         int size,
-        List<MetricSpec> metrics
+        AggregatorFactories.Builder aggregations
     ) {
         return new LanceFragmentQueryRequest(
             tableUri,
@@ -185,7 +192,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             storageOptions,
             filterSql,
             size,
-            metrics,
+            aggregations,
             Collections.emptyList()
         );
     }

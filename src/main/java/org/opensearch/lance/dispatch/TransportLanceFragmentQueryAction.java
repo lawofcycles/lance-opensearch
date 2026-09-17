@@ -39,7 +39,6 @@ import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceRegistry;
-import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricSpec;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.search.SearchHit;
@@ -51,12 +50,6 @@ import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.MultiBucketCollector;
 import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer;
 import org.opensearch.search.aggregations.SearchContextAggregations;
-import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
-import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
-import org.opensearch.search.aggregations.metrics.MaxAggregationBuilder;
-import org.opensearch.search.aggregations.metrics.MinAggregationBuilder;
-import org.opensearch.search.aggregations.metrics.SumAggregationBuilder;
-import org.opensearch.search.aggregations.metrics.ValueCountAggregationBuilder;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
@@ -221,14 +214,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * {@link InternalAggregations#topLevelReduce} on the collected
      * per-node results, matching the shard fan-out reduce path.
      *
-     * <p>Returns {@code null} when the request carries no metric
-     * specs; the response carries {@code aggregations == null} in
-     * that case.
+     * <p>Returns {@code null} when the request carries no aggregations;
+     * the response carries {@code aggregations == null} in that case.
      */
     private InternalAggregations aggregateViaIndexSearcher(LanceFragmentQueryRequest request, List<Integer> allFragmentIds)
         throws Exception {
-        List<MetricSpec> metrics = request.metrics();
-        if (metrics.isEmpty()) {
+        AggregatorFactories.Builder factoriesBuilder = request.aggregations();
+        if (factoriesBuilder == null || factoriesBuilder.getAggregatorFactories().isEmpty()) {
             return null;
         }
         Metadata metadata = clusterService.state().metadata();
@@ -288,27 +280,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 QueryShardContext qsc = indexService.newQueryShardContext(0, searcher, System::currentTimeMillis, null);
                 searchContext.withQueryShardContext(qsc);
 
-                // Build AggregatorFactories: one stock aggregator per
-                // metric spec. Every supported metric type has a native
-                // InternalAggregation representation that InternalAggregations
-                // reduces natively, so we drop the previous
-                // Sum+ValueCount synthetic AVG workaround: InternalAvg
-                // carries its own count internally and reduces on its own.
-                AggregatorFactories.Builder factoriesBuilder = new AggregatorFactories.Builder();
-                for (MetricSpec spec : metrics) {
-                    switch (spec.type()) {
-                        case SUM ->
-                            factoriesBuilder.addAggregator(new SumAggregationBuilder(spec.name()).field(spec.field()));
-                        case AVG ->
-                            factoriesBuilder.addAggregator(new AvgAggregationBuilder(spec.name()).field(spec.field()));
-                        case MIN ->
-                            factoriesBuilder.addAggregator(new MinAggregationBuilder(spec.name()).field(spec.field()));
-                        case MAX ->
-                            factoriesBuilder.addAggregator(new MaxAggregationBuilder(spec.name()).field(spec.field()));
-                        case VALUE_COUNT ->
-                            factoriesBuilder.addAggregator(new ValueCountAggregationBuilder(spec.name()).field(spec.field()));
-                    }
-                }
+                // The AggregatorFactories.Builder we received on the wire
+                // is the raw shape from the coordinator's
+                // SearchSourceBuilder.aggregations() — Stage 2 wire format
+                // ships aggregations as native OpenSearch shape rather
+                // than a plugin-specific projection. Build the concrete
+                // factories against the local QueryShardContext and drive
+                // them through the standard aggregator preCollection /
+                // BucketCollector / postCollection cycle.
                 AggregatorFactories factories = factoriesBuilder.build(qsc, null);
 
                 List<Aggregator> topLevelAggregators = factories.createTopLevelAggregators(searchContext);

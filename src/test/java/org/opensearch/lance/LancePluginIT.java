@@ -599,18 +599,20 @@ public class LancePluginIT extends OpenSearchRestTestCase {
                     0.0d
                 );
 
-                // Bucket aggregations continue to route through the
-                // shard fan-out because LanceMetricAggregator does not
-                // implement them yet. The response must still be
-                // well-formed and carry the terms bucket, which is
-                // the shard aggregator's shape.
+                // Direction 1 Stage 2: terms bucket aggregation
+                // now runs on the fragment executor via the stock
+                // TermsAggregator against per-fragment
+                // LanceFragmentLeafReaders. The response must carry
+                // one bucket per distinct id value (6 rows, all
+                // unique ids 0..5 = 6 buckets, doc_count=1 each).
                 String bucketBody = readAll(
-                    postJson("/" + indexName + "/_search", "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\"}}}}")
+                    postJson("/" + indexName + "/_search", "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":10}}}}")
                 );
                 assertTrue(
-                    "terms aggregation must fall through to shard path and carry buckets: " + bucketBody,
+                    "terms aggregation via fragment path carries buckets: " + bucketBody,
                     bucketBody.contains("\"buckets\":")
                 );
+                assertEquals(6, extractIntPath(bucketBody, "hits", "total", "value"));
             } finally {
                 updateClusterSetting("lance.dispatch.mode", "shard");
             }

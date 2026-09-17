@@ -74,20 +74,33 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
 
     public void testRequestRoundTrip() throws Exception {
         StorageOptions storage = StorageOptions.of(java.util.Map.of("region", "us-east-1"));
+        // Aggregations flow across the wire as an
+        // AggregatorFactories.Builder now — the raw shape from
+        // SearchSourceBuilder.aggregations(). Build one with two metric
+        // aggregations so the round-trip exercises the native
+        // OpenSearch serialisation rather than the previous plugin-
+        // specific MetricSpec projection.
+        org.opensearch.search.aggregations.AggregatorFactories.Builder aggs =
+            new org.opensearch.search.aggregations.AggregatorFactories.Builder()
+                .addAggregator(new org.opensearch.search.aggregations.metrics.SumAggregationBuilder("s").field("id"))
+                .addAggregator(new org.opensearch.search.aggregations.metrics.MinAggregationBuilder("m").field("id"));
         LanceFragmentQueryRequest original = new LanceFragmentQueryRequest(
             "s3://bucket/tables/demo.lance",
             "demo",
             storage,
             "id >= 2",
             5,
-            List.of(new MetricSpec("s", MetricType.SUM, "id"), new MetricSpec("m", MetricType.MIN, "id")),
+            aggs,
             List.of(0, 2, 4)
         );
 
         LanceFragmentQueryRequest restored;
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             original.writeTo(out);
-            try (StreamInput in = out.bytes().streamInput()) {
+            try (
+                StreamInput raw = out.bytes().streamInput();
+                NamedWriteableAwareStreamInput in = new NamedWriteableAwareStreamInput(raw, AGG_REGISTRY)
+            ) {
                 restored = new LanceFragmentQueryRequest(in);
             }
         }
@@ -96,7 +109,8 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         assertEquals(original.indexName(), restored.indexName());
         assertEquals(original.filterSql(), restored.filterSql());
         assertEquals(original.size(), restored.size());
-        assertEquals(original.metrics(), restored.metrics());
+        assertNotNull(restored.aggregations());
+        assertEquals(2, restored.aggregations().getAggregatorFactories().size());
         assertEquals(original.fragmentIds(), restored.fragmentIds());
         assertEquals(original.storageOptions().asMap(), restored.storageOptions().asMap());
     }
@@ -109,7 +123,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             storage,
             /* filterSql */ null,
             10,
-            Collections.emptyList()
+            /* aggregations */ null
         );
 
         LanceFragmentQueryRequest restored;
@@ -125,7 +139,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         assertTrue("empty fragmentIds is the all-fragments sentinel", restored.fragmentIds().isEmpty());
         assertNull("empty list must expose as null through the SDK helper", restored.fragmentIdsOrNull());
         assertEquals(original.size(), restored.size());
-        assertEquals(original.metrics(), restored.metrics());
+        assertNull(restored.aggregations());
     }
 
     public void testResponseRoundTrip() throws Exception {

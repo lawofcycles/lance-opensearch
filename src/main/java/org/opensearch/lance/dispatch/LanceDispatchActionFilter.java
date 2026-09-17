@@ -5,7 +5,6 @@
 
 package org.opensearch.lance.dispatch;
 
-import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -32,7 +31,6 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
-import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricSpec;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -164,20 +162,19 @@ public class LanceDispatchActionFilter implements ActionFilter {
             return;
         }
 
-        Optional<List<MetricSpec>> metrics = LanceMetricAggregator.parseSupported(searchRequest.source());
-        if (metrics.isEmpty()) {
+        if (!LanceAggregationSupport.isSupported(searchRequest.source())) {
             // Aggregation shape the fragment executor cannot answer
-            // yet (bucket, script, missing-value, sub-aggregation,
-            // or a metric on a non-ValuesSource builder).
+            // yet (scripts, missing values, sub-aggregations, or a
+            // metric on a non-ValuesSource builder).
             chain.proceed(task, action, request, listener);
             return;
         }
 
-        if (!metrics.get().isEmpty() && concrete.length > 1) {
-            // Cross-index metric aggregation needs a partial-reduce
-            // path (Milestone 5-D) that merges partials across
-            // independent Lance datasets. Until then multi-index
-            // metric requests route through the shard path.
+        if (LanceAggregationSupport.hasAggregations(searchRequest.source()) && concrete.length > 1) {
+            // Cross-index aggregation needs a partial-reduce path
+            // (Milestone 5-D) that merges partials across independent
+            // Lance datasets. Until then multi-index aggregation
+            // requests route through the shard path.
             chain.proceed(task, action, request, listener);
             return;
         }

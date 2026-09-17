@@ -37,13 +37,13 @@ import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.Index;
 import org.opensearch.lance.LanceRegistry;
-import org.opensearch.script.ScriptService;import org.opensearch.lance.StorageOptions;
-import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricSpec;
-import org.opensearch.lance.dispatch.LanceMetricAggregator.PartialState;
+import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
+import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
+import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -117,7 +117,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         SearchSourceBuilder source = searchRequest.source();
 
         String filterSql = resolveFilterSql(source);
-        List<MetricSpec> metrics = resolveMetrics(source);
+        AggregatorFactories.Builder aggregations = source == null ? null : source.aggregations();
         int effectiveSize = resolveSize(source);
 
         Index[] concrete = indexNameExpressionResolver.concreteIndices(clusterService.state(), searchRequest);
@@ -142,8 +142,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // Per-index fan-out results, collected sequentially.
         // Sequential loop keeps the merge trivial; parallel per-index
         // fan-out is future work if it becomes a hot spot.
-        MergeState merged = new MergeState(metrics, effectiveSize);
-        runIndexLoop(targets, 0, nodeList, filterSql, effectiveSize, metrics, merged, start, listener);
+        MergeState merged = new MergeState(aggregations, effectiveSize);
+        runIndexLoop(targets, 0, nodeList, filterSql, effectiveSize, aggregations, merged, start, listener);
     }
 
     /**
@@ -157,7 +157,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         List<DiscoveryNode> nodeList,
         String filterSql,
         int effectiveSize,
-        List<MetricSpec> metrics,
+        AggregatorFactories.Builder aggregations,
         MergeState merged,
         long startMillis,
         ActionListener<SearchResponse> listener
@@ -173,10 +173,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 nodeList,
                 filterSql,
                 effectiveSize,
-                metrics,
+                aggregations,
                 merged,
                 ActionListener.wrap(
-                    v -> runIndexLoop(targets, index + 1, nodeList, filterSql, effectiveSize, metrics, merged, startMillis, listener),
+                    v -> runIndexLoop(targets, index + 1, nodeList, filterSql, effectiveSize, aggregations, merged, startMillis, listener),
                     listener::onFailure
                 )
             );
@@ -197,7 +197,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         List<DiscoveryNode> nodeList,
         String filterSql,
         int effectiveSize,
-        List<MetricSpec> metrics,
+        AggregatorFactories.Builder aggregations,
         MergeState merged,
         ActionListener<Void> done
     ) throws Exception {
@@ -229,7 +229,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 target.storageOptions(),
                 filterSql,
                 effectiveSize,
-                metrics,
+                aggregations,
                 fragmentsForNode
             );
             LOGGER.info(
@@ -358,11 +358,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         return LanceKnnFilterTranslator.toLanceSql((org.opensearch.index.query.QueryBuilder) query);
     }
 
-    private static List<MetricSpec> resolveMetrics(SearchSourceBuilder source) {
-        Optional<List<MetricSpec>> parsed = LanceMetricAggregator.parseSupported(source);
-        return parsed.orElse(java.util.Collections.emptyList());
-    }
-
     private static int resolveSize(SearchSourceBuilder source) {
         if (source == null || source.size() < 0) {
             return 10;
@@ -407,14 +402,14 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      */
     private final class MergeState {
 
-        private final List<MetricSpec> metrics;
+        private final AggregatorFactories.Builder aggregationsRequested;
         private final int effectiveSize;
         private long totalMatched = 0L;
         private final List<SearchHit> hits = new ArrayList<>();
         private final List<InternalAggregations> perNodeAggregations = new ArrayList<>();
 
-        MergeState(List<MetricSpec> metrics, int effectiveSize) {
-            this.metrics = metrics;
+        MergeState(AggregatorFactories.Builder aggregationsRequested, int effectiveSize) {
+            this.aggregationsRequested = aggregationsRequested;
             this.effectiveSize = effectiveSize;
         }
 
@@ -440,7 +435,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 hits.isEmpty() ? Float.NaN : 1.0f
             );
             InternalAggregations aggregations = null;
-            if (!metrics.isEmpty() && !perNodeAggregations.isEmpty()) {
+            if (aggregationsRequested != null && !perNodeAggregations.isEmpty()) {
                 // Feed every per-node InternalAggregations tree into the
                 // stock reduce path so cross-node reduction lives in
                 // OpenSearch's aggregator code rather than in the Lance
