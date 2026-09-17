@@ -323,7 +323,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     private SearchResponse emptyResponse(long took) {
         SearchHits hits = new SearchHits(new SearchHit[0], new TotalHits(0, TotalHits.Relation.EQUAL_TO), Float.NaN);
         SearchResponseSections sections = new SearchResponseSections(hits, null, null, false, false, null, 1);
-        return new SearchResponse(sections, null, 0, 0, 0, took, ShardSearchFailure.EMPTY_ARRAY, SearchResponse.Clusters.EMPTY);
+        // Same rationale as MergeState.buildResponse: report a
+        // single logical unit rather than 0 shards so clients that
+        // check {@code _shards.total >= 1} keep parsing correctly.
+        return new SearchResponse(sections, null, 1, 1, 0, took, ShardSearchFailure.EMPTY_ARRAY, SearchResponse.Clusters.EMPTY);
     }
 
     private record IndexTarget(String indexName, String tableUri, StorageOptions storageOptions) {
@@ -339,7 +342,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         private final List<MetricSpec> metrics;
         private final int effectiveSize;
         private long totalMatched = 0L;
-        private int totalFragments = 0;
         private final List<SearchHit> hits = new ArrayList<>();
         private final List<List<PartialState>> perGroupPartials = new ArrayList<>();
 
@@ -351,7 +353,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         void absorbTargetResponses(Collection<LanceFragmentQueryResponse> responses) {
             for (LanceFragmentQueryResponse response : responses) {
                 totalMatched += response.matched();
-                totalFragments += response.fragmentCount();
                 for (SearchHit hit : response.hits()) {
                     if (hits.size() < effectiveSize) {
                         hits.add(hit);
@@ -372,12 +373,22 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             );
             InternalAggregations aggregations = metrics.isEmpty() ? null : LanceMetricAggregator.mergePartials(metrics, perGroupPartials);
             SearchResponseSections sections = new SearchResponseSections(searchHits, aggregations, null, false, false, null, 1);
+            // Hide the Lance fragment fan-out from the response
+            // shape. The user's mental model is one logical dataset,
+            // not N shards; reporting fragmentCount here would leak
+            // the Lucene-shard concept back into the API surface
+            // that shard-free dispatch is meant to remove. total /
+            // successful stay at 1 (single logical unit) so clients
+            // scripts that expect at least one successful shard
+            // continue to parse cleanly. The physical distribution
+            // is still observable through the coordinator's INFO
+            // logs and, in the future, dedicated telemetry.
             return new SearchResponse(
                 sections,
                 null,
-                totalFragments,
-                totalFragments,
-                0,
+                /* totalShards */ 1,
+                /* successfulShards */ 1,
+                /* skippedShards */ 0,
                 took,
                 ShardSearchFailure.EMPTY_ARRAY,
                 SearchResponse.Clusters.EMPTY

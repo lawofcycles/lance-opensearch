@@ -188,22 +188,33 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
 
     /**
-     * Selects between the two dispatch models for Lance-backed indexes.
-     * {@code shard} (default) keeps the standard OpenSearch shard
-     * fan-out: each shard opens its own {@code LanceReadOnlyEngine}
-     * over a fragment partition determined at attach time.
-     * {@code fragment} routes queries through an {@code ActionFilter}
-     * that intercepts {@code indices:data/read/search} before shard
-     * fan-out and (in later milestones) dispatches per-fragment work
-     * directly to data nodes.
+     * Setting name / lifecycle for the plugin's shard-free dispatch
+     * mode. Values:
+     * <ul>
+     *   <li>{@code fragment} — default. Search requests whose top-level
+     *       query and aggregations sit inside the whitelist run through
+     *       the plugin's own coordinator, which fans out per-fragment
+     *       work directly to data nodes and merges partials without
+     *       going through the shard executor. Queries outside the
+     *       whitelist (bucket aggregations, sort, from &gt; 0,
+     *       highlighter, geo, script, etc.) transparently fall
+     *       through to the shard-based path via
+     *       {@code chain.proceed(...)}. Users see the shard-free
+     *       execution automatically for the shapes fragment mode
+     *       covers; nothing to configure.</li>
+     *   <li>{@code shard} — opts out entirely. Every request goes
+     *       through the standard shard executor regardless of query
+     *       shape. Kept for operators who need to compare behaviour
+     *       against the classic path or who suspect a fragment-mode
+     *       regression.</li>
+     * </ul>
      *
-     * <p>Node scoped and dynamic so operators can flip between the two
-     * paths without a restart while the shard-free prototype is under
-     * construction.
+     * <p>Node scoped and dynamic so operators can toggle without a
+     * restart.
      */
     public static final Setting<String> LANCE_DISPATCH_MODE_SETTING = Setting.simpleString(
         "lance.dispatch.mode",
-        "shard",
+        "fragment",
         LancePlugin::validateDispatchMode,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
