@@ -214,6 +214,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             List<Integer> fragmentsForNode = assignment.getValue();
             LanceFragmentQueryRequest fragmentRequest = new LanceFragmentQueryRequest(
                 target.tableUri(),
+                target.indexName(),
                 target.storageOptions(),
                 filterSql,
                 effectiveSize,

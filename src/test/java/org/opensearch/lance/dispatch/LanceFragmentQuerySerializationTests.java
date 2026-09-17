@@ -68,6 +68,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         StorageOptions storage = StorageOptions.of(java.util.Map.of("region", "us-east-1"));
         LanceFragmentQueryRequest original = new LanceFragmentQueryRequest(
             "s3://bucket/tables/demo.lance",
+            "demo",
             storage,
             "id >= 2",
             5,
@@ -84,6 +85,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         }
 
         assertEquals(original.tableUri(), restored.tableUri());
+        assertEquals(original.indexName(), restored.indexName());
         assertEquals(original.filterSql(), restored.filterSql());
         assertEquals(original.size(), restored.size());
         assertEquals(original.metrics(), restored.metrics());
@@ -95,6 +97,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         StorageOptions storage = StorageOptions.empty();
         LanceFragmentQueryRequest original = LanceFragmentQueryRequest.allFragments(
             "/tmp/table.lance",
+            "demo",
             storage,
             /* filterSql */ null,
             10,
@@ -109,6 +112,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             }
         }
 
+        assertEquals(original.indexName(), restored.indexName());
         assertNull(restored.filterSql());
         assertTrue("empty fragmentIds is the all-fragments sentinel", restored.fragmentIds().isEmpty());
         assertNull("empty list must expose as null through the SDK helper", restored.fragmentIdsOrNull());

@@ -32,6 +32,7 @@ import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricSpec;
 public final class LanceFragmentQueryRequest extends ActionRequest {
 
     private final String tableUri;
+    private final String indexName;
     private final StorageOptions storageOptions;
     private final String filterSql;
     private final int size;
@@ -42,6 +43,11 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
      * @param tableUri absolute URI of the Lance table, resolved by
      *     the coordinator from the index metadata's
      *     {@code lance.table} setting
+     * @param indexName concrete OpenSearch index name the search
+     *     originally targeted. The receiving node uses this to look
+     *     up the {@link org.opensearch.index.IndexService} for
+     *     mapper / query-shard context construction on the
+     *     direction-1 aggregator path.
      * @param storageOptions credentials / endpoint hints used to
      *     open the table via {@link org.opensearch.lance.LanceRegistry}
      * @param filterSql Lance SQL filter, or {@code null} for
@@ -56,6 +62,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
      */
     public LanceFragmentQueryRequest(
         String tableUri,
+        String indexName,
         StorageOptions storageOptions,
         String filterSql,
         int size,
@@ -63,6 +70,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         List<Integer> fragmentIds
     ) {
         this.tableUri = tableUri;
+        this.indexName = indexName;
         this.storageOptions = storageOptions;
         this.filterSql = filterSql;
         this.size = size;
@@ -73,6 +81,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     public LanceFragmentQueryRequest(StreamInput in) throws IOException {
         super(in);
         this.tableUri = in.readString();
+        this.indexName = in.readString();
         this.storageOptions = StorageOptions.readFromStream(in);
         this.filterSql = in.readOptionalString();
         this.size = in.readVInt();
@@ -94,6 +103,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
         out.writeString(tableUri);
+        out.writeString(indexName);
         storageOptions.writeTo(out);
         out.writeOptionalString(filterSql);
         out.writeVInt(size);
@@ -117,6 +127,10 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
 
     public String tableUri() {
         return tableUri;
+    }
+
+    public String indexName() {
+        return indexName;
     }
 
     public StorageOptions storageOptions() {
@@ -159,11 +173,20 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     /** Convenience factory for single-node dispatch (all fragments). */
     public static LanceFragmentQueryRequest allFragments(
         String tableUri,
+        String indexName,
         StorageOptions storageOptions,
         String filterSql,
         int size,
         List<MetricSpec> metrics
     ) {
-        return new LanceFragmentQueryRequest(tableUri, storageOptions, filterSql, size, metrics, Collections.emptyList());
+        return new LanceFragmentQueryRequest(
+            tableUri,
+            indexName,
+            storageOptions,
+            filterSql,
+            size,
+            metrics,
+            Collections.emptyList()
+        );
     }
 }
