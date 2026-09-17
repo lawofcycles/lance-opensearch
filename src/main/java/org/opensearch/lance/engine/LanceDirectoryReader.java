@@ -59,6 +59,65 @@ public final class LanceDirectoryReader extends DirectoryReader {
                 )
             );
         }
+        return openWithLeaves(directory, commit, dataset, leaves);
+    }
+
+    /**
+     * Open a reader whose leaves are the explicit list of Lance fragment ids
+     * — the fan-out unit the shard-free (direction 1) fragment path receives
+     * from the coordinator. Contrast with the shard-mode variant above, which
+     * derives its leaf list from a {@code shardId % numShards} partition of
+     * the whole table. This variant lets the per-node handler open exactly
+     * the fragments it was told to scan, so the resulting DirectoryReader is
+     * usable directly by an {@link org.apache.lucene.search.IndexSearcher}
+     * that drives stock OpenSearch aggregators against per-fragment leaves.
+     *
+     * <p>Fragments listed in {@code fragmentIds} that do not exist in the
+     * dataset are silently skipped (the coordinator may occasionally send a
+     * fragment id whose fragment has been compacted away between assignment
+     * and open; the handler handles the resulting empty leaf list by
+     * returning an empty response).
+     *
+     * @param directory   the Lucene {@link Directory} the reader reports to
+     *                    Lucene's own bookkeeping; the reader does not actually
+     *                    write to it (fragments live in Lance).
+     * @param commit      opaque marker retained through the reader lifecycle;
+     *                    {@code null} is accepted for the direction 1 path
+     *                    which does not consult it.
+     * @param dataset     the Lance dataset; the returned reader takes
+     *                    ownership and closes it on {@link #close()}.
+     * @param intField    primary key column name for {@code _id} lookups; empty
+     *                    string when the Lance table has no declared primary
+     *                    key.
+     * @param fragmentIds Lance fragment ids this reader should expose as
+     *                    leaves. Non-null, may be empty (empty means "no
+     *                    fragments assigned"; the returned reader has zero
+     *                    leaves and behaves as a valid empty reader).
+     */
+    public static LanceDirectoryReader openForFragments(
+        Directory directory,
+        IndexCommit commit,
+        Dataset dataset,
+        String intField,
+        List<Integer> fragmentIds
+    ) throws IOException {
+        java.util.Set<Integer> wanted = new java.util.HashSet<>(fragmentIds);
+        List<LeafReader> leaves = new ArrayList<>(wanted.size());
+        for (Fragment fragment : dataset.getFragments()) {
+            if (!wanted.contains(fragment.getId())) {
+                continue;
+            }
+            leaves.add(
+                LanceSequentialLeafReader.wrap(
+                    new LanceFragmentLeafReader(dataset, fragment.getId(), fragment.metadata().getPhysicalRows(), intField)
+                )
+            );
+        }
+        return openWithLeaves(directory, commit, dataset, leaves);
+    }
+
+    private static LanceDirectoryReader openWithLeaves(Directory directory, IndexCommit commit, Dataset dataset, List<LeafReader> leaves)
+        throws IOException {
         ByteBuffersDirectory bridgeDir = new ByteBuffersDirectory();
         try (IndexWriter writer = new IndexWriter(bridgeDir, new IndexWriterConfig())) {
             writer.addDocument(new Document());
