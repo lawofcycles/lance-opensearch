@@ -52,7 +52,7 @@ public class LanceMetricAggregatorMergeTests extends OpenSearchTestCase {
 
     public void testMergeAcrossTwoGroupsSumsPartials() {
         // Group A saw rows [1, 2, 3]: count=3, sum=6, min=1, max=3.
-        // Group B saw rows [4, 5]:    count=2, sum=9, min=4, max=5.
+        // Group B saw rows [4, 5]: count=2, sum=9, min=4, max=5.
         // Total: count=5, sum=15, avg=3, min=1, max=5.
         List<PartialState> groupA = List.of(
             new PartialState(3, 6, 1, 3), // COUNT
@@ -174,10 +174,7 @@ public class LanceMetricAggregatorMergeTests extends OpenSearchTestCase {
         List<PartialState> groupB = List.of(new PartialState(4, 3 + 4 + 5 + 6, 3, 6)); // rows [3..6]
         List<PartialState> groupC = List.of(new PartialState(3, 7 + 8 + 9, 7, 9)); // rows [7,8,9]
 
-        InternalAggregations merged = LanceMetricAggregator.mergePartials(
-            List.of(SUM),
-            List.of(groupA, groupB, groupC)
-        );
+        InternalAggregations merged = LanceMetricAggregator.mergePartials(List.of(SUM), List.of(groupA, groupB, groupC));
 
         int expectedSum = 0 + 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9;
         assertEquals((double) expectedSum, ((InternalSum) merged.asMap().get("s")).getValue(), 0.0d);

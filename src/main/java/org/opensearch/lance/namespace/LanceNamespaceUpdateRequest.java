@@ -39,11 +39,20 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
      * options. Unused fields for unregister are ignored on the wire.
      */
     public static LanceNamespaceUpdateRequest register(String rootUri, StorageOptions storageOptions) {
-        return new LanceNamespaceUpdateRequest(Operation.REGISTER, rootUri, storageOptions);
+        return applyLongTimeout(new LanceNamespaceUpdateRequest(Operation.REGISTER, rootUri, storageOptions));
     }
 
     public static LanceNamespaceUpdateRequest unregister(String rootUri) {
-        return new LanceNamespaceUpdateRequest(Operation.UNREGISTER, rootUri, StorageOptions.empty());
+        return applyLongTimeout(new LanceNamespaceUpdateRequest(Operation.UNREGISTER, rootUri, StorageOptions.empty()));
+    }
+
+    private static LanceNamespaceUpdateRequest applyLongTimeout(LanceNamespaceUpdateRequest request) {
+        // Widen the master-node timeout to match the ack timeout so
+        // the caller does not get a 30s ProcessClusterEventTimeoutException
+        // when the manager is queued behind namespace-poll CreateIndex
+        // updates. 90s aligns with the plugin's own await window.
+        request.clusterManagerNodeTimeout(TimeValue.timeValueSeconds(90));
+        return request;
     }
 
     private LanceNamespaceUpdateRequest(Operation operation, String rootUri, StorageOptions storageOptions) {
@@ -94,10 +103,11 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
 
     @Override
     public TimeValue ackTimeout() {
-        // Give followers up to 30 seconds to acknowledge the state
-        // change. The plugin's own await loops already wait this
-        // long, so aligning the timeouts here keeps behaviour
-        // predictable when a follower is slow to apply state.
-        return TimeValue.timeValueSeconds(30);
+        // Give followers up to 90 seconds to acknowledge the state
+        // change. Namespace polls on the manager occasionally batch
+        // several CreateIndex updates ahead of a register /
+        // unregister, so the ack has to wait behind them. The
+        // plugin's own await loops align to the same window.
+        return TimeValue.timeValueSeconds(90);
     }
 }

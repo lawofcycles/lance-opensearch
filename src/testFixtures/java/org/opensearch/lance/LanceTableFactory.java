@@ -91,6 +91,10 @@ final class LanceTableFactory {
      *         {@code /_lance/attach} or namespace register).
      */
     static String writeTable(Path parent, String name, int rowCount) throws Exception {
+        return retryOnFfiFlake(() -> writeTableOnce(parent, name, rowCount));
+    }
+
+    private static String writeTableOnce(Path parent, String name, int rowCount) throws Exception {
         Path tablePath = parent.resolve(name + ".lance");
         String uri = tablePath.toString();
         Schema schema = new Schema(
@@ -219,6 +223,10 @@ final class LanceTableFactory {
      * Rows with {@code i == 5} set every nullable column to Arrow null.
      */
     static String writeNullableTable(Path parent, String name) throws Exception {
+        return retryOnFfiFlake(() -> writeNullableTableOnce(parent, name));
+    }
+
+    private static String writeNullableTableOnce(Path parent, String name) throws Exception {
         Path tablePath = parent.resolve(name + ".lance");
         String uri = tablePath.toString();
         Schema schema = new Schema(
@@ -332,6 +340,10 @@ final class LanceTableFactory {
      *         {@code /_lance/attach} or namespace register.
      */
     static String writeKeywordOnlyTable(Path parent, String name, int rowCount) throws Exception {
+        return retryOnFfiFlake(() -> writeKeywordOnlyTableOnce(parent, name, rowCount));
+    }
+
+    private static String writeKeywordOnlyTableOnce(Path parent, String name, int rowCount) throws Exception {
         Path tablePath = parent.resolve(name + ".lance");
         String uri = tablePath.toString();
         Schema schema = new Schema(
@@ -384,5 +396,58 @@ final class LanceTableFactory {
             }
         }
         return uri;
+    }
+
+    /**
+     * Retry helper for the known Lance 11 FFI flake documented in
+     * research/opensearch/lance-integration/lance-11-ffi-flake.md.
+     * The flake manifests as a RuntimeException carrying the string
+     * "The FixedSizeList type requires an integer parameter" thrown
+     * inside Dataset.create's Arrow C Data bridge; retrying almost
+     * always succeeds. Multi-node integTest exercises the flake at
+     * a higher rate because three cluster JVMs and the test JVM
+     * share the same Lance native allocator pool.
+     *
+     * <p>Any exception that does not match the flake signature is
+     * rethrown unchanged so real failures still surface.
+     */
+    @FunctionalInterface
+    private interface ThrowingSupplier {
+        String get() throws Exception;
+    }
+
+    private static String retryOnFfiFlake(ThrowingSupplier supplier) throws Exception {
+        int maxAttempts = 5;
+        Exception lastFlake = null;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return supplier.get();
+            } catch (RuntimeException e) {
+                if (!isFfiFlake(e)) {
+                    throw e;
+                }
+                lastFlake = e;
+                Thread.sleep(200L * attempt);
+            }
+        }
+        if (lastFlake != null) {
+            throw lastFlake;
+        }
+        throw new AssertionError("retryOnFfiFlake exhausted attempts without an exception");
+    }
+
+    private static boolean isFfiFlake(Throwable t) {
+        // Match the exception chain because Dataset.create wraps the
+        // native error message inside a RuntimeException whose cause
+        // chain can be one or two levels deep.
+        Throwable cursor = t;
+        while (cursor != null) {
+            String message = cursor.getMessage();
+            if (message != null && message.contains("FixedSizeList type requires an integer parameter")) {
+                return true;
+            }
+            cursor = cursor.getCause();
+        }
+        return false;
     }
 }

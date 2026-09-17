@@ -341,6 +341,14 @@ integTest {
         sharedTablesDir.mkdirs()
     }
     systemProperty 'tests.lance.shared_tables_dir', sharedTablesDir.absolutePath
+    // Milestone 5-D2 keeps the default integTest single-node so the
+    // dev cycle stays around a minute. A separate multiNodeIntegTest
+    // task below runs a focused set of tests against a 3-node
+    // cluster to verify multi-node fan-out without paying the
+    // ~10x latency penalty on every commit.
+    filter {
+        excludeTestsMatching 'org.opensearch.lance.LanceMultiNodeIT'
+    }
 }
 
 testClusters.integTest {
@@ -349,15 +357,6 @@ testClusters.integTest {
     // HEAD request). INTEG_TEST is a slimmer distribution built for exactly
     // this scenario and works on every platform.
     testDistribution = 'INTEG_TEST'
-    // Milestone 5-D1 moves LanceNamespaceService onto cluster state
-    // and routes register / unregister through a
-    // TransportClusterManagerNodeAction so a multi-node cluster now
-    // sees the same namespace list on every node without a per-node
-    // in-memory broadcast. The IT stays single-node here because
-    // Lance datasets sitting on local disk race the same file
-    // across three JVMs when the cluster runs on one host; a proper
-    // multi-node IT needs either a shared filesystem or S3-backed
-    // fixtures and is deferred to Milestone 5-D2.
     plugin(project.tasks.bundlePlugin.archiveFile)
     jvmArgs('--add-opens=java.base/java.nio=ALL-UNNAMED')
     systemProperty('arrow.allocation.manager.type', 'Unsafe')
@@ -366,3 +365,43 @@ testClusters.integTest {
     // register a table then assertBusy for the index to appear.
     setting 'lance.namespace.poll_cadence', '1s'
 }
+
+// Multi-node integTest: verifies the coordinator's fragment fan-out,
+// namespace propagation across nodes, and cluster-state routing at
+// scale. Kept as a separate task with a smaller test set so the
+// default integTest stays fast; this one only needs to be re-run
+// when the transport / dispatch / namespace paths change.
+task multiNodeIntegTest(type: org.opensearch.gradle.test.RestIntegTestTask) {
+    description = 'Runs the multi-node subset of integration tests against a 3-node cluster.'
+    dependsOn tasks.bundlePlugin
+    SourceSetContainer sourceSets = project.getExtensions().getByType(SourceSetContainer.class)
+    SourceSet testSourceSet = sourceSets.getByName('test')
+    setTestClassesDirs(testSourceSet.getOutput().getClassesDirs())
+    setClasspath(testSourceSet.getRuntimeClasspath())
+
+    systemProperty 'tests.security.manager', 'false'
+    systemProperty 'arrow.allocation.manager.type', 'Unsafe'
+    jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
+    doFirst {
+        sharedTablesDir.mkdirs()
+    }
+    systemProperty 'tests.lance.shared_tables_dir', sharedTablesDir.absolutePath
+    filter {
+        includeTestsMatching 'org.opensearch.lance.LanceMultiNodeIT'
+    }
+}
+
+testClusters.multiNodeIntegTest {
+    testDistribution = 'INTEG_TEST'
+    // Three nodes co-located on one host is enough to exercise
+    // coordinator -> data-node transport fan-out, cluster-state
+    // propagation of namespace metadata, and the manager-only
+    // poll path.
+    numberOfNodes = 3
+    plugin(project.tasks.bundlePlugin.archiveFile)
+    jvmArgs('--add-opens=java.base/java.nio=ALL-UNNAMED')
+    systemProperty('arrow.allocation.manager.type', 'Unsafe')
+    setting 'lance.namespace.poll_cadence', '1s'
+}
+
+check.dependsOn multiNodeIntegTest

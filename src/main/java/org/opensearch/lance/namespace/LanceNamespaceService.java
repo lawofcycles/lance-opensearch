@@ -71,11 +71,12 @@ public final class LanceNamespaceService {
      */
     private final Map<String, DirectoryNamespace> directoryCache = new ConcurrentHashMap<>();
     /**
-     * Ack timeout for cluster state updates. Kept short because the
-     * only work each update touches is a small metadata write; a longer
-     * timeout would hide a broken cluster more than help.
+     * Ack timeout for cluster state updates. Sized so the register /
+     * unregister await loop tolerates the manager being queued
+     * behind a batch of namespace-poll CreateIndex updates in a
+     * loaded multi-node cluster.
      */
-    private static final TimeValue STATE_UPDATE_TIMEOUT = TimeValue.timeValueSeconds(30);
+    private static final TimeValue STATE_UPDATE_TIMEOUT = TimeValue.timeValueSeconds(90);
     private final Map<String, Long> servedVersions = new ConcurrentHashMap<>();
     // Index names created via /_lance/attach along with the absolute Lance
     // table path and storage_options they point at. Tracked here so poll()
@@ -205,23 +206,33 @@ public final class LanceNamespaceService {
      * if the URI was not registered.
      */
     public boolean unregister(String rootUri) {
-        LanceNamespaceMetadata current = currentMetadata(clusterService.state());
-        LanceNamespaceMetadata updated = current.withUnregistered(rootUri);
-        if (updated == current) {
-            return false;
-        }
+        // Do not skip the manager round-trip based on the local
+        // node's cluster state: the local view can lag behind
+        // recent registrations from another node or from this node
+        // if the applier has not yet run. The manager returns a
+        // response with a "changed" flag so we can 404 a REST
+        // caller trying to unregister a path the cluster never had.
         java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicReference<LanceNamespaceUpdateResponse> responseRef =
+            new java.util.concurrent.atomic.AtomicReference<>();
         java.util.concurrent.atomic.AtomicReference<Exception> failure = new java.util.concurrent.atomic.AtomicReference<>();
         client.execute(
             LanceNamespaceUpdateAction.INSTANCE,
             LanceNamespaceUpdateRequest.unregister(rootUri),
-            ActionListener.wrap(response -> latch.countDown(), e -> {
+            ActionListener.wrap(response -> {
+                responseRef.set(response);
+                latch.countDown();
+            }, e -> {
                 failure.set(e);
                 latch.countDown();
             })
         );
         awaitAckOrLog(latch, failure, "unregister", rootUri);
-        return failure.get() == null;
+        if (failure.get() != null) {
+            return false;
+        }
+        LanceNamespaceUpdateResponse response = responseRef.get();
+        return response != null && response.changed();
     }
 
     private static void awaitAckOrLog(
@@ -248,6 +259,16 @@ public final class LanceNamespaceService {
         // then would trip the AssertionError inside
         // ClusterApplierService instead of returning gracefully.
         if (clusterService.lifecycleState() != org.opensearch.common.lifecycle.Lifecycle.State.STARTED) {
+            return;
+        }
+        // Poll only on the cluster manager. In a multi-node cluster
+        // every node would otherwise scan the shared namespaces and
+        // race to CreateIndex the same table, which spikes state
+        // update pressure and starves other traffic (unregister
+        // ack timeouts, follower state application). Skipping the
+        // poll on followers is safe because the manager surfaces
+        // every discovered index into cluster state anyway.
+        if (!clusterService.state().nodes().isLocalNodeElectedClusterManager()) {
             return;
         }
         LanceNamespaceMetadata metadata = currentMetadata(clusterService.state());

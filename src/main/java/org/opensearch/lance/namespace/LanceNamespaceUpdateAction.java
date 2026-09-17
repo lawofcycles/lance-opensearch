@@ -6,7 +6,6 @@
 package org.opensearch.lance.namespace;
 
 import org.opensearch.action.ActionType;
-import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 
 /**
  * Internal action name for cluster-state-scoped namespace mutations.
@@ -18,12 +17,12 @@ import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
  * handler can serve both mutations without duplicating the manager
  * routing plumbing.
  */
-public final class LanceNamespaceUpdateAction extends ActionType<AcknowledgedResponse> {
+public final class LanceNamespaceUpdateAction extends ActionType<LanceNamespaceUpdateResponse> {
 
     public static final String NAME = "cluster:admin/lance/namespace/update";
     public static final LanceNamespaceUpdateAction INSTANCE = new LanceNamespaceUpdateAction();
 
     private LanceNamespaceUpdateAction() {
-        super(NAME, AcknowledgedResponse::new);
+        super(NAME, LanceNamespaceUpdateResponse::new);
     }
 }
