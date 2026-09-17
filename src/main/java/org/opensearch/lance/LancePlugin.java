@@ -369,7 +369,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client, initialMode);
         clusterService.getClusterSettings().addSettingsUpdateConsumer(LANCE_DISPATCH_MODE_SETTING, dispatchActionFilter::setMode);
 
-        namespaceService = new LanceNamespaceService(client, threadPool, cadence, builderMaxRows);
+        namespaceService = new LanceNamespaceService(client, clusterService, threadPool, cadence, builderMaxRows);
         return List.of(namespaceService);
     }
 
@@ -460,6 +460,37 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             new org.opensearch.plugins.ActionPlugin.ActionHandler<>(
                 org.opensearch.lance.dispatch.LanceCoordinatorAction.INSTANCE,
                 org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.class
+            ),
+            new org.opensearch.plugins.ActionPlugin.ActionHandler<>(
+                org.opensearch.lance.namespace.LanceNamespaceUpdateAction.INSTANCE,
+                org.opensearch.lance.namespace.TransportLanceNamespaceUpdateAction.class
+            )
+        );
+    }
+
+    @Override
+    public List<org.opensearch.core.common.io.stream.NamedWriteableRegistry.Entry> getNamedWriteables() {
+        return List.of(
+            new org.opensearch.core.common.io.stream.NamedWriteableRegistry.Entry(
+                org.opensearch.cluster.metadata.Metadata.Custom.class,
+                org.opensearch.lance.namespace.LanceNamespaceMetadata.TYPE,
+                org.opensearch.lance.namespace.LanceNamespaceMetadata::new
+            ),
+            new org.opensearch.core.common.io.stream.NamedWriteableRegistry.Entry(
+                org.opensearch.cluster.NamedDiff.class,
+                org.opensearch.lance.namespace.LanceNamespaceMetadata.TYPE,
+                org.opensearch.lance.namespace.LanceNamespaceMetadata::readDiffFrom
+            )
+        );
+    }
+
+    @Override
+    public List<org.opensearch.core.xcontent.NamedXContentRegistry.Entry> getNamedXContent() {
+        return List.of(
+            new org.opensearch.core.xcontent.NamedXContentRegistry.Entry(
+                org.opensearch.cluster.metadata.Metadata.Custom.class,
+                new org.opensearch.core.ParseField(org.opensearch.lance.namespace.LanceNamespaceMetadata.TYPE),
+                org.opensearch.lance.namespace.LanceNamespaceMetadata::fromXContent
             )
         );
     }

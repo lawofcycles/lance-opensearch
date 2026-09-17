@@ -11,7 +11,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.logging.log4j.LogManager;
@@ -26,7 +25,10 @@ import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.exists.indices.IndicesExistsRequest;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.action.admin.indices.refresh.RefreshRequest;
+import org.opensearch.cluster.ClusterChangedEvent;
+import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
@@ -57,9 +59,23 @@ public final class LanceNamespaceService {
     private static final Logger LOG = LogManager.getLogger(LanceNamespaceService.class);
 
     private final Client client;
+    private final ClusterService clusterService;
     private final TimeValue cadence;
     private final long builderMaxRows;
-    private final List<RegisteredNamespace> namespaces = new CopyOnWriteArrayList<>();
+    /**
+     * Per-node cache of the runtime {@link DirectoryNamespace} handles
+     * keyed by root URI. Rebuilt from cluster state on every
+     * {@link #onClusterStateChanged} callback so a fresh node that
+     * joins mid-life still sees the registrations that were already
+     * in the cluster's {@link LanceNamespaceMetadata}.
+     */
+    private final Map<String, DirectoryNamespace> directoryCache = new ConcurrentHashMap<>();
+    /**
+     * Ack timeout for cluster state updates. Kept short because the
+     * only work each update touches is a small metadata write; a longer
+     * timeout would hide a broken cluster more than help.
+     */
+    private static final TimeValue STATE_UPDATE_TIMEOUT = TimeValue.timeValueSeconds(30);
     private final Map<String, Long> servedVersions = new ConcurrentHashMap<>();
     // Index names created via /_lance/attach along with the absolute Lance
     // table path and storage_options they point at. Tracked here so poll()
@@ -81,11 +97,63 @@ public final class LanceNamespaceService {
     // seconds would otherwise flood the log.
     private final Set<String> warnedWaitPolicy = ConcurrentHashMap.newKeySet();
 
-    public LanceNamespaceService(Client client, ThreadPool threadPool, TimeValue cadence, long builderMaxRows) {
+    public LanceNamespaceService(
+        Client client,
+        ClusterService clusterService,
+        ThreadPool threadPool,
+        TimeValue cadence,
+        long builderMaxRows
+    ) {
         this.client = client;
+        this.clusterService = clusterService;
         this.cadence = cadence;
         this.builderMaxRows = builderMaxRows;
+        // Subscribe before the first schedule fires so the poller
+        // never runs against a stale cache. addListener returns
+        // immediately; the listener body reads whatever state is
+        // current when the applier fires.
+        clusterService.addListener(this::onClusterStateChanged);
         threadPool.scheduleWithFixedDelay(this::poll, cadence, ThreadPool.Names.GENERIC);
+    }
+
+    /**
+     * Reconcile the per-node {@link #directoryCache} against the
+     * cluster's {@link LanceNamespaceMetadata}. Called from the
+     * cluster state applier on every state that touches metadata, so
+     * new registrations propagated from another node reach the
+     * cache in time for the next poll cycle. Failures to initialise
+     * a DirectoryNamespace surface as warnings, matching the
+     * behaviour {@link #register} used to have for local
+     * initialisation errors.
+     */
+    private void onClusterStateChanged(ClusterChangedEvent event) {
+        if (!event.metadataChanged()) {
+            return;
+        }
+        LanceNamespaceMetadata metadata = currentMetadata(event.state());
+        Set<String> desired = new java.util.HashSet<>(metadata.entries().size());
+        for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
+            desired.add(entry.rootUri());
+            directoryCache.computeIfAbsent(entry.rootUri(), uri -> {
+                try {
+                    DirectoryNamespace namespace = new DirectoryNamespace();
+                    Map<String, String> config = new HashMap<>();
+                    config.put("root", uri);
+                    namespace.initialize(config, LanceRegistry.allocator());
+                    return namespace;
+                } catch (Exception e) {
+                    LOG.warn("failed to initialise namespace {} through DirectoryNamespace", uri, e);
+                    return null;
+                }
+            });
+        }
+        // Drop cache entries for namespaces the cluster removed.
+        directoryCache.keySet().removeIf(uri -> !desired.contains(uri));
+    }
+
+    private static LanceNamespaceMetadata currentMetadata(ClusterState state) {
+        LanceNamespaceMetadata metadata = state.metadata().custom(LanceNamespaceMetadata.TYPE);
+        return metadata == null ? LanceNamespaceMetadata.EMPTY : metadata;
     }
 
     /** Namespace poll cadence in effect for this service. */
@@ -98,26 +166,34 @@ public final class LanceNamespaceService {
     }
 
     public void register(String rootUri, StorageOptions storageOptions) {
-        for (RegisteredNamespace ns : namespaces) {
-            if (ns.rootUri.equals(rootUri)) {
+        LanceNamespaceMetadata current = currentMetadata(clusterService.state());
+        for (LanceNamespaceMetadata.Entry entry : current.entries()) {
+            if (entry.rootUri().equals(rootUri)) {
                 return;
             }
         }
-        try {
-            DirectoryNamespace namespace = new DirectoryNamespace();
-            Map<String, String> config = new HashMap<>();
-            config.put("root", rootUri);
-            namespace.initialize(config, LanceRegistry.allocator());
-            namespaces.add(new RegisteredNamespace(rootUri, namespace, storageOptions));
-        } catch (Exception e) {
-            LOG.warn("failed to initialise namespace {} through DirectoryNamespace", rootUri, e);
-        }
+        // Route through the cluster manager: any non-manager node
+        // that tries to submitStateUpdateTask directly gets
+        // NotClusterManagerException. TransportClusterManagerNodeAction
+        // handles the forwarding, retries, and acknowledgement.
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicReference<Exception> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        client.execute(
+            LanceNamespaceUpdateAction.INSTANCE,
+            LanceNamespaceUpdateRequest.register(rootUri, storageOptions),
+            ActionListener.wrap(response -> latch.countDown(), e -> {
+                failure.set(e);
+                latch.countDown();
+            })
+        );
+        awaitAckOrLog(latch, failure, "register", rootUri);
     }
 
     public List<String> namespaces() {
-        List<String> uris = new ArrayList<>(namespaces.size());
-        for (RegisteredNamespace ns : namespaces) {
-            uris.add(ns.rootUri);
+        LanceNamespaceMetadata metadata = currentMetadata(clusterService.state());
+        List<String> uris = new ArrayList<>(metadata.entries().size());
+        for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
+            uris.add(entry.rootUri());
         }
         return List.copyOf(uris);
     }
@@ -129,22 +205,72 @@ public final class LanceNamespaceService {
      * if the URI was not registered.
      */
     public boolean unregister(String rootUri) {
-        return namespaces.removeIf(ns -> ns.rootUri.equals(rootUri));
+        LanceNamespaceMetadata current = currentMetadata(clusterService.state());
+        LanceNamespaceMetadata updated = current.withUnregistered(rootUri);
+        if (updated == current) {
+            return false;
+        }
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicReference<Exception> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        client.execute(
+            LanceNamespaceUpdateAction.INSTANCE,
+            LanceNamespaceUpdateRequest.unregister(rootUri),
+            ActionListener.wrap(response -> latch.countDown(), e -> {
+                failure.set(e);
+                latch.countDown();
+            })
+        );
+        awaitAckOrLog(latch, failure, "unregister", rootUri);
+        return failure.get() == null;
+    }
+
+    private static void awaitAckOrLog(
+        java.util.concurrent.CountDownLatch latch,
+        java.util.concurrent.atomic.AtomicReference<Exception> failure,
+        String opName,
+        String rootUri
+    ) {
+        try {
+            if (!latch.await(STATE_UPDATE_TIMEOUT.getSeconds() + 5, java.util.concurrent.TimeUnit.SECONDS)) {
+                LOG.warn("{} {} timed out waiting for cluster state ack", opName, rootUri);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (failure.get() != null) {
+            LOG.warn("{} {} failed", opName, rootUri, failure.get());
+        }
     }
 
     private void poll() {
-        for (RegisteredNamespace ns : namespaces) {
+        // Skip poll cycles that fire before the applier delivers a
+        // cluster state, which happens once at startup. Reading state()
+        // then would trip the AssertionError inside
+        // ClusterApplierService instead of returning gracefully.
+        if (clusterService.lifecycleState() != org.opensearch.common.lifecycle.Lifecycle.State.STARTED) {
+            return;
+        }
+        LanceNamespaceMetadata metadata = currentMetadata(clusterService.state());
+        for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
+            DirectoryNamespace directory = directoryCache.get(entry.rootUri());
+            if (directory == null) {
+                // Cluster state carries the registration but the
+                // applier has not yet built a runtime handle on this
+                // node. Skip this cycle; the next poll after
+                // onClusterStateChanged finishes will pick it up.
+                continue;
+            }
             try {
-                ListTablesResponse response = ns.namespace.listTables(new ListTablesRequest());
+                ListTablesResponse response = directory.listTables(new ListTablesRequest());
                 Set<String> tables = response.getTables();
                 if (tables == null) {
                     continue;
                 }
                 for (String tableName : tables) {
-                    syncTable(ns.rootUri, tableName, ns.storageOptions);
+                    syncTable(entry.rootUri(), tableName, entry.storageOptions());
                 }
             } catch (Exception e) {
-                LOG.warn("namespace poll failed for {}", ns.rootUri, e);
+                LOG.warn("namespace poll failed for {}", entry.rootUri(), e);
             }
         }
         // Sync attach-created indexes so append fragments surface on the
@@ -668,9 +794,6 @@ public final class LanceNamespaceService {
                 indexName
             );
         }
-    }
-
-    private record RegisteredNamespace(String rootUri, DirectoryNamespace namespace, StorageOptions storageOptions) {
     }
 
     private record AttachedIndex(String tablePath, StorageOptions storageOptions) {
