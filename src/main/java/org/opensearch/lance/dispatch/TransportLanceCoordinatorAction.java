@@ -28,6 +28,9 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.cluster.routing.IndexShardRoutingTable;
+import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
@@ -201,7 +204,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             return;
         }
 
-        Map<DiscoveryNode, List<Integer>> perNode = groupFragmentsByNode(allFragmentIds, nodeList);
+        Map<DiscoveryNode, List<Integer>> perNode = groupFragmentsByNode(allFragmentIds, nodeListForTarget(target, nodeList));
         int fanOutSize = perNode.size();
 
         GroupedActionListener<LanceFragmentQueryResponse> gathered = new GroupedActionListener<>(ActionListener.wrap(responses -> {
@@ -278,6 +281,62 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             result.computeIfAbsent(node, k -> new ArrayList<>()).add(fragmentIds.get(i));
         }
         return result;
+    }
+
+    /**
+     * Filter the data-node list down to nodes that hold at least one
+     * started shard copy of the target index.
+     *
+     * <p>The fragment path drives OpenSearch's aggregator machinery
+     * through {@link org.opensearch.index.shard.IndexShard} so the
+     * receiving node must have the index initialised in its
+     * {@link org.opensearch.indices.IndicesService}. A node without a
+     * started shard has no IndexService yet
+     * ({@code IndicesService.indexServiceSafe} throws
+     * {@code IndexNotFoundException}), so the fragment query would
+     * fail there.
+     *
+     * <p>Lance-backed indices are created with {@code
+     * number_of_replicas=0} so, in a multi-node cluster, only one
+     * data node holds the shard at steady state. Fragment fan-out
+     * collapses to that node when this method runs. Every fragment
+     * still executes because Lance fragments live in external
+     * storage: the shard-holding node can open any fragment through
+     * {@link org.opensearch.lance.LanceRegistry#openDataset}. To
+     * reintroduce cross-node parallelism, operators can request more
+     * shards (or replicas) — each additional shard copy widens the
+     * set of nodes this filter accepts.
+     *
+     * <p>If cluster state has no {@link IndexRoutingTable} for the
+     * index yet (very early in create-index handling) or no shard is
+     * started anywhere, fall back to the caller's full node list.
+     * The receiving node then surfaces a clear
+     * {@code IndexNotFoundException} in that rare case.
+     */
+    private List<DiscoveryNode> nodeListForTarget(IndexTarget target, List<DiscoveryNode> fullList) {
+        IndexMetadata indexMetadata = clusterService.state().metadata().index(target.indexName());
+        if (indexMetadata == null) {
+            return fullList;
+        }
+        IndexRoutingTable routingTable = clusterService.state().routingTable().index(indexMetadata.getIndex());
+        if (routingTable == null) {
+            return fullList;
+        }
+        java.util.Set<String> nodesWithShard = new java.util.HashSet<>();
+        for (IndexShardRoutingTable shardTable : routingTable) {
+            for (ShardRouting shardRouting : shardTable) {
+                if (shardRouting.started()) {
+                    nodesWithShard.add(shardRouting.currentNodeId());
+                }
+            }
+        }
+        List<DiscoveryNode> filtered = new ArrayList<>(fullList.size());
+        for (DiscoveryNode node : fullList) {
+            if (nodesWithShard.contains(node.getId())) {
+                filtered.add(node);
+            }
+        }
+        return filtered.isEmpty() ? fullList : filtered;
     }
 
     private static String resolveFilterSql(SearchSourceBuilder source) {
