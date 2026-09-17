@@ -160,11 +160,11 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     }
 
     /**
-     * Translate {@link #fragmentIds()} to the value
-     * {@link LanceMetricAggregator#aggregatePartials(org.lance.Dataset, List, String, List)}
-     * expects: {@code null} for "all fragments", non-null list
-     * otherwise. Keeping the wire representation as a non-null empty
-     * list makes the transport serialisation branch-free.
+     * Translate {@link #fragmentIds()} to the value the per-node
+     * fragment executor expects: {@code null} for "all fragments",
+     * non-null list otherwise. Keeping the wire representation as a
+     * non-null empty list makes the transport serialisation
+     * branch-free.
      */
     public List<Integer> fragmentIdsOrNull() {
         return fragmentIds.isEmpty() ? null : fragmentIds;

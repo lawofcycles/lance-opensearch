@@ -30,16 +30,8 @@ import org.lance.ipc.ScanOptions;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
-import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.AggregationBuilder;
-import org.opensearch.search.aggregations.InternalAggregation;
-import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
-import org.opensearch.search.aggregations.metrics.InternalAvg;
-import org.opensearch.search.aggregations.metrics.InternalMax;
-import org.opensearch.search.aggregations.metrics.InternalMin;
-import org.opensearch.search.aggregations.metrics.InternalSum;
-import org.opensearch.search.aggregations.metrics.InternalValueCount;
 import org.opensearch.search.aggregations.metrics.MaxAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.MinAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.SumAggregationBuilder;
@@ -67,23 +59,34 @@ import org.opensearch.search.builder.SearchSourceBuilder;
  * back to the standard shard-based path instead of failing the
  * request.
  *
- * <p>The class exposes two entry points to support both single-node
- * and multi-node dispatch:
+ * <p>The class exposes two entry points that keep the fragment
+ * dispatch path independent of OpenSearch's aggregator machinery for
+ * the numeric baseline:
  * <ul>
- *   <li>{@link #aggregatePartials} runs a Lance scan over a specific
- *       list of fragment ids and returns per-metric
- *       {@link PartialState partial state}. It is safe to call this
- *       from a node handler on a subset of the dataset; the state is
- *       transport-serializable so a coordinator can gather partials
- *       from every node.</li>
- *   <li>{@link #mergePartials} takes the list of partials produced by
- *       one or more calls to {@link #aggregatePartials} and folds
- *       them into a single {@link InternalAggregations} ready to
- *       attach to the response. The merge preserves the associativity
- *       the metric aggregations require: partials from any partition
- *       of the input rows collapse to the same result as scanning
- *       the whole dataset in one pass.</li>
+ *   <li>{@link #parseSupported(SearchSourceBuilder)} classifies the
+ *       request and, on success, returns the metric specs the
+ *       fragment executor will run through OpenSearch's stock
+ *       aggregators (Direction 1 / Stage 1). It is what the
+ *       dispatch filter consults to decide whether to route to the
+ *       fragment path or fall back to shard dispatch.</li>
+ *   <li>{@link #aggregatePartials} keeps a Lance-only reference
+ *       implementation that a prototype test
+ *       ({@code PerFragmentAggregatorPrototypeTests}) uses as the
+ *       oracle when comparing per-fragment IndexReader results to
+ *       the direct Lance-scan numbers.</li>
  * </ul>
+ *
+ * <p>Cross-node partial merge lives on the transport layer now:
+ * {@link TransportLanceFragmentQueryAction} ships
+ * {@link org.opensearch.search.aggregations.InternalAggregations} on
+ * the wire and
+ * {@link TransportLanceCoordinatorAction.MergeState#buildResponse}
+ * reduces them through
+ * {@link org.opensearch.search.aggregations.InternalAggregations#topLevelReduce}.
+ * The plugin-specific {@code mergePartials} that previously folded
+ * {@link PartialState} lists into an
+ * {@link org.opensearch.search.aggregations.InternalAggregations} is
+ * gone as of the Stage 2 wire-format switch.
  */
 public final class LanceMetricAggregator {
 
@@ -294,41 +297,6 @@ public final class LanceMetricAggregator {
         return partials;
     }
 
-    /**
-     * Fold every group's per-spec partials into one
-     * {@link InternalAggregations} block. Each entry in
-     * {@code perGroupPartials} must be a list of the same length as
-     * {@code specs} (aligned by index); the merge is associative so
-     * ordering across groups does not matter.
-     *
-     * <p>When {@code specs} is empty or every group is empty, returns
-     * {@code null} so the caller can leave the response's
-     * aggregations section absent, matching the shape a shard-mode
-     * response without aggregations would have.
-     */
-    public static InternalAggregations mergePartials(List<MetricSpec> specs, List<List<PartialState>> perGroupPartials) {
-        if (specs.isEmpty()) {
-            return null;
-        }
-        PartialState[] merged = new PartialState[specs.size()];
-        for (int i = 0; i < specs.size(); i++) {
-            merged[i] = PartialState.EMPTY;
-        }
-        for (List<PartialState> group : perGroupPartials) {
-            if (group.isEmpty()) {
-                continue;
-            }
-            for (int i = 0; i < specs.size(); i++) {
-                merged[i] = merged[i].merge(group.get(i));
-            }
-        }
-        List<InternalAggregation> aggregations = new ArrayList<>(specs.size());
-        for (int i = 0; i < specs.size(); i++) {
-            aggregations.add(toInternalAggregation(specs.get(i), merged[i]));
-        }
-        return InternalAggregations.from(aggregations);
-    }
-
     private static void updateState(MetricSpec spec, FieldVector vector, int rowCount, State state) {
         for (int i = 0; i < rowCount; i++) {
             if (vector.isNull(i)) {
@@ -360,20 +328,6 @@ public final class LanceMetricAggregator {
                 }
             }
         }
-    }
-
-    private static InternalAggregation toInternalAggregation(MetricSpec spec, PartialState state) {
-        // Map<String, Object> metadata is nullable on every Internal*
-        // constructor. DocValueFormat.RAW matches the standard metric
-        // aggregator output for numeric fields without a mapping-time
-        // formatter override.
-        return switch (spec.type()) {
-            case VALUE_COUNT -> new InternalValueCount(spec.name(), state.count(), null);
-            case SUM -> new InternalSum(spec.name(), state.sum(), DocValueFormat.RAW, null);
-            case AVG -> new InternalAvg(spec.name(), state.sum(), state.count(), DocValueFormat.RAW, null);
-            case MIN -> new InternalMin(spec.name(), state.min(), DocValueFormat.RAW, null);
-            case MAX -> new InternalMax(spec.name(), state.max(), DocValueFormat.RAW, null);
-        };
     }
 
     /**
