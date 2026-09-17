@@ -335,8 +335,8 @@ public final class LanceMetricAggregator {
      * floating-point widths Lance surfaces on typical text / numeric
      * columns are handled; other types cause the aggregator to
      * silently skip the row rather than throw, matching the
-     * "skip unsupported cells" behaviour of
-     * {@link LanceRowSourceRenderer}.
+     * "skip unsupported cells" behaviour the retired Arrow-batch
+     * source renderer used.
      */
     private static double readAsDouble(FieldVector vector, int rowIndex) {
         if (vector instanceof TinyIntVector v) {
