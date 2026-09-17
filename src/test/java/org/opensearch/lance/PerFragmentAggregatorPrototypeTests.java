@@ -19,6 +19,7 @@ import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
+import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.lance.Dataset;
@@ -28,6 +29,8 @@ import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.lance.dispatch.LanceMetricAggregator;
 import org.opensearch.lance.engine.LanceDirectoryReader;
+import org.opensearch.lance.query.LanceFtsQuery;
+import org.opensearch.lance.query.LanceKnnQuery;
 import org.opensearch.search.aggregations.AggregatorTestCase;
 import org.opensearch.search.aggregations.bucket.terms.StringTerms;
 import org.opensearch.search.aggregations.bucket.terms.Terms;
@@ -242,6 +245,107 @@ public class PerFragmentAggregatorPrototypeTests extends AggregatorTestCase {
                     ScoreDoc hit = top.scoreDocs[i];
                     long value = (long) ((org.apache.lucene.search.FieldDoc) hit).fields[0];
                     assertEquals("descending order at position " + i, rowCount - 1 - i, value);
+                }
+            }
+        }
+    }
+
+    /**
+     * Phase C-1: FTS scoring via LanceFtsQuery on a per-fragment reader.
+     * The fixture's {@code body} column has {@code "hello lance N"} on every
+     * even row and {@code "quick brown fox N"} on every odd row, with an
+     * INVERTED index. Search for {@code hello} should return exactly the
+     * even rows.
+     *
+     * <p>Note: stock Lucene {@code MatchQuery} over LanceFragmentLeafReader
+     * would return zero hits because {@code terms(field)} is null (the Lance
+     * FTS index does not expose a Lucene {@code Terms}). LanceFtsQuery
+     * bypasses that by scanning Lance's inverted index natively per fragment,
+     * which is why {@code fullTextQuery} is passed to Lance's own scan builder
+     * inside {@link LanceFtsQuery}'s scorer. That path is what fragment path
+     * would inherit for free by running the same Query through per-fragment
+     * IndexSearcher instead of maintaining a parallel FTS implementation.
+     */
+    public void testFtsQueryScoresRowsMatchingTokenViaPerFragmentReader() throws Exception {
+        Path scratch = Files.createTempDirectory("lance-phaseC-fts-");
+        int rowCount = 20;
+        String uri = LanceTableFactory.writeTable(scratch, "phaseC_fts", rowCount);
+
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            try (
+                DirectoryReader dr = LanceDirectoryReader.open(
+                    new ByteBuffersDirectory(),
+                    null,
+                    dataset,
+                    "id",
+                    /* shardId */ 0,
+                    /* numShards */ 1
+                )
+            ) {
+                IndexSearcher searcher = new IndexSearcher(dr);
+                // Match every row that has "hello" in body (the even rows).
+                TopDocs top = searcher.search(new LanceFtsQuery("body", "hello"), rowCount);
+
+                int expectedHits = rowCount / 2;
+                assertEquals("hit count matches every even row", expectedHits, top.totalHits.value());
+                assertEquals("returned hits fills the actual match count", expectedHits, top.scoreDocs.length);
+                for (ScoreDoc hit : top.scoreDocs) {
+                    assertTrue(
+                        "hit score is positive (Lance FTS reports BM25-scaled scores)",
+                        hit.score > 0.0f
+                    );
+                }
+            }
+        }
+    }
+
+    /**
+     * Phase C-2: knn scoring via LanceKnnQuery on a per-fragment reader.
+     * The fixture writes {@code embedding[0] = i} and other coordinates zero
+     * for each row. Querying with vector {@code [0.5, 0, ..., 0]} should
+     * bring rows 0 and 1 up first (both at distance 0.5), then row 2 at
+     * distance 1.5, and so on.
+     *
+     * <p>LanceKnnQuery does one shard-wide nearest scan on the first leaf's
+     * FragmentLeafReader (cached inside the Weight) and dispatches the
+     * per-fragment slice on subsequent leaves. That is exactly the shape
+     * fragment path wants: one Lance native call, distributed as Lucene hits
+     * per leaf.
+     */
+    public void testKnnQueryReturnsClosestVectorsViaPerFragmentReader() throws Exception {
+        Path scratch = Files.createTempDirectory("lance-phaseC-knn-");
+        int rowCount = 20;
+        String uri = LanceTableFactory.writeTable(scratch, "phaseC_knn", rowCount);
+
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            try (
+                DirectoryReader dr = LanceDirectoryReader.open(
+                    new ByteBuffersDirectory(),
+                    null,
+                    dataset,
+                    "id",
+                    /* shardId */ 0,
+                    /* numShards */ 1
+                )
+            ) {
+                IndexSearcher searcher = new IndexSearcher(dr);
+                float[] target = new float[LanceTableFactory.VECTOR_DIM];
+                target[0] = 0.5f;
+                int k = 5;
+                TopDocs top = searcher.search(new LanceKnnQuery("embedding", target, k), k);
+
+                assertEquals("returned hits fills the requested k", k, top.scoreDocs.length);
+                // Every returned hit must carry a positive score (converted
+                // from Lance's distance via boost / (1 + distance) inside
+                // LanceKnnQuery, so smaller distance means higher score).
+                float previousScore = Float.MAX_VALUE;
+                for (ScoreDoc hit : top.scoreDocs) {
+                    assertTrue("hit score is positive", hit.score > 0.0f);
+                    assertTrue(
+                        "scores are non-increasing when Lucene returns top-k by relevance",
+                        hit.score <= previousScore
+                    );
+                    previousScore = hit.score;
                 }
             }
         }
