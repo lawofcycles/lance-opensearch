@@ -105,8 +105,8 @@ public final class LanceFragmentSearchContext extends SearchContext {
     private final ShardId shardId;
     private final IndexShard indexShard;
     private final MapperService mapperService;
-    private final QueryShardContext queryShardContext;
-    private final ContextIndexSearcher searcher;
+    private QueryShardContext queryShardContext;
+    private ContextIndexSearcher searcher;
     private final BigArrays bigArrays;
     private final SearchShardTarget shardTarget;
     private final BitsetFilterCache bitsetFilterCache;
@@ -115,26 +115,65 @@ public final class LanceFragmentSearchContext extends SearchContext {
     private BucketCollectorProcessor bucketCollectorProcessor = new BucketCollectorProcessor();
     private final List<Releasable> releasables = new ArrayList<>();
 
+    /**
+     * Two-phase construction: {@link ContextIndexSearcher} keeps a
+     * reference to the enclosing {@link SearchContext}, and
+     * {@link org.opensearch.index.IndexService#newQueryShardContext}
+     * needs the {@link org.apache.lucene.search.IndexSearcher} at
+     * construction. The caller builds this class first (with
+     * {@code queryShardContext = null}), then constructs the
+     * ContextIndexSearcher against this context, then builds the
+     * QueryShardContext with the searcher, then attaches both back
+     * through {@link #withSearcher(ContextIndexSearcher)} and
+     * {@link #withQueryShardContext(QueryShardContext)}. This mirrors
+     * the pattern {@link org.opensearch.search.DefaultSearchContext}
+     * uses internally, where the SearchContext and its
+     * ContextIndexSearcher refer to each other.
+     */
     public LanceFragmentSearchContext(
         IndexShard indexShard,
-        ContextIndexSearcher searcher,
         Query query,
         SearchContextAggregations aggregations,
         BigArrays bigArrays,
         BitsetFilterCache bitsetFilterCache,
-        QueryShardContext queryShardContext,
         String localNodeId
     ) {
         this.indexShard = indexShard;
         this.shardId = indexShard.shardId();
         this.mapperService = indexShard.mapperService();
-        this.queryShardContext = queryShardContext;
-        this.searcher = searcher;
+        this.queryShardContext = null;
+        this.searcher = null;
         this.bigArrays = bigArrays;
         this.bitsetFilterCache = bitsetFilterCache;
         this.query = query;
         this.aggregations = aggregations;
         this.shardTarget = new SearchShardTarget(localNodeId, shardId, null, OriginalIndices.NONE);
+    }
+
+    /**
+     * Attach the {@link ContextIndexSearcher} the aggregator machinery
+     * will drive. Call exactly once after constructing the fragment
+     * search context; {@link SearchContext#searcher()} throws
+     * {@link IllegalStateException} until this is called.
+     */
+    public LanceFragmentSearchContext withSearcher(ContextIndexSearcher searcher) {
+        this.searcher = searcher;
+        return this;
+    }
+
+    /**
+     * Attach the {@link QueryShardContext} the aggregator machinery
+     * will resolve ValuesSourceConfig against. Call exactly once
+     * after constructing the fragment search context and building
+     * the QueryShardContext against
+     * {@link org.opensearch.index.IndexService#newQueryShardContext}
+     * with {@link #searcher()};
+     * {@link SearchContext#getQueryShardContext()} throws
+     * {@link IllegalStateException} until this is called.
+     */
+    public LanceFragmentSearchContext withQueryShardContext(QueryShardContext queryShardContext) {
+        this.queryShardContext = queryShardContext;
+        return this;
     }
 
     // ------------- Real implementations -------------
@@ -146,6 +185,9 @@ public final class LanceFragmentSearchContext extends SearchContext {
 
     @Override
     public ContextIndexSearcher searcher() {
+        if (searcher == null) {
+            throw new IllegalStateException("LanceFragmentSearchContext.searcher() called before withSearcher(...) attached the ContextIndexSearcher");
+        }
         return searcher;
     }
 
@@ -161,6 +203,11 @@ public final class LanceFragmentSearchContext extends SearchContext {
 
     @Override
     public QueryShardContext getQueryShardContext() {
+        if (queryShardContext == null) {
+            throw new IllegalStateException(
+                "LanceFragmentSearchContext.getQueryShardContext() called before withQueryShardContext(...) attached the QueryShardContext"
+            );
+        }
         return queryShardContext;
     }
 
