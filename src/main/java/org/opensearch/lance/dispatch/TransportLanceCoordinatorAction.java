@@ -217,8 +217,31 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             dataset.getFragments().forEach(fragment -> allFragmentIds.add(fragment.getId()));
         }
         if (allFragmentIds.isEmpty()) {
-            // Empty table: nothing to fan out, no partials to merge.
-            done.onResponse(null);
+            if (spec.aggregations() == null) {
+                // Empty table with no aggregations requested: no
+                // partials to merge, and hits.total.value = 0 is
+                // already the coordinator's default when no
+                // response is absorbed. Skip the fan-out entirely.
+                done.onResponse(null);
+                return;
+            }
+            // Empty table + aggregations requested: the coordinator
+            // still needs an aggregations block in the response
+            // (matching shard path behaviour for an empty index).
+            // Send a single fan-out to the primary node with an
+            // empty fragment set. The per-node executor opens a
+            // LanceDirectoryReader with zero leaves, runs the
+            // aggregators over zero docs, and returns an empty
+            // InternalAggregations tree that the coordinator merges
+            // via topLevelReduce. Same wire format as any other
+            // fan-out; the only novel case is the reader being
+            // shaped to maxDoc=0.
+            List<DiscoveryNode> primaries = nodeListForTarget(target, nodeList);
+            if (primaries.isEmpty()) {
+                done.onResponse(null);
+                return;
+            }
+            dispatchEmptyAggregationRun(target, primaries.get(0), spec, merged, done);
             return;
         }
 
@@ -289,6 +312,71 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 }
             );
         }
+    }
+
+    /**
+     * Send a single fan-out to the primary node with an empty
+     * fragment set so the per-node aggregator machinery still runs
+     * over zero docs and returns an empty
+     * {@link InternalAggregations} tree. Reserved for the
+     * empty-table case where the request asked for aggregations;
+     * without this the response would drop the aggregations block
+     * entirely rather than returning the standard "aggregators
+     * ran, no data" shape.
+     */
+    private void dispatchEmptyAggregationRun(
+        IndexTarget target,
+        DiscoveryNode primary,
+        FragmentQuerySpec spec,
+        MergeState merged,
+        ActionListener<Void> done
+    ) {
+        LanceFragmentQueryRequest fragmentRequest = new LanceFragmentQueryRequest(
+            target.tableUri(),
+            target.indexName(),
+            target.storageOptions(),
+            spec.filterSql(),
+            spec.query(),
+            spec.postFilter(),
+            spec.sorts(),
+            spec.searchAfter(),
+            spec.effectiveSize(),
+            spec.aggregations(),
+            java.util.Collections.emptyList()
+        );
+        LOGGER.info(
+            "lance.dispatch: fan-out index [{}] table [{}] empty aggregation run on primary node [{}]",
+            target.indexName(),
+            target.tableUri(),
+            primary.getId()
+        );
+        transportService.sendRequest(
+            primary,
+            LanceFragmentQueryAction.NAME,
+            fragmentRequest,
+            new org.opensearch.transport.TransportResponseHandler<LanceFragmentQueryResponse>() {
+                @Override
+                public LanceFragmentQueryResponse read(org.opensearch.core.common.io.stream.StreamInput in) throws java.io.IOException {
+                    return new LanceFragmentQueryResponse(in);
+                }
+
+                @Override
+                public void handleResponse(LanceFragmentQueryResponse response) {
+                    merged.absorbTargetResponses(target, java.util.List.of(response));
+                    done.onResponse(null);
+                }
+
+                @Override
+                public void handleException(org.opensearch.transport.TransportException exp) {
+                    done.onFailure(exp);
+                }
+
+                @Override
+                public String executor() {
+                    return org.opensearch.threadpool.ThreadPool.Names.SEARCH;
+                }
+            }
+        );
     }
 
     /**

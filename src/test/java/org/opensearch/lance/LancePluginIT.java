@@ -679,6 +679,59 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeReturnsAggregationsBlockForEmptyTable() throws Exception {
+        // A 0-row Lance table with an aggregation request used to
+        // drop the aggregations block entirely from the response.
+        // Fragment path skipped the fan-out (nothing to fan out) so
+        // the coordinator had no per-node InternalAggregations to
+        // reduce, and the response was missing the "aggregations"
+        // key that shard path would still produce. Coordinator now
+        // dispatches a single empty-fragment fan-out to the primary
+        // node whenever the request carries aggregations, so the
+        // per-node executor runs the aggregator over zero docs and
+        // returns an empty tree the coordinator can reduce.
+        String suffix = "s3-empty-agg-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 0);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // max aggregation on id. Zero rows means the metric
+            // has no value, but the aggregations block itself must
+            // still be present with a null value.
+            String metricBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}"
+                )
+            );
+            assertEquals(0, extractIntPath(metricBody, "hits", "total", "value"));
+            assertTrue("expected aggregations block for empty table max agg: " + metricBody, metricBody.contains("\"aggregations\""));
+            assertTrue("expected m bucket for empty table max agg: " + metricBody, metricBody.contains("\"m\""));
+
+            // terms aggregation: empty table produces buckets=[] but
+            // the aggregations block should still be there.
+            String termsBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"g\":{\"terms\":{\"field\":\"id\"}}}}"
+                )
+            );
+            assertEquals(0, extractIntPath(termsBody, "hits", "total", "value"));
+            assertTrue("expected aggregations block for empty table terms agg: " + termsBody, termsBody.contains("\"aggregations\""));
+            assertTrue("expected g bucket for empty table terms agg: " + termsBody, termsBody.contains("\"g\""));
+            assertTrue("expected empty buckets on empty table: " + termsBody, termsBody.contains("\"buckets\":[]"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFragmentDispatchModeStampsIndexAndVersionEnvelope() throws Exception {
         // The response envelope should carry _index on every hit
         // regardless of what the request asked for, and _version /
