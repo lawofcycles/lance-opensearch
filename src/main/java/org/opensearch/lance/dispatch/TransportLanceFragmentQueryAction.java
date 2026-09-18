@@ -206,11 +206,17 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     searchContext.withQueryShardContext(qsc);
 
                     Query query = resolveLuceneQuery(request, qsc);
+                    Query hitsQuery = applyPostFilter(query, request, qsc);
                     org.opensearch.search.sort.SortAndFormats sortAndFormats = resolveSort(request, qsc);
 
-                    List<SearchHit> hits = scanHitsViaIndexSearcher(searcher, query, sortAndFormats, request.searchAfter(), request.size());
+                    // Aggregations run over the top-level query only —
+                    // OpenSearch semantics for post_filter say the
+                    // filter applies to hits (and hits.total.value)
+                    // but not to aggregations. Hits and matched
+                    // therefore use the AND-combined query.
+                    List<SearchHit> hits = scanHitsViaIndexSearcher(searcher, hitsQuery, sortAndFormats, request.searchAfter(), request.size());
                     InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query);
-                    long matched = computeMatched(dataset, request, searcher, query);
+                    long matched = computeMatched(dataset, request, searcher, hitsQuery);
                     return new LanceFragmentQueryResponse(matched, fragmentCount, hits, aggregations);
                 }
             }
@@ -264,6 +270,24 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             return null;
         }
         return org.opensearch.search.sort.SortBuilder.buildSort(request.sorts(), qsc).orElse(null);
+    }
+
+    /**
+     * Combine the top-level query with {@code post_filter} into the
+     * Lucene query used for hits and matched counting. Returns the
+     * unmodified {@code base} when no post_filter is set.
+     * Aggregations still run against {@code base} because
+     * OpenSearch semantics say post_filter applies only to hits.
+     */
+    private static Query applyPostFilter(Query base, LanceFragmentQueryRequest request, QueryShardContext qsc) throws java.io.IOException {
+        if (request.postFilter() == null) {
+            return base;
+        }
+        Query pf = request.postFilter().toQuery(qsc);
+        return new org.apache.lucene.search.BooleanQuery.Builder()
+            .add(base, org.apache.lucene.search.BooleanClause.Occur.MUST)
+            .add(pf, org.apache.lucene.search.BooleanClause.Occur.FILTER)
+            .build();
     }
 
     /**
@@ -471,7 +495,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         List<Integer> fragmentIds = request.fragmentIdsOrNull();
         String filterSql = request.filterSql();
         boolean hasScoringQuery = request.query() != null && filterSql == null;
-        if (hasScoringQuery) {
+        boolean hasPostFilter = request.postFilter() != null;
+        if (hasScoringQuery || hasPostFilter) {
+            // post_filter narrows hits.total.value below what
+            // filterSql / countRows would return, so ask Lucene
+            // directly against the AND-combined query.
             return searcher.count(luceneQuery);
         }
         if (filterSql == null) {

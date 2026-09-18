@@ -63,6 +63,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     private final StorageOptions storageOptions;
     private final String filterSql;
     private final QueryBuilder query;
+    private final QueryBuilder postFilter;
     private final List<SortBuilder<?>> sorts;
     private final Object[] searchAfter;
     private final int size;
@@ -75,6 +76,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         StorageOptions storageOptions,
         String filterSql,
         QueryBuilder query,
+        QueryBuilder postFilter,
         List<SortBuilder<?>> sorts,
         Object[] searchAfter,
         int size,
@@ -86,6 +88,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.storageOptions = storageOptions;
         this.filterSql = filterSql;
         this.query = query;
+        this.postFilter = postFilter;
         this.sorts = sorts == null ? Collections.emptyList() : List.copyOf(sorts);
         this.searchAfter = searchAfter;
         this.size = size;
@@ -100,6 +103,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.storageOptions = StorageOptions.readFromStream(in);
         this.filterSql = in.readOptionalString();
         this.query = in.readOptionalNamedWriteable(QueryBuilder.class);
+        this.postFilter = in.readOptionalNamedWriteable(QueryBuilder.class);
         int sortCount = in.readVInt();
         if (sortCount == 0) {
             this.sorts = Collections.emptyList();
@@ -133,6 +137,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         storageOptions.writeTo(out);
         out.writeOptionalString(filterSql);
         out.writeOptionalNamedWriteable(query);
+        out.writeOptionalNamedWriteable(postFilter);
         out.writeVInt(sorts.size());
         for (SortBuilder<?> sort : sorts) {
             out.writeNamedWriteable(sort);
@@ -196,6 +201,15 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
      */
     public QueryBuilder query() {
         return query;
+    }
+
+    /**
+     * Post-filter query builder — applied only to the hits after
+     * aggregations have been computed over {@link #query()}. May be
+     * {@code null} when the request has no post_filter clause.
+     */
+    public QueryBuilder postFilter() {
+        return postFilter;
     }
 
     /**
@@ -267,6 +281,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             storageOptions,
             filterSql,
             query,
+            /* postFilter */ null,
             sorts,
             null,
             size,

@@ -207,9 +207,9 @@ public class LanceDispatchActionFilter implements ActionFilter {
      *
      * <p>Rejected shapes (fall through to shard path):
      * <ul>
-     *   <li>{@code suggest}, {@code highlighter}, {@code post_filter}
-     *       — each needs its own per-fragment plumbing that isn't in
-     *       place.</li>
+     *   <li>{@code suggest}, {@code highlighter} — need FTS
+     *       positional / candidate APIs Lance does not surface
+     *       yet.</li>
      *   <li>{@code search_after} without {@code sort} — the per-fragment
      *       executor drives {@link
      *       org.apache.lucene.search.IndexSearcher#searchAfter} which
@@ -243,9 +243,7 @@ public class LanceDispatchActionFilter implements ActionFilter {
         if (source == null) {
             return true;
         }
-        if (source.suggest() != null
-            || source.highlighter() != null
-            || source.postFilter() != null) {
+        if (source.suggest() != null || source.highlighter() != null) {
             return false;
         }
         // search_after depends on sort — Lucene's searchAfter takes a

@@ -686,6 +686,41 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeAnswersPostFilter() throws Exception {
+        // post_filter narrows hits (and hits.total.value) but leaves
+        // aggregations unaffected. Fragment path runs aggregations
+        // against the top-level query and applies the post_filter
+        // to the hits scan on the per-node executor.
+        String suffix = "s3-pf-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // Query matches all 6 rows, post_filter narrows to id
+            // >= 4 (rows 4 and 5). The aggregation counts the full
+            // 6 rows because post_filter must not influence it.
+            String body = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":10,\"query\":{\"match_all\":{}},"
+                        + "\"post_filter\":{\"range\":{\"id\":{\"gte\":4}}},"
+                        + "\"aggs\":{\"total\":{\"value_count\":{\"field\":\"id\"}}}}"
+                )
+            );
+            assertEquals(2, extractIntPath(body, "hits", "total", "value"));
+            assertEquals(6, extractIntPath(body, "aggregations", "total", "value"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFragmentDispatchModeAnswersSearchAfter() throws Exception {
         // search_after pagination flows through the fragment path
         // when the request also carries a sort. The per-node
