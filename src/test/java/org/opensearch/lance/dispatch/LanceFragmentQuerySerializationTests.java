@@ -15,15 +15,12 @@ import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.lance.StorageOptions;
-import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricSpec;
-import org.opensearch.lance.dispatch.LanceMetricAggregator.MetricType;
-import org.opensearch.lance.dispatch.LanceMetricAggregator.PartialState;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchModule;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
- * Round-trip serialisation tests for the Milestone 5-C2 transport
+ * Round-trip serialisation tests for the fragment-dispatch transport
  * classes. Guarantee that a request or response byte-for-byte
  * survives the wire so coordinator and node handlers can be
  * developed independently without breaking each other.
@@ -34,52 +31,13 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         new SearchModule(Settings.EMPTY, java.util.Collections.emptyList()).getNamedWriteables()
     );
 
-    public void testMetricSpecRoundTrip() throws Exception {
-        MetricSpec original = new MetricSpec("total", MetricType.SUM, "amount");
-        MetricSpec restored;
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            original.writeTo(out);
-            try (StreamInput in = out.bytes().streamInput()) {
-                restored = new MetricSpec(in);
-            }
-        }
-        assertEquals(original, restored);
-    }
-
-    public void testPartialStateRoundTrip() throws Exception {
-        PartialState original = new PartialState(3L, 7.5d, -1.0d, 4.0d);
-        PartialState restored;
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            original.writeTo(out);
-            try (StreamInput in = out.bytes().streamInput()) {
-                restored = new PartialState(in);
-            }
-        }
-        assertEquals(original, restored);
-    }
-
-    public void testEmptyPartialStateRoundTrip() throws Exception {
-        // PartialState.EMPTY carries +/- Infinity sentinels that
-        // Double serialisation must preserve exactly for min / max
-        // to remain neutral through the merge.
-        PartialState restored;
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            PartialState.EMPTY.writeTo(out);
-            try (StreamInput in = out.bytes().streamInput()) {
-                restored = new PartialState(in);
-            }
-        }
-        assertEquals(PartialState.EMPTY, restored);
-    }
-
     public void testRequestRoundTrip() throws Exception {
         StorageOptions storage = StorageOptions.of(java.util.Map.of("region", "us-east-1"));
         // Aggregations flow across the wire as an
-        // AggregatorFactories.Builder now — the raw shape from
-        // SearchSourceBuilder.aggregations(). Build one with two metric
-        // aggregations so the round-trip exercises the native
-        // OpenSearch serialisation rather than the previous plugin-
-        // specific MetricSpec projection.
+        // AggregatorFactories.Builder — the raw shape from
+        // SearchSourceBuilder.aggregations(). Build one with two
+        // metric aggregations so the round-trip exercises the
+        // native OpenSearch serialisation.
         org.opensearch.search.aggregations.AggregatorFactories.Builder aggs =
             new org.opensearch.search.aggregations.AggregatorFactories.Builder()
                 .addAggregator(new org.opensearch.search.aggregations.metrics.SumAggregationBuilder("s").field("id"))
@@ -151,11 +109,12 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         hit.score(1.0f);
         hit.sourceRef(new BytesArray("{\"id\":3}"));
 
-        // Wire format now carries InternalAggregations (see Direction 1
-        // Stage 2). We build a real InternalSum so the round-trip exercises
-        // the aggregator's own StreamInput/StreamOutput code path rather
-        // than an empty container: an empty InternalAggregations would not
-        // catch bugs in per-aggregation serialisation.
+        // Wire format now carries InternalAggregations (Direction 1
+        // Stage 2). Build a real InternalSum so the round-trip
+        // exercises the aggregator's own StreamInput/StreamOutput
+        // code path rather than an empty container: an empty
+        // InternalAggregations would not catch bugs in
+        // per-aggregation serialisation.
         org.opensearch.search.aggregations.InternalAggregations aggregations =
             org.opensearch.search.aggregations.InternalAggregations.from(
                 List.<org.opensearch.search.aggregations.InternalAggregation>of(
