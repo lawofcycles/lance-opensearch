@@ -679,6 +679,78 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testMinScoreTerminateAfterTrackTotalHitsFallThroughToShardPath() throws Exception {
+        // min_score, terminate_after, and track_total_hits used to
+        // slip past isDispatchable and produce silently wrong
+        // response envelopes (issue #37 cases 1 and 3). Fragment
+        // path counts matches from Lance metadata (or Lucene
+        // count()) without threading these knobs through, so the
+        // request would come back with hits.total.value from the
+        // full match set and terminated_early=false, even when
+        // the caller asked for a tighter answer. Reject list now
+        // sends each of these shapes to the shard path where the
+        // built-in MinScoreCollector /
+        // EarlyTerminatingCollector / total-hits-up-to gate
+        // actually clip.
+        String suffix = "s3-reject-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // min_score above 1.0 excludes every hit from a
+            // match_all query (all hits carry score 1.0). Fragment
+            // path used to return total=6; shard path clips to
+            // total=0.
+            String minScoreBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"min_score\":2.0}")
+            );
+            assertEquals(0, extractIntPath(minScoreBody, "hits", "total", "value"));
+
+            // terminate_after=2 tells the collector to stop after
+            // two docs per segment. Shard path signals early
+            // termination through terminated_early=true; fragment
+            // path omits the flag entirely because it never wired
+            // the count through its scan. Shard path leaves
+            // hits.total.value as the pre-terminate count, so we
+            // only look at the flag rather than total.
+            String terminateBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"terminate_after\":2}")
+            );
+            assertTrue(
+                "terminate_after should set terminated_early=true on the shard path: " + terminateBody,
+                terminateBody.contains("\"terminated_early\":true")
+            );
+
+            // track_total_hits=3 on a 6-row table produces
+            // relation=gte with a value at the shard path
+            // early-terminated counter. Fragment path used to
+            // return relation="eq" with the Lance metadata count.
+            String trackBoundBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":3}")
+            );
+            assertTrue("track_total_hits:3 should return relation=gte: " + trackBoundBody, trackBoundBody.contains("\"relation\":\"gte\""));
+
+            // track_total_hits=false omits hits.total entirely on
+            // the shard path. Fragment path used to always return
+            // the exact Lance total, ignoring the flag. Assert on
+            // the response envelope shape rather than the counter
+            // value because the two paths disagree on the shape.
+            String trackFalseBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":false}")
+            );
+            assertFalse("track_total_hits:false should omit hits.total: " + trackFalseBody, trackFalseBody.contains("\"total\":{"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFragmentDispatchModeReturnsAggregationsBlockForEmptyTable() throws Exception {
         // A 0-row Lance table with an aggregation request used to
         // drop the aggregations block entirely from the response.

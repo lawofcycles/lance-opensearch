@@ -42,8 +42,9 @@ import org.opensearch.transport.client.Client;
  *       {@link LanceAggregationSupport#isSupported}) — reject shapes
  *       the fragment executor cannot answer correctly: suggester,
  *       highlighter, score-only {@code search_after}, {@code
- *       collapse}, {@code rescore}, pipeline aggregations, and
- *       cross-index metrics.</li>
+ *       collapse}, {@code rescore}, pipeline aggregations, {@code
+ *       min_score}, {@code terminate_after}, {@code
+ *       track_total_hits}, and cross-index metrics.</li>
  *   <li>Delegate the request to {@link LanceCoordinatorAction} via
  *       {@link Client#execute(org.opensearch.action.ActionType,
  *       org.opensearch.action.ActionRequest, ActionListener)}.
@@ -271,6 +272,36 @@ public class LanceDispatchActionFilter implements ActionFilter {
         // don't expect. Route to the shard path where the standard
         // reduce loop handles them.
         if (source.aggregations() != null && hasPipelineAggregation(source.aggregations())) {
+            return false;
+        }
+        // min_score filters hits by score threshold. The fragment
+        // executor's hits + matched counting comes from Lance
+        // metadata (or Lucene count), which sees every doc that
+        // matches the query regardless of score. Passing the
+        // request through would return hits above the threshold
+        // but still report matched as the pre-filter total, so
+        // send to the shard path where the built-in
+        // MinScoreCollector actually clips.
+        if (source.minScore() != null) {
+            return false;
+        }
+        // terminate_after cuts the collector short after N docs on
+        // each shard. Fragment path does not thread the terminate
+        // count into its scan, so both hits.total.value and the
+        // terminated_early flag would be silently wrong. Shard
+        // path implements it directly via
+        // EarlyTerminatingCollector.
+        if (source.terminateAfter() > 0) {
+            return false;
+        }
+        // track_total_hits controls whether hits.total is exact
+        // ("eq") or an early-terminated lower bound ("gte"). The
+        // fragment executor always reports the exact total (Lance
+        // metadata knows the row count for free), so a "false" or
+        // integer bound would produce a relation that disagrees
+        // with the number the user asked for. Route to the shard
+        // path when the caller explicitly specifies the flag.
+        if (source.trackTotalHitsUpTo() != null) {
             return false;
         }
         return true;
