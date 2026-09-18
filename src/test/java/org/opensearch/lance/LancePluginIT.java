@@ -768,6 +768,78 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeAnswersScriptCollapseAndRescore() throws Exception {
+        // Probe: three shapes flow through the fragment path without
+        // any explicit plumbing because the per-fragment reader
+        // already exposes the doc values / IndexSearcher hooks each
+        // one needs. If this test starts failing, the shape has to
+        // move onto the isDispatchable reject list (or the fragment
+        // executor has to grow the missing piece).
+        String suffix = "s3-scq-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // id > 2 -> rows 3, 4, 5.
+            String body = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":10,\"query\":{\"script\":{\"script\":{\"source\":\"doc['id'].value > 2\"}}}}"
+                )
+            );
+            assertEquals(3, extractIntPath(body, "hits", "total", "value"));
+
+            // Same doc value path also drives script sort. Rows
+            // 5..0 in id desc order.
+            String sortBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":3,\"query\":{\"match_all\":{}},"
+                        + "\"sort\":[{\"_script\":{\"script\":{\"source\":\"doc['id'].value\"},\"type\":\"number\",\"order\":\"desc\"}}]}"
+                )
+            );
+            assertEquals(6, extractIntPath(sortBody, "hits", "total", "value"));
+            assertTrue("script sort first hit should carry sort value 5: " + sortBody, sortBody.contains("\"sort\":[5"));
+            assertTrue("script sort second hit should carry sort value 4: " + sortBody, sortBody.contains("\"sort\":[4"));
+
+            // Collapse on the id column. Every id is unique so
+            // the collapsed hit count matches the raw count, but
+            // the collapse phase itself runs through the fragment
+            // path — the per-fragment reader exposes id as
+            // NumericDocValues which the collapse builder consumes
+            // through the standard collector.
+            String collapseBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":10,\"query\":{\"match_all\":{}},\"collapse\":{\"field\":\"id\"},\"sort\":[{\"id\":\"asc\"}]}"
+                )
+            );
+            assertEquals(6, extractIntPath(collapseBody, "hits", "total", "value"));
+
+            // Rescore: match_all first pass, then rescore top-3
+            // window by body match on "lance". The rescore phase
+            // runs on the fragment path's IndexSearcher — hits
+            // that match the body FTS get a higher score.
+            String rescoreBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":3,\"query\":{\"match_all\":{}},"
+                        + "\"rescore\":{\"window_size\":6,\"query\":{\"rescore_query\":{\"match\":{\"body\":\"lance\"}}}}}"
+                )
+            );
+            assertEquals(6, extractIntPath(rescoreBody, "hits", "total", "value"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     private static void updateClusterSetting(String key, String value) throws IOException {
         Request request = new Request("PUT", "/_cluster/settings");
         request.setJsonEntity("{\"transient\":{\"" + key + "\":\"" + value + "\"}}");
