@@ -129,6 +129,34 @@ public class RestAttachAction extends BaseRestHandler {
             }
             storageOptions = StorageOptions.parseFromRequestField(body.get("storage_options"), "[lance_attach]");
             multiFields = parseMultiFields(body.get("multi_fields"));
+            java.util.Map<String, java.util.LinkedHashMap<String, String>> overrides = parseOverrides(body.get("overrides"));
+            if (!overrides.isEmpty()) {
+                if (!multiFields.isEmpty()) {
+                    // Same conceptual data (sub-field spec) coming in twice
+                    // through both shapes is ambiguous: which one wins?
+                    // Reject rather than pick a rule the operator did not
+                    // know about. `overrides` is the forward-looking shape;
+                    // the old `multi_fields` clause is kept for BC only.
+                    for (String col : overrides.keySet()) {
+                        if (multiFields.containsKey(col)) {
+                            throw new IllegalArgumentException(
+                                "attach body carries both [multi_fields] and [overrides] entries for column ["
+                                    + col
+                                    + "]; use [overrides] and drop the duplicate [multi_fields] entry"
+                            );
+                        }
+                    }
+                    // No column conflict; merge into one map. `overrides`
+                    // wins on any later augmentation because it is the
+                    // canonical shape.
+                    java.util.LinkedHashMap<String, java.util.LinkedHashMap<String, String>> merged = new java.util.LinkedHashMap<>();
+                    merged.putAll(multiFields);
+                    merged.putAll(overrides);
+                    multiFields = merged;
+                } else {
+                    multiFields = overrides;
+                }
+            }
         } catch (IllegalArgumentException e) {
             String message = e.getMessage();
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
@@ -669,32 +697,128 @@ public class RestAttachAction extends BaseRestHandler {
      * </pre>
      */
     public static java.util.Map<String, java.util.LinkedHashMap<String, String>> parseMultiFields(Object raw) {
+        return parseSubFieldsBody(raw, "multi_fields");
+    }
+
+    /**
+     * Parse the {@code overrides} block on the attach body. This is the
+     * forward-looking receiver for per-column mapping overrides (RFC
+     * Mapping interface: "optional override rules where the defaults
+     * resolve a column differently than intended"). Today it accepts
+     * only sub-field declarations, so structurally it is a superset of
+     * {@link #parseMultiFields}: {@code overrides.[col].fields.[sub].type}
+     * takes exactly the same shape as
+     * {@code multi_fields.[col].[sub].type}.
+     *
+     * <p>The clause is versioned by shape rather than by a flag:
+     * {@code type} on the base column (for {@code ip}, {@code wildcard},
+     * an analyzer mode, or a preferred index type) is not accepted yet
+     * and returns 400. That reservation lets subsequent tickets
+     * (#6 / #7 / #11) grow the receiver without another wire-format
+     * change.
+     *
+     * <p>Returns the same normalised shape as
+     * {@link #parseMultiFields} so callers can persist it through the
+     * existing {@code index.lance.multi_fields} setting and re-derive
+     * from it on version advance.
+     */
+    public static java.util.Map<String, java.util.LinkedHashMap<String, String>> parseOverrides(Object raw) {
         if (raw == null) {
             return java.util.Collections.emptyMap();
         }
         if (!(raw instanceof java.util.Map<?, ?> rawMap)) {
-            throw new IllegalArgumentException("[multi_fields] must be an object; per-column key → per-sub-field type mapping");
+            throw new IllegalArgumentException("[overrides] must be an object; per-column override rules");
         }
         java.util.LinkedHashMap<String, java.util.LinkedHashMap<String, String>> out = new java.util.LinkedHashMap<>();
         for (java.util.Map.Entry<?, ?> entry : rawMap.entrySet()) {
             if (!(entry.getKey() instanceof String baseName) || baseName.isEmpty()) {
-                throw new IllegalArgumentException("[multi_fields] keys must be non-empty column names");
+                throw new IllegalArgumentException("[overrides] keys must be non-empty column names");
             }
-            if (!(entry.getValue() instanceof java.util.Map<?, ?> subMap)) {
-                throw new IllegalArgumentException("[multi_fields." + baseName + "] must be an object of sub-field definitions");
+            if (!(entry.getValue() instanceof java.util.Map<?, ?> spec)) {
+                throw new IllegalArgumentException("[overrides." + baseName + "] must be an object");
+            }
+            if (spec.containsKey("type")) {
+                // Base-column type override (ip / wildcard / analyzer /
+                // scalar / vector index type) is reserved but not
+                // implemented yet. Explicitly refuse rather than
+                // silently ignore so an operator experimenting today
+                // knows to wait for #6 / #7 / #11.
+                Object t = spec.get("type");
+                throw new IllegalArgumentException(
+                    "[overrides."
+                        + baseName
+                        + ".type="
+                        + t
+                        + "] is not supported yet; only [overrides."
+                        + baseName
+                        + ".fields] is accepted today"
+                );
+            }
+            Object rawFields = spec.get("fields");
+            if (rawFields == null) {
+                // Empty override entry is not useful; refuse so a stray
+                // `"body": {}` does not silently accomplish nothing.
+                throw new IllegalArgumentException("[overrides." + baseName + "] must declare at least [fields]");
+            }
+            if (!(rawFields instanceof java.util.Map<?, ?> fieldsMap)) {
+                throw new IllegalArgumentException("[overrides." + baseName + ".fields] must be an object");
             }
             java.util.LinkedHashMap<String, String> subs = new java.util.LinkedHashMap<>();
-            for (java.util.Map.Entry<?, ?> subEntry : subMap.entrySet()) {
+            for (java.util.Map.Entry<?, ?> subEntry : fieldsMap.entrySet()) {
                 if (!(subEntry.getKey() instanceof String subName) || subName.isEmpty()) {
-                    throw new IllegalArgumentException("[multi_fields." + baseName + "] sub-field names must be non-empty strings");
+                    throw new IllegalArgumentException("[overrides." + baseName + ".fields] sub-field names must be non-empty strings");
                 }
                 if (!(subEntry.getValue() instanceof java.util.Map<?, ?> subDefMap)) {
-                    throw new IllegalArgumentException("[multi_fields." + baseName + "." + subName + "] must be an object");
+                    throw new IllegalArgumentException("[overrides." + baseName + ".fields." + subName + "] must be an object");
                 }
                 Object typeValue = subDefMap.get("type");
                 if (!(typeValue instanceof String typeStr) || typeStr.isEmpty()) {
                     throw new IllegalArgumentException(
-                        "[multi_fields." + baseName + "." + subName + ".type] is required and must be a string"
+                        "[overrides." + baseName + ".fields." + subName + ".type] is required and must be a string"
+                    );
+                }
+                subs.put(subName, typeStr);
+            }
+            if (!subs.isEmpty()) {
+                out.put(baseName, subs);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Shared parser body for the two attach clauses that describe
+     * sub-fields ({@code multi_fields} and {@code overrides.[col].fields}).
+     * Kept as one helper so the two clauses agree on validation rules
+     * without duplicating the loop.
+     */
+    private static java.util.Map<String, java.util.LinkedHashMap<String, String>> parseSubFieldsBody(Object raw, String clauseName) {
+        if (raw == null) {
+            return java.util.Collections.emptyMap();
+        }
+        if (!(raw instanceof java.util.Map<?, ?> rawMap)) {
+            throw new IllegalArgumentException("[" + clauseName + "] must be an object; per-column key → per-sub-field type mapping");
+        }
+        java.util.LinkedHashMap<String, java.util.LinkedHashMap<String, String>> out = new java.util.LinkedHashMap<>();
+        for (java.util.Map.Entry<?, ?> entry : rawMap.entrySet()) {
+            if (!(entry.getKey() instanceof String baseName) || baseName.isEmpty()) {
+                throw new IllegalArgumentException("[" + clauseName + "] keys must be non-empty column names");
+            }
+            if (!(entry.getValue() instanceof java.util.Map<?, ?> subMap)) {
+                throw new IllegalArgumentException("[" + clauseName + "." + baseName + "] must be an object of sub-field definitions");
+            }
+            java.util.LinkedHashMap<String, String> subs = new java.util.LinkedHashMap<>();
+            for (java.util.Map.Entry<?, ?> subEntry : subMap.entrySet()) {
+                if (!(subEntry.getKey() instanceof String subName) || subName.isEmpty()) {
+                    throw new IllegalArgumentException("[" + clauseName + "." + baseName + "] sub-field names must be non-empty strings");
+                }
+                if (!(subEntry.getValue() instanceof java.util.Map<?, ?> subDefMap)) {
+                    throw new IllegalArgumentException("[" + clauseName + "." + baseName + "." + subName + "] must be an object");
+                }
+                Object typeValue = subDefMap.get("type");
+                if (!(typeValue instanceof String typeStr) || typeStr.isEmpty()) {
+                    throw new IllegalArgumentException(
+                        "[" + clauseName + "." + baseName + "." + subName + ".type] is required and must be a string"
                     );
                 }
                 subs.put(subName, typeStr);

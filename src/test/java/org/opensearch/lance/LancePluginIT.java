@@ -1838,6 +1838,90 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testOverridesAcceptsFieldsClause() throws Exception {
+        // Issue #2: `overrides` on the attach body accepts the same
+        // sub-field declaration `multi_fields` accepts, and produces the
+        // same mapping / doc value shape. This exercises the forward
+        // path so future callers can drop `multi_fields` and use
+        // `overrides` exclusively.
+        String suffix = "overrides-fields-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson(
+                "/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"fields\":{\"raw\":{\"type\":\"keyword\"}}}}}"
+            );
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            String mappingBody = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+            assertTrue(
+                "expected body.fields.raw:keyword: " + mappingBody,
+                mappingBody.contains("\"fields\":{\"raw\":{\"type\":\"keyword\"")
+            );
+
+            // term query on body.raw should resolve through the sub-field
+            // doc values exactly as it does with the multi_fields clause.
+            String termBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"term\":{\"body.raw\":\"hello lance 0\"}}}")
+            );
+            assertEquals(1, extractIntPath(termBody, "hits", "total", "value"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testOverridesRejectsColumnTypeOverride() throws Exception {
+        // The `type` field on an overrides entry is the reservation
+        // point for future work (#6 ip / wildcard, #7 analyzer mode,
+        // #11 preferred index type). Today it is not implemented, so
+        // the parser must refuse rather than silently accept and
+        // return 400 with a message that points at the reserved
+        // shape.
+        String suffix = "overrides-type-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        ResponseException failure = expectThrows(
+            ResponseException.class,
+            () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"type\":\"ip\"}}}")
+        );
+        assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
+        String body = readAll(failure.getResponse());
+        assertTrue("expected message about type not supported: " + body, body.contains("not supported yet"));
+    }
+
+    public void testOverridesConflictsWithMultiFieldsRejected() throws Exception {
+        // Both clauses declaring sub-fields for the same base column
+        // is ambiguous. Refuse rather than pick a rule the operator
+        // did not know about.
+        String suffix = "overrides-conflict-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        ResponseException failure = expectThrows(
+            ResponseException.class,
+            () -> postJson(
+                "/_lance/attach",
+                "{\"table\":\""
+                    + tableUri
+                    + "\","
+                    + "\"multi_fields\":{\"body\":{\"raw\":{\"type\":\"keyword\"}}},"
+                    + "\"overrides\":{\"body\":{\"fields\":{\"raw\":{\"type\":\"keyword\"}}}}}"
+            )
+        );
+        assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
+        String body = readAll(failure.getResponse());
+        assertTrue("expected message about ambiguous body: " + body, body.contains("both [multi_fields] and [overrides]"));
+    }
+
     public void testAttachAndKnn() throws Exception {
         // Row i sits at coordinate (i, 0, 0, ...) so the nearest neighbour
         // of (2.4, 0, ...) is row 2 followed by row 3. Vector index build is

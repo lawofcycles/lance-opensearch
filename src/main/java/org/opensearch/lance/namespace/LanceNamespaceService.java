@@ -27,6 +27,7 @@ import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.action.admin.indices.refresh.RefreshRequest;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
@@ -477,7 +478,18 @@ public final class LanceNamespaceService {
                     // The RFC's Mapping interface states the mapping is re-derived at
                     // every checkout. We derive first so the builder only touches
                     // columns that derived to lance_text; keyword columns stay untouched.
-                    RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset);
+                    // Re-apply any attach-body overrides captured on shard creation
+                    // (issue #2) so the re-derived mapping preserves multi-field
+                    // declarations across manifest version advance; without this the
+                    // mapping would drop back to the default derivation and a caller
+                    // querying body.raw would suddenly see 400 no-such-field errors.
+                    IndexMetadata rederivationMetadata = clusterService.state().metadata().index(indexName);
+                    String storedMultiFieldsJson = rederivationMetadata == null
+                        ? ""
+                        : rederivationMetadata.getSettings().get(LanceEngineFactory.MULTI_FIELDS_SETTING, "");
+                    java.util.Map<String, java.util.LinkedHashMap<String, String>> storedMultiFields = RestAttachAction
+                        .deserialiseMultiFields(storedMultiFieldsJson);
+                    RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, storedMultiFields);
                     rederivedMappingJson = derivation.mappingJson();
                     warnOnLanceFieldRename(indexName, dataset.getLanceSchema());
                     if ("wait".equals(policy)) {
