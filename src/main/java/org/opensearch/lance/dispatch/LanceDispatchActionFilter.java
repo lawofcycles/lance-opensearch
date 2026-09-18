@@ -44,7 +44,8 @@ import org.opensearch.transport.client.Client;
  *       highlighter, score-only {@code search_after}, {@code
  *       collapse}, {@code rescore}, pipeline aggregations, {@code
  *       min_score}, {@code terminate_after}, {@code
- *       track_total_hits}, and cross-index metrics.</li>
+ *       track_total_hits}, {@code stored_fields}, {@code
+ *       docvalue_fields}, {@code explain}, and cross-index metrics.</li>
  *   <li>Delegate the request to {@link LanceCoordinatorAction} via
  *       {@link Client#execute(org.opensearch.action.ActionType,
  *       org.opensearch.action.ActionRequest, ActionListener)}.
@@ -302,6 +303,32 @@ public class LanceDispatchActionFilter implements ActionFilter {
         // with the number the user asked for. Route to the shard
         // path when the caller explicitly specifies the flag.
         if (source.trackTotalHitsUpTo() != null) {
+            return false;
+        }
+        // stored_fields projects a specific list of stored fields
+        // per hit (or "_none_" to hide _source entirely). The
+        // fragment executor materialises hits by copying the raw
+        // _source bytes emitted by LanceFragmentLeafReader; the
+        // stored_fields context is dropped, so a request that asks
+        // for a stored field subset (or explicitly hides _source
+        // with "_none_") gets the full _source back. Route to the
+        // shard path where the fetch phase applies the projection.
+        if (source.storedFields() != null) {
+            return false;
+        }
+        // docvalue_fields loads named doc values into hits.fields.
+        // The fragment executor does not populate hits.fields, so a
+        // request that asks for docvalue_fields would come back
+        // without them at all. Route to the shard path.
+        if (source.docValueFields() != null && !source.docValueFields().isEmpty()) {
+            return false;
+        }
+        // explain returns a per-hit scoring explanation. The
+        // fragment executor drives IndexSearcher.search but never
+        // calls searcher.explain, so a request with "explain":true
+        // would come back without any _explanation field on the
+        // hits. Route to the shard path.
+        if (Boolean.TRUE.equals(source.explain())) {
             return false;
         }
         return true;

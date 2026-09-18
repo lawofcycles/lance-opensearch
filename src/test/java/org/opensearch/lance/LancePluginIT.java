@@ -700,6 +700,61 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testStoredFieldsDocValueFieldsExplainFallThroughToShardPath() throws Exception {
+        // stored_fields, docvalue_fields, and explain used to slip
+        // past isDispatchable and produce silently wrong hit
+        // envelopes (issue #37 case 4 remainder). Fragment
+        // executor drops all three: stored_fields projection is
+        // ignored so _source stays in hits (including when
+        // "_none_" asks to hide it entirely), docvalue_fields is
+        // never populated into hits.fields, and explain never
+        // adds the _explanation field. Reject list now sends
+        // each of these shapes to the shard path where the
+        // built-in fetch phase applies the projection and
+        // synthesises the explanation.
+        String suffix = "s3-storedfields-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // stored_fields: "_none_" hides _source entirely on
+            // the shard path. Fragment path used to always
+            // materialise _source from the Lance row scan.
+            String noneBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"stored_fields\":\"_none_\"}")
+            );
+            assertFalse("stored_fields:_none_ should suppress _source: " + noneBody, noneBody.contains("\"_source\""));
+
+            // docvalue_fields projects doc values into hits.fields.
+            // Fragment path used to omit hits.fields entirely.
+            String docvalueBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"docvalue_fields\":[\"id\"]}")
+            );
+            assertTrue(
+                "docvalue_fields should populate hits.fields on the shard path: " + docvalueBody,
+                docvalueBody.contains("\"fields\":{\"id\"")
+            );
+
+            // explain: true adds a per-hit _explanation with a
+            // scoring breakdown on the shard path. Fragment path
+            // used to never call searcher.explain, so the field
+            // was missing.
+            String explainBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"explain\":true}")
+            );
+            assertTrue("explain:true should add _explanation on the shard path: " + explainBody, explainBody.contains("\"_explanation\""));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testMinScoreTerminateAfterTrackTotalHitsFallThroughToShardPath() throws Exception {
         // min_score, terminate_after, and track_total_hits used to
         // slip past isDispatchable and produce silently wrong
