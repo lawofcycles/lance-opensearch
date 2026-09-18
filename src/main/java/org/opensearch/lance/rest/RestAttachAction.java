@@ -175,7 +175,8 @@ public class RestAttachAction extends BaseRestHandler {
             .put("index.number_of_shards", 1)
             .put("index.number_of_replicas", 0)
             .put(LanceEngineFactory.TABLE_SETTING, table)
-            .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField);
+            .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField)
+            .put(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, derivation.keyFieldType);
         pinnedVersion.ifPresent(v -> settings.put(LanceEngineFactory.VERSION_SETTING, v));
         storageOptions.writeToSettings(settings);
         CreateIndexRequest create = new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson);
@@ -360,8 +361,8 @@ public class RestAttachAction extends BaseRestHandler {
         }
     }
 
-    public record Derivation(String mappingJson, String keyField, long version, long rows, int fragments, List<String> notes, java.util.Set<
-        String> ftsColumns, java.util.Set<String> scalarColumns, java.util.Set<String> vectorColumns) {
+    public record Derivation(String mappingJson, String keyField, String keyFieldType, long version, long rows, int fragments, List<
+        String> notes, java.util.Set<String> ftsColumns, java.util.Set<String> scalarColumns, java.util.Set<String> vectorColumns) {
     }
 
     public static Derivation derive(Dataset dataset) throws Exception {
@@ -369,6 +370,13 @@ public class RestAttachAction extends BaseRestHandler {
         int fragments = dataset.getFragments().size();
 
         String keyField = null;
+        // Track the Arrow type family of the declared primary key so the
+        // engine can pick the right lookup strategy (signed integer via
+        // Long.parseLong / Utf8 via SQL-quoted string). The setting is
+        // ignored by the engine when keyField is empty, so leaving the
+        // default "long" here matches the pre-#24 behaviour for tables
+        // that never declared a PK.
+        String keyFieldType = "long";
         java.util.List<String> notes = new java.util.ArrayList<>();
         java.util.Set<String> ftsColumns = new java.util.LinkedHashSet<>();
         java.util.Set<String> scalarColumns = new java.util.LinkedHashSet<>();
@@ -383,7 +391,28 @@ public class RestAttachAction extends BaseRestHandler {
             int fieldId = field.getId();
             boolean declaredPk = field.getMetadata() != null && field.getMetadata().containsKey(PK_METADATA_KEY);
             if (declaredPk) {
-                keyField = name;
+                // Signed integers up to 64 bits and Utf8 are the two PK
+                // shapes the engine knows how to look up. Any other type
+                // gets recorded as a note and left off keyField so the
+                // engine treats the table as PK-less rather than trying
+                // to serve GET on an unsupported column. Unsigned or
+                // >64-bit integers are out of scope for #24 and follow
+                // a separate ticket.
+                if (type instanceof ArrowType.Int intType && intType.getIsSigned() && intType.getBitWidth() <= 64) {
+                    keyField = name;
+                    keyFieldType = "long";
+                } else if (type instanceof ArrowType.Utf8) {
+                    keyField = name;
+                    keyFieldType = "keyword";
+                } else {
+                    notes.add(
+                        "column "
+                            + name
+                            + " is declared as primary key with unsupported Arrow type "
+                            + type
+                            + "; GET /_doc returns 404 and _id falls back to \"<fragment>-<offset>\""
+                    );
+                }
             }
             if (type instanceof ArrowType.Int intType) {
                 int bitWidth = intType.getBitWidth();
@@ -503,11 +532,13 @@ public class RestAttachAction extends BaseRestHandler {
 
         if (keyField == null) {
             keyField = "";
+            keyFieldType = "long";
             notes.add("no primary key declared; _id GET returns 404, `_id` values are not unique");
         }
         return new Derivation(
             mapping.toString(),
             keyField,
+            keyFieldType,
             dataset.version(),
             rows,
             fragments,

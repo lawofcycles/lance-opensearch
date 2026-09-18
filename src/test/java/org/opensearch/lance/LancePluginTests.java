@@ -57,6 +57,7 @@ public class LancePluginTests extends OpenSearchTestCase {
         // The exact settings the RFC and the README expect users to see.
         assertTrue(settingKeys.contains(LanceEngineFactory.TABLE_SETTING));
         assertTrue(settingKeys.contains(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING));
+        assertTrue(settingKeys.contains(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING));
         assertTrue(settingKeys.contains("index.lance.uncovered_fragment_policy"));
         assertTrue(settingKeys.contains("lance.namespace.poll_cadence"));
         assertTrue(settingKeys.contains("lance.builder.max_rows"));

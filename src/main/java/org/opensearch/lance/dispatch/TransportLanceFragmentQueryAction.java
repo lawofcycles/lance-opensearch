@@ -232,6 +232,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             IndexService indexService = indicesService.indexServiceSafe(index);
             IndexShard indexShard = indexService.getShard(0);
             String pkField = indexMetadata.getSettings().get("index.lance.primary_key_field", "");
+            // Parse the type setting through the same fromSetting helper the
+            // engine uses so unknown values fall back to LONG. Empty pkField
+            // overrides whatever the type says (see the reader constructor
+            // for the canonicalisation).
+            org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType = pkField.isEmpty()
+                ? org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.NONE
+                : org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.fromSetting(
+                    indexMetadata.getSettings().get("index.lance.primary_key_type", "long")
+                );
 
             // Open a fresh Dataset for the reader: LanceDirectoryReader
             // takes ownership of the Dataset and closes it in doClose.
@@ -243,7 +252,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // same way they apply to shard path hits.
             try (
                 Dataset readerDataset = LanceRegistry.openDataset(request.tableUri(), request.storageOptions());
-                DirectoryReader dr = openWrappedReader(indexService, readerDataset, pkField, effectiveFragmentIds)
+                DirectoryReader dr = openWrappedReader(indexService, readerDataset, pkField, pkType, effectiveFragmentIds)
             ) {
                 MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
                     Integer.MAX_VALUE,
@@ -579,6 +588,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         IndexService indexService,
         Dataset readerDataset,
         String pkField,
+        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
         List<Integer> effectiveFragmentIds
     ) throws IOException {
         DirectoryReader lanceReader = LanceDirectoryReader.openForFragments(
@@ -586,6 +596,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             null,
             readerDataset,
             pkField,
+            pkType,
             effectiveFragmentIds
         );
         try {

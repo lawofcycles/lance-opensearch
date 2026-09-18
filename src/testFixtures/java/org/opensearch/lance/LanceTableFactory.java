@@ -343,6 +343,88 @@ final class LanceTableFactory {
         return retryOnFfiFlake(() -> writeKeywordOnlyTableOnce(parent, name, rowCount));
     }
 
+    /**
+     * Writes a Lance table whose primary key is a Utf8 column. Uses a Utf8
+     * only schema so the {@code lance-schema:unenforced-primary-key}
+     * metadata can be attached to the PK field without tripping the C Data
+     * serialisation bug that fires when a FixedSizeList column sits in the
+     * same schema (see the note on {@link #writeTable}). Row layout for
+     * {@code rowCount} rows:
+     * <ul>
+     *   <li>{@code key = "alpha-i"} (deterministic, unique per row)</li>
+     *   <li>{@code label = "row-i"} for even {@code i}, {@code "col-i"}
+     *       for odd {@code i}</li>
+     * </ul>
+     * Used by the {@code _id} string PK integration tests to verify that
+     * {@code _search} echoes the Utf8 PK values as {@code _id} and
+     * {@code GET /{index}/_doc/{key}} resolves via a quoted Lance filter.
+     */
+    static String writeStringPkTable(Path parent, String name, int rowCount) throws Exception {
+        return retryOnFfiFlake(() -> writeStringPkTableOnce(parent, name, rowCount));
+    }
+
+    private static String writeStringPkTableOnce(Path parent, String name, int rowCount) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        java.util.Map<String, String> pkMeta = Map.of("lance-schema:unenforced-primary-key", "true");
+        Schema schema = new Schema(
+            Arrays.asList(
+                // PK metadata rides on the field's FieldType. Utf8 alone in
+                // the schema keeps the C Data bridge from tripping on the
+                // FixedSizeList issue the note on writeTable documents.
+                // Lance also requires the primary key column itself to be
+                // non-nullable ("Primary key column and all its ancestors
+                // must not be nullable" from lance-core's schema
+                // validator), so nullable is false on the PK field.
+                new Field("key", new FieldType(false, new ArrowType.Utf8(), null, pkMeta), null),
+                new Field("label", FieldType.nullable(new ArrowType.Utf8()), null)
+            ),
+            Map.of()
+        );
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            byte[] ipcBytes;
+            try (
+                VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                ByteArrayOutputStream out = new ByteArrayOutputStream()
+            ) {
+                VarCharVector keyVector = (VarCharVector) root.getVector("key");
+                VarCharVector labelVector = (VarCharVector) root.getVector("label");
+                keyVector.allocateNew();
+                labelVector.allocateNew();
+                for (int i = 0; i < rowCount; i++) {
+                    keyVector.setSafe(i, ("alpha-" + i).getBytes(StandardCharsets.UTF_8));
+                    String label = (i % 2 == 0 ? "row-" : "col-") + i;
+                    labelVector.setSafe(i, label.getBytes(StandardCharsets.UTF_8));
+                }
+                keyVector.setValueCount(rowCount);
+                labelVector.setValueCount(rowCount);
+                root.setRowCount(rowCount);
+                try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                }
+                ipcBytes = out.toByteArray();
+            }
+
+            try (
+                ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+            ) {
+                Data.exportArrayStream(allocator, reader, stream);
+                WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
+                // No FTS index on either column: the point is to exercise
+                // the keyword PK path, not FTS. Derivation surfaces the
+                // key column as `keyword` and the mapping still lets term
+                // and match queries resolve.
+                Dataset.create(allocator, stream, uri, writeParams).close();
+            }
+        }
+        return uri;
+    }
+
     private static String writeKeywordOnlyTableOnce(Path parent, String name, int rowCount) throws Exception {
         Path tablePath = parent.resolve(name + ".lance");
         String uri = tablePath.toString();

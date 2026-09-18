@@ -79,6 +79,16 @@ public final class LanceEngineFactory implements EngineFactory {
     public static final String TABLE_SETTING = "index.lance.table";
     public static final String PRIMARY_KEY_FIELD_SETTING = "index.lance.primary_key_field";
     /**
+     * Arrow type of the declared primary key column. {@code "long"} covers
+     * signed integer PKs (default, preserves the pre-#24 behaviour when the
+     * setting is missing); {@code "keyword"} covers Utf8 PKs, which take a
+     * separate lookup path that quotes the {@code _id} inside the Lance
+     * filter and holds {@code BytesRef} values in the reader instead of
+     * numeric ones. Ignored when {@link #PRIMARY_KEY_FIELD_SETTING} is empty
+     * because there is no PK to type in that case.
+     */
+    public static final String PRIMARY_KEY_TYPE_SETTING = "index.lance.primary_key_type";
+    /**
      * Pin the Lance manifest version an index reads. Non-negative values pin
      * the dataset to that version; the default {@code -1L} means "follow the
      * latest version" and lets {@link org.opensearch.lance.namespace.LanceNamespaceService}'s
@@ -86,15 +96,72 @@ public final class LanceEngineFactory implements EngineFactory {
      */
     public static final String VERSION_SETTING = "index.lance.version";
 
+    /**
+     * Arrow type kinds a Lance primary key column can take. Kept small on
+     * purpose: {@link #LONG} covers signed integer PKs (any bit width up to
+     * 64), {@link #KEYWORD} covers Utf8 PKs, and {@link #NONE} is the
+     * sentinel used at runtime when the primary key column name is empty
+     * (either because the table did not declare a PK, or because derivation
+     * refused to surface a PK of an unsupported type). Unsigned or wider
+     * than 64 bit integer PKs are out of scope for this ticket; see issue
+     * #24 for the follow-up.
+     */
+    public enum LancePrimaryKeyType {
+        NONE("none"),
+        LONG("long"),
+        KEYWORD("keyword");
+
+        private final String settingValue;
+
+        LancePrimaryKeyType(String settingValue) {
+            this.settingValue = settingValue;
+        }
+
+        public String settingValue() {
+            return settingValue;
+        }
+
+        /**
+         * Resolve the setting-string form back into an enum. Unknown or
+         * empty values map to {@link #LONG} for backwards compatibility
+         * with pre-#24 indices where the setting did not exist and the
+         * only supported kind was signed integer.
+         */
+        public static LancePrimaryKeyType fromSetting(String value) {
+            if (value == null || value.isEmpty()) {
+                return LONG;
+            }
+            switch (value) {
+                case "keyword":
+                    return KEYWORD;
+                case "long":
+                    return LONG;
+                case "none":
+                    return NONE;
+                default:
+                    return LONG;
+            }
+        }
+    }
+
     @Override
     public Engine newReadWriteEngine(EngineConfig config) {
         String table = config.getIndexSettings().getSettings().get(TABLE_SETTING);
         String field = config.getIndexSettings().getSettings().get(PRIMARY_KEY_FIELD_SETTING, "");
+        // Empty field name overrides whatever the type setting says: no PK
+        // means no lookup, no _id materialisation from a column, and the
+        // reader will synthesise "<fragment>-<offset>" instead. Callers that
+        // set field="" but leave the type setting alone (or vice versa) get
+        // consistent behaviour rather than one accessor reading the field
+        // and another the type.
+        LancePrimaryKeyType pkType = field.isEmpty()
+            ? LancePrimaryKeyType.NONE
+            : LancePrimaryKeyType.fromSetting(config.getIndexSettings().getSettings().get(PRIMARY_KEY_TYPE_SETTING, "long"));
         int shardId = config.getShardId().id();
         long versionSetting = config.getIndexSettings().getSettings().getAsLong(VERSION_SETTING, -1L);
         java.util.Optional<Long> pinnedVersion = versionSetting >= 0 ? java.util.Optional.of(versionSetting) : java.util.Optional.empty();
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(config.getIndexSettings().getSettings());
-        return new LanceReadOnlyEngine(config, table, field, shardId, pinnedVersion, storageOptions);
+        return new LanceReadOnlyEngine(config, table, field, pkType, shardId, pinnedVersion, storageOptions);
     }
 
     static final class LanceReadOnlyEngine extends ReadOnlyEngine {
@@ -103,6 +170,7 @@ public final class LanceEngineFactory implements EngineFactory {
 
         final String tablePath;
         final String field;
+        final LancePrimaryKeyType pkType;
         final int shardId;
         /**
          * Pinned Lance manifest version. When present, {@link #openLanceReader()}
@@ -119,6 +187,7 @@ public final class LanceEngineFactory implements EngineFactory {
             EngineConfig config,
             String table,
             String field,
+            LancePrimaryKeyType pkType,
             int shardId,
             java.util.Optional<Long> pinnedVersion,
             StorageOptions storageOptions
@@ -126,6 +195,7 @@ public final class LanceEngineFactory implements EngineFactory {
             super(config, null, null, true, Function.identity(), true);
             this.tablePath = table;
             this.field = field;
+            this.pkType = pkType;
             this.shardId = shardId;
             this.pinnedVersion = pinnedVersion;
             this.storageOptions = storageOptions;
@@ -154,7 +224,7 @@ public final class LanceEngineFactory implements EngineFactory {
             OpenSearchDirectoryReader wrapped = null;
             LanceDirectoryReader reader = null;
             try {
-                reader = LanceDirectoryReader.open(directory, commit, dataset, field);
+                reader = LanceDirectoryReader.open(directory, commit, dataset, field, pkType);
                 wrapped = OpenSearchDirectoryReader.wrap(reader, config().getShardId());
                 return wrapped;
             } catch (Throwable t) {
@@ -264,7 +334,7 @@ public final class LanceEngineFactory implements EngineFactory {
          */
         @Override
         public GetResult get(Get get, BiFunction<String, SearcherScope, Engine.Searcher> searcherFactory) {
-            if (field == null || field.isEmpty()) {
+            if (field == null || field.isEmpty() || pkType == LancePrimaryKeyType.NONE) {
                 // The table did not declare a primary key. With no `_id`
                 // lookup column there is nothing to resolve, so return
                 // NOT_EXISTS immediately rather than passing an empty field
@@ -277,11 +347,38 @@ public final class LanceEngineFactory implements EngineFactory {
             // revisited, the coordinator will need to fan out to every
             // shard because a Lance primary key has no relationship to
             // OpenSearch's hash(_id) % numShards routing.
-            long key;
-            try {
-                key = Long.parseLong(get.id());
-            } catch (NumberFormatException e) {
-                return GetResult.NOT_EXISTS;
+            //
+            // The Lance scan filter is built to match the declared PK
+            // type. For a signed integer PK the filter is
+            // `<field> = <long>`; parsing failures short-circuit to
+            // NOT_EXISTS so `GET /{index}/_doc/alpha` on an integer PK
+            // does not throw a 500. For a Utf8 PK the filter is
+            // `<field> = '<escaped>'` with single-quote doubling on
+            // the id value so ids that contain a quote (`o'brien`) do
+            // not break the filter expression or open an injection
+            // path; ids never fail to parse, so the empty-id short
+            // circuit is the only NOT_EXISTS branch on this path.
+            String filter;
+            switch (pkType) {
+                case LONG: {
+                    long key;
+                    try {
+                        key = Long.parseLong(get.id());
+                    } catch (NumberFormatException e) {
+                        return GetResult.NOT_EXISTS;
+                    }
+                    filter = field + " = " + key;
+                    break;
+                }
+                case KEYWORD: {
+                    if (get.id().isEmpty()) {
+                        return GetResult.NOT_EXISTS;
+                    }
+                    filter = field + " = '" + get.id().replace("'", "''") + "'";
+                    break;
+                }
+                default:
+                    return GetResult.NOT_EXISTS;
             }
 
             Engine.Searcher searcher = searcherFactory.apply("get", SearcherScope.EXTERNAL);
@@ -304,7 +401,7 @@ public final class LanceEngineFactory implements EngineFactory {
                     return GetResult.NOT_EXISTS;
                 }
 
-                ScanOptions options = new ScanOptions.Builder().filter(field + " = " + key)
+                ScanOptions options = new ScanOptions.Builder().filter(filter)
                     .columns(Collections.singletonList(field))
                     .fragmentIds(fragmentIds)
                     .withRowAddress(true)

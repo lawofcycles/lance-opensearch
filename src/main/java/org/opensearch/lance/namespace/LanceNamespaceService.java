@@ -469,7 +469,8 @@ public final class LanceNamespaceService {
             .put("index.number_of_shards", 1)
             .put("index.number_of_replicas", 0)
             .put(LanceEngineFactory.TABLE_SETTING, table)
-            .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField());
+            .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField())
+            .put(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, derivation.keyFieldType());
         storageOptions.writeToSettings(settings);
         // LanceCreateIndexActionFilter blocks user PUT /{index} with
         // index.lance.table in settings. This surface call is

@@ -47,24 +47,39 @@ public final class LanceDirectoryReader extends DirectoryReader {
      * scheme (fragment id modulo shard count) was retired when
      * {@code number_of_shards} was dropped from attach; {@link #openForFragments}
      * is the fan-out variant used by the fragment path.
+     */
+    /**
+     * Open a whole-table reader for the shard-level engine's GET / stats /
+     * refresh needs. Every fragment in the dataset is surfaced as a leaf.
      *
      * @param directory the Lucene {@link Directory} the reader reports to
-     *                  Lucene's own bookkeeping; the reader does not actually
-     *                  write to it (fragments live in Lance).
-     * @param commit    Lucene {@link IndexCommit} for the empty bootstrap
-     *                  commit; retained through the reader lifecycle.
+     *                  Lucene's own bookkeeping.
+     * @param commit    marker retained through the reader lifecycle.
      * @param dataset   the Lance dataset; the returned reader takes
      *                  ownership and closes it on {@link #close()}.
      * @param intField  primary key column name for {@code _id} lookups; empty
      *                  string when the Lance table has no declared primary
      *                  key.
+     * @param pkType    Arrow type family of the declared primary key. When
+     *                  it is {@link org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType#KEYWORD}
+     *                  the reader holds string PK values so {@code _id}
+     *                  echoes them verbatim; otherwise (including
+     *                  {@link org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType#NONE})
+     *                  the reader falls back to the integer / synthesised
+     *                  paths.
      */
-    public static LanceDirectoryReader open(Directory directory, IndexCommit commit, Dataset dataset, String intField) throws IOException {
+    public static LanceDirectoryReader open(
+        Directory directory,
+        IndexCommit commit,
+        Dataset dataset,
+        String intField,
+        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType
+    ) throws IOException {
         List<LeafReader> leaves = new ArrayList<>();
         for (Fragment fragment : dataset.getFragments()) {
             leaves.add(
                 LanceSequentialLeafReader.wrap(
-                    new LanceFragmentLeafReader(dataset, fragment.getId(), fragment.metadata().getPhysicalRows(), intField)
+                    new LanceFragmentLeafReader(dataset, fragment.getId(), fragment.metadata().getPhysicalRows(), intField, pkType)
                 )
             );
         }
@@ -98,6 +113,8 @@ public final class LanceDirectoryReader extends DirectoryReader {
      * @param intField    primary key column name for {@code _id} lookups; empty
      *                    string when the Lance table has no declared primary
      *                    key.
+     * @param pkType      Arrow type family of the declared primary key
+     *                    (see the sibling {@link #open} overload).
      * @param fragmentIds Lance fragment ids this reader should expose as
      *                    leaves. Non-null, may be empty (empty means "no
      *                    fragments assigned"; the returned reader has zero
@@ -108,6 +125,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         IndexCommit commit,
         Dataset dataset,
         String intField,
+        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
         List<Integer> fragmentIds
     ) throws IOException {
         java.util.Set<Integer> wanted = new java.util.HashSet<>(fragmentIds);
@@ -118,7 +136,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
             }
             leaves.add(
                 LanceSequentialLeafReader.wrap(
-                    new LanceFragmentLeafReader(dataset, fragment.getId(), fragment.metadata().getPhysicalRows(), intField)
+                    new LanceFragmentLeafReader(dataset, fragment.getId(), fragment.metadata().getPhysicalRows(), intField, pkType)
                 )
             );
         }

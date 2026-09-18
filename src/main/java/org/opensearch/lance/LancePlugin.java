@@ -100,6 +100,21 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.IndexScope,
         Setting.Property.Final
     );
+    /**
+     * String form of the declared primary key's Arrow type family, used by
+     * {@link LanceEngineFactory} to pick the right lookup strategy. Only
+     * {@code "long"} (signed integer PK, default) and {@code "keyword"}
+     * (Utf8 PK) are recognised; unknown values fall back to {@code "long"}
+     * to keep pre-#24 indices readable. The setting has no meaning when
+     * {@link #PRIMARY_KEY_FIELD_SETTING} is empty (the table has no PK).
+     */
+    public static final Setting<String> PRIMARY_KEY_TYPE_SETTING = Setting.simpleString(
+        LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING,
+        "long",
+        LancePlugin::validatePrimaryKeyType,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
     public static final Setting<Long> VERSION_SETTING = Setting.longSetting(
         LanceEngineFactory.VERSION_SETTING,
         -1L,
@@ -229,6 +244,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         return List.of(
             TABLE_SETTING,
             PRIMARY_KEY_FIELD_SETTING,
+            PRIMARY_KEY_TYPE_SETTING,
             VERSION_SETTING,
             UNCOVERED_FRAGMENT_POLICY_SETTING,
             NAMESPACE_POLL_CADENCE_SETTING,
@@ -245,6 +261,21 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     private static void validateUncoveredFragmentPolicy(String value) {
         if (!"wait".equals(value) && !"immediate".equals(value)) {
             throw new IllegalArgumentException("index.lance.uncovered_fragment_policy must be 'wait' or 'immediate', got '" + value + "'");
+        }
+    }
+
+    private static void validatePrimaryKeyType(String value) {
+        // Empty is accepted so the setting can be omitted on indices that
+        // do not declare a primary key (the runtime path treats the PK
+        // field name as the source of truth for "PK present"). Otherwise
+        // restrict to the two enum-mapped forms so a typo like "keywords"
+        // fails at CreateIndex time rather than silently falling back to
+        // long.
+        if (value == null || value.isEmpty()) {
+            return;
+        }
+        if (!"long".equals(value) && !"keyword".equals(value) && !"none".equals(value)) {
+            throw new IllegalArgumentException("index.lance.primary_key_type must be 'long' or 'keyword', got '" + value + "'");
         }
     }
 

@@ -1364,6 +1364,109 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testStringPrimaryKeyEchoesInHitsAndResolvesInGet() throws Exception {
+        // Regression for #24: a Utf8 primary key column used to be read
+        // through readAsLong (returning 0 for every row) and looked up
+        // through Long.parseLong (which either 500'd Lance with "Received
+        // literal Int64(0) and could not convert to literal of type 'Utf8'"
+        // or short-circuited to 404 for non-numeric ids). Now the reader
+        // holds string PK values in a parallel array, _search emits them
+        // as _id verbatim, and GET builds a SQL-quoted filter so the
+        // Lance scan finds the row.
+        String suffix = "strpk-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeStringPkTable(scratchDir, tableName, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(
+                "attach on Utf8 PK table failed: " + readAll(attach),
+                RestStatus.OK.getStatus(),
+                attach.getStatusLine().getStatusCode()
+            );
+
+            // Derivation must surface the Utf8 PK column as the
+            // declared primary_key_field, and the new type setting must
+            // carry the string form so the engine picks the KEYWORD
+            // lookup path on reopen.
+            Response settings = client().performRequest(new Request("GET", "/" + indexName + "/_settings"));
+            String settingsBody = readAll(settings);
+            assertTrue("expected primary_key_field: key, saw: " + settingsBody, settingsBody.contains("\"primary_key_field\":\"key\""));
+            assertTrue(
+                "expected primary_key_type: keyword, saw: " + settingsBody,
+                settingsBody.contains("\"primary_key_type\":\"keyword\"")
+            );
+
+            // _search must return the Utf8 PK values as _id verbatim.
+            // Old behaviour returned _id: "0" for every row.
+            String searchBody = readAll(postJson("/" + indexName + "/_search", "{\"size\":4}"));
+            assertEquals(4, extractIntPath(searchBody, "hits", "total", "value"));
+            java.util.Set<String> ids = new java.util.HashSet<>();
+            try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, searchBody)) {
+                java.util.Map<String, Object> map = parser.map();
+                @SuppressWarnings("unchecked")
+                java.util.List<Object> hits = (java.util.List<Object>) ((java.util.Map<String, Object>) map.get("hits")).get("hits");
+                for (Object hitObj : hits) {
+                    @SuppressWarnings("unchecked")
+                    java.util.Map<String, Object> hit = (java.util.Map<String, Object>) hitObj;
+                    ids.add((String) hit.get("_id"));
+                }
+            }
+            assertEquals(
+                "expected 4 alpha-N ids, saw: " + ids + " (body=" + searchBody + ")",
+                java.util.Set.of("alpha-0", "alpha-1", "alpha-2", "alpha-3"),
+                ids
+            );
+
+            // GET by a known key resolves through the quoted Lance
+            // filter. Previously this either 500'd or 404'd.
+            Response getResponse = client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-2"));
+            assertEquals(
+                "expected 200 for GET on Utf8 PK, saw " + getResponse.getStatusLine().getStatusCode(),
+                200,
+                getResponse.getStatusLine().getStatusCode()
+            );
+            String getBody = readAll(getResponse);
+            assertTrue("expected found:true, saw: " + getBody, getBody.contains("\"found\":true"));
+            assertTrue("expected _id:alpha-2, saw: " + getBody, getBody.contains("\"_id\":\"alpha-2\""));
+            assertTrue("expected key:alpha-2 in _source, saw: " + getBody, getBody.contains("\"key\":\"alpha-2\""));
+            assertTrue("expected label:row-2 in _source, saw: " + getBody, getBody.contains("\"label\":\"row-2\""));
+
+            // Unknown key must return 404 (not 500). This exercises the
+            // negative branch of the SQL-quoted filter.
+            ResponseException notFound = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-999"))
+            );
+            assertEquals(
+                "expected 404 for missing Utf8 PK, saw " + notFound.getResponse().getStatusLine().getStatusCode(),
+                404,
+                notFound.getResponse().getStatusLine().getStatusCode()
+            );
+
+            // Single quote in the id must not break the filter or open
+            // an injection path. `''` is the SQL escape for a literal
+            // quote inside a quoted string; the escape puts an
+            // unmatched-in-the-data id past the filter, so Lance
+            // returns no rows and the engine reports 404.
+            ResponseException quoted = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/al'pha"))
+            );
+            assertEquals(
+                "expected 404 for quoted Utf8 id, saw " + quoted.getResponse().getStatusLine().getStatusCode(),
+                404,
+                quoted.getResponse().getStatusLine().getStatusCode()
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testAttachAndKnn() throws Exception {
         // Row i sits at coordinate (i, 0, 0, ...) so the nearest neighbour
         // of (2.4, 0, ...) is row 2 followed by row 3. Vector index build is

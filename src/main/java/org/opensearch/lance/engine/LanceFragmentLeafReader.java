@@ -105,9 +105,29 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     private final String fieldName;
+    /**
+     * Arrow type family of the declared primary key. Drives {@code _id}
+     * materialisation: {@link org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType#LONG}
+     * reads from {@link #values}, {@link org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType#KEYWORD}
+     * reads from {@link #pkStrings}, and
+     * {@link org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType#NONE}
+     * falls back to a synthesised {@code "<fragment>-<offset>"}. Set to
+     * {@code NONE} whenever {@link #fieldName} is empty regardless of what
+     * the caller passed in.
+     */
+    private final org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType;
     private final int maxDoc;
     private final int numDocs;
     private final long[] values;
+    /**
+     * Per-doc string primary key values, populated only when
+     * {@link #pkType} is {@code KEYWORD}. {@code null} entries fall back to
+     * the synthesised {@code "<fragment>-<offset>"} form in
+     * {@link #materialiseStoredFields}; that keeps rows with a null PK
+     * value from collapsing to the same {@code _id} while still returning
+     * a stable, unique identifier per row.
+     */
+    private final String[] pkStrings;
     private final Bits liveDocs;
     private final FieldInfos fieldInfos;
     private final Dataset dataset;
@@ -157,12 +177,31 @@ public final class LanceFragmentLeafReader extends LeafReader {
     // bridge, which fires the listeners registered by the OpenSearch caches.
     private final DirectoryReader cacheLifetimeBridge;
 
-    public LanceFragmentLeafReader(Dataset dataset, int fragmentId, long physicalRows, String intField) throws IOException {
+    public LanceFragmentLeafReader(
+        Dataset dataset,
+        int fragmentId,
+        long physicalRows,
+        String intField,
+        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType
+    ) throws IOException {
         this.dataset = dataset;
         this.fragmentId = fragmentId;
         this.fieldName = intField;
+        // Empty field name overrides pkType regardless of what the caller
+        // passed in. The engine performs the same override at setting-read
+        // time, but the reader is also invoked from
+        // LanceDirectoryReader.openForFragments where the caller may pass
+        // a mismatched pair; canonicalising here keeps every accessor
+        // agreeing on "no PK" without needing the caller to zip them.
+        this.pkType = intField.isEmpty() ? org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.NONE : pkType;
         this.maxDoc = (int) physicalRows;
         this.values = new long[maxDoc];
+        // pkStrings is a separate per-doc array so LONG PKs do not pay
+        // for a parallel object array they never read from. Allocated
+        // eagerly only for KEYWORD PKs.
+        this.pkStrings = this.pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.KEYWORD
+            ? new String[maxDoc]
+            : null;
 
         // Schema pass: classify every column we might surface, resolve FTS
         // presence for Utf8 columns via one describeIndices call each. This
@@ -187,10 +226,17 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
         // Row-address scan: cheap even on large fragments because we only ask
         // Lance for _rowaddr plus (optionally) the primary key column. This
-        // establishes liveDocs, numDocs, and the values[] used to synthesise
-        // _id from the primary key. Every other scalar column stays on disk
-        // until the first accessor touches it.
-        boolean loadPk = !intField.isEmpty() && columnKind.get(intField) == ColumnKind.NUMERIC;
+        // establishes liveDocs, numDocs, and the values[] / pkStrings[] used
+        // to synthesise _id from the primary key. Every other scalar column
+        // stays on disk until the first accessor touches it.
+        boolean loadNumericPk = this.pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.LONG
+            && columnKind.get(intField) == ColumnKind.NUMERIC;
+        // KEYWORD PK sits on a Utf8 column that always classifies as
+        // TEXT_FTS or TEXT_KEYWORD by columnKind; either way the row-scan
+        // pulls it as a VarCharVector, so the column classification does
+        // not constrain the load here the way it does for numeric PKs.
+        boolean loadStringPk = this.pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.KEYWORD;
+        boolean loadPk = loadNumericPk || loadStringPk;
         List<String> pkScanColumns = loadPk ? Collections.singletonList(intField) : Collections.emptyList();
         FixedBitSet live = new FixedBitSet(maxDoc);
         int liveCount = 0;
@@ -207,8 +253,20 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
                     live.set(offset);
                     liveCount++;
-                    if (pkVector != null && !pkVector.isNull(i)) {
+                    if (pkVector == null || pkVector.isNull(i)) {
+                        continue;
+                    }
+                    if (loadNumericPk) {
                         values[offset] = readAsLong(pkVector, i);
+                    } else {
+                        // Utf8 columns come back as VarCharVector regardless
+                        // of whether describeIndices reported an FTS index.
+                        // Passing raw bytes through Java's default charset
+                        // (UTF-8) reproduces the operator's original string
+                        // for _id and matches the encoding the SQL filter
+                        // in LanceReadOnlyEngine.get uses.
+                        org.apache.arrow.vector.VarCharVector vc = (org.apache.arrow.vector.VarCharVector) pkVector;
+                        pkStrings[offset] = new String(vc.get(i), java.nio.charset.StandardCharsets.UTF_8);
                     }
                 }
             }
@@ -907,15 +965,33 @@ public final class LanceFragmentLeafReader extends LeafReader {
     void materialiseStoredFields(int docID, StoredFieldVisitor visitor) throws IOException {
         FieldInfo idInfo = storedOnly("_id", 1);
         if (visitor.needsField(idInfo) == StoredFieldVisitor.Status.YES) {
-            // When the Lance table declares a primary key column, values[] holds
-            // its per-row content and _id echoes that. When it doesn't, values[]
-            // is all zeros and every row would collapse to the same _id "0",
-            // silently breaking sort-by-_id and _mget dedup. Fall back to a
-            // synthesised address `<fragment>-<offset>` so at least the _id is
-            // unique inside the shard. GET /_doc/{id} still returns 404 for
-            // these tables (see LanceReadOnlyEngine.get); this synthesis is
-            // strictly for _search response fidelity.
-            String idString = fieldName.isEmpty() ? (fragmentId + "-" + docID) : Long.toString(values[docID]);
+            // Materialise _id from whichever column the declared primary key
+            // lives on, or synthesise "<fragment>-<offset>" when no PK is
+            // declared. Without this fallback every row on a PK-less table
+            // would collapse to the same _id, silently breaking sort-by-_id
+            // and _mget dedup. GET /_doc/{id} still returns 404 for PK-less
+            // tables (see LanceReadOnlyEngine.get); the fallback is strictly
+            // for _search response fidelity.
+            //
+            // KEYWORD PKs read from pkStrings, which the constructor
+            // populated from the Utf8 column. A null slot (nullable column,
+            // Arrow null in that row) also falls through to the synthesised
+            // form so the row still gets a unique id rather than repeating
+            // an empty string.
+            String idString;
+            switch (pkType) {
+                case KEYWORD:
+                    String stringPk = pkStrings != null ? pkStrings[docID] : null;
+                    idString = stringPk != null ? stringPk : (fragmentId + "-" + docID);
+                    break;
+                case LONG:
+                    idString = Long.toString(values[docID]);
+                    break;
+                case NONE:
+                default:
+                    idString = fragmentId + "-" + docID;
+                    break;
+            }
             org.apache.lucene.util.BytesRef encoded = org.opensearch.index.mapper.Uid.encodeId(idString);
             byte[] bytes = new byte[encoded.length];
             System.arraycopy(encoded.bytes, encoded.offset, bytes, 0, encoded.length);
