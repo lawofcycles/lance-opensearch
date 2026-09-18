@@ -370,17 +370,14 @@ public class LancePluginIT extends OpenSearchRestTestCase {
     }
 
     public void testFragmentDispatchModeAnswersFilterQueries() throws Exception {
-        // Milestone 5-A of the shard-free dispatch prototype: setting
-        // lance.dispatch.mode = fragment must route match_all *and*
-        // filter queries (term / terms / exists / range / bool) on
-        // Lance-backed indices through the plugin's own executor.
-        // The count and the returned hits both come from Lance via
-        // LanceKnnFilterTranslator, so hits.total.value stays in sync
-        // with the number of matching hits regardless of shard state.
-        // Query shapes outside the translator's whitelist (match on a
-        // text field, geo, script, aggregations, sort, pagination)
-        // still route through the standard shard fan-out; those
-        // shapes are for later milestones.
+        // Fragment-path baseline: match_all + filter queries
+        // (term / terms / exists / range / bool) on Lance-backed
+        // indices flow through the plugin's own executor. The count
+        // and hits both come from Lance via LanceKnnFilterTranslator
+        // (metadata-only Dataset.countRows for the count, and
+        // ScanOptions.filter for the hits' Lance scan), so
+        // hits.total.value stays in sync with the number of matching
+        // hits regardless of shard state.
         String suffix = "dispatch-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -391,127 +388,78 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // Baseline: shard mode returns the six rows Lance table
-            // factory wrote. If this fails the standard path is broken
-            // independently of the intercept.
-            int baselineHits = extractIntPath(
-                readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}")),
+            String matchAllBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
+            int matchAllHits = extractIntPath(matchAllBody, "hits", "total", "value");
+            assertEquals("fragment path match_all must return the true row count", 6, matchAllHits);
+            // Default size is 10 so a 6-row table returns all six
+            // hits. Each hit carries a synthesised _id in the form
+            // "<fragmentId>-<offset>" and a _source rendered from
+            // the Arrow batch. The LanceTableFactory fixture puts
+            // "hello lance " at even offsets and "quick brown fox"
+            // at odd offsets in the body column; both must show
+            // up in the response.
+            assertTrue(
+                "fragment path match_all must populate the hits array: " + matchAllBody,
+                matchAllBody.contains("\"_id\":\"0-0\"")
+            );
+            assertTrue(
+                "fragment path match_all must render _source with the body column: " + matchAllBody,
+                matchAllBody.contains("hello lance")
+            );
+            assertTrue(
+                "fragment path match_all must render _source with the id column: " + matchAllBody,
+                matchAllBody.contains("\"id\":0")
+            );
+
+            // A size=2 request returns only two hits but keeps the
+            // total row count at six.
+            String sizeBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}},\"size\":2}"));
+            assertEquals("size clause must not affect total", 6, extractIntPath(sizeBody, "hits", "total", "value"));
+            int returnedHits = countOccurrences(sizeBody, "\"_id\":");
+            assertEquals("size=2 must return exactly two hits: " + sizeBody, 2, returnedHits);
+
+            // Term queries on numeric columns are answered by the
+            // fragment executor. The count and hit metadata both come
+            // from the plugin's own path via
+            // LanceKnnFilterTranslator -> Dataset.countRows(sql) +
+            // ScanOptions.filter(sql).
+            String termBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"term\":{\"id\":3}}}"));
+            assertEquals("fragment path term must match exactly one row", 1, extractIntPath(termBody, "hits", "total", "value"));
+            assertTrue("fragment path term must return the id=3 hit: " + termBody, termBody.contains("\"_id\":\"0-3\""));
+            assertTrue("fragment path term must render the matching row: " + termBody, termBody.contains("\"id\":3"));
+
+            // A numeric range covers three rows (id in {2, 3, 4}).
+            String rangeBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"id\":{\"gte\":2,\"lt\":5}}}}"));
+            assertEquals("fragment path range must count matching rows", 3, extractIntPath(rangeBody, "hits", "total", "value"));
+            assertTrue("fragment path range must include id=2: " + rangeBody, rangeBody.contains("\"id\":2"));
+            assertTrue("fragment path range must include id=4: " + rangeBody, rangeBody.contains("\"id\":4"));
+
+            // Bool AND of two filters proves nested translation works
+            // end-to-end. id >= 2 intersects id = 3, so the response
+            // must count and return exactly the id=3 row.
+            String boolBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"bool\":{\"filter\":[{\"range\":{\"id\":{\"gte\":2}}},{\"term\":{\"id\":3}}]}}}"
+                )
+            );
+            assertEquals("fragment path bool must count the intersection", 1, extractIntPath(boolBody, "hits", "total", "value"));
+            assertTrue("fragment path bool must return the id=3 hit: " + boolBody, boolBody.contains("\"_id\":\"0-3\""));
+
+            // Full-text match queries also flow through the fragment
+            // executor since Stage 3 widened the dispatch filter. The
+            // per-node handler translates the QueryBuilder via
+            // QueryShardContext.toQuery, gets a LanceFtsQuery from the
+            // lance_text field mapper, and drives IndexSearcher.search
+            // against the per-fragment reader.
+            int matchHits = extractIntPath(
+                readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}}}")),
                 "hits",
                 "total",
                 "value"
             );
-            assertEquals("baseline shard mode should surface the six rows", 6, baselineHits);
-
-            // Flip the cluster to fragment mode and confirm match_all
-            // now goes through the plugin's own executor. The executor
-            // reads the row count directly from the Lance dataset, so
-            // hits.total.value must equal the row count regardless of
-            // shard state. Milestone 3 also populates the hits array
-            // with synthesised {@code _id}s sourced from Lance's
-            // _rowaddr, so the response now looks like a standard
-            // OpenSearch search response instead of an empty-hits
-            // stub.
-            updateClusterSetting("lance.dispatch.mode", "fragment");
-            try {
-                String matchAllBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
-                int matchAllHits = extractIntPath(matchAllBody, "hits", "total", "value");
-                assertEquals("fragment mode match_all must return the true row count", 6, matchAllHits);
-                // Default size is 10 so a 6-row table returns all six
-                // hits. Each hit carries a synthesised _id in the form
-                // "<fragmentId>-<offset>" and a _source rendered from
-                // the Arrow batch. The LanceTableFactory fixture puts
-                // "hello lance " at even offsets and "quick brown fox"
-                // at odd offsets in the body column; both must show
-                // up in the response.
-                assertTrue(
-                    "fragment mode match_all must populate the hits array: " + matchAllBody,
-                    matchAllBody.contains("\"_id\":\"0-0\"")
-                );
-                assertTrue(
-                    "fragment mode match_all must render _source with the body column: " + matchAllBody,
-                    matchAllBody.contains("hello lance")
-                );
-                assertTrue(
-                    "fragment mode match_all must render _source with the id column: " + matchAllBody,
-                    matchAllBody.contains("\"id\":0")
-                );
-
-                // A size=2 request returns only two hits but keeps the
-                // total row count at six.
-                String sizeBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}},\"size\":2}"));
-                assertEquals("size clause must not affect total", 6, extractIntPath(sizeBody, "hits", "total", "value"));
-                int returnedHits = countOccurrences(sizeBody, "\"_id\":");
-                assertEquals("size=2 must return exactly two hits: " + sizeBody, 2, returnedHits);
-
-                // Milestone 5-A: term queries on numeric columns are
-                // now answered by the fragment executor itself, not
-                // the shard fall-through. The count and hit metadata
-                // both come from the plugin's own path via
-                // LanceKnnFilterTranslator -> Dataset.countRows(sql) +
-                // ScanOptions.filter(sql).
-                String termBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"term\":{\"id\":3}}}"));
-                assertEquals("fragment mode term must match exactly one row", 1, extractIntPath(termBody, "hits", "total", "value"));
-                // The synthesised _id sourced from _rowaddr is the
-                // signal that the fragment executor answered the
-                // request; shard mode would emit the same value but
-                // via a different code path. What matters is that we
-                // see the offset of the matching row (id = 3 lives at
-                // offset 3 in fragment 0) and its _source column.
-                assertTrue("fragment mode term must return the id=3 hit: " + termBody, termBody.contains("\"_id\":\"0-3\""));
-                assertTrue("fragment mode term must render the matching row: " + termBody, termBody.contains("\"id\":3"));
-
-                // A numeric range covers three rows (id in {2, 3, 4}).
-                // Total must be 3 and the returned hits must include
-                // id 2 and id 4 (id 3 is proven separately above).
-                String rangeBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"id\":{\"gte\":2,\"lt\":5}}}}"));
-                assertEquals("fragment mode range must count matching rows", 3, extractIntPath(rangeBody, "hits", "total", "value"));
-                assertTrue("fragment mode range must include id=2: " + rangeBody, rangeBody.contains("\"id\":2"));
-                assertTrue("fragment mode range must include id=4: " + rangeBody, rangeBody.contains("\"id\":4"));
-
-                // Bool AND of two filters proves nested translation
-                // works end-to-end. id >= 2 intersects id = 3, so the
-                // response must count and return exactly the id=3 row.
-                String boolBody = readAll(
-                    postJson(
-                        "/" + indexName + "/_search",
-                        "{\"query\":{\"bool\":{\"filter\":[{\"range\":{\"id\":{\"gte\":2}}},{\"term\":{\"id\":3}}]}}}"
-                    )
-                );
-                assertEquals("fragment mode bool must count the intersection", 1, extractIntPath(boolBody, "hits", "total", "value"));
-                assertTrue("fragment mode bool must return the id=3 hit: " + boolBody, boolBody.contains("\"_id\":\"0-3\""));
-
-                // Full-text match queries now flow through the
-                // fragment executor since Stage 3 widened the
-                // dispatch filter. The per-node handler translates
-                // the QueryBuilder via QueryShardContext.toQuery,
-                // gets a LanceFtsQuery from the lance_text field
-                // mapper, and drives IndexSearcher.search against
-                // the per-fragment reader. Baseline hit count still
-                // comes back positive from the same table.
-                int matchHits = extractIntPath(
-                    readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}}}")),
-                    "hits",
-                    "total",
-                    "value"
-                );
-                assertTrue("match query must return hits on fragment path (got " + matchHits + ")", matchHits > 0);
-            } finally {
-                updateClusterSetting("lance.dispatch.mode", "shard");
-            }
-
-            // Post-recovery: reverting to shard mode brings back real
-            // Lance hits without another restart.
-            int recoveredHits = extractIntPath(
-                readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}")),
-                "hits",
-                "total",
-                "value"
-            );
-            assertEquals("recovered shard mode should surface the six rows again", 6, recoveredHits);
+            assertTrue("match query must return hits on fragment path (got " + matchHits + ")", matchHits > 0);
         } finally {
-            try {
-                updateClusterSetting("lance.dispatch.mode", "shard");
-            } catch (Exception ignored) {}
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
@@ -539,89 +487,81 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            updateClusterSetting("lance.dispatch.mode", "fragment");
-            try {
-                // The fixture writes six rows with id = 0..5, so the
-                // canonical aggregates are: count = 6, sum = 15,
-                // avg = 2.5, min = 0, max = 5. size=0 is standard for
-                // aggregation-only requests and avoids paying the
-                // hits scan on the same request.
-                String body = readAll(
-                    postJson(
-                        "/" + indexName + "/_search",
-                        "{\"size\":0,\"aggs\":{"
-                            + "\"c\":{\"value_count\":{\"field\":\"id\"}},"
-                            + "\"s\":{\"sum\":{\"field\":\"id\"}},"
-                            + "\"a\":{\"avg\":{\"field\":\"id\"}},"
-                            + "\"m\":{\"min\":{\"field\":\"id\"}},"
-                            + "\"M\":{\"max\":{\"field\":\"id\"}}"
-                            + "}}"
-                    )
-                );
-                assertEquals(
-                    "aggregation must count matching rows via Dataset.countRows",
-                    6,
-                    extractIntPath(body, "hits", "total", "value")
-                );
-                assertEquals("value_count on id must equal row count", 6, extractIntPath(body, "aggregations", "c", "value"));
-                assertEquals("sum(id) 0..5 == 15", 15.0d, extractDoublePath(body, "aggregations", "s", "value"), 0.0d);
-                assertEquals("avg(id) 0..5 == 2.5", 2.5d, extractDoublePath(body, "aggregations", "a", "value"), 0.0d);
-                assertEquals("min(id) == 0", 0.0d, extractDoublePath(body, "aggregations", "m", "value"), 0.0d);
-                assertEquals("max(id) == 5", 5.0d, extractDoublePath(body, "aggregations", "M", "value"), 0.0d);
+            // The fixture writes six rows with id = 0..5, so the
+            // canonical aggregates are: count = 6, sum = 15,
+            // avg = 2.5, min = 0, max = 5. size=0 is standard for
+            // aggregation-only requests and avoids paying the
+            // hits scan on the same request.
+            String body = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"aggs\":{"
+                        + "\"c\":{\"value_count\":{\"field\":\"id\"}},"
+                        + "\"s\":{\"sum\":{\"field\":\"id\"}},"
+                        + "\"a\":{\"avg\":{\"field\":\"id\"}},"
+                        + "\"m\":{\"min\":{\"field\":\"id\"}},"
+                        + "\"M\":{\"max\":{\"field\":\"id\"}}"
+                        + "}}"
+                )
+            );
+            assertEquals(
+                "aggregation must count matching rows via Dataset.countRows",
+                6,
+                extractIntPath(body, "hits", "total", "value")
+            );
+            assertEquals("value_count on id must equal row count", 6, extractIntPath(body, "aggregations", "c", "value"));
+            assertEquals("sum(id) 0..5 == 15", 15.0d, extractDoublePath(body, "aggregations", "s", "value"), 0.0d);
+            assertEquals("avg(id) 0..5 == 2.5", 2.5d, extractDoublePath(body, "aggregations", "a", "value"), 0.0d);
+            assertEquals("min(id) == 0", 0.0d, extractDoublePath(body, "aggregations", "m", "value"), 0.0d);
+            assertEquals("max(id) == 5", 5.0d, extractDoublePath(body, "aggregations", "M", "value"), 0.0d);
 
-                // Filter query pushes the same SQL predicate into
-                // Dataset.countRows and ScanOptions.filter, so
-                // sum(id where id >= 2) must equal 2+3+4+5 = 14 with
-                // total = 4.
-                String filteredBody = readAll(
-                    postJson(
-                        "/" + indexName + "/_search",
-                        "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":2}}}," + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
-                    )
-                );
-                assertEquals("filtered aggregation must count filtered rows", 4, extractIntPath(filteredBody, "hits", "total", "value"));
-                assertEquals("sum(id) with id>=2 == 14", 14.0d, extractDoublePath(filteredBody, "aggregations", "s", "value"), 0.0d);
+            // Filter query pushes the same SQL predicate into
+            // Dataset.countRows and ScanOptions.filter, so
+            // sum(id where id >= 2) must equal 2+3+4+5 = 14 with
+            // total = 4.
+            String filteredBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":2}}}," + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
+                )
+            );
+            assertEquals("filtered aggregation must count filtered rows", 4, extractIntPath(filteredBody, "hits", "total", "value"));
+            assertEquals("sum(id) with id>=2 == 14", 14.0d, extractDoublePath(filteredBody, "aggregations", "s", "value"), 0.0d);
 
-                // Hits + aggregation in the same request must both
-                // come from the fragment executor: hits carry the
-                // synthesised _rowaddr id, aggregations carry the
-                // computed value.
-                String hitsPlusAggs = readAll(
-                    postJson(
-                        "/" + indexName + "/_search",
-                        "{\"size\":2,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
-                    )
-                );
-                assertEquals("total unchanged when hits also requested", 6, extractIntPath(hitsPlusAggs, "hits", "total", "value"));
-                assertTrue("hits section must carry the synthesised _id: " + hitsPlusAggs, hitsPlusAggs.contains("\"_id\":\"0-0\""));
-                assertEquals(
-                    "sum unchanged when hits also requested",
-                    15.0d,
-                    extractDoublePath(hitsPlusAggs, "aggregations", "s", "value"),
-                    0.0d
-                );
+            // Hits + aggregation in the same request must both
+            // come from the fragment executor: hits carry the
+            // synthesised _rowaddr id, aggregations carry the
+            // computed value.
+            String hitsPlusAggs = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":2,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
+                )
+            );
+            assertEquals("total unchanged when hits also requested", 6, extractIntPath(hitsPlusAggs, "hits", "total", "value"));
+            assertTrue("hits section must carry the synthesised _id: " + hitsPlusAggs, hitsPlusAggs.contains("\"_id\":\"0-0\""));
+            assertEquals(
+                "sum unchanged when hits also requested",
+                15.0d,
+                extractDoublePath(hitsPlusAggs, "aggregations", "s", "value"),
+                0.0d
+            );
 
-                // Direction 1 Stage 2: terms bucket aggregation
-                // now runs on the fragment executor via the stock
-                // TermsAggregator against per-fragment
-                // LanceFragmentLeafReaders. The response must carry
-                // one bucket per distinct id value (6 rows, all
-                // unique ids 0..5 = 6 buckets, doc_count=1 each).
-                String bucketBody = readAll(
-                    postJson("/" + indexName + "/_search", "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":10}}}}")
-                );
-                assertTrue(
-                    "terms aggregation via fragment path carries buckets: " + bucketBody,
-                    bucketBody.contains("\"buckets\":")
-                );
-                assertEquals(6, extractIntPath(bucketBody, "hits", "total", "value"));
-            } finally {
-                updateClusterSetting("lance.dispatch.mode", "shard");
-            }
+            // Direction 1 Stage 2: terms bucket aggregation
+            // now runs on the fragment executor via the stock
+            // TermsAggregator against per-fragment
+            // LanceFragmentLeafReaders. The response must carry
+            // one bucket per distinct id value (6 rows, all
+            // unique ids 0..5 = 6 buckets, doc_count=1 each).
+            String bucketBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":10}}}}")
+            );
+            assertTrue(
+                "terms aggregation via fragment path carries buckets: " + bucketBody,
+                bucketBody.contains("\"buckets\":")
+            );
+            assertEquals(6, extractIntPath(bucketBody, "hits", "total", "value"));
         } finally {
-            try {
-                updateClusterSetting("lance.dispatch.mode", "shard");
-            } catch (Exception ignored) {}
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
@@ -646,58 +586,53 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            updateClusterSetting("lance.dispatch.mode", "fragment");
-            try {
-                // Match on lance_text (body column contains "hello lance"
-                // for even rows, "hello world" for odd rows). Fragment
-                // path drives LanceFtsQuery via IndexSearcher.search and
-                // returns 3 hits (even rows) with real BM25 scores.
-                String matchBody = readAll(
-                    postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}}}")
-                );
-                assertEquals(3, extractIntPath(matchBody, "hits", "total", "value"));
-                assertTrue("match hits must carry a positive Lucene score: " + matchBody, matchBody.contains("\"_score\":"));
-                assertFalse("Stage 3 must not report the hard-coded 1.0 score anymore: " + matchBody, matchBody.contains("\"_score\":1.0"));
+            // Match on lance_text (body column contains "hello lance"
+            // for even rows, "hello world" for odd rows). Fragment
+            // path drives LanceFtsQuery via IndexSearcher.search and
+            // returns 3 hits (even rows) with real BM25 scores.
+            String matchBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}}}")
+            );
+            assertEquals(3, extractIntPath(matchBody, "hits", "total", "value"));
+            assertTrue("match hits must carry a positive Lucene score: " + matchBody, matchBody.contains("\"_score\":"));
+            assertFalse("Stage 3 must not report the hard-coded 1.0 score anymore: " + matchBody, matchBody.contains("\"_score\":1.0"));
 
-                // knn on lance_knn. Table factory writes 8-dim
-                // vectors where row i has embedding[0]=i and all
-                // other coordinates zero (see LanceTableFactory
-                // VECTOR_DIM), so a query vector concentrated on the
-                // first axis ranks id=5 highest.
-                String queryVector = "[0.5,0.0,0.0,0.0,0.0,0.0,0.0,0.0]";
-                String knnBody = readAll(
-                    postJson(
-                        "/" + indexName + "/_search",
-                        "{\"size\":3,\"query\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":" + queryVector + ",\"k\":3}}}"
-                    )
-                );
-                assertEquals(3, extractIntPath(knnBody, "hits", "total", "value"));
-                // Cosine similarity produces a positive score for the
-                // nearest neighbour.
-                assertTrue("knn top hit must have a positive score: " + knnBody, knnBody.contains("\"_score\":"));
+            // knn on lance_knn. Table factory writes 8-dim
+            // vectors where row i has embedding[0]=i and all
+            // other coordinates zero (see LanceTableFactory
+            // VECTOR_DIM), so a query vector concentrated on the
+            // first axis ranks id=5 highest.
+            String queryVector = "[0.5,0.0,0.0,0.0,0.0,0.0,0.0,0.0]";
+            String knnBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":3,\"query\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":" + queryVector + ",\"k\":3}}}"
+                )
+            );
+            assertEquals(3, extractIntPath(knnBody, "hits", "total", "value"));
+            // Cosine similarity produces a positive score for the
+            // nearest neighbour.
+            assertTrue("knn top hit must have a positive score: " + knnBody, knnBody.contains("\"_score\":"));
 
-                // Sort by id descending. 6 rows -> ids 0..5, descending
-                // means the first hit is id=5, then 4, 3.
-                String sortBody = readAll(
-                    postJson(
-                        "/" + indexName + "/_search",
-                        "{\"size\":3,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}]}"
-                    )
-                );
-                assertEquals(6, extractIntPath(sortBody, "hits", "total", "value"));
-                // Every hit should carry sort values under the "sort" field.
-                assertTrue("sort hits must carry sort values: " + sortBody, sortBody.contains("\"sort\":[5]"));
-                assertTrue("second sort hit must have sort value [4]: " + sortBody, sortBody.contains("\"sort\":[4]"));
-                assertTrue("third sort hit must have sort value [3]: " + sortBody, sortBody.contains("\"sort\":[3]"));
-                // Top sorted hit is the row with id=5 (Lance offset 5
-                // within fragment 0 because there's no declared PK).
-                int firstIdx = sortBody.indexOf("\"_id\":");
-                assertTrue("expected an _id in sorted response: " + sortBody, firstIdx >= 0);
-                String firstIdSlice = sortBody.substring(firstIdx, Math.min(sortBody.length(), firstIdx + 20));
-                assertTrue("first sorted hit must be _id = \"0-5\": " + firstIdSlice, firstIdSlice.contains("\"0-5\""));
-            } finally {
-                updateClusterSetting("lance.dispatch.mode", "shard");
-            }
+            // Sort by id descending. 6 rows -> ids 0..5, descending
+            // means the first hit is id=5, then 4, 3.
+            String sortBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":3,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}]}"
+                )
+            );
+            assertEquals(6, extractIntPath(sortBody, "hits", "total", "value"));
+            // Every hit should carry sort values under the "sort" field.
+            assertTrue("sort hits must carry sort values: " + sortBody, sortBody.contains("\"sort\":[5]"));
+            assertTrue("second sort hit must have sort value [4]: " + sortBody, sortBody.contains("\"sort\":[4]"));
+            assertTrue("third sort hit must have sort value [3]: " + sortBody, sortBody.contains("\"sort\":[3]"));
+            // Top sorted hit is the row with id=5 (Lance offset 5
+            // within fragment 0 because there's no declared PK).
+            int firstIdx = sortBody.indexOf("\"_id\":");
+            assertTrue("expected an _id in sorted response: " + sortBody, firstIdx >= 0);
+            String firstIdSlice = sortBody.substring(firstIdx, Math.min(sortBody.length(), firstIdx + 20));
+            assertTrue("first sorted hit must be _id = \"0-5\": " + firstIdSlice, firstIdSlice.contains("\"0-5\""));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));

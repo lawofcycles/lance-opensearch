@@ -74,26 +74,21 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            updateClusterSetting("lance.dispatch.mode", "fragment");
-            try {
-                String body = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
-                assertEquals(6, extractIntPath(body, "hits", "total", "value"));
-                // Every hit is materialised from Lance regardless of
-                // which node scanned the fragment.
-                assertTrue("expected _rowaddr-derived hit ids: " + body, body.contains("\"_id\":\"0-0\""));
-                assertTrue("expected _source rendered from Arrow: " + body, body.contains("hello lance"));
+            String body = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
+            assertEquals(6, extractIntPath(body, "hits", "total", "value"));
+            // Every hit is materialised from Lance regardless of
+            // which node scanned the fragment.
+            assertTrue("expected _rowaddr-derived hit ids: " + body, body.contains("\"_id\":\"0-0\""));
+            assertTrue("expected _source rendered from Arrow: " + body, body.contains("hello lance"));
 
-                String sumBody = readAll(
-                    postJson(
-                        "/" + indexName + "/_search",
-                        "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
-                    )
-                );
-                assertEquals(6, extractIntPath(sumBody, "hits", "total", "value"));
-                assertEquals(15.0d, extractDoublePath(sumBody, "aggregations", "s", "value"), 0.0d);
-            } finally {
-                updateClusterSetting("lance.dispatch.mode", "shard");
-            }
+            String sumBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
+                )
+            );
+            assertEquals(6, extractIntPath(sumBody, "hits", "total", "value"));
+            assertEquals(15.0d, extractDoublePath(sumBody, "aggregations", "s", "value"), 0.0d);
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));

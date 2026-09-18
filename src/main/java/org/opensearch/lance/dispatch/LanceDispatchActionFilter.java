@@ -6,7 +6,6 @@
 package org.opensearch.lance.dispatch;
 
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -39,21 +38,18 @@ import org.opensearch.transport.client.Client;
 
 /**
  * ActionFilter that intercepts {@code indices:data/read/search} for
- * Lance-backed indexes when {@code lance.dispatch.mode} is set to
- * {@code fragment}, and hands the request off to the plugin's own
+ * Lance-backed indices and hands the request off to the plugin's own
  * shard-free coordinator instead of OpenSearch's standard shard
  * fan-out.
  *
- * <p>Milestone 5-C3 of the shard-free dispatch prototype. The
- * filter now owns three responsibilities:
+ * <p>The filter owns three responsibilities:
  * <ul>
- *   <li>Recognise whether the request is fragment-dispatchable by
- *       checking the target indexes ({@link #allLanceBacked}), the
- *       top-level query ({@link LanceKnnFilterTranslator}), the
- *       aggregations block ({@link LanceMetricAggregator#parseSupported}),
- *       and the presence of features the coordinator does not yet
- *       handle (sorts, from &gt; 0, search_after, highlighter,
- *       suggester, post_filter, or cross-index metrics).</li>
+ *   <li>Recognise whether the request is fragment-dispatchable
+ *       ({@link #allLanceBacked} plus {@link #isDispatchable} plus
+ *       {@link LanceAggregationSupport#isSupported}) — reject shapes
+ *       the fragment executor cannot yet answer (from &gt; 0,
+ *       search_after, highlighter, suggester, post_filter, or
+ *       cross-index metrics).</li>
  *   <li>Delegate the request to {@link LanceCoordinatorAction} via
  *       {@link Client#execute(org.opensearch.action.ActionType,
  *       org.opensearch.action.ActionRequest, ActionListener)}.
@@ -62,15 +58,17 @@ import org.opensearch.transport.client.Client;
  *       single-node clusters take the same path with a fan-out of
  *       one local hop.</li>
  *   <li>Fall through to the standard shard fan-out via
- *       {@code chain.proceed} for anything else (dispatch mode
- *       {@code shard}, non-Lance targets, unsupported query or
- *       aggregation shapes, or cross-index requests with metrics).</li>
+ *       {@code chain.proceed} for anything else (non-Lance targets,
+ *       unsupported query or aggregation shapes, cross-index
+ *       requests with metrics). The shard path still exists as a
+ *       safety net for shapes the fragment executor has not yet
+ *       taken over.</li>
  * </ul>
  *
  * <p>The heavy lifting — opening the Lance dataset, enumerating
  * fragments, grouping them by node, scanning, and merging partials
- * — moves to {@link TransportLanceCoordinatorAction} and
- * {@link TransportLanceFragmentQueryAction}. The filter is now
+ * — lives in {@link TransportLanceCoordinatorAction} and
+ * {@link TransportLanceFragmentQueryAction}. The filter is
  * effectively a routing switch.
  */
 public class LanceDispatchActionFilter implements ActionFilter {
@@ -84,40 +82,14 @@ public class LanceDispatchActionFilter implements ActionFilter {
     private final IndexNameExpressionResolver indexNameExpressionResolver;
     private final Client client;
 
-    /**
-     * Current dispatch mode. Held as {@link AtomicReference} so the
-     * cluster-settings update consumer can hot-swap the value without
-     * synchronising the {@link #apply} hot path.
-     */
-    private final AtomicReference<LanceDispatchMode> mode;
-
     public LanceDispatchActionFilter(
         ClusterService clusterService,
         IndexNameExpressionResolver indexNameExpressionResolver,
-        Client client,
-        LanceDispatchMode initialMode
+        Client client
     ) {
         this.clusterService = clusterService;
         this.indexNameExpressionResolver = indexNameExpressionResolver;
         this.client = client;
-        this.mode = new AtomicReference<>(initialMode);
-    }
-
-    /**
-     * Called from the cluster-settings listener installed by
-     * {@code LancePlugin.createComponents}. Only the raw string form
-     * arrives from settings, so we parse it here.
-     */
-    public void setMode(String rawValue) {
-        LanceDispatchMode next = LanceDispatchMode.parse(rawValue);
-        LanceDispatchMode previous = mode.getAndSet(next);
-        if (previous != next) {
-            LOGGER.info("lance.dispatch.mode changed [{} -> {}]", previous, next);
-        }
-    }
-
-    public LanceDispatchMode currentMode() {
-        return mode.get();
     }
 
     @Override
@@ -138,7 +110,7 @@ public class LanceDispatchActionFilter implements ActionFilter {
         ActionListener<Response> listener,
         ActionFilterChain<Request, Response> chain
     ) {
-        if (mode.get() != LanceDispatchMode.FRAGMENT || !SEARCH_ACTION_NAME.equals(action) || !(request instanceof SearchRequest)) {
+        if (!SEARCH_ACTION_NAME.equals(action) || !(request instanceof SearchRequest)) {
             chain.proceed(task, action, request, listener);
             return;
         }

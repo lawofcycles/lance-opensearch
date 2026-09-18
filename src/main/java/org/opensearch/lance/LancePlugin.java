@@ -26,7 +26,6 @@ import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.mapper.Mapper;
 import org.opensearch.indices.breaker.BreakerSettings;
 import org.opensearch.lance.dispatch.LanceDispatchActionFilter;
-import org.opensearch.lance.dispatch.LanceDispatchMode;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
 import org.opensearch.lance.mapper.LanceVectorFieldMapper;
@@ -187,39 +186,6 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.Dynamic
     );
 
-    /**
-     * Setting name / lifecycle for the plugin's shard-free dispatch
-     * mode. Values:
-     * <ul>
-     *   <li>{@code fragment} — default. Search requests whose top-level
-     *       query and aggregations sit inside the whitelist run through
-     *       the plugin's own coordinator, which fans out per-fragment
-     *       work directly to data nodes and merges partials without
-     *       going through the shard executor. Queries outside the
-     *       whitelist (bucket aggregations, sort, from &gt; 0,
-     *       highlighter, geo, script, etc.) transparently fall
-     *       through to the shard-based path via
-     *       {@code chain.proceed(...)}. Users see the shard-free
-     *       execution automatically for the shapes fragment mode
-     *       covers; nothing to configure.</li>
-     *   <li>{@code shard} — opts out entirely. Every request goes
-     *       through the standard shard executor regardless of query
-     *       shape. Kept for operators who need to compare behaviour
-     *       against the classic path or who suspect a fragment-mode
-     *       regression.</li>
-     * </ul>
-     *
-     * <p>Node scoped and dynamic so operators can toggle without a
-     * restart.
-     */
-    public static final Setting<String> LANCE_DISPATCH_MODE_SETTING = Setting.simpleString(
-        "lance.dispatch.mode",
-        "fragment",
-        LancePlugin::validateDispatchMode,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic
-    );
-
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -232,8 +198,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             STORAGE_OPTIONS_SETTING,
             NATIVE_MEMORY_LIMIT_SETTING,
             NATIVE_MEMORY_CB_ENABLED_SETTING,
-            NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING,
-            LANCE_DISPATCH_MODE_SETTING
+            NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING
         );
     }
 
@@ -250,13 +215,6 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // Setting.simpleString surfaces back to the operator as a
         // 400-style validation error.
         NativeMemoryLimit.parse(value, "lance.native_memory.limit");
-    }
-
-    private static void validateDispatchMode(String value) {
-        // LanceDispatchMode.parse throws IllegalArgumentException on
-        // malformed input, which Setting.simpleString surfaces back to
-        // the operator as a 400-style validation error.
-        LanceDispatchMode.parse(value);
     }
 
     @Override
@@ -372,13 +330,13 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         clusterService.getClusterSettings().addSettingsUpdateConsumer(NATIVE_MEMORY_CB_ENABLED_SETTING, LanceCircuitBreaker::setEnabled);
         clusterService.getClusterSettings().addSettingsUpdateConsumer(NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING, this::updatePollInterval);
 
-        // Register the shard-free dispatch ActionFilter. The filter is
-        // a no-op while lance.dispatch.mode is `shard` (default). Wire
-        // the settings listener before the filter is exposed through
-        // getActionFilters so dynamic updates take effect immediately.
-        LanceDispatchMode initialMode = LanceDispatchMode.parse(LANCE_DISPATCH_MODE_SETTING.get(environment.settings()));
-        this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client, initialMode);
-        clusterService.getClusterSettings().addSettingsUpdateConsumer(LANCE_DISPATCH_MODE_SETTING, dispatchActionFilter::setMode);
+        // Register the shard-free dispatch ActionFilter. It
+        // intercepts every _search request against Lance-backed
+        // indices, delegating to the plugin's own coordinator; the
+        // shard fan-out via ReadOnlyEngine only runs when the
+        // fragment executor cannot answer a shape yet (from > 0,
+        // search_after, highlighter, suggest, post_filter).
+        this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client);
 
         namespaceService = new LanceNamespaceService(client, clusterService, threadPool, cadence, builderMaxRows);
         return List.of(namespaceService);
