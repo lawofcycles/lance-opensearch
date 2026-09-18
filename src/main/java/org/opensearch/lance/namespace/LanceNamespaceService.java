@@ -99,6 +99,24 @@ public final class LanceNamespaceService {
     // index for the lifetime of the plugin instance; a poll every few
     // seconds would otherwise flood the log.
     private final Set<String> warnedWaitPolicy = ConcurrentHashMap.newKeySet();
+    /**
+     * Deleted-index tombstones for the re-surface guard (#34). Maps a
+     * Lance-backed index name to the millisecond timestamp at which
+     * the {@code DELETE /{index}} was observed on the cluster state.
+     * The poll cycle consults this map before creating a new index
+     * for a table it would otherwise surface; if the tombstone is
+     * still within {@link #resurfaceGrace} the surface is skipped,
+     * otherwise the entry is dropped and surfacing proceeds. Entries
+     * only get added for indexes carrying {@code index.lance.table}
+     * so plain OpenSearch indexes never accumulate here.
+     */
+    private final Map<String, Long> tombstones = new ConcurrentHashMap<>();
+    /**
+     * Current grace period. Held in an {@link AtomicReference} so a
+     * dynamic setting update from {@link org.opensearch.lance.LancePlugin}
+     * can atomically swap it in without racing against the poll cycle.
+     */
+    private final java.util.concurrent.atomic.AtomicReference<TimeValue> resurfaceGrace;
     private final ThreadPool threadPool;
 
     public LanceNamespaceService(
@@ -108,17 +126,39 @@ public final class LanceNamespaceService {
         TimeValue cadence,
         long builderMaxRows
     ) {
+        this(client, clusterService, threadPool, cadence, builderMaxRows, TimeValue.timeValueHours(1));
+    }
+
+    public LanceNamespaceService(
+        Client client,
+        ClusterService clusterService,
+        ThreadPool threadPool,
+        TimeValue cadence,
+        long builderMaxRows,
+        TimeValue resurfaceGrace
+    ) {
         this.client = client;
         this.clusterService = clusterService;
         this.threadPool = threadPool;
         this.cadence = cadence;
         this.builderMaxRows = builderMaxRows;
+        this.resurfaceGrace = new java.util.concurrent.atomic.AtomicReference<>(resurfaceGrace);
         // Subscribe before the first schedule fires so the poller
         // never runs against a stale cache. addListener returns
         // immediately; the listener body reads whatever state is
         // current when the applier fires.
         clusterService.addListener(this::onClusterStateChanged);
         threadPool.scheduleWithFixedDelay(this::poll, cadence, ThreadPool.Names.GENERIC);
+    }
+
+    /**
+     * Reactive setter for the dynamic
+     * {@code lance.namespace.resurface_guard_grace} node setting. Zero
+     * or negative disables the guard (poll re-surfaces immediately),
+     * matching the pre-#34 behaviour.
+     */
+    public void setResurfaceGrace(TimeValue newGrace) {
+        resurfaceGrace.set(newGrace);
     }
 
     /**
@@ -134,6 +174,40 @@ public final class LanceNamespaceService {
     private void onClusterStateChanged(ClusterChangedEvent event) {
         if (!event.metadataChanged()) {
             return;
+        }
+        // Tombstone bookkeeping for the re-surface guard: any index that
+        // disappeared from cluster state since the previous applier tick
+        // gets a tombstone entry if it was a Lance-backed index. Ordinary
+        // OpenSearch indexes are skipped. Additions and mutations do not
+        // touch the map here; the poll cycle removes an entry once the
+        // grace period elapses or the operator sets the grace to zero.
+        if (event.previousState() != null && event.previousState().metadata() != null) {
+            org.opensearch.cluster.metadata.Metadata previous = event.previousState().metadata();
+            org.opensearch.cluster.metadata.Metadata current = event.state().metadata();
+            long now = System.currentTimeMillis();
+            for (String prevIndex : previous.indices().keySet()) {
+                if (current.hasIndex(prevIndex)) {
+                    continue;
+                }
+                org.opensearch.cluster.metadata.IndexMetadata prevMeta = previous.index(prevIndex);
+                if (prevMeta == null) {
+                    continue;
+                }
+                String table = prevMeta.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+                if (table == null || table.isEmpty()) {
+                    continue;
+                }
+                tombstones.put(prevIndex, now);
+                // Also stop tracking the served version and the
+                // attached-index bookkeeping so the delete really looks
+                // "gone" to the poll cycle and to attach retries.
+                servedVersions.remove(prevIndex);
+                attachedIndexes.remove(prevIndex);
+                warnedUnowned.remove(prevIndex);
+                warnedRenamed.remove(prevIndex);
+                warnedWaitPolicy.remove(prevIndex);
+                LOG.info("recording resurface tombstone for deleted Lance-backed index {} (table {})", prevIndex, table);
+            }
         }
         LanceNamespaceMetadata metadata = currentMetadata(event.state());
         Set<String> desired = new java.util.HashSet<>(metadata.entries().size());
@@ -201,6 +275,31 @@ public final class LanceNamespaceService {
             uris.add(entry.rootUri());
         }
         return List.copyOf(uris);
+    }
+
+    /**
+     * List the tables the poll cycle would surface from the namespace
+     * registered at {@code rootUri}. Returns an empty {@link Optional} when
+     * the namespace is not registered (or the local applier has not yet
+     * built the runtime handle for it), a populated set otherwise. The
+     * value comes straight from {@link DirectoryNamespace#listTables}, so
+     * table names are without the {@code .lance} suffix and without any
+     * scheme prefix — matching the form the surface path uses.
+     *
+     * <p>Read-only: does not create, delete, or advance anything. The
+     * caller can use this to preview what the next poll would do (for
+     * example after a fresh namespace registration on a large directory),
+     * or to spot tables the poller failed to surface due to a name
+     * clash with an existing OpenSearch index.
+     */
+    public java.util.Optional<java.util.Set<String>> listTables(String rootUri) throws Exception {
+        DirectoryNamespace directory = directoryCache.get(rootUri);
+        if (directory == null) {
+            return java.util.Optional.empty();
+        }
+        ListTablesResponse response = directory.listTables(new ListTablesRequest());
+        java.util.Set<String> tables = response.getTables();
+        return java.util.Optional.of(tables == null ? java.util.Collections.emptySet() : tables);
     }
 
     /**
@@ -328,6 +427,24 @@ public final class LanceNamespaceService {
         try {
             boolean exists = client.admin().indices().exists(new IndicesExistsRequest(indexName)).actionGet().isExists();
             if (!exists) {
+                // Re-surface guard (#34): if this index was recently
+                // deleted through OpenSearch, honour the operator's
+                // intent and skip the surface until the grace period
+                // expires. Grace <= 0 disables the guard and matches
+                // the pre-#34 behaviour where every poll would
+                // recreate the index unconditionally.
+                Long tombstonedAt = tombstones.get(indexName);
+                if (tombstonedAt != null) {
+                    long graceMs = resurfaceGrace.get().millis();
+                    if (graceMs > 0 && System.currentTimeMillis() - tombstonedAt < graceMs) {
+                        LOG.debug("skipping surface of {} at {}: index was deleted within the resurface guard window", indexName, table);
+                        return;
+                    }
+                    // Grace expired or the guard was turned off; clear
+                    // the tombstone so the map does not grow without
+                    // bound and let surfacing proceed.
+                    tombstones.remove(indexName);
+                }
                 surface(indexName, table, storageOptions);
                 return;
             }

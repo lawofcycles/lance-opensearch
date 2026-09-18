@@ -185,6 +185,142 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         assertEquals("expected 404 for unregister of unknown path, saw " + status, 404, status);
     }
 
+    public void testListTablesReturnsSurfacedNames() throws Exception {
+        // POST /_lance/namespace/tables previews what the poll would
+        // surface, without waiting for the poll cycle to run. Useful for
+        // debugging a fresh registration on a large directory (operator
+        // can see immediately whether the plugin reads the same table
+        // set they expect).
+        String suffix = "listtables-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        LanceTableFactory.writeTable(scratchDir, "alpha", 4);
+        LanceTableFactory.writeTable(scratchDir, "bravo", 4);
+        try {
+            Response register = postJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
+
+            Response listing = postJson("/_lance/namespace/tables", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), listing.getStatusLine().getStatusCode());
+            String body = readAll(listing);
+            assertTrue("expected path echo: " + body, body.contains("\"path\":\"" + scratchDir.toString() + "\""));
+            assertTrue("expected table alpha in list: " + body, body.contains("\"alpha\""));
+            assertTrue("expected table bravo in list: " + body, body.contains("\"bravo\""));
+        } finally {
+            try {
+                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testListTablesReturns404ForUnregisteredPath() throws IOException {
+        // Preview against a path that never went through
+        // POST /_lance/namespace must be 404, not 200 with an empty list.
+        // Empty list would let a caller confuse "not registered" with
+        // "registered but empty".
+        String phantom = scratchPathString("phantom-list") + "-nope";
+        ResponseException failure = expectThrows(
+            ResponseException.class,
+            () -> postJson("/_lance/namespace/tables", "{\"path\":\"" + phantom + "\"}")
+        );
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        assertEquals("expected 404 for list_tables on unknown path, saw " + status, 404, status);
+        String body = readAll(failure.getResponse());
+        assertTrue("expected registered:false in 404 body: " + body, body.contains("\"registered\":false"));
+    }
+
+    public void testListTablesRejectsMissingPath() throws IOException {
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/namespace/tables", "{}"));
+        assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
+        String body = readAll(failure.getResponse());
+        assertTrue("expected [path] is required message: " + body, body.contains("[path] is required"));
+    }
+
+    public void testResurfaceGuardHoldsDeletedIndexDuringGrace() throws Exception {
+        // A Lance-backed index that the operator deleted via
+        // DELETE /{index} must stay deleted for the resurface grace
+        // period. Small grace so the post-grace resurface assertion
+        // can fire within the test wall-clock budget.
+        String suffix = "resurface-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 4);
+        String indexName = tableName;
+        updateClusterSetting("lance.namespace.resurface_guard_grace", "3s");
+        try {
+            Response register = postJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s"));
+
+            client().performRequest(new Request("DELETE", "/" + indexName));
+
+            // Wait longer than the poll cadence (1s in test config)
+            // but shorter than the 3s grace. The index must stay gone.
+            Thread.sleep(1_500);
+            ResponseException stillGone = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/" + indexName))
+            );
+            assertEquals(
+                "expected 404 while inside resurface grace, saw " + stillGone.getResponse().getStatusLine().getStatusCode(),
+                404,
+                stillGone.getResponse().getStatusLine().getStatusCode()
+            );
+
+            // After the grace expires the next poll must recreate it.
+            // Give the poll a couple of cadences of slack.
+            Thread.sleep(4_000);
+            Response recovered = client().performRequest(
+                new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s")
+            );
+            assertEquals(
+                "expected the index to resurface after grace expiry: " + readAll(recovered),
+                RestStatus.OK.getStatus(),
+                recovered.getStatusLine().getStatusCode()
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+            try {
+                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            } catch (Exception ignored) {}
+            updateClusterSetting("lance.namespace.resurface_guard_grace", "1h");
+        }
+    }
+
+    public void testResurfaceGuardDisabledByZeroGrace() throws Exception {
+        // Grace = 0 short-circuits the tombstone check so the poll
+        // cycle recreates the index on the very next tick.
+        String suffix = "resurface0-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 4);
+        String indexName = tableName;
+        updateClusterSetting("lance.namespace.resurface_guard_grace", "0");
+        try {
+            postJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s"));
+            client().performRequest(new Request("DELETE", "/" + indexName));
+            Thread.sleep(3_000);
+            Response recovered = client().performRequest(
+                new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s")
+            );
+            assertEquals(
+                "expected the index to come back with grace=0: " + readAll(recovered),
+                RestStatus.OK.getStatus(),
+                recovered.getStatusLine().getStatusCode()
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+            try {
+                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            } catch (Exception ignored) {}
+            updateClusterSetting("lance.namespace.resurface_guard_grace", "1h");
+        }
+    }
+
     public void testAttachRejectsMissingTable() throws IOException {
         // POST /_lance/attach with a path that does not exist on disk lets
         // Dataset.open throw. The plugin must surface this as an HTTP error

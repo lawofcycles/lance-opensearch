@@ -146,6 +146,22 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         TimeValue.timeValueSeconds(1),
         Setting.Property.NodeScope
     );
+    /**
+     * How long a Lance-backed index that got deleted from OpenSearch
+     * (through {@code DELETE /{index}}) is held in the namespace poll's
+     * tombstone list so a subsequent poll cycle does not immediately
+     * recreate it. Zero disables the guard (poll re-surfaces
+     * immediately, matching the pre-#34 behaviour). Applies only to
+     * indexes that were surfaced or attached by this plugin; ordinary
+     * OpenSearch indexes are never in the tombstone list.
+     */
+    public static final Setting<TimeValue> NAMESPACE_RESURFACE_GRACE_SETTING = Setting.timeSetting(
+        "lance.namespace.resurface_guard_grace",
+        TimeValue.timeValueHours(1),
+        TimeValue.timeValueMillis(0),
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
     public static final Setting<Long> BUILDER_MAX_ROWS_SETTING = Setting.longSetting(
         "lance.builder.max_rows",
         1_000_000L,
@@ -260,6 +276,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             MULTI_FIELDS_SETTING,
             UNCOVERED_FRAGMENT_POLICY_SETTING,
             NAMESPACE_POLL_CADENCE_SETTING,
+            NAMESPACE_RESURFACE_GRACE_SETTING,
             BUILDER_MAX_ROWS_SETTING,
             ALLOWED_TABLE_ROOTS_SETTING,
             STORAGE_OPTIONS_SETTING,
@@ -423,7 +440,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client);
         this.createIndexActionFilter = new LanceCreateIndexActionFilter(threadPool);
 
-        namespaceService = new LanceNamespaceService(client, clusterService, threadPool, cadence, builderMaxRows);
+        namespaceService = new LanceNamespaceService(
+            client,
+            clusterService,
+            threadPool,
+            cadence,
+            builderMaxRows,
+            NAMESPACE_RESURFACE_GRACE_SETTING.get(environment.settings())
+        );
+        // Register a reactive consumer so an operator can adjust the grace
+        // period at runtime without a rolling restart.
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(NAMESPACE_RESURFACE_GRACE_SETTING, namespaceService::setResurfaceGrace);
         return List.of(namespaceService);
     }
 

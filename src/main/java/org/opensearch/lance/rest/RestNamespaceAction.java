@@ -47,7 +47,8 @@ public class RestNamespaceAction extends BaseRestHandler {
         return List.of(
             new Route(RestRequest.Method.POST, "/_lance/namespace"),
             new Route(RestRequest.Method.GET, "/_lance/namespace"),
-            new Route(RestRequest.Method.DELETE, "/_lance/namespace")
+            new Route(RestRequest.Method.DELETE, "/_lance/namespace"),
+            new Route(RestRequest.Method.POST, "/_lance/namespace/tables")
         );
     }
 
@@ -76,6 +77,40 @@ public class RestNamespaceAction extends BaseRestHandler {
         String path = (String) rawPath;
         if (path.isEmpty()) {
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, "[path] must not be empty"));
+        }
+        // POST /_lance/namespace/tables is a read-only listing endpoint.
+        // POST is used (rather than GET with a query parameter) because
+        // registered paths can contain slashes, scheme prefixes
+        // (s3://bucket/root), and other characters that make URL-encoded
+        // path segments fragile. Body-with-path matches the shape of the
+        // register / unregister calls right above.
+        if (request.path().endsWith("/tables")) {
+            return channel -> {
+                try {
+                    java.util.Optional<java.util.Set<String>> tables = service.listTables(path);
+                    try (XContentBuilder b = channel.newBuilder()) {
+                        if (tables.isEmpty()) {
+                            // Namespace not registered on this node (or
+                            // applier has not yet built the runtime
+                            // handle). Return 404 so the operator learns
+                            // the path is unknown rather than seeing an
+                            // empty list they might misread as "no
+                            // tables".
+                            b.startObject().field("registered", false).field("path", path).endObject();
+                            channel.sendResponse(new BytesRestResponse(RestStatus.NOT_FOUND, b));
+                            return;
+                        }
+                        java.util.List<String> sorted = new java.util.ArrayList<>(tables.get());
+                        java.util.Collections.sort(sorted);
+                        b.startObject().field("path", path).field("tables", sorted).endObject();
+                        channel.sendResponse(new BytesRestResponse(RestStatus.OK, b));
+                    }
+                } catch (Exception e) {
+                    channel.sendResponse(
+                        new BytesRestResponse(RestStatus.INTERNAL_SERVER_ERROR, "list tables for [" + path + "] failed: " + e.getMessage())
+                    );
+                }
+            };
         }
         if (request.method() == RestRequest.Method.DELETE) {
             // DELETE only stops the polling of that path. Already-surfaced
