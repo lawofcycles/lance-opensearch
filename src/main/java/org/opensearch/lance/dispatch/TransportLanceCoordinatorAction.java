@@ -155,7 +155,16 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // Per-index fan-out results, collected sequentially.
         // Sequential loop keeps the merge trivial; parallel per-index
         // fan-out is future work if it becomes a hot spot.
-        FragmentQuerySpec spec = new FragmentQuerySpec(filterSql, query, postFilter, sorts, searchAfter, perNodeSize, aggregations);
+        FragmentQuerySpec spec = new FragmentQuerySpec(
+            filterSql,
+            query,
+            postFilter,
+            sorts,
+            searchAfter,
+            perNodeSize,
+            aggregations,
+            source != null && source.trackScores()
+        );
         boolean versionRequested = source != null && Boolean.TRUE.equals(source.version());
         boolean seqNoAndPrimaryTermRequested = source != null && Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
         MergeState merged = new MergeState(aggregations, from, size, versionRequested, seqNoAndPrimaryTermRequested);
@@ -267,7 +276,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 spec.searchAfter(),
                 spec.effectiveSize(),
                 spec.aggregations(),
-                fragmentsForNode
+                fragmentsForNode,
+                spec.trackScores()
             );
             LOGGER.info(
                 "lance.dispatch: fan-out index [{}] table [{}] to node [{}] with fragments {}",
@@ -342,7 +352,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             spec.searchAfter(),
             spec.effectiveSize(),
             spec.aggregations(),
-            java.util.Collections.emptyList()
+            java.util.Collections.emptyList(),
+            spec.trackScores()
         );
         LOGGER.info(
             "lance.dispatch: fan-out index [{}] table [{}] empty aggregation run on primary node [{}]",
@@ -532,7 +543,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      */
     private record FragmentQuerySpec(String filterSql, org.opensearch.index.query.QueryBuilder query,
         org.opensearch.index.query.QueryBuilder postFilter, List<org.opensearch.search.sort.SortBuilder<?>> sorts, Object[] searchAfter,
-        int effectiveSize, AggregatorFactories.Builder aggregations) {
+        int effectiveSize, AggregatorFactories.Builder aggregations, boolean trackScores) {
     }
 
     /**
@@ -643,11 +654,24 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 int end = Math.min(hits.size(), from + size);
                 paged = hits.subList(from, end).toArray(new SearchHit[0]);
             }
-            SearchHits searchHits = new SearchHits(
-                paged,
-                new TotalHits(totalMatched, TotalHits.Relation.EQUAL_TO),
-                paged.length == 0 ? Float.NaN : 1.0f
-            );
+            // max_score is the largest per-hit score in the paged
+            // window, matching shard path behaviour. The old
+            // hard-coded 1.0f flattened the response for
+            // function_score / script_score / FTS queries where
+            // real scores can range far above 1.0. NaN when no
+            // hits survive paging, or when every hit carries NaN
+            // (e.g. sort without track_scores).
+            float maxScore = Float.NaN;
+            for (SearchHit hit : paged) {
+                float score = hit.getScore();
+                if (Float.isNaN(score)) {
+                    continue;
+                }
+                if (Float.isNaN(maxScore) || score > maxScore) {
+                    maxScore = score;
+                }
+            }
+            SearchHits searchHits = new SearchHits(paged, new TotalHits(totalMatched, TotalHits.Relation.EQUAL_TO), maxScore);
             InternalAggregations aggregations = null;
             if (aggregationsRequested != null && !perNodeAggregations.isEmpty()) {
                 // Feed every per-node InternalAggregations tree into the

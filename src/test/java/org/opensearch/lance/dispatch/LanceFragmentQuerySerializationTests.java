@@ -53,7 +53,8 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             /* searchAfter */ null,
             5,
             aggs,
-            List.of(0, 2, 4)
+            List.of(0, 2, 4),
+            /* trackScores */ true
         );
 
         LanceFragmentQueryRequest restored;
@@ -75,6 +76,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         assertEquals(2, restored.aggregations().getAggregatorFactories().size());
         assertEquals(original.fragmentIds(), restored.fragmentIds());
         assertEquals(original.storageOptions().asMap(), restored.storageOptions().asMap());
+        assertEquals(original.trackScores(), restored.trackScores());
     }
 
     public void testRequestWithNullFilterAndAllFragmentsRoundTrip() throws Exception {

@@ -69,6 +69,14 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     private final int size;
     private final AggregatorFactories.Builder aggregations;
     private final List<Integer> fragmentIds;
+    /**
+     * Whether the caller opted into per-hit score collection via
+     * {@code track_scores}. Sort-only queries default to
+     * {@code false} in Lucene, so the executor has to opt in
+     * explicitly to keep {@code _score} populated when the user
+     * asks for it alongside a {@code sort} clause.
+     */
+    private final boolean trackScores;
 
     public LanceFragmentQueryRequest(
         String tableUri,
@@ -81,7 +89,8 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         Object[] searchAfter,
         int size,
         AggregatorFactories.Builder aggregations,
-        List<Integer> fragmentIds
+        List<Integer> fragmentIds,
+        boolean trackScores
     ) {
         this.tableUri = tableUri;
         this.indexName = indexName;
@@ -94,6 +103,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.size = size;
         this.aggregations = aggregations;
         this.fragmentIds = List.copyOf(fragmentIds);
+        this.trackScores = trackScores;
     }
 
     public LanceFragmentQueryRequest(StreamInput in) throws IOException {
@@ -127,6 +137,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             readFragments.add(in.readVInt());
         }
         this.fragmentIds = List.copyOf(readFragments);
+        this.trackScores = in.readBoolean();
     }
 
     @Override
@@ -159,6 +170,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         for (Integer id : fragmentIds) {
             out.writeVInt(id);
         }
+        out.writeBoolean(trackScores);
     }
 
     @Override
@@ -264,7 +276,29 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         return fragmentIds.isEmpty() ? null : fragmentIds;
     }
 
-    /** Convenience factory for single-node dispatch (all fragments). */
+    /**
+     * Whether the caller opted into {@code track_scores}. When
+     * {@code true} the per-node executor asks Lucene to keep
+     * per-hit scores even when {@code sort} is present, so hits
+     * come back with numeric {@code _score} values instead of
+     * NaN. Ignored when {@code sort} is empty because plain
+     * {@link org.apache.lucene.search.IndexSearcher#search(org.apache.lucene.search.Query, int)}
+     * already collects scores.
+     */
+    public boolean trackScores() {
+        return trackScores;
+    }
+
+    /**
+     * Convenience factory for single-node dispatch (all fragments).
+     *
+     * <p>{@code trackScores} defaults to {@code false} because
+     * every caller of this helper today either has no {@code sort}
+     * clause (score-only queries collect scores automatically) or
+     * runs in tests where the flag is not exercised. Callers that
+     * need {@code track_scores:true} alongside a sort should use
+     * the full constructor instead.
+     */
     public static LanceFragmentQueryRequest allFragments(
         String tableUri,
         String indexName,
@@ -286,7 +320,8 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             null,
             size,
             aggregations,
-            Collections.emptyList()
+            Collections.emptyList(),
+            /* trackScores */ false
         );
     }
 }

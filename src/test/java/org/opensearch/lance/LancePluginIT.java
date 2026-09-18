@@ -755,6 +755,96 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testMaxScoreAndTrackScoresOnFragmentPath() throws Exception {
+        // Issue #37 case 2: the fragment executor used to write
+        // hits.max_score as a hard-coded 1.0 regardless of the
+        // real per-hit score, and never honoured track_scores
+        // when combined with a sort. Both quirks silently
+        // changed the response envelope compared to the shard
+        // path. Since the case 2 fix the coordinator's
+        // MergeState computes max_score from the paged window,
+        // and per-node Lucene search wires track_scores through
+        // to the 4 / 5 argument search / searchAfter overloads.
+        // Three shapes exercise those seams:
+        // 1. constant_score without sort. Scores fall out of
+        // IndexSearcher.search(query, size), max_score
+        // lifts to the caller-chosen boost.
+        // 2. constant_score with sort by id and
+        // track_scores:true. The 4 arg
+        // search(query, size, sort, true) collects both
+        // sort values and scores, so hits carry the boost
+        // and max_score does too.
+        // 3. constant_score with sort by id and no
+        // track_scores. Lucene's sort collector skips
+        // score computation, hits carry _score:null, and
+        // max_score comes back as null after the NaN
+        // guard in MergeState skips every hit.
+        String suffix = "s3-trackscores-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // Shape 1: constant_score without sort. Every hit
+            // carries the boost, max_score matches.
+            String noSortBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":4,\"query\":{\"constant_score\":{\"filter\":{\"match_all\":{}},\"boost\":3.5}}}"
+                )
+            );
+            assertEquals(4, extractIntPath(noSortBody, "hits", "total", "value"));
+            assertEquals(3.5d, extractDoublePath(noSortBody, "hits", "max_score"), 0.0001d);
+            assertEquals(3.5d, extractDoublePath(noSortBody, "hits", "hits", "0", "_score"), 0.0001d);
+            assertEquals(3.5d, extractDoublePath(noSortBody, "hits", "hits", "3", "_score"), 0.0001d);
+
+            // Shape 2: sort by id with track_scores:true. Score
+            // stays populated alongside sort values.
+            String trackBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":4,\"query\":{\"constant_score\":{\"filter\":{\"match_all\":{}},\"boost\":3.5}},"
+                        + "\"sort\":[{\"id\":\"desc\"}],\"track_scores\":true}"
+                )
+            );
+            assertEquals(4, extractIntPath(trackBody, "hits", "total", "value"));
+            assertEquals(3.5d, extractDoublePath(trackBody, "hits", "max_score"), 0.0001d);
+            assertEquals(3.5d, extractDoublePath(trackBody, "hits", "hits", "0", "_score"), 0.0001d);
+            assertEquals(3.5d, extractDoublePath(trackBody, "hits", "hits", "3", "_score"), 0.0001d);
+            // Sort by id desc puts id=3 first.
+            assertTrue("sort desc must start with id=3: " + trackBody, trackBody.contains("\"sort\":[3]"));
+
+            // Shape 3: sort by id with no track_scores. Lucene
+            // reports NaN for every hit, JSON encodes that as
+            // null. max_score falls out to null as well because
+            // MergeState skips NaN hits before picking the max.
+            String nullScoreBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":4,\"query\":{\"constant_score\":{\"filter\":{\"match_all\":{}},\"boost\":3.5}},"
+                        + "\"sort\":[{\"id\":\"desc\"}]}"
+                )
+            );
+            assertEquals(4, extractIntPath(nullScoreBody, "hits", "total", "value"));
+            assertTrue(
+                "sort without track_scores must produce max_score:null: " + nullScoreBody,
+                nullScoreBody.contains("\"max_score\":null")
+            );
+            assertTrue(
+                "sort without track_scores must produce per-hit _score:null: " + nullScoreBody,
+                nullScoreBody.contains("\"_score\":null")
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testMinScoreTerminateAfterTrackTotalHitsFallThroughToShardPath() throws Exception {
         // min_score, terminate_after, and track_total_hits used to
         // slip past isDispatchable and produce silently wrong

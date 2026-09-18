@@ -287,7 +287,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         hitsQuery,
                         sortAndFormats,
                         request.searchAfter(),
-                        request.size()
+                        request.size(),
+                        request.trackScores()
                     );
                     InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query);
                     long matched = computeMatched(dataset, request, searcher, hitsQuery);
@@ -378,13 +379,28 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * standard {@link org.apache.lucene.search.IndexSearcher#search(Query, int, org.apache.lucene.search.Sort)}
      * call and per-hit sort values are captured for the coordinator's
      * merge phase.
+     *
+     * <p>{@code trackScores} follows the OpenSearch
+     * {@code track_scores} request flag. Sort-based Lucene search
+     * defaults to computing sort values only, leaving
+     * {@link ScoreDoc#score} at {@link Float#NaN}. When the caller
+     * asks for {@code track_scores:true} the 4 / 5 argument
+     * {@link org.apache.lucene.search.IndexSearcher#search(Query, int, org.apache.lucene.search.Sort, boolean)}
+     * / {@code searchAfter} overloads compute scores alongside the
+     * sort, so hits come back with numeric {@code _score} values
+     * and the coordinator's {@code max_score} sees real numbers.
+     * The score-only path ({@code sortAndFormats == null}) already
+     * collects scores through
+     * {@link org.apache.lucene.search.IndexSearcher#search(Query, int)}
+     * and ignores this flag.
      */
     private List<SearchHit> scanHitsViaIndexSearcher(
         ContextIndexSearcher searcher,
         Query query,
         org.opensearch.search.sort.SortAndFormats sortAndFormats,
         Object[] searchAfter,
-        int size
+        int size,
+        boolean trackScores
     ) throws java.io.IOException {
         if (size <= 0) {
             return Collections.emptyList();
@@ -401,11 +417,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             int maxDoc = searcher.getIndexReader().maxDoc();
             int afterDoc = maxDoc > 0 ? maxDoc - 1 : 0;
             org.apache.lucene.search.FieldDoc after = new org.apache.lucene.search.FieldDoc(afterDoc, 0f, searchAfter);
-            topDocs = searcher.searchAfter(after, query, size, sortAndFormats.sort);
+            topDocs = searcher.searchAfter(after, query, size, sortAndFormats.sort, trackScores);
         } else if (sortAndFormats == null) {
             topDocs = searcher.search(query, size);
         } else {
-            topDocs = searcher.search(query, size, sortAndFormats.sort);
+            topDocs = searcher.search(query, size, sortAndFormats.sort, trackScores);
         }
         List<SearchHit> out = new ArrayList<>(topDocs.scoreDocs.length);
         for (int i = 0; i < topDocs.scoreDocs.length; i++) {
