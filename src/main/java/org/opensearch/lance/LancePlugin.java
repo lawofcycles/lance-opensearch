@@ -193,6 +193,36 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.Dynamic
     );
 
+    /**
+     * Cap on how many fragment path queries this node executes in
+     * parallel. Fragment path processes every fragment of an index on
+     * one node, so per-query heap (FTS score arrays sized by
+     * {@code maxDoc}, aggregation buffers) scales with the number of
+     * concurrent requests rather than with cluster fan-out. The
+     * {@code lance_native} circuit breaker still catches individual
+     * runaway queries, but at high concurrency allocation races the
+     * breaker and the node can drop into {@code OutOfMemoryError}
+     * before the breaker fires; a bounded semaphore backstops that
+     * race by serialising the tail once the limit is reached.
+     *
+     * <p>Default {@code 4} is chosen so that fragment path stays
+     * comfortably below the search threadpool size (which is
+     * {@code (allocated_processors * 3) / 2 + 1}) on typical
+     * hardware, and matches the concurrency level at which the
+     * evaluation observed the parent circuit breaker successfully
+     * rejecting overflow with 429 rather than the JVM dying. Node
+     * scoped and static: changing the value requires a restart
+     * because the underlying semaphore's permit count is fixed at
+     * plugin init.
+     */
+    public static final Setting<Integer> FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING = Setting.intSetting(
+        "lance.fragment_dispatch.max_concurrent",
+        4,
+        1,
+        128,
+        Setting.Property.NodeScope
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -206,7 +236,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             STORAGE_OPTIONS_SETTING,
             NATIVE_MEMORY_LIMIT_SETTING,
             NATIVE_MEMORY_CB_ENABLED_SETTING,
-            NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING
+            NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING,
+            FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING
         );
     }
 

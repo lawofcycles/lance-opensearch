@@ -132,6 +132,22 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     private final IndicesService indicesService;
     private final BigArrays bigArrays;
     private final CircuitBreakerService circuitBreakerService;
+    /**
+     * Bound on how many fragment path queries this node runs in
+     * parallel. Fragment path serves an entire index's fragments on
+     * one node, so per-query heap (score arrays, aggregation
+     * buffers) scales with concurrency rather than shard fan-out;
+     * the semaphore keeps allocation from racing the
+     * {@code lance_native} circuit breaker into an OOM. Backed by
+     * {@link LancePlugin#FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING},
+     * read once at construction so the permit count is fixed for
+     * the life of the node. Threads waiting for a permit are
+     * SEARCH threadpool threads, which is the same pool the
+     * fan-out sender uses, so a queue never grows without bound —
+     * once every search thread is either running or waiting here,
+     * the transport layer applies its own queue limits.
+     */
+    private final java.util.concurrent.Semaphore concurrencyLimit;
 
     @Inject
     public TransportLanceFragmentQueryAction(
@@ -147,13 +163,27 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         this.indicesService = indicesService;
         this.bigArrays = bigArrays;
         this.circuitBreakerService = circuitBreakerService;
+        int permits = org.opensearch.lance.LancePlugin.FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING.get(clusterService.getSettings());
+        this.concurrencyLimit = new java.util.concurrent.Semaphore(permits, /*fair*/ false);
     }
 
     @Override
     protected void doExecute(Task task, LanceFragmentQueryRequest request, ActionListener<LanceFragmentQueryResponse> listener) {
+        boolean acquired = false;
         try {
+            // Bound the fragment path concurrency before we touch any
+            // per-query buffers. Blocking here parks the SEARCH thread
+            // that carried the request in, which pushes back on the
+            // fan-out sender the same way any other slow shard would;
+            // it is preferable to letting the JVM race the circuit
+            // breaker into OOM.
+            concurrencyLimit.acquire();
+            acquired = true;
             LanceFragmentQueryResponse response = execute(request);
             listener.onResponse(response);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            listener.onFailure(interrupted);
         } catch (Exception e) {
             LOGGER.warn(
                 "fragment query failed on this node for [{}] filter [{}] fragments [{}]",
@@ -163,6 +193,10 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 e
             );
             listener.onFailure(e);
+        } finally {
+            if (acquired) {
+                concurrencyLimit.release();
+            }
         }
     }
 
