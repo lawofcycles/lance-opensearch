@@ -322,6 +322,57 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testAttachWithPinnedVersionServesSnapshot() throws Exception {
+        // Attach the same table twice: once without version (latest,
+        // registered with the namespace poller) and once with version=1
+        // (readonly snapshot, no poller). Both queries must succeed and
+        // return the same 6-row match_all count because the table is
+        // written in a single commit so version 1 is also the latest.
+        String suffix = "tt-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String latestIndex = tableName + "-latest";
+        String pinnedIndex = tableName + "-v1";
+        try {
+            Response attachLatest = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + latestIndex + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attachLatest.getStatusLine().getStatusCode());
+            Response attachPinned = postJson(
+                "/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"name\":\"" + pinnedIndex + "\",\"version\":1}"
+            );
+            assertEquals(RestStatus.OK.getStatus(), attachPinned.getStatusLine().getStatusCode());
+
+            String latestBody = readAll(postJson("/" + latestIndex + "/_search", "{\"query\":{\"match_all\":{}}}"));
+            assertEquals(6, extractIntPath(latestBody, "hits", "total", "value"));
+            String pinnedBody = readAll(postJson("/" + pinnedIndex + "/_search", "{\"query\":{\"match_all\":{}}}"));
+            assertEquals(6, extractIntPath(pinnedBody, "hits", "total", "value"));
+
+            // The pinned index must record index.lance.version=1 so a
+            // node restart or shard reallocation keeps reading the same
+            // Lance manifest version.
+            Response settings = client().performRequest(new Request("GET", "/" + pinnedIndex + "/_settings"));
+            String settingsBody = readAll(settings);
+            assertTrue("expected index.lance.version=1 to persist: " + settingsBody, settingsBody.contains("\"version\":\"1\""));
+        } finally {
+            for (String idx : new String[] { latestIndex, pinnedIndex }) {
+                try {
+                    client().performRequest(new Request("DELETE", "/" + idx));
+                } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    public void testAttachRejectsNegativeVersion() throws IOException {
+        String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"version\":-1}";
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        assertEquals("expected 400 for negative version, saw " + status, 400, status);
+        String body = readAll(failure.getResponse());
+        assertTrue("expected message about [version], saw: " + body, body.contains("[version]"));
+    }
+
     public void testAttachKeywordOnlyUtf8TableGoesGreen() throws Exception {
         // Regression for the SHA 403576c FieldInfos-duplicate bug: a
         // Utf8 column with no inverted index is loaded through the

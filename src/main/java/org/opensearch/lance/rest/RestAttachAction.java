@@ -94,6 +94,7 @@ public class RestAttachAction extends BaseRestHandler {
 
         String table;
         String explicitName;
+        Long pinnedVersion;
         StorageOptions storageOptions;
         try {
             table = readOptionalString(body, "table");
@@ -117,6 +118,12 @@ public class RestAttachAction extends BaseRestHandler {
                     )
                 );
             }
+            pinnedVersion = readOptionalLong(body, "version");
+            if (pinnedVersion != null && pinnedVersion < 0) {
+                return channel -> channel.sendResponse(
+                    new BytesRestResponse(RestStatus.BAD_REQUEST, "[version] must be a non-negative integer")
+                );
+            }
             storageOptions = StorageOptions.parseFromRequestField(body.get("storage_options"), "[lance_attach]");
         } catch (IllegalArgumentException e) {
             String message = e.getMessage();
@@ -136,18 +143,19 @@ public class RestAttachAction extends BaseRestHandler {
         final String tableFinal = table;
         final String indexName = explicitName != null ? explicitName : tableName(table);
         final StorageOptions storageOptionsFinal = storageOptions;
+        final java.util.Optional<Long> pinnedVersionFinal = java.util.Optional.ofNullable(pinnedVersion);
 
         // Dispatch the JNI work to the generic pool. Dataset.open blocks on
         // native I/O and would trip the transport-thread assertion otherwise.
         return channel -> threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             Derivation derivation;
-            try (Dataset dataset = LanceRegistry.openDataset(tableFinal, storageOptionsFinal)) {
+            try (Dataset dataset = LanceRegistry.openDataset(tableFinal, storageOptionsFinal, pinnedVersionFinal)) {
                 derivation = derive(dataset);
             } catch (Exception e) {
                 sendError(channel, e);
                 return;
             }
-            createIndex(client, channel, indexName, tableFinal, derivation, namespaceService, storageOptionsFinal);
+            createIndex(client, channel, indexName, tableFinal, derivation, namespaceService, storageOptionsFinal, pinnedVersionFinal);
         });
     }
 
@@ -158,24 +166,31 @@ public class RestAttachAction extends BaseRestHandler {
         String table,
         Derivation derivation,
         LanceNamespaceService namespaceService,
-        StorageOptions storageOptions
+        StorageOptions storageOptions,
+        java.util.Optional<Long> pinnedVersion
     ) {
         Settings.Builder settings = Settings.builder()
             .put("index.number_of_shards", 1)
             .put("index.number_of_replicas", 0)
             .put(LanceEngineFactory.TABLE_SETTING, table)
             .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField);
+        pinnedVersion.ifPresent(v -> settings.put(LanceEngineFactory.VERSION_SETTING, v));
         storageOptions.writeToSettings(settings);
         CreateIndexRequest create = new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson);
 
         client.admin().indices().create(create, new ActionListener<CreateIndexResponse>() {
             @Override
             public void onResponse(CreateIndexResponse response) {
-                // Register the attach-created index with the namespace
-                // poller so subsequent appends surface without a manual
-                // /_refresh. Idempotent: repeated attaches with the same
-                // (name, table) just refresh the served version.
-                namespaceService.registerAttachedIndex(indexName, table, derivation.version, storageOptions);
+                // Register the attach-created index with the namespace poller
+                // only when the operator is following the latest version.
+                // Pinned indices stay on their manifest version by design
+                // (readonly snapshot for reproducibility), so the poll cycle
+                // does not need to touch them and would otherwise burn cycles
+                // probing for a manifest advance that must not change the
+                // reader.
+                if (pinnedVersion.isEmpty()) {
+                    namespaceService.registerAttachedIndex(indexName, table, derivation.version, storageOptions);
+                }
                 writeAttachResponse(channel, indexName, table, derivation, false);
             }
 
@@ -188,7 +203,7 @@ public class RestAttachAction extends BaseRestHandler {
                 // The index already exists. Verify it is a Lance index for the
                 // same table before claiming success; otherwise attach would
                 // silently take credit for an unrelated index.
-                verifyExistingLanceIndex(client, channel, indexName, table, derivation, namespaceService, storageOptions);
+                verifyExistingLanceIndex(client, channel, indexName, table, derivation, namespaceService, storageOptions, pinnedVersion);
             }
         });
     }
@@ -200,7 +215,8 @@ public class RestAttachAction extends BaseRestHandler {
         String table,
         Derivation derivation,
         LanceNamespaceService namespaceService,
-        StorageOptions storageOptions
+        StorageOptions storageOptions,
+        java.util.Optional<Long> pinnedVersion
     ) {
         ClusterStateRequest stateRequest = new ClusterStateRequest();
         stateRequest.clear().metadata(true).indices(indexName);
@@ -229,8 +245,13 @@ public class RestAttachAction extends BaseRestHandler {
                 }
                 // Same table, so record the (index, table) pair with the
                 // namespace poller in case this node has forgotten it
-                // (cluster restart after attach, for example).
-                namespaceService.registerAttachedIndex(indexName, table, derivation.version, storageOptions);
+                // (cluster restart after attach, for example). Pinned
+                // indices are readonly snapshots and stay outside the
+                // poll cycle so a manifest advance does not race with
+                // the intended version.
+                if (pinnedVersion.isEmpty()) {
+                    namespaceService.registerAttachedIndex(indexName, table, derivation.version, storageOptions);
+                }
                 writeAttachResponse(channel, indexName, table, derivation, true);
             }
 
@@ -290,6 +311,17 @@ public class RestAttachAction extends BaseRestHandler {
             throw new IllegalArgumentException("[" + key + "] must be a string, got " + v.getClass().getSimpleName());
         }
         return (String) v;
+    }
+
+    private static Long readOptionalLong(Map<String, Object> body, String key) {
+        Object v = body.get(key);
+        if (v == null) {
+            return null;
+        }
+        if (!(v instanceof Number)) {
+            throw new IllegalArgumentException("[" + key + "] must be a number, got " + v.getClass().getSimpleName());
+        }
+        return ((Number) v).longValue();
     }
 
     private static void sendError(RestChannel channel, Exception e) {

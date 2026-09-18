@@ -99,6 +99,13 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.IndexScope,
         Setting.Property.Final
     );
+    public static final Setting<Long> VERSION_SETTING = Setting.longSetting(
+        LanceEngineFactory.VERSION_SETTING,
+        -1L,
+        -1L,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
     public static final Setting<String> UNCOVERED_FRAGMENT_POLICY_SETTING = Setting.simpleString(
         "index.lance.uncovered_fragment_policy",
         "immediate",
@@ -191,6 +198,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         return List.of(
             TABLE_SETTING,
             PRIMARY_KEY_FIELD_SETTING,
+            VERSION_SETTING,
             UNCOVERED_FRAGMENT_POLICY_SETTING,
             NAMESPACE_POLL_CADENCE_SETTING,
             BUILDER_MAX_ROWS_SETTING,

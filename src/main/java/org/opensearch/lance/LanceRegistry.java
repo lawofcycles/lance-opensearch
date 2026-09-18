@@ -121,14 +121,39 @@ public final class LanceRegistry {
      * the shared Session.
      */
     public static Dataset openDataset(String uri, StorageOptions storageOptions) {
+        return openDataset(uri, storageOptions, java.util.Optional.empty());
+    }
+
+    /**
+     * Open a Lance dataset at a specific manifest version. When
+     * {@code pinnedVersion} is non-empty, the returned dataset is
+     * pinned to that Lance version and will not follow subsequent
+     * appends. Callers that pin should also opt the resulting index
+     * out of the namespace poll cycle (see {@code
+     * LanceNamespaceService.registerAttachedIndex}) so refresh does
+     * not race with a manifest advance.
+     *
+     * <p>Storage options and version pinning both go through
+     * {@link ReadOptions}, so this method combines them into a single
+     * {@code ReadOptions} rather than round-tripping through
+     * {@link StorageOptions#toReadOptionsOrNull} (which would drop
+     * the version silently).
+     */
+    public static Dataset openDataset(String uri, StorageOptions storageOptions, java.util.Optional<Long> pinnedVersion) {
         OpenDatasetBuilder builder = Dataset.open().allocator(ALLOCATOR).uri(uri);
         Session session = SESSION;
         if (session != null && !session.isClosed()) {
             builder = builder.session(session);
         }
-        ReadOptions readOptions = storageOptions == null ? null : storageOptions.toReadOptionsOrNull();
-        if (readOptions != null) {
-            builder = builder.readOptions(readOptions);
+        java.util.Map<String, String> storageMap = storageOptions == null ? null : storageOptions.asMap();
+        boolean hasStorage = storageMap != null && !storageMap.isEmpty();
+        if (hasStorage || pinnedVersion.isPresent()) {
+            ReadOptions.Builder roBuilder = new ReadOptions.Builder();
+            if (hasStorage) {
+                roBuilder.setStorageOptions(storageMap);
+            }
+            pinnedVersion.ifPresent(roBuilder::setVersion);
+            builder = builder.readOptions(roBuilder.build());
         }
         return builder.build();
     }

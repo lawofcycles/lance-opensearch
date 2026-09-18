@@ -78,14 +78,23 @@ public final class LanceEngineFactory implements EngineFactory {
 
     public static final String TABLE_SETTING = "index.lance.table";
     public static final String PRIMARY_KEY_FIELD_SETTING = "index.lance.primary_key_field";
+    /**
+     * Pin the Lance manifest version an index reads. Non-negative values pin
+     * the dataset to that version; the default {@code -1L} means "follow the
+     * latest version" and lets {@link org.opensearch.lance.namespace.LanceNamespaceService}'s
+     * poll advance the reader as new fragments land.
+     */
+    public static final String VERSION_SETTING = "index.lance.version";
 
     @Override
     public Engine newReadWriteEngine(EngineConfig config) {
         String table = config.getIndexSettings().getSettings().get(TABLE_SETTING);
         String field = config.getIndexSettings().getSettings().get(PRIMARY_KEY_FIELD_SETTING, "");
         int shardId = config.getShardId().id();
+        long versionSetting = config.getIndexSettings().getSettings().getAsLong(VERSION_SETTING, -1L);
+        java.util.Optional<Long> pinnedVersion = versionSetting >= 0 ? java.util.Optional.of(versionSetting) : java.util.Optional.empty();
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(config.getIndexSettings().getSettings());
-        return new LanceReadOnlyEngine(config, table, field, shardId, storageOptions);
+        return new LanceReadOnlyEngine(config, table, field, shardId, pinnedVersion, storageOptions);
     }
 
     static final class LanceReadOnlyEngine extends ReadOnlyEngine {
@@ -95,19 +104,35 @@ public final class LanceEngineFactory implements EngineFactory {
         final String tablePath;
         final String field;
         final int shardId;
+        /**
+         * Pinned Lance manifest version. When present, {@link #openLanceReader()}
+         * passes this through {@link org.opensearch.lance.LanceRegistry#openDataset(String, StorageOptions, java.util.Optional)}
+         * so the shard reads a fixed snapshot; the reader manager's version
+         * probe below also returns the pinned value, so {@code refreshIfNeeded}
+         * short-circuits.
+         */
+        final java.util.Optional<Long> pinnedVersion;
         final StorageOptions storageOptions;
         private final LanceReaderManager lanceReaderManager;
 
-        LanceReadOnlyEngine(EngineConfig config, String table, String field, int shardId, StorageOptions storageOptions) {
+        LanceReadOnlyEngine(
+            EngineConfig config,
+            String table,
+            String field,
+            int shardId,
+            java.util.Optional<Long> pinnedVersion,
+            StorageOptions storageOptions
+        ) {
             super(config, null, null, true, Function.identity(), true);
             this.tablePath = table;
             this.field = field;
             this.shardId = shardId;
+            this.pinnedVersion = pinnedVersion;
             this.storageOptions = storageOptions;
             try {
                 OpenSearchDirectoryReader initial = openLanceReader();
                 long initialVersion;
-                try (Dataset probe = LanceRegistry.openDataset(tablePath, storageOptions)) {
+                try (Dataset probe = LanceRegistry.openDataset(tablePath, storageOptions, pinnedVersion)) {
                     initialVersion = probe.version();
                 }
                 this.lanceReaderManager = new LanceReaderManager(initial, this, initialVersion);
@@ -120,7 +145,7 @@ public final class LanceEngineFactory implements EngineFactory {
             Directory directory = engineConfig.getStore().directory();
             SegmentInfos infos = getLastCommittedSegmentInfos();
             IndexCommit commit = Lucene.getIndexCommit(infos, directory);
-            Dataset dataset = LanceRegistry.openDataset(tablePath, storageOptions);
+            Dataset dataset = LanceRegistry.openDataset(tablePath, storageOptions, pinnedVersion);
             // If wrapping the dataset in a directory reader fails, close it
             // here — otherwise the JNI-owned Dataset handle leaks and
             // eventually starves the native allocator. `LanceDirectoryReader`
@@ -354,7 +379,7 @@ public final class LanceEngineFactory implements EngineFactory {
             // safe: a concurrent `maybeRefresh()` blocks on refreshLock
             // and will observe the updated version once we return.
             long latest;
-            try (Dataset probe = LanceRegistry.openDataset(engine.tablePath, engine.storageOptions)) {
+            try (Dataset probe = LanceRegistry.openDataset(engine.tablePath, engine.storageOptions, engine.pinnedVersion)) {
                 latest = probe.version();
             }
             if (latest == servedVersion) {
