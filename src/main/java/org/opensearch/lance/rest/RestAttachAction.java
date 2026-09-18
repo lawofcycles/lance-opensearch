@@ -340,8 +340,8 @@ public class RestAttachAction extends BaseRestHandler {
         }
     }
 
-    public record Derivation(String mappingJson, String keyField, long version, long rows, int fragments, List<String> notes,
-        java.util.Set<String> ftsColumns, java.util.Set<String> scalarColumns, java.util.Set<String> vectorColumns) {
+    public record Derivation(String mappingJson, String keyField, long version, long rows, int fragments, List<String> notes, java.util.Set<
+        String> ftsColumns, java.util.Set<String> scalarColumns, java.util.Set<String> vectorColumns) {
     }
 
     public static Derivation derive(Dataset dataset) throws Exception {

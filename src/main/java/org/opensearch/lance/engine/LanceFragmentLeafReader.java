@@ -174,9 +174,9 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     continue;
                 }
                 if (kind == ColumnKind.TEXT_FTS) {
-                    boolean hasFts = !dataset
-                        .describeIndices(new IndexCriteria.Builder().forColumn(field.getName()).mustSupportFts(true).build())
-                        .isEmpty();
+                    boolean hasFts = !dataset.describeIndices(
+                        new IndexCriteria.Builder().forColumn(field.getName()).mustSupportFts(true).build()
+                    ).isEmpty();
                     kind = hasFts ? ColumnKind.TEXT_FTS : ColumnKind.TEXT_KEYWORD;
                 }
                 columnKind.put(field.getName(), kind);
@@ -194,8 +194,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
         List<String> pkScanColumns = loadPk ? Collections.singletonList(intField) : Collections.emptyList();
         FixedBitSet live = new FixedBitSet(maxDoc);
         int liveCount = 0;
-        ScanOptions options = new ScanOptions.Builder()
-            .fragmentIds(Collections.singletonList(fragmentId))
+        ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
             .columns(pkScanColumns)
             .withRowAddress(true)
             .build();
@@ -320,8 +319,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             }
             long[] col = new long[maxDoc];
             FixedBitSet presence = new FixedBitSet(maxDoc);
-            ScanOptions colOptions = new ScanOptions.Builder()
-                .fragmentIds(Collections.singletonList(fragmentId))
+            ScanOptions colOptions = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
                 .columns(Collections.singletonList(name))
                 .withRowAddress(true)
                 .build();
@@ -356,8 +354,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             }
             long[] col = new long[maxDoc];
             FixedBitSet presence = new FixedBitSet(maxDoc);
-            ScanOptions colOptions = new ScanOptions.Builder()
-                .fragmentIds(Collections.singletonList(fragmentId))
+            ScanOptions colOptions = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
                 .columns(Collections.singletonList(name))
                 .withRowAddress(true)
                 .build();
@@ -397,8 +394,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 return;
             }
             String[] raw = new String[maxDoc];
-            ScanOptions colOptions = new ScanOptions.Builder()
-                .fragmentIds(Collections.singletonList(fragmentId))
+            ScanOptions colOptions = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
                 .columns(Collections.singletonList(name))
                 .withRowAddress(true)
                 .build();
@@ -409,9 +405,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     VarCharVector vector = (VarCharVector) root.getVector(name);
                     for (int i = 0; i < root.getRowCount(); i++) {
                         int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
-                        raw[offset] = vector.isNull(i)
-                            ? null
-                            : new String(vector.get(i), java.nio.charset.StandardCharsets.UTF_8);
+                        raw[offset] = vector.isNull(i) ? null : new String(vector.get(i), java.nio.charset.StandardCharsets.UTF_8);
                     }
                 }
             } catch (Exception e) {
@@ -461,8 +455,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 return;
             }
             String[][] rows = new String[maxDoc][];
-            ScanOptions colOptions = new ScanOptions.Builder()
-                .fragmentIds(Collections.singletonList(fragmentId))
+            ScanOptions colOptions = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
                 .columns(Collections.singletonList(name))
                 .withRowAddress(true)
                 .build();
@@ -542,8 +535,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 return;
             }
             byte[][] col = new byte[maxDoc][];
-            ScanOptions colOptions = new ScanOptions.Builder()
-                .fragmentIds(Collections.singletonList(fragmentId))
+            ScanOptions colOptions = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
                 .columns(Collections.singletonList(name))
                 .withRowAddress(true)
                 .build();

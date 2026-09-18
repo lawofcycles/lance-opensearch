@@ -219,10 +219,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for number_of_shards, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
-        assertTrue(
-            "expected message about [number_of_shards], saw: " + body,
-            body.contains("[number_of_shards] is no longer accepted")
-        );
+        assertTrue("expected message about [number_of_shards], saw: " + body, body.contains("[number_of_shards] is no longer accepted"));
     }
 
     public void testAttachRefusesToClaimPlainIndex() throws IOException {
@@ -455,10 +452,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             // "hello lance " at even offsets and "quick brown fox"
             // at odd offsets in the body column; both must show
             // up in the response.
-            assertTrue(
-                "fragment path match_all must populate the hits array: " + matchAllBody,
-                matchAllBody.contains("\"_id\":\"0-0\"")
-            );
+            assertTrue("fragment path match_all must populate the hits array: " + matchAllBody, matchAllBody.contains("\"_id\":\"0-0\""));
             assertTrue(
                 "fragment path match_all must render _source with the body column: " + matchAllBody,
                 matchAllBody.contains("hello lance")
@@ -561,11 +555,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
                         + "}}"
                 )
             );
-            assertEquals(
-                "aggregation must count matching rows via Dataset.countRows",
-                6,
-                extractIntPath(body, "hits", "total", "value")
-            );
+            assertEquals("aggregation must count matching rows via Dataset.countRows", 6, extractIntPath(body, "hits", "total", "value"));
             assertEquals("value_count on id must equal row count", 6, extractIntPath(body, "aggregations", "c", "value"));
             assertEquals("sum(id) 0..5 == 15", 15.0d, extractDoublePath(body, "aggregations", "s", "value"), 0.0d);
             assertEquals("avg(id) 0..5 == 2.5", 2.5d, extractDoublePath(body, "aggregations", "a", "value"), 0.0d);
@@ -613,10 +603,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             String bucketBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":10}}}}")
             );
-            assertTrue(
-                "terms aggregation via fragment path carries buckets: " + bucketBody,
-                bucketBody.contains("\"buckets\":")
-            );
+            assertTrue("terms aggregation via fragment path carries buckets: " + bucketBody, bucketBody.contains("\"buckets\":"));
             assertEquals(6, extractIntPath(bucketBody, "hits", "total", "value"));
         } finally {
             try {
@@ -647,9 +634,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             // for even rows, "hello world" for odd rows). Fragment
             // path drives LanceFtsQuery via IndexSearcher.search and
             // returns 3 hits (even rows) with real BM25 scores.
-            String matchBody = readAll(
-                postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}}}")
-            );
+            String matchBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}}}"));
             assertEquals(3, extractIntPath(matchBody, "hits", "total", "value"));
             assertTrue("match hits must carry a positive Lucene score: " + matchBody, matchBody.contains("\"_score\":"));
             assertFalse("Stage 3 must not report the hard-coded 1.0 score anymore: " + matchBody, matchBody.contains("\"_score\":1.0"));
@@ -674,10 +659,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             // Sort by id descending. 6 rows -> ids 0..5, descending
             // means the first hit is id=5, then 4, 3.
             String sortBody = readAll(
-                postJson(
-                    "/" + indexName + "/_search",
-                    "{\"size\":3,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}]}"
-                )
+                postJson("/" + indexName + "/_search", "{\"size\":3,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}]}")
             );
             assertEquals(6, extractIntPath(sortBody, "hits", "total", "value"));
             // Every hit should carry sort values under the "sort" field.
@@ -719,10 +701,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             // 2, 1, 0]; skipping two leaves [3, 2, 1, 0] and size=2
             // clips to [3, 2].
             String body = readAll(
-                postJson(
-                    "/" + indexName + "/_search",
-                    "{\"from\":2,\"size\":2,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}]}"
-                )
+                postJson("/" + indexName + "/_search", "{\"from\":2,\"size\":2,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}]}")
             );
             assertEquals(6, extractIntPath(body, "hits", "total", "value"));
             assertTrue("expected sort value [3] on the first paged hit: " + body, body.contains("\"sort\":[3]"));
@@ -792,10 +771,7 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             // order is [5, 4, 3, 2, 1, 0]; the first page keeps 5
             // and 4.
             String first = readAll(
-                postJson(
-                    "/" + indexName + "/_search",
-                    "{\"size\":2,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}]}"
-                )
+                postJson("/" + indexName + "/_search", "{\"size\":2,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}]}")
             );
             assertTrue("expected first page to include sort value [5]: " + first, first.contains("\"sort\":[5]"));
             assertTrue("expected first page to include sort value [4]: " + first, first.contains("\"sort\":[4]"));

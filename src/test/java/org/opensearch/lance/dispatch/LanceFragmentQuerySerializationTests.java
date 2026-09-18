@@ -39,9 +39,9 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         // metric aggregations so the round-trip exercises the
         // native OpenSearch serialisation.
         org.opensearch.search.aggregations.AggregatorFactories.Builder aggs =
-            new org.opensearch.search.aggregations.AggregatorFactories.Builder()
-                .addAggregator(new org.opensearch.search.aggregations.metrics.SumAggregationBuilder("s").field("id"))
-                .addAggregator(new org.opensearch.search.aggregations.metrics.MinAggregationBuilder("m").field("id"));
+            new org.opensearch.search.aggregations.AggregatorFactories.Builder().addAggregator(
+                new org.opensearch.search.aggregations.metrics.SumAggregationBuilder("s").field("id")
+            ).addAggregator(new org.opensearch.search.aggregations.metrics.MinAggregationBuilder("m").field("id"));
         LanceFragmentQueryRequest original = new LanceFragmentQueryRequest(
             "s3://bucket/tables/demo.lance",
             "demo",
@@ -117,20 +117,18 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         // code path rather than an empty container: an empty
         // InternalAggregations would not catch bugs in
         // per-aggregation serialisation.
-        org.opensearch.search.aggregations.InternalAggregations aggregations =
-            org.opensearch.search.aggregations.InternalAggregations.from(
-                List.<org.opensearch.search.aggregations.InternalAggregation>of(
-                    new org.opensearch.search.aggregations.metrics.InternalSum("s", 3.0d,
-                        org.opensearch.search.DocValueFormat.RAW, java.util.Map.of())
+        org.opensearch.search.aggregations.InternalAggregations aggregations = org.opensearch.search.aggregations.InternalAggregations.from(
+            List.<org.opensearch.search.aggregations.InternalAggregation>of(
+                new org.opensearch.search.aggregations.metrics.InternalSum(
+                    "s",
+                    3.0d,
+                    org.opensearch.search.DocValueFormat.RAW,
+                    java.util.Map.of()
                 )
-            );
-
-        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(
-            1L,
-            1,
-            List.of(hit),
-            aggregations
+            )
         );
+
+        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(1L, 1, List.of(hit), aggregations);
 
         LanceFragmentQueryResponse restored;
         try (BytesStreamOutput out = new BytesStreamOutput()) {

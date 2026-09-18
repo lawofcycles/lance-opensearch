@@ -61,9 +61,7 @@ final class LanceAggregationSupport {
 
     /** True when the source carries at least one aggregation. */
     static boolean hasAggregations(SearchSourceBuilder source) {
-        return source != null
-            && source.aggregations() != null
-            && !source.aggregations().getAggregatorFactories().isEmpty();
+        return source != null && source.aggregations() != null && !source.aggregations().getAggregatorFactories().isEmpty();
     }
 
     private static boolean isBuilderSupported(AggregationBuilder builder) {

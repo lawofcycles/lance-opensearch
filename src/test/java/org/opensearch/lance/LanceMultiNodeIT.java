@@ -81,12 +81,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertTrue("expected _rowaddr-derived hit ids: " + body, body.contains("\"_id\":\"0-0\""));
             assertTrue("expected _source rendered from Arrow: " + body, body.contains("hello lance"));
 
-            String sumBody = readAll(
-                postJson(
-                    "/" + indexName + "/_search",
-                    "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
-                )
-            );
+            String sumBody = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"));
             assertEquals(6, extractIntPath(sumBody, "hits", "total", "value"));
             assertEquals(15.0d, extractDoublePath(sumBody, "aggregations", "s", "value"), 0.0d);
         } finally {

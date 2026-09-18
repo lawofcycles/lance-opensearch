@@ -55,7 +55,6 @@ import org.opensearch.search.query.ReduceableSearchResult;
 import org.opensearch.search.rescore.RescoreContext;
 import org.opensearch.search.sort.SortAndFormats;
 import org.opensearch.search.suggest.SuggestionSearchContext;
-import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.unit.TimeValue;
 
@@ -186,7 +185,9 @@ public final class LanceFragmentSearchContext extends SearchContext {
     @Override
     public ContextIndexSearcher searcher() {
         if (searcher == null) {
-            throw new IllegalStateException("LanceFragmentSearchContext.searcher() called before withSearcher(...) attached the ContextIndexSearcher");
+            throw new IllegalStateException(
+                "LanceFragmentSearchContext.searcher() called before withSearcher(...) attached the ContextIndexSearcher"
+            );
         }
         return searcher;
     }

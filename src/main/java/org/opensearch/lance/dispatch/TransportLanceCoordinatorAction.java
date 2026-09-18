@@ -11,7 +11,6 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -439,15 +438,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * the recursive {@link #runIndexLoop} / {@link #fanOutForTarget}
      * signatures short even as new wire-format fields are added.
      */
-    private record FragmentQuerySpec(
-        String filterSql,
-        org.opensearch.index.query.QueryBuilder query,
-        org.opensearch.index.query.QueryBuilder postFilter,
-        List<org.opensearch.search.sort.SortBuilder<?>> sorts,
-        Object[] searchAfter,
-        int effectiveSize,
-        AggregatorFactories.Builder aggregations
-    ) {}
+    private record FragmentQuerySpec(String filterSql, org.opensearch.index.query.QueryBuilder query,
+        org.opensearch.index.query.QueryBuilder postFilter, List<org.opensearch.search.sort.SortBuilder<?>> sorts, Object[] searchAfter,
+        int effectiveSize, AggregatorFactories.Builder aggregations) {
+    }
 
     /**
      * Mutable accumulator that folds every fan-out result into the

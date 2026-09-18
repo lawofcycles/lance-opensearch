@@ -102,8 +102,7 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
                 }
                 int maxDoc = leaf.maxDoc();
                 FixedBitSet matches = new FixedBitSet(maxDoc);
-                ScanOptions options = new ScanOptions.Builder()
-                    .fragmentIds(Collections.singletonList(leaf.fragmentId()))
+                ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(leaf.fragmentId()))
                     .filter(filterSql)
                     .withRowAddress(true)
                     .limit((long) maxDoc)

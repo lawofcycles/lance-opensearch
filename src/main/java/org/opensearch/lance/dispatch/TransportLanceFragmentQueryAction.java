@@ -8,7 +8,6 @@ package org.opensearch.lance.dispatch;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -23,7 +22,6 @@ import org.lance.Fragment;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.util.BigArrays;
@@ -155,9 +153,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
 
             IndexMetadata indexMetadata = clusterService.state().metadata().index(request.indexName());
             if (indexMetadata == null) {
-                throw new IllegalStateException(
-                    "Fragment path cannot resolve OpenSearch index [" + request.indexName() + "] on this node"
-                );
+                throw new IllegalStateException("Fragment path cannot resolve OpenSearch index [" + request.indexName() + "] on this node");
             }
             Index index = indexMetadata.getIndex();
             IndexService indexService = indicesService.indexServiceSafe(index);
@@ -214,7 +210,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     // filter applies to hits (and hits.total.value)
                     // but not to aggregations. Hits and matched
                     // therefore use the AND-combined query.
-                    List<SearchHit> hits = scanHitsViaIndexSearcher(searcher, hitsQuery, sortAndFormats, request.searchAfter(), request.size());
+                    List<SearchHit> hits = scanHitsViaIndexSearcher(
+                        searcher,
+                        hitsQuery,
+                        sortAndFormats,
+                        request.searchAfter(),
+                        request.size()
+                    );
                     InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query);
                     long matched = computeMatched(dataset, request, searcher, hitsQuery);
                     return new LanceFragmentQueryResponse(matched, fragmentCount, hits, aggregations);
@@ -284,8 +286,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             return base;
         }
         Query pf = request.postFilter().toQuery(qsc);
-        return new org.apache.lucene.search.BooleanQuery.Builder()
-            .add(base, org.apache.lucene.search.BooleanClause.Occur.MUST)
+        return new org.apache.lucene.search.BooleanQuery.Builder().add(base, org.apache.lucene.search.BooleanClause.Occur.MUST)
             .add(pf, org.apache.lucene.search.BooleanClause.Occur.FILTER)
             .build();
     }
@@ -486,12 +487,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * so this is a second pass in exchange for the exact total
      * (versus underestimating when {@code size} clips).
      */
-    private long computeMatched(
-        Dataset dataset,
-        LanceFragmentQueryRequest request,
-        ContextIndexSearcher searcher,
-        Query luceneQuery
-    ) throws Exception {
+    private long computeMatched(Dataset dataset, LanceFragmentQueryRequest request, ContextIndexSearcher searcher, Query luceneQuery)
+        throws Exception {
         List<Integer> fragmentIds = request.fragmentIdsOrNull();
         String filterSql = request.filterSql();
         boolean hasScoringQuery = request.query() != null && filterSql == null;

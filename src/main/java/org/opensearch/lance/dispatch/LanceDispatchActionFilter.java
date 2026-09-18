@@ -5,8 +5,6 @@
 
 package org.opensearch.lance.dispatch;
 
-import java.util.Optional;
-
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
@@ -23,15 +21,8 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.index.Index;
-import org.opensearch.index.query.BoolQueryBuilder;
-import org.opensearch.index.query.ExistsQueryBuilder;
-import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
-import org.opensearch.index.query.RangeQueryBuilder;
-import org.opensearch.index.query.TermQueryBuilder;
-import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.lance.engine.LanceEngineFactory;
-import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.builder.SearchSourceBuilder;
