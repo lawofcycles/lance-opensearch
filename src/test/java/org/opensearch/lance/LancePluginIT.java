@@ -208,15 +208,21 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         assertTrue("expected message about [table], saw: " + body, body.contains("[table]"));
     }
 
-    public void testAttachRejectsNonNumericShards() throws IOException {
-        // Sending `number_of_shards` as a string previously crashed inside the
-        // Object -> Number cast and returned 500. It must be rejected as 400.
-        String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"number_of_shards\":\"3\"}";
+    public void testAttachRejectsNumberOfShards() throws IOException {
+        // Attach used to derive a shard count from the row count and accept an
+        // explicit `number_of_shards` override. The fragment path is now the
+        // only search implementation and fans out per fragment regardless of
+        // shard count, so attach rejects the option to avoid silently
+        // ignoring it.
+        String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"number_of_shards\":3}";
         ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
         int status = failure.getResponse().getStatusLine().getStatusCode();
-        assertEquals("expected 400 for non-numeric number_of_shards, saw " + status, 400, status);
+        assertEquals("expected 400 for number_of_shards, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
-        assertTrue("expected message about [number_of_shards], saw: " + body, body.contains("[number_of_shards]"));
+        assertTrue(
+            "expected message about [number_of_shards], saw: " + body,
+            body.contains("[number_of_shards] is no longer accepted")
+        );
     }
 
     public void testAttachRefusesToClaimPlainIndex() throws IOException {

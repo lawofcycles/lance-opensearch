@@ -43,10 +43,14 @@ import org.opensearch.transport.client.node.NodeClient;
  * The RFC's attach operation. Derives everything from the table and creates
  * a real engine backed index. The mapping follows the derivation defaults
  * (a string column carrying an FTS index maps to text, integers map to
- * numeric doc values fields), the shard count follows table size, and the
- * primary key is detected from Lance field metadata. Optional overrides:
- * "name" (index name, defaults to the table directory name) and
- * "number_of_shards" (pins the derived count).
+ * numeric doc values fields), the shard count is always one, and the
+ * primary key is detected from Lance field metadata. Optional override:
+ * "name" (index name, defaults to the table directory name).
+ *
+ * <p>Attach always creates a single-shard index because the fragment path
+ * (see {@code LanceDispatchActionFilter}) is the only search implementation
+ * left, and it fans out to fragments regardless of shard count. Requests
+ * carrying {@code number_of_shards} are rejected with 400.
  *
  * <p>Threading: the JNI work ({@link Dataset#open}, schema and row counts)
  * runs on {@link ThreadPool.Names#GENERIC}. The transport thread only
@@ -61,7 +65,6 @@ import org.opensearch.transport.client.node.NodeClient;
 public class RestAttachAction extends BaseRestHandler {
 
     private static final String PK_METADATA_KEY = "lance-schema:unenforced-primary-key";
-    private static final long ROWS_PER_SHARD_TARGET = 500_000;
 
     private final ThreadPool threadPool;
     private final AllowedTableRoots allowedRoots;
@@ -91,7 +94,6 @@ public class RestAttachAction extends BaseRestHandler {
 
         String table;
         String explicitName;
-        Number pinnedShards;
         StorageOptions storageOptions;
         try {
             table = readOptionalString(body, "table");
@@ -99,7 +101,22 @@ public class RestAttachAction extends BaseRestHandler {
                 return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, "[table] is required"));
             }
             explicitName = readOptionalString(body, "name");
-            pinnedShards = readOptionalNumber(body, "number_of_shards");
+            if (body.containsKey("number_of_shards")) {
+                // Attach used to derive a shard count from the row count, but
+                // the fragment path is now the only search implementation and
+                // shards no longer influence fan-out. Rejecting the option is
+                // cleaner than silently ignoring it — an operator setting
+                // `number_of_shards: 5` would otherwise still get a
+                // single-shard index and be confused about why fan-out did
+                // not widen.
+                return channel -> channel.sendResponse(
+                    new BytesRestResponse(
+                        RestStatus.BAD_REQUEST,
+                        "[number_of_shards] is no longer accepted by /_lance/attach; the fragment path fans out at the fragment "
+                            + "level regardless of shard count, and Lance-backed indices are always single-shard"
+                    )
+                );
+            }
             storageOptions = StorageOptions.parseFromRequestField(body.get("storage_options"), "[lance_attach]");
         } catch (IllegalArgumentException e) {
             String message = e.getMessage();
@@ -118,7 +135,6 @@ public class RestAttachAction extends BaseRestHandler {
 
         final String tableFinal = table;
         final String indexName = explicitName != null ? explicitName : tableName(table);
-        final Number pinnedShardsFinal = pinnedShards;
         final StorageOptions storageOptionsFinal = storageOptions;
 
         // Dispatch the JNI work to the generic pool. Dataset.open blocks on
@@ -126,7 +142,7 @@ public class RestAttachAction extends BaseRestHandler {
         return channel -> threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             Derivation derivation;
             try (Dataset dataset = LanceRegistry.openDataset(tableFinal, storageOptionsFinal)) {
-                derivation = derive(dataset, pinnedShardsFinal);
+                derivation = derive(dataset);
             } catch (Exception e) {
                 sendError(channel, e);
                 return;
@@ -145,7 +161,7 @@ public class RestAttachAction extends BaseRestHandler {
         StorageOptions storageOptions
     ) {
         Settings.Builder settings = Settings.builder()
-            .put("index.number_of_shards", derivation.shards)
+            .put("index.number_of_shards", 1)
             .put("index.number_of_replicas", 0)
             .put(LanceEngineFactory.TABLE_SETTING, table)
             .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField);
@@ -250,7 +266,6 @@ public class RestAttachAction extends BaseRestHandler {
             b.field("version", derivation.version);
             b.field("rows", derivation.rows);
             b.field("fragments", derivation.fragments);
-            b.field("derived_number_of_shards", derivation.shards);
             b.field("derived_key_field", derivation.keyField);
             b.rawField(
                 "derived_mapping",
@@ -277,17 +292,6 @@ public class RestAttachAction extends BaseRestHandler {
         return (String) v;
     }
 
-    private static Number readOptionalNumber(Map<String, Object> body, String key) {
-        Object v = body.get(key);
-        if (v == null) {
-            return null;
-        }
-        if (!(v instanceof Number)) {
-            throw new IllegalArgumentException("[" + key + "] must be a number, got " + v.getClass().getSimpleName());
-        }
-        return (Number) v;
-    }
-
     private static void sendError(RestChannel channel, Exception e) {
         try {
             channel.sendResponse(new BytesRestResponse(channel, e));
@@ -304,16 +308,13 @@ public class RestAttachAction extends BaseRestHandler {
         }
     }
 
-    public record Derivation(String mappingJson, int shards, String keyField, long version, long rows, int fragments, List<String> notes,
+    public record Derivation(String mappingJson, String keyField, long version, long rows, int fragments, List<String> notes,
         java.util.Set<String> ftsColumns, java.util.Set<String> scalarColumns, java.util.Set<String> vectorColumns) {
     }
 
-    public static Derivation derive(Dataset dataset, Number pinnedShards) throws Exception {
+    public static Derivation derive(Dataset dataset) throws Exception {
         long rows = dataset.countRows();
         int fragments = dataset.getFragments().size();
-        int shards = pinnedShards != null
-            ? pinnedShards.intValue()
-            : (int) Math.max(1, Math.min(fragments == 0 ? 1 : fragments, (rows + ROWS_PER_SHARD_TARGET - 1) / ROWS_PER_SHARD_TARGET));
 
         String keyField = null;
         java.util.List<String> notes = new java.util.ArrayList<>();
@@ -454,7 +455,6 @@ public class RestAttachAction extends BaseRestHandler {
         }
         return new Derivation(
             mapping.toString(),
-            shards,
             keyField,
             dataset.version(),
             rows,

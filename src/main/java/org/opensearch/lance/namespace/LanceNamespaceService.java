@@ -356,7 +356,7 @@ public final class LanceNamespaceService {
                     // The RFC's Mapping interface states the mapping is re-derived at
                     // every checkout. We derive first so the builder only touches
                     // columns that derived to lance_text; keyword columns stay untouched.
-                    RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, null);
+                    RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset);
                     rederivedMappingJson = derivation.mappingJson();
                     warnOnLanceFieldRename(indexName, dataset.getLanceSchema());
                     if ("wait".equals(policy)) {
@@ -454,16 +454,15 @@ public final class LanceNamespaceService {
             // the current Lance schema. Automatic index creation is off by
             // default (see C3 / C9); operators build indexes explicitly
             // through POST /_lance/build_indexes.
-            derivation = RestAttachAction.derive(dataset, null);
+            derivation = RestAttachAction.derive(dataset);
         }
         // Fire the CreateIndex asynchronously so a red shard on this table
         // does not block the poll thread for 30 seconds waiting for ack.
         // Every other table in the same namespace was previously stuck
         // behind that block. See issue #29.
         final long version = derivation.version();
-        final int shards = derivation.shards();
         Settings.Builder settings = Settings.builder()
-            .put("index.number_of_shards", shards)
+            .put("index.number_of_shards", 1)
             .put("index.number_of_replicas", 0)
             .put(LanceEngineFactory.TABLE_SETTING, table)
             .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField());
@@ -476,7 +475,7 @@ public final class LanceNamespaceService {
                     @Override
                     public void onResponse(org.opensearch.action.admin.indices.create.CreateIndexResponse response) {
                         servedVersions.put(indexName, version);
-                        LOG.info("surfaced table {} as index {} (version {}, {} shards)", table, indexName, version, shards);
+                        LOG.info("surfaced table {} as index {} (version {})", table, indexName, version);
                     }
 
                     @Override

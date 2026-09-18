@@ -170,7 +170,7 @@ public class RestBuildIndexesAction extends BaseRestHandler {
         List<String> scalarBuilt;
         List<String> vectorBuilt;
         try (Dataset dataset = LanceRegistry.openDataset(tableUri, storageOptions)) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, null);
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset);
             Set<String> columnsFilter = columnsFilterRaw != null ? new LinkedHashSet<>(columnsFilterRaw) : null;
             if (columnsFilter != null) {
                 // Reject unknown columns up front so callers don't get a 200

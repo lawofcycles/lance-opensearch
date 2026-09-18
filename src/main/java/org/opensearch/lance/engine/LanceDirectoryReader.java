@@ -39,20 +39,29 @@ public final class LanceDirectoryReader extends DirectoryReader {
     // a real CacheHelper without reimplementing Lucene's cache internals.
     private final DirectoryReader cacheLifetimeBridge;
 
-    public static LanceDirectoryReader open(
-        Directory directory,
-        IndexCommit commit,
-        Dataset dataset,
-        String intField,
-        int shardId,
-        int numShards
-    ) throws IOException {
+    /**
+     * Open a reader whose leaves are every fragment of {@code dataset}. Used
+     * by the shard-level engine ({@link LanceEngineFactory.LanceReadOnlyEngine})
+     * to expose the whole table through the single primary shard that a
+     * Lance-backed attach always produces. The RFC's shard-partitioning
+     * scheme (fragment id modulo shard count) was retired when
+     * {@code number_of_shards} was dropped from attach; {@link #openForFragments}
+     * is the fan-out variant used by the fragment path.
+     *
+     * @param directory the Lucene {@link Directory} the reader reports to
+     *                  Lucene's own bookkeeping; the reader does not actually
+     *                  write to it (fragments live in Lance).
+     * @param commit    Lucene {@link IndexCommit} for the empty bootstrap
+     *                  commit; retained through the reader lifecycle.
+     * @param dataset   the Lance dataset; the returned reader takes
+     *                  ownership and closes it on {@link #close()}.
+     * @param intField  primary key column name for {@code _id} lookups; empty
+     *                  string when the Lance table has no declared primary
+     *                  key.
+     */
+    public static LanceDirectoryReader open(Directory directory, IndexCommit commit, Dataset dataset, String intField) throws IOException {
         List<LeafReader> leaves = new ArrayList<>();
         for (Fragment fragment : dataset.getFragments()) {
-            // fragment-to-shard partitioning: shard N serves fragments with id % numShards == N
-            if (fragment.getId() % numShards != shardId) {
-                continue;
-            }
             leaves.add(
                 LanceSequentialLeafReader.wrap(
                     new LanceFragmentLeafReader(dataset, fragment.getId(), fragment.metadata().getPhysicalRows(), intField)
@@ -65,9 +74,9 @@ public final class LanceDirectoryReader extends DirectoryReader {
     /**
      * Open a reader whose leaves are the explicit list of Lance fragment ids
      * — the fan-out unit the shard-free (direction 1) fragment path receives
-     * from the coordinator. Contrast with the shard-mode variant above, which
-     * derives its leaf list from a {@code shardId % numShards} partition of
-     * the whole table. This variant lets the per-node handler open exactly
+     * from the coordinator. Contrast with the whole-table variant above,
+     * which returns every fragment for the shard-level engine to serve GET
+     * by _id and stats. This variant lets the per-node handler open exactly
      * the fragments it was told to scan, so the resulting DirectoryReader is
      * usable directly by an {@link org.apache.lucene.search.IndexSearcher}
      * that drives stock OpenSearch aggregators against per-fragment leaves.

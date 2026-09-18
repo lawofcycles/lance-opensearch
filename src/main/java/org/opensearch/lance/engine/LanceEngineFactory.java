@@ -62,9 +62,8 @@ public final class LanceEngineFactory implements EngineFactory {
         String table = config.getIndexSettings().getSettings().get(TABLE_SETTING);
         String field = config.getIndexSettings().getSettings().get(PRIMARY_KEY_FIELD_SETTING, "");
         int shardId = config.getShardId().id();
-        int numShards = config.getIndexSettings().getNumberOfShards();
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(config.getIndexSettings().getSettings());
-        return new LanceReadOnlyEngine(config, table, field, shardId, numShards, storageOptions);
+        return new LanceReadOnlyEngine(config, table, field, shardId, storageOptions);
     }
 
     static final class LanceReadOnlyEngine extends ReadOnlyEngine {
@@ -74,16 +73,14 @@ public final class LanceEngineFactory implements EngineFactory {
         final String tablePath;
         final String field;
         final int shardId;
-        final int numShards;
         final StorageOptions storageOptions;
         private final LanceReaderManager lanceReaderManager;
 
-        LanceReadOnlyEngine(EngineConfig config, String table, String field, int shardId, int numShards, StorageOptions storageOptions) {
+        LanceReadOnlyEngine(EngineConfig config, String table, String field, int shardId, StorageOptions storageOptions) {
             super(config, null, null, true, Function.identity(), true);
             this.tablePath = table;
             this.field = field;
             this.shardId = shardId;
-            this.numShards = numShards;
             this.storageOptions = storageOptions;
             try {
                 OpenSearchDirectoryReader initial = openLanceReader();
@@ -110,7 +107,7 @@ public final class LanceEngineFactory implements EngineFactory {
             OpenSearchDirectoryReader wrapped = null;
             LanceDirectoryReader reader = null;
             try {
-                reader = LanceDirectoryReader.open(directory, commit, dataset, field, shardId, numShards);
+                reader = LanceDirectoryReader.open(directory, commit, dataset, field);
                 wrapped = OpenSearchDirectoryReader.wrap(reader, config().getShardId());
                 return wrapped;
             } catch (Throwable t) {
@@ -227,24 +224,12 @@ public final class LanceEngineFactory implements EngineFactory {
                 // name to Lance and getting a 500 back.
                 return GetResult.NOT_EXISTS;
             }
-            if (numShards > 1) {
-                // OpenSearch routes GET /_doc/{id} to `hash(_id) % numShards`,
-                // but a Lance PK has no relationship to the fragment layout,
-                // so the request lands on the correct shard only by chance
-                // (verified against a 4-shard attach: 7/16 hits). Silent
-                // `found: false` on the miss shards is worse than a clean
-                // rejection. The proper fix — coordinator-side fan-out to
-                // every shard — is tracked as follow-up work; until then,
-                // fail loudly so operators know to fall back to `_search`
-                // or attach with `number_of_shards: 1`.
-                throw new IllegalArgumentException(
-                    "GET by _id is not supported on Lance indices with more than one shard (numShards="
-                        + numShards
-                        + "). Use `_search` with a term query on `"
-                        + field
-                        + "` instead, or reattach the index with `number_of_shards: 1`."
-                );
-            }
+            // Lance-backed indices are always single-shard (attach rejects
+            // number_of_shards > 1), so GET /_doc/{id} always lands on the
+            // shard holding every fragment. When multi-shard support is
+            // revisited, the coordinator will need to fan out to every
+            // shard because a Lance primary key has no relationship to
+            // OpenSearch's hash(_id) % numShards routing.
             long key;
             try {
                 key = Long.parseLong(get.id());
