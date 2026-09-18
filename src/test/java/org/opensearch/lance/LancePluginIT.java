@@ -819,13 +819,19 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
-    public void testFragmentDispatchModeAnswersScriptCollapseAndRescore() throws Exception {
-        // Probe: three shapes flow through the fragment path without
-        // any explicit plumbing because the per-fragment reader
-        // already exposes the doc values / IndexSearcher hooks each
-        // one needs. If this test starts failing, the shape has to
-        // move onto the isDispatchable reject list (or the fragment
-        // executor has to grow the missing piece).
+    public void testFragmentDispatchModeAnswersScriptQueryAndScriptSort() throws Exception {
+        // Two shapes flow through the fragment path without any
+        // explicit plumbing because the per-fragment reader already
+        // exposes doc values that scripts consume through the
+        // standard DocValues API. If this test starts failing, the
+        // shape has to move onto the isDispatchable reject list (or
+        // the fragment executor has to grow the missing piece).
+        //
+        // collapse and rescore used to live in this test as well
+        // but they are silent no-ops on the fragment path (collapse
+        // returns ungrouped hits, rescore leaves first-pass scores
+        // untouched), so they now sit on the isDispatchable reject
+        // list and go through the standard shard path instead.
         String suffix = "s3-scq-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -857,33 +863,6 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             assertEquals(6, extractIntPath(sortBody, "hits", "total", "value"));
             assertTrue("script sort first hit should carry sort value 5: " + sortBody, sortBody.contains("\"sort\":[5"));
             assertTrue("script sort second hit should carry sort value 4: " + sortBody, sortBody.contains("\"sort\":[4"));
-
-            // Collapse on the id column. Every id is unique so
-            // the collapsed hit count matches the raw count, but
-            // the collapse phase itself runs through the fragment
-            // path — the per-fragment reader exposes id as
-            // NumericDocValues which the collapse builder consumes
-            // through the standard collector.
-            String collapseBody = readAll(
-                postJson(
-                    "/" + indexName + "/_search",
-                    "{\"size\":10,\"query\":{\"match_all\":{}},\"collapse\":{\"field\":\"id\"},\"sort\":[{\"id\":\"asc\"}]}"
-                )
-            );
-            assertEquals(6, extractIntPath(collapseBody, "hits", "total", "value"));
-
-            // Rescore: match_all first pass, then rescore top-3
-            // window by body match on "lance". The rescore phase
-            // runs on the fragment path's IndexSearcher — hits
-            // that match the body FTS get a higher score.
-            String rescoreBody = readAll(
-                postJson(
-                    "/" + indexName + "/_search",
-                    "{\"size\":3,\"query\":{\"match_all\":{}},"
-                        + "\"rescore\":{\"window_size\":6,\"query\":{\"rescore_query\":{\"match\":{\"body\":\"lance\"}}}}}"
-                )
-            );
-            assertEquals(6, extractIntPath(rescoreBody, "hits", "total", "value"));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));

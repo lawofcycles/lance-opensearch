@@ -32,6 +32,8 @@ import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
+import org.opensearch.search.aggregations.AggregationBuilder;
+import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.client.Client;
@@ -47,9 +49,10 @@ import org.opensearch.transport.client.Client;
  *   <li>Recognise whether the request is fragment-dispatchable
  *       ({@link #allLanceBacked} plus {@link #isDispatchable} plus
  *       {@link LanceAggregationSupport#isSupported}) — reject shapes
- *       the fragment executor cannot yet answer (search_after,
- *       highlighter, suggester, post_filter, or
- *       cross-index metrics).</li>
+ *       the fragment executor cannot answer correctly: suggester,
+ *       highlighter, score-only {@code search_after}, {@code
+ *       collapse}, {@code rescore}, pipeline aggregations, and
+ *       cross-index metrics.</li>
  *   <li>Delegate the request to {@link LanceCoordinatorAction} via
  *       {@link Client#execute(org.opensearch.action.ActionType,
  *       org.opensearch.action.ActionRequest, ActionListener)}.
@@ -252,6 +255,70 @@ public class LanceDispatchActionFilter implements ActionFilter {
         if (source.searchAfter() != null && (source.sorts() == null || source.sorts().isEmpty())) {
             return false;
         }
+        // collapse groups hits by a field and can materialise
+        // inner_hits per group. The fragment executor does not
+        // synthesise the CollapsingTopDocsCollector state, so hits
+        // come back ungrouped and inner_hits disappear silently.
+        // Send to the shard path instead of returning wrong hits.
+        if (source.collapse() != null) {
+            return false;
+        }
+        // rescore layers a second-pass query on top of the first
+        // Sort/TopDocs window. The fragment executor drives a plain
+        // IndexSearcher.search and never runs the rescorer, so
+        // scores stay at their first-pass values. Send to the shard
+        // path so users get either the rescored order or a proper
+        // error, not silent scores.
+        if (source.rescores() != null && !source.rescores().isEmpty()) {
+            return false;
+        }
+        // Pipeline aggregations (sibling like avg_bucket / bucket_sort
+        // and parent like cumulative_sum) hit an
+        // "Already been replayed" IllegalStateException in the
+        // coordinator merge because the fragment path replays the
+        // InternalAggregations tree in a way the pipeline aggregators
+        // don't expect. Route to the shard path where the standard
+        // reduce loop handles them.
+        if (source.aggregations() != null && hasPipelineAggregation(source.aggregations())) {
+            return false;
+        }
         return true;
+    }
+
+    /**
+     * Returns {@code true} if the aggregation tree contains any
+     * pipeline aggregator, either at the top level (sibling pipelines
+     * such as {@code avg_bucket}) or nested inside a bucket
+     * aggregation (parent pipelines such as {@code cumulative_sum}
+     * or {@code bucket_sort}).
+     */
+    private static boolean hasPipelineAggregation(AggregatorFactories.Builder aggs) {
+        if (aggs == null) {
+            return false;
+        }
+        if (!aggs.getPipelineAggregatorFactories().isEmpty()) {
+            return true;
+        }
+        for (AggregationBuilder child : aggs.getAggregatorFactories()) {
+            if (containsPipeline(child)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsPipeline(AggregationBuilder agg) {
+        if (agg == null) {
+            return false;
+        }
+        if (!agg.getPipelineAggregations().isEmpty()) {
+            return true;
+        }
+        for (AggregationBuilder child : agg.getSubAggregations()) {
+            if (containsPipeline(child)) {
+                return true;
+            }
+        }
+        return false;
     }
 }

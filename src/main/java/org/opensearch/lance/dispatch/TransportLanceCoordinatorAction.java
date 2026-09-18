@@ -303,8 +303,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     }
 
     /**
-     * Filter the data-node list down to nodes that hold at least one
-     * started shard copy of the target index.
+     * Return the single data node that hosts the primary shard of
+     * the target index.
      *
      * <p>The fragment path drives OpenSearch's aggregator machinery
      * through {@link org.opensearch.index.shard.IndexShard} so the
@@ -315,22 +315,25 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * {@code IndexNotFoundException}), so the fragment query would
      * fail there.
      *
-     * <p>Lance-backed indices are created with {@code
-     * number_of_replicas=0} so, in a multi-node cluster, only one
-     * data node holds the shard at steady state. Fragment fan-out
-     * collapses to that node when this method runs. Every fragment
-     * still executes because Lance fragments live in external
-     * storage: the shard-holding node can open any fragment through
-     * {@link org.opensearch.lance.LanceRegistry#openDataset}. To
-     * reintroduce cross-node parallelism, operators can request more
-     * shards (or replicas) — each additional shard copy widens the
-     * set of nodes this filter accepts.
+     * <p>Lance-backed indices are single-shard. With the default
+     * {@code number_of_replicas=0} exactly one data node holds the
+     * shard, and the fragment fan-out collapses to that node. With
+     * {@code auto_expand_replicas} or an explicit replica count the
+     * routing table also carries replica copies; if the coordinator
+     * merged partials from both primary and replica hosts it would
+     * concatenate two disjoint sets of fragments and per-node sort
+     * order would leak into the top-level {@code hits} sequence.
+     * The fragment path has no per-node sort merge, so we pin
+     * fan-out to the primary. Every fragment still executes because
+     * Lance fragments live in external storage: the primary node can
+     * open any fragment through
+     * {@link org.opensearch.lance.LanceRegistry#openDataset}.
      *
      * <p>If cluster state has no {@link IndexRoutingTable} for the
-     * index yet (very early in create-index handling) or no shard is
-     * started anywhere, fall back to the caller's full node list.
-     * The receiving node then surfaces a clear
-     * {@code IndexNotFoundException} in that rare case.
+     * index yet (very early in create-index handling) or the primary
+     * is not yet {@link ShardRouting#started()}, fall back to the
+     * caller's full node list. The receiving node then surfaces a
+     * clear {@code IndexNotFoundException} in that rare case.
      */
     private List<DiscoveryNode> nodeListForTarget(IndexTarget target, List<DiscoveryNode> fullList) {
         IndexMetadata indexMetadata = clusterService.state().metadata().index(target.indexName());
@@ -341,21 +344,23 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         if (routingTable == null) {
             return fullList;
         }
-        java.util.Set<String> nodesWithShard = new java.util.HashSet<>();
+        String primaryNodeId = null;
         for (IndexShardRoutingTable shardTable : routingTable) {
-            for (ShardRouting shardRouting : shardTable) {
-                if (shardRouting.started()) {
-                    nodesWithShard.add(shardRouting.currentNodeId());
-                }
+            ShardRouting primary = shardTable.primaryShard();
+            if (primary != null && primary.started()) {
+                primaryNodeId = primary.currentNodeId();
+                break;
             }
         }
-        List<DiscoveryNode> filtered = new ArrayList<>(fullList.size());
+        if (primaryNodeId == null) {
+            return fullList;
+        }
         for (DiscoveryNode node : fullList) {
-            if (nodesWithShard.contains(node.getId())) {
-                filtered.add(node);
+            if (node.getId().equals(primaryNodeId)) {
+                return java.util.Collections.singletonList(node);
             }
         }
-        return filtered.isEmpty() ? fullList : filtered;
+        return fullList;
     }
 
     /**
