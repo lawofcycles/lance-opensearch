@@ -14,8 +14,10 @@ import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.search.aggregations.AggregatorFactories;
+import org.opensearch.search.sort.SortBuilder;
 
 /**
  * Per-node dispatch request. The coordinator groups the target
@@ -27,11 +29,32 @@ import org.opensearch.search.aggregations.AggregatorFactories;
  * "all"), and honours the filter and aggregations alongside the
  * hits {@code size} allowance.
  *
- * <p>Aggregations flow as an
- * {@link AggregatorFactories.Builder} (native OpenSearch shape,
- * NamedWriteable-compatible), so any aggregation type the OpenSearch
- * aggregator machinery understands can travel across the fragment
- * dispatch wire without a plugin-specific projection.
+ * <p>Since Direction 1 Stage 3 the request carries native OpenSearch
+ * shapes on the wire:
+ * <ul>
+ *   <li>{@link #query()} — top-level query builder (nullable).
+ *       Translated to a Lucene {@link org.apache.lucene.search.Query}
+ *       on the receiving node via
+ *       {@link org.opensearch.index.query.QueryShardContext#toQuery}.
+ *       When {@code null} the executor uses
+ *       {@link org.apache.lucene.search.MatchAllDocsQuery}.</li>
+ *   <li>{@link #sorts()} — top-level sort builders (nullable, empty
+ *       list also allowed). Passed to
+ *       {@link org.apache.lucene.search.IndexSearcher#search(org.apache.lucene.search.Query, int, org.apache.lucene.search.Sort)}
+ *       through {@link org.opensearch.search.sort.SortBuilder#buildSort}.</li>
+ *   <li>{@link #aggregations()} — top-level aggregator specs
+ *       ({@link AggregatorFactories.Builder}), NamedWriteable-compatible.</li>
+ * </ul>
+ *
+ * <p>{@link #filterSql()} is preserved alongside {@link #query()} for
+ * Lance metadata-only counting via {@code Dataset.countRows(String)}.
+ * When the query is a pure filter shape (term / range / bool / ...)
+ * the coordinator sets both fields; when the query needs scoring
+ * (match / knn) only {@link #query()} is set. The per-node executor
+ * uses {@link #query()} for hits and aggregations, and
+ * {@link #filterSql()} for {@code hits.total.value} counting when
+ * available (metadata path), falling back to
+ * {@link org.apache.lucene.search.IndexSearcher#count} otherwise.
  */
 public final class LanceFragmentQueryRequest extends ActionRequest {
 
@@ -39,38 +62,19 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     private final String indexName;
     private final StorageOptions storageOptions;
     private final String filterSql;
+    private final QueryBuilder query;
+    private final List<SortBuilder<?>> sorts;
     private final int size;
     private final AggregatorFactories.Builder aggregations;
     private final List<Integer> fragmentIds;
 
-    /**
-     * @param tableUri absolute URI of the Lance table, resolved by
-     *     the coordinator from the index metadata's
-     *     {@code lance.table} setting
-     * @param indexName concrete OpenSearch index name the search
-     *     originally targeted. The receiving node uses this to look
-     *     up the {@link org.opensearch.index.IndexService} for
-     *     mapper / query-shard context construction on the
-     *     direction-1 aggregator path.
-     * @param storageOptions credentials / endpoint hints used to
-     *     open the table via {@link org.opensearch.lance.LanceRegistry}
-     * @param filterSql Lance SQL filter, or {@code null} for
-     *     match_all
-     * @param size max hits the node should return; the coordinator
-     *     may over-fetch across nodes and truncate on merge
-     * @param aggregations top-level aggregator specs; {@code null}
-     *     when the request carries no aggregations. Preserved as
-     *     the native OpenSearch shape so the receiving node feeds it
-     *     straight into {@code factoriesBuilder.build(qsc, null)}.
-     * @param fragmentIds fragment ids the node should scan; an
-     *     empty list is shorthand for "every fragment on this
-     *     dataset" and is used by single-node dispatch or by tests
-     */
     public LanceFragmentQueryRequest(
         String tableUri,
         String indexName,
         StorageOptions storageOptions,
         String filterSql,
+        QueryBuilder query,
+        List<SortBuilder<?>> sorts,
         int size,
         AggregatorFactories.Builder aggregations,
         List<Integer> fragmentIds
@@ -79,6 +83,8 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.indexName = indexName;
         this.storageOptions = storageOptions;
         this.filterSql = filterSql;
+        this.query = query;
+        this.sorts = sorts == null ? Collections.emptyList() : List.copyOf(sorts);
         this.size = size;
         this.aggregations = aggregations;
         this.fragmentIds = List.copyOf(fragmentIds);
@@ -90,6 +96,17 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.indexName = in.readString();
         this.storageOptions = StorageOptions.readFromStream(in);
         this.filterSql = in.readOptionalString();
+        this.query = in.readOptionalNamedWriteable(QueryBuilder.class);
+        int sortCount = in.readVInt();
+        if (sortCount == 0) {
+            this.sorts = Collections.emptyList();
+        } else {
+            List<SortBuilder<?>> readSorts = new ArrayList<>(sortCount);
+            for (int i = 0; i < sortCount; i++) {
+                readSorts.add(in.readNamedWriteable(SortBuilder.class));
+            }
+            this.sorts = List.copyOf(readSorts);
+        }
         this.size = in.readVInt();
         this.aggregations = in.readBoolean() ? new AggregatorFactories.Builder(in) : null;
         int fragmentCount = in.readVInt();
@@ -107,6 +124,11 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         out.writeString(indexName);
         storageOptions.writeTo(out);
         out.writeOptionalString(filterSql);
+        out.writeOptionalNamedWriteable(query);
+        out.writeVInt(sorts.size());
+        for (SortBuilder<?> sort : sorts) {
+            out.writeNamedWriteable(sort);
+        }
         out.writeVInt(size);
         if (aggregations == null) {
             out.writeBoolean(false);
@@ -140,8 +162,34 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         return storageOptions;
     }
 
+    /**
+     * Lance SQL filter for metadata-only counting via
+     * {@code Dataset.countRows(String)}. May be {@code null} when
+     * the query is not a pure filter shape (e.g. match / knn); in
+     * that case the per-node executor falls back to
+     * {@link org.apache.lucene.search.IndexSearcher#count} against
+     * {@link #query()}.
+     */
     public String filterSql() {
         return filterSql;
+    }
+
+    /**
+     * Top-level query builder, translated to a Lucene Query on the
+     * receiving node. May be {@code null} when the request is
+     * match_all; the executor then uses
+     * {@link org.apache.lucene.search.MatchAllDocsQuery}.
+     */
+    public QueryBuilder query() {
+        return query;
+    }
+
+    /**
+     * Top-level sort clauses. Empty list means no sort (score
+     * order or unordered).
+     */
+    public List<SortBuilder<?>> sorts() {
+        return sorts;
     }
 
     public int size() {
@@ -183,6 +231,8 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         String indexName,
         StorageOptions storageOptions,
         String filterSql,
+        QueryBuilder query,
+        List<SortBuilder<?>> sorts,
         int size,
         AggregatorFactories.Builder aggregations
     ) {
@@ -191,6 +241,8 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             indexName,
             storageOptions,
             filterSql,
+            query,
+            sorts,
             size,
             aggregations,
             Collections.emptyList()

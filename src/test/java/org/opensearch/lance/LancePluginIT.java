@@ -480,19 +480,21 @@ public class LancePluginIT extends OpenSearchRestTestCase {
                 assertEquals("fragment mode bool must count the intersection", 1, extractIntPath(boolBody, "hits", "total", "value"));
                 assertTrue("fragment mode bool must return the id=3 hit: " + boolBody, boolBody.contains("\"_id\":\"0-3\""));
 
-                // Query shapes outside the translator's whitelist
-                // (match on a text field) still fall through to the
-                // shard-based path. The baseline hit count comes from
-                // shard mode, so this proves the fall-through is
-                // wired correctly. Milestone 5-A intentionally leaves
-                // full-text search on the shard executor.
+                // Full-text match queries now flow through the
+                // fragment executor since Stage 3 widened the
+                // dispatch filter. The per-node handler translates
+                // the QueryBuilder via QueryShardContext.toQuery,
+                // gets a LanceFtsQuery from the lance_text field
+                // mapper, and drives IndexSearcher.search against
+                // the per-fragment reader. Baseline hit count still
+                // comes back positive from the same table.
                 int matchHits = extractIntPath(
                     readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}}}")),
                     "hits",
                     "total",
                     "value"
                 );
-                assertTrue("match query must fall through to shard path and still return hits (got " + matchHits + ")", matchHits > 0);
+                assertTrue("match query must return hits on fragment path (got " + matchHits + ")", matchHits > 0);
             } finally {
                 updateClusterSetting("lance.dispatch.mode", "shard");
             }
@@ -620,6 +622,83 @@ public class LancePluginIT extends OpenSearchRestTestCase {
             try {
                 updateClusterSetting("lance.dispatch.mode", "shard");
             } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testFragmentDispatchModeAnswersMatchKnnAndSort() throws Exception {
+        // Direction 1 Stage 3: match on lance_text, knn on
+        // lance_knn, and sort now flow through the fragment
+        // executor. The per-node handler translates the QueryBuilder
+        // via QueryShardContext.toQuery, drives IndexSearcher.search
+        // against the shared per-fragment reader, and returns real
+        // Lucene scores + sort values. Before Stage 3 all three
+        // shapes fell through to the shard fan-out.
+        String suffix = "s3-mks-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            updateClusterSetting("lance.dispatch.mode", "fragment");
+            try {
+                // Match on lance_text (body column contains "hello lance"
+                // for even rows, "hello world" for odd rows). Fragment
+                // path drives LanceFtsQuery via IndexSearcher.search and
+                // returns 3 hits (even rows) with real BM25 scores.
+                String matchBody = readAll(
+                    postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}}}")
+                );
+                assertEquals(3, extractIntPath(matchBody, "hits", "total", "value"));
+                assertTrue("match hits must carry a positive Lucene score: " + matchBody, matchBody.contains("\"_score\":"));
+                assertFalse("Stage 3 must not report the hard-coded 1.0 score anymore: " + matchBody, matchBody.contains("\"_score\":1.0"));
+
+                // knn on lance_knn. Table factory writes 8-dim
+                // vectors where row i has embedding[0]=i and all
+                // other coordinates zero (see LanceTableFactory
+                // VECTOR_DIM), so a query vector concentrated on the
+                // first axis ranks id=5 highest.
+                String queryVector = "[0.5,0.0,0.0,0.0,0.0,0.0,0.0,0.0]";
+                String knnBody = readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":3,\"query\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":" + queryVector + ",\"k\":3}}}"
+                    )
+                );
+                assertEquals(3, extractIntPath(knnBody, "hits", "total", "value"));
+                // Cosine similarity produces a positive score for the
+                // nearest neighbour.
+                assertTrue("knn top hit must have a positive score: " + knnBody, knnBody.contains("\"_score\":"));
+
+                // Sort by id descending. 6 rows -> ids 0..5, descending
+                // means the first hit is id=5, then 4, 3.
+                String sortBody = readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":3,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}]}"
+                    )
+                );
+                assertEquals(6, extractIntPath(sortBody, "hits", "total", "value"));
+                // Every hit should carry sort values under the "sort" field.
+                assertTrue("sort hits must carry sort values: " + sortBody, sortBody.contains("\"sort\":[5]"));
+                assertTrue("second sort hit must have sort value [4]: " + sortBody, sortBody.contains("\"sort\":[4]"));
+                assertTrue("third sort hit must have sort value [3]: " + sortBody, sortBody.contains("\"sort\":[3]"));
+                // Top sorted hit is the row with id=5 (Lance offset 5
+                // within fragment 0 because there's no declared PK).
+                int firstIdx = sortBody.indexOf("\"_id\":");
+                assertTrue("expected an _id in sorted response: " + sortBody, firstIdx >= 0);
+                String firstIdSlice = sortBody.substring(firstIdx, Math.min(sortBody.length(), firstIdx + 20));
+                assertTrue("first sorted hit must be _id = \"0-5\": " + firstIdSlice, firstIdSlice.contains("\"0-5\""));
+            } finally {
+                updateClusterSetting("lance.dispatch.mode", "shard");
+            }
+        } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}

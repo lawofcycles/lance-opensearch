@@ -117,6 +117,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         SearchSourceBuilder source = searchRequest.source();
 
         String filterSql = resolveFilterSql(source);
+        org.opensearch.index.query.QueryBuilder query = source == null ? null : source.query();
+        List<org.opensearch.search.sort.SortBuilder<?>> sorts = source == null || source.sorts() == null
+            ? java.util.Collections.emptyList()
+            : source.sorts();
         AggregatorFactories.Builder aggregations = source == null ? null : source.aggregations();
         int effectiveSize = resolveSize(source);
 
@@ -142,8 +146,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // Per-index fan-out results, collected sequentially.
         // Sequential loop keeps the merge trivial; parallel per-index
         // fan-out is future work if it becomes a hot spot.
+        FragmentQuerySpec spec = new FragmentQuerySpec(filterSql, query, sorts, effectiveSize, aggregations);
         MergeState merged = new MergeState(aggregations, effectiveSize);
-        runIndexLoop(targets, 0, nodeList, filterSql, effectiveSize, aggregations, merged, start, listener);
+        runIndexLoop(targets, 0, nodeList, spec, merged, start, listener);
     }
 
     /**
@@ -155,9 +160,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         List<IndexTarget> targets,
         int index,
         List<DiscoveryNode> nodeList,
-        String filterSql,
-        int effectiveSize,
-        AggregatorFactories.Builder aggregations,
+        FragmentQuerySpec spec,
         MergeState merged,
         long startMillis,
         ActionListener<SearchResponse> listener
@@ -171,12 +174,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             fanOutForTarget(
                 target,
                 nodeList,
-                filterSql,
-                effectiveSize,
-                aggregations,
+                spec,
                 merged,
                 ActionListener.wrap(
-                    v -> runIndexLoop(targets, index + 1, nodeList, filterSql, effectiveSize, aggregations, merged, startMillis, listener),
+                    v -> runIndexLoop(targets, index + 1, nodeList, spec, merged, startMillis, listener),
                     listener::onFailure
                 )
             );
@@ -195,9 +196,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     private void fanOutForTarget(
         IndexTarget target,
         List<DiscoveryNode> nodeList,
-        String filterSql,
-        int effectiveSize,
-        AggregatorFactories.Builder aggregations,
+        FragmentQuerySpec spec,
         MergeState merged,
         ActionListener<Void> done
     ) throws Exception {
@@ -227,9 +226,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 target.tableUri(),
                 target.indexName(),
                 target.storageOptions(),
-                filterSql,
-                effectiveSize,
-                aggregations,
+                spec.filterSql(),
+                spec.query(),
+                spec.sorts(),
+                spec.effectiveSize(),
+                spec.aggregations(),
                 fragmentsForNode
             );
             LOGGER.info(
@@ -347,6 +348,14 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         return filtered.isEmpty() ? fullList : filtered;
     }
 
+    /**
+     * Try to translate the top-level query to a Lance SQL filter for
+     * metadata-only row counting. Returns {@code null} when the
+     * query is match_all, absent, or cannot be expressed in Lance
+     * SQL (e.g. match, knn, or anything requiring a Lucene scoring
+     * pass). In those cases the per-node executor falls back to
+     * {@link org.apache.lucene.search.IndexSearcher#count}.
+     */
     private static String resolveFilterSql(SearchSourceBuilder source) {
         if (source == null) {
             return null;
@@ -355,7 +364,14 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         if (query == null || query instanceof org.opensearch.index.query.MatchAllQueryBuilder) {
             return null;
         }
-        return LanceKnnFilterTranslator.toLanceSql((org.opensearch.index.query.QueryBuilder) query);
+        try {
+            return LanceKnnFilterTranslator.toLanceSql((org.opensearch.index.query.QueryBuilder) query);
+        } catch (IllegalArgumentException ignored) {
+            // Query shape outside the translator's whitelist (match,
+            // knn, ...). No filter push-down; the per-node hits path
+            // and computeMatched fall back to Lucene.
+            return null;
+        }
     }
 
     private static int resolveSize(SearchSourceBuilder source) {
@@ -394,6 +410,20 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
     private record IndexTarget(String indexName, String tableUri, StorageOptions storageOptions) {
     }
+
+    /**
+     * Immutable bundle of the query-time settings the coordinator
+     * resolves once and threads through the per-index fan-out. Keeps
+     * the recursive {@link #runIndexLoop} / {@link #fanOutForTarget}
+     * signatures short even as new wire-format fields are added.
+     */
+    private record FragmentQuerySpec(
+        String filterSql,
+        org.opensearch.index.query.QueryBuilder query,
+        List<org.opensearch.search.sort.SortBuilder<?>> sorts,
+        int effectiveSize,
+        AggregatorFactories.Builder aggregations
+    ) {}
 
     /**
      * Mutable accumulator that folds every fan-out result into the

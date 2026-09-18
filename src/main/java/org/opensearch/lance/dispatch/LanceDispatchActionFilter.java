@@ -152,12 +152,11 @@ public class LanceDispatchActionFilter implements ActionFilter {
             return;
         }
 
-        Optional<String> filter = resolveDispatchFilter(searchRequest);
-        if (filter.isEmpty()) {
-            // Sorts / from > 0 / search_after / highlighter /
-            // suggester / post_filter, or a top-level query builder
-            // outside the LanceKnnFilterTranslator whitelist. Fall
-            // through so the standard path can still answer.
+        if (!isDispatchable(searchRequest)) {
+            // from > 0 / search_after / highlighter / suggester /
+            // post_filter, or a top-level query builder outside the
+            // fragment executor's supported shape. Fall through so
+            // the standard path can still answer.
             chain.proceed(task, action, request, listener);
             return;
         }
@@ -232,61 +231,50 @@ public class LanceDispatchActionFilter implements ActionFilter {
     }
 
     /**
-     * Decide whether the request can be answered by the fragment
-     * executor and, if so, what SQL filter to push into Lance.
+     * Decide whether the fragment executor can answer this request.
      *
-     * <p>The three possible outcomes are:
+     * <p>Rejected shapes (fall through to shard path):
      * <ul>
-     *   <li>{@link Optional#empty()} — the request carries features
-     *       the fragment executor cannot answer yet (sorts,
-     *       from &gt; 0, search_after, highlighter, suggester,
-     *       post_filter) or its top-level query is outside the
-     *       {@link LanceKnnFilterTranslator} whitelist. The caller
-     *       falls through to the standard shard path.</li>
-     *   <li>{@code Optional.of("")} — match_all or an empty request
-     *       body. Signals to the coordinator that no filter needs to
-     *       be pushed into Lance.</li>
-     *   <li>{@code Optional.of(sql)} — the top-level query is a
-     *       {@code term}, {@code terms}, {@code exists},
-     *       {@code range}, or {@code bool} combination of those,
-     *       already translated to Lance SQL and ready for the
-     *       coordinator to feed to {@code Dataset.countRows(sql)}
-     *       and {@code ScanOptions.filter(sql)}.</li>
+     *   <li>{@code from > 0} — pagination beyond the first page needs
+     *       coordinator-side skip logic that isn't wired yet.</li>
+     *   <li>{@code search_after}, {@code suggest}, {@code highlighter},
+     *       {@code post_filter} — each needs its own per-fragment
+     *       plumbing that isn't in place.</li>
      * </ul>
      *
-     * <p>A translator failure on a nested clause is treated as
-     * "not dispatchable" rather than a request error: the shard path
-     * can still answer the query.
+     * <p>Accepted shapes (fragment path answers end-to-end):
+     * <ul>
+     *   <li>any top-level query the local {@link
+     *       org.opensearch.index.query.QueryShardContext} can translate
+     *       (match on {@code lance_text}, knn on {@code lance_knn},
+     *       term / terms / range / exists / bool combinations, ...).
+     *       The receiving node ships the {@link QueryBuilder} across
+     *       the wire and re-parses it via {@code
+     *       QueryShardContext.toQuery}, so per-node mapping
+     *       decisions apply. The coordinator additionally translates
+     *       pure-filter shapes into Lance SQL for metadata-only row
+     *       counting, but the accept/reject decision does not
+     *       depend on that translation succeeding.</li>
+     *   <li>sort clauses — the per-node executor drives {@link
+     *       org.apache.lucene.search.IndexSearcher#search(org.apache.lucene.search.Query,
+     *       int, org.apache.lucene.search.Sort)} and each hit carries
+     *       its sort values back for the coordinator merge.</li>
+     *   <li>aggregations that pass {@link
+     *       LanceAggregationSupport#isSupported}.</li>
+     * </ul>
      */
-    private Optional<String> resolveDispatchFilter(SearchRequest searchRequest) {
+    private boolean isDispatchable(SearchRequest searchRequest) {
         SearchSourceBuilder source = searchRequest.source();
         if (source == null) {
-            return Optional.of("");
+            return true;
         }
-        if (source.sorts() != null
-            || source.suggest() != null
+        if (source.suggest() != null
             || source.highlighter() != null
             || source.postFilter() != null
             || source.searchAfter() != null
             || source.from() > 0) {
-            return Optional.empty();
+            return false;
         }
-        QueryBuilder query = source.query();
-        if (query == null || query instanceof MatchAllQueryBuilder) {
-            return Optional.of("");
-        }
-        if (query instanceof TermQueryBuilder
-            || query instanceof TermsQueryBuilder
-            || query instanceof ExistsQueryBuilder
-            || query instanceof RangeQueryBuilder
-            || query instanceof BoolQueryBuilder) {
-            try {
-                return Optional.of(LanceKnnFilterTranslator.toLanceSql(query));
-            } catch (IllegalArgumentException e) {
-                LOGGER.debug("fragment dispatch declined for query [{}]: {}", query.getName(), e.getMessage());
-                return Optional.empty();
-            }
-        }
-        return Optional.empty();
+        return true;
     }
 }

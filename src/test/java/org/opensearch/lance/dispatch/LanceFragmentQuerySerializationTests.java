@@ -89,6 +89,8 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             "demo",
             storage,
             "id >= 2",
+            /* query */ null,
+            /* sorts */ Collections.emptyList(),
             5,
             aggs,
             List.of(0, 2, 4)
@@ -122,6 +124,8 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             "demo",
             storage,
             /* filterSql */ null,
+            /* query */ null,
+            /* sorts */ Collections.emptyList(),
             10,
             /* aggregations */ null
         );
