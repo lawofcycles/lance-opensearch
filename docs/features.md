@@ -39,6 +39,7 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 - PK column type is inferred at attach time from the Lance `lance-schema:unenforced-primary-key` metadata:
   - **Signed integer** (up to 64 bits): id is parsed through `Long.parseLong`; the filter is `<field> = <long>`.
   - **Utf8**: id is placed inside single quotes; single quotes inside the id are doubled to prevent injection. Empty id short-circuits to 404.
+  - **UInt64**: id is parsed through `BigInteger`; the filter uses the wide decimal literal Lance's SQL accepts. The PK column also surfaces as an OpenSearch `unsigned_long` mapping, so term / range / sort / aggregation resolve through the built-in unsigned semantics. Non-PK UInt64 columns are not surfaced today.
 - Tables without a declared PK expose an empty `primary_key_field`; GET returns 404, and `_id` on `_search` hits is synthesised as `<fragment>-<offset>` so sort-by-`_id` and `_mget` dedup stay correct.
 
 ### Hit shape
@@ -106,7 +107,8 @@ Types listed here map to real OpenSearch field types with doc values or FTS back
 
 | Arrow type | OpenSearch mapping | Notes |
 |---|---|---|
-| `int8` / `int16` / `int32` / `int64` (signed) | `byte` / `short` / `integer` / `long` | Unsigned integer variants are noted in the attach response and left unmapped. |
+| `int8` / `int16` / `int32` / `int64` (signed) | `byte` / `short` / `integer` / `long` | Unsigned integer variants are noted in the attach response and left unmapped, except for UInt64 declared as the primary key (see next row). |
+| `uint64` declared as the primary key | `unsigned_long` | Values are held as raw 64-bit patterns; `Long.toUnsignedString` decodes the `_id`, and `BigInteger` handles the `GET /_doc/{id}` parse. Non-PK UInt64 columns are still not surfaced. |
 | `boolean` | `boolean` | |
 | `date` / `timestamp` (all units and TZs) | `date` | Normalised to epoch millis in the reader. |
 | `utf8` with a Lance FTS index | `lance_text` | Enables `match`, `lance_match`, `lance_match_phrase`, `lance_multi_match`. |

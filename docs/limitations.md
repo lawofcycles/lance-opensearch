@@ -42,7 +42,7 @@ OpenSearch's stock `match` and `match_phrase` queries against a `lance_text` fie
 ## Primary key semantics
 
 - `GET /<index>/_doc/<id>` requires the Lance table to carry `lance-schema:unenforced-primary-key` metadata on the PK column. Tables without a declared PK expose an empty `primary_key_field`; GET returns 404. `_search` still emits unique `_id` values synthesised as `<fragment>-<offset>`.
-- Signed integer PKs up to 64 bits and Utf8 PKs are supported. Unsigned 64 or `> Long.MAX_VALUE` integer PKs are not (issue #24 residual).
+- Signed integer, UInt64, and Utf8 PKs are supported. Unsigned integer PKs narrower than 64 bits (UInt8 / UInt16 / UInt32) are not surfaced today because OpenSearch has no matching unsigned mapping type below `unsigned_long`.
 
 ## Freshness
 
