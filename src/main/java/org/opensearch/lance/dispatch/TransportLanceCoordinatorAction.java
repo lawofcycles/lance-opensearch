@@ -122,7 +122,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             ? java.util.Collections.emptyList()
             : source.sorts();
         AggregatorFactories.Builder aggregations = source == null ? null : source.aggregations();
-        int effectiveSize = resolveSize(source);
+        int size = resolveSize(source);
+        int from = resolveFrom(source);
+        // Each per-node executor needs from + size docs so the coordinator
+        // has enough hits after skipping `from`. Deep pagination costs
+        // linear memory per node just like the shard path — no additional
+        // fragment-level penalty.
+        int perNodeSize = from + size;
 
         Index[] concrete = indexNameExpressionResolver.concreteIndices(clusterService.state(), searchRequest);
         List<IndexTarget> targets = resolveTargets(concrete);
@@ -146,8 +152,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // Per-index fan-out results, collected sequentially.
         // Sequential loop keeps the merge trivial; parallel per-index
         // fan-out is future work if it becomes a hot spot.
-        FragmentQuerySpec spec = new FragmentQuerySpec(filterSql, query, sorts, effectiveSize, aggregations);
-        MergeState merged = new MergeState(aggregations, effectiveSize);
+        FragmentQuerySpec spec = new FragmentQuerySpec(filterSql, query, sorts, perNodeSize, aggregations);
+        MergeState merged = new MergeState(aggregations, from, size);
         runIndexLoop(targets, 0, nodeList, spec, merged, start, listener);
     }
 
@@ -381,6 +387,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         return source.size();
     }
 
+    private static int resolveFrom(SearchSourceBuilder source) {
+        if (source == null || source.from() < 0) {
+            return 0;
+        }
+        return source.from();
+    }
+
     private List<IndexTarget> resolveTargets(Index[] concrete) {
         Metadata metadata = clusterService.state().metadata();
         List<IndexTarget> targets = new ArrayList<>(concrete.length);
@@ -433,21 +446,32 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     private final class MergeState {
 
         private final AggregatorFactories.Builder aggregationsRequested;
-        private final int effectiveSize;
+        // Requested pagination window. `perNodeSize` on the wire is
+        // `from + size` so every per-node executor already returned
+        // enough hits for us to skip the first `from` and keep `size`.
+        private final int from;
+        private final int size;
         private long totalMatched = 0L;
         private final List<SearchHit> hits = new ArrayList<>();
         private final List<InternalAggregations> perNodeAggregations = new ArrayList<>();
 
-        MergeState(AggregatorFactories.Builder aggregationsRequested, int effectiveSize) {
+        MergeState(AggregatorFactories.Builder aggregationsRequested, int from, int size) {
             this.aggregationsRequested = aggregationsRequested;
-            this.effectiveSize = effectiveSize;
+            this.from = from;
+            this.size = size;
         }
 
         void absorbTargetResponses(Collection<LanceFragmentQueryResponse> responses) {
             for (LanceFragmentQueryResponse response : responses) {
                 totalMatched += response.matched();
+                // Keep every hit until we finish collecting per-node
+                // responses; the skip/limit runs in buildResponse
+                // where we know the full merged set. Multi-node sort
+                // merge is future work — for now the coordinator
+                // concatenates in per-node arrival order and relies on
+                // the per-node executor's own sort/topN cut.
                 for (SearchHit hit : response.hits()) {
-                    if (hits.size() < effectiveSize) {
+                    if (hits.size() < from + size) {
                         hits.add(hit);
                     }
                 }
@@ -459,10 +483,19 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
         SearchResponse buildResponse(long startMillis) {
             long took = System.currentTimeMillis() - startMillis;
+            // Apply from/size to the collected hits so the response
+            // reflects the requested pagination window.
+            SearchHit[] paged;
+            if (hits.size() <= from) {
+                paged = new SearchHit[0];
+            } else {
+                int end = Math.min(hits.size(), from + size);
+                paged = hits.subList(from, end).toArray(new SearchHit[0]);
+            }
             SearchHits searchHits = new SearchHits(
-                hits.toArray(new SearchHit[0]),
+                paged,
                 new TotalHits(totalMatched, TotalHits.Relation.EQUAL_TO),
-                hits.isEmpty() ? Float.NaN : 1.0f
+                paged.length == 0 ? Float.NaN : 1.0f
             );
             InternalAggregations aggregations = null;
             if (aggregationsRequested != null && !perNodeAggregations.isEmpty()) {

@@ -47,8 +47,8 @@ import org.opensearch.transport.client.Client;
  *   <li>Recognise whether the request is fragment-dispatchable
  *       ({@link #allLanceBacked} plus {@link #isDispatchable} plus
  *       {@link LanceAggregationSupport#isSupported}) — reject shapes
- *       the fragment executor cannot yet answer (from &gt; 0,
- *       search_after, highlighter, suggester, post_filter, or
+ *       the fragment executor cannot yet answer (search_after,
+ *       highlighter, suggester, post_filter, or
  *       cross-index metrics).</li>
  *   <li>Delegate the request to {@link LanceCoordinatorAction} via
  *       {@link Client#execute(org.opensearch.action.ActionType,
@@ -125,10 +125,10 @@ public class LanceDispatchActionFilter implements ActionFilter {
         }
 
         if (!isDispatchable(searchRequest)) {
-            // from > 0 / search_after / highlighter / suggester /
-            // post_filter, or a top-level query builder outside the
-            // fragment executor's supported shape. Fall through so
-            // the standard path can still answer.
+            // search_after / highlighter / suggester / post_filter,
+            // or a top-level query builder outside the fragment
+            // executor's supported shape. Fall through so the
+            // standard path can still answer.
             chain.proceed(task, action, request, listener);
             return;
         }
@@ -207,8 +207,6 @@ public class LanceDispatchActionFilter implements ActionFilter {
      *
      * <p>Rejected shapes (fall through to shard path):
      * <ul>
-     *   <li>{@code from > 0} — pagination beyond the first page needs
-     *       coordinator-side skip logic that isn't wired yet.</li>
      *   <li>{@code search_after}, {@code suggest}, {@code highlighter},
      *       {@code post_filter} — each needs its own per-fragment
      *       plumbing that isn't in place.</li>
@@ -243,8 +241,7 @@ public class LanceDispatchActionFilter implements ActionFilter {
         if (source.suggest() != null
             || source.highlighter() != null
             || source.postFilter() != null
-            || source.searchAfter() != null
-            || source.from() > 0) {
+            || source.searchAfter() != null) {
             return false;
         }
         return true;

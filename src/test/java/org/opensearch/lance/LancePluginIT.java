@@ -646,6 +646,46 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeAnswersFromPagination() throws Exception {
+        // from > 0 used to fall through to the shard path because the
+        // coordinator merge did not know how to skip. Now the
+        // coordinator asks each per-node executor for `from + size`
+        // hits and drops the leading `from` from the merged response,
+        // so pagination beyond the first page runs through the
+        // fragment executor end-to-end.
+        String suffix = "s3-from-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // Sort by id descending, request the third page window
+            // (from=2, size=2). Full descending order is [5, 4, 3,
+            // 2, 1, 0]; skipping two leaves [3, 2, 1, 0] and size=2
+            // clips to [3, 2].
+            String body = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"from\":2,\"size\":2,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}]}"
+                )
+            );
+            assertEquals(6, extractIntPath(body, "hits", "total", "value"));
+            assertTrue("expected sort value [3] on the first paged hit: " + body, body.contains("\"sort\":[3]"));
+            assertTrue("expected sort value [2] on the second paged hit: " + body, body.contains("\"sort\":[2]"));
+            assertFalse("hit sort value [5] must have been skipped by from=2: " + body, body.contains("\"sort\":[5]"));
+            assertFalse("hit sort value [4] must have been skipped by from=2: " + body, body.contains("\"sort\":[4]"));
+            assertFalse("only two hits should remain after size=2: " + body, body.contains("\"sort\":[1]"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     private static void updateClusterSetting(String key, String value) throws IOException {
         Request request = new Request("PUT", "/_cluster/settings");
         request.setJsonEntity("{\"transient\":{\"" + key + "\":\"" + value + "\"}}");
