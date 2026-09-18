@@ -686,6 +686,53 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeAnswersSearchAfter() throws Exception {
+        // search_after pagination flows through the fragment path
+        // when the request also carries a sort. The per-node
+        // executor calls IndexSearcher.searchAfter(FieldDoc, size,
+        // sort) with the coordinator-forwarded cursor; the merged
+        // response contains only the hits after the cursor value.
+        String suffix = "s3-sa-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // First page: sort id desc, size=2. Full descending
+            // order is [5, 4, 3, 2, 1, 0]; the first page keeps 5
+            // and 4.
+            String first = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":2,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}]}"
+                )
+            );
+            assertTrue("expected first page to include sort value [5]: " + first, first.contains("\"sort\":[5]"));
+            assertTrue("expected first page to include sort value [4]: " + first, first.contains("\"sort\":[4]"));
+
+            // Second page via search_after: the cursor is the last
+            // sort value from the first page. Expect ids 3 and 2.
+            String second = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":2,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}],\"search_after\":[4]}"
+                )
+            );
+            assertTrue("expected second page to include sort value [3]: " + second, second.contains("\"sort\":[3]"));
+            assertTrue("expected second page to include sort value [2]: " + second, second.contains("\"sort\":[2]"));
+            assertFalse("search_after cursor value [4] must be excluded: " + second, second.contains("\"sort\":[4]"));
+            assertFalse("hit above the cursor must be excluded: " + second, second.contains("\"sort\":[5]"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     private static void updateClusterSetting(String key, String value) throws IOException {
         Request request = new Request("PUT", "/_cluster/settings");
         request.setJsonEntity("{\"transient\":{\"" + key + "\":\"" + value + "\"}}");

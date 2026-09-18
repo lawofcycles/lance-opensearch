@@ -208,7 +208,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     Query query = resolveLuceneQuery(request, qsc);
                     org.opensearch.search.sort.SortAndFormats sortAndFormats = resolveSort(request, qsc);
 
-                    List<SearchHit> hits = scanHitsViaIndexSearcher(searcher, query, sortAndFormats, request.size());
+                    List<SearchHit> hits = scanHitsViaIndexSearcher(searcher, query, sortAndFormats, request.searchAfter(), request.size());
                     InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query);
                     long matched = computeMatched(dataset, request, searcher, query);
                     return new LanceFragmentQueryResponse(matched, fragmentCount, hits, aggregations);
@@ -286,13 +286,26 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         ContextIndexSearcher searcher,
         Query query,
         org.opensearch.search.sort.SortAndFormats sortAndFormats,
+        Object[] searchAfter,
         int size
     ) throws java.io.IOException {
         if (size <= 0) {
             return Collections.emptyList();
         }
         TopDocs topDocs;
-        if (sortAndFormats == null) {
+        if (searchAfter != null && sortAndFormats != null) {
+            // FieldDoc.doc is Lucene's tie-breaker for docs sharing
+            // the sort value with the cursor. Setting it just past
+            // the reader's last doc means "exclude the tied doc",
+            // which matches OpenSearch's usual search_after
+            // semantics. Integer.MAX_VALUE is rejected by Lucene's
+            // pre-flight (`>= maxDoc`), so pin the value to
+            // `maxDoc - 1` (or 0 when the reader is empty).
+            int maxDoc = searcher.getIndexReader().maxDoc();
+            int afterDoc = maxDoc > 0 ? maxDoc - 1 : 0;
+            org.apache.lucene.search.FieldDoc after = new org.apache.lucene.search.FieldDoc(afterDoc, 0f, searchAfter);
+            topDocs = searcher.searchAfter(after, query, size, sortAndFormats.sort);
+        } else if (sortAndFormats == null) {
             topDocs = searcher.search(query, size);
         } else {
             topDocs = searcher.search(query, size, sortAndFormats.sort);

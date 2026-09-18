@@ -207,9 +207,14 @@ public class LanceDispatchActionFilter implements ActionFilter {
      *
      * <p>Rejected shapes (fall through to shard path):
      * <ul>
-     *   <li>{@code search_after}, {@code suggest}, {@code highlighter},
-     *       {@code post_filter} — each needs its own per-fragment
-     *       plumbing that isn't in place.</li>
+     *   <li>{@code suggest}, {@code highlighter}, {@code post_filter}
+     *       — each needs its own per-fragment plumbing that isn't in
+     *       place.</li>
+     *   <li>{@code search_after} without {@code sort} — the per-fragment
+     *       executor drives {@link
+     *       org.apache.lucene.search.IndexSearcher#searchAfter} which
+     *       requires a matching Sort. Without one the shard path's
+     *       score-order search_after is used instead.</li>
      * </ul>
      *
      * <p>Accepted shapes (fragment path answers end-to-end):
@@ -240,8 +245,13 @@ public class LanceDispatchActionFilter implements ActionFilter {
         }
         if (source.suggest() != null
             || source.highlighter() != null
-            || source.postFilter() != null
-            || source.searchAfter() != null) {
+            || source.postFilter() != null) {
+            return false;
+        }
+        // search_after depends on sort — Lucene's searchAfter takes a
+        // FieldDoc whose fields correspond to the Sort clauses. A
+        // score-order search_after is a shard-path shape.
+        if (source.searchAfter() != null && (source.sorts() == null || source.sorts().isEmpty())) {
             return false;
         }
         return true;

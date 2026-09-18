@@ -64,6 +64,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     private final String filterSql;
     private final QueryBuilder query;
     private final List<SortBuilder<?>> sorts;
+    private final Object[] searchAfter;
     private final int size;
     private final AggregatorFactories.Builder aggregations;
     private final List<Integer> fragmentIds;
@@ -75,6 +76,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         String filterSql,
         QueryBuilder query,
         List<SortBuilder<?>> sorts,
+        Object[] searchAfter,
         int size,
         AggregatorFactories.Builder aggregations,
         List<Integer> fragmentIds
@@ -85,6 +87,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.filterSql = filterSql;
         this.query = query;
         this.sorts = sorts == null ? Collections.emptyList() : List.copyOf(sorts);
+        this.searchAfter = searchAfter;
         this.size = size;
         this.aggregations = aggregations;
         this.fragmentIds = List.copyOf(fragmentIds);
@@ -107,6 +110,11 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             }
             this.sorts = List.copyOf(readSorts);
         }
+        // search_after values are the sort-field values of the last
+        // hit from the previous page. Serialised through
+        // writeGenericValue so any doc-value type (long, double,
+        // string, boolean) round-trips without a discriminator.
+        this.searchAfter = in.readBoolean() ? (Object[]) in.readGenericValue() : null;
         this.size = in.readVInt();
         this.aggregations = in.readBoolean() ? new AggregatorFactories.Builder(in) : null;
         int fragmentCount = in.readVInt();
@@ -128,6 +136,12 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         out.writeVInt(sorts.size());
         for (SortBuilder<?> sort : sorts) {
             out.writeNamedWriteable(sort);
+        }
+        if (searchAfter == null) {
+            out.writeBoolean(false);
+        } else {
+            out.writeBoolean(true);
+            out.writeGenericValue(searchAfter);
         }
         out.writeVInt(size);
         if (aggregations == null) {
@@ -192,6 +206,17 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         return sorts;
     }
 
+    /**
+     * Cursor for {@code search_after} pagination — the sort-field
+     * values of the last hit from the previous page. {@code null}
+     * when the request is not paginated with {@code search_after}.
+     * When non-null, sorts is guaranteed non-empty (the dispatch
+     * filter rejects search_after without a matching sort).
+     */
+    public Object[] searchAfter() {
+        return searchAfter;
+    }
+
     public int size() {
         return size;
     }
@@ -243,6 +268,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             filterSql,
             query,
             sorts,
+            null,
             size,
             aggregations,
             Collections.emptyList()

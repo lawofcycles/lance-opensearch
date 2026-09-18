@@ -49,6 +49,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             "id >= 2",
             /* query */ null,
             /* sorts */ Collections.emptyList(),
+            /* searchAfter */ null,
             5,
             aggs,
             List.of(0, 2, 4)

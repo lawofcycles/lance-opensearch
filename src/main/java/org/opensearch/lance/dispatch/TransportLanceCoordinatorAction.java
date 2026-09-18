@@ -121,6 +121,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         List<org.opensearch.search.sort.SortBuilder<?>> sorts = source == null || source.sorts() == null
             ? java.util.Collections.emptyList()
             : source.sorts();
+        Object[] searchAfter = source == null ? null : source.searchAfter();
         AggregatorFactories.Builder aggregations = source == null ? null : source.aggregations();
         int size = resolveSize(source);
         int from = resolveFrom(source);
@@ -152,7 +153,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // Per-index fan-out results, collected sequentially.
         // Sequential loop keeps the merge trivial; parallel per-index
         // fan-out is future work if it becomes a hot spot.
-        FragmentQuerySpec spec = new FragmentQuerySpec(filterSql, query, sorts, perNodeSize, aggregations);
+        FragmentQuerySpec spec = new FragmentQuerySpec(filterSql, query, sorts, searchAfter, perNodeSize, aggregations);
         MergeState merged = new MergeState(aggregations, from, size);
         runIndexLoop(targets, 0, nodeList, spec, merged, start, listener);
     }
@@ -235,6 +236,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 spec.filterSql(),
                 spec.query(),
                 spec.sorts(),
+                spec.searchAfter(),
                 spec.effectiveSize(),
                 spec.aggregations(),
                 fragmentsForNode
@@ -434,6 +436,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         String filterSql,
         org.opensearch.index.query.QueryBuilder query,
         List<org.opensearch.search.sort.SortBuilder<?>> sorts,
+        Object[] searchAfter,
         int effectiveSize,
         AggregatorFactories.Builder aggregations
     ) {}
