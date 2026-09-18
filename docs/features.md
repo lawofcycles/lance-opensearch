@@ -8,8 +8,11 @@ Every Lance-backed index carries a single primary shard (attach rejects `number_
 
 - `POST /_lance/namespace` registers a directory as a Lance namespace. The plugin polls it for `*.lance` tables and surfaces each as an OpenSearch index. Mapping is derived from the Lance Arrow schema on every surface.
 - `POST /_lance/attach` attaches a single Lance table URI directly. Idempotent: a repeated call for the same URI returns `already_attached: true`; a name clash with a non-Lance index or a Lance index for a different table returns 409.
+- `POST /_lance/namespace/tables {"path": "..."}` returns the table names the poll would surface from a registered namespace. Read-only preview, useful for spotting a table the poll skipped due to a name clash. Unregistered paths return 404.
+- `DELETE /_lance/namespace {"path": "..."}` stops polling that namespace. Already-surfaced indexes stay in place; delete them separately if the tables should disappear.
 - `POST /_lance/build_indexes/{index}` triggers Lance-side FTS / scalar / vector index builds from OpenSearch. Automatic builds happen for tables at or under `lance.builder.max_rows` (default 1,000,000 rows); larger tables use this explicit endpoint.
 - Poll cadence is controlled by the cluster setting `lance.namespace.poll_cadence` (default 10s).
+- Resurface guard: when an operator runs `DELETE /{index}` on a Lance-backed index, the poll cycle honours that deletion for `lance.namespace.resurface_guard_grace` (default 1 hour, node-scoped dynamic). Once the grace expires the poll recreates the index if the underlying Lance table is still there. Set to `0` to disable the guard entirely.
 
 ## Query shapes
 

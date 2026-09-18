@@ -54,7 +54,7 @@ OpenSearch's stock `match` and `match_phrase` queries against a `lance_text` fie
 - `storage_options` are stored in plain index settings (`index.lance.storage_options.<key>`), including any credentials the operator writes there. Keystore / `SecureSetting` integration and the lance-namespace vended-credentials flow (`vend_credentials`, `expires_at_millis`) are not wired yet.
 - Base-scoped options (`base_<url>.aws_access_key_id`) for nested Lance references are out of scope for now.
 - REST catalogs (Glue, Unity, Iceberg REST) are not wired to the namespace endpoint yet. Only the filesystem adapter is exercised today. Sub-directory tables (`root/sub/table.lance`) are not surfaced either: the poller lists top-level tables only.
-- Namespace registrations are held in process memory on the node that received the request. They must be reissued after a cluster restart, and other nodes in a multi-node cluster do not surface the same tables until they too register the path.
+- Namespace registrations live in cluster state and survive full cluster restarts. Every node's poll cycle reads the same set. Multi-node runs no longer need each node to re-register the path independently.
 
 ## Mapping coverage gaps
 
