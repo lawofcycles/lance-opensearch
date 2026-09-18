@@ -44,13 +44,35 @@ import org.opensearch.lance.StorageOptions;
 /**
  * Engine factory producing a read-only engine backed by a Lance table.
  *
- * <p>The empty Lucene commit created at shard bootstrap supplies sequence
- * number metadata to the {@link ReadOnlyEngine} superclass; the plugin
- * layers a separate {@link ReferenceManager} on top whose reference is a
- * {@link LanceDirectoryReader}. {@link Engine#refresh(String)} atomically
- * swaps in a new reader when the Lance manifest version advances, so
- * searches continue to be served against the previous reader while the new
- * one is being built.
+ * <p>{@code _search} is intercepted by {@link
+ * org.opensearch.lance.dispatch.LanceDispatchActionFilter} and served by the
+ * fragment path (see {@link
+ * org.opensearch.lance.dispatch.TransportLanceCoordinatorAction}), so the
+ * engine returned here rarely runs a query end-to-end. Its remaining
+ * responsibilities are:
+ * <ul>
+ *   <li>{@code GET /_doc/{id}} — {@link #newReadWriteEngine} returns an
+ *       engine whose {@link Engine#get(Engine.Get, java.util.function.BiFunction)}
+ *       resolves the primary key through a Lance scalar-index-backed
+ *       point lookup.</li>
+ *   <li>Shard-level stats: {@link Engine#docStats()} and
+ *       {@link Engine#segmentsStats(boolean, boolean)} report Lance-provided
+ *       row counts instead of Lucene segment stats.</li>
+ *   <li>Refresh lifecycle: {@link Engine#refresh(String)} advances the
+ *       shared reader when the Lance manifest version advances, so the
+ *       fragment executors that open per-fragment leaves see the latest
+ *       version. The reader is also the safety net for the handful of
+ *       {@code _search} shapes that {@code LanceDispatchActionFilter}
+ *       falls through to the shard path ({@code suggest},
+ *       {@code highlighter}, {@code search_after} without {@code sort}).</li>
+ * </ul>
+ *
+ * <p>Under the hood, the empty Lucene commit created at shard bootstrap
+ * supplies sequence number metadata to the {@link ReadOnlyEngine}
+ * superclass; the plugin layers a separate {@link ReferenceManager} on top
+ * whose reference is a {@link LanceDirectoryReader}. The manager swaps in
+ * a new reader when the Lance manifest advances so refresh does not close
+ * the previous reader until in-flight readers release.
  */
 public final class LanceEngineFactory implements EngineFactory {
 
