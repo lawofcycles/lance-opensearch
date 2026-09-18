@@ -53,18 +53,20 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 
 ### Multi-fields
 
-- Attach body accepts a `multi_fields` clause that declares a `keyword` sub-field on a Utf8 base column, so a single Lance column serves both full-text (`lance_text`) and exact-match / aggregation (`.raw`) without duplicating source:
+- Attach body accepts a `multi_fields` clause (or the equivalent `overrides.[col].fields` clause, see below) that declares a `keyword` sub-field on a Utf8 base column, so a single Lance column serves both full-text (`lance_text`) and exact-match / aggregation (`.raw`) without duplicating source:
 
   ```json
   POST /_lance/attach
   {
     "table": "s3://bucket/tables/demo.lance",
-    "multi_fields": { "body": { "raw": { "type": "keyword" } } }
+    "overrides": { "body": { "fields": { "raw": { "type": "keyword" } } } }
   }
   ```
 
-- The base column must be Utf8 (`lance_text` or `keyword`); other Arrow types are rejected at attach with a 400. Sub-field type must be `keyword` today; the wider `overrides` framework (ip / wildcard / analyzer mode / index-type selection) is tracked in issue #2.
-- Persisted in `index.lance.multi_fields` (an index setting) so the engine can rehydrate the spec on shard open.
+  The legacy shape `"multi_fields": {"body": {"raw": {"type": "keyword"}}}` is still accepted for backward compatibility; both shapes end up in the same `index.lance.multi_fields` setting.
+
+- The base column must be Utf8 (`lance_text` or `keyword`); other Arrow types are rejected at attach with a 400. Sub-field type must be `keyword` today. Base column type overrides (`overrides.[col].type`) are reserved for issue #6 (`ip` / `wildcard`), #7 (analyzer mode), and #11 (preferred index type); today the parser refuses them with 400.
+- Persisted in `index.lance.multi_fields` (an index setting). Namespace poll re-derivation reads the setting back and re-applies it on every manifest version advance, so multi-field declarations survive schema changes.
 
 ## Aggregations
 
