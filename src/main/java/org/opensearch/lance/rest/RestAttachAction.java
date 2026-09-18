@@ -20,11 +20,13 @@ import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.lance.LanceInternalHeaders;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -178,34 +180,52 @@ public class RestAttachAction extends BaseRestHandler {
         storageOptions.writeToSettings(settings);
         CreateIndexRequest create = new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson);
 
-        client.admin().indices().create(create, new ActionListener<CreateIndexResponse>() {
-            @Override
-            public void onResponse(CreateIndexResponse response) {
-                // Register the attach-created index with the namespace poller
-                // only when the operator is following the latest version.
-                // Pinned indices stay on their manifest version by design
-                // (readonly snapshot for reproducibility), so the poll cycle
-                // does not need to touch them and would otherwise burn cycles
-                // probing for a manifest advance that must not change the
-                // reader.
-                if (pinnedVersion.isEmpty()) {
-                    namespaceService.registerAttachedIndex(indexName, table, derivation.version, storageOptions);
+        // LanceCreateIndexActionFilter blocks user PUT /{index} that
+        // tries to set index.lance.table. Stamp the internal header
+        // so this plugin-issued call is recognised as legitimate.
+        // stashContext preserves the caller's headers for the outer
+        // REST handler.
+        ThreadContext threadContext = client.threadPool().getThreadContext();
+        try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
+            threadContext.putHeader(LanceInternalHeaders.LANCE_INTERNAL_CREATE_INDEX, "true");
+            client.admin().indices().create(create, new ActionListener<CreateIndexResponse>() {
+                @Override
+                public void onResponse(CreateIndexResponse response) {
+                    // Register the attach-created index with the namespace poller
+                    // only when the operator is following the latest version.
+                    // Pinned indices stay on their manifest version by design
+                    // (readonly snapshot for reproducibility), so the poll cycle
+                    // does not need to touch them and would otherwise burn cycles
+                    // probing for a manifest advance that must not change the
+                    // reader.
+                    if (pinnedVersion.isEmpty()) {
+                        namespaceService.registerAttachedIndex(indexName, table, derivation.version, storageOptions);
+                    }
+                    writeAttachResponse(channel, indexName, table, derivation, false);
                 }
-                writeAttachResponse(channel, indexName, table, derivation, false);
-            }
 
-            @Override
-            public void onFailure(Exception e) {
-                if (!isAlreadyExists(e)) {
-                    sendError(channel, e);
-                    return;
+                @Override
+                public void onFailure(Exception e) {
+                    if (!isAlreadyExists(e)) {
+                        sendError(channel, e);
+                        return;
+                    }
+                    // The index already exists. Verify it is a Lance index for the
+                    // same table before claiming success; otherwise attach would
+                    // silently take credit for an unrelated index.
+                    verifyExistingLanceIndex(
+                        client,
+                        channel,
+                        indexName,
+                        table,
+                        derivation,
+                        namespaceService,
+                        storageOptions,
+                        pinnedVersion
+                    );
                 }
-                // The index already exists. Verify it is a Lance index for the
-                // same table before claiming success; otherwise attach would
-                // silently take credit for an unrelated index.
-                verifyExistingLanceIndex(client, channel, indexName, table, derivation, namespaceService, storageOptions, pinnedVersion);
-            }
-        });
+            });
+        }
     }
 
     private static void verifyExistingLanceIndex(

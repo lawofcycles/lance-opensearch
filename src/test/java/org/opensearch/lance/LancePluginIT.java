@@ -208,6 +208,27 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         assertTrue("expected message about [table], saw: " + body, body.contains("[table]"));
     }
 
+    public void testCreateIndexRejectsLanceTableSetting() throws IOException {
+        // Sending index.lance.table through PUT /{index} used to
+        // succeed silently: the engine wired up without the derive
+        // step running, so the resulting index had no mapping and
+        // typed queries failed with "No mapping found" even
+        // though _count returned the Lance metadata count. Reject
+        // the request up front and point at POST /_lance/attach
+        // so callers land on the entry point that actually
+        // derives the mapping. Case 6 of issue #37.
+        String indexName = "rawput-" + randomAlphaOfLength(6).toLowerCase(java.util.Locale.ROOT);
+        Request create = new Request("PUT", "/" + indexName);
+        create.setJsonEntity("{\"settings\":{\"index.lance.table\":\"/tmp/does-not-matter.lance\"}}");
+        create.setOptions(create.getOptions().toBuilder().addHeader("Content-Type", "application/json"));
+        ResponseException failure = expectThrows(ResponseException.class, () -> client().performRequest(create));
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        assertEquals("expected 400 for direct PUT with index.lance.table, saw " + status, 400, status);
+        String body = readAll(failure.getResponse());
+        assertTrue("expected error to mention [index.lance.table]: " + body, body.contains("index.lance.table"));
+        assertTrue("expected error to point at /_lance/attach: " + body, body.contains("/_lance/attach"));
+    }
+
     public void testAttachRejectsNumberOfShards() throws IOException {
         // Attach used to derive a shard count from the row count and accept an
         // explicit `number_of_shards` override. The fragment path is now the

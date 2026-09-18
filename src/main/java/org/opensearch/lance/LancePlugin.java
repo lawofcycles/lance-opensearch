@@ -26,6 +26,7 @@ import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.mapper.Mapper;
 import org.opensearch.indices.breaker.BreakerSettings;
 import org.opensearch.lance.dispatch.LanceDispatchActionFilter;
+import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
 import org.opensearch.lance.mapper.LanceVectorFieldMapper;
@@ -268,6 +269,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     private org.opensearch.threadpool.ThreadPool threadPool;
     private AllowedTableRoots allowedTableRoots;
     private LanceDispatchActionFilter dispatchActionFilter;
+    private LanceCreateIndexActionFilter createIndexActionFilter;
 
     /**
      * Cancellable handle for the scheduled task that samples the shared
@@ -376,6 +378,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // fragment executor cannot answer a shape yet (from > 0,
         // search_after, highlighter, suggest, post_filter).
         this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client);
+        this.createIndexActionFilter = new LanceCreateIndexActionFilter(threadPool);
 
         namespaceService = new LanceNamespaceService(client, clusterService, threadPool, cadence, builderMaxRows);
         return List.of(namespaceService);
@@ -446,11 +449,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // filter is always present when the search machinery starts
         // routing through it; the null guard exists purely for the
         // test framework's out-of-order invocations.
-        LanceDispatchActionFilter filter = dispatchActionFilter;
-        if (filter == null) {
+        LanceDispatchActionFilter dispatch = dispatchActionFilter;
+        LanceCreateIndexActionFilter guard = createIndexActionFilter;
+        if (dispatch == null && guard == null) {
             return List.of();
         }
-        return List.of(filter);
+        if (guard == null) {
+            return List.of(dispatch);
+        }
+        if (dispatch == null) {
+            return List.of(guard);
+        }
+        return List.of(dispatch, guard);
     }
 
     @Override

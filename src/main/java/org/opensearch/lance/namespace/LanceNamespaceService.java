@@ -31,10 +31,12 @@ import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.lance.LanceInternalHeaders;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -97,6 +99,7 @@ public final class LanceNamespaceService {
     // index for the lifetime of the plugin instance; a poll every few
     // seconds would otherwise flood the log.
     private final Set<String> warnedWaitPolicy = ConcurrentHashMap.newKeySet();
+    private final ThreadPool threadPool;
 
     public LanceNamespaceService(
         Client client,
@@ -107,6 +110,7 @@ public final class LanceNamespaceService {
     ) {
         this.client = client;
         this.clusterService = clusterService;
+        this.threadPool = threadPool;
         this.cadence = cadence;
         this.builderMaxRows = builderMaxRows;
         // Subscribe before the first schedule fires so the poller
@@ -467,34 +471,43 @@ public final class LanceNamespaceService {
             .put(LanceEngineFactory.TABLE_SETTING, table)
             .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField());
         storageOptions.writeToSettings(settings);
-        client.admin()
-            .indices()
-            .create(
-                new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson()),
-                new ActionListener<org.opensearch.action.admin.indices.create.CreateIndexResponse>() {
-                    @Override
-                    public void onResponse(org.opensearch.action.admin.indices.create.CreateIndexResponse response) {
-                        servedVersions.put(indexName, version);
-                        LOG.info("surfaced table {} as index {} (version {})", table, indexName, version);
-                    }
-
-                    @Override
-                    public void onFailure(Exception e) {
-                        // ResourceAlreadyExistsException means another node
-                        // (or an earlier poll) already surfaced the table;
-                        // the syncTable path will pick it up next cycle.
-                        Throwable cursor = e;
-                        while (cursor != null) {
-                            if (cursor instanceof org.opensearch.ResourceAlreadyExistsException) {
-                                LOG.debug("surface for {} raced with an existing index", indexName);
-                                return;
-                            }
-                            cursor = cursor.getCause();
+        // LanceCreateIndexActionFilter blocks user PUT /{index} with
+        // index.lance.table in settings. This surface call is
+        // plugin-internal so stamp the marker header before dispatch;
+        // stashContext preserves the caller's headers for whatever
+        // scheduled the poll.
+        ThreadContext threadContext = threadPool.getThreadContext();
+        try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
+            threadContext.putHeader(LanceInternalHeaders.LANCE_INTERNAL_CREATE_INDEX, "true");
+            client.admin()
+                .indices()
+                .create(
+                    new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson()),
+                    new ActionListener<org.opensearch.action.admin.indices.create.CreateIndexResponse>() {
+                        @Override
+                        public void onResponse(org.opensearch.action.admin.indices.create.CreateIndexResponse response) {
+                            servedVersions.put(indexName, version);
+                            LOG.info("surfaced table {} as index {} (version {})", table, indexName, version);
                         }
-                        LOG.warn("surface failed for {} at version {}: {}", indexName, version, e.getMessage());
+
+                        @Override
+                        public void onFailure(Exception e) {
+                            // ResourceAlreadyExistsException means another node
+                            // (or an earlier poll) already surfaced the table;
+                            // the syncTable path will pick it up next cycle.
+                            Throwable cursor = e;
+                            while (cursor != null) {
+                                if (cursor instanceof org.opensearch.ResourceAlreadyExistsException) {
+                                    LOG.debug("surface for {} raced with an existing index", indexName);
+                                    return;
+                                }
+                                cursor = cursor.getCause();
+                            }
+                            LOG.warn("surface failed for {} at version {}: {}", indexName, version, e.getMessage());
+                        }
                     }
-                }
-            );
+                );
+        }
     }
 
     void recordServedVersion(String indexName, long version) {
