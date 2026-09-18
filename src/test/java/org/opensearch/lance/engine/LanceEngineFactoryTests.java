@@ -66,6 +66,10 @@ public class LanceEngineFactoryTests extends OpenSearchTestCase {
         assertEquals(LanceEngineFactory.LancePrimaryKeyType.LONG, LanceEngineFactory.LancePrimaryKeyType.fromSetting("gibberish"));
         assertEquals(LanceEngineFactory.LancePrimaryKeyType.LONG, LanceEngineFactory.LancePrimaryKeyType.fromSetting("long"));
         assertEquals(LanceEngineFactory.LancePrimaryKeyType.KEYWORD, LanceEngineFactory.LancePrimaryKeyType.fromSetting("keyword"));
+        assertEquals(
+            LanceEngineFactory.LancePrimaryKeyType.UNSIGNED_LONG,
+            LanceEngineFactory.LancePrimaryKeyType.fromSetting("unsigned_long")
+        );
         assertEquals(LanceEngineFactory.LancePrimaryKeyType.NONE, LanceEngineFactory.LancePrimaryKeyType.fromSetting("none"));
     }
 }

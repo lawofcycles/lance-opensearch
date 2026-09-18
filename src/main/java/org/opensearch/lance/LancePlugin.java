@@ -303,8 +303,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         if (value == null || value.isEmpty()) {
             return;
         }
-        if (!"long".equals(value) && !"keyword".equals(value) && !"none".equals(value)) {
-            throw new IllegalArgumentException("index.lance.primary_key_type must be 'long' or 'keyword', got '" + value + "'");
+        if (!"long".equals(value) && !"keyword".equals(value) && !"unsigned_long".equals(value) && !"none".equals(value)) {
+            throw new IllegalArgumentException(
+                "index.lance.primary_key_type must be 'long', 'unsigned_long', or 'keyword', got '" + value + "'"
+            );
         }
     }
 

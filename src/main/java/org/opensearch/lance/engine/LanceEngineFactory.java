@@ -121,6 +121,7 @@ public final class LanceEngineFactory implements EngineFactory {
     public enum LancePrimaryKeyType {
         NONE("none"),
         LONG("long"),
+        UNSIGNED_LONG("unsigned_long"),
         KEYWORD("keyword");
 
         private final String settingValue;
@@ -148,6 +149,8 @@ public final class LanceEngineFactory implements EngineFactory {
                     return KEYWORD;
                 case "long":
                     return LONG;
+                case "unsigned_long":
+                    return UNSIGNED_LONG;
                 case "none":
                     return NONE;
                 default:
@@ -381,6 +384,13 @@ public final class LanceEngineFactory implements EngineFactory {
             // not break the filter expression or open an injection
             // path; ids never fail to parse, so the empty-id short
             // circuit is the only NOT_EXISTS branch on this path.
+            // For an UNSIGNED_LONG PK the filter is
+            // `<field> = <literal>` where the literal is the
+            // BigInteger's decimal form; Lance's SQL parser (DataFusion
+            // based) accepts numeric literals wider than 64 bits and
+            // matches them against a UInt64 column. Non-numeric ids
+            // (including negative) short-circuit to NOT_EXISTS so
+            // GET /{index}/_doc/-1 or /alpha does not throw a 500.
             String filter;
             switch (pkType) {
                 case LONG: {
@@ -391,6 +401,20 @@ public final class LanceEngineFactory implements EngineFactory {
                         return GetResult.NOT_EXISTS;
                     }
                     filter = field + " = " + key;
+                    break;
+                }
+                case UNSIGNED_LONG: {
+                    java.math.BigInteger key;
+                    try {
+                        key = new java.math.BigInteger(get.id());
+                    } catch (NumberFormatException e) {
+                        return GetResult.NOT_EXISTS;
+                    }
+                    if (key.signum() < 0 || key.bitLength() > 64) {
+                        // Outside the UInt64 range: no row can match.
+                        return GetResult.NOT_EXISTS;
+                    }
+                    filter = field + " = " + key.toString();
                     break;
                 }
                 case KEYWORD: {

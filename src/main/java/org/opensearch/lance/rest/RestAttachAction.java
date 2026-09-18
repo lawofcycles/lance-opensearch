@@ -419,16 +419,22 @@ public class RestAttachAction extends BaseRestHandler {
             int fieldId = field.getId();
             boolean declaredPk = field.getMetadata() != null && field.getMetadata().containsKey(PK_METADATA_KEY);
             if (declaredPk) {
-                // Signed integers up to 64 bits and Utf8 are the two PK
-                // shapes the engine knows how to look up. Any other type
-                // gets recorded as a note and left off keyField so the
-                // engine treats the table as PK-less rather than trying
-                // to serve GET on an unsupported column. Unsigned or
-                // >64-bit integers are out of scope for #24 and follow
-                // a separate ticket.
+                // Signed integers up to 64 bits, unsigned 64 bit
+                // integers, and Utf8 are the three PK shapes the
+                // engine knows how to look up. Any other type gets
+                // recorded as a note and left off keyField so the
+                // engine treats the table as PK-less rather than
+                // trying to serve GET on an unsupported column.
+                // Unsigned int8 / int16 / int32 PKs are out of
+                // scope for #24 too (no OpenSearch mapping type
+                // covers unsigned <64 bit); they fall through to
+                // the note branch.
                 if (type instanceof ArrowType.Int intType && intType.getIsSigned() && intType.getBitWidth() <= 64) {
                     keyField = name;
                     keyFieldType = "long";
+                } else if (type instanceof ArrowType.Int intType && !intType.getIsSigned() && intType.getBitWidth() == 64) {
+                    keyField = name;
+                    keyFieldType = "unsigned_long";
                 } else if (type instanceof ArrowType.Utf8) {
                     keyField = name;
                     keyFieldType = "keyword";
@@ -445,12 +451,24 @@ public class RestAttachAction extends BaseRestHandler {
             if (type instanceof ArrowType.Int intType) {
                 int bitWidth = intType.getBitWidth();
                 if (!intType.getIsSigned()) {
+                    if (bitWidth == 64 && name.equals(keyField)) {
+                        // UInt64 PK column: surface it as unsigned_long
+                        // so term / range / sort / aggregation resolve
+                        // through OpenSearch's built-in unsigned_long
+                        // machinery. Non-PK UInt64 columns still stay
+                        // unsurfaced today (they would need the reader
+                        // to distinguish signed vs unsigned on read).
+                        startFieldWithId(mapping, name, fieldId, "unsigned_long", arrowTypeIdentity(intType));
+                        mapping.field("index", false).field("doc_values", true).endObject();
+                        scalarColumns.add(name);
+                        continue;
+                    }
                     notes.add(
                         "column "
                             + name
                             + ": unsigned int"
                             + bitWidth
-                            + " not surfaced (OpenSearch has no unsigned equivalent for byte/short/int, and unsigned_long doc values require BigInteger which the reader does not synthesise yet)"
+                            + " not surfaced (OpenSearch has no unsigned equivalent for byte/short/int, and non-PK unsigned_long doc values still require reader work)"
                     );
                     continue;
                 }

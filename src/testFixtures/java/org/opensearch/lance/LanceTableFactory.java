@@ -425,6 +425,90 @@ final class LanceTableFactory {
         return uri;
     }
 
+    /**
+     * Writes a Lance table whose primary key is a UInt64 column. Values
+     * intentionally straddle Long.MAX_VALUE so the resulting {@code _id}
+     * strings cover both the low half (fits in signed long) and the top
+     * half (only expressible as an unsigned long / BigInteger) of the
+     * UInt64 range. Layout for a {@code rowCount == 4} table:
+     * <ul>
+     *   <li>row 0: {@code id = 0}</li>
+     *   <li>row 1: {@code id = 42}</li>
+     *   <li>row 2: {@code id = Long.MAX_VALUE} (9223372036854775807)</li>
+     *   <li>row 3: {@code id = 18446744073709551610} (2^64 - 6, top of UInt64 range, wraps to -6 as a signed long)</li>
+     * </ul>
+     * The PK column is non-nullable to satisfy Lance's schema validator
+     * ("Primary key column and all its ancestors must not be nullable").
+     * Utf8-only sidecar column is included so integer / string columns
+     * both round-trip.
+     */
+    static String writeUnsignedLongPkTable(Path parent, String name) throws Exception {
+        return retryOnFfiFlake(() -> writeUnsignedLongPkTableOnce(parent, name));
+    }
+
+    private static String writeUnsignedLongPkTableOnce(Path parent, String name) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        java.util.Map<String, String> pkMeta = Map.of("lance-schema:unenforced-primary-key", "true");
+        // Fixed four-row fixture. Kept out of the caller signature so
+        // the values that straddle Long.MAX_VALUE stay stable across
+        // tests without leaking test-specific tuning into other
+        // fixtures.
+        long[] rows = new long[] {
+            0L,
+            42L,
+            Long.MAX_VALUE,
+            // 2^64 - 6, the top of the UInt64 range. As a signed long
+            // this is -6; the reader stores the raw bit pattern and
+            // Long.toUnsignedString decodes it back.
+            0xFFFFFFFFFFFFFFFAL };
+        int rowCount = rows.length;
+        Schema schema = new Schema(
+            Arrays.asList(
+                new Field("id", new FieldType(false, new ArrowType.Int(64, /* isSigned */ false), null, pkMeta), null),
+                new Field("label", FieldType.nullable(new ArrowType.Utf8()), null)
+            ),
+            Map.of()
+        );
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            byte[] ipcBytes;
+            try (
+                VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                ByteArrayOutputStream out = new ByteArrayOutputStream()
+            ) {
+                org.apache.arrow.vector.UInt8Vector idVector = (org.apache.arrow.vector.UInt8Vector) root.getVector("id");
+                VarCharVector labelVector = (VarCharVector) root.getVector("label");
+                idVector.allocateNew(rowCount);
+                labelVector.allocateNew();
+                for (int i = 0; i < rowCount; i++) {
+                    idVector.set(i, rows[i]);
+                    labelVector.setSafe(i, ("row-" + i).getBytes(StandardCharsets.UTF_8));
+                }
+                idVector.setValueCount(rowCount);
+                labelVector.setValueCount(rowCount);
+                root.setRowCount(rowCount);
+                try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                }
+                ipcBytes = out.toByteArray();
+            }
+
+            try (
+                ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+            ) {
+                Data.exportArrayStream(allocator, reader, stream);
+                WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
+                Dataset.create(allocator, stream, uri, writeParams).close();
+            }
+        }
+        return uri;
+    }
+
     private static String writeKeywordOnlyTableOnce(Path parent, String name, int rowCount) throws Exception {
         Path tablePath = parent.resolve(name + ".lance");
         String uri = tablePath.toString();

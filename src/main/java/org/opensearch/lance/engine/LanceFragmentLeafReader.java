@@ -264,13 +264,25 @@ public final class LanceFragmentLeafReader extends LeafReader {
         } catch (Exception e) {
             throw new IOException(e);
         }
+        // An UNSIGNED_LONG primary key sits on a Lance UInt64 column that
+        // classify() otherwise refuses (unsigned integers are not
+        // surfaced by default). Force it into NUMERIC here so the PK
+        // gets a NumericDocValues entry alongside signed integer
+        // columns; readAsLong already returns the unsigned bit pattern
+        // for UInt8Vector, so the doc value path is otherwise
+        // untouched. Only this one column is elevated; other UInt64
+        // columns stay unsurfaced.
+        if (this.pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.UNSIGNED_LONG && !intField.isEmpty()) {
+            columnKind.putIfAbsent(intField, ColumnKind.NUMERIC);
+        }
 
         // Row-address scan: cheap even on large fragments because we only ask
         // Lance for _rowaddr plus (optionally) the primary key column. This
         // establishes liveDocs, numDocs, and the values[] / pkStrings[] used
         // to synthesise _id from the primary key. Every other scalar column
         // stays on disk until the first accessor touches it.
-        boolean loadNumericPk = this.pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.LONG
+        boolean loadNumericPk = (this.pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.LONG
+            || this.pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.UNSIGNED_LONG)
             && columnKind.get(intField) == ColumnKind.NUMERIC;
         // KEYWORD PK sits on a Utf8 column that always classifies as
         // TEXT_FTS or TEXT_KEYWORD by columnKind; either way the row-scan
@@ -1065,6 +1077,13 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 case LONG:
                     idString = Long.toString(values[docID]);
                     break;
+                case UNSIGNED_LONG:
+                    // values[] carries the unsigned bit pattern (see
+                    // constructor row-scan + readAsLong on UInt8Vector).
+                    // Long.toUnsignedString decodes it back into the
+                    // 0..2^64-1 range the operator wrote.
+                    idString = Long.toUnsignedString(values[docID]);
+                    break;
                 case NONE:
                 default:
                     idString = fragmentId + "-" + docID;
@@ -1100,7 +1119,19 @@ public final class LanceFragmentLeafReader extends LeafReader {
                         case NUMERIC -> {
                             ensureNumericLoaded(name);
                             if (numericPresence.get(name).get(docID)) {
-                                builder.field(name, numericColumns.get(name)[docID]);
+                                long numericValue = numericColumns.get(name)[docID];
+                                if (pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.UNSIGNED_LONG
+                                    && name.equals(fieldName)) {
+                                    // UInt64 PK column: emit as an unsigned
+                                    // decimal so the JSON number matches
+                                    // what the operator wrote. Other
+                                    // UInt64 columns are not surfaced by
+                                    // classify(), so this branch fires
+                                    // only for the PK.
+                                    builder.field(name, new java.math.BigInteger(Long.toUnsignedString(numericValue)));
+                                } else {
+                                    builder.field(name, numericValue);
+                                }
                             }
                         }
                         case BOOLEAN -> {
@@ -1203,6 +1234,15 @@ public final class LanceFragmentLeafReader extends LeafReader {
         }
         if (v instanceof BigIntVector bv) {
             return bv.get(i);
+        }
+        if (v instanceof org.apache.arrow.vector.UInt8Vector u) {
+            // UInt64 comes back as UInt8Vector in Arrow Java. Its get()
+            // returns a Java long that already carries the unsigned bit
+            // pattern; the _id path decodes it via
+            // Long.toUnsignedString and the doc value path exposes it
+            // untouched so OpenSearch's unsigned_long field type
+            // reinterprets the sign bit.
+            return u.get(i);
         }
         if (v instanceof DateDayVector d) {
             return d.get(i) * 86_400_000L;

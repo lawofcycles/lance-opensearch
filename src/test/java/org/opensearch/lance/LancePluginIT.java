@@ -1603,6 +1603,98 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testUnsignedLongPrimaryKeyRoundTripsThroughIdAndGet() throws Exception {
+        // Issue #24 remainder: a UInt64 PK column must survive the round
+        // trip through _search / _id / GET even when the values sit
+        // above Long.MAX_VALUE. The reader holds them as raw long bit
+        // patterns; _id decodes with Long.toUnsignedString and GET
+        // parses through BigInteger before handing a wide decimal
+        // literal to Lance's SQL filter.
+        String suffix = "ulongpk-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeUnsignedLongPkTable(scratchDir, tableName);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(
+                "attach on UInt64 PK table failed: " + readAll(attach),
+                RestStatus.OK.getStatus(),
+                attach.getStatusLine().getStatusCode()
+            );
+
+            // Settings must carry primary_key_type: unsigned_long, and
+            // mapping must expose the PK column as unsigned_long so
+            // OpenSearch's built-in field type handles the doc value
+            // interpretation.
+            String settingsBody = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
+            assertTrue(
+                "expected primary_key_type: unsigned_long, saw: " + settingsBody,
+                settingsBody.contains("\"primary_key_type\":\"unsigned_long\"")
+            );
+            String mappingBody = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+            assertTrue("expected mapping type unsigned_long: " + mappingBody, mappingBody.contains("\"type\":\"unsigned_long\""));
+
+            // _search must return four distinct _id strings: 0, 42,
+            // Long.MAX_VALUE (9223372036854775807), and 2^64 - 6
+            // (18446744073709551610). Previously the top-half value
+            // would have shown as -6 or 0.
+            String searchBody = readAll(postJson("/" + indexName + "/_search", "{\"size\":4}"));
+            assertEquals(4, extractIntPath(searchBody, "hits", "total", "value"));
+            java.util.Set<String> ids = new java.util.HashSet<>();
+            try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, searchBody)) {
+                java.util.Map<String, Object> map = parser.map();
+                @SuppressWarnings("unchecked")
+                java.util.List<Object> hits = (java.util.List<Object>) ((java.util.Map<String, Object>) map.get("hits")).get("hits");
+                for (Object hitObj : hits) {
+                    @SuppressWarnings("unchecked")
+                    java.util.Map<String, Object> hit = (java.util.Map<String, Object>) hitObj;
+                    ids.add((String) hit.get("_id"));
+                }
+            }
+            assertEquals(
+                "expected the four canonical UInt64 ids, saw: " + ids + " (body=" + searchBody + ")",
+                java.util.Set.of("0", "42", "9223372036854775807", "18446744073709551610"),
+                ids
+            );
+
+            // GET by a low-half key resolves through Long.parseLong /
+            // BigInteger and hits the Lance filter with a literal
+            // Lance understands.
+            Response getLow = client().performRequest(new Request("GET", "/" + indexName + "/_doc/42"));
+            assertEquals(200, getLow.getStatusLine().getStatusCode());
+            String getLowBody = readAll(getLow);
+            assertTrue("expected _id:42, saw: " + getLowBody, getLowBody.contains("\"_id\":\"42\""));
+
+            // GET by the top-half key exercises the BigInteger path.
+            // Previously Long.parseLong would have thrown
+            // NumberFormatException and the engine short-circuited to
+            // 404.
+            Response getHigh = client().performRequest(new Request("GET", "/" + indexName + "/_doc/18446744073709551610"));
+            assertEquals(200, getHigh.getStatusLine().getStatusCode());
+            String getHighBody = readAll(getHigh);
+            assertTrue("expected _id:18446744073709551610, saw: " + getHighBody, getHighBody.contains("\"_id\":\"18446744073709551610\""));
+
+            // Negative / oversized ids never match a UInt64 row and
+            // must be rejected as 404 before Lance sees them.
+            ResponseException notFound = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/-1"))
+            );
+            assertEquals(404, notFound.getResponse().getStatusLine().getStatusCode());
+            ResponseException tooLarge = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/99999999999999999999"))
+            );
+            assertEquals(404, tooLarge.getResponse().getStatusLine().getStatusCode());
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testMultiFieldsExposesKeywordSubField() throws Exception {
         // Issue #8: attach body accepts a multi_fields clause so an Utf8
         // FTS column can carry a keyword sub-field for exact-match or
