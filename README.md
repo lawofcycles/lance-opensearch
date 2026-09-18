@@ -12,17 +12,18 @@ Built against OpenSearch 3.8.0 with Lance 11.0.0.
 
 ## Features
 
-The plugin surfaces a Lance table as an OpenSearch index whose shards each own a subset of the table's fragments. Queries and gets are served directly out of the Lance columns and indexes.
+The plugin surfaces a Lance table as an OpenSearch index. `_search` runs through a shard-free fragment fan-out: the coordinator dispatches Lance fragments across the data nodes holding the index's primary shard, and each per-node executor drives OpenSearch's standard aggregator machinery and Lucene `IndexSearcher` against per-fragment leaf readers. Every Lance-backed index carries a single primary shard (attach rejects `number_of_shards`); multi-node parallelism comes from replica placement.
 
-- Namespace registration polls a directory for `*.lance` tables and surfaces each as an OpenSearch index. Mapping and shard count are derived from the Lance schema and row count.
+- Namespace registration polls a directory for `*.lance` tables and surfaces each as an OpenSearch index. Mapping is derived from the Lance schema.
 - Full-text search over an FTS-indexed column (`match`, `bool` composition). BM25 scores are returned by Lance.
 - AND / OR operator control, fuzziness, prefix length, and max term expansions for Lance FTS via the `lance_match` DSL query, and phrase order (with slop) via `lance_match_phrase`.
 - Multi-field full-text via `lance_multi_match` (per-field boosts and shared operator, pushed straight into Lance's `MultiMatchQuery`).
 - Score composition across FTS clauses via `lance_fts_boost` (positive / negative with `negative_boost`) and `lance_fts_bool` (`must` / `should` / `must_not` clause arrays), evaluated entirely on Lance's side rather than layered on Lucene's `BooleanQuery`.
-- Vector nearest-neighbour search via the custom `lance_knn` DSL query. Per-shard nearest scan; coordinator merge reconstructs the global top-k.
+- Vector nearest-neighbour search via the custom `lance_knn` DSL query. Per-fragment nearest scan; coordinator merge reconstructs the global top-k.
 - Primary-key lookup via `GET /<index>/_doc/<id>`. Uses a Lance scalar index when present; falls back to a filtered scan.
 - `_source` and `_id` synthesised on the fly from Lance rows.
-- Aggregations through Lucene's aggregator over Lance-backed doc values.
+- Aggregations (metric: `sum` / `avg` / `min` / `max` / `value_count`; bucket: `terms` / `histogram` / `date_histogram`) through Lucene's aggregator over Lance-backed doc values.
+- `from` + `size` pagination, `search_after` cursor pagination (when the request carries `sort`), `post_filter` narrowing, `sort` by scalar field, `collapse`, `rescore`, and Painless `script` query / sort. Suggest, highlighter, and score-order `search_after` still fall through to the shard-level engine because they need Lance FTS internals the Java SDK does not currently surface.
 - Automatic follow-forward when Lance advances to a new manifest version. No index close, no shard reallocation, no request downtime.
 - Per-table object-store credentials, endpoints, and timeouts through a `storage_options` map on `POST /_lance/attach` and `POST /_lance/namespace`. Keys and values follow Lance's Rust `object_store` naming (e.g. `aws_access_key_id`, `aws_region`, `aws_endpoint`, `allow_http`) so what the caller writes is what Lance sees. Options ride into the index settings, so the JVM can address two buckets with different credentials at the same time.
 
