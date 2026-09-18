@@ -487,5 +487,7 @@ Alternatively, keep the surviving indices and reattach each one explicitly with 
 
 ## Next steps
 
+- Full feature reference: [features.md](features.md).
+- Known limitations and shapes routed to the shard path: [limitations.md](limitations.md).
 - The plugin's design and the invariants it upholds live in the RFC: [opensearch-project/OpenSearch#22643](https://github.com/opensearch-project/OpenSearch/issues/22643).
-- Known unfinished work is tracked as issues in this repository. See the README's "What is not yet implemented" list for the shape of the gaps.
+- Known unfinished work is tracked as issues in this repository.

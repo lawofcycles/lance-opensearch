@@ -6,39 +6,18 @@ Lance is an open columnar table format designed for machine learning workloads: 
 
 ## Status
 
-Early draft. Not production ready. The read-side plumbing — namespace registration, mapping derivation, the four query shapes, and the follow-forward refresh loop — works end to end against real Lance tables, but interfaces and settings are still shifting. Use it to explore the design or to try it against your own Lance tables; not to run anything you depend on.
+Early draft. Not production ready. The read-side plumbing (namespace registration, mapping derivation, `_search` / GET / aggregation shapes, and the follow-forward refresh loop) works end to end against real Lance tables, but interfaces and settings are still shifting. Use it to explore the design or try it against your own Lance tables, not to run anything you depend on.
 
 Built against OpenSearch 3.8.0 with Lance 11.0.0.
 
-## Features
+## What it does
 
-The plugin surfaces a Lance table as an OpenSearch index. `_search` runs through a shard-free fragment fan-out: the coordinator dispatches Lance fragments across the data nodes holding the index's primary shard, and each per-node executor drives OpenSearch's standard aggregator machinery and Lucene `IndexSearcher` against per-fragment leaf readers. Every Lance-backed index carries a single primary shard (attach rejects `number_of_shards`); multi-node parallelism comes from replica placement.
+- Registers a directory or a single Lance table URI and surfaces it as an OpenSearch index. Mapping derives from the Lance Arrow schema.
+- Runs full-text (`match`, `lance_match`, `lance_match_phrase`, `lance_multi_match`, `lance_fts_boost`, `lance_fts_bool`), vector (`lance_knn`), primary-key GET, and aggregation queries through a fragment fan-out that drives Lucene's stock aggregator machinery over per-fragment leaf readers.
+- Follows the Lance manifest forward automatically. `"version": N` on attach also pins a readonly snapshot.
+- Accepts per-table `storage_options` (S3, GCS, Azure) so a single JVM can address multiple buckets with different credentials.
 
-- Namespace registration polls a directory for `*.lance` tables and surfaces each as an OpenSearch index. Mapping is derived from the Lance schema.
-- Full-text search over an FTS-indexed column (`match`, `bool` composition). BM25 scores are returned by Lance.
-- AND / OR operator control, fuzziness, prefix length, and max term expansions for Lance FTS via the `lance_match` DSL query, and phrase order (with slop) via `lance_match_phrase`.
-- Multi-field full-text via `lance_multi_match` (per-field boosts and shared operator, pushed straight into Lance's `MultiMatchQuery`).
-- Score composition across FTS clauses via `lance_fts_boost` (positive / negative with `negative_boost`) and `lance_fts_bool` (`must` / `should` / `must_not` clause arrays), evaluated entirely on Lance's side rather than layered on Lucene's `BooleanQuery`.
-- Vector nearest-neighbour search via the custom `lance_knn` DSL query. Per-fragment nearest scan; coordinator merge reconstructs the global top-k.
-- Primary-key lookup via `GET /<index>/_doc/<id>`. Uses a Lance scalar index when present; falls back to a filtered scan.
-- `_source` and `_id` synthesised on the fly from Lance rows.
-- Aggregations (metric: `sum` / `avg` / `min` / `max` / `value_count`; bucket: `terms` / `histogram` / `date_histogram`) through Lucene's aggregator over Lance-backed doc values.
-- `from` + `size` pagination, `search_after` cursor pagination (when the request carries `sort`), `post_filter` narrowing, `sort` by scalar field, `collapse`, `rescore`, and Painless `script` query / sort. Suggest, highlighter, and score-order `search_after` still fall through to the shard-level engine because they need Lance FTS internals the Java SDK does not currently surface.
-- Automatic follow-forward when Lance advances to a new manifest version. No index close, no shard reallocation, no request downtime. Attach also accepts `"version": N` in the body to pin a Lance-backed index to a specific manifest version for readonly snapshots (the poll cycle then leaves the pinned index alone); tag / branch checkout is not yet exposed by the Lance Java SDK.
-- Per-table object-store credentials, endpoints, and timeouts through a `storage_options` map on `POST /_lance/attach` and `POST /_lance/namespace`. Keys and values follow Lance's Rust `object_store` naming (e.g. `aws_access_key_id`, `aws_region`, `aws_endpoint`, `allow_http`) so what the caller writes is what Lance sees. Options ride into the index settings, so the JVM can address two buckets with different credentials at the same time.
-
-Mapping type coverage today: `int32` / `int64`, `boolean`, `date` / `timestamp`, `string` (as `lance_text` when the column has a Lance FTS index, otherwise `keyword`), `fixed_size_list<float>` (as `knn_vector`), `list<string>` (multi-valued `keyword`), `binary`.
-
-## Not yet implemented
-
-- Analytics route via `sandbox/plugins/analytics-backend-datafusion`. All queries currently take the reader route.
-- PPL / SQL integration (lives in `opensearch-project/sql`).
-- Mapping coverage for `ip`, `wildcard`, `object`, `nested`, and the geo family.
-- Text analysis beyond Lance's native tokenizer. RFC's second text mode (OpenSearch analyzer → derived column backfill) is only proven for English.
-- Native ingestion via `_bulk` / `_doc` (RFC future work #1).
-- Lucene custom index type stored in `_indices/{uuid}/` (RFC future work #2).
-
-Full backlog: the issues tab of this repository.
+See [docs/features.md](docs/features.md) for the full feature list and [docs/limitations.md](docs/limitations.md) for known limitations and shapes routed to the shard path.
 
 ## Requirements
 
@@ -46,49 +25,30 @@ Full backlog: the issues tab of this repository.
 - OpenSearch 3.8.0
 - macOS/aarch64, linux/x86_64, or linux/aarch64 (Lance's Rust native library ships in `org.lance:lance-core` for these platforms)
 
-## Quick start
+## Build
 
 ```
 ./gradlew build
 ```
 
-produces the plugin zip at `build/distributions/opensearch-lance-0.1.0.zip`.
+Produces `build/distributions/opensearch-lance-0.1.0.zip`.
 
-The full walkthrough — install into OpenSearch, prepare a Lance table, register a namespace, and run the four supported query shapes — is in [docs/getting-started.md](docs/getting-started.md).
+To run the tests:
 
-## Hybrid search
+```
+./gradlew test integTest multiNodeIntegTest
+```
 
-Full-text and vector sub-queries compose inside compound queries at the shard level. `bool.should` with an FTS clause (`lance_match`, stock `match` on a `lance_text` field, `lance_match_phrase`, `lance_multi_match`) and `lance_knn` returns the union of hits, and the sum-of-child-scores puts docs that satisfy both sub-queries at the top. Integration tests `testBoolShouldComposesLanceMatchWithLanceKnn` and `testBoolShouldComposesStockMatchOnLanceTextWithLanceKnn` exercise this end-to-end.
+## Try it
 
-OpenSearch's dedicated [hybrid search](https://opensearch.org/docs/latest/search-plugins/hybrid-search/) (the `hybrid` query and its `normalization-processor` / `combination-processor` search pipeline) is served by the `neural-search` plugin. That plugin's `HybridQueryWeight` calls `createWeight` on every sub-query and composes their `Scorer` outputs the same way `bool.should` does per shard, and the coordinator normalises per-sub-query top-K on top. The Lance queries in this plugin implement the standard Lucene `Query` / `Weight` / `ScorerSupplier` / `Scorer` contract, so a hybrid query mixing `match` on `lance_text` (or `lance_match`) with `lance_knn` runs through the same shard-side path the bool.should ITs cover. To use it, install `neural-search` alongside this plugin and follow the hybrid search docs; coordinator-side score normalisation and pipeline behaviour are agnostic to the Lance shard implementation.
+The end-to-end walkthrough (install into OpenSearch, prepare a Lance table, register a namespace, run every query shape) is in [docs/getting-started.md](docs/getting-started.md).
 
-An end-to-end IT with the `neural-search` plugin installed alongside this plugin is tracked separately.
+## Documentation
 
-## Known limitations
-
-- Nearest-neighbour queries scan once per fragment, because {@code LanceKnnQuery} runs at the leaf level. When a Lance table contains many small fragments the same query issues one native scan per fragment; consolidate fragments with the Lance writer's compaction step to reduce that overhead.
-- Nearest-neighbour scores are `boost / (1 + distance)`, not metric-normalised. Compare scores within a single query, not across queries or engines.
-- `lance_knn` accepts an inner `filter` clause that Lance evaluates before applying the K-nearest cutoff (a pre-filter, so K matching rows are still returned when they exist). Supported filter clauses are `match_all`, `term`, `terms`, `exists`, `range`, and `bool` (`filter` / `must` / `must_not` / `should`). Other clauses such as `match`, geo queries, and scripts are rejected with 400. `lance_knn` combined with an outer `bool.filter` still runs the outer clause as a post-filter; wrap it inside `lance_knn.filter` to push it into Lance.
-- OpenSearch's stock `match` and `match_phrase` queries against a `lance_text` field ignore the `operator`, `minimum_should_match`, phrase order, and `slop` parameters. Reason: `lance_text` uses a keyword-analyzer `TextSearchInfo` so the whole query string reaches Lance as a single token and Lance's own tokenizer runs on the query text — OpenSearch's combining layer never sees multiple tokens. Use the plugin's `lance_match` DSL for AND / OR operator control, fuzziness, prefix length, and max expansions, `lance_match_phrase` for phrase order and slop, `lance_multi_match` for multi-field search with optional per-field boosts, and `lance_fts_boost` / `lance_fts_bool` to compose FTS clauses on Lance's side. `minimum_should_match` on stock `match` is still ignored because Lance's Java SDK does not expose the equivalent knob today.
-- `lance_knn` is limited to `Float32` element types. Lance vectors declared as `int8`, `uint8` / binary, or `float16` are surfaced in the attach notes but excluded from the mapping until the Java SDK gains a `setKey(byte[])` / `setKey(short[])` entry point.
-- Lance-backed indices are always single-shard. `POST /_lance/attach` rejects any request carrying `number_of_shards` with 400: the fragment path fans out per fragment regardless of shard count, and shards no longer influence search parallelism. Multi-node parallelism comes from replica placement (set `index.number_of_replicas` to `data_nodes - 1`, or use `auto_expand_replicas: 0-all`, so every data node holds a copy of the primary shard).
-- GET by `_id` requires a primary key declared through the Lance `lance-schema:unenforced-primary-key` metadata. Tables without a declared PK expose an empty `primary_key_field` and GET returns 404.
-- The engine is read-only. `_flush`, `_forcemerge`, `_settings` writes, `_close`, and `_open` on a Lance-backed index are either no-ops or unsupported; mutation happens on the Lance side.
-- Namespace registrations are held in process memory on the node that received the request. They need to be reissued after a cluster restart, and other nodes in a multi-node cluster will not surface the same tables until they too register the path.
-- REST catalogs (Glue, Unity, Iceberg REST) are not wired to the namespace endpoint yet; only the filesystem adapter is exercised today. Tables placed under sub-directories (`root/sub/table.lance`) are not surfaced either — the poller lists top-level tables only.
-- If an OpenSearch index already exists under the same name as a surfaced Lance table, the plugin logs one warning and leaves the table alone on every subsequent poll. Rename, delete, or attach explicitly to resolve.
-- Automatic index builds are disabled by default. Attach and namespace registration do not create FTS / scalar / vector indexes on the Lance table. Indexes are expected to be built outside OpenSearch by the same writer that produced the table (Python `dataset.create_index`, Ray, Spark, or the Lance Java SDK); the plugin provides `POST /_lance/build_indexes/{index}` as an auxiliary path for operators who want to trigger a build from the cluster. Indexes created that way still block subsequent Lance `alter_columns` calls on the indexed column, so drop the index via `drop_index` before altering the type.
-- Append visibility follows the poll cadence, not the index build time. When a Lance table advances to a new version, the plugin exposes the new version as soon as the next poll observes it (default cadence 10 seconds, configurable via `lance.namespace.poll_cadence`). Queries against newly appended fragments run through Lance's mixed execution plan: covered fragments use the existing FTS or knn index while uncovered fragments fall back to a flat scan, and the results are unioned. An incremental append therefore does not slow down queries hitting the already-covered fragments. To keep uncovered fragments from accumulating, run `POST /_lance/build_indexes/{index}` with `{"optimize": true}` periodically or through the same writer that runs the append. The `index.lance.uncovered_fragment_policy` setting still accepts `wait` alongside the default `immediate`, but both values now expose the new version at once; `wait` is reserved for a future async-optimize implementation.
-- Each leaf reader loads Lance columns lazily. The constructor only performs a schema pass and a metadata-only row-address scan; every scalar column moves from "declared in schema" to "loaded" the first time a Lucene accessor asks for it, at which point that column is materialised into heap for the fragment's lifetime. Queries that never render `_source` (aggregations, `size=0` hit counts, sort-only searches) only heap-allocate the columns they consult. Queries that render `_source` still load every scalar column on the first hit.
-- S3-compatible storage is configured through a per-table `storage_options` map on the attach / namespace body, persisted as `index.lance.storage_options.<key>` in the index settings and passed to Lance's Rust `object_store` on every open. When the map is empty, Lance falls back to environment variables (`AWS_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `AWS_ALLOW_HTTP`). Credentials are stored in plain index settings today; keystore / SecureSetting integration and the lance-namespace vended-credentials flow (`vend_credentials`, `expires_at_millis`) are not wired yet. Base-scoped options (`base_<url>.aws_access_key_id`) for nested Lance references are also out of scope for now.
-- Lance `blob` columns and `LargeBinary` / `Struct` / `Utf8` list / `Decimal` / `FloatingPoint(HALF|DOUBLE)` columns are stored in the table but not surfaced in the mapping or `_source`. The attach response notes them so operators can plan around the gap.
-- Version pinning through `"version": N` on `POST /_lance/attach` is available for readonly snapshots. Tag and branch checkout are not exposed by the Lance Java SDK (v11) yet, so they cannot be pinned from OpenSearch.
-- Lindera and Jieba tokenizers are not bundled with lance-jni. Only ICU-based tokenization is available for CJK text through the Lance FTS index.
-- Lance's index cache and metadata cache are shared across every dataset on a node through a single Lance `Session`. The upper bound is controlled by the node setting `lance.native_memory.limit`, which accepts either an absolute size (for example `10gb`) or a percentage of the host memory left after the JVM heap is subtracted (for example `40%`, the default). The value is split 6:1 between the index and metadata caches, mirroring Lance's own default ratio. On r7g.4xlarge (128 GiB physical, 31 GiB heap) the default resolves to roughly 33 GiB of index cache and 5.5 GiB of metadata cache; on a smaller node such as t3.medium the same fraction resolves to under a gigabyte. A `lance_native` circuit breaker mirrors the Session cache limit and shows up in `GET /_nodes/stats/breaker`; a background sampler pushes `Session.sizeBytes()` into the breaker every 5 seconds by default, and FTS or knn queries are rejected with a 429 `CircuitBreakingException` once usage catches up to the limit. `lance.native_memory.limit` itself is still a static node setting that requires a rolling restart; `lance.native_memory.circuit_breaker.enabled` and `lance.native_memory.circuit_breaker.poll_interval` are dynamic.
-- Fragment path concurrency is capped by the node setting `lance.fragment_dispatch.max_concurrent` (default `4`). Fragment path serves every fragment of an index on one node, so per-query heap (FTS score arrays sized by `maxDoc`, aggregation buffers) scales with concurrency rather than shard fan-out; without a cap, allocation can race the `lance_native` circuit breaker into an `OutOfMemoryError` before the breaker fires. Requests that exceed the limit block waiting for a permit, so raising it trades higher throughput for a smaller margin against OOM. Node scoped and static: changes take effect after a rolling restart.
-- `_search` (fragment path) and `GET /_doc/{id}` (engine path) do not share a freshness view. After an append advances the Lance table, `_search` reflects the new rows on its next call because the fragment executor opens the latest version per query. GET runs through the engine that follows the shard's poll cadence (default 10 seconds, configurable via `lance.namespace.poll_cadence`), so the same row may return 404 for a few seconds after `_search` starts listing it. Read-your-writes therefore depends on the API used; use `_search` when the write side matters.
-- `collapse`, `rescore`, and pipeline aggregations (`avg_bucket`, `bucket_sort`, `cumulative_sum`, and other bucket-metrics variants) run through the standard shard path rather than the fragment path. The fragment executor does not synthesise `CollapsingTopDocsCollector` state or the rescorer window, and the coordinator's aggregation merge cannot replay pipeline aggregators without the "Already been replayed" error, so `LanceDispatchActionFilter.isDispatchable` sends these shapes back to the shard path so results are correct rather than silently wrong. Cross-index metrics, suggesters, highlighters, and `search_after` without a `sort` clause are also on that reject list.
-- Multi-node `_search` fan-out is pinned to the node that hosts the primary shard. With `number_of_replicas=0` (the default) exactly one node holds the shard and the fan-out is already local; with `auto_expand_replicas: 0-all` or a higher replica count the same rule collapses fan-out to the primary node because the fragment path does not sort-merge partial hits from replica hosts. Every fragment still executes because Lance fragments live in external storage and the primary node can open all of them.
+- [docs/getting-started.md](docs/getting-started.md) — Build, install, prepare a table, run the query shapes.
+- [docs/features.md](docs/features.md) — Feature reference by concern.
+- [docs/limitations.md](docs/limitations.md) — Known limitations and shard-path fall-throughs.
+- [CHANGELOG.md](CHANGELOG.md) — Release notes.
 
 ## Feedback
 
