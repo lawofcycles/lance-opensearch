@@ -35,6 +35,7 @@ import org.opensearch.common.inject.Inject;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.Index;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -42,6 +43,7 @@ import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
+import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
@@ -154,7 +156,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // Sequential loop keeps the merge trivial; parallel per-index
         // fan-out is future work if it becomes a hot spot.
         FragmentQuerySpec spec = new FragmentQuerySpec(filterSql, query, postFilter, sorts, searchAfter, perNodeSize, aggregations);
-        MergeState merged = new MergeState(aggregations, from, size);
+        boolean versionRequested = source != null && Boolean.TRUE.equals(source.version());
+        boolean seqNoAndPrimaryTermRequested = source != null && Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
+        MergeState merged = new MergeState(aggregations, from, size, versionRequested, seqNoAndPrimaryTermRequested);
         runIndexLoop(targets, 0, nodeList, spec, merged, start, listener);
     }
 
@@ -222,7 +226,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         int fanOutSize = perNode.size();
 
         GroupedActionListener<LanceFragmentQueryResponse> gathered = new GroupedActionListener<>(ActionListener.wrap(responses -> {
-            merged.absorbTargetResponses(responses);
+            merged.absorbTargetResponses(target, responses);
             done.onResponse(null);
         }, done::onFailure), fanOutSize);
 
@@ -456,17 +460,49 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // enough hits for us to skip the first `from` and keep `size`.
         private final int from;
         private final int size;
+        // Whether the request asked for _version / _seq_no /
+        // _primary_term envelope fields on hits. Fragment path has
+        // no per-doc version accounting (Lance datasets are
+        // append/rewrite, not per-doc versioned), so populated
+        // values are constant: version=1, seqNo=0, primaryTerm=1.
+        // The flags exist so the coordinator only stamps hits when
+        // the caller explicitly asked, matching shard path
+        // behaviour where these fields default off.
+        private final boolean versionRequested;
+        private final boolean seqNoAndPrimaryTermRequested;
         private long totalMatched = 0L;
         private final List<SearchHit> hits = new ArrayList<>();
         private final List<InternalAggregations> perNodeAggregations = new ArrayList<>();
 
-        MergeState(AggregatorFactories.Builder aggregationsRequested, int from, int size) {
+        MergeState(
+            AggregatorFactories.Builder aggregationsRequested,
+            int from,
+            int size,
+            boolean versionRequested,
+            boolean seqNoAndPrimaryTermRequested
+        ) {
             this.aggregationsRequested = aggregationsRequested;
             this.from = from;
             this.size = size;
+            this.versionRequested = versionRequested;
+            this.seqNoAndPrimaryTermRequested = seqNoAndPrimaryTermRequested;
         }
 
-        void absorbTargetResponses(Collection<LanceFragmentQueryResponse> responses) {
+        void absorbTargetResponses(IndexTarget target, Collection<LanceFragmentQueryResponse> responses) {
+            // Every hit needs a SearchShardTarget so the response
+            // envelope carries the {@code _index} key that clients
+            // expect. Fragment path has no shard concept, so we
+            // synthesise one entry keyed on the resolved index
+            // metadata; the shard id is always 0 (single-shard).
+            IndexMetadata indexMetadata = clusterService.state().metadata().index(target.indexName());
+            SearchShardTarget shardTarget = indexMetadata == null
+                ? null
+                : new SearchShardTarget(
+                    clusterService.localNode().getId(),
+                    new ShardId(indexMetadata.getIndex(), 0),
+                    /* clusterAlias */ null,
+                    org.opensearch.action.OriginalIndices.NONE
+                );
             for (LanceFragmentQueryResponse response : responses) {
                 totalMatched += response.matched();
                 // Keep every hit until we finish collecting per-node
@@ -476,6 +512,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 // concatenates in per-node arrival order and relies on
                 // the per-node executor's own sort/topN cut.
                 for (SearchHit hit : response.hits()) {
+                    stampEnvelope(hit, shardTarget);
                     if (hits.size() < from + size) {
                         hits.add(hit);
                     }
@@ -483,6 +520,27 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 if (response.aggregations() != null) {
                     perNodeAggregations.add(response.aggregations());
                 }
+            }
+        }
+
+        /**
+         * Attach the shard target and, if requested, the constant
+         * version / seq_no / primary_term envelope values to a
+         * per-node hit. Runs on the coordinator because per-node
+         * responses do not know the index name and because the
+         * request-level flags live on {@link SearchSourceBuilder}
+         * which is not shipped over the wire in full.
+         */
+        private void stampEnvelope(SearchHit hit, SearchShardTarget shardTarget) {
+            if (shardTarget != null) {
+                hit.shard(shardTarget);
+            }
+            if (versionRequested) {
+                hit.version(1L);
+            }
+            if (seqNoAndPrimaryTermRequested) {
+                hit.setSeqNo(0L);
+                hit.setPrimaryTerm(1L);
             }
         }
 

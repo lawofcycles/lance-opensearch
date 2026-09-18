@@ -679,6 +679,61 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeStampsIndexAndVersionEnvelope() throws Exception {
+        // The response envelope should carry _index on every hit
+        // regardless of what the request asked for, and _version /
+        // _seq_no / _primary_term when the request opted in via
+        // `version` / `seq_no_primary_term`. Fragment path used to
+        // omit all four because it built SearchHit objects on the
+        // per-node executor without a SearchShardTarget and without
+        // per-doc version accounting; the coordinator now stamps
+        // them on absorbTargetResponses.
+        String suffix = "s3-env-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // Plain _search: _index must be present on every hit,
+            // version / seq_no / primary_term must NOT (defaults are
+            // off).
+            String plain = readAll(postJson("/" + indexName + "/_search", "{\"size\":2,\"query\":{\"match_all\":{}}}"));
+            assertTrue("expected _index=[" + indexName + "] on each hit: " + plain, plain.contains("\"_index\":\"" + indexName + "\""));
+            assertFalse("_version must be omitted by default: " + plain, plain.contains("\"_version\""));
+            assertFalse("_seq_no must be omitted by default: " + plain, plain.contains("\"_seq_no\""));
+            assertFalse("_primary_term must be omitted by default: " + plain, plain.contains("\"_primary_term\""));
+
+            // version: true opts _version in, but not seq_no /
+            // primary_term. Fragment path has no per-doc version so
+            // the constant value 1 is reported.
+            String versioned = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"version\":true}")
+            );
+            assertTrue("expected _index on each hit: " + versioned, versioned.contains("\"_index\":\"" + indexName + "\""));
+            assertTrue("expected _version=1 when version:true: " + versioned, versioned.contains("\"_version\":1"));
+            assertFalse("_seq_no still off: " + versioned, versioned.contains("\"_seq_no\""));
+
+            // seq_no_primary_term: true opts _seq_no and
+            // _primary_term in but leaves _version off. Constants
+            // seqNo=0 / primaryTerm=1 match the shard path defaults
+            // for a freshly-indexed doc.
+            String seqno = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"seq_no_primary_term\":true}")
+            );
+            assertTrue("expected _seq_no=0: " + seqno, seqno.contains("\"_seq_no\":0"));
+            assertTrue("expected _primary_term=1: " + seqno, seqno.contains("\"_primary_term\":1"));
+            assertFalse("_version still off: " + seqno, seqno.contains("\"_version\""));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFragmentDispatchModeAnswersFromPagination() throws Exception {
         // from > 0 used to fall through to the shard path because the
         // coordinator merge did not know how to skip. Now the
