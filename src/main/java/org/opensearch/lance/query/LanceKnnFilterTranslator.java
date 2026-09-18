@@ -72,9 +72,11 @@ public final class LanceKnnFilterTranslator {
             return "true";
         }
         if (builder instanceof TermQueryBuilder t) {
+            rejectMultiFieldPath(t.fieldName());
             return t.fieldName() + " = " + literal(t.value(), t.fieldName());
         }
         if (builder instanceof TermsQueryBuilder t) {
+            rejectMultiFieldPath(t.fieldName());
             java.util.List<?> values = t.values();
             if (values == null || values.isEmpty()) {
                 // `terms {"col": []}` matches nothing; translate to `false`
@@ -86,9 +88,11 @@ public final class LanceKnnFilterTranslator {
             return t.fieldName() + " IN (" + elements + ")";
         }
         if (builder instanceof ExistsQueryBuilder e) {
+            rejectMultiFieldPath(e.fieldName());
             return e.fieldName() + " IS NOT NULL";
         }
         if (builder instanceof RangeQueryBuilder r) {
+            rejectMultiFieldPath(r.fieldName());
             return translateRange(r);
         }
         if (builder instanceof BoolQueryBuilder b) {
@@ -97,6 +101,32 @@ public final class LanceKnnFilterTranslator {
         throw new IllegalArgumentException(
             "[lance_knn] filter type [" + builder.getClass().getSimpleName() + "] is not supported by the pre-filter translator"
         );
+    }
+
+    /**
+     * Refuse a dotted field name so multi-field sub-fields
+     * ({@code body.raw}) do not fall through to the Lance SQL
+     * pre-filter path. Sub-fields share the base column's data but
+     * exist only as Lucene {@code FieldInfo} entries; Lance does not
+     * know about them and would interpret the dot as a struct field
+     * access, returning a 500 like "type Utf8 is not Struct, Map, or
+     * Null". Sub-field queries belong on the Lucene searcher path
+     * (SortedSetDocValues), which the coordinator picks when
+     * {@code filterSql} is null.
+     *
+     * <p>Nested Lance columns (Struct / List&lt;Struct&gt;) are not
+     * surfaced yet (issues #4 / #5), so a dot in the mapping today
+     * means multi-field unambiguously. Revisit this guard when those
+     * shapes land.
+     */
+    private static void rejectMultiFieldPath(String fieldName) {
+        if (fieldName != null && fieldName.indexOf('.') >= 0) {
+            throw new IllegalArgumentException(
+                "[lance_knn] filter cannot push down to Lance for dotted field ["
+                    + fieldName
+                    + "]; multi-field sub-fields resolve via Lucene doc values instead"
+            );
+        }
     }
 
     private static String translateRange(RangeQueryBuilder r) {

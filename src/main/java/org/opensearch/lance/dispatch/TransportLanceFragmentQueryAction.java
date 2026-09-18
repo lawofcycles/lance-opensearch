@@ -241,6 +241,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 : org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.fromSetting(
                     indexMetadata.getSettings().get("index.lance.primary_key_type", "long")
                 );
+            // Multi-fields spec is persisted as JSON in a single setting.
+            // Empty (no attach-body clause) leaves the reader with an empty
+            // sub-field map. Malformed JSON falls through to
+            // IllegalArgumentException, which the outer catch turns into a
+            // 500 for the caller; that is loud enough to surface a bad
+            // index setting without hiding the failure behind an empty map.
+            java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields = org.opensearch.lance.rest.RestAttachAction
+                .deserialiseMultiFields(indexMetadata.getSettings().get("index.lance.multi_fields", ""));
 
             // Open a fresh Dataset for the reader: LanceDirectoryReader
             // takes ownership of the Dataset and closes it in doClose.
@@ -252,7 +260,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // same way they apply to shard path hits.
             try (
                 Dataset readerDataset = LanceRegistry.openDataset(request.tableUri(), request.storageOptions());
-                DirectoryReader dr = openWrappedReader(indexService, readerDataset, pkField, pkType, effectiveFragmentIds)
+                DirectoryReader dr = openWrappedReader(indexService, readerDataset, pkField, pkType, multiFields, effectiveFragmentIds)
             ) {
                 MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
                     Integer.MAX_VALUE,
@@ -589,6 +597,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         Dataset readerDataset,
         String pkField,
         org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
         List<Integer> effectiveFragmentIds
     ) throws IOException {
         DirectoryReader lanceReader = LanceDirectoryReader.openForFragments(
@@ -597,6 +606,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             readerDataset,
             pkField,
             pkType,
+            multiFields,
             effectiveFragmentIds
         );
         try {

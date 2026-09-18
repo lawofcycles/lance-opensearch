@@ -122,6 +122,17 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.IndexScope,
         Setting.Property.Final
     );
+    /**
+     * JSON stringified multi-fields spec, persisted by attach so the
+     * engine can rehydrate keyword sub-fields on shard open. Empty
+     * means no sub-fields declared. See design note 36.
+     */
+    public static final Setting<String> MULTI_FIELDS_SETTING = Setting.simpleString(
+        LanceEngineFactory.MULTI_FIELDS_SETTING,
+        "",
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
     public static final Setting<String> UNCOVERED_FRAGMENT_POLICY_SETTING = Setting.simpleString(
         "index.lance.uncovered_fragment_policy",
         "immediate",
@@ -246,6 +257,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             PRIMARY_KEY_FIELD_SETTING,
             PRIMARY_KEY_TYPE_SETTING,
             VERSION_SETTING,
+            MULTI_FIELDS_SETTING,
             UNCOVERED_FRAGMENT_POLICY_SETTING,
             NAMESPACE_POLL_CADENCE_SETTING,
             BUILDER_MAX_ROWS_SETTING,

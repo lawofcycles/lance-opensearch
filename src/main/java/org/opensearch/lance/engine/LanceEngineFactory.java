@@ -97,6 +97,18 @@ public final class LanceEngineFactory implements EngineFactory {
     public static final String VERSION_SETTING = "index.lance.version";
 
     /**
+     * Compact JSON stringified form of the multi-fields spec captured at
+     * attach time. Empty when the attach body did not carry a
+     * {@code multi_fields} clause. The engine parses the string back into
+     * a base → (sub → type) map on shard open and forwards it to the
+     * reader so keyword sub-fields ({@code body.raw} on a {@code body}
+     * Utf8 column) become queryable through doc values. See
+     * {@link org.opensearch.lance.rest.RestAttachAction#serialiseMultiFields}
+     * / {@link org.opensearch.lance.rest.RestAttachAction#deserialiseMultiFields}.
+     */
+    public static final String MULTI_FIELDS_SETTING = "index.lance.multi_fields";
+
+    /**
      * Arrow type kinds a Lance primary key column can take. Kept small on
      * purpose: {@link #LONG} covers signed integer PKs (any bit width up to
      * 64), {@link #KEYWORD} covers Utf8 PKs, and {@link #NONE} is the
@@ -161,7 +173,10 @@ public final class LanceEngineFactory implements EngineFactory {
         long versionSetting = config.getIndexSettings().getSettings().getAsLong(VERSION_SETTING, -1L);
         java.util.Optional<Long> pinnedVersion = versionSetting >= 0 ? java.util.Optional.of(versionSetting) : java.util.Optional.empty();
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(config.getIndexSettings().getSettings());
-        return new LanceReadOnlyEngine(config, table, field, pkType, shardId, pinnedVersion, storageOptions);
+        String multiFieldsJson = config.getIndexSettings().getSettings().get(MULTI_FIELDS_SETTING, "");
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields = org.opensearch.lance.rest.RestAttachAction
+            .deserialiseMultiFields(multiFieldsJson);
+        return new LanceReadOnlyEngine(config, table, field, pkType, shardId, pinnedVersion, storageOptions, multiFields);
     }
 
     static final class LanceReadOnlyEngine extends ReadOnlyEngine {
@@ -181,6 +196,12 @@ public final class LanceEngineFactory implements EngineFactory {
          */
         final java.util.Optional<Long> pinnedVersion;
         final StorageOptions storageOptions;
+        /**
+         * Multi-fields spec captured at attach time. Empty when the operator
+         * did not declare any sub-fields. Forwarded verbatim to the reader
+         * so keyword sub-fields become queryable through doc values.
+         */
+        final java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields;
         private final LanceReaderManager lanceReaderManager;
 
         LanceReadOnlyEngine(
@@ -190,7 +211,8 @@ public final class LanceEngineFactory implements EngineFactory {
             LancePrimaryKeyType pkType,
             int shardId,
             java.util.Optional<Long> pinnedVersion,
-            StorageOptions storageOptions
+            StorageOptions storageOptions,
+            java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
         ) {
             super(config, null, null, true, Function.identity(), true);
             this.tablePath = table;
@@ -199,6 +221,7 @@ public final class LanceEngineFactory implements EngineFactory {
             this.shardId = shardId;
             this.pinnedVersion = pinnedVersion;
             this.storageOptions = storageOptions;
+            this.multiFields = multiFields;
             try {
                 OpenSearchDirectoryReader initial = openLanceReader();
                 long initialVersion;
@@ -224,7 +247,7 @@ public final class LanceEngineFactory implements EngineFactory {
             OpenSearchDirectoryReader wrapped = null;
             LanceDirectoryReader reader = null;
             try {
-                reader = LanceDirectoryReader.open(directory, commit, dataset, field, pkType);
+                reader = LanceDirectoryReader.open(directory, commit, dataset, field, pkType, multiFields);
                 wrapped = OpenSearchDirectoryReader.wrap(reader, config().getShardId());
                 return wrapped;
             } catch (Throwable t) {

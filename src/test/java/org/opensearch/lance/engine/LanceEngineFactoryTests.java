@@ -28,6 +28,32 @@ public class LanceEngineFactoryTests extends OpenSearchTestCase {
         assertEquals("index.lance.primary_key_type", LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING);
     }
 
+    public void testMultiFieldsSettingKey() {
+        assertEquals("index.lance.multi_fields", LanceEngineFactory.MULTI_FIELDS_SETTING);
+    }
+
+    public void testMultiFieldsSerialiseDeserialiseRoundTrip() {
+        // Empty map round-trips to empty string and back to empty map so
+        // absence of a multi_fields clause never persists a setting.
+        assertEquals("", org.opensearch.lance.rest.RestAttachAction.serialiseMultiFields(java.util.Collections.emptyMap()));
+        assertTrue(org.opensearch.lance.rest.RestAttachAction.deserialiseMultiFields("").isEmpty());
+        assertTrue(org.opensearch.lance.rest.RestAttachAction.deserialiseMultiFields(null).isEmpty());
+
+        // Nested map with one keyword sub-field survives the JSON round
+        // trip so the engine sees exactly what attach persisted.
+        java.util.LinkedHashMap<String, java.util.LinkedHashMap<String, String>> in = new java.util.LinkedHashMap<>();
+        java.util.LinkedHashMap<String, String> bodySubs = new java.util.LinkedHashMap<>();
+        bodySubs.put("raw", "keyword");
+        in.put("body", bodySubs);
+        String json = org.opensearch.lance.rest.RestAttachAction.serialiseMultiFields(in);
+        assertEquals("{\"body\":{\"raw\":\"keyword\"}}", json);
+
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> out = org.opensearch.lance.rest.RestAttachAction
+            .deserialiseMultiFields(json);
+        assertEquals(1, out.size());
+        assertEquals("keyword", out.get("body").get("raw"));
+    }
+
     public void testPrimaryKeyTypeFromSettingFallsBackToLong() {
         // Empty and unknown strings must return LONG so pre-#24 indices
         // without the setting continue to open with the integer lookup

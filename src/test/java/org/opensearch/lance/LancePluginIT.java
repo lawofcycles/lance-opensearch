@@ -1467,6 +1467,149 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testMultiFieldsExposesKeywordSubField() throws Exception {
+        // Issue #8: attach body accepts a multi_fields clause so an Utf8
+        // FTS column can carry a keyword sub-field for exact-match or
+        // aggregation without duplicating source. The primary field stays
+        // lance_text (Lance FTS index) and the sub-field gets its own
+        // keyword mapping backed by the same underlying Lance column.
+        //
+        // Uses the standard 6-row fixture where body is
+        // "hello lance 0" / "quick brown fox 1" / "hello lance 2" / ...
+        // and every value is unique. Row i's body is unique so a term
+        // query on body.raw resolves to exactly one hit.
+        String suffix = "multifields-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson(
+                "/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"multi_fields\":{\"body\":{\"raw\":{\"type\":\"keyword\"}}}}"
+            );
+            assertEquals(
+                "attach with multi_fields failed: " + readAll(attach),
+                RestStatus.OK.getStatus(),
+                attach.getStatusLine().getStatusCode()
+            );
+
+            // Mapping must carry the sub-field under fields.raw with
+            // type keyword. This confirms derive() emitted the block.
+            String mappingBody = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+            assertTrue(
+                "mapping must expose body.fields.raw as keyword: " + mappingBody,
+                mappingBody.contains("\"fields\":{\"raw\":{\"type\":\"keyword\"")
+            );
+
+            // Term query on body.raw must return exactly one hit for a
+            // known body value. Previously the sub-field did not exist
+            // in FieldInfos so the query resolved to zero hits or 400.
+            String termBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"term\":{\"body.raw\":\"hello lance 0\"}}}")
+            );
+            assertEquals(
+                "term body.raw hello lance 0 must return 1 hit: " + termBody,
+                1,
+                extractIntPath(termBody, "hits", "total", "value")
+            );
+            assertEquals(0, extractIntPath(termBody, "hits", "hits", "0", "_source", "id"));
+
+            // Aggregation over body.raw produces 6 buckets (one per row)
+            // because every body value is unique. This exercises the
+            // SortedSetDocValues path on the sub-field.
+            String aggBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"aggs\":{\"per_body\":{\"terms\":{\"field\":\"body.raw\",\"size\":10}}}}"
+                )
+            );
+            // Buckets count varies with terms aggregation ordering; assert
+            // the total unique bucket count via bucket array length in the
+            // response body. Six distinct body values means at least six
+            // hello / quick lines in the JSON.
+            int bucketCount = 0;
+            try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, aggBody)) {
+                java.util.Map<String, Object> map = parser.map();
+                @SuppressWarnings("unchecked")
+                java.util.Map<String, Object> aggs = (java.util.Map<String, Object>) map.get("aggregations");
+                @SuppressWarnings("unchecked")
+                java.util.Map<String, Object> perBody = (java.util.Map<String, Object>) aggs.get("per_body");
+                @SuppressWarnings("unchecked")
+                java.util.List<Object> buckets = (java.util.List<Object>) perBody.get("buckets");
+                bucketCount = buckets.size();
+            }
+            assertEquals("body.raw terms agg must produce 6 unique buckets: " + aggBody, 6, bucketCount);
+
+            // Primary field body still resolves as lance_text: a match
+            // query returns hits for the tokens "hello lance" occurring
+            // on rows 0/2/4. The sub-field must not disturb the parent
+            // field's FTS path.
+            String matchBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}}}"));
+            assertEquals(3, extractIntPath(matchBody, "hits", "total", "value"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testMultiFieldsRejectsInvalidBaseColumn() throws Exception {
+        // Non-Utf8 base column (integer id) with a keyword sub-field is
+        // rejected at attach time so the operator gets a 400 rather than
+        // an index that silently fails to serve body.raw queries. Same
+        // for unknown base columns and non-keyword sub-field types.
+        String suffix = "multifieldsbad-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        try {
+            ResponseException nonUtf8 = expectThrows(
+                ResponseException.class,
+                () -> postJson(
+                    "/_lance/attach",
+                    "{\"table\":\"" + tableUri + "\",\"multi_fields\":{\"id\":{\"raw\":{\"type\":\"keyword\"}}}}"
+                )
+            );
+            assertEquals(400, nonUtf8.getResponse().getStatusLine().getStatusCode());
+            assertTrue(
+                "expected error mentioning [id] must be Utf8, saw: " + readAll(nonUtf8.getResponse()),
+                readAll(nonUtf8.getResponse()).contains("must be Utf8")
+            );
+
+            ResponseException unknownColumn = expectThrows(
+                ResponseException.class,
+                () -> postJson(
+                    "/_lance/attach",
+                    "{\"table\":\"" + tableUri + "\",\"multi_fields\":{\"noSuchCol\":{\"raw\":{\"type\":\"keyword\"}}}}"
+                )
+            );
+            assertEquals(400, unknownColumn.getResponse().getStatusLine().getStatusCode());
+            assertTrue(
+                "expected error mentioning unknown column, saw: " + readAll(unknownColumn.getResponse()),
+                readAll(unknownColumn.getResponse()).contains("unknown column")
+            );
+
+            ResponseException badSubType = expectThrows(
+                ResponseException.class,
+                () -> postJson(
+                    "/_lance/attach",
+                    "{\"table\":\"" + tableUri + "\",\"multi_fields\":{\"body\":{\"raw\":{\"type\":\"text\"}}}}"
+                )
+            );
+            assertEquals(400, badSubType.getResponse().getStatusLine().getStatusCode());
+            assertTrue(
+                "expected error mentioning [keyword] type, saw: " + readAll(badSubType.getResponse()),
+                readAll(badSubType.getResponse()).contains("must be [keyword]")
+            );
+        } finally {
+            // No successful attach here so no index cleanup required, but
+            // the scratch dir cleanup will happen through sharedRoot.
+        }
+    }
+
     public void testAttachAndKnn() throws Exception {
         // Row i sits at coordinate (i, 0, 0, ...) so the nearest neighbour
         // of (2.4, 0, ...) is row 2 followed by row 3. Vector index build is

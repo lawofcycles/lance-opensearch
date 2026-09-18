@@ -128,6 +128,23 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * a stable, unique identifier per row.
      */
     private final String[] pkStrings;
+    /**
+     * Sub-field name → base column name lookup for multi-fields. Empty
+     * when the attach body did not declare {@code multi_fields}. Every
+     * entry is a keyword sub-field on a Utf8 base column; the reader
+     * routes {@link #getSortedDocValues} / {@link #getSortedSetDocValues}
+     * on the sub-field name through the base column's ord data
+     * structure. See design note 36 for why the sub-field shares the
+     * base column's ord map rather than getting its own.
+     */
+    private final java.util.Map<String, String> keywordSubFields;
+    /**
+     * Base column names that carry at least one keyword sub-field.
+     * {@link #ensureTextLoaded} consults this set so a TEXT_FTS column
+     * with a sub-field still builds the ord data structure that
+     * TEXT_KEYWORD would build by default.
+     */
+    private final java.util.Set<String> basesWithKeywordSub;
     private final Bits liveDocs;
     private final FieldInfos fieldInfos;
     private final Dataset dataset;
@@ -182,7 +199,8 @@ public final class LanceFragmentLeafReader extends LeafReader {
         int fragmentId,
         long physicalRows,
         String intField,
-        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType
+        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
     ) throws IOException {
         this.dataset = dataset;
         this.fragmentId = fragmentId;
@@ -202,6 +220,29 @@ public final class LanceFragmentLeafReader extends LeafReader {
         this.pkStrings = this.pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.KEYWORD
             ? new String[maxDoc]
             : null;
+        // Flatten the multi-fields spec into "<sub>" → "<base>" lookup so
+        // getSortedDocValues("body.raw") can route to the base column's
+        // ord data structure without re-parsing the spec. Only keyword
+        // sub-fields are supported today (see design note 36), so any
+        // sub-field type that is not "keyword" is skipped defensively
+        // rather than errored out — the attach-time validation is where
+        // the error surfaces.
+        java.util.LinkedHashMap<String, String> subToBase = new java.util.LinkedHashMap<>();
+        java.util.Set<String> basesWithKeywordSub = new java.util.HashSet<>();
+        if (multiFields != null && !multiFields.isEmpty()) {
+            for (java.util.Map.Entry<String, java.util.LinkedHashMap<String, String>> entry : multiFields.entrySet()) {
+                String baseName = entry.getKey();
+                for (java.util.Map.Entry<String, String> sub : entry.getValue().entrySet()) {
+                    if (!"keyword".equals(sub.getValue())) {
+                        continue;
+                    }
+                    subToBase.put(baseName + "." + sub.getKey(), baseName);
+                    basesWithKeywordSub.add(baseName);
+                }
+            }
+        }
+        this.keywordSubFields = java.util.Collections.unmodifiableMap(subToBase);
+        this.basesWithKeywordSub = java.util.Collections.unmodifiableSet(basesWithKeywordSub);
 
         // Schema pass: classify every column we might surface, resolve FTS
         // presence for Utf8 columns via one describeIndices call each. This
@@ -283,6 +324,12 @@ public final class LanceFragmentLeafReader extends LeafReader {
         // TEXT_FTS / BINARY → no doc values but the FieldInfo exists so the
         // security plugin's FLS wrapper can drop them by name (see LanceFtsQuery
         // FLS-bypass check; see e21bf3c for the original bug).
+        //
+        // Multi-fields append a synthetic SORTED_SET entry per keyword
+        // sub-field so getSortedDocValues / getSortedSetDocValues on the
+        // sub-field name resolve, and so FLS field enumeration sees them.
+        // The underlying data lives on the base column; the sub-field
+        // entry only exists in the FieldInfos, not in columnKind.
         List<FieldInfo> infos = new java.util.ArrayList<>();
         int number = 10;
         for (Map.Entry<String, ColumnKind> entry : columnKind.entrySet()) {
@@ -300,6 +347,30 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     false,
                     IndexOptions.NONE,
                     dvType,
+                    DocValuesSkipIndexType.NONE,
+                    -1,
+                    Collections.emptyMap(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    VectorEncoding.FLOAT32,
+                    VectorSimilarityFunction.EUCLIDEAN,
+                    false,
+                    false
+                )
+            );
+        }
+        for (String subName : keywordSubFields.keySet()) {
+            infos.add(
+                new FieldInfo(
+                    subName,
+                    number++,
+                    false,
+                    true,
+                    false,
+                    IndexOptions.NONE,
+                    DocValuesType.SORTED_SET,
                     DocValuesSkipIndexType.NONE,
                     -1,
                     Collections.emptyMap(),
@@ -469,7 +540,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             } catch (Exception e) {
                 throw new IOException(e);
             }
-            if (columnKind.get(name) == ColumnKind.TEXT_KEYWORD) {
+            if (columnKind.get(name) == ColumnKind.TEXT_KEYWORD || basesWithKeywordSub.contains(name)) {
                 TreeSet<String> unique = new TreeSet<>();
                 for (String v : raw) {
                     if (v != null) {
@@ -746,16 +817,23 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
     @Override
     public SortedDocValues getSortedDocValues(String field) {
-        if (columnKind.get(field) != ColumnKind.TEXT_KEYWORD) {
+        // A keyword sub-field (multi-fields) resolves to its base column's
+        // ord data structure. Route through the base column name so
+        // ensureTextLoaded reuses whatever ords were already built for
+        // TEXT_KEYWORD, or builds fresh ords for a TEXT_FTS base that
+        // otherwise would not have any.
+        String source = keywordSubFields.getOrDefault(field, field);
+        ColumnKind kind = columnKind.get(source);
+        if (kind != ColumnKind.TEXT_KEYWORD && !basesWithKeywordSub.contains(source)) {
             return null;
         }
         try {
-            ensureTextLoaded(field);
+            ensureTextLoaded(source);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
-        int[] ords = keywordOrds.get(field);
-        BytesRef[] terms = keywordTerms.get(field);
+        int[] ords = keywordOrds.get(source);
+        BytesRef[] terms = keywordTerms.get(source);
         if (ords == null || terms == null) {
             return null;
         }

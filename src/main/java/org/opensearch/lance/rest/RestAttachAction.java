@@ -98,6 +98,7 @@ public class RestAttachAction extends BaseRestHandler {
         String explicitName;
         Long pinnedVersion;
         StorageOptions storageOptions;
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields;
         try {
             table = readOptionalString(body, "table");
             if (table == null || table.isEmpty()) {
@@ -127,6 +128,7 @@ public class RestAttachAction extends BaseRestHandler {
                 );
             }
             storageOptions = StorageOptions.parseFromRequestField(body.get("storage_options"), "[lance_attach]");
+            multiFields = parseMultiFields(body.get("multi_fields"));
         } catch (IllegalArgumentException e) {
             String message = e.getMessage();
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
@@ -146,13 +148,17 @@ public class RestAttachAction extends BaseRestHandler {
         final String indexName = explicitName != null ? explicitName : tableName(table);
         final StorageOptions storageOptionsFinal = storageOptions;
         final java.util.Optional<Long> pinnedVersionFinal = java.util.Optional.ofNullable(pinnedVersion);
+        final java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFieldsFinal = multiFields;
 
         // Dispatch the JNI work to the generic pool. Dataset.open blocks on
         // native I/O and would trip the transport-thread assertion otherwise.
         return channel -> threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             Derivation derivation;
             try (Dataset dataset = LanceRegistry.openDataset(tableFinal, storageOptionsFinal, pinnedVersionFinal)) {
-                derivation = derive(dataset);
+                derivation = derive(dataset, multiFieldsFinal);
+            } catch (IllegalArgumentException e) {
+                channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, e.getMessage()));
+                return;
             } catch (Exception e) {
                 sendError(channel, e);
                 return;
@@ -177,6 +183,9 @@ public class RestAttachAction extends BaseRestHandler {
             .put(LanceEngineFactory.TABLE_SETTING, table)
             .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField)
             .put(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, derivation.keyFieldType);
+        if (!derivation.multiFieldsJson.isEmpty()) {
+            settings.put(LanceEngineFactory.MULTI_FIELDS_SETTING, derivation.multiFieldsJson);
+        }
         pinnedVersion.ifPresent(v -> settings.put(LanceEngineFactory.VERSION_SETTING, v));
         storageOptions.writeToSettings(settings);
         CreateIndexRequest create = new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson);
@@ -361,11 +370,30 @@ public class RestAttachAction extends BaseRestHandler {
         }
     }
 
-    public record Derivation(String mappingJson, String keyField, String keyFieldType, long version, long rows, int fragments, List<
-        String> notes, java.util.Set<String> ftsColumns, java.util.Set<String> scalarColumns, java.util.Set<String> vectorColumns) {
+    public record Derivation(String mappingJson, String keyField, String keyFieldType, String multiFieldsJson, long version, long rows,
+        int fragments, List<String> notes, java.util.Set<String> ftsColumns, java.util.Set<String> scalarColumns, java.util.Set<
+            String> vectorColumns) {
     }
 
     public static Derivation derive(Dataset dataset) throws Exception {
+        return derive(dataset, java.util.Collections.emptyMap());
+    }
+
+    /**
+     * Extended derive that honours the {@code multi_fields} clause on the
+     * attach body. {@code multiFields} keys are base column names in the
+     * Lance schema; each value is an ordered map of sub-field-name to
+     * sub-field type (only {@code "keyword"} is accepted today; see design
+     * note 36). The base column must resolve to a Utf8 mapping (either
+     * {@code lance_text} or {@code keyword}); anything else is rejected
+     * with {@link IllegalArgumentException} so a mistyped body surfaces as
+     * a 400 rather than a silently unusable index. The mapping JSON gets a
+     * {@code fields} block per base column, and the derivation carries a
+     * JSON stringified form of the multi-fields spec so the engine can
+     * rehydrate it on shard open.
+     */
+    public static Derivation derive(Dataset dataset, java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields)
+        throws Exception {
         long rows = dataset.countRows();
         int fragments = dataset.getFragments().size();
 
@@ -462,11 +490,14 @@ public class RestAttachAction extends BaseRestHandler {
                     .isEmpty();
                 if (hasFts) {
                     startFieldWithId(mapping, name, fieldId, "lance_text", arrowTypeIdentity(type));
+                    writeMultiFieldsBlock(mapping, name, multiFields);
                     mapping.endObject();
                     ftsColumns.add(name);
                 } else {
                     startFieldWithId(mapping, name, fieldId, "keyword", arrowTypeIdentity(type));
-                    mapping.field("index", false).field("doc_values", true).endObject();
+                    mapping.field("index", false).field("doc_values", true);
+                    writeMultiFieldsBlock(mapping, name, multiFields);
+                    mapping.endObject();
                     scalarColumns.add(name);
                 }
             } else if (type instanceof ArrowType.FixedSizeList fsl) {
@@ -535,10 +566,51 @@ public class RestAttachAction extends BaseRestHandler {
             keyFieldType = "long";
             notes.add("no primary key declared; _id GET returns 404, `_id` values are not unique");
         }
+
+        // Validate multi_fields against the actual schema: every declared
+        // base column must exist and must be Utf8, because keyword-flavoured
+        // sub-fields only make sense on a string column (they share the
+        // underlying data with the base field). Sub-field type must be
+        // "keyword" today; other types will land alongside issue #7 /#6.
+        // Also refuse a sub-field name that collides with an existing
+        // field id so the mapping stays unambiguous.
+        java.util.Set<String> allColumnNames = new java.util.HashSet<>();
+        for (LanceField field : lanceSchema.fields()) {
+            allColumnNames.add(field.getName());
+        }
+        for (java.util.Map.Entry<String, java.util.LinkedHashMap<String, String>> entry : multiFields.entrySet()) {
+            String baseName = entry.getKey();
+            if (!allColumnNames.contains(baseName)) {
+                throw new IllegalArgumentException("multi_fields references unknown column [" + baseName + "]");
+            }
+            if (!ftsColumns.contains(baseName) && !isKeywordScalar(lanceSchema, baseName)) {
+                throw new IllegalArgumentException(
+                    "multi_fields column [" + baseName + "] must be Utf8; other Arrow types cannot host a keyword sub-field"
+                );
+            }
+            for (java.util.Map.Entry<String, String> sub : entry.getValue().entrySet()) {
+                String subName = sub.getKey();
+                String subType = sub.getValue();
+                if (!"keyword".equals(subType)) {
+                    throw new IllegalArgumentException(
+                        "multi_fields sub-field [" + baseName + "." + subName + "] type must be [keyword], got [" + subType + "]"
+                    );
+                }
+                if (allColumnNames.contains(baseName + "." + subName)) {
+                    throw new IllegalArgumentException(
+                        "multi_fields sub-field [" + baseName + "." + subName + "] collides with an existing schema column"
+                    );
+                }
+            }
+        }
+
+        String multiFieldsJson = serialiseMultiFields(multiFields);
+
         return new Derivation(
             mapping.toString(),
             keyField,
             keyFieldType,
+            multiFieldsJson,
             dataset.version(),
             rows,
             fragments,
@@ -547,6 +619,161 @@ public class RestAttachAction extends BaseRestHandler {
             scalarColumns,
             vectorColumns
         );
+    }
+
+    /**
+     * True when {@code baseName} exists in the schema as a Utf8 column
+     * without a Lance FTS index (i.e. derivation maps it to keyword).
+     * Utf8 with FTS is picked up separately via {@code ftsColumns.contains}
+     * on the caller side.
+     */
+    private static boolean isKeywordScalar(LanceSchema lanceSchema, String baseName) {
+        for (LanceField field : lanceSchema.fields()) {
+            if (baseName.equals(field.getName())) {
+                return field.getType() instanceof ArrowType.Utf8;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Parse the {@code multi_fields} block on the attach body into a
+     * base column → ordered map (sub-field name → sub-field type) form
+     * derived from the request map. Rejects malformed shapes with
+     * {@link IllegalArgumentException} so the REST layer surfaces them
+     * as a 400.
+     *
+     * <p>Expected shape:
+     * <pre>
+     *   "multi_fields": {
+     *     "body": { "raw": { "type": "keyword" } }
+     *   }
+     * </pre>
+     */
+    public static java.util.Map<String, java.util.LinkedHashMap<String, String>> parseMultiFields(Object raw) {
+        if (raw == null) {
+            return java.util.Collections.emptyMap();
+        }
+        if (!(raw instanceof java.util.Map<?, ?> rawMap)) {
+            throw new IllegalArgumentException("[multi_fields] must be an object; per-column key → per-sub-field type mapping");
+        }
+        java.util.LinkedHashMap<String, java.util.LinkedHashMap<String, String>> out = new java.util.LinkedHashMap<>();
+        for (java.util.Map.Entry<?, ?> entry : rawMap.entrySet()) {
+            if (!(entry.getKey() instanceof String baseName) || baseName.isEmpty()) {
+                throw new IllegalArgumentException("[multi_fields] keys must be non-empty column names");
+            }
+            if (!(entry.getValue() instanceof java.util.Map<?, ?> subMap)) {
+                throw new IllegalArgumentException("[multi_fields." + baseName + "] must be an object of sub-field definitions");
+            }
+            java.util.LinkedHashMap<String, String> subs = new java.util.LinkedHashMap<>();
+            for (java.util.Map.Entry<?, ?> subEntry : subMap.entrySet()) {
+                if (!(subEntry.getKey() instanceof String subName) || subName.isEmpty()) {
+                    throw new IllegalArgumentException("[multi_fields." + baseName + "] sub-field names must be non-empty strings");
+                }
+                if (!(subEntry.getValue() instanceof java.util.Map<?, ?> subDefMap)) {
+                    throw new IllegalArgumentException("[multi_fields." + baseName + "." + subName + "] must be an object");
+                }
+                Object typeValue = subDefMap.get("type");
+                if (!(typeValue instanceof String typeStr) || typeStr.isEmpty()) {
+                    throw new IllegalArgumentException(
+                        "[multi_fields." + baseName + "." + subName + ".type] is required and must be a string"
+                    );
+                }
+                subs.put(subName, typeStr);
+            }
+            if (!subs.isEmpty()) {
+                out.put(baseName, subs);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Emit the {@code "fields": {...}} sub-block on the mapping for a
+     * base column, when the operator declared sub-fields for it. No-op
+     * when {@code multiFields} has no entry for {@code baseName}. Sub-field
+     * definition uses the same shape as the top-level keyword mapping
+     * ({@code index:false, doc_values:true}) so the field is queryable
+     * via doc values without duplicating the source string.
+     */
+    private static void writeMultiFieldsBlock(
+        XContentBuilder mapping,
+        String baseName,
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
+    ) throws Exception {
+        java.util.LinkedHashMap<String, String> subs = multiFields.get(baseName);
+        if (subs == null || subs.isEmpty()) {
+            return;
+        }
+        mapping.startObject("fields");
+        for (java.util.Map.Entry<String, String> sub : subs.entrySet()) {
+            mapping.startObject(sub.getKey());
+            mapping.field("type", sub.getValue());
+            mapping.field("index", false);
+            mapping.field("doc_values", true);
+            mapping.endObject();
+        }
+        mapping.endObject();
+    }
+
+    /**
+     * Compact JSON stringify of the multi-fields spec so it can be
+     * carried through an OpenSearch index setting (which only accepts
+     * strings). Empty on empty input so the caller can decide whether
+     * to write the setting at all.
+     */
+    public static String serialiseMultiFields(java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields) {
+        if (multiFields.isEmpty()) {
+            return "";
+        }
+        try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
+            builder.startObject();
+            for (java.util.Map.Entry<String, java.util.LinkedHashMap<String, String>> entry : multiFields.entrySet()) {
+                builder.startObject(entry.getKey());
+                for (java.util.Map.Entry<String, String> sub : entry.getValue().entrySet()) {
+                    builder.field(sub.getKey(), sub.getValue());
+                }
+                builder.endObject();
+            }
+            builder.endObject();
+            return builder.toString();
+        } catch (Exception e) {
+            throw new IllegalStateException("failed to serialise multi_fields", e);
+        }
+    }
+
+    /**
+     * Parse the compact JSON form back into the base → (sub → type) map.
+     * Reverse of {@link #serialiseMultiFields}. Empty on empty input,
+     * throws {@link IllegalArgumentException} on malformed JSON so the
+     * engine startup path can surface it as a shard-open failure.
+     */
+    public static java.util.Map<String, java.util.LinkedHashMap<String, String>> deserialiseMultiFields(String stringified) {
+        if (stringified == null || stringified.isEmpty()) {
+            return java.util.Collections.emptyMap();
+        }
+        try (
+            org.opensearch.core.xcontent.XContentParser parser = org.opensearch.core.xcontent.MediaTypeRegistry.JSON.xContent()
+                .createParser(org.opensearch.core.xcontent.NamedXContentRegistry.EMPTY, null, stringified)
+        ) {
+            java.util.Map<String, Object> raw = parser.map();
+            java.util.LinkedHashMap<String, java.util.LinkedHashMap<String, String>> out = new java.util.LinkedHashMap<>();
+            for (java.util.Map.Entry<String, Object> entry : raw.entrySet()) {
+                if (!(entry.getValue() instanceof java.util.Map<?, ?> subs)) {
+                    throw new IllegalArgumentException("multi_fields[" + entry.getKey() + "] is not an object");
+                }
+                java.util.LinkedHashMap<String, String> flattened = new java.util.LinkedHashMap<>();
+                for (java.util.Map.Entry<?, ?> sub : subs.entrySet()) {
+                    flattened.put(String.valueOf(sub.getKey()), String.valueOf(sub.getValue()));
+                }
+                out.put(entry.getKey(), flattened);
+            }
+            return out;
+        } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalArgumentException("failed to parse index.lance.multi_fields JSON: " + e.getMessage(), e);
+        }
     }
 
     private static String tableName(String table) {

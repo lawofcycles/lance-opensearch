@@ -73,13 +73,21 @@ public final class LanceDirectoryReader extends DirectoryReader {
         IndexCommit commit,
         Dataset dataset,
         String intField,
-        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType
+        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
     ) throws IOException {
         List<LeafReader> leaves = new ArrayList<>();
         for (Fragment fragment : dataset.getFragments()) {
             leaves.add(
                 LanceSequentialLeafReader.wrap(
-                    new LanceFragmentLeafReader(dataset, fragment.getId(), fragment.metadata().getPhysicalRows(), intField, pkType)
+                    new LanceFragmentLeafReader(
+                        dataset,
+                        fragment.getId(),
+                        fragment.metadata().getPhysicalRows(),
+                        intField,
+                        pkType,
+                        multiFields
+                    )
                 )
             );
         }
@@ -126,6 +134,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         Dataset dataset,
         String intField,
         org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
         List<Integer> fragmentIds
     ) throws IOException {
         java.util.Set<Integer> wanted = new java.util.HashSet<>(fragmentIds);
@@ -136,7 +145,14 @@ public final class LanceDirectoryReader extends DirectoryReader {
             }
             leaves.add(
                 LanceSequentialLeafReader.wrap(
-                    new LanceFragmentLeafReader(dataset, fragment.getId(), fragment.metadata().getPhysicalRows(), intField, pkType)
+                    new LanceFragmentLeafReader(
+                        dataset,
+                        fragment.getId(),
+                        fragment.metadata().getPhysicalRows(),
+                        intField,
+                        pkType,
+                        multiFields
+                    )
                 )
             );
         }
