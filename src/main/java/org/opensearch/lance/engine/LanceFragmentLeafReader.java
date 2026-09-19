@@ -9,11 +9,9 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.arrow.vector.BigIntVector;
@@ -281,25 +279,20 @@ public final class LanceFragmentLeafReader extends LeafReader {
     // NumericDocValues.advanceExact and _source materialisation both consult this
     // to distinguish "value is 0" from "value is missing" for nullable Arrow columns.
     private final Map<String, FixedBitSet> numericPresence = new ConcurrentHashMap<>();
-    private final Map<String, String[]> textColumns = new ConcurrentHashMap<>();
     private final Map<String, long[]> booleanColumns = new ConcurrentHashMap<>();
     private final Map<String, FixedBitSet> booleanPresence = new ConcurrentHashMap<>();
-    // Utf8 columns without an FTS index surface as keyword. We keep them in
-    // textColumns for _source synthesis and additionally build sorted term
-    // dictionaries plus per-doc ordinals so getSortedSetDocValues can serve
-    // term, terms, aggregation and sort requests through the doc value path.
+    // Utf8 columns without an FTS index surface as keyword. Their sorted
+    // term dictionary plus per-doc ordinals let getSortedDocValues serve
+    // term, terms, aggregation and sort requests through the doc value
+    // path. No per-row String copy is kept: _source is rendered from the
+    // per-hit take, and Binary columns have no doc value representation
+    // at all so they are never loaded through the reader.
     private final Map<String, BytesRef[]> keywordTerms = new ConcurrentHashMap<>();
     private final Map<String, int[]> keywordOrds = new ConcurrentHashMap<>();
-    // List<Utf8> columns surface as multi-valued keyword. keywordArrayValues
-    // holds the per-doc string arrays for _source synthesis; keywordArrayOrds
+    // List<Utf8> columns surface as multi-valued keyword; keywordArrayOrds
     // and keywordArrayTerms back a multi-valued SortedSetDocValues.
-    private final Map<String, String[][]> keywordArrayValues = new ConcurrentHashMap<>();
     private final Map<String, int[][]> keywordArrayOrds = new ConcurrentHashMap<>();
     private final Map<String, BytesRef[]> keywordArrayTerms = new ConcurrentHashMap<>();
-    // Binary / LargeBinary columns surface as OpenSearch binary type. The bytes
-    // are held per-doc for _source synthesis (base64-encoded on output);
-    // neither indexed nor loaded into doc values.
-    private final Map<String, byte[][]> binaryColumns = new ConcurrentHashMap<>();
 
     /**
      * Shard-level column materialisation coordinator. Non-null when the
@@ -814,13 +807,19 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     /**
-     * Load a Utf8 column into {@code textColumns}. If the column is
-     * {@link ColumnKind#TEXT_KEYWORD} (i.e. no FTS index), also build the
-     * sorted term dictionary and per-doc ords used by
-     * {@link #getSortedDocValues}. TEXT_FTS columns skip the keyword build.
+     * Build the keyword dictionary for a Utf8 column: sorted
+     * {@code BytesRef[]} terms plus a per-doc ordinal array (-1 for
+     * Arrow null), stored in {@link #keywordTerms} / {@link #keywordOrds}
+     * for {@link #getSortedDocValues}. Called only for
+     * {@link ColumnKind#TEXT_KEYWORD} columns and for TEXT_FTS columns
+     * that carry a {@code multi_fields} keyword sub-field; nothing else
+     * reads Utf8 values through the reader any more ({@code _source}
+     * comes from the per-hit take), so no per-row {@link String} copy
+     * is retained. Delegates to {@link LanceShardColumnCache} when one
+     * is installed so the scan runs once per shard.
      */
     private void ensureTextLoaded(String name) throws IOException {
-        if (textColumns.containsKey(name)) {
+        if (keywordOrds.containsKey(name)) {
             return;
         }
         LanceShardColumnCache cache = shardColumnCache;
@@ -829,10 +828,12 @@ public final class LanceFragmentLeafReader extends LeafReader {
             return;
         }
         synchronized (columnLock(name)) {
-            if (textColumns.containsKey(name)) {
+            if (keywordOrds.containsKey(name)) {
                 return;
             }
-            String[] raw = new String[maxDoc];
+            int[] ids = new int[maxDoc];
+            Arrays.fill(ids, -1);
+            KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder();
             ScanOptions colOptions = singleColumnScan(name);
             try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
@@ -840,68 +841,43 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
                     VarCharVector vector = (VarCharVector) root.getVector(name);
                     for (int i = 0; i < root.getRowCount(); i++) {
+                        if (vector.isNull(i)) {
+                            continue;
+                        }
                         int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
-                        raw[offset] = vector.isNull(i) ? null : new String(vector.get(i), java.nio.charset.StandardCharsets.UTF_8);
+                        ids[offset] = builder.intern(vector, i);
                     }
                 }
             } catch (Exception e) {
                 throw new IOException(e);
             }
-            publishTextColumnInternal(name, raw);
+            KeywordDictionaryBuilder.Dictionary dictionary = builder.finish();
+            dictionary.remap(ids);
+            publishTextColumn(name, dictionary.terms(), ids);
         }
     }
 
     /**
-     * Publish sink for {@link LanceShardColumnCache#loadTextColumn}.
-     * Also builds the per-fragment keyword dictionary if the column
-     * is a {@link ColumnKind#TEXT_KEYWORD} or the base of a
-     * {@code multi_fields} keyword sub-field. Keyword dictionaries
-     * stay per-fragment (each leaf's {@code keywordTerms} /
-     * {@code keywordOrds} indexes are independent) because
-     * {@link org.apache.lucene.index.SortedDocValues} ord-comparison
-     * semantics assume per-segment ord spaces.
+     * Publish sink for {@link LanceShardColumnCache#loadTextColumn} and
+     * the per-leaf fallback above. {@code terms} are sorted in unsigned
+     * byte order and {@code ords} maps every doc to an index into
+     * {@code terms} or -1. Keyword dictionaries stay per-fragment
+     * because {@link org.apache.lucene.index.SortedDocValues}
+     * ord-comparison semantics assume per-segment ord spaces.
      */
-    void publishTextColumn(String name, String[] raw) {
-        publishTextColumnInternal(name, raw);
-    }
-
-    private void publishTextColumnInternal(String name, String[] raw) {
-        if (columnKind.get(name) == ColumnKind.TEXT_KEYWORD || basesWithKeywordSub.contains(name)) {
-            TreeSet<String> unique = new TreeSet<>();
-            for (String v : raw) {
-                if (v != null) {
-                    unique.add(v);
-                }
-            }
-            BytesRef[] terms = new BytesRef[unique.size()];
-            Map<String, Integer> lookup = new HashMap<>();
-            int idx = 0;
-            for (String t : unique) {
-                terms[idx] = new BytesRef(t);
-                lookup.put(t, idx);
-                idx++;
-            }
-            int[] ords = new int[maxDoc];
-            Arrays.fill(ords, -1);
-            for (int r = 0; r < maxDoc; r++) {
-                String v = raw[r];
-                if (v != null) {
-                    ords[r] = lookup.get(v);
-                }
-            }
-            keywordTerms.put(name, terms);
-            keywordOrds.put(name, ords);
-        }
-        textColumns.put(name, raw);
+    void publishTextColumn(String name, BytesRef[] terms, int[] ords) {
+        keywordTerms.put(name, terms);
+        keywordOrds.put(name, ords);
     }
 
     /**
-     * Load a List&lt;Utf8&gt; column into {@code keywordArrayValues} and build
-     * the sorted term dictionary + per-doc ord arrays that back the multi-valued
-     * SortedSetDocValues.
+     * Build the multi-valued keyword dictionary for a List&lt;Utf8&gt;
+     * column: sorted terms plus, per doc, a strictly ascending
+     * duplicate-free ordinal array (null for an Arrow-null list), for
+     * {@link #getSortedSetDocValues}.
      */
     private void ensureKeywordArrayLoaded(String name) throws IOException {
-        if (keywordArrayValues.containsKey(name)) {
+        if (keywordArrayOrds.containsKey(name)) {
             return;
         }
         LanceShardColumnCache cache = shardColumnCache;
@@ -910,10 +886,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
             return;
         }
         synchronized (columnLock(name)) {
-            if (keywordArrayValues.containsKey(name)) {
+            if (keywordArrayOrds.containsKey(name)) {
                 return;
             }
-            String[][] rows = new String[maxDoc][];
+            int[][] rows = new int[maxDoc][];
+            KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder();
             ScanOptions colOptions = singleColumnScan(name);
             try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
@@ -922,127 +899,53 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     ListVector vector = (ListVector) root.getVector(name);
                     VarCharVector elements = (VarCharVector) vector.getDataVector();
                     for (int i = 0; i < root.getRowCount(); i++) {
-                        int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
                         if (vector.isNull(i)) {
-                            rows[offset] = null;
                             continue;
                         }
-                        int start = vector.getElementStartIndex(i);
-                        int end = vector.getElementEndIndex(i);
-                        String[] arr = new String[end - start];
-                        for (int e = start; e < end; e++) {
-                            arr[e - start] = elements.isNull(e)
-                                ? null
-                                : new String(elements.get(e), java.nio.charset.StandardCharsets.UTF_8);
-                        }
-                        rows[offset] = arr;
+                        int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
+                        rows[offset] = internListElements(builder, vector, elements, i);
                     }
                 }
             } catch (Exception e) {
                 throw new IOException(e);
             }
-            publishKeywordArrayColumnInternal(name, rows);
+            KeywordDictionaryBuilder.Dictionary dictionary = builder.finish();
+            for (int r = 0; r < rows.length; r++) {
+                if (rows[r] != null) {
+                    rows[r] = dictionary.remapSortedUnique(rows[r]);
+                }
+            }
+            publishKeywordArrayColumn(name, dictionary.terms(), rows);
         }
     }
 
     /**
-     * Publish sink for
-     * {@link LanceShardColumnCache#loadKeywordArrayColumn}. Same as
-     * {@link #publishTextColumn} but the ord dictionary is a
-     * multi-valued flavour ({@code keywordArrayOrds} carries
-     * {@code int[]} per doc rather than a scalar ord).
+     * Intern the non-null elements of list {@code index} and return
+     * their insertion-order ids (not yet remapped to sorted ordinals).
+     * Shared by the per-leaf loader and {@link LanceShardColumnCache}.
      */
-    void publishKeywordArrayColumn(String name, String[][] rows) {
-        publishKeywordArrayColumnInternal(name, rows);
+    static int[] internListElements(KeywordDictionaryBuilder builder, ListVector vector, VarCharVector elements, int index) {
+        int start = vector.getElementStartIndex(index);
+        int end = vector.getElementEndIndex(index);
+        int[] ids = new int[end - start];
+        int count = 0;
+        for (int e = start; e < end; e++) {
+            if (!elements.isNull(e)) {
+                ids[count++] = builder.intern(elements, e);
+            }
+        }
+        return count == ids.length ? ids : Arrays.copyOf(ids, count);
     }
 
-    private void publishKeywordArrayColumnInternal(String name, String[][] rows) {
-        TreeSet<String> unique = new TreeSet<>();
-        for (String[] row : rows) {
-            if (row == null) continue;
-            for (String v : row) {
-                if (v != null) unique.add(v);
-            }
-        }
-        BytesRef[] terms = new BytesRef[unique.size()];
-        Map<String, Integer> lookup = new HashMap<>();
-        int idx = 0;
-        for (String t : unique) {
-            terms[idx] = new BytesRef(t);
-            lookup.put(t, idx);
-            idx++;
-        }
-        int[][] rowOrds = new int[maxDoc][];
-        for (int r = 0; r < maxDoc; r++) {
-            String[] row = rows[r];
-            if (row == null) {
-                rowOrds[r] = null;
-                continue;
-            }
-            // Ords are stored in sorted order without duplicates so
-            // SortedSetDocValues.nextOrd walks strictly ascending.
-            TreeSet<Integer> unique2 = new TreeSet<>();
-            for (String v : row) {
-                if (v != null) unique2.add(lookup.get(v));
-            }
-            int[] ordArr = new int[unique2.size()];
-            int j = 0;
-            for (int o : unique2) {
-                ordArr[j++] = o;
-            }
-            rowOrds[r] = ordArr;
-        }
+    /**
+     * Publish sink for {@link LanceShardColumnCache#loadKeywordArrayColumn}
+     * and the per-leaf fallback above. Same contract as
+     * {@link #publishTextColumn} but each doc carries an ordinal array
+     * ({@code null} for a null list) instead of a scalar ordinal.
+     */
+    void publishKeywordArrayColumn(String name, BytesRef[] terms, int[][] rowOrds) {
         keywordArrayTerms.put(name, terms);
         keywordArrayOrds.put(name, rowOrds);
-        keywordArrayValues.put(name, rows);
-    }
-
-    private void ensureBinaryLoaded(String name) throws IOException {
-        if (binaryColumns.containsKey(name)) {
-            return;
-        }
-        LanceShardColumnCache cache = shardColumnCache;
-        if (cache != null) {
-            cache.loadBinaryColumn(name);
-            return;
-        }
-        synchronized (columnLock(name)) {
-            if (binaryColumns.containsKey(name)) {
-                return;
-            }
-            byte[][] col = new byte[maxDoc][];
-            ScanOptions colOptions = singleColumnScan(name);
-            try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
-                while (reader.loadNextBatch()) {
-                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                    FieldVector v = root.getVector(name);
-                    for (int i = 0; i < root.getRowCount(); i++) {
-                        int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
-                        if (v.isNull(i)) {
-                            col[offset] = null;
-                        } else if (v instanceof VarBinaryVector vb) {
-                            col[offset] = vb.get(i);
-                        } else if (v instanceof LargeVarBinaryVector lb) {
-                            col[offset] = lb.get(i);
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                throw new IOException(e);
-            }
-            binaryColumns.put(name, col);
-        }
-    }
-
-    /**
-     * Publish sink for
-     * {@link LanceShardColumnCache#loadBinaryColumn}. Simplest of
-     * the five publish sinks — the leaf's binary map keys straight
-     * into {@code binaryColumns} without any secondary dictionary.
-     */
-    void publishBinaryColumn(String name, byte[][] values) {
-        binaryColumns.put(name, values);
     }
 
     @Override

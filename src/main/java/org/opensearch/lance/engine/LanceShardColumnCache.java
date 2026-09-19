@@ -14,9 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.FieldVector;
-import org.apache.arrow.vector.LargeVarBinaryVector;
 import org.apache.arrow.vector.UInt8Vector;
-import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
@@ -72,7 +70,6 @@ public final class LanceShardColumnCache {
     private final Map<String, Boolean> loadedBooleanColumns = new ConcurrentHashMap<>();
     private final Map<String, Boolean> loadedTextColumns = new ConcurrentHashMap<>();
     private final Map<String, Boolean> loadedKeywordArrayColumns = new ConcurrentHashMap<>();
-    private final Map<String, Boolean> loadedBinaryColumns = new ConcurrentHashMap<>();
 
     /**
      * Build a cache scoped to {@code leaves} against {@code dataset}.
@@ -240,15 +237,17 @@ public final class LanceShardColumnCache {
     }
 
     /**
-     * Load a Utf8 column across the fragment subset. The cache reads
-     * the raw {@link String} values into a per-fragment
-     * {@code String[maxDoc]} and hands them to each leaf via
-     * {@link LanceFragmentLeafReader#publishTextColumn}; the leaf
-     * builds any per-fragment keyword dictionary
-     * ({@code keywordTerms} / {@code keywordOrds}) itself based on
-     * its own {@code columnKind} / {@code basesWithKeywordSub} state.
-     * Keyword dictionaries stay per-fragment because that is what
-     * {@link org.apache.lucene.index.SortedDocValues} expects for
+     * Load a Utf8 column across the fragment subset and build each
+     * fragment's keyword dictionary. The scan streams every value once
+     * into a per-fragment {@link KeywordDictionaryBuilder} (distinct
+     * terms interned into a byte pool, one {@code int} id per row);
+     * after the scan each builder is sorted and the ids are remapped to
+     * ordinals before the leaf receives them through
+     * {@link LanceFragmentLeafReader#publishTextColumn}. No per-row
+     * {@link String} is created (issue #52: the previous
+     * {@code String[maxDoc]} intermediate cost about 2 GB per 20M-row
+     * query). Keyword dictionaries stay per-fragment because that is
+     * what {@link org.apache.lucene.index.SortedDocValues} expects for
      * ord-comparison semantics.
      */
     public void loadTextColumn(String name) throws IOException {
@@ -260,9 +259,13 @@ public final class LanceShardColumnCache {
             if (loadedTextColumns.containsKey(name)) {
                 return;
             }
-            Map<Integer, String[]> rawByFragment = new HashMap<>(leavesByFragmentId.size() * 2);
+            Map<Integer, int[]> idsByFragment = new HashMap<>(leavesByFragmentId.size() * 2);
+            Map<Integer, KeywordDictionaryBuilder> buildersByFragment = new HashMap<>(leavesByFragmentId.size() * 2);
             for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
-                rawByFragment.put(leaf.fragmentId(), new String[leaf.maxDoc()]);
+                int[] ids = new int[leaf.maxDoc()];
+                java.util.Arrays.fill(ids, -1);
+                idsByFragment.put(leaf.fragmentId(), ids);
+                buildersByFragment.put(leaf.fragmentId(), new KeywordDictionaryBuilder());
             }
             ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(new java.util.ArrayList<>(leavesByFragmentId.keySet()))
                 .columns(Collections.singletonList(name))
@@ -276,14 +279,16 @@ public final class LanceShardColumnCache {
                     UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
                     VarCharVector vector = (VarCharVector) root.getVector(name);
                     for (int i = 0; i < root.getRowCount(); i++) {
-                        long addr = rowAddr.get(i);
-                        int fragId = (int) (addr >>> 32);
-                        int offset = (int) (addr & 0xFFFFFFFFL);
-                        String[] raw = rawByFragment.get(fragId);
-                        if (raw == null) {
+                        if (vector.isNull(i)) {
                             continue;
                         }
-                        raw[offset] = vector.isNull(i) ? null : new String(vector.get(i), java.nio.charset.StandardCharsets.UTF_8);
+                        long addr = rowAddr.get(i);
+                        int fragId = (int) (addr >>> 32);
+                        int[] ids = idsByFragment.get(fragId);
+                        if (ids == null) {
+                            continue;
+                        }
+                        ids[(int) (addr & 0xFFFFFFFFL)] = buildersByFragment.get(fragId).intern(vector, i);
                     }
                 }
             } catch (IOException e) {
@@ -292,21 +297,23 @@ public final class LanceShardColumnCache {
                 throw new IOException(e);
             }
             for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
-                leaf.publishTextColumn(name, rawByFragment.get(leaf.fragmentId()));
+                int[] ids = idsByFragment.get(leaf.fragmentId());
+                KeywordDictionaryBuilder.Dictionary dictionary = buildersByFragment.get(leaf.fragmentId()).finish();
+                dictionary.remap(ids);
+                leaf.publishTextColumn(name, dictionary.terms(), ids);
             }
             loadedTextColumns.put(name, Boolean.TRUE);
         }
     }
 
     /**
-     * Load a {@code List<Utf8>} column across the fragment subset.
-     * Reads the nested Arrow list-of-varchar values into per-fragment
-     * {@code String[maxDoc][]} arrays and hands them to each leaf via
-     * {@link LanceFragmentLeafReader#publishKeywordArrayColumn};
-     * the leaf builds its own per-fragment ord dictionary in the
-     * publish sink (multi-valued keyword semantics live in the leaf's
-     * {@code keywordArrayValues} / {@code keywordArrayOrds} /
-     * {@code keywordArrayTerms} maps).
+     * Load a {@code List<Utf8>} column across the fragment subset and
+     * build each fragment's multi-valued keyword dictionary. Same
+     * interning scheme as {@link #loadTextColumn}; each doc keeps an
+     * {@code int[]} of element ids (null for an Arrow-null list) that
+     * is remapped to a sorted, duplicate-free ordinal array before the
+     * leaf receives it through
+     * {@link LanceFragmentLeafReader#publishKeywordArrayColumn}.
      */
     public void loadKeywordArrayColumn(String name) throws IOException {
         if (loadedKeywordArrayColumns.containsKey(name)) {
@@ -317,9 +324,11 @@ public final class LanceShardColumnCache {
             if (loadedKeywordArrayColumns.containsKey(name)) {
                 return;
             }
-            Map<Integer, String[][]> rowsByFragment = new HashMap<>(leavesByFragmentId.size() * 2);
+            Map<Integer, int[][]> rowsByFragment = new HashMap<>(leavesByFragmentId.size() * 2);
+            Map<Integer, KeywordDictionaryBuilder> buildersByFragment = new HashMap<>(leavesByFragmentId.size() * 2);
             for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
-                rowsByFragment.put(leaf.fragmentId(), new String[leaf.maxDoc()][]);
+                rowsByFragment.put(leaf.fragmentId(), new int[leaf.maxDoc()][]);
+                buildersByFragment.put(leaf.fragmentId(), new KeywordDictionaryBuilder());
             }
             ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(new java.util.ArrayList<>(leavesByFragmentId.keySet()))
                 .columns(Collections.singletonList(name))
@@ -334,26 +343,21 @@ public final class LanceShardColumnCache {
                     ListVector vector = (ListVector) root.getVector(name);
                     VarCharVector elements = (VarCharVector) vector.getDataVector();
                     for (int i = 0; i < root.getRowCount(); i++) {
+                        if (vector.isNull(i)) {
+                            continue;
+                        }
                         long addr = rowAddr.get(i);
                         int fragId = (int) (addr >>> 32);
-                        int offset = (int) (addr & 0xFFFFFFFFL);
-                        String[][] rows = rowsByFragment.get(fragId);
+                        int[][] rows = rowsByFragment.get(fragId);
                         if (rows == null) {
                             continue;
                         }
-                        if (vector.isNull(i)) {
-                            rows[offset] = null;
-                            continue;
-                        }
-                        int start = vector.getElementStartIndex(i);
-                        int end = vector.getElementEndIndex(i);
-                        String[] arr = new String[end - start];
-                        for (int e = start; e < end; e++) {
-                            arr[e - start] = elements.isNull(e)
-                                ? null
-                                : new String(elements.get(e), java.nio.charset.StandardCharsets.UTF_8);
-                        }
-                        rows[offset] = arr;
+                        rows[(int) (addr & 0xFFFFFFFFL)] = LanceFragmentLeafReader.internListElements(
+                            buildersByFragment.get(fragId),
+                            vector,
+                            elements,
+                            i
+                        );
                     }
                 }
             } catch (IOException e) {
@@ -362,68 +366,16 @@ public final class LanceShardColumnCache {
                 throw new IOException(e);
             }
             for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
-                leaf.publishKeywordArrayColumn(name, rowsByFragment.get(leaf.fragmentId()));
+                int[][] rows = rowsByFragment.get(leaf.fragmentId());
+                KeywordDictionaryBuilder.Dictionary dictionary = buildersByFragment.get(leaf.fragmentId()).finish();
+                for (int r = 0; r < rows.length; r++) {
+                    if (rows[r] != null) {
+                        rows[r] = dictionary.remapSortedUnique(rows[r]);
+                    }
+                }
+                leaf.publishKeywordArrayColumn(name, dictionary.terms(), rows);
             }
             loadedKeywordArrayColumns.put(name, Boolean.TRUE);
-        }
-    }
-
-    /**
-     * Load a Binary (or LargeBinary) column across the fragment
-     * subset. Reads raw bytes into per-fragment {@code byte[maxDoc][]}
-     * arrays and hands them to each leaf via
-     * {@link LanceFragmentLeafReader#publishBinaryColumn}.
-     */
-    public void loadBinaryColumn(String name) throws IOException {
-        if (loadedBinaryColumns.containsKey(name)) {
-            return;
-        }
-        Object lock = columnLocks.computeIfAbsent(name, k -> new Object());
-        synchronized (lock) {
-            if (loadedBinaryColumns.containsKey(name)) {
-                return;
-            }
-            Map<Integer, byte[][]> valuesByFragment = new HashMap<>(leavesByFragmentId.size() * 2);
-            for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
-                valuesByFragment.put(leaf.fragmentId(), new byte[leaf.maxDoc()][]);
-            }
-            ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(new java.util.ArrayList<>(leavesByFragmentId.keySet()))
-                .columns(Collections.singletonList(name))
-                .withRowAddress(true);
-            if (filterSql != null) {
-                builder = builder.filter(filterSql);
-            }
-            try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
-                while (reader.loadNextBatch()) {
-                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                    FieldVector v = root.getVector(name);
-                    for (int i = 0; i < root.getRowCount(); i++) {
-                        long addr = rowAddr.get(i);
-                        int fragId = (int) (addr >>> 32);
-                        int offset = (int) (addr & 0xFFFFFFFFL);
-                        byte[][] values = valuesByFragment.get(fragId);
-                        if (values == null) {
-                            continue;
-                        }
-                        if (v.isNull(i)) {
-                            values[offset] = null;
-                        } else if (v instanceof VarBinaryVector vb) {
-                            values[offset] = vb.get(i);
-                        } else if (v instanceof LargeVarBinaryVector lb) {
-                            values[offset] = lb.get(i);
-                        }
-                    }
-                }
-            } catch (IOException e) {
-                throw e;
-            } catch (Exception e) {
-                throw new IOException(e);
-            }
-            for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
-                leaf.publishBinaryColumn(name, valuesByFragment.get(leaf.fragmentId()));
-            }
-            loadedBinaryColumns.put(name, Boolean.TRUE);
         }
     }
 }
