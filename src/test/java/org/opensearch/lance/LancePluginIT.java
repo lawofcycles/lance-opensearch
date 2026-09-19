@@ -674,6 +674,84 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeCountsFtsHitsWithoutWeightMaterialisation() throws Exception {
+        // Issue #42 Phase A / Step A-1: `size:0` on a pure FTS shape
+        // used to route through IndexSearcher.count(luceneQuery), which
+        // triggered LanceFtsQuery's Weight to fully materialise every
+        // hit's row address and score into the sparse buffer. On a 20M
+        // row table with 500k matching hits QA measured 4.6 s for a
+        // count-only query that pylance answered in <2 ms because
+        // Lance's inverted-index scan can stream row counts when we
+        // ask for zero columns. This test fences that count path:
+        //
+        // - lance_match size:0 must return the exact match count
+        // (no clip, no over-count) for match / phrase / bool
+        // - post_filter present + size:0 must fall through to the
+        // Weight path (post_filter narrowing needs Lucene)
+        // - non-FTS scoring shapes (knn) continue on the Weight
+        // path since Lance has no countRows(NearestQuery)
+        String suffix = "ftscount-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        // 20 rows: 10 with "hello lance N" (even ids), 10 with "quick
+        // brown fox N" (odd ids). "lance" hits 10 rows, "hello lance"
+        // as a phrase hits the same 10 rows.
+        LanceTableFactory.writeTable(scratchDir, tableName, 20);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // Simple lance_match count-only: total = 10, hits empty.
+            String matchBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}},\"size\":0}"));
+            assertEquals("match size:0 total must be 10", 10, extractIntPath(matchBody, "hits", "total", "value"));
+            assertEquals("size:0 must return no hits", 0, countOccurrences(matchBody, "\"_id\":"));
+
+            // lance_match_phrase count-only: same 10 rows contain
+            // "hello lance N" so the phrase count matches the
+            // simple match count.
+            String phraseBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"hello lance\"}},\"size\":0}"
+                )
+            );
+            assertEquals("phrase size:0 total must be 10", 10, extractIntPath(phraseBody, "hits", "total", "value"));
+
+            // Zero-match count: query never touches the fixture so
+            // the count path must still return 0 (regression fence
+            // against the Weight path failing when the FTS scan
+            // yields empty batches).
+            String zeroBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"nonexistent\"}},\"size\":0}")
+            );
+            assertEquals("no-match size:0 total must be 0", 0, extractIntPath(zeroBody, "hits", "total", "value"));
+
+            // Post-filter forces the Weight fallback because the
+            // post_filter narrows below what Dataset.countRows
+            // would report. The fixture pins ids 0..19 sequential,
+            // so id >= 10 keeps five "hello lance" rows (10, 12, 14,
+            // 16, 18) and drops the rest. When Weight-fallback works
+            // correctly total = 5, hits empty (size:0).
+            String postFilterBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"match\":{\"body\":\"lance\"}}," + "\"post_filter\":{\"range\":{\"id\":{\"gte\":10}}}," + "\"size\":0}"
+                )
+            );
+            assertEquals(
+                "match + post_filter size:0 must narrow to 5 via Weight fallback",
+                5,
+                extractIntPath(postFilterBody, "hits", "total", "value")
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFragmentDispatchModeAppliesTopKPushdownForFtsHits() throws Exception {
         // Issue #42 Phase B: pure FTS (lance_match / lance_match_phrase
         // as the top-level query) with no sort, no aggregation, and no

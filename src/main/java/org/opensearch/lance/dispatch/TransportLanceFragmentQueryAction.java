@@ -837,10 +837,24 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         String filterSql = request.filterSql();
         boolean hasScoringQuery = request.query() != null && filterSql == null;
         boolean hasPostFilter = request.postFilter() != null;
+        if (hasScoringQuery && !hasPostFilter && luceneQuery instanceof LanceFtsQuery fts) {
+            // Pure FTS shape (no post_filter, no other scoring
+            // clause): count via Lance's inverted-index scan
+            // without materialising every match. Lance's FTS scan
+            // walks the posting list once and can stream row counts
+            // when we do not ask it for row addresses or scores;
+            // pylance measures this at 1.5-1.9 ms independent of hit
+            // count, versus 4.6 s for the Weight-based path on a
+            // 20M-row table with 500k hits (issue #42 perf report).
+            return countFtsHitsDirectly(dataset, fts, fragmentIds);
+        }
         if (hasScoringQuery || hasPostFilter) {
             // post_filter narrows hits.total.value below what
             // filterSql / countRows would return, so ask Lucene
-            // directly against the AND-combined query.
+            // directly against the AND-combined query. knn also
+            // lands here (its LanceKnnQuery is not the LanceFtsQuery
+            // branch above); Lucene serves the count via the shared
+            // shard-level nearest scan the Weight already cached.
             return searcher.count(luceneQuery);
         }
         if (filterSql == null) {
@@ -866,6 +880,51 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         long total = 0L;
         try (
             org.lance.ipc.LanceScanner scanner = dataset.newScan(options);
+            org.apache.arrow.vector.ipc.ArrowReader reader = scanner.scanBatches()
+        ) {
+            while (reader.loadNextBatch()) {
+                total += reader.getVectorSchemaRoot().getRowCount();
+            }
+        }
+        return total;
+    }
+
+    /**
+     * Count FTS hits without materialising row addresses or scores.
+     *
+     * <p>Lance's inverted-index scanner can walk the posting list
+     * once and stream row counts when we ask for zero columns and
+     * no row address / row id. This is the count-only counterpart
+     * of {@code Dataset.countRows(sqlFilter)} for scalar filters,
+     * and pylance measures it at low milliseconds independent of
+     * the hit count. See issue #42 phase A / Step A-1 for the
+     * background: without this path, an FTS count went through
+     * {@code IndexSearcher.count(luceneQuery)}, which triggered
+     * {@link LanceFtsQuery}'s Weight to materialise every match's
+     * row address and score into a sparse array (see
+     * {@code LanceFtsQuery.scorerSupplier}). The Weight is
+     * necessary for the hits phase, but only wastes work for a
+     * pure count.
+     *
+     * <p>The Lance SDK has no {@code Dataset.countRows(FullTextQuery)}
+     * overload today, so this method assembles a scan that yields
+     * zero payload columns; the batches carry only the row count
+     * that the aggregator returns via {@code getRowCount()}. When
+     * fragmentIds is null every fragment is included; otherwise
+     * Lance filters the scan to the caller's subset (matching the
+     * {@code Dataset.countRows(sql)} branch below).
+     */
+    private long countFtsHitsDirectly(Dataset dataset, LanceFtsQuery fts, List<Integer> fragmentIds) throws Exception {
+        org.lance.ipc.ScanOptions.Builder builder = new org.lance.ipc.ScanOptions.Builder().fullTextQuery(fts.fullTextQuery())
+            .columns(Collections.emptyList())
+            .withRowAddress(false)
+            .withRowId(false);
+        if (fragmentIds != null) {
+            builder = builder.fragmentIds(fragmentIds);
+        }
+        long total = 0L;
+        try (
+            org.lance.ipc.LanceScanner scanner = dataset.newScan(builder.build());
             org.apache.arrow.vector.ipc.ArrowReader reader = scanner.scanBatches()
         ) {
             while (reader.loadNextBatch()) {

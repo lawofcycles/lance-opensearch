@@ -156,7 +156,7 @@ public final class LanceFtsQuery extends Query {
         );
     }
 
-    FullTextQuery fullTextQuery() {
+    public FullTextQuery fullTextQuery() {
         return fullTextQuery;
     }
 
