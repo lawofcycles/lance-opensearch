@@ -180,6 +180,52 @@ public final class LanceKnnFilterTranslator {
         return "(" + (andSql != null ? andSql : orSql) + ")";
     }
 
+    /**
+     * ISO-8601 date and date-time literals the range translator
+     * lifts into Lance's SQL {@code timestamp '...'} form.
+     *
+     * <p>DataFusion (Lance's SQL evaluator) rejects a bare
+     * {@code Utf8("2024-03-01")} literal against a
+     * {@code Timestamp(Microsecond, None)} column with
+     * "could not convert to literal of type 'Timestamp(...)'", so a
+     * range query on a mapped {@code date} field returned 400
+     * unless the caller opened a raw Lance SQL escape hatch. This
+     * pattern lets the translator recognise the shape of a date
+     * literal and wrap it in {@code timestamp '...'} instead. The
+     * three accepted forms cover what OpenSearch date_math and the
+     * REST DSL emit:
+     *
+     * <ul>
+     *   <li>{@code YYYY-MM-DD} — date-only (Lance parses this as
+     *       midnight, matching OpenSearch semantics).</li>
+     *   <li>{@code YYYY-MM-DDTHH:MM:SS(.frac)?} — date and time,
+     *       no zone.</li>
+     *   <li>{@code YYYY-MM-DDTHH:MM:SS(.frac)?(Z|+HH:MM|-HH:MM|+HHMM|-HHMM)}
+     *       — date and time with UTC offset.</li>
+     * </ul>
+     *
+     * <p>Numeric epoch-millis literals on date fields still fall
+     * through as plain integers today; DataFusion rejects those the
+     * same way. Fixing the numeric side needs mapping context in
+     * the translator (see issue #43 follow-up), out of scope for
+     * this pass.
+     *
+     * <p>The trade-off with a shape-only heuristic is that a
+     * {@code Utf8} column carrying a value that happens to match
+     * the pattern would also be lifted into a timestamp literal;
+     * DataFusion would then reject the wrong-type comparison at
+     * evaluation time. That case does not exist in real workloads
+     * (Utf8 columns holding literal date strings for {@code range}
+     * filtering is unusual), and if it does surface the shape-based
+     * dispatch stays a documented limitation until the mapping
+     * hook is in.
+     */
+    private static final java.util.regex.Pattern ISO_DATE_LIKE = java.util.regex.Pattern.compile(
+        "^\\d{4}-\\d{2}-\\d{2}"                       // date
+            + "(?:T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?"  // optional time
+            + "(?:Z|[+-]\\d{2}:?\\d{2})?)?$"          // optional zone
+    );
+
     private static String literal(Object value, String fieldName) {
         if (value == null) {
             throw new IllegalArgumentException("[lance_knn] filter value on [" + fieldName + "] must not be null");
@@ -191,6 +237,13 @@ public final class LanceKnnFilterTranslator {
             return value.toString();
         }
         if (value instanceof String s) {
+            if (ISO_DATE_LIKE.matcher(s).matches()) {
+                // Lance / DataFusion parses timestamp literals in
+                // the same "YYYY-MM-DDTHH:MM:SS(.frac)?(Z|+HH:MM)?"
+                // shape we already validated, so pass the value
+                // through verbatim inside `timestamp '...'`.
+                return "timestamp '" + s + "'";
+            }
             // Escape single quotes by doubling them, which is the standard
             // SQL literal escape that DataFusion accepts.
             return "'" + s.replace("'", "''") + "'";

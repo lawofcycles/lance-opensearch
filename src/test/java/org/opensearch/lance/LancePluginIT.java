@@ -674,6 +674,112 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeAnswersDateRangeQuery() throws Exception {
+        // Issue #43: a `range` query with an ISO-8601 string literal
+        // ({"gte":"2024-03-01","lt":"2024-04-01"}) on a Lance
+        // Timestamp column used to return 400. LanceKnnFilterTranslator
+        // emitted a bare Utf8 SQL literal ('2024-03-01') and
+        // DataFusion rejected the comparison against a Timestamp
+        // column with "could not convert to literal of type
+        // 'Timestamp(...)'". The translator now recognises ISO-8601
+        // shapes and lifts them into `timestamp '...'` so the same
+        // range DSL that works on shard-path date fields also works
+        // when the request lands on the fragment executor.
+        //
+        // Four shapes exercise the fix:
+        // (a) date-only literal
+        // (b) datetime literal (with T and seconds)
+        // (c) bool filter combining a keyword term with a date range
+        // (d) date_histogram bucket aggregation consuming the date column
+        String suffix = "date-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeDatedTable(scratchDir, tableName);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // (a) Date-only literal: id 2 (2024-03-10) and id 3
+            // (2024-03-25) are the two March rows in the fixture, so
+            // [2024-03-01, 2024-04-01) picks exactly those two.
+            String dateOnly = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"ts\":{\"gte\":\"2024-03-01\",\"lt\":\"2024-04-01\"}}}}")
+            );
+            assertEquals(
+                "date-only range must count only the two March rows: " + dateOnly,
+                2,
+                extractIntPath(dateOnly, "hits", "total", "value")
+            );
+            assertTrue("date-only range must include the id=2 hit: " + dateOnly, dateOnly.contains("\"id\":2"));
+            assertTrue("date-only range must include the id=3 hit: " + dateOnly, dateOnly.contains("\"id\":3"));
+
+            // (b) Datetime literal: id 1 (2024-02-20) and id 2
+            // (2024-03-10) fall inside
+            // [2024-02-01T00:00:00Z, 2024-03-15T12:00:00Z). id 3
+            // (2024-03-25) sits above the upper bound and must be
+            // excluded, proving the timestamp comparison respects
+            // sub-day precision.
+            String dateTime = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"range\":{\"ts\":{\"gte\":\"2024-02-01T00:00:00Z\",\"lt\":\"2024-03-15T12:00:00Z\"}}}}"
+                )
+            );
+            assertEquals(
+                "datetime range must count Feb + early-March rows only: " + dateTime,
+                2,
+                extractIntPath(dateTime, "hits", "total", "value")
+            );
+            assertTrue("datetime range must include the id=1 hit: " + dateTime, dateTime.contains("\"id\":1"));
+            assertTrue("datetime range must include the id=2 hit: " + dateTime, dateTime.contains("\"id\":2"));
+
+            // (c) bool filter [term category=odd, range ts]: the odd
+            // subset is {1, 3, 5}, the date range keeps rows in
+            // [2024-01-01, 2024-05-01), and id 5 (2024-05-30) falls
+            // outside the upper bound. The intersection is exactly
+            // {1, 3}. This proves nested translation still routes the
+            // date literal through the timestamp path.
+            String boolBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"bool\":{\"filter\":["
+                        + "{\"term\":{\"category\":\"odd\"}},"
+                        + "{\"range\":{\"ts\":{\"gte\":\"2024-01-01\",\"lt\":\"2024-05-01\"}}}"
+                        + "]}}}"
+                )
+            );
+            assertEquals(
+                "bool filter must intersect the keyword and date-range subsets: " + boolBody,
+                2,
+                extractIntPath(boolBody, "hits", "total", "value")
+            );
+            assertTrue("bool filter must include id=1: " + boolBody, boolBody.contains("\"id\":1"));
+            assertTrue("bool filter must include id=3: " + boolBody, boolBody.contains("\"id\":3"));
+
+            // (d) date_histogram on the same column, monthly interval.
+            // All six rows contribute: {Jan:1, Feb:1, March:2, April:1,
+            // May:1}, so five buckets are opened and the March bucket
+            // carries two docs. min_doc_count 1 keeps empty months out.
+            String hist = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"aggs\":{\"per_month\":{\"date_histogram\":"
+                        + "{\"field\":\"ts\",\"calendar_interval\":\"month\",\"min_doc_count\":1}}}}"
+                )
+            );
+            assertEquals("date_histogram must see every row: " + hist, 6, extractIntPath(hist, "hits", "total", "value"));
+            int monthBuckets = countOccurrences(hist, "\"doc_count\":");
+            assertEquals("date_histogram must open five monthly buckets: " + hist, 5, monthBuckets);
+            assertTrue("date_histogram must carry a bucket with two docs (March): " + hist, hist.contains("\"doc_count\":2"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFragmentDispatchModeCountsFtsHitsWithoutWeightMaterialisation() throws Exception {
         // Issue #42 Phase A / Step A-1: `size:0` on a pure FTS shape
         // used to route through IndexSearcher.count(luceneQuery), which

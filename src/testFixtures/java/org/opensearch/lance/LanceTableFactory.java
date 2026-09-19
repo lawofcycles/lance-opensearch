@@ -9,6 +9,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Map;
@@ -21,6 +22,7 @@ import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TimeStampMicroVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -28,6 +30,7 @@ import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
@@ -558,6 +561,122 @@ final class LanceTableFactory {
                 // Deliberately no createIndex call: leaving the Utf8
                 // column without an inverted index is what triggers
                 // the keyword code path in LanceFragmentLeafReader.
+                Dataset.create(allocator, stream, uri, writeParams).close();
+            }
+        }
+        return uri;
+    }
+
+    /**
+     * Writes a Lance table exercising a Timestamp column. Used by the
+     * date-range regression tests: a {@code range} query with an
+     * ISO-8601 string literal on a Timestamp column used to return 400
+     * because {@link org.opensearch.lance.query.LanceKnnFilterTranslator}
+     * emitted a plain Utf8 SQL literal that DataFusion could not
+     * compare against a Timestamp. This fixture is the smallest schema
+     * that reproduces the bug: an int primary key so hits assertions
+     * can pin down individual rows, a Utf8 category column so bool
+     * filter tests can combine a keyword term with a date range, and a
+     * {@code Timestamp(Microsecond, None)} column so the fragment
+     * reader normalises the values to epoch millis for OpenSearch's
+     * date field type.
+     *
+     * <p>Row layout (fixed six-row table so the caller does not have
+     * to pick between date coverage and row count):
+     * <ul>
+     *   <li>id 0, category "even", ts 2024-01-15T00:00:00Z</li>
+     *   <li>id 1, category "odd",  ts 2024-02-20T00:00:00Z</li>
+     *   <li>id 2, category "even", ts 2024-03-10T00:00:00Z</li>
+     *   <li>id 3, category "odd",  ts 2024-03-25T00:00:00Z</li>
+     *   <li>id 4, category "even", ts 2024-04-05T00:00:00Z</li>
+     *   <li>id 5, category "odd",  ts 2024-05-30T00:00:00Z</li>
+     * </ul>
+     * The spread lets a {@code [2024-03-01, 2024-04-01)} range pick
+     * the two March rows, a datetime range starting mid-March slice
+     * partial months, and a monthly {@code date_histogram} produce
+     * five buckets with the March bucket carrying two docs. The
+     * category column has no FTS index so derivation maps it to
+     * {@code keyword}; term queries can pin the odd or even subset
+     * without waking up FTS scoring.
+     *
+     * @return absolute URI of the table, usable as-is for
+     *         {@code /_lance/attach} or namespace register.
+     */
+    static String writeDatedTable(Path parent, String name) throws Exception {
+        return retryOnFfiFlake(() -> writeDatedTableOnce(parent, name));
+    }
+
+    private static String writeDatedTableOnce(Path parent, String name) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        // Fixed six-row layout. Values live inside the method so the
+        // assertions in the IT can name the exact row that must fall
+        // inside a given range without leaking test tuning into the
+        // caller.
+        long[] tsMicros = new long[] {
+            Instant.parse("2024-01-15T00:00:00Z").toEpochMilli() * 1000L,
+            Instant.parse("2024-02-20T00:00:00Z").toEpochMilli() * 1000L,
+            Instant.parse("2024-03-10T00:00:00Z").toEpochMilli() * 1000L,
+            Instant.parse("2024-03-25T00:00:00Z").toEpochMilli() * 1000L,
+            Instant.parse("2024-04-05T00:00:00Z").toEpochMilli() * 1000L,
+            Instant.parse("2024-05-30T00:00:00Z").toEpochMilli() * 1000L };
+        int rowCount = tsMicros.length;
+        Schema schema = new Schema(
+            Arrays.asList(
+                // Same rationale as writeTable: no PK metadata in the
+                // schema. This fixture does not need GET /_doc so the
+                // synthesised offset-based _id from LanceFragmentLeafReader
+                // is enough.
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("category", FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("ts", FieldType.nullable(new ArrowType.Timestamp(TimeUnit.MICROSECOND, null)), null)
+            ),
+            Map.of()
+        );
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            byte[] ipcBytes;
+            try (
+                VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                ByteArrayOutputStream out = new ByteArrayOutputStream()
+            ) {
+                IntVector idVector = (IntVector) root.getVector("id");
+                VarCharVector categoryVector = (VarCharVector) root.getVector("category");
+                TimeStampMicroVector tsVector = (TimeStampMicroVector) root.getVector("ts");
+
+                idVector.allocateNew(rowCount);
+                categoryVector.allocateNew();
+                tsVector.allocateNew(rowCount);
+
+                for (int i = 0; i < rowCount; i++) {
+                    idVector.set(i, i);
+                    String category = (i % 2 == 0) ? "even" : "odd";
+                    categoryVector.setSafe(i, category.getBytes(StandardCharsets.UTF_8));
+                    tsVector.set(i, tsMicros[i]);
+                }
+                idVector.setValueCount(rowCount);
+                categoryVector.setValueCount(rowCount);
+                tsVector.setValueCount(rowCount);
+                root.setRowCount(rowCount);
+                try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                }
+                ipcBytes = out.toByteArray();
+            }
+
+            try (
+                ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+            ) {
+                Data.exportArrayStream(allocator, reader, stream);
+                WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
+                // No index on the category or ts column: the point is
+                // to exercise the range-on-Timestamp SQL path, not any
+                // scalar index. Derivation maps ts to `date` and
+                // category to `keyword` unconditionally.
                 Dataset.create(allocator, stream, uri, writeParams).close();
             }
         }
