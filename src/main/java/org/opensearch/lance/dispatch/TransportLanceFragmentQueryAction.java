@@ -407,28 +407,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
-     * Translate the request's OpenSearch-native query representation
-     * into a Lucene {@link Query} the shared {@link ContextIndexSearcher}
-     * can execute. Priority order:
-     * <ol>
-     *   <li>{@link LanceFragmentQueryRequest#query()} — the top-level
-     *       {@link org.opensearch.index.query.QueryBuilder} the
-     *       coordinator forwarded. Runs through the local
-     *       {@link QueryShardContext#toQuery} so per-node mapping
-     *       decisions (Lance FTS field types, knn field types,
-     *       etc.) apply.</li>
-     *   <li>{@link LanceFragmentQueryRequest#filterSql()} — a
-     *       Lance SQL filter the coordinator translated ahead of
-     *       time from a pure-filter query. Wrapped in
-     *       {@link LanceScanFilterQuery} so Lance native evaluates
-     *       the predicate per leaf.</li>
-     *   <li>Otherwise: {@link MatchAllDocsQuery}.</li>
-     * </ol>
-     * The two shapes are mutually exclusive on the wire (the
-     * coordinator sets one or the other), so precedence is only a
-     * belt-and-braces guard against future double-set bugs.
-     */
-    /**
      * Strip any scan-limit hint from a Lance-backed Query so it can
      * be reused for match-count purposes.
      *
@@ -459,7 +437,46 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         return query;
     }
 
+    /**
+     * Translate the request's OpenSearch-native query representation
+     * into a Lucene {@link Query} the shared {@link ContextIndexSearcher}
+     * can execute. Priority order:
+     * <ol>
+     *   <li>{@link LanceFragmentQueryRequest#filterSql()} — the
+     *       coordinator translated the whole top-level query tree to
+     *       Lance SQL (bool / term / terms / range / exists /
+     *       match_all over mapped columns). Wrapped in
+     *       {@link LanceScanFilterQuery} so one Lance native scan per
+     *       shard evaluates the predicate and yields the matching row
+     *       addresses, optionally clipped to {@code size} when the
+     *       shape allows (see {@link #resolveScanFilterTopK}). This
+     *       takes precedence over the QueryBuilder because the Lucene
+     *       translation of the same tree (PointRange / term queries
+     *       that fall back to doc values on a reader without points)
+     *       has to load every referenced column through the doc value
+     *       path before it can match a single row, whereas the Lance
+     *       scan reads only {@code _rowaddr}. {@link #computeMatched}
+     *       already trusts the same SQL for {@code hits.total}, so the
+     *       two stay consistent by construction.</li>
+     *   <li>{@link LanceFragmentQueryRequest#query()} — the top-level
+     *       {@link org.opensearch.index.query.QueryBuilder} the
+     *       coordinator forwarded, for shapes the translator refused
+     *       (match / knn / anything scoring, or a tree touching an
+     *       unmapped field, see issue #50). Runs through the local
+     *       {@link QueryShardContext#toQuery} so per-node mapping
+     *       decisions (Lance FTS field types, knn field types, etc.)
+     *       apply.</li>
+     *   <li>Otherwise: {@link MatchAllDocsQuery}.</li>
+     * </ol>
+     * The coordinator ships the QueryBuilder on every request and
+     * adds filterSql whenever translation succeeds, so both are
+     * commonly set at once; filterSql wins because it is the
+     * cheaper, already-validated form of the same predicate.
+     */
     private Query resolveLuceneQuery(LanceFragmentQueryRequest request, QueryShardContext qsc) throws java.io.IOException {
+        if (request.filterSql() != null) {
+            return new LanceScanFilterQuery(request.filterSql(), resolveScanFilterTopK(request));
+        }
         if (request.query() != null) {
             // Rewrite before toQuery so that shapes which rely on
             // doRewrite to fold themselves away — most notably
@@ -491,10 +508,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 return fts.withScanLimit(scanLimit);
             }
             return base;
-        }
-        if (request.filterSql() != null) {
-            int scanLimit = resolveScanFilterTopK(request);
-            return new LanceScanFilterQuery(request.filterSql(), scanLimit);
         }
         return new MatchAllDocsQuery();
     }

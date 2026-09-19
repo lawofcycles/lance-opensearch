@@ -29,16 +29,17 @@ import org.opensearch.lance.engine.LanceFragmentLeafReader;
 
 /**
  * Lucene {@link org.apache.lucene.search.Query} that expresses a Lance SQL
- * filter as a per-leaf scorer. The scorer runs a Lance native scan against
- * {@code fragmentIds=[leaf.fragmentId()]} with the SQL filter applied, and
- * exposes every matching row's fragment offset as a doc id through a
- * {@link BitSetIterator}. Every returned doc is scored 1.0f (no BM25, no
- * ranking); this class is a bit-mask carrier for use as a filter, not a
- * relevance query.
+ * filter as a Lucene scorer. The Weight runs one Lance native scan per
+ * shard against the fragment ids of every Lance-backed leaf under the
+ * searcher, with the SQL filter applied, buckets the returned row
+ * addresses by fragment, and exposes each fragment's matching offsets as
+ * doc ids through a {@link BitSetIterator}. Every returned doc is scored
+ * 1.0f (no BM25, no ranking); this class is a bit-mask carrier for use as
+ * a filter, not a relevance query.
  *
- * <p>Mirrors {@link LanceFtsQuery}'s per-leaf pattern so aggregators and
- * bucket collectors get exactly one Lance native scan per fragment, and
- * the matched doc set feeds them through the standard
+ * <p>Mirrors {@link LanceFtsQuery}'s shard-level pattern so hits,
+ * aggregators and bucket collectors share exactly one Lance native scan
+ * per request, and the matched doc set feeds them through the standard
  * {@link org.apache.lucene.search.LeafCollector#collect(int)} contract. The
  * fragment path uses this to run stock aggregators against Lance-native
  * filter results without translating the filter back into Lucene primitives
@@ -58,8 +59,8 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
 
     private final String filterSql;
     /**
-     * Upper bound on rows the per-leaf Lance scan is allowed to return.
-     * {@link #SCAN_LIMIT_UNBOUNDED} lets the scan fill the full fragment.
+     * Upper bound on rows the shard-level Lance scan is allowed to return.
+     * {@link #SCAN_LIMIT_UNBOUNDED} lets the scan return every match.
      *
      * <p>Callers that know they only need the top {@code size + from}
      * hits (pure scalar filter shape, no sort, no aggregations, no
@@ -130,80 +131,150 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
 
     @Override
     public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) {
-        return new Weight(this) {
-            @Override
-            public Explanation explain(LeafReaderContext context, int doc) {
-                return Explanation.match(1.0f, "lance scan filter");
-            }
+        return new LanceScanFilterWeight(this);
+    }
 
-            @Override
-            public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
-                LanceFragmentLeafReader leaf = LanceFragmentLeafReader.unwrap(context.reader());
-                if (leaf == null) {
-                    return null;
+    /**
+     * Weight that runs the filter scan once per shard and serves every
+     * Lance-backed leaf from the resulting per-fragment bitsets.
+     *
+     * <p>Same shape as {@code LanceFtsQuery.LanceFtsWeight}: the first
+     * leaf the searcher visits collects the fragment ids of every
+     * Lance-backed sibling under the top-level reader context, issues
+     * one {@code newScan} with {@code fragmentIds} set to that list,
+     * buckets the returned {@code _rowaddr}s by fragment, and publishes
+     * the map through a CAS so the remaining leaves only look up their
+     * own bitset. One scan per shard instead of one per fragment keeps
+     * the fixed cost of the filter (plan, index lookup, JNI round
+     * trip) from scaling with fragment count; see issue #42 Phase D.
+     *
+     * <p>{@code scanLimit} is applied to the shard-level scan, so a
+     * bounded request transfers at most {@code scanLimit} row
+     * addresses across all fragments, which is exactly the number of
+     * hits the caller can return.
+     */
+    private static final class LanceScanFilterWeight extends Weight {
+
+        private final java.util.concurrent.atomic.AtomicReference<java.util.Map<Integer, FixedBitSet>> shardMatches =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
+        LanceScanFilterWeight(LanceScanFilterQuery query) {
+            super(query);
+        }
+
+        private LanceScanFilterQuery query() {
+            return (LanceScanFilterQuery) getQuery();
+        }
+
+        @Override
+        public Explanation explain(LeafReaderContext context, int doc) {
+            return Explanation.match(1.0f, "lance scan filter");
+        }
+
+        @Override
+        public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
+            LanceFragmentLeafReader leaf = LanceFragmentLeafReader.unwrap(context.reader());
+            if (leaf == null) {
+                return null;
+            }
+            java.util.Map<Integer, FixedBitSet> matchesByFragment = ensureShardScan(context, leaf);
+            FixedBitSet matches = matchesByFragment.get(leaf.fragmentId());
+            if (matches == null) {
+                return null;
+            }
+            int cardinality = matches.cardinality();
+            if (cardinality == 0) {
+                return null;
+            }
+            DocIdSetIterator iterator = new BitSetIterator(matches, cardinality);
+            Scorer scorer = new Scorer() {
+                @Override
+                public DocIdSetIterator iterator() {
+                    return iterator;
                 }
-                int maxDoc = leaf.maxDoc();
-                // Cap the scan at the caller-supplied top-k when they
-                // asked for one (pure scalar filter shape). Fall back
-                // to maxDoc otherwise so aggregations and other
-                // consumers of the full match set keep working.
-                long effectiveLimit = scanLimit == SCAN_LIMIT_UNBOUNDED ? (long) maxDoc : Math.min((long) scanLimit, (long) maxDoc);
-                FixedBitSet matches = new FixedBitSet(maxDoc);
-                ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(leaf.fragmentId()))
-                    .filter(filterSql)
-                    .withRowAddress(true)
-                    .limit(effectiveLimit)
-                    .build();
-                try (LanceScanner scanner = leaf.dataset().newScan(options); ArrowReader reader = scanner.scanBatches()) {
-                    while (reader.loadNextBatch()) {
-                        VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                        UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                        for (int i = 0; i < root.getRowCount(); i++) {
-                            int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
-                            matches.set(offset);
+
+                @Override
+                public float getMaxScore(int upTo) {
+                    return 1.0f;
+                }
+
+                @Override
+                public float score() {
+                    return 1.0f;
+                }
+
+                @Override
+                public int docID() {
+                    return iterator.docID();
+                }
+            };
+            return new Weight.DefaultScorerSupplier(scorer);
+        }
+
+        private java.util.Map<Integer, FixedBitSet> ensureShardScan(LeafReaderContext context, LanceFragmentLeafReader leaf)
+            throws IOException {
+            java.util.Map<Integer, FixedBitSet> cached = shardMatches.get();
+            if (cached != null) {
+                return cached;
+            }
+            // Walk up to the top-level context: LeafReaderContext.leaves()
+            // is only valid on the top-level IndexReaderContext. The
+            // fragment coordinator's searcher wraps exactly the leaves
+            // this per-node executor was assigned, so the sibling set
+            // is the fragment subset the request was fanned out with.
+            org.apache.lucene.index.IndexReaderContext topCtx = context;
+            while (!topCtx.isTopLevel) {
+                topCtx = topCtx.parent;
+            }
+            java.util.Map<Integer, FixedBitSet> matchesByFragment = new java.util.HashMap<>();
+            java.util.List<Integer> fragmentIds = new java.util.ArrayList<>();
+            for (LeafReaderContext sibling : topCtx.leaves()) {
+                LanceFragmentLeafReader sl = LanceFragmentLeafReader.unwrap(sibling.reader());
+                if (sl != null) {
+                    fragmentIds.add(sl.fragmentId());
+                    matchesByFragment.put(sl.fragmentId(), new FixedBitSet(sl.maxDoc()));
+                }
+            }
+            if (fragmentIds.isEmpty()) {
+                shardMatches.compareAndSet(null, matchesByFragment);
+                return shardMatches.get();
+            }
+            int scanLimit = query().scanLimit();
+            ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(fragmentIds)
+                .filter(query().filterSql())
+                .columns(Collections.emptyList())
+                .withRowAddress(true);
+            if (scanLimit != SCAN_LIMIT_UNBOUNDED) {
+                builder = builder.limit(scanLimit);
+            }
+            try (LanceScanner scanner = leaf.dataset().newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
+                while (reader.loadNextBatch()) {
+                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                    for (int i = 0; i < root.getRowCount(); i++) {
+                        long addr = rowAddr.get(i);
+                        FixedBitSet matches = matchesByFragment.get((int) (addr >>> 32));
+                        if (matches != null) {
+                            matches.set((int) (addr & 0xFFFFFFFFL));
                         }
                     }
-                } catch (IOException e) {
-                    throw e;
-                } catch (Exception e) {
-                    throw new IOException(e);
                 }
-                if (matches.cardinality() == 0) {
-                    return null;
-                }
-                DocIdSetIterator iterator = new BitSetIterator(matches, matches.cardinality());
-                Scorer scorer = new Scorer() {
-                    @Override
-                    public DocIdSetIterator iterator() {
-                        return iterator;
-                    }
-
-                    @Override
-                    public float getMaxScore(int upTo) {
-                        return 1.0f;
-                    }
-
-                    @Override
-                    public float score() {
-                        return 1.0f;
-                    }
-
-                    @Override
-                    public int docID() {
-                        return iterator.docID();
-                    }
-                };
-                return new Weight.DefaultScorerSupplier(scorer);
+            } catch (IOException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new IOException(e);
             }
+            shardMatches.compareAndSet(null, matchesByFragment);
+            return shardMatches.get();
+        }
 
-            @Override
-            public boolean isCacheable(LeafReaderContext ctx) {
-                // Same rationale as LanceFtsQuery: the scan reads live
-                // Lance data whose visibility may advance between
-                // searches. Skip Lucene's query cache and let the
-                // reader lifecycle handle freshness.
-                return false;
-            }
-        };
+        @Override
+        public boolean isCacheable(LeafReaderContext ctx) {
+            // Same rationale as LanceFtsQuery: the scan reads live
+            // Lance data whose visibility may advance between
+            // searches. Skip Lucene's query cache and let the
+            // reader lifecycle handle freshness.
+            return false;
+        }
     }
 }
