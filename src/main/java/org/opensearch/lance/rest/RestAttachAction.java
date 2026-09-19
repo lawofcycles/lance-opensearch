@@ -447,6 +447,55 @@ public class RestAttachAction extends BaseRestHandler {
             int fieldId = field.getId();
             boolean declaredPk = field.getMetadata() != null && field.getMetadata().containsKey(PK_METADATA_KEY);
             if (declaredPk) {
+                // Lance's Rust schema validator refuses a table whose
+                // primary key column is nullable
+                // ("Primary key column and all its ancestors must not
+                // be nullable", `rust/lance-core/src/datatypes/schema.rs`
+                // in Lance 11.0.0). The validator fires both when
+                // `Dataset.create` writes the schema and when
+                // `Dataset.open` reads it back. On Lance 11 that
+                // means a fresh nullable-PK table cannot be produced
+                // through the current SDK, and any older or
+                // hand-crafted table that does carry the shape
+                // fails at attach's initial `Dataset.open` inside
+                // `LanceRegistry.openDataset` with a
+                // `LanceError(Schema)` wrapped in a generic
+                // 500 response. That earlier path is loud enough
+                // that the "attach 200 → shard settles red on
+                // recovery" scenario the issue described is not
+                // reachable through Lance 11 anymore.
+                //
+                // The check below is defense in depth for the
+                // narrow case where the reader accepts a schema
+                // with a nullable PK metadata attribute (an older
+                // Lance format the current reader is permissive
+                // about, or a schema that got the metadata
+                // attached post-write) and still reaches
+                // `derive`. When it does fire, a 400 that names
+                // the column and the metadata key is a far
+                // better operator experience than the
+                // recovery-time `LanceError(Schema)` that
+                // motivated the issue in the first place.
+                //
+                // Complementary note: only field-level
+                // `lance-schema:unenforced-primary-key` metadata
+                // is honoured. Schema-level metadata on the
+                // Arrow root is silently ignored by both the
+                // Lance reader and this loop; the attach guide
+                // documents that so writers do not chase a
+                // missing PK caused by placing the marker on
+                // the wrong Arrow object.
+                if (field.isNullable()) {
+                    throw new IllegalArgumentException(
+                        "column ["
+                            + name
+                            + "] is declared as primary key but is nullable; Lance requires the primary key column and "
+                            + "all its ancestors to be non-nullable. Rewrite the table with a non-nullable primary key "
+                            + "column, or drop the ["
+                            + PK_METADATA_KEY
+                            + "] metadata to attach it as a PK-less table."
+                    );
+                }
                 // Signed integers up to 64 bits, unsigned 64 bit
                 // integers, and Utf8 are the three PK shapes the
                 // engine knows how to look up. Any other type gets
