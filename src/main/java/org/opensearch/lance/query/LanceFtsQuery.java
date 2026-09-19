@@ -48,9 +48,32 @@ import org.opensearch.lance.engine.LanceFragmentLeafReader;
  */
 public final class LanceFtsQuery extends Query {
 
+    /** Sentinel that disables top-k pushdown; the scan is bounded only by fragment maxDoc. */
+    public static final int SCAN_LIMIT_UNBOUNDED = 0;
+
     private final FullTextQuery fullTextQuery;
     private final Set<String> columns;
     private final String canonical;
+    /**
+     * Upper bound on rows the per-leaf Lance FTS scan is allowed to
+     * return. {@link #SCAN_LIMIT_UNBOUNDED} lets the scan produce
+     * every matching row (the historical behaviour).
+     *
+     * <p>Callers that only need the top {@code size} hits (pure FTS
+     * shape with no sort, no aggregations, no post_filter) pass that
+     * value here and let Lance's inverted-index scorer stop scoring
+     * once it has enough score-sorted rows. This is the direct
+     * counterpart of {@link
+     * org.opensearch.lance.query.LanceScanFilterQuery#scanLimit()}
+     * for FTS: {@code LanceScanFilterQuery} clips at the level of
+     * "matched row addresses" for scalar filters, this class clips
+     * at "score-sorted rows" for full-text queries.
+     *
+     * <p>Aggregations, sort by a non-score field, and post_filter all
+     * need the full matched set; the fragment path resolver keeps
+     * this at {@link #SCAN_LIMIT_UNBOUNDED} for those shapes.
+     */
+    private final int scanLimit;
 
     /**
      * Primary constructor. {@code columns} is the set of Lance columns
@@ -59,12 +82,39 @@ public final class LanceFtsQuery extends Query {
      * for the query to run against that leaf.
      */
     public LanceFtsQuery(FullTextQuery fullTextQuery, Set<String> columns) {
+        this(fullTextQuery, columns, SCAN_LIMIT_UNBOUNDED);
+    }
+
+    /**
+     * Full constructor including the top-k pushdown hint.
+     */
+    public LanceFtsQuery(FullTextQuery fullTextQuery, Set<String> columns, int scanLimit) {
         this.fullTextQuery = Objects.requireNonNull(fullTextQuery, "fullTextQuery must not be null");
         this.columns = Set.copyOf(Objects.requireNonNull(columns, "columns must not be null"));
         if (this.columns.isEmpty()) {
             throw new IllegalArgumentException("columns must not be empty");
         }
+        if (scanLimit < 0) {
+            throw new IllegalArgumentException("scanLimit must not be negative, was " + scanLimit);
+        }
+        this.scanLimit = scanLimit;
         this.canonical = canonicalString(fullTextQuery);
+    }
+
+    /**
+     * Return a copy of this query with a new scan limit. Used by the
+     * fragment path resolver to attach the request's {@code size} to
+     * a plain-DSL LanceFtsQuery without going through every DSL builder.
+     */
+    public LanceFtsQuery withScanLimit(int newScanLimit) {
+        if (newScanLimit == scanLimit) {
+            return this;
+        }
+        return new LanceFtsQuery(fullTextQuery, columns, newScanLimit);
+    }
+
+    public int scanLimit() {
+        return scanLimit;
     }
 
     /**
@@ -143,12 +193,20 @@ public final class LanceFtsQuery extends Query {
                 // would be the growth path we are trying to prevent.
                 LanceCircuitBreaker.checkAndTrip("lance_fts_query");
                 int maxDoc = leaf.maxDoc();
+                // Clip the FTS scan at the caller-supplied top-k when
+                // one was pinned. Lance's inverted-index scorer
+                // maintains a bounded heap of score-sorted rows, so
+                // asking for k << maxDoc costs O(hits * log k) rather
+                // than O(hits) with a full transfer. The scan floor
+                // is 1 (Lance rejects limit == 0); shapes that must
+                // see every match keep the sentinel and get maxDoc.
+                long effectiveLimit = scanLimit == SCAN_LIMIT_UNBOUNDED ? (long) maxDoc : Math.min((long) scanLimit, (long) maxDoc);
                 float[] scores = new float[maxDoc];
                 org.apache.lucene.util.FixedBitSet matches = new org.apache.lucene.util.FixedBitSet(maxDoc);
                 ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(leaf.fragmentId()))
                     .fullTextQuery(fullTextQuery)
                     .withRowAddress(true)
-                    .limit((long) maxDoc)
+                    .limit(effectiveLimit)
                     .build();
                 try (LanceScanner scanner = leaf.dataset().newScan(options); ArrowReader reader = scanner.scanBatches()) {
                     while (reader.loadNextBatch()) {
@@ -211,12 +269,12 @@ public final class LanceFtsQuery extends Query {
 
     @Override
     public boolean equals(Object other) {
-        return other instanceof LanceFtsQuery q && columns.equals(q.columns) && canonical.equals(q.canonical);
+        return other instanceof LanceFtsQuery q && columns.equals(q.columns) && canonical.equals(q.canonical) && scanLimit == q.scanLimit;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(columns, canonical);
+        return Objects.hash(columns, canonical, scanLimit);
     }
 
     /**

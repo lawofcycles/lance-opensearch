@@ -42,6 +42,7 @@ import org.opensearch.index.shard.IndexShard;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.engine.LanceDirectoryReader;
+import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.aggregations.Aggregator;
@@ -321,6 +322,16 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
 
                     Query query = resolveLuceneQuery(request, qsc);
                     Query hitsQuery = applyPostFilter(query, request, qsc);
+                    // Match count runs through the same Weight as the
+                    // hits phase when the query is a scoring Lucene
+                    // query (FTS, knn), so strip any scan-limit hint
+                    // from the query before handing it to
+                    // computeMatched. Without this, an FTS Weight
+                    // that was clipped to `size` rows during
+                    // scanHitsViaIndexSearcher would also clip the
+                    // count and hits.total.value would collapse to
+                    // `size`.
+                    Query countQuery = withoutScanLimit(hitsQuery);
                     org.opensearch.search.sort.SortAndFormats sortAndFormats = resolveSort(request, qsc);
 
                     // Aggregations run over the top-level query only —
@@ -337,7 +348,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         request.trackScores()
                     );
                     InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query);
-                    long matched = computeMatched(dataset, request, searcher, hitsQuery);
+                    long matched = computeMatched(dataset, request, searcher, countQuery);
                     return new LanceFragmentQueryResponse(matched, fragmentCount, hits, aggregations);
                 }
             }
@@ -366,9 +377,55 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * coordinator sets one or the other), so precedence is only a
      * belt-and-braces guard against future double-set bugs.
      */
+    /**
+     * Strip any scan-limit hint from a Lance-backed Query so it can
+     * be reused for match-count purposes.
+     *
+     * <p>{@link LanceFtsQuery} and {@link LanceScanFilterQuery} both
+     * embed an optional top-k inside the {@link Query} instance
+     * itself: the fragment scan uses that hint to stop early during
+     * the hits phase. The same instance is also what
+     * {@link #computeMatched} hands to {@code IndexSearcher.count}
+     * when there is no cheaper counting path (scoring queries, or
+     * scan-filter queries wrapped by post_filter). Counting the top
+     * {@code size} rows instead of every matched row would collapse
+     * {@code hits.total.value} to {@code size}, so build a fresh
+     * unbounded copy before the count call.
+     *
+     * <p>Non-Lance queries fall through unchanged; nested queries
+     * (bool / boost / dis_max wrapping a LanceFtsQuery) are the
+     * same story — the resolver keeps the scan limit at
+     * {@link LanceScanFilterQuery#SCAN_LIMIT_UNBOUNDED} for those
+     * shapes, so nothing needs to be rewritten here.
+     */
+    private static Query withoutScanLimit(Query query) {
+        if (query instanceof LanceFtsQuery fts && fts.scanLimit() != LanceFtsQuery.SCAN_LIMIT_UNBOUNDED) {
+            return fts.withScanLimit(LanceFtsQuery.SCAN_LIMIT_UNBOUNDED);
+        }
+        if (query instanceof LanceScanFilterQuery scan && scan.scanLimit() != LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED) {
+            return new LanceScanFilterQuery(scan.filterSql(), LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED);
+        }
+        return query;
+    }
+
     private Query resolveLuceneQuery(LanceFragmentQueryRequest request, QueryShardContext qsc) throws java.io.IOException {
         if (request.query() != null) {
-            return request.query().toQuery(qsc);
+            Query base = request.query().toQuery(qsc);
+            // If the request shape allows top-k pushdown and the
+            // resulting Lucene tree is a bare LanceFtsQuery (single
+            // lance_match / lance_match_phrase / etc. at the root),
+            // ship the size hint into it so Lance's FTS scorer can
+            // stop after k score-sorted rows. Callers wrapping the
+            // FTS clause in a bool / boost / dis_max keep the
+            // sentinel: mixing the top-k with other scorers would
+            // clip the wrong side. Phase B follow-ups can extend the
+            // rewrite deeper once we teach the scorer to negotiate
+            // with siblings.
+            int scanLimit = resolveScanFilterTopK(request);
+            if (scanLimit != LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED && base instanceof LanceFtsQuery fts) {
+                return fts.withScanLimit(scanLimit);
+            }
+            return base;
         }
         if (request.filterSql() != null) {
             int scanLimit = resolveScanFilterTopK(request);

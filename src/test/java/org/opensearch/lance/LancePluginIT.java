@@ -674,6 +674,104 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeAppliesTopKPushdownForFtsHits() throws Exception {
+        // Issue #42 Phase B: pure FTS (lance_match / lance_match_phrase
+        // as the top-level query) with no sort, no aggregation, and no
+        // post_filter must push size into the per-fragment Lance scan
+        // as `limit(size)`. Lance's inverted-index scorer holds a
+        // bounded score-sorted heap, so a size:5 request against a
+        // large hit set never has to transfer or rank 4+ orders of
+        // magnitude of rows the client will not look at.
+        //
+        // Regression fence covers: hits stay correct up to the
+        // requested size, hits.total.value keeps returning the true
+        // count from LanceFtsQuery's Weight (because that Weight runs
+        // once per size:0 count call and the scan limit is disabled
+        // there), and shapes that must NOT enable the pushdown (sort
+        // by non-score field / agg) keep serving the full matched set.
+        String suffix = "ftstop-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        // 20 rows: 10 with "hello lance N" (even ids), 10 with "quick
+        // brown fox N" (odd ids). The "lance" match yields 10 hits.
+        LanceTableFactory.writeTable(scratchDir, tableName, 20);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // Match "lance" hits 10 rows; size:3 must clip hits to 3
+            // while hits.total.value stays at 10. If the clip leaked
+            // into the total, the count would drop to 3.
+            String matchBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}},\"size\":3}"));
+            assertEquals("match size:3 total must be 10", 10, extractIntPath(matchBody, "hits", "total", "value"));
+            int matchReturnedHits = countOccurrences(matchBody, "\"_id\":");
+            assertEquals("match size:3 must return three hits: " + matchBody, 3, matchReturnedHits);
+
+            // Match with a size larger than the matched set must
+            // return every match (no clip, no padding).
+            String allMatchBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}},\"size\":50}")
+            );
+            assertEquals("match size:50 total must be 10", 10, extractIntPath(allMatchBody, "hits", "total", "value"));
+            int allMatchReturnedHits = countOccurrences(allMatchBody, "\"_id\":");
+            assertEquals("match size:50 must return ten hits: " + allMatchBody, 10, allMatchReturnedHits);
+
+            // size:0 count-only: hits stays empty, total reflects the
+            // full match (served by IndexSearcher.count on the FTS
+            // Weight without the top-k enabled).
+            String countBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}},\"size\":0}"));
+            assertEquals("match size:0 total must be 10", 10, extractIntPath(countBody, "hits", "total", "value"));
+            int countReturnedHits = countOccurrences(countBody, "\"_id\":");
+            assertEquals("size:0 must return no hits", 0, countReturnedHits);
+
+            // Sort by a non-score field must disable the top-k
+            // pushdown: even at size:3, we need every match so sort
+            // by id desc can pick the largest id (the row with "hello
+            // lance 18" at id=18 must come first for the "lance"
+            // match on even ids).
+            String sortBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"match\":{\"body\":\"lance\"}},\"size\":3,\"sort\":[{\"id\":\"desc\"}]}"
+                )
+            );
+            assertEquals("match sort size:3 total must be 10", 10, extractIntPath(sortBody, "hits", "total", "value"));
+            int sortReturnedHits = countOccurrences(sortBody, "\"_id\":");
+            assertEquals("match sort size:3 must return three hits: " + sortBody, 3, sortReturnedHits);
+            assertTrue("match sort desc must put id=18 first: " + sortBody, sortBody.contains("\"id\":18"));
+
+            // Aggregation must disable the top-k pushdown: the sum of
+            // even ids 0..18 is 0+2+4+6+8+10+12+14+16+18 = 90. If the
+            // scan were clipped to 3, the sum would be < 90.
+            String aggBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"match\":{\"body\":\"lance\"}},\"size\":3,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
+                )
+            );
+            assertEquals("match agg size:3 total must be 10", 10, extractIntPath(aggBody, "hits", "total", "value"));
+            assertEquals("sum(id) over match must be 90", 90.0d, extractDoublePath(aggBody, "aggregations", "s", "value"), 0.0d);
+
+            // lance_match_phrase should follow the same pushdown path.
+            // "hello lance" matches all 10 even-id rows exactly.
+            String phraseBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"hello lance\"}},\"size\":4}"
+                )
+            );
+            assertEquals("phrase size:4 total must be 10", 10, extractIntPath(phraseBody, "hits", "total", "value"));
+            int phraseReturnedHits = countOccurrences(phraseBody, "\"_id\":");
+            assertEquals("phrase size:4 must return four hits: " + phraseBody, 4, phraseReturnedHits);
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFragmentDispatchModeAppliesTopKPushdownForScalarFilterHits() throws Exception {
         // Issue #42 Phase A: pure scalar filter (term / range / bool
         // built from LanceKnnFilterTranslator-translatable clauses)
