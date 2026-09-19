@@ -106,13 +106,35 @@ public final class LanceRegistry {
      *
      * <p>Safety w.r.t. in-flight datasets: Lance's Rust {@code Session}
      * lives inside an {@code Arc<Session>} that every {@code Dataset}
-     * captures through {@code ReadOptions.setSession}. The Java-side
-     * {@link Session#close()} releases only the reference this Registry
-     * holds; every dataset that already captured the old session keeps
-     * its own {@code Arc}, so the native session stays alive for their
-     * cache reads and is dropped only once the last dataset closes.
-     * The new session takes over for any {@code openDataset} that
-     * happens after this call returns.
+     * captures through {@code ReadOptions.setSession}. Datasets that
+     * already captured the old session keep their own {@code Arc}, so
+     * the native session stays alive for their cache reads and is
+     * dropped only once the last dataset closes. The new session takes
+     * over for any {@code openDataset} that happens after this call
+     * returns.
+     *
+     * <p>Concurrency detail: we deliberately do NOT call
+     * {@link Session#close()} on the previous session, because
+     * {@code Session.close()} in {@code lance-jni} is
+     * {@code Box::from_raw} of the {@code Box<Arc<LanceSession>>}
+     * whose raw pointer is what {@link #openDataset} reads from
+     * {@code Session.nativeSessionHandle} and passes to
+     * {@code Dataset.openNative}. The Rust side dereferences that
+     * pointer through {@code session_from_handle} to clone the
+     * {@code Arc}, and if a concurrent {@code close()} calls
+     * {@code Box::from_raw} between the pointer read and the clone,
+     * the dereference is use-after-free and crashes the JVM with
+     * {@code SIGBUS} in {@code Java_org_lance_Dataset_openNative}.
+     * Under repeated DELETE events during the integration test suite
+     * this race was reproducible; the {@code openDataset} reader
+     * cannot be synchronised against {@code close()} without holding
+     * a lock across the whole native call. Leaving {@code previous}
+     * unclosed leaks the Java wrapper and one {@code Arc}
+     * reference, so the underlying native {@code Session} object is
+     * not reclaimed until JVM exit. The cache pages inside that
+     * session are still dropped as their owning datasets close, so
+     * the leak is a bounded per-reinstall constant rather than
+     * per-cache-entry.
      *
      * <p>Coarseness: this is a whole-cache invalidation. Every path
      * pays the cost of a cold cache on its next query, not just the
@@ -137,17 +159,12 @@ public final class LanceRegistry {
         }
         Session next = Session.builder().indexCacheSizeBytes(indexCacheBytes).metadataCacheSizeBytes(metadataCacheBytes).build();
         SESSION = next;
-        // Release the Registry's own Arc reference to the old
-        // Session. Datasets that captured it keep the underlying
-        // Rust session alive through their own Arc so this cannot
-        // yank the ground out from under an in-flight query.
-        try {
-            previous.close();
-        } catch (Exception ignored) {
-            // close() on the Java wrapper is best-effort. If it
-            // fails the Java handle leaks a long but the native
-            // Arc is still dropped when the last dataset closes.
-        }
+        // Deliberately do NOT call previous.close(). See javadoc above.
+        // The old Session leaks its Java wrapper and one Arc reference,
+        // but that is required to avoid a use-after-free crash in
+        // Java_org_lance_Dataset_openNative when a concurrent shard is
+        // still in the process of building a Dataset against the old
+        // session handle.
     }
 
     /**
