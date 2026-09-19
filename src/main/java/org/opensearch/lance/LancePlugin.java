@@ -327,6 +327,84 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         return Optional.empty();
     }
 
+    /**
+     * Wire an {@link org.opensearch.index.shard.IndexEventListener} onto
+     * every {@link org.opensearch.index.IndexModule} so that Lance-backed
+     * indexes trigger a cache invalidation whenever OpenSearch deletes
+     * their index metadata. The listener is a no-op for non-Lance
+     * indexes.
+     *
+     * <h4>Why this listener exists</h4>
+     *
+     * <p>The shared Lance {@link org.lance.Session} holds an LRU of
+     * index and metadata pages keyed by path plus a manifest fingerprint,
+     * but the cache does not observe when the underlying
+     * {@code _indices/<uuid>/*.lance} files are deleted from disk. If
+     * an operator deletes a Lance-backed index in OpenSearch and then
+     * recreates the Lance table at the same path (typical remediation
+     * workflow after a bug fix or a fresh data load), any subsequent
+     * {@code openDataset} on that path can still hit cache entries
+     * that reference the old {@code _indices/<uuid>/} files. Every
+     * request that touches such an entry returns
+     * {@code 500 Not found: tables/<path>/_indices/<old-uuid>/page_lookup.lance}
+     * with no way to recover short of a node restart (see #46).
+     *
+     * <h4>Why the invalidation runs on {@code beforeIndexRemoved} with
+     * reason {@code DELETED}</h4>
+     *
+     * <p>An index leaves this node for several reasons; only the
+     * {@code DELETED} reason removes the underlying files from disk.
+     * {@code CLOSED}, {@code NO_LONGER_ASSIGNED}, {@code REOPENED}, and
+     * the failure cases either keep the disk state intact or hand the
+     * shard off to another node that still needs the current cache.
+     * Rebuilding the shared session for any of those would trade the
+     * cache warm-up cost for zero correctness benefit, so this
+     * listener discriminates on the reason.
+     *
+     * <h4>Coarseness of the invalidation</h4>
+     *
+     * <p>{@link LanceRegistry#reinstallSession()} rebuilds the whole
+     * shared session because Lance 11's Java SDK does not expose a
+     * per-path invalidation entry point. Every Lance-backed index on
+     * this node pays a cold-cache cost on its next query, not just
+     * the path that triggered the rebuild. The trade-off is
+     * documented at the {@link LanceRegistry#reinstallSession()} call
+     * site; when an upstream SDK exposes a targeted invalidation
+     * hook, replace this coarse rebuild with a narrower call.
+     */
+    @Override
+    public void onIndexModule(org.opensearch.index.IndexModule indexModule) {
+        if (indexModule.getSettings().get(LanceEngineFactory.TABLE_SETTING) == null) {
+            return;
+        }
+        indexModule.addIndexEventListener(new org.opensearch.index.shard.IndexEventListener() {
+            @Override
+            public void beforeIndexRemoved(
+                org.opensearch.index.IndexService indexService,
+                org.opensearch.indices.cluster.IndicesClusterStateService.AllocatedIndices.IndexRemovalReason reason
+            ) {
+                if (reason != org.opensearch.indices.cluster.IndicesClusterStateService.AllocatedIndices.IndexRemovalReason.DELETED) {
+                    return;
+                }
+                try {
+                    LanceRegistry.reinstallSession();
+                    LOGGER.info(
+                        "reinstalled shared Lance Session after DELETE of Lance-backed index [{}]; "
+                            + "subsequent re-attach on the same path will not see cached _indices/<uuid>/ pages",
+                        indexService.index().getName()
+                    );
+                } catch (Throwable t) {
+                    LOGGER.warn(
+                        "failed to reinstall shared Lance Session after DELETE of Lance-backed index [{}]; "
+                            + "re-attaching the same path may need a node restart if it returns 500 on GET",
+                        indexService.index().getName(),
+                        t
+                    );
+                }
+            }
+        });
+    }
+
     private LanceNamespaceService namespaceService;
     private org.opensearch.threadpool.ThreadPool threadPool;
     private AllowedTableRoots allowedTableRoots;

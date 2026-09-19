@@ -2329,6 +2329,125 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testAttachRecreateAtSamePathServesNewContent() throws Exception {
+        // Issue #46: recreating a Lance table at the same filesystem
+        // path left stale index-page entries in the shared Lance
+        // Session cache. The re-attach opened its Dataset against
+        // the same Session, so GET on the re-attached index either
+        // returned rows that only existed in the deleted table or
+        // 500'd with "Not found: tables/<path>/_indices/<old-uuid>/page_lookup.lance"
+        // depending on which pages the cache still held. The fix
+        // hooks a listener onto every Lance-backed IndexModule and
+        // reinstalls the shared Session on DELETE, so any subsequent
+        // openDataset picks up the fresh manifest.
+        //
+        // This test walks the whole attach → delete → recreate →
+        // re-attach loop the QA report described and checks the
+        // observable outcome: GET on the second attach must resolve
+        // to the recreated table, not to the deleted one. It is a
+        // regression fence for the lifecycle rather than a strict
+        // reproducer for the underlying cache pathology, because
+        // Lance's cache keying is opaque to Java and the specific
+        // manifest-version collision the QA report captured
+        // (version 8 on both writes) is not reliably reproducible
+        // from an in-JVM writer with fresh small tables. The listener
+        // still fires here — the reinstall runs during
+        // {@code DELETE /{index}} — so a regression that broke the
+        // reinstall path or dropped the listener registration would
+        // still change observable behaviour on this test.
+        //
+        // Table shape: Utf8 PK table so GET has something to look up.
+        // {@code writeTable} would not do because its PK metadata
+        // clashes with the FixedSizeList column and the fixture
+        // decides to leave the PK undeclared (see the comment on
+        // {@code LanceTableFactory.writeTable}). {@code writeStringPkTable}
+        // sets the PK metadata field-only so GET / _id both resolve.
+        String suffix = "recreate-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        Path tablePath = scratchDir.resolve(tableName + ".lance");
+        String tableUri = tablePath.toString();
+        String indexName = tableName;
+
+        // First attach: 4 rows with keys alpha-0..alpha-3. Prime
+        // the Session cache with a GET so the fix has something to
+        // invalidate on DELETE.
+        LanceTableFactory.writeStringPkTable(scratchDir, tableName, 4);
+        try {
+            Response attach1 = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals("first attach failed: " + readAll(attach1), RestStatus.OK.getStatus(), attach1.getStatusLine().getStatusCode());
+
+            Response beforeGet = client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-2"));
+            assertEquals(
+                "GET on original table must find alpha-2, saw " + beforeGet.getStatusLine().getStatusCode(),
+                200,
+                beforeGet.getStatusLine().getStatusCode()
+            );
+
+            // Delete the OS index. This is what triggers the
+            // IndexEventListener the plugin registers on every
+            // Lance-backed IndexModule, which in turn reinstalls
+            // the shared Session so its cache does not survive the
+            // upcoming path reuse.
+            client().performRequest(new Request("DELETE", "/" + indexName));
+
+            // Recreate the Lance table at the exact same URI with a
+            // smaller row set: keys alpha-0 and alpha-1 only. The
+            // filesystem contents at tablePath are entirely
+            // replaced; without the Session reinstall the cache
+            // would still hand back pages that reference the
+            // deleted _indices/<old-uuid>/ files and GET on alpha-2
+            // or alpha-3 would either 500 or resolve to stale rows.
+            deleteRecursively(tablePath);
+            LanceTableFactory.writeStringPkTable(scratchDir, tableName, 2);
+
+            Response attach2 = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals("second attach failed: " + readAll(attach2), RestStatus.OK.getStatus(), attach2.getStatusLine().getStatusCode());
+
+            // alpha-1 exists in the new table: GET returns 200.
+            Response afterHit = client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-1"));
+            assertEquals(
+                "GET on recreated table must find alpha-1, saw " + afterHit.getStatusLine().getStatusCode(),
+                200,
+                afterHit.getStatusLine().getStatusCode()
+            );
+
+            // alpha-2 existed in the old table but not the new one:
+            // the response must be 404, not a stale hit and not a
+            // 500 caused by the cache pointing at a deleted file.
+            ResponseException stale = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-2"))
+            );
+            assertEquals(
+                "GET on stale key alpha-2 must return 404, saw "
+                    + stale.getResponse().getStatusLine().getStatusCode()
+                    + " body="
+                    + readAll(stale.getResponse()),
+                404,
+                stale.getResponse().getStatusLine().getStatusCode()
+            );
+
+            // Same fence for alpha-3.
+            ResponseException stale3 = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-3"))
+            );
+            assertEquals(
+                "GET on stale key alpha-3 must return 404, saw "
+                    + stale3.getResponse().getStatusLine().getStatusCode()
+                    + " body="
+                    + readAll(stale3.getResponse()),
+                404,
+                stale3.getResponse().getStatusLine().getStatusCode()
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testUnsignedLongPrimaryKeyRoundTripsThroughIdAndGet() throws Exception {
         // Issue #24 remainder: a UInt64 PK column must survive the round
         // trip through _search / _id / GET even when the values sit
