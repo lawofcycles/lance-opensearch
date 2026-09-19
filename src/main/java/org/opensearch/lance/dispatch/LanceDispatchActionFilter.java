@@ -18,6 +18,7 @@ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.index.Index;
@@ -27,6 +28,7 @@ import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
+import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 
 /**
@@ -77,15 +79,18 @@ public class LanceDispatchActionFilter implements ActionFilter {
     private final ClusterService clusterService;
     private final IndexNameExpressionResolver indexNameExpressionResolver;
     private final Client client;
+    private final ThreadPool threadPool;
 
     public LanceDispatchActionFilter(
         ClusterService clusterService,
         IndexNameExpressionResolver indexNameExpressionResolver,
-        Client client
+        Client client,
+        ThreadPool threadPool
     ) {
         this.clusterService = clusterService;
         this.indexNameExpressionResolver = indexNameExpressionResolver;
         this.client = client;
+        this.threadPool = threadPool;
     }
 
     @Override
@@ -152,9 +157,41 @@ public class LanceDispatchActionFilter implements ActionFilter {
             // queries to every data node. In single-node clusters
             // the fan-out reduces to a local executeLocally hop so
             // the same code path serves both.
+            //
+            // Fork onto the SEARCH threadpool before entering the
+            // coordinator: this filter runs on the transport worker
+            // that received the HTTP request, and
+            // NodeClient.executeLocally invokes the coordinator's
+            // doExecute inline (its request handler executor only
+            // fires when the call arrives over the transport
+            // layer). Without the fork, SQL translation, Lance
+            // native scan, Lucene collection, and Semaphore.acquire
+            // would all run on netty transport_worker threads,
+            // stalling node I/O; core enforces this via
+            // Transports.assertNotTransportThread on hot paths. The
+            // AbstractRunnable form ensures fork failures
+            // (thread-pool rejection, shutting-down node) surface
+            // via listener.onFailure rather than being silently
+            // swallowed.
             @SuppressWarnings("unchecked")
-            ActionListener<SearchResponse> typedListener = (ActionListener<SearchResponse>) listener;
-            client.execute(LanceCoordinatorAction.INSTANCE, searchRequest, typedListener);
+            final ActionListener<SearchResponse> typedListener = (ActionListener<SearchResponse>) listener;
+            threadPool.executor(ThreadPool.Names.SEARCH).execute(new AbstractRunnable() {
+                @Override
+                protected void doRun() {
+                    client.execute(LanceCoordinatorAction.INSTANCE, searchRequest, typedListener);
+                }
+
+                @Override
+                public void onFailure(Exception e) {
+                    LOGGER.warn("fragment dispatch fork failed for {}; falling back to shard path", (Object) searchRequest.indices(), e);
+                    chain.proceed(task, action, request, listener);
+                }
+
+                @Override
+                public String toString() {
+                    return "lance dispatch coordinator entry for " + java.util.Arrays.toString(searchRequest.indices());
+                }
+            });
         } catch (Exception e) {
             LOGGER.warn("fragment dispatch failed for {}; falling back to shard path", (Object) searchRequest.indices(), e);
             chain.proceed(task, action, request, listener);

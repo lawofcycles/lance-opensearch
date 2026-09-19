@@ -49,6 +49,7 @@ import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
+import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 /**
@@ -87,7 +88,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         BigArrays bigArrays,
         ScriptService scriptService
     ) {
-        super(LanceCoordinatorAction.NAME, transportService, actionFilters, SearchRequest::new);
+        super(LanceCoordinatorAction.NAME, transportService, actionFilters, SearchRequest::new, ThreadPool.Names.SEARCH);
         this.transportService = transportService;
         this.clusterService = clusterService;
         this.indexNameExpressionResolver = indexNameExpressionResolver;

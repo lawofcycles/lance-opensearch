@@ -439,7 +439,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // shard fan-out via ReadOnlyEngine only runs when the
         // fragment executor cannot answer a shape yet (from > 0,
         // search_after, highlighter, suggest, post_filter).
-        this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client);
+        this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client, threadPool);
         this.createIndexActionFilter = new LanceCreateIndexActionFilter(threadPool);
 
         namespaceService = new LanceNamespaceService(

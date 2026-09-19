@@ -54,6 +54,7 @@ import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucket
 import org.opensearch.search.aggregations.SearchContextAggregations;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.tasks.Task;
+import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 /**
@@ -178,7 +179,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         BigArrays bigArrays,
         CircuitBreakerService circuitBreakerService
     ) {
-        super(LanceFragmentQueryAction.NAME, transportService, actionFilters, LanceFragmentQueryRequest::new);
+        super(LanceFragmentQueryAction.NAME, transportService, actionFilters, LanceFragmentQueryRequest::new, ThreadPool.Names.SEARCH);
         this.clusterService = clusterService;
         this.indicesService = indicesService;
         this.bigArrays = bigArrays;
