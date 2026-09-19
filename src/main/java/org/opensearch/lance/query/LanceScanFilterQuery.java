@@ -53,32 +53,74 @@ import org.opensearch.lance.engine.LanceFragmentLeafReader;
  */
 public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
 
-    private final String filterSql;
+    /** Sentinel that disables top-k pushdown; the scan is bounded only by fragment maxDoc. */
+    public static final int SCAN_LIMIT_UNBOUNDED = 0;
 
+    private final String filterSql;
+    /**
+     * Upper bound on rows the per-leaf Lance scan is allowed to return.
+     * {@link #SCAN_LIMIT_UNBOUNDED} lets the scan fill the full fragment.
+     *
+     * <p>Callers that know they only need the top {@code size + from}
+     * hits (pure scalar filter shape, no sort, no aggregations, no
+     * post_filter) pass that value here and let Lance stop scanning
+     * once it has enough rows. The scan is deterministic in Lance's
+     * internal row-address order (which, for indexed scans, follows
+     * the scalar index's ordering); OpenSearch does not promise a
+     * particular hit order when the query has no sort clause, so
+     * clipping in Lance rather than in Lucene collectors preserves the
+     * visible contract while eliminating the Arrow transfer of hits
+     * the caller will never look at.
+     *
+     * <p>Aggregations, sort, and post_filter all need the full matched
+     * set; the resolver keeps this at {@link #SCAN_LIMIT_UNBOUNDED} for
+     * those shapes.
+     */
+    private final int scanLimit;
+
+    /**
+     * Convenience constructor for callers that do not want to enable
+     * top-k pushdown. Equivalent to
+     * {@code new LanceScanFilterQuery(filterSql, SCAN_LIMIT_UNBOUNDED)}.
+     */
     public LanceScanFilterQuery(String filterSql) {
+        this(filterSql, SCAN_LIMIT_UNBOUNDED);
+    }
+
+    public LanceScanFilterQuery(String filterSql, int scanLimit) {
         this.filterSql = Objects.requireNonNull(filterSql, "filterSql must not be null");
         if (filterSql.isEmpty()) {
             throw new IllegalArgumentException("filterSql must not be empty; use MatchAllDocsQuery for the null-filter case");
         }
+        if (scanLimit < 0) {
+            throw new IllegalArgumentException("scanLimit must not be negative, was " + scanLimit);
+        }
+        this.scanLimit = scanLimit;
     }
 
     public String filterSql() {
         return filterSql;
     }
 
+    public int scanLimit() {
+        return scanLimit;
+    }
+
     @Override
     public String toString(String field) {
-        return "LanceScanFilterQuery{" + filterSql + "}";
+        return "LanceScanFilterQuery{filter=" + filterSql + ", scanLimit=" + scanLimit + "}";
     }
 
     @Override
     public boolean equals(Object o) {
-        return sameClassAs(o) && filterSql.equals(((LanceScanFilterQuery) o).filterSql);
+        return sameClassAs(o)
+            && filterSql.equals(((LanceScanFilterQuery) o).filterSql)
+            && scanLimit == ((LanceScanFilterQuery) o).scanLimit;
     }
 
     @Override
     public int hashCode() {
-        return classHash() ^ filterSql.hashCode();
+        return classHash() ^ filterSql.hashCode() ^ Integer.hashCode(scanLimit);
     }
 
     @Override
@@ -101,11 +143,16 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
                     return null;
                 }
                 int maxDoc = leaf.maxDoc();
+                // Cap the scan at the caller-supplied top-k when they
+                // asked for one (pure scalar filter shape). Fall back
+                // to maxDoc otherwise so aggregations and other
+                // consumers of the full match set keep working.
+                long effectiveLimit = scanLimit == SCAN_LIMIT_UNBOUNDED ? (long) maxDoc : Math.min((long) scanLimit, (long) maxDoc);
                 FixedBitSet matches = new FixedBitSet(maxDoc);
                 ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(leaf.fragmentId()))
                     .filter(filterSql)
                     .withRowAddress(true)
-                    .limit((long) maxDoc)
+                    .limit(effectiveLimit)
                     .build();
                 try (LanceScanner scanner = leaf.dataset().newScan(options); ArrowReader reader = scanner.scanBatches()) {
                     while (reader.loadNextBatch()) {

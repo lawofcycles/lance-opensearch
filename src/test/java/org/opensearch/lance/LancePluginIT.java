@@ -674,6 +674,86 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeAppliesTopKPushdownForScalarFilterHits() throws Exception {
+        // Issue #42 Phase A: pure scalar filter (term / range / bool
+        // built from LanceKnnFilterTranslator-translatable clauses)
+        // with no sort, no aggregation, and no post_filter must
+        // push size into the per-fragment Lance scan as `limit(size)`.
+        // The regression fence covers: hits stay correct up to the
+        // requested size, hits.total.value keeps returning the true
+        // count from Dataset.countRows(sql), and shapes that must
+        // NOT enable the pushdown (sort / agg) keep serving the full
+        // matched set.
+        String suffix = "topk-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        // 20 rows so a size:5 request exercises the top-k clip while
+        // still leaving enough distinct rows for the count assertion.
+        LanceTableFactory.writeTable(scratchDir, tableName, 20);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // Range covers 20 rows; size:5 must clip hits to 5 while
+            // hits.total.value stays at 20. If the clip leaks into
+            // Dataset.countRows the total would drop to 5.
+            String rangeBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"id\":{\"gte\":0,\"lt\":20}}},\"size\":5}")
+            );
+            assertEquals("range size:5 total must be 20", 20, extractIntPath(rangeBody, "hits", "total", "value"));
+            int rangeReturnedHits = countOccurrences(rangeBody, "\"_id\":");
+            assertEquals("range size:5 must return five hits: " + rangeBody, 5, rangeReturnedHits);
+
+            // Term narrowing to a single row must still return that
+            // row even when size:5 is more than the matched count.
+            String termBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"term\":{\"id\":3}},\"size\":5}"));
+            assertEquals("term id=3 total must be 1", 1, extractIntPath(termBody, "hits", "total", "value"));
+            assertTrue("term id=3 must return the id=3 hit: " + termBody, termBody.contains("\"_id\":\"0-3\""));
+
+            // size:0 count-only: hits stays empty, total reflects the
+            // full match (served by Dataset.countRows(sql) directly).
+            String countBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"id\":{\"gte\":0,\"lt\":20}}},\"size\":0}")
+            );
+            assertEquals("range size:0 total must be 20", 20, extractIntPath(countBody, "hits", "total", "value"));
+            int countReturnedHits = countOccurrences(countBody, "\"_id\":");
+            assertEquals("size:0 must return no hits", 0, countReturnedHits);
+
+            // Sort must disable the top-k pushdown: even at size:5 we
+            // need the full matched set to sort by id desc, and the
+            // first hit must be id=19 (max id in the range).
+            String sortBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"range\":{\"id\":{\"gte\":0,\"lt\":20}}},\"size\":5,\"sort\":[{\"id\":\"desc\"}]}"
+                )
+            );
+            assertEquals("sort size:5 total must be 20", 20, extractIntPath(sortBody, "hits", "total", "value"));
+            int sortReturnedHits = countOccurrences(sortBody, "\"_id\":");
+            assertEquals("sort size:5 must return five hits: " + sortBody, 5, sortReturnedHits);
+            assertTrue("sort desc must put id=19 first: " + sortBody, sortBody.contains("\"id\":19"));
+            assertTrue("sort desc must put id=15 last: " + sortBody, sortBody.contains("\"id\":15"));
+
+            // Aggregation must disable the top-k pushdown: sum over
+            // the full range is 0 + 1 + ... + 19 = 190. If the scan
+            // were clipped to 5, the sum would be < 190.
+            String aggBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"range\":{\"id\":{\"gte\":0,\"lt\":20}}},\"size\":5,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
+                )
+            );
+            assertEquals("agg size:5 total must be 20", 20, extractIntPath(aggBody, "hits", "total", "value"));
+            assertEquals("sum(id) over range must be 190", 190.0d, extractDoublePath(aggBody, "aggregations", "s", "value"), 0.0d);
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFragmentDispatchModeAnswersMetricAggregations() throws Exception {
         // Milestone 5-B of the shard-free dispatch prototype: setting
         // lance.dispatch.mode = fragment must let the plugin's own

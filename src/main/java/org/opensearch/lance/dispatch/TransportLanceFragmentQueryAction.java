@@ -371,9 +371,63 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             return request.query().toQuery(qsc);
         }
         if (request.filterSql() != null) {
-            return new LanceScanFilterQuery(request.filterSql());
+            int scanLimit = resolveScanFilterTopK(request);
+            return new LanceScanFilterQuery(request.filterSql(), scanLimit);
         }
         return new MatchAllDocsQuery();
+    }
+
+    /**
+     * Decide whether the pure scalar filter shape can push a
+     * {@code limit(size)} into the per-fragment Lance scan.
+     *
+     * <p>Enabled only when every consumer of the matched set inside
+     * this transport action is content with the top-k (or when there
+     * are no consumers at all):
+     * <ul>
+     *   <li>No sort clause — Lance's row-address ordering matches
+     *       what {@link org.apache.lucene.search.IndexSearcher#search(Query, int)}
+     *       returns for a scalar query.</li>
+     *   <li>No aggregations — aggregators need every matched doc to
+     *       accumulate bucket counts and metric state.</li>
+     *   <li>No post_filter — post_filter narrows below the scan and
+     *       would leave the caller short of the requested rows.</li>
+     * </ul>
+     *
+     * <p>The coordinator already folds the top-level {@code from} into
+     * {@code size} before shipping the request (see
+     * {@link TransportLanceCoordinatorAction#executeCoordinated}'s
+     * {@code perNodeSize = from + size} calculation), so
+     * {@link LanceFragmentQueryRequest#size()} is the per-node top-k
+     * the coordinator is asking for. Using it directly here is safe.
+     *
+     * <p>{@code hits.total.value} is served by
+     * {@link #computeMatched}, which for the scalar-filter shape
+     * dispatches straight to {@link Dataset#countRows(String)} and
+     * therefore is not affected by the scan clip.
+     *
+     * <p>Returns {@link LanceScanFilterQuery#SCAN_LIMIT_UNBOUNDED}
+     * when top-k pushdown is not safe.
+     */
+    private int resolveScanFilterTopK(LanceFragmentQueryRequest request) {
+        if (!request.sorts().isEmpty()) {
+            return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
+        }
+        if (request.aggregations() != null && !request.aggregations().getAggregatorFactories().isEmpty()) {
+            return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
+        }
+        if (request.postFilter() != null) {
+            return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
+        }
+        int size = request.size();
+        if (size <= 0) {
+            // size:0 count-only shape never enters
+            // scanHitsViaIndexSearcher, and computeMatched serves the
+            // total from Dataset.countRows without going through this
+            // scorer, so we can leave the scan unbounded.
+            return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
+        }
+        return size;
     }
 
     /**
