@@ -111,6 +111,16 @@ dependencies {
     }
     implementation "com.fasterxml.jackson.core:jackson-annotations:${jackson_annotations_version}"
 
+    // lance-namespace-apache-client 0.11.1+ uses JavaTimeModule for
+    // ISO-8601 handling on the request/response models (timestamp fields
+    // added in namespace 0.11's REST spec). Not bundled by OpenSearch
+    // core, so ship it here alongside jackson-databind. Exclude the
+    // annotations transitive because we already bring our own.
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:${jackson_databind_version}") {
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-annotations'
+    }
+
     testImplementation "org.opensearch.test:framework:${opensearch_version}"
 
     // Test-fixtures source set carries reusable Lance-writing helpers
