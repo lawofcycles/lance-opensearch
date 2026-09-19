@@ -84,16 +84,23 @@ import org.lance.ipc.ScanOptions;
  * LeafReader over one Lance fragment.
  *
  * Docids are physical row offsets within the fragment, liveDocs reflects the
- * fragment's deletion file (computed from row address gaps), and the numeric
+ * fragment's deletion file (built from a {@code _rowaddr}-only scan, and only
+ * when the fragment metadata says a deletion file exists), and the numeric
  * field is served as DocValues from the Lance column. This is the RFC's
  * "leaf corresponds to a fragment group" contract in its minimal form.
+ *
+ * <p>Construction reads no data pages unless a deletion file is present.
+ * {@code _id} and {@code _source} are fetched per hit through
+ * {@link #prefetchRows} / {@link #materialiseStoredFields}, so the cost of
+ * opening a leaf does not grow with the number of rows in the fragment.
  */
 public final class LanceFragmentLeafReader extends LeafReader {
 
     /**
      * Column kind resolved once during construction from the fragment schema
-     * plus a Lance {@code describeIndices} call for {@code Utf8} columns.
-     * The constructor no longer materialises column data; each column moves
+     * plus the caller-resolved set of Utf8 columns that carry an FTS index
+     * (see {@link #resolveFtsColumns}).
+     * The constructor does not materialise column data; each column moves
      * from "declared in schema" to "loaded" the first time a Lucene accessor
      * asks for it. This is the mitigation for issue #21 (heap footprint).
      */
@@ -144,9 +151,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
     private final String fieldName;
     /**
      * Arrow type family of the declared primary key. Drives {@code _id}
-     * materialisation: {@link org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType#LONG}
-     * reads from {@link #values}, {@link org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType#KEYWORD}
-     * reads from {@link #pkStrings}, and
+     * materialisation in {@link #materialiseStoredFields}:
+     * {@link org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType#LONG}
+     * / {@code UNSIGNED_LONG} render the PK value the row take returned
+     * as a decimal string, {@code KEYWORD} echoes the Utf8 value
+     * verbatim, and
      * {@link org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType#NONE}
      * falls back to a synthesised {@code "<fragment>-<offset>"}. Set to
      * {@code NONE} whenever {@link #fieldName} is empty regardless of what
@@ -155,16 +164,53 @@ public final class LanceFragmentLeafReader extends LeafReader {
     private final org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType;
     private final int maxDoc;
     private final int numDocs;
-    private final long[] values;
     /**
-     * Per-doc string primary key values, populated only when
-     * {@link #pkType} is {@code KEYWORD}. {@code null} entries fall back to
-     * the synthesised {@code "<fragment>-<offset>"} form in
-     * {@link #materialiseStoredFields}; that keeps rows with a null PK
-     * value from collapsing to the same {@code _id} while still returning
-     * a stable, unique identifier per row.
+     * Rows fetched by {@link #prefetchRows} keyed by doc id (physical
+     * row offset within the fragment). Each entry holds the decoded
+     * values of {@link #takeColumns} in that order; {@link #MISSING_ROW}
+     * marks a doc id the take scan did not return (deleted between the
+     * scan that produced the doc id and the fetch, which should not
+     * happen because the reader pins one Dataset version, but is
+     * handled so a miss does not trigger a second scan for the same
+     * doc).
+     *
+     * <p>This replaces the previous constructor-time
+     * {@code _rowaddr + PK} scan of the whole fragment (which populated
+     * a {@code long[maxDoc]} / {@code String[maxDoc]} pair for
+     * {@code _id}) and the whole-column {@code ensureXxxLoaded} path
+     * {@code _source} rendering used to depend on. Fetching only the
+     * hit rows keeps the per-request cost proportional to
+     * {@code size} rather than to the number of rows in the fragment;
+     * see issue #42 (QA r8 section 10.8: the 1-hit floor scaled with
+     * total rows, not fragment count, because of the constructor
+     * scan).
      */
-    private final String[] pkStrings;
+    private final Map<Integer, Object[]> takenRows = new ConcurrentHashMap<>();
+    private static final Object[] MISSING_ROW = new Object[0];
+    /**
+     * Upper bound on how many row addresses one {@code _rowaddr IN
+     * (...)} take scan carries. Lance turns the IN list into a direct
+     * take by address (no filter evaluation), so the cap only bounds
+     * the SQL string the JNI layer has to parse. {@code
+     * index.max_result_window} defaults to 10000, so a normal fetch
+     * needs at most three chunks.
+     */
+    private static final int TAKE_CHUNK = 4096;
+    /**
+     * Column names the row take projects, in {@code _source} emission
+     * order. The first {@link #sourceColumnCount} entries are the
+     * surfaced columns from {@link #columnKind} (schema order); when
+     * the primary key column is not itself surfaced (its Arrow type is
+     * one {@link #classify} declines) it is appended after them so
+     * {@code _id} can still be rendered.
+     */
+    private final List<String> takeColumns;
+    private final int sourceColumnCount;
+    /**
+     * Index of the primary key column inside {@link #takeColumns}, or
+     * {@code -1} when {@link #pkType} is {@code NONE}.
+     */
+    private final int pkTakeIndex;
     /**
      * Sub-field name → base column name lookup for multi-fields. Empty
      * when the attach body did not declare {@code multi_fields}. Every
@@ -279,34 +325,80 @@ public final class LanceFragmentLeafReader extends LeafReader {
     // bridge, which fires the listeners registered by the OpenSearch caches.
     private final DirectoryReader cacheLifetimeBridge;
 
-    public LanceFragmentLeafReader(
-        Dataset dataset,
-        int fragmentId,
-        long physicalRows,
-        String intField,
-        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
-    ) throws IOException {
-        this(dataset, fragmentId, physicalRows, intField, pkType, multiFields, null);
+    /**
+     * Resolve which Utf8 columns of {@code dataset} carry an FTS
+     * (inverted) index. The result feeds every leaf's schema pass so
+     * the {@code describeIndices} round trip happens once per
+     * {@link LanceDirectoryReader} open instead of once per (leaf,
+     * Utf8 column) pair. On a table with 80 fragments and two text
+     * columns that is 160 JNI calls saved per request.
+     *
+     * @return set of column names that have an index supporting FTS;
+     *         never {@code null}, possibly empty
+     */
+    static java.util.Set<String> resolveFtsColumns(Dataset dataset) throws IOException {
+        java.util.Set<String> fts = new java.util.HashSet<>();
+        try {
+            for (org.apache.arrow.vector.types.pojo.Field field : dataset.getSchema().getFields()) {
+                if (!(field.getType() instanceof ArrowType.Utf8)) {
+                    continue;
+                }
+                boolean hasFts = !dataset.describeIndices(
+                    new IndexCriteria.Builder().forColumn(field.getName()).mustSupportFts(true).build()
+                ).isEmpty();
+                if (hasFts) {
+                    fts.add(field.getName());
+                }
+            }
+        } catch (Exception e) {
+            throw new IOException(e);
+        }
+        return fts;
     }
 
     /**
-     * Same as {@link #LanceFragmentLeafReader(Dataset, int, long, String,
-     * org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType,
-     * java.util.Map)}, but attaches a Lance SQL predicate that
-     * every {@link #ensureNumericLoaded} / {@link #ensureBooleanLoaded}
-     * / {@link #ensureTextLoaded} / {@link #ensureKeywordArrayLoaded}
-     * / {@link #ensureBinaryLoaded} call layers into its
-     * {@link ScanOptions#filter} before scanning. See the
-     * {@link #filterSql} field doc for the details.
+     * Open a leaf over one Lance fragment.
+     *
+     * <p>Construction is metadata-only unless the fragment carries a
+     * deletion file. The schema pass classifies columns from
+     * {@code dataset.getSchema()} and the caller-supplied
+     * {@code ftsColumns}; no data pages are read. When
+     * {@code hasDeletionFile} is true a single {@code _rowaddr}-only
+     * scan of this fragment builds {@link #liveDocs} (Lucene needs the
+     * bitmap because {@link org.apache.lucene.search.MatchAllDocsQuery}
+     * and doc value iterators walk {@code 0..maxDoc} without going
+     * through a Lance scan that would skip deleted rows). Fragments
+     * without a deletion file report every physical row as live and
+     * skip the scan entirely. Primary key values are not read here;
+     * {@link #materialiseStoredFields} fetches them per hit through
+     * {@link #prefetchRows}.
+     *
+     * @param dataset         the Lance dataset; the leaf does not take
+     *                        ownership
+     * @param fragmentId      Lance fragment id this leaf exposes
+     * @param physicalRows    {@code FragmentMetadata.getPhysicalRows()},
+     *                        which becomes {@link #maxDoc}
+     * @param hasDeletionFile {@code FragmentMetadata.getDeletionFile() != null}
+     * @param intField        primary key column name, or empty when
+     *                        the table declares no primary key
+     * @param pkType          Arrow type family of the primary key
+     * @param multiFields     attach-body multi-fields spec, nullable
+     * @param ftsColumns      Utf8 columns with an FTS index, from
+     *                        {@link #resolveFtsColumns}
+     * @param filterSql       Lance SQL predicate every per-column scan
+     *                        this leaf issues layers into its
+     *                        {@link ScanOptions#filter}, or {@code null}
+     *                        for unfiltered scans (see {@link #filterSql})
      */
     public LanceFragmentLeafReader(
         Dataset dataset,
         int fragmentId,
         long physicalRows,
+        boolean hasDeletionFile,
         String intField,
         org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
         java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+        java.util.Set<String> ftsColumns,
         String filterSql
     ) throws IOException {
         this.dataset = dataset;
@@ -320,14 +412,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
         // agreeing on "no PK" without needing the caller to zip them.
         this.pkType = intField.isEmpty() ? org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.NONE : pkType;
         this.maxDoc = (int) physicalRows;
-        this.values = new long[maxDoc];
         this.filterSql = filterSql;
-        // pkStrings is a separate per-doc array so LONG PKs do not pay
-        // for a parallel object array they never read from. Allocated
-        // eagerly only for KEYWORD PKs.
-        this.pkStrings = this.pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.KEYWORD
-            ? new String[maxDoc]
-            : null;
         // Flatten the multi-fields spec into "<sub>" → "<base>" lookup so
         // getSortedDocValues("body.raw") can route to the base column's
         // ord data structure without re-parsing the spec. Only keyword
@@ -352,9 +437,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
         this.keywordSubFields = java.util.Collections.unmodifiableMap(subToBase);
         this.basesWithKeywordSub = java.util.Collections.unmodifiableSet(basesWithKeywordSub);
 
-        // Schema pass: classify every column we might surface, resolve FTS
-        // presence for Utf8 columns via one describeIndices call each. This
-        // is metadata only — no data pages are read here.
+        // Schema pass: classify every column we might surface. FTS
+        // presence for Utf8 columns comes from the caller-resolved
+        // ftsColumns set (one describeIndices sweep per reader, see
+        // resolveFtsColumns) rather than a per-leaf JNI call. This is
+        // metadata only — no data pages are read here.
         try {
             for (org.apache.arrow.vector.types.pojo.Field field : dataset.getSchema().getFields()) {
                 ColumnKind kind = classify(field);
@@ -362,10 +449,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     continue;
                 }
                 if (kind == ColumnKind.TEXT_FTS) {
-                    boolean hasFts = !dataset.describeIndices(
-                        new IndexCriteria.Builder().forColumn(field.getName()).mustSupportFts(true).build()
-                    ).isEmpty();
-                    kind = hasFts ? ColumnKind.TEXT_FTS : ColumnKind.TEXT_KEYWORD;
+                    kind = ftsColumns.contains(field.getName()) ? ColumnKind.TEXT_FTS : ColumnKind.TEXT_KEYWORD;
                 }
                 columnKind.put(field.getName(), kind);
                 // Remember the precision of Float32 / Float64 columns
@@ -396,58 +480,57 @@ public final class LanceFragmentLeafReader extends LeafReader {
             columnKind.putIfAbsent(intField, ColumnKind.NUMERIC);
         }
 
-        // Row-address scan: cheap even on large fragments because we only ask
-        // Lance for _rowaddr plus (optionally) the primary key column. This
-        // establishes liveDocs, numDocs, and the values[] / pkStrings[] used
-        // to synthesise _id from the primary key. Every other scalar column
-        // stays on disk until the first accessor touches it.
-        boolean loadNumericPk = (this.pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.LONG
-            || this.pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.UNSIGNED_LONG)
-            && columnKind.get(intField) == ColumnKind.NUMERIC;
-        // KEYWORD PK sits on a Utf8 column that always classifies as
-        // TEXT_FTS or TEXT_KEYWORD by columnKind; either way the row-scan
-        // pulls it as a VarCharVector, so the column classification does
-        // not constrain the load here the way it does for numeric PKs.
-        boolean loadStringPk = this.pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.KEYWORD;
-        boolean loadPk = loadNumericPk || loadStringPk;
-        List<String> pkScanColumns = loadPk ? Collections.singletonList(intField) : Collections.emptyList();
-        FixedBitSet live = new FixedBitSet(maxDoc);
-        int liveCount = 0;
-        ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
-            .columns(pkScanColumns)
-            .withRowAddress(true)
-            .build();
-        try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
-            while (reader.loadNextBatch()) {
-                VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                FieldVector pkVector = loadPk ? root.getVector(intField) : null;
-                for (int i = 0; i < root.getRowCount(); i++) {
-                    int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
-                    live.set(offset);
-                    liveCount++;
-                    if (pkVector == null || pkVector.isNull(i)) {
-                        continue;
-                    }
-                    if (loadNumericPk) {
-                        values[offset] = readAsLong(pkVector, i);
-                    } else {
-                        // Utf8 columns come back as VarCharVector regardless
-                        // of whether describeIndices reported an FTS index.
-                        // Passing raw bytes through Java's default charset
-                        // (UTF-8) reproduces the operator's original string
-                        // for _id and matches the encoding the SQL filter
-                        // in LanceReadOnlyEngine.get uses.
-                        org.apache.arrow.vector.VarCharVector vc = (org.apache.arrow.vector.VarCharVector) pkVector;
-                        pkStrings[offset] = new String(vc.get(i), java.nio.charset.StandardCharsets.UTF_8);
+        // Projection for the per-hit row take (see prefetchRows): every
+        // surfaced column in schema order so _source keys come out in a
+        // stable order, plus the PK column appended when its Arrow type
+        // is one classify() declines (the take still needs it for _id).
+        List<String> take = new java.util.ArrayList<>(columnKind.keySet());
+        this.sourceColumnCount = take.size();
+        int pkIndex = -1;
+        if (this.pkType != org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.NONE) {
+            pkIndex = take.indexOf(intField);
+            if (pkIndex < 0) {
+                take.add(intField);
+                pkIndex = take.size() - 1;
+            }
+        }
+        this.pkTakeIndex = pkIndex;
+        this.takeColumns = Collections.unmodifiableList(take);
+
+        // liveDocs: Lucene's MatchAllDocsQuery and the doc value
+        // iterators walk 0..maxDoc directly, so deleted physical rows
+        // must be masked here. Fragments without a deletion file have
+        // no deleted rows and skip the scan; fragments with one run a
+        // _rowaddr-only scan (8 bytes per row, no payload columns) to
+        // learn which offsets survive. Lance-driven scans (FTS, knn,
+        // scalar filter) already skip deleted rows on their own, so
+        // this bitmap only has to cover the Lucene-driven iteration.
+        if (hasDeletionFile) {
+            FixedBitSet live = new FixedBitSet(maxDoc);
+            int liveCount = 0;
+            ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
+                .columns(Collections.emptyList())
+                .withRowAddress(true)
+                .build();
+            try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+                while (reader.loadNextBatch()) {
+                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                    for (int i = 0; i < root.getRowCount(); i++) {
+                        int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
+                        live.set(offset);
+                        liveCount++;
                     }
                 }
+            } catch (Exception e) {
+                throw new IOException(e);
             }
-        } catch (Exception e) {
-            throw new IOException(e);
+            this.numDocs = liveCount;
+            this.liveDocs = liveCount == maxDoc ? null : live;
+        } else {
+            this.numDocs = maxDoc;
+            this.liveDocs = null;
         }
-        this.numDocs = liveCount;
-        this.liveDocs = liveCount == maxDoc ? null : live;
 
         // FieldInfos derived from columnKind. Order matches the schema pass
         // above; field numbers start at 10 to leave 1 / 2 free for _id and
@@ -1306,14 +1389,181 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     /**
+     * Fetch the rows behind {@code docIds} from Lance in one take scan
+     * per {@link #TAKE_CHUNK} doc ids and stash them in
+     * {@link #takenRows} for {@link #materialiseStoredFields}.
+     *
+     * <p>The scan filters on {@code _rowaddr IN (...)}. Lance recognises
+     * that predicate shape as a take-by-address (see
+     * {@code TakeOperation::try_from_expr} in
+     * {@code rust/lance/src/dataset/scanner.rs}) and reads exactly the
+     * requested rows without evaluating a filter or walking the
+     * fragment, so a {@code size:10} fetch touches 10 rows of the
+     * projected columns regardless of how many rows the fragment
+     * holds. Row addresses are {@code (fragmentId << 32) | docId},
+     * which is the same encoding the FTS / knn / scalar-filter scans
+     * decode doc ids from, and unlike {@code Dataset.takeRows} it does
+     * not depend on whether the table uses stable row ids.
+     *
+     * <p>Doc ids already present in {@link #takenRows} are skipped so a
+     * caller can prefetch a whole page and then let the per-doc
+     * {@code document(...)} calls hit the cache. Doc ids the scan does
+     * not return are recorded as {@link #MISSING_ROW} so the fallback
+     * single-doc prefetch inside {@link #materialiseStoredFields} does
+     * not issue a second scan for them.
+     *
+     * <p>{@link #filterSql} is deliberately not layered in: the doc ids
+     * were produced by a scan that already applied it (or by Lucene
+     * iteration the caller chose), so re-applying it could only drop
+     * rows the caller has decided to return.
+     */
+    public void prefetchRows(int[] docIds) throws IOException {
+        List<Long> addresses = new java.util.ArrayList<>(docIds.length);
+        java.util.Set<Integer> requested = new java.util.HashSet<>();
+        for (int docId : docIds) {
+            if (takenRows.containsKey(docId) || !requested.add(docId)) {
+                continue;
+            }
+            addresses.add(((long) fragmentId << 32) | (docId & 0xFFFFFFFFL));
+        }
+        if (addresses.isEmpty()) {
+            return;
+        }
+        if (takeColumns.isEmpty()) {
+            // Nothing to project (PK-less table whose columns are all
+            // unsurfaced): every row renders as a synthesised _id and
+            // an empty _source, so there is no reason to call into
+            // Lance.
+            for (int docId : requested) {
+                takenRows.putIfAbsent(docId, new Object[0]);
+            }
+            return;
+        }
+        for (int from = 0; from < addresses.size(); from += TAKE_CHUNK) {
+            List<Long> chunk = addresses.subList(from, Math.min(from + TAKE_CHUNK, addresses.size()));
+            StringBuilder sql = new StringBuilder(chunk.size() * 12 + 16).append("_rowaddr IN (");
+            for (int i = 0; i < chunk.size(); i++) {
+                if (i > 0) {
+                    sql.append(',');
+                }
+                sql.append(chunk.get(i).longValue());
+            }
+            sql.append(')');
+            ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
+                .columns(takeColumns)
+                .filter(sql.toString())
+                .withRowAddress(true)
+                .build();
+            try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+                while (reader.loadNextBatch()) {
+                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                    FieldVector[] vectors = new FieldVector[takeColumns.size()];
+                    for (int c = 0; c < vectors.length; c++) {
+                        vectors[c] = root.getVector(takeColumns.get(c));
+                    }
+                    for (int i = 0; i < root.getRowCount(); i++) {
+                        int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
+                        Object[] row = new Object[vectors.length];
+                        for (int c = 0; c < vectors.length; c++) {
+                            row[c] = decodeTakeValue(takeColumns.get(c), vectors[c], i);
+                        }
+                        takenRows.put(offset, row);
+                    }
+                }
+            } catch (IOException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new IOException(e);
+            }
+        }
+        for (int docId : requested) {
+            takenRows.putIfAbsent(docId, MISSING_ROW);
+        }
+    }
+
+    /**
+     * Decode one cell of a take-scan batch into the representation
+     * {@link #materialiseStoredFields} renders from. Numeric columns
+     * go through {@link #readAsLong} so the value carries the same
+     * encoding as the doc value path (sortable-int / sortable-long for
+     * floats, epoch millis for dates and timestamps, raw bit pattern
+     * for UInt64); booleans become {@link Boolean}; Utf8 becomes
+     * {@link String}; List&lt;Utf8&gt; becomes {@code String[]}; Binary
+     * / LargeBinary become {@code byte[]}. A column that is not in
+     * {@link #columnKind} (only the appended PK can be) is decoded by
+     * vector type: Utf8 as a string, anything {@link #readAsLong}
+     * understands as a long, otherwise {@code null}. Arrow nulls
+     * return {@code null}.
+     */
+    private Object decodeTakeValue(String name, FieldVector vector, int i) {
+        if (vector == null || vector.isNull(i)) {
+            return null;
+        }
+        ColumnKind kind = columnKind.get(name);
+        if (kind == null) {
+            if (vector instanceof VarCharVector vc) {
+                return new String(vc.get(i), java.nio.charset.StandardCharsets.UTF_8);
+            }
+            try {
+                return readAsLong(vector, i);
+            } catch (IllegalStateException unsupported) {
+                return null;
+            }
+        }
+        return switch (kind) {
+            case NUMERIC -> readAsLong(vector, i);
+            case BOOLEAN -> ((BitVector) vector).get(i) == 1;
+            case TEXT_FTS, TEXT_KEYWORD -> new String(((VarCharVector) vector).get(i), java.nio.charset.StandardCharsets.UTF_8);
+            case KEYWORD_ARRAY -> {
+                ListVector list = (ListVector) vector;
+                VarCharVector elements = (VarCharVector) list.getDataVector();
+                int start = list.getElementStartIndex(i);
+                int end = list.getElementEndIndex(i);
+                String[] arr = new String[end - start];
+                for (int e = start; e < end; e++) {
+                    arr[e - start] = elements.isNull(e) ? null : new String(elements.get(e), java.nio.charset.StandardCharsets.UTF_8);
+                }
+                yield arr;
+            }
+            case BINARY -> {
+                if (vector instanceof VarBinaryVector vb) {
+                    yield vb.get(i);
+                }
+                if (vector instanceof LargeVarBinaryVector lb) {
+                    yield lb.get(i);
+                }
+                yield null;
+            }
+        };
+    }
+
+    /**
      * Materialise stored fields for a single doc. Extracted from the {@code
      * storedFields()} anonymous class so the sequential wrapper (see
      * {@link LanceSequentialLeafReader}) can call the same routine when
      * {@code FetchPhase} switches to the sequential stored-fields path.
+     *
+     * <p>Reads from the row {@link #prefetchRows} fetched for
+     * {@code docID}. Callers that know the whole page up front
+     * (the fragment dispatch handler) prefetch every hit in one scan
+     * per leaf; a doc that was not prefetched triggers a single-row
+     * take here so the method stays correct for any caller.
      */
     void materialiseStoredFields(int docID, StoredFieldVisitor visitor) throws IOException {
         FieldInfo idInfo = storedOnly("_id", 1);
-        if (visitor.needsField(idInfo) == StoredFieldVisitor.Status.YES) {
+        FieldInfo sourceInfo = storedOnly("_source", 2);
+        boolean needsId = visitor.needsField(idInfo) == StoredFieldVisitor.Status.YES;
+        boolean needsSource = visitor.needsField(sourceInfo) == StoredFieldVisitor.Status.YES;
+        if (!needsId && !needsSource) {
+            return;
+        }
+        Object[] row = takenRows.get(docID);
+        if (row == null) {
+            prefetchRows(new int[] { docID });
+            row = takenRows.getOrDefault(docID, MISSING_ROW);
+        }
+        if (needsId) {
             // Materialise _id from whichever column the declared primary key
             // lives on, or synthesise "<fragment>-<offset>" when no PK is
             // declared. Without this fallback every row on a PK-less table
@@ -1322,39 +1572,26 @@ public final class LanceFragmentLeafReader extends LeafReader {
             // tables (see LanceReadOnlyEngine.get); the fallback is strictly
             // for _search response fidelity.
             //
-            // KEYWORD PKs read from pkStrings, which the constructor
-            // populated from the Utf8 column. A null slot (nullable column,
-            // Arrow null in that row) also falls through to the synthesised
-            // form so the row still gets a unique id rather than repeating
-            // an empty string.
-            String idString;
-            switch (pkType) {
-                case KEYWORD:
-                    String stringPk = pkStrings != null ? pkStrings[docID] : null;
-                    idString = stringPk != null ? stringPk : (fragmentId + "-" + docID);
-                    break;
-                case LONG:
-                    idString = Long.toString(values[docID]);
-                    break;
-                case UNSIGNED_LONG:
-                    // values[] carries the unsigned bit pattern (see
-                    // constructor row-scan + readAsLong on UInt8Vector).
-                    // Long.toUnsignedString decodes it back into the
-                    // 0..2^64-1 range the operator wrote.
-                    idString = Long.toUnsignedString(values[docID]);
-                    break;
-                case NONE:
-                default:
-                    idString = fragmentId + "-" + docID;
-                    break;
-            }
+            // A null PK value (nullable column, Arrow null in that row) or
+            // a row the take did not return also fall through to the
+            // synthesised form so the row still gets a unique id rather
+            // than repeating an empty string.
+            Object pk = pkTakeIndex >= 0 && pkTakeIndex < row.length ? row[pkTakeIndex] : null;
+            String idString = switch (pkType) {
+                case KEYWORD -> pk instanceof String s ? s : fragmentId + "-" + docID;
+                case LONG -> pk instanceof Long l ? Long.toString(l) : fragmentId + "-" + docID;
+                // readAsLong returns the unsigned bit pattern for
+                // UInt8Vector; Long.toUnsignedString decodes it back into
+                // the 0..2^64-1 range the operator wrote.
+                case UNSIGNED_LONG -> pk instanceof Long l ? Long.toUnsignedString(l) : fragmentId + "-" + docID;
+                default -> fragmentId + "-" + docID;
+            };
             org.apache.lucene.util.BytesRef encoded = org.opensearch.index.mapper.Uid.encodeId(idString);
             byte[] bytes = new byte[encoded.length];
             System.arraycopy(encoded.bytes, encoded.offset, bytes, 0, encoded.length);
             visitor.binaryField(idInfo, bytes);
         }
-        FieldInfo sourceInfo = storedOnly("_source", 2);
-        if (visitor.needsField(sourceInfo) == StoredFieldVisitor.Status.YES) {
+        if (needsSource) {
             // Build _source through XContentBuilder so string values get the
             // JSON escaping RFC 8259 requires (control characters U+0000
             // through U+001F, quotes, backslashes). Hand-rolled string
@@ -1364,75 +1601,49 @@ public final class LanceFragmentLeafReader extends LeafReader {
             // Dashboards) rejected it.
             //
             // Column iteration follows the schema pass order captured in
-            // columnKind, so _source keys land in the same order regardless
-            // of which column an earlier accessor happened to load first.
-            // ensureXxxLoaded is called per column so _source materialisation
-            // is the point where every scalar column of a fragment ends up
-            // in heap; queries that never render _source (aggregations, size=0
-            // hit counts) pay for only the columns their query touched.
+            // takeColumns (the leading sourceColumnCount entries mirror
+            // columnKind), so _source keys land in the same order every
+            // time. Values come from the per-hit take; no whole-column
+            // load happens here.
             try (org.opensearch.core.xcontent.XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
                 builder.startObject();
-                for (Map.Entry<String, ColumnKind> entry : columnKind.entrySet()) {
-                    String name = entry.getKey();
-                    switch (entry.getValue()) {
+                int limit = Math.min(sourceColumnCount, row.length);
+                for (int c = 0; c < limit; c++) {
+                    Object value = row[c];
+                    if (value == null) {
+                        continue;
+                    }
+                    String name = takeColumns.get(c);
+                    switch (columnKind.get(name)) {
                         case NUMERIC -> {
-                            ensureNumericLoaded(name);
-                            if (numericPresence.get(name).get(docID)) {
-                                long numericValue = numericColumns.get(name)[docID];
-                                NumericPrecision precision = numericPrecision.getOrDefault(name, NumericPrecision.INTEGER);
-                                switch (precision) {
-                                    case FLOAT -> builder.field(
-                                        name,
-                                        org.apache.lucene.util.NumericUtils.sortableIntToFloat((int) numericValue)
-                                    );
-                                    case DOUBLE -> builder.field(
-                                        name,
-                                        org.apache.lucene.util.NumericUtils.sortableLongToDouble(numericValue)
-                                    );
-                                    case INTEGER -> {
-                                        if (pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.UNSIGNED_LONG
-                                            && name.equals(fieldName)) {
-                                            // UInt64 PK column: emit as an unsigned
-                                            // decimal so the JSON number matches
-                                            // what the operator wrote. Other
-                                            // UInt64 columns are not surfaced by
-                                            // classify(), so this branch fires
-                                            // only for the PK.
-                                            builder.field(name, new java.math.BigInteger(Long.toUnsignedString(numericValue)));
-                                        } else {
-                                            builder.field(name, numericValue);
-                                        }
+                            long numericValue = (Long) value;
+                            NumericPrecision precision = numericPrecision.getOrDefault(name, NumericPrecision.INTEGER);
+                            switch (precision) {
+                                case FLOAT -> builder.field(
+                                    name,
+                                    org.apache.lucene.util.NumericUtils.sortableIntToFloat((int) numericValue)
+                                );
+                                case DOUBLE -> builder.field(name, org.apache.lucene.util.NumericUtils.sortableLongToDouble(numericValue));
+                                case INTEGER -> {
+                                    if (pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.UNSIGNED_LONG
+                                        && name.equals(fieldName)) {
+                                        // UInt64 PK column: emit as an unsigned
+                                        // decimal so the JSON number matches
+                                        // what the operator wrote. Other
+                                        // UInt64 columns are not surfaced by
+                                        // classify(), so this branch fires
+                                        // only for the PK.
+                                        builder.field(name, new java.math.BigInteger(Long.toUnsignedString(numericValue)));
+                                    } else {
+                                        builder.field(name, numericValue);
                                     }
                                 }
                             }
                         }
-                        case BOOLEAN -> {
-                            ensureBooleanLoaded(name);
-                            if (booleanPresence.get(name).get(docID)) {
-                                builder.field(name, booleanColumns.get(name)[docID] == 1);
-                            }
-                        }
-                        case TEXT_FTS, TEXT_KEYWORD -> {
-                            ensureTextLoaded(name);
-                            String value = textColumns.get(name)[docID];
-                            if (value != null) {
-                                builder.field(name, value);
-                            }
-                        }
-                        case KEYWORD_ARRAY -> {
-                            ensureKeywordArrayLoaded(name);
-                            String[] arr = keywordArrayValues.get(name)[docID];
-                            if (arr != null) {
-                                builder.field(name, arr);
-                            }
-                        }
-                        case BINARY -> {
-                            ensureBinaryLoaded(name);
-                            byte[] bytes = binaryColumns.get(name)[docID];
-                            if (bytes != null) {
-                                builder.field(name, java.util.Base64.getEncoder().encodeToString(bytes));
-                            }
-                        }
+                        case BOOLEAN -> builder.field(name, (Boolean) value);
+                        case TEXT_FTS, TEXT_KEYWORD -> builder.field(name, (String) value);
+                        case KEYWORD_ARRAY -> builder.field(name, (String[]) value);
+                        case BINARY -> builder.field(name, java.util.Base64.getEncoder().encodeToString((byte[]) value));
                     }
                 }
                 builder.endObject();

@@ -2521,6 +2521,101 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testDeletedRowsStayOutOfHitsTotalsAndSource() throws Exception {
+        // The leaf reader used to learn which physical rows are live by
+        // scanning `_rowaddr` (plus the primary key) for every fragment
+        // at open time. That scan was also what fed `_id`. Both now
+        // come from different places: liveDocs from the fragment's
+        // deletion file (a `_rowaddr`-only scan runs only when the
+        // fragment metadata reports one), `_id` and `_source` from a
+        // per-hit `_rowaddr IN (...)` take. This test creates a table
+        // with a deletion file and checks that the two paths agree
+        // with each other and with Lance: deleted rows are not counted,
+        // not returned, and the survivors' `_id` / `_source` still
+        // round-trip the primary key.
+        String suffix = "deleted-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeStringPkTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        // Delete two rows out of six. The fragment keeps six physical
+        // rows (maxDoc stays 6) and gains a deletion file, so docids 1
+        // and 4 become liveDocs holes.
+        LanceTableFactory.deleteRows(tableUri, "key IN ('alpha-1', 'alpha-4')");
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // _count goes through the engine's reader; hits.total goes
+            // through the fragment path's Lance-side count. Both must
+            // exclude the two deleted rows.
+            String countBody = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count")));
+            assertEquals("_count body=" + countBody, 4, extractIntPath(countBody, "count"));
+
+            // match_all with size covering the whole table: Lucene
+            // iterates 0..maxDoc here (no Lance scan produces the doc
+            // ids), so this is the shape that depends on liveDocs
+            // being built from the deletion file.
+            String searchBody = readAll(postJson("/" + indexName + "/_search", "{\"size\":10,\"sort\":[{\"key\":\"asc\"}]}"));
+            assertEquals("hits.total body=" + searchBody, 4, extractIntPath(searchBody, "hits", "total", "value"));
+            java.util.List<String> ids = new java.util.ArrayList<>();
+            java.util.List<String> labels = new java.util.ArrayList<>();
+            try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, searchBody)) {
+                java.util.Map<String, Object> map = parser.map();
+                @SuppressWarnings("unchecked")
+                java.util.List<Object> hits = (java.util.List<Object>) ((java.util.Map<String, Object>) map.get("hits")).get("hits");
+                for (Object hitObj : hits) {
+                    @SuppressWarnings("unchecked")
+                    java.util.Map<String, Object> hit = (java.util.Map<String, Object>) hitObj;
+                    ids.add((String) hit.get("_id"));
+                    @SuppressWarnings("unchecked")
+                    java.util.Map<String, Object> source = (java.util.Map<String, Object>) hit.get("_source");
+                    labels.add((String) source.get("label"));
+                }
+            }
+            // _id comes from the per-hit take of the PK column; the
+            // deleted keys must not appear and the survivors must be
+            // the operator's original strings, not synthesised ids.
+            assertEquals(
+                "expected the four surviving keys in sort order, saw " + ids + " (body=" + searchBody + ")",
+                java.util.List.of("alpha-0", "alpha-2", "alpha-3", "alpha-5"),
+                ids
+            );
+            // _source comes from the same take; labels are "row-N" for
+            // even N and "col-N" for odd N in the fixture.
+            assertEquals(
+                "expected surviving labels aligned with ids, saw " + labels,
+                java.util.List.of("row-0", "row-2", "col-3", "col-5"),
+                labels
+            );
+
+            // A term query on a deleted key resolves through the Lance
+            // scalar filter, which skips deleted rows on its own; the
+            // count path must agree (0), not report the pre-deletion
+            // presence.
+            String deletedTerm = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"term\":{\"key\":\"alpha-1\"}}}")
+            );
+            assertEquals("deleted key must not match, body=" + deletedTerm, 0, extractIntPath(deletedTerm, "hits", "total", "value"));
+
+            // GET by primary key: the engine path (SQL filter on the PK)
+            // must also honour the deletion.
+            ResponseException notFound = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-4"))
+            );
+            assertEquals("expected 404 for deleted key", 404, notFound.getResponse().getStatusLine().getStatusCode());
+            String getBody = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-5")));
+            assertTrue("expected found:true for surviving key, saw " + getBody, getBody.contains("\"found\":true"));
+            assertTrue("expected label:col-5, saw " + getBody, getBody.contains("\"label\":\"col-5\""));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testAttachRecreateAtSamePathServesNewContent() throws Exception {
         // Issue #46: recreating a Lance table at the same filesystem
         // path left stale index-page entries in the shared Lance

@@ -329,6 +329,23 @@ final class LanceTableFactory {
     }
 
     /**
+     * Delete rows from an existing Lance table by SQL predicate.
+     * Simulates {@code dataset.delete("...")} from Python / Rust; the
+     * fragment gains a deletion file and its physical row count stays
+     * unchanged, which is the shape the leaf reader's liveDocs path
+     * has to mask. Used by integration tests that assert deleted rows
+     * stay out of hits, totals, and fetched {@code _source}.
+     */
+    static void deleteRows(String tableUri, String predicate) throws Exception {
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
+        ) {
+            dataset.delete(predicate);
+        }
+    }
+
+    /**
      * Writes a Lance table with a Utf8 column that has no FTS index, so
      * {@code RestAttachAction.derive} maps the column to
      * {@code keyword} rather than {@code lance_text}. The leaf reader

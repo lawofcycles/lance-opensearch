@@ -42,6 +42,7 @@ import org.opensearch.index.shard.IndexShard;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.engine.LanceDirectoryReader;
+import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.search.SearchHit;
@@ -626,6 +627,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         } else {
             topDocs = searcher.search(query, size, sortAndFormats.sort, trackScores);
         }
+        prefetchHitRows(searcher.getIndexReader(), topDocs.scoreDocs);
         List<SearchHit> out = new ArrayList<>(topDocs.scoreDocs.length);
         for (int i = 0; i < topDocs.scoreDocs.length; i++) {
             ScoreDoc scoreDoc = topDocs.scoreDocs[i];
@@ -642,6 +644,44 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             out.add(hit);
         }
         return out;
+    }
+
+    /**
+     * Group the page's doc ids by leaf and hand each Lance-backed leaf
+     * its slice so the rows behind the hits are fetched in one Lance
+     * take per leaf before the per-doc {@code document(...)} loop
+     * runs. Without this, {@link LanceFragmentLeafReader#materialiseStoredFields}
+     * would fall back to a single-row take per hit ({@code size} JNI
+     * round trips instead of one per leaf touched).
+     *
+     * <p>Leaves that do not unwrap to a {@link LanceFragmentLeafReader}
+     * (which should not happen on this path; every leaf the fragment
+     * dispatch reader exposes is Lance-backed) are skipped and fall
+     * back to the per-doc path.
+     */
+    private static void prefetchHitRows(org.apache.lucene.index.IndexReader reader, ScoreDoc[] scoreDocs) throws IOException {
+        if (scoreDocs.length == 0) {
+            return;
+        }
+        List<org.apache.lucene.index.LeafReaderContext> leaves = reader.leaves();
+        java.util.Map<Integer, List<Integer>> docsByLeaf = new java.util.TreeMap<>();
+        for (ScoreDoc scoreDoc : scoreDocs) {
+            int leafIndex = org.apache.lucene.index.ReaderUtil.subIndex(scoreDoc.doc, leaves);
+            int localDoc = scoreDoc.doc - leaves.get(leafIndex).docBase;
+            docsByLeaf.computeIfAbsent(leafIndex, k -> new ArrayList<>()).add(localDoc);
+        }
+        for (java.util.Map.Entry<Integer, List<Integer>> entry : docsByLeaf.entrySet()) {
+            LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(leaves.get(entry.getKey()).reader());
+            if (lance == null) {
+                continue;
+            }
+            List<Integer> docs = entry.getValue();
+            int[] docIds = new int[docs.size()];
+            for (int i = 0; i < docIds.length; i++) {
+                docIds[i] = docs.get(i);
+            }
+            lance.prefetchRows(docIds);
+        }
     }
 
     /**
@@ -1049,12 +1089,4 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         }
         return total;
     }
-
-    /**
-     * Suppress unused-import warnings from javadoc {@link ...}
-     * references. Kept private to avoid altering the class's public
-     * surface.
-     */
-    @SuppressWarnings("unused")
-    private static void javadocReferences(org.opensearch.lance.engine.LanceFragmentLeafReader unused1) {}
 }

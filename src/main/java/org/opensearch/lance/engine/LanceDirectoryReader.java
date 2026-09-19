@@ -78,14 +78,21 @@ public final class LanceDirectoryReader extends DirectoryReader {
     ) throws IOException {
         List<LeafReader> leaves = new ArrayList<>();
         List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>();
+        // One describeIndices sweep for the whole reader; every leaf's
+        // schema pass reads the resulting set instead of calling into
+        // Lance per (leaf, Utf8 column).
+        java.util.Set<String> ftsColumns = LanceFragmentLeafReader.resolveFtsColumns(dataset);
         for (Fragment fragment : dataset.getFragments()) {
             LanceFragmentLeafReader raw = new LanceFragmentLeafReader(
                 dataset,
                 fragment.getId(),
                 fragment.metadata().getPhysicalRows(),
+                fragment.metadata().getDeletionFile() != null,
                 intField,
                 pkType,
-                multiFields
+                multiFields,
+                ftsColumns,
+                null
             );
             rawLeaves.add(raw);
             leaves.add(LanceSequentialLeafReader.wrap(raw));
@@ -172,6 +179,10 @@ public final class LanceDirectoryReader extends DirectoryReader {
         java.util.Set<Integer> wanted = new java.util.HashSet<>(fragmentIds);
         List<LeafReader> leaves = new ArrayList<>(wanted.size());
         List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>(wanted.size());
+        // One describeIndices sweep for the whole reader; every leaf's
+        // schema pass reads the resulting set instead of calling into
+        // Lance per (leaf, Utf8 column).
+        java.util.Set<String> ftsColumns = LanceFragmentLeafReader.resolveFtsColumns(dataset);
         for (Fragment fragment : dataset.getFragments()) {
             if (!wanted.contains(fragment.getId())) {
                 continue;
@@ -180,9 +191,11 @@ public final class LanceDirectoryReader extends DirectoryReader {
                 dataset,
                 fragment.getId(),
                 fragment.metadata().getPhysicalRows(),
+                fragment.metadata().getDeletionFile() != null,
                 intField,
                 pkType,
                 multiFields,
+                ftsColumns,
                 filterSql
             );
             rawLeaves.add(raw);

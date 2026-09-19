@@ -71,8 +71,8 @@ OpenSearch's stock `match` and `match_phrase` queries against a `lance_text` fie
 
 ## Reader memory profile
 
-- Each Lance fragment leaf loads columns lazily. The reader constructor only performs a schema pass and a row-address scan (metadata plus the PK column, if declared); every other scalar column moves from "declared" to "loaded" the first time a Lucene accessor asks for it, then stays in heap for the fragment's lifetime.
-- Queries that never render `_source` (aggregations, `size=0` hit counts, sort-only searches) only heap-allocate the columns they consult. Queries that render `_source` still load every scalar column on the first hit.
+- Each Lance fragment leaf loads columns lazily. The reader constructor only performs a schema pass; a fragment that carries a deletion file additionally runs a `_rowaddr`-only scan to learn which physical rows are live. Every scalar column moves from "declared" to "loaded" the first time a Lucene accessor (doc values, sort, aggregation) asks for it, then stays in heap for the fragment's lifetime.
+- `_id` and `_source` are not served from those whole-column loads. The fragment path fetches the rows behind the hits with a `_rowaddr IN (...)` take per leaf, so a `size:10` fetch reads ten rows of the projected columns regardless of table size. Queries that never render hits (aggregations, `size=0` hit counts) only heap-allocate the columns they consult.
 
 ## Version pinning
 
