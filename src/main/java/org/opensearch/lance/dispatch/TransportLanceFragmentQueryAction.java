@@ -913,7 +913,23 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         // Filter + fragment subset: scan and count. Cheap for
         // typical query workloads because the filter narrows the
         // row set before the scan even starts.
-        org.lance.ipc.ScanOptions options = new org.lance.ipc.ScanOptions.Builder().filter(filterSql).fragmentIds(fragmentIds).build();
+        //
+        // Ask Lance for zero payload columns and no row address /
+        // row id: the batches only need to carry a row count that
+        // the loop below accumulates via getRowCount(). Without
+        // columns(emptyList()) Lance materialises every column of
+        // every matching row (including large text / vector fields
+        // for size:0 requests), which QA measured at 5.2 s for a
+        // scalar term filter on a 20M-row table where the actual
+        // count is trivial (issue #42 QA r8 recommendation 5,
+        // immediate step). This mirrors what countFtsHitsDirectly
+        // does for the FTS shape.
+        org.lance.ipc.ScanOptions options = new org.lance.ipc.ScanOptions.Builder().filter(filterSql)
+            .fragmentIds(fragmentIds)
+            .columns(Collections.emptyList())
+            .withRowAddress(false)
+            .withRowId(false)
+            .build();
         long total = 0L;
         try (
             org.lance.ipc.LanceScanner scanner = dataset.newScan(options);
