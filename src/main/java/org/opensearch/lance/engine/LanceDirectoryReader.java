@@ -77,19 +77,26 @@ public final class LanceDirectoryReader extends DirectoryReader {
         java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
     ) throws IOException {
         List<LeafReader> leaves = new ArrayList<>();
+        List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>();
         for (Fragment fragment : dataset.getFragments()) {
-            leaves.add(
-                LanceSequentialLeafReader.wrap(
-                    new LanceFragmentLeafReader(
-                        dataset,
-                        fragment.getId(),
-                        fragment.metadata().getPhysicalRows(),
-                        intField,
-                        pkType,
-                        multiFields
-                    )
-                )
+            LanceFragmentLeafReader raw = new LanceFragmentLeafReader(
+                dataset,
+                fragment.getId(),
+                fragment.metadata().getPhysicalRows(),
+                intField,
+                pkType,
+                multiFields
             );
+            rawLeaves.add(raw);
+            leaves.add(LanceSequentialLeafReader.wrap(raw));
+        }
+        // Install the shard-level column materialisation coordinator
+        // so every leaf's ensureXxxLoaded delegates through one
+        // dataset.newScan per column. See LanceShardColumnCache
+        // javadoc for the rationale.
+        LanceShardColumnCache cache = new LanceShardColumnCache(dataset, null, rawLeaves);
+        for (LanceFragmentLeafReader raw : rawLeaves) {
+            raw.setShardColumnCache(cache);
         }
         return openWithLeaves(directory, commit, dataset, leaves);
     }
@@ -164,23 +171,29 @@ public final class LanceDirectoryReader extends DirectoryReader {
     ) throws IOException {
         java.util.Set<Integer> wanted = new java.util.HashSet<>(fragmentIds);
         List<LeafReader> leaves = new ArrayList<>(wanted.size());
+        List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>(wanted.size());
         for (Fragment fragment : dataset.getFragments()) {
             if (!wanted.contains(fragment.getId())) {
                 continue;
             }
-            leaves.add(
-                LanceSequentialLeafReader.wrap(
-                    new LanceFragmentLeafReader(
-                        dataset,
-                        fragment.getId(),
-                        fragment.metadata().getPhysicalRows(),
-                        intField,
-                        pkType,
-                        multiFields,
-                        filterSql
-                    )
-                )
+            LanceFragmentLeafReader raw = new LanceFragmentLeafReader(
+                dataset,
+                fragment.getId(),
+                fragment.metadata().getPhysicalRows(),
+                intField,
+                pkType,
+                multiFields,
+                filterSql
             );
+            rawLeaves.add(raw);
+            leaves.add(LanceSequentialLeafReader.wrap(raw));
+        }
+        // Wire the shard-level column cache with the same filterSql
+        // the leaves themselves layer in singleColumnScan. See
+        // LanceShardColumnCache javadoc for the rationale.
+        LanceShardColumnCache cache = new LanceShardColumnCache(dataset, filterSql, rawLeaves);
+        for (LanceFragmentLeafReader raw : rawLeaves) {
+            raw.setShardColumnCache(cache);
         }
         return openWithLeaves(directory, commit, dataset, leaves);
     }

@@ -254,6 +254,21 @@ public final class LanceFragmentLeafReader extends LeafReader {
     // are held per-doc for _source synthesis (base64-encoded on output);
     // neither indexed nor loaded into doc values.
     private final Map<String, byte[][]> binaryColumns = new ConcurrentHashMap<>();
+
+    /**
+     * Shard-level column materialisation coordinator. Non-null when the
+     * containing {@link LanceDirectoryReader} was created with a
+     * {@link LanceShardColumnCache} (the fragment-dispatch and
+     * whole-table open paths both install one). When set,
+     * {@link #ensureNumericLoaded} delegates the actual scan work to
+     * the cache so the newScan overhead is paid once per column
+     * across the reader instead of once per (column, leaf). When
+     * unset the leaf falls back to its own per-fragment scan for
+     * backwards compatibility (unit tests that construct leaves
+     * directly, callers that skip {@link LanceDirectoryReader}).
+     */
+    private volatile LanceShardColumnCache shardColumnCache;
+
     // Bridge to Lucene's cache lifecycle. IndicesQueryCache, IndicesFieldDataCache
     // and IndicesRequestCache all key entries by IndexReader.CacheKey and rely on
     // IndexReader.ClosedListener to invalidate them. IndexReader.CacheKey has a
@@ -597,6 +612,17 @@ public final class LanceFragmentLeafReader extends LeafReader {
         if (numericColumns.containsKey(name)) {
             return;
         }
+        LanceShardColumnCache cache = shardColumnCache;
+        if (cache != null) {
+            // Delegate to the shard-level coordinator: one scan for
+            // the whole reader instead of one per leaf. After the
+            // cache returns, publishNumericColumn below has put the
+            // fragment's slice into this leaf's numericColumns /
+            // numericPresence maps, so the containsKey short-circuit
+            // fires on subsequent calls.
+            cache.loadNumericColumn(name);
+            return;
+        }
         synchronized (columnLock(name)) {
             if (numericColumns.containsKey(name)) {
                 return;
@@ -625,8 +651,45 @@ public final class LanceFragmentLeafReader extends LeafReader {
         }
     }
 
+    /**
+     * Called by {@link LanceShardColumnCache#loadNumericColumn} after
+     * the shard-level scan has bucketed this leaf's fragment. Simply
+     * writes into the per-leaf storage the accessors already read
+     * from ({@link #numericColumns}, {@link #numericPresence}), so
+     * downstream {@link #getSortedNumericDocValues} calls see the
+     * populated arrays through the same {@code ConcurrentHashMap}
+     * happens-before as the pre-cache per-leaf path.
+     *
+     * <p>Package-private because only the cache should call it — the
+     * cache lives alongside this class in
+     * {@code org.opensearch.lance.engine} and is the sole owner of
+     * the shard-level scan lifecycle.
+     */
+    void publishNumericColumn(String name, long[] values, FixedBitSet presence) {
+        numericPresence.put(name, presence);
+        numericColumns.put(name, values);
+    }
+
+    /**
+     * Attach a {@link LanceShardColumnCache} to this leaf. Called
+     * from {@link LanceDirectoryReader}'s open paths after the full
+     * leaf list has been assembled so the cache has references to
+     * every leaf in the reader. {@code null} disables the cache
+     * indirection and returns the leaf to its per-fragment scan
+     * fallback (only used by tests that construct leaves without a
+     * DirectoryReader).
+     */
+    void setShardColumnCache(LanceShardColumnCache cache) {
+        this.shardColumnCache = cache;
+    }
+
     private void ensureBooleanLoaded(String name) throws IOException {
         if (booleanColumns.containsKey(name)) {
+            return;
+        }
+        LanceShardColumnCache cache = shardColumnCache;
+        if (cache != null) {
+            cache.loadBooleanColumn(name);
             return;
         }
         synchronized (columnLock(name)) {
@@ -658,6 +721,16 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     /**
+     * Publish sink for {@link LanceShardColumnCache#loadBooleanColumn}.
+     * Same shape as {@link #publishNumericColumn}; the two boolean
+     * bookkeeping maps mirror the numeric ones.
+     */
+    void publishBooleanColumn(String name, long[] values, FixedBitSet presence) {
+        booleanPresence.put(name, presence);
+        booleanColumns.put(name, values);
+    }
+
+    /**
      * Load a Utf8 column into {@code textColumns}. If the column is
      * {@link ColumnKind#TEXT_KEYWORD} (i.e. no FTS index), also build the
      * sorted term dictionary and per-doc ords used by
@@ -665,6 +738,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
      */
     private void ensureTextLoaded(String name) throws IOException {
         if (textColumns.containsKey(name)) {
+            return;
+        }
+        LanceShardColumnCache cache = shardColumnCache;
+        if (cache != null) {
+            cache.loadTextColumn(name);
             return;
         }
         synchronized (columnLock(name)) {
@@ -686,34 +764,52 @@ public final class LanceFragmentLeafReader extends LeafReader {
             } catch (Exception e) {
                 throw new IOException(e);
             }
-            if (columnKind.get(name) == ColumnKind.TEXT_KEYWORD || basesWithKeywordSub.contains(name)) {
-                TreeSet<String> unique = new TreeSet<>();
-                for (String v : raw) {
-                    if (v != null) {
-                        unique.add(v);
-                    }
-                }
-                BytesRef[] terms = new BytesRef[unique.size()];
-                Map<String, Integer> lookup = new HashMap<>();
-                int idx = 0;
-                for (String t : unique) {
-                    terms[idx] = new BytesRef(t);
-                    lookup.put(t, idx);
-                    idx++;
-                }
-                int[] ords = new int[maxDoc];
-                Arrays.fill(ords, -1);
-                for (int r = 0; r < maxDoc; r++) {
-                    String v = raw[r];
-                    if (v != null) {
-                        ords[r] = lookup.get(v);
-                    }
-                }
-                keywordTerms.put(name, terms);
-                keywordOrds.put(name, ords);
-            }
-            textColumns.put(name, raw);
+            publishTextColumnInternal(name, raw);
         }
+    }
+
+    /**
+     * Publish sink for {@link LanceShardColumnCache#loadTextColumn}.
+     * Also builds the per-fragment keyword dictionary if the column
+     * is a {@link ColumnKind#TEXT_KEYWORD} or the base of a
+     * {@code multi_fields} keyword sub-field. Keyword dictionaries
+     * stay per-fragment (each leaf's {@code keywordTerms} /
+     * {@code keywordOrds} indexes are independent) because
+     * {@link org.apache.lucene.index.SortedDocValues} ord-comparison
+     * semantics assume per-segment ord spaces.
+     */
+    void publishTextColumn(String name, String[] raw) {
+        publishTextColumnInternal(name, raw);
+    }
+
+    private void publishTextColumnInternal(String name, String[] raw) {
+        if (columnKind.get(name) == ColumnKind.TEXT_KEYWORD || basesWithKeywordSub.contains(name)) {
+            TreeSet<String> unique = new TreeSet<>();
+            for (String v : raw) {
+                if (v != null) {
+                    unique.add(v);
+                }
+            }
+            BytesRef[] terms = new BytesRef[unique.size()];
+            Map<String, Integer> lookup = new HashMap<>();
+            int idx = 0;
+            for (String t : unique) {
+                terms[idx] = new BytesRef(t);
+                lookup.put(t, idx);
+                idx++;
+            }
+            int[] ords = new int[maxDoc];
+            Arrays.fill(ords, -1);
+            for (int r = 0; r < maxDoc; r++) {
+                String v = raw[r];
+                if (v != null) {
+                    ords[r] = lookup.get(v);
+                }
+            }
+            keywordTerms.put(name, terms);
+            keywordOrds.put(name, ords);
+        }
+        textColumns.put(name, raw);
     }
 
     /**
@@ -723,6 +819,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
      */
     private void ensureKeywordArrayLoaded(String name) throws IOException {
         if (keywordArrayValues.containsKey(name)) {
+            return;
+        }
+        LanceShardColumnCache cache = shardColumnCache;
+        if (cache != null) {
+            cache.loadKeywordArrayColumn(name);
             return;
         }
         synchronized (columnLock(name)) {
@@ -757,49 +858,69 @@ public final class LanceFragmentLeafReader extends LeafReader {
             } catch (Exception e) {
                 throw new IOException(e);
             }
-            TreeSet<String> unique = new TreeSet<>();
-            for (String[] row : rows) {
-                if (row == null) continue;
-                for (String v : row) {
-                    if (v != null) unique.add(v);
-                }
-            }
-            BytesRef[] terms = new BytesRef[unique.size()];
-            Map<String, Integer> lookup = new HashMap<>();
-            int idx = 0;
-            for (String t : unique) {
-                terms[idx] = new BytesRef(t);
-                lookup.put(t, idx);
-                idx++;
-            }
-            int[][] rowOrds = new int[maxDoc][];
-            for (int r = 0; r < maxDoc; r++) {
-                String[] row = rows[r];
-                if (row == null) {
-                    rowOrds[r] = null;
-                    continue;
-                }
-                // Ords are stored in sorted order without duplicates so
-                // SortedSetDocValues.nextOrd walks strictly ascending.
-                TreeSet<Integer> unique2 = new TreeSet<>();
-                for (String v : row) {
-                    if (v != null) unique2.add(lookup.get(v));
-                }
-                int[] ordArr = new int[unique2.size()];
-                int j = 0;
-                for (int o : unique2) {
-                    ordArr[j++] = o;
-                }
-                rowOrds[r] = ordArr;
-            }
-            keywordArrayTerms.put(name, terms);
-            keywordArrayOrds.put(name, rowOrds);
-            keywordArrayValues.put(name, rows);
+            publishKeywordArrayColumnInternal(name, rows);
         }
+    }
+
+    /**
+     * Publish sink for
+     * {@link LanceShardColumnCache#loadKeywordArrayColumn}. Same as
+     * {@link #publishTextColumn} but the ord dictionary is a
+     * multi-valued flavour ({@code keywordArrayOrds} carries
+     * {@code int[]} per doc rather than a scalar ord).
+     */
+    void publishKeywordArrayColumn(String name, String[][] rows) {
+        publishKeywordArrayColumnInternal(name, rows);
+    }
+
+    private void publishKeywordArrayColumnInternal(String name, String[][] rows) {
+        TreeSet<String> unique = new TreeSet<>();
+        for (String[] row : rows) {
+            if (row == null) continue;
+            for (String v : row) {
+                if (v != null) unique.add(v);
+            }
+        }
+        BytesRef[] terms = new BytesRef[unique.size()];
+        Map<String, Integer> lookup = new HashMap<>();
+        int idx = 0;
+        for (String t : unique) {
+            terms[idx] = new BytesRef(t);
+            lookup.put(t, idx);
+            idx++;
+        }
+        int[][] rowOrds = new int[maxDoc][];
+        for (int r = 0; r < maxDoc; r++) {
+            String[] row = rows[r];
+            if (row == null) {
+                rowOrds[r] = null;
+                continue;
+            }
+            // Ords are stored in sorted order without duplicates so
+            // SortedSetDocValues.nextOrd walks strictly ascending.
+            TreeSet<Integer> unique2 = new TreeSet<>();
+            for (String v : row) {
+                if (v != null) unique2.add(lookup.get(v));
+            }
+            int[] ordArr = new int[unique2.size()];
+            int j = 0;
+            for (int o : unique2) {
+                ordArr[j++] = o;
+            }
+            rowOrds[r] = ordArr;
+        }
+        keywordArrayTerms.put(name, terms);
+        keywordArrayOrds.put(name, rowOrds);
+        keywordArrayValues.put(name, rows);
     }
 
     private void ensureBinaryLoaded(String name) throws IOException {
         if (binaryColumns.containsKey(name)) {
+            return;
+        }
+        LanceShardColumnCache cache = shardColumnCache;
+        if (cache != null) {
+            cache.loadBinaryColumn(name);
             return;
         }
         synchronized (columnLock(name)) {
@@ -829,6 +950,16 @@ public final class LanceFragmentLeafReader extends LeafReader {
             }
             binaryColumns.put(name, col);
         }
+    }
+
+    /**
+     * Publish sink for
+     * {@link LanceShardColumnCache#loadBinaryColumn}. Simplest of
+     * the five publish sinks — the leaf's binary map keys straight
+     * into {@code binaryColumns} without any secondary dictionary.
+     */
+    void publishBinaryColumn(String name, byte[][] values) {
+        binaryColumns.put(name, values);
     }
 
     @Override
@@ -1363,7 +1494,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
     // nulls; this method assumes the input index has a value. Date/Timestamp
     // vectors are normalized to epoch milliseconds so the DateFieldMapper
     // reads them through the same numeric doc value path as integers.
-    private static long readAsLong(FieldVector v, int i) {
+    static long readAsLong(FieldVector v, int i) {
         if (v instanceof org.apache.arrow.vector.TinyIntVector t) {
             return t.get(i);
         }
