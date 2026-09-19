@@ -6,12 +6,16 @@
 package org.opensearch.lance.query;
 
 import java.io.IOException;
-import java.util.Collections;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.UInt8Vector;
@@ -166,131 +170,257 @@ public final class LanceFtsQuery extends Query {
 
     @Override
     public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) {
-        return new Weight(this) {
-            @Override
-            public Explanation explain(LeafReaderContext context, int doc) {
-                return Explanation.match(0f, "lance fts");
-            }
+        return new LanceFtsWeight(this, boost);
+    }
 
-            @Override
-            public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
-                if (!(org.apache.lucene.index.FilterLeafReader.unwrap(context.reader()) instanceof LanceFragmentLeafReader leaf)) {
+    /**
+     * Per-fragment result buckets for a single shard-wide Lance FTS
+     * scan. Sizes are typically at most the caller's scan limit for
+     * the fragments that carry hits (many fragments carry none), so
+     * the arrays grow geometrically from a small initial capacity.
+     *
+     * <p>Modelled on {@link LanceKnnQuery.FragmentHits} but stores
+     * BM25 scores (higher = better) rather than distances (lower =
+     * better). Kept as a separate class instead of shared because
+     * the field names {@code offsets}/{@code scores} read better in
+     * the FTS context than {@code offsets}/{@code distances}.
+     */
+    static final class FtsFragmentHits {
+        int[] offsets = new int[8];
+        float[] scores = new float[offsets.length];
+        int size = 0;
+
+        void add(int offset, float score) {
+            if (size == offsets.length) {
+                offsets = Arrays.copyOf(offsets, offsets.length * 2);
+                scores = Arrays.copyOf(scores, scores.length * 2);
+            }
+            offsets[size] = offset;
+            scores[size] = score;
+            size++;
+        }
+    }
+
+    /**
+     * Weight for a Lance FTS query. Runs a single Lance scan across
+     * every Lance-backed leaf in the shard (the "shard-level scan"
+     * pattern that {@link LanceKnnQuery.LanceKnnWeight} already uses
+     * for nearest-neighbour queries), buckets the hits by fragment
+     * id from the returned {@code _rowaddr}, and hands each per-leaf
+     * {@link ScorerSupplier} its fragment's slice out of the shared
+     * map.
+     *
+     * <p>The reason for the shard-level scan is fragment fixed cost.
+     * Before, {@code scorerSupplier} called {@code dataset.newScan}
+     * per leaf, one call per fragment; QA measurements on a 20M-row
+     * table with 80 fragments per shard put the per-leaf overhead at
+     * 15-19 ms, so an unscoped {@code lance_match} paid 1.2-1.5 s
+     * just to spin up the scanner 80 times before any actual work
+     * happened. The consolidated scan collapses that to a single
+     * newScan call per Weight instance, so the fragment fixed cost
+     * shrinks from {@code N_fragments * per_scan_overhead} to a
+     * single {@code per_scan_overhead}. See {@code issue-42-design.md}
+     * Phase D / Direction 4 for the design rationale.
+     *
+     * <p>{@code scanLimit} used to bound the scan at
+     * {@code min(scanLimit, per_fragment_maxDoc)}, and the top-k
+     * pushdown pass ({@code #42} Phase B / Step B-1) added the field
+     * so the FTS scorer could stop after {@code size} score-sorted
+     * rows per fragment. With the shard-level scan the limit still
+     * caps the total transfer at {@code scanLimit} but is now applied
+     * once across the fragment subset instead of per fragment; a
+     * request of {@code size=20} over 20 fragments per node now
+     * transfers 20 hits, not 400, matching the shape the coordinator
+     * ultimately merges anyway.
+     */
+    final class LanceFtsWeight extends Weight {
+
+        private final float boost;
+        // Cache populated by the first Lance-backed leaf we visit and
+        // reused for every other leaf in the same Weight. Set once
+        // via CAS so concurrent readers see a fully constructed map.
+        private final AtomicReference<Map<Integer, FtsFragmentHits>> shardHits = new AtomicReference<>();
+
+        LanceFtsWeight(LanceFtsQuery query, float boost) {
+            super(query);
+            this.boost = boost;
+        }
+
+        @Override
+        public Explanation explain(LeafReaderContext context, int doc) {
+            return Explanation.match(0f, "lance fts");
+        }
+
+        @Override
+        public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
+            if (!(org.apache.lucene.index.FilterLeafReader.unwrap(context.reader()) instanceof LanceFragmentLeafReader leaf)) {
+                return null;
+            }
+            // Security plugin FLS hides a field by dropping it from
+            // the wrapper reader's FieldInfos. If any referenced
+            // column is missing on this leaf's wrapper reader,
+            // contribute no hits so the caller cannot use the FTS
+            // query as a probe against the hidden data. The check
+            // stays per-leaf (rather than moving into ensureShardScan)
+            // so an FLS decision that hides the column on one leaf
+            // still leaves other leaves working. In practice FLS is
+            // per-shard consistent, so this is equivalent to a
+            // one-shot check, but keeping the loop preserves the
+            // pre-Phase D behaviour for any callers that reason
+            // about it.
+            for (String col : query().columns()) {
+                if (context.reader().getFieldInfos().fieldInfo(col) == null) {
                     return null;
                 }
-                // Security plugin FLS hides a field by dropping it from the
-                // wrapper reader's FieldInfos. If any referenced column is
-                // missing on the wrapper reader, contribute no hits so the
-                // caller cannot use it as a search term either.
-                for (String col : columns) {
-                    if (context.reader().getFieldInfos().fieldInfo(col) == null) {
-                        return null;
-                    }
+            }
+            Map<Integer, FtsFragmentHits> hitsByFragment = ensureShardScan(context, leaf);
+            FtsFragmentHits hits = hitsByFragment.get(leaf.fragmentId());
+            if (hits == null || hits.size == 0) {
+                return null;
+            }
+            int hitCount = hits.size;
+            // Pack (offset, score) into longs sorted by offset so
+            // the Lucene DocIdSetIterator contract (ascending docIds)
+            // is satisfied. Offsets are non-negative ints so signed
+            // long ordering is docId-ascending.
+            long[] packed = new long[hitCount];
+            for (int i = 0; i < hitCount; i++) {
+                int offset = hits.offsets[i];
+                float s = hits.scores[i];
+                packed[i] = ((long) offset << 32) | (Float.floatToIntBits(s) & 0xFFFFFFFFL);
+            }
+            Arrays.sort(packed);
+            int[] docIds = new int[hitCount];
+            float[] hitScores = new float[hitCount];
+            for (int i = 0; i < hitCount; i++) {
+                docIds[i] = (int) (packed[i] >>> 32);
+                hitScores[i] = Float.intBitsToFloat((int) (packed[i] & 0xFFFFFFFFL));
+            }
+            LanceSparseHitIterator iterator = new LanceSparseHitIterator(docIds, hitScores, hitCount);
+            Scorer scorer = new Scorer() {
+                @Override
+                public DocIdSetIterator iterator() {
+                    return iterator;
                 }
-                // Bail out early if the shared native Session has caught
-                // up to the configured limit: dataset.newScan below is
-                // exactly the call that loads the inverted index into
-                // native memory, so running it after the breaker trips
-                // would be the growth path we are trying to prevent.
-                LanceCircuitBreaker.checkAndTrip("lance_fts_query");
-                int maxDoc = leaf.maxDoc();
-                // Clip the FTS scan at the caller-supplied top-k when
-                // one was pinned. Lance's inverted-index scorer
-                // maintains a bounded heap of score-sorted rows, so
-                // asking for k << maxDoc costs O(hits * log k) rather
-                // than O(hits) with a full transfer. The scan floor
-                // is 1 (Lance rejects limit == 0); shapes that must
-                // see every match keep the sentinel and get maxDoc.
-                long effectiveLimit = scanLimit == SCAN_LIMIT_UNBOUNDED ? (long) maxDoc : Math.min((long) scanLimit, (long) maxDoc);
-                // Accumulate hits into a packed long array
-                // (docId << 32 | Float.floatToIntBits(score)) sized
-                // to the effective limit rather than the fragment's
-                // maxDoc. A fragment with maxDoc = 250,000 and a
-                // size:10 query used to allocate 1 MB of scores and
-                // 31 KB of bitset per query; the packed form uses
-                // 8 bytes * hitCount, an order of magnitude smaller
-                // in the common case and unchanged when the caller
-                // asks for the full match set. Growth is capped by
-                // effectiveLimit so an unbounded scan cannot overrun.
-                int capacity = (int) Math.min(effectiveLimit, 128L);
-                if (capacity <= 0) {
-                    capacity = 1;
-                }
-                long[] packed = new long[capacity];
-                int hitCount = 0;
-                ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(leaf.fragmentId()))
-                    .fullTextQuery(fullTextQuery)
-                    .withRowAddress(true)
-                    .limit(effectiveLimit)
-                    .build();
-                try (LanceScanner scanner = leaf.dataset().newScan(options); ArrowReader reader = scanner.scanBatches()) {
-                    while (reader.loadNextBatch()) {
-                        VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                        UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                        Float4Vector score = (Float4Vector) root.getVector("_score");
-                        for (int i = 0; i < root.getRowCount(); i++) {
-                            if (hitCount == packed.length) {
-                                int nextSize = Math.min(packed.length * 2, Math.max((int) effectiveLimit, packed.length + 1));
-                                packed = java.util.Arrays.copyOf(packed, nextSize);
-                            }
-                            int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
-                            float s = score.get(i) * boost;
-                            packed[hitCount++] = ((long) offset << 32) | (Float.floatToIntBits(s) & 0xFFFFFFFFL);
-                        }
-                    }
-                } catch (IOException e) {
-                    throw e;
-                } catch (Exception e) {
-                    throw new IOException(e);
-                }
-                if (hitCount == 0) {
-                    return null;
-                }
-                // Sort by packed key so docIds land ascending; scores
-                // ride along in the low 32 bits. Java Arrays.sort on
-                // long uses the natural (signed) ordering, but offsets
-                // are non-negative int values, so the high 32 bits
-                // stay in 0..Integer.MAX_VALUE and the sort is
-                // effectively docId ascending, score ascending as a
-                // stable secondary — the Lucene DocIdSetIterator
-                // contract asks for ascending docIds and does not
-                // care about score order at equal docIds.
-                java.util.Arrays.sort(packed, 0, hitCount);
-                int[] docIds = new int[hitCount];
-                float[] hitScores = new float[hitCount];
-                for (int i = 0; i < hitCount; i++) {
-                    docIds[i] = (int) (packed[i] >>> 32);
-                    hitScores[i] = Float.intBitsToFloat((int) (packed[i] & 0xFFFFFFFFL));
-                }
-                LanceSparseHitIterator iterator = new LanceSparseHitIterator(docIds, hitScores, hitCount);
-                Scorer scorer = new Scorer() {
-                    @Override
-                    public DocIdSetIterator iterator() {
-                        return iterator;
-                    }
 
-                    @Override
-                    public float getMaxScore(int upTo) {
-                        return Float.MAX_VALUE;
-                    }
+                @Override
+                public float getMaxScore(int upTo) {
+                    return Float.MAX_VALUE;
+                }
 
-                    @Override
-                    public float score() {
-                        return iterator.currentScore();
-                    }
+                @Override
+                public float score() {
+                    return iterator.currentScore();
+                }
 
-                    @Override
-                    public int docID() {
-                        return iterator.docID();
-                    }
-                };
-                return new Weight.DefaultScorerSupplier(scorer);
+                @Override
+                public int docID() {
+                    return iterator.docID();
+                }
+            };
+            return new Weight.DefaultScorerSupplier(scorer);
+        }
+
+        private LanceFtsQuery query() {
+            return (LanceFtsQuery) getQuery();
+        }
+
+        private Map<Integer, FtsFragmentHits> ensureShardScan(LeafReaderContext context, LanceFragmentLeafReader leaf) throws IOException {
+            Map<Integer, FtsFragmentHits> cached = shardHits.get();
+            if (cached != null) {
+                return cached;
+            }
+            // First scan on this shard is where Lance loads the
+            // inverted index into native memory. Refuse to start it
+            // if the breaker has already tripped so we do not push
+            // the cache past its budget mid-query.
+            LanceCircuitBreaker.checkAndTrip("lance_fts_query");
+
+            // Collect the fragment ids of every Lance-backed leaf in
+            // this shard so the single scan only touches the fragments
+            // this per-node executor was assigned. The IndexSearcher
+            // built by the fragment coordinator wraps exactly those
+            // fragments' leaves inside a LanceDirectoryReader, so
+            // walking the top-level context's leaves() gives the same
+            // subset the request was fanned out with — no more, no
+            // less. Walk up to the top-level context because
+            // LeafReaderContext.leaves() (inherited from
+            // IndexReaderContext) is only valid when isTopLevel is
+            // true.
+            org.apache.lucene.index.IndexReaderContext topCtx = context;
+            while (!topCtx.isTopLevel) {
+                topCtx = topCtx.parent;
+            }
+            List<Integer> fragmentIds = new ArrayList<>();
+            for (LeafReaderContext sibling : topCtx.leaves()) {
+                LanceFragmentLeafReader sl = LanceFragmentLeafReader.unwrap(sibling.reader());
+                if (sl != null) {
+                    fragmentIds.add(sl.fragmentId());
+                }
+            }
+            if (fragmentIds.isEmpty()) {
+                // No Lance-backed leaves at all: nothing to scan.
+                // Install an empty map so subsequent scorer calls
+                // short-circuit through the cache.
+                Map<Integer, FtsFragmentHits> empty = new HashMap<>();
+                shardHits.compareAndSet(null, empty);
+                return shardHits.get();
             }
 
-            @Override
-            public boolean isCacheable(LeafReaderContext ctx) {
-                return false;
+            // effectiveLimit applies to the whole scan (not per
+            // fragment). scanLimit == SCAN_LIMIT_UNBOUNDED asks for
+            // every match; otherwise Lance stops after that many
+            // score-sorted rows across the fragment subset. Callers
+            // that need every match (aggregation, sort by non-score,
+            // post_filter) keep the sentinel via
+            // TransportLanceFragmentQueryAction.resolveScanFilterTopK.
+            long effectiveLimit;
+            if (scanLimit == SCAN_LIMIT_UNBOUNDED) {
+                effectiveLimit = 0L; // Lance treats 0 as "no limit"
+            } else {
+                // Lance rejects limit == 0; if a caller passed
+                // scanLimit == 0 through some other route the top-k
+                // clip below is 1.
+                effectiveLimit = Math.max(1L, (long) scanLimit);
             }
-        };
+
+            ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(fragmentIds)
+                .fullTextQuery(query().fullTextQuery())
+                .withRowAddress(true);
+            if (effectiveLimit > 0) {
+                builder = builder.limit(effectiveLimit);
+            }
+
+            Map<Integer, FtsFragmentHits> fresh = new HashMap<>();
+            try (LanceScanner scanner = leaf.dataset().newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
+                while (reader.loadNextBatch()) {
+                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                    Float4Vector score = (Float4Vector) root.getVector("_score");
+                    for (int i = 0; i < root.getRowCount(); i++) {
+                        long addr = rowAddr.get(i);
+                        int fragId = (int) (addr >>> 32);
+                        int offset = (int) (addr & 0xFFFFFFFFL);
+                        float s = score.get(i) * boost;
+                        fresh.computeIfAbsent(fragId, id -> new FtsFragmentHits()).add(offset, s);
+                    }
+                }
+            } catch (IOException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new IOException(e);
+            }
+            // Whichever thread wins the CAS installs the map; losers reuse it.
+            if (shardHits.compareAndSet(null, fresh)) {
+                return fresh;
+            }
+            return shardHits.get();
+        }
+
+        @Override
+        public boolean isCacheable(LeafReaderContext ctx) {
+            return false;
+        }
     }
 
     @Override
