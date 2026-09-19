@@ -21,6 +21,8 @@ import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.DateDayVector;
 import org.apache.arrow.vector.DateMilliVector;
 import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.Float4Vector;
+import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.LargeVarBinaryVector;
 import org.apache.arrow.vector.TimeStampMicroTZVector;
@@ -96,12 +98,47 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * asks for it. This is the mitigation for issue #21 (heap footprint).
      */
     private enum ColumnKind {
-        NUMERIC,       // signed Int / Date / Timestamp — served as NumericDocValues
+        NUMERIC,       // signed Int / Date / Timestamp / Float32 / Float64 — served as NumericDocValues
         BOOLEAN,       // Bool — served as NumericDocValues via ConcurrentHashMap
         TEXT_FTS,      // Utf8 with a Lance FTS index — FieldInfo only, no doc values
         TEXT_KEYWORD,  // Utf8 without an FTS index — SortedSetDocValues via ords
         KEYWORD_ARRAY, // List<Utf8> — multi-valued SortedSetDocValues
         BINARY         // Binary / LargeBinary — FieldInfo only, values fetched for _source
+    }
+
+    /**
+     * Encoding of a value stored inside {@code numericColumns}. Every
+     * numeric column shares the same {@code long[]} storage so that
+     * {@link org.apache.lucene.index.NumericDocValues} can hand back a
+     * {@code long} per doc regardless of the underlying Arrow type. The
+     * enum records how to render that {@code long} back to a JSON value
+     * inside {@link #materialiseStoredFields} and — where relevant — how
+     * downstream OpenSearch field mappers decode the value on read.
+     *
+     * <ul>
+     *   <li>{@link #INTEGER} — a plain integer (default). Emitted as a
+     *       {@code long} in {@code _source}. Signed integer columns and
+     *       date / timestamp columns fall in here; the epoch-millis
+     *       normalisation done inside {@link #readAsLong} means the
+     *       {@code DateFieldMapper} decodes them directly.</li>
+     *   <li>{@link #FLOAT} — a {@code float32} column whose values are
+     *       stored as {@code NumericUtils.floatToSortableInt} results
+     *       widened to {@code long}. OpenSearch's {@code float} field
+     *       type decodes the stored value via
+     *       {@code NumericUtils.sortableIntToFloat((int) longValue)}
+     *       inside {@code SortedNumericDoubleValues}, so range / sort /
+     *       aggregation work through the numeric doc value path
+     *       unchanged. {@code _source} rendering decodes the same way
+     *       so the JSON value matches the original {@code float}.</li>
+     *   <li>{@link #DOUBLE} — a {@code float64} column, mirrored to
+     *       {@code NumericUtils.doubleToSortableLong} on the write side
+     *       and {@code sortableLongToDouble} on the read side.</li>
+     * </ul>
+     */
+    private enum NumericPrecision {
+        INTEGER,
+        FLOAT,
+        DOUBLE
     }
 
     private final String fieldName;
@@ -176,6 +213,16 @@ public final class LanceFragmentLeafReader extends LeafReader {
     // so materialiseStoredFields emits _source keys in schema order regardless
     // of which columns have been loaded so far.
     private final LinkedHashMap<String, ColumnKind> columnKind = new LinkedHashMap<>();
+    /**
+     * Precision override for numeric columns whose {@link ColumnKind} is
+     * {@link ColumnKind#NUMERIC} but whose underlying Arrow type is not
+     * a plain integer or a date/timestamp. Populated during the schema
+     * pass for {@code Float32} and {@code Float64} columns (see
+     * {@link NumericPrecision}); every other numeric column is absent
+     * from the map and defaults to {@link NumericPrecision#INTEGER}
+     * inside the {@code getOrDefault} lookups.
+     */
+    private final Map<String, NumericPrecision> numericPrecision = new ConcurrentHashMap<>();
     // Per-column monitors so ensureXxxLoaded serialises the Lance scan for
     // that column without blocking other columns. The first accessor pays the
     // scan cost, subsequent readers see the populated map entry via the
@@ -306,6 +353,18 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     kind = hasFts ? ColumnKind.TEXT_FTS : ColumnKind.TEXT_KEYWORD;
                 }
                 columnKind.put(field.getName(), kind);
+                // Remember the precision of Float32 / Float64 columns
+                // so materialiseStoredFields and readAsLong can round
+                // trip them through the shared long[] storage. All
+                // other numeric columns default to INTEGER via
+                // getOrDefault and no entry is written here.
+                if (field.getType() instanceof ArrowType.FloatingPoint fp) {
+                    if (fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE) {
+                        numericPrecision.put(field.getName(), NumericPrecision.FLOAT);
+                    } else if (fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE) {
+                        numericPrecision.put(field.getName(), NumericPrecision.DOUBLE);
+                    }
+                }
             }
         } catch (Exception e) {
             throw new IOException(e);
@@ -474,6 +533,21 @@ public final class LanceFragmentLeafReader extends LeafReader {
         }
         if (type instanceof ArrowType.Date || type instanceof ArrowType.Timestamp) {
             return ColumnKind.NUMERIC;
+        }
+        if (type instanceof ArrowType.FloatingPoint fp) {
+            // Float16 stays unsurfaced today: neither the OpenSearch
+            // `half_float` field type nor the Lance Java SDK's
+            // Float2Vector round-trip is wired through the reader.
+            // Float32 / Float64 both fold into the shared numeric doc
+            // value path; the precision is remembered separately in
+            // numericPrecision so _source and readAsLong can encode /
+            // decode via NumericUtils.floatToSortableInt or
+            // doubleToSortableLong.
+            if (fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE
+                || fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE) {
+                return ColumnKind.NUMERIC;
+            }
+            return null;
         }
         if (type instanceof ArrowType.List
             && field.getChildren().size() == 1
@@ -1174,17 +1248,30 @@ public final class LanceFragmentLeafReader extends LeafReader {
                             ensureNumericLoaded(name);
                             if (numericPresence.get(name).get(docID)) {
                                 long numericValue = numericColumns.get(name)[docID];
-                                if (pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.UNSIGNED_LONG
-                                    && name.equals(fieldName)) {
-                                    // UInt64 PK column: emit as an unsigned
-                                    // decimal so the JSON number matches
-                                    // what the operator wrote. Other
-                                    // UInt64 columns are not surfaced by
-                                    // classify(), so this branch fires
-                                    // only for the PK.
-                                    builder.field(name, new java.math.BigInteger(Long.toUnsignedString(numericValue)));
-                                } else {
-                                    builder.field(name, numericValue);
+                                NumericPrecision precision = numericPrecision.getOrDefault(name, NumericPrecision.INTEGER);
+                                switch (precision) {
+                                    case FLOAT -> builder.field(
+                                        name,
+                                        org.apache.lucene.util.NumericUtils.sortableIntToFloat((int) numericValue)
+                                    );
+                                    case DOUBLE -> builder.field(
+                                        name,
+                                        org.apache.lucene.util.NumericUtils.sortableLongToDouble(numericValue)
+                                    );
+                                    case INTEGER -> {
+                                        if (pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.UNSIGNED_LONG
+                                            && name.equals(fieldName)) {
+                                            // UInt64 PK column: emit as an unsigned
+                                            // decimal so the JSON number matches
+                                            // what the operator wrote. Other
+                                            // UInt64 columns are not surfaced by
+                                            // classify(), so this branch fires
+                                            // only for the PK.
+                                            builder.field(name, new java.math.BigInteger(Long.toUnsignedString(numericValue)));
+                                        } else {
+                                            builder.field(name, numericValue);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1297,6 +1384,21 @@ public final class LanceFragmentLeafReader extends LeafReader {
             // untouched so OpenSearch's unsigned_long field type
             // reinterprets the sign bit.
             return u.get(i);
+        }
+        if (v instanceof Float4Vector f) {
+            // Store the sortable-int encoding widened to long. OpenSearch's
+            // FloatFieldType decodes on the way out by casting the long back
+            // to int and calling NumericUtils.sortableIntToFloat, so range
+            // / sort / aggregation stay accurate. Explicit int → long
+            // widening keeps the sign extension consistent with
+            // NumericDocValues callers that read the raw long.
+            return org.apache.lucene.util.NumericUtils.floatToSortableInt(f.get(i));
+        }
+        if (v instanceof Float8Vector f) {
+            // Same shape as Float4Vector but the sortable representation
+            // is already 64-bit so no widening is needed. DoubleFieldType
+            // decodes with NumericUtils.sortableLongToDouble.
+            return org.apache.lucene.util.NumericUtils.doubleToSortableLong(f.get(i));
         }
         if (v instanceof DateDayVector d) {
             return d.get(i) * 86_400_000L;

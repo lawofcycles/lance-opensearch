@@ -1369,6 +1369,132 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeAnswersFloatQueries() throws Exception {
+        // Issue #44: Float32 and Float64 scalar columns used to fall
+        // through derive() into the "stored only" notes bucket,
+        // leaving the column with no mapping. `range price` returned
+        // 500 `Rewrite first` (unknown-field query path),
+        // `sort price` returned 400 `No mapping found`, metric
+        // aggregations returned 200 but with a null value, and the
+        // JSON _source omitted the column entirely despite the
+        // "stored only" wording.
+        //
+        // The fix wires float32 → `float` and float64 → `double`
+        // through derive(), and the leaf reader routes both through
+        // the shared NumericDocValues path via
+        // NumericUtils.floatToSortableInt / doubleToSortableLong.
+        // _source rendering decodes the sortable encoding on the
+        // way out so the JSON number equals the original value.
+        //
+        // Shapes exercised:
+        // (a) range on float32 (price >= 25.0 && price < 55.0)
+        // (b) sort ascending on float64 (weight)
+        // (c) metric aggregations (sum / avg / min / max) on both columns
+        // (d) _source round trip of the exact float32 / float64 values
+        String suffix = "float-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeFloatColumnTable(scratchDir, tableName);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // Mapping must expose price / weight with the correct
+            // OpenSearch numeric types. Regression fence for the
+            // derive() branch: if a future refactor drops the
+            // FloatingPoint case, this assertion catches it before
+            // the query-side asserts explain why.
+            String mappingBody = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+            assertTrue("mapping must expose price as float: " + mappingBody, mappingBody.contains("\"price\":{\"type\":\"float\""));
+            assertTrue("mapping must expose weight as double: " + mappingBody, mappingBody.contains("\"weight\":{\"type\":\"double\""));
+
+            // (a) range on price: 6 rows, price = i * 12.5f, so
+            // values are {0.0, 12.5, 25.0, 37.5, 50.0, 62.5}. The
+            // half-open range [25.0, 55.0) picks {25.0, 37.5, 50.0},
+            // rows id={2, 3, 4}.
+            String rangeBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"price\":{\"gte\":25.0,\"lt\":55.0}}}}")
+            );
+            assertEquals("range price total: " + rangeBody, 3, extractIntPath(rangeBody, "hits", "total", "value"));
+            assertTrue("range price must include id=2: " + rangeBody, rangeBody.contains("\"id\":2"));
+            assertTrue("range price must include id=3: " + rangeBody, rangeBody.contains("\"id\":3"));
+            assertTrue("range price must include id=4: " + rangeBody, rangeBody.contains("\"id\":4"));
+
+            // (b) sort weight ascending: values are {0/3, 1/3, 2/3,
+            // 1.0, 4/3, 5/3}. Ascending sort returns id order 0..5.
+            // Reading id from the first hit is enough to prove the
+            // double doc-value comparator ordered them correctly.
+            String sortBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}},\"sort\":[{\"weight\":\"asc\"}],\"size\":6}")
+            );
+            assertEquals("sort weight total: " + sortBody, 6, extractIntPath(sortBody, "hits", "total", "value"));
+            assertEquals(
+                "sort weight asc first hit must be id=0: " + sortBody,
+                0,
+                extractIntPath(sortBody, "hits", "hits", "0", "_source", "id")
+            );
+            assertEquals(
+                "sort weight asc last hit must be id=5: " + sortBody,
+                5,
+                extractIntPath(sortBody, "hits", "hits", "5", "_source", "id")
+            );
+
+            // (c) metric aggs: expected values for six rows.
+            // sum(price) = 12.5 * (0+1+2+3+4+5) = 12.5 * 15 = 187.5
+            // avg(price) = 187.5 / 6 = 31.25
+            // min(price) = 0.0
+            // max(price) = 62.5
+            // sum(weight) = 0/3+1/3+2/3+3/3+4/3+5/3 = 15/3 = 5.0
+            // min(weight) = 0.0
+            // max(weight) = 5/3 ≈ 1.6666666
+            String aggBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"aggs\":{"
+                        + "\"ps\":{\"sum\":{\"field\":\"price\"}},"
+                        + "\"pa\":{\"avg\":{\"field\":\"price\"}},"
+                        + "\"pm\":{\"min\":{\"field\":\"price\"}},"
+                        + "\"pM\":{\"max\":{\"field\":\"price\"}},"
+                        + "\"ws\":{\"sum\":{\"field\":\"weight\"}},"
+                        + "\"wm\":{\"min\":{\"field\":\"weight\"}},"
+                        + "\"wM\":{\"max\":{\"field\":\"weight\"}}"
+                        + "}}"
+                )
+            );
+            // Small tolerance for float rounding: even sortableInt
+            // decoding preserves the original float32 exactly, but
+            // sum accumulates in double and the intermediate float32
+            // representations round.
+            assertEquals("sum(price) == 187.5", 187.5d, extractDoublePath(aggBody, "aggregations", "ps", "value"), 1e-4);
+            assertEquals("avg(price) == 31.25", 31.25d, extractDoublePath(aggBody, "aggregations", "pa", "value"), 1e-4);
+            assertEquals("min(price) == 0.0", 0.0d, extractDoublePath(aggBody, "aggregations", "pm", "value"), 1e-4);
+            assertEquals("max(price) == 62.5", 62.5d, extractDoublePath(aggBody, "aggregations", "pM", "value"), 1e-4);
+            assertEquals("sum(weight) == 5.0", 5.0d, extractDoublePath(aggBody, "aggregations", "ws", "value"), 1e-9);
+            assertEquals("min(weight) == 0.0", 0.0d, extractDoublePath(aggBody, "aggregations", "wm", "value"), 1e-9);
+            assertEquals("max(weight) == 5/3", 5.0d / 3.0d, extractDoublePath(aggBody, "aggregations", "wM", "value"), 1e-9);
+
+            // (d) _source round trip: the hit for id=4 must carry
+            // price = 50.0 (exact float32) and weight = 4/3
+            // (double, 6-decimal digit match is enough — the JSON
+            // codec emits the shortest round-trippable form).
+            String hitBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"term\":{\"id\":4}},\"size\":1}"));
+            assertEquals("term id=4 total", 1, extractIntPath(hitBody, "hits", "total", "value"));
+            assertEquals("id=4 price must round trip", 50.0d, extractDoublePath(hitBody, "hits", "hits", "0", "_source", "price"), 0.0d);
+            assertEquals(
+                "id=4 weight must round trip",
+                4.0d / 3.0d,
+                extractDoublePath(hitBody, "hits", "hits", "0", "_source", "weight"),
+                1e-9
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFragmentDispatchModeAnswersMatchKnnAndSort() throws Exception {
         // Direction 1 Stage 3: match on lance_text, knn on
         // lance_knn, and sort now flow through the fragment

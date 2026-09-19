@@ -113,6 +113,7 @@ Types listed here map to real OpenSearch field types with doc values or FTS back
 |---|---|---|
 | `int8` / `int16` / `int32` / `int64` (signed) | `byte` / `short` / `integer` / `long` | Unsigned integer variants are noted in the attach response and left unmapped, except for UInt64 declared as the primary key (see next row). |
 | `uint64` declared as the primary key | `unsigned_long` | Values are held as raw 64-bit patterns; `Long.toUnsignedString` decodes the `_id`, and `BigInteger` handles the `GET /_doc/{id}` parse. Non-PK UInt64 columns are still not surfaced. |
+| `float32` / `float64` (scalar) | `float` / `double` | Values are folded into the shared `long[]` doc value storage via `NumericUtils.floatToSortableInt` / `doubleToSortableLong` and decoded on the way out so range, sort, metric aggregation, and `_source` all round trip. `float16` stays unmapped. |
 | `boolean` | `boolean` | |
 | `date` / `timestamp` (all units and TZs) | `date` | Normalised to epoch millis in the reader. |
 | `utf8` with a Lance FTS index | `lance_text` | Enables `match`, `lance_match`, `lance_match_phrase`, `lance_multi_match`. |
@@ -123,7 +124,7 @@ Types listed here map to real OpenSearch field types with doc values or FTS back
 
 Multi-fields (`fields.raw: keyword` on a Utf8 base column) is supported through the `multi_fields` attach clause above.
 
-Types not yet surfaced: `ip`, `wildcard`, `object` (Arrow `Struct`), `nested` (Arrow `List<Struct>`), and the geo family. `Utf8` list, `Decimal`, and `FloatingPoint(HALF|DOUBLE)` are stored in the table but excluded from the mapping today; the attach response notes them.
+Types not yet surfaced: `ip`, `wildcard`, `object` (Arrow `Struct`), `nested` (Arrow `List<Struct>`), and the geo family. `Utf8` list, `Decimal`, and `FloatingPoint(HALF)` are stored in the table but excluded from the mapping today; the attach response notes them.
 
 ## Native memory bounds
 

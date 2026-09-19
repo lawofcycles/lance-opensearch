@@ -574,6 +574,36 @@ public class RestAttachAction extends BaseRestHandler {
                 startFieldWithId(mapping, name, fieldId, "boolean", arrowTypeIdentity(type));
                 mapping.field("index", false).field("doc_values", true).endObject();
                 scalarColumns.add(name);
+            } else if (type instanceof ArrowType.FloatingPoint fp) {
+                // Scalar float columns. FixedSizeList<float32> vectors go
+                // through the branch below and pick up the lance_vector
+                // mapping; this branch handles bare Float32 / Float64
+                // columns that were previously left in the "stored only"
+                // notes and consequently unreachable through range /
+                // sort / metric aggregation / _source. Both surface with
+                // doc values enabled: OpenSearch's `float` / `double`
+                // mappers pair with the NumericDocValues path the reader
+                // already serves through the shared long[] storage
+                // (see NumericPrecision inside LanceFragmentLeafReader
+                // for the encoding trick). HALF stays unmapped because
+                // the reader does not carry a half-precision decoder
+                // today.
+                String osType;
+                switch (fp.getPrecision()) {
+                    case SINGLE:
+                        osType = "float";
+                        break;
+                    case DOUBLE:
+                        osType = "double";
+                        break;
+                    case HALF:
+                    default:
+                        notes.add("column " + name + ": FloatingPoint precision " + fp.getPrecision() + " not surfaced");
+                        continue;
+                }
+                startFieldWithId(mapping, name, fieldId, osType, arrowTypeIdentity(fp));
+                mapping.field("index", false).field("doc_values", true).endObject();
+                scalarColumns.add(name);
             } else if (type instanceof ArrowType.Date || type instanceof ArrowType.Timestamp) {
                 // Date32/Date64 and every Timestamp unit are normalized to epoch millis
                 // by the reader, so the default epoch_millis-friendly format applies.

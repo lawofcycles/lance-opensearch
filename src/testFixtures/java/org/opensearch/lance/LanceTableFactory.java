@@ -21,6 +21,7 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.Float4Vector;
+import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
 import org.apache.arrow.vector.TimeStampMicroVector;
@@ -678,6 +679,93 @@ final class LanceTableFactory {
                 // to exercise the range-on-Timestamp SQL path, not any
                 // scalar index. Derivation maps ts to `date` and
                 // category to `keyword` unconditionally.
+                Dataset.create(allocator, stream, uri, writeParams).close();
+            }
+        }
+        return uri;
+    }
+
+    /**
+     * Writes a Lance table exercising Float32 and Float64 scalar columns.
+     * The default {@link #writeTable} fixture only carries integer, string
+     * and vector columns, so it cannot exercise the floating point mapping
+     * path {@code RestAttachAction.derive} lays down for the {@code float}
+     * and {@code double} OpenSearch field types.
+     *
+     * <p>Row layout (fixed six-row table):
+     * <ul>
+     *   <li>id (int32, non-null): {@code i}</li>
+     *   <li>price (float32, nullable): {@code i * 12.5f} — spread across the
+     *       full precision range so range assertions in the IT stay tight</li>
+     *   <li>weight (float64, nullable): {@code i / 3.0} — irrational enough
+     *       that a naive integer-only round trip mangles it</li>
+     * </ul>
+     * The floats and doubles are stored through the same shared
+     * {@code long[]} column storage as integers via
+     * {@code NumericUtils.floatToSortableInt} /
+     * {@code NumericUtils.doubleToSortableLong}, then decoded back on the
+     * read side. Assertions in the IT cross-check the JSON {@code _source}
+     * values against the original {@code f}/{@code d} inputs to prove the
+     * round trip does not lose precision.
+     *
+     * @return absolute URI of the table.
+     */
+    static String writeFloatColumnTable(Path parent, String name) throws Exception {
+        return withLocaleRoot(() -> writeFloatColumnTableOnce(parent, name));
+    }
+
+    private static String writeFloatColumnTableOnce(Path parent, String name) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        int rowCount = 6;
+        Schema schema = new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("price", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)), null),
+                new Field("weight", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null)
+            ),
+            Map.of()
+        );
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            byte[] ipcBytes;
+            try (
+                VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                ByteArrayOutputStream out = new ByteArrayOutputStream()
+            ) {
+                IntVector idVector = (IntVector) root.getVector("id");
+                Float4Vector priceVector = (Float4Vector) root.getVector("price");
+                Float8Vector weightVector = (Float8Vector) root.getVector("weight");
+
+                idVector.allocateNew(rowCount);
+                priceVector.allocateNew(rowCount);
+                weightVector.allocateNew(rowCount);
+
+                for (int i = 0; i < rowCount; i++) {
+                    idVector.set(i, i);
+                    priceVector.set(i, i * 12.5f);
+                    weightVector.set(i, i / 3.0);
+                }
+                idVector.setValueCount(rowCount);
+                priceVector.setValueCount(rowCount);
+                weightVector.setValueCount(rowCount);
+                root.setRowCount(rowCount);
+
+                try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                }
+                ipcBytes = out.toByteArray();
+            }
+
+            try (
+                ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+            ) {
+                Data.exportArrayStream(allocator, reader, stream);
+                WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
                 Dataset.create(allocator, stream, uri, writeParams).close();
             }
         }
