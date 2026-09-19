@@ -280,7 +280,7 @@ public final class LanceNamespaceService {
 
     /**
      * List the tables the poll cycle would surface from the namespace
-     * registered at {@code rootUri}. Returns an empty {@link Optional} when
+     * registered at {@code rootUri}. Returns an empty {@link java.util.Optional} when
      * the namespace is not registered (or the local applier has not yet
      * built the runtime handle for it), a populated set otherwise. The
      * value comes straight from {@link DirectoryNamespace#listTables}, so

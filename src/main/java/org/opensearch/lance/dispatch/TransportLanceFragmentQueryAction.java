@@ -27,7 +27,9 @@ import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.CheckedFunction;
+import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.inject.Inject;
+import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.breaker.CircuitBreaker;
@@ -113,13 +115,31 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * that removed or renamed the accessor, in which case failing
      * fast is more useful than silently bypassing DLS/FLS.
      */
-    private static final Method INDEX_SERVICE_GET_READER_WRAPPER;
+    private static final Method INDEX_SERVICE_GET_READER_WRAPPER = resolveReaderWrapperAccessor();
 
-    static {
+    /**
+     * Resolve the reflective handle for
+     * {@code IndexService#getReaderWrapper()} once at class load.
+     * The accessor is package-private in OpenSearch core, so we
+     * have to go through {@code getDeclaredMethod} +
+     * {@code setAccessible}; those are on the forbidden APIs list
+     * so we scope the suppression to this single helper. The
+     * plugin-security.policy already grants
+     * {@code ReflectPermission "suppressAccessChecks"}, so runtime
+     * policy is not affected by this suppression.
+     *
+     * <p>{@code NoSuchMethodException} means the plugin was built
+     * against an OpenSearch version that removed or renamed the
+     * accessor; refuse to load the class rather than silently
+     * bypassing DLS/FLS.
+     */
+    @SuppressForbidden(reason = "IndexService#getReaderWrapper() is package-private in core; "
+        + "reflection is required to apply DLS/FLS on the fragment path until upstream exposes it")
+    private static Method resolveReaderWrapperAccessor() {
         try {
             Method m = IndexService.class.getDeclaredMethod("getReaderWrapper");
             m.setAccessible(true);
-            INDEX_SERVICE_GET_READER_WRAPPER = m;
+            return m;
         } catch (NoSuchMethodException e) {
             throw new IllegalStateException(
                 "IndexService#getReaderWrapper is not available on this OpenSearch build; refusing to serve Lance fragment queries because DLS/FLS would be bypassed silently",
@@ -260,7 +280,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // same way they apply to shard path hits.
             try (
                 Dataset readerDataset = LanceRegistry.openDataset(request.tableUri(), request.storageOptions());
-                DirectoryReader dr = openWrappedReader(indexService, readerDataset, pkField, pkType, multiFields, effectiveFragmentIds)
+                DirectoryReader dr = openWrappedReader(
+                    indexService,
+                    indexShard,
+                    readerDataset,
+                    pkField,
+                    pkType,
+                    multiFields,
+                    effectiveFragmentIds
+                )
             ) {
                 MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
                     Integer.MAX_VALUE,
@@ -570,10 +598,18 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
 
     /**
      * Open the Lance-backed {@link DirectoryReader} for the caller's
-     * fragment subset and run it through the IndexService reader
-     * wrapper if one is installed, so per-index reader
-     * transformations (most importantly DLS and FLS from the
-     * security plugin) apply to fragment path hits.
+     * fragment subset, wrap it as an
+     * {@link OpenSearchDirectoryReader} so downstream code that
+     * relies on {@code ShardUtils.extractShardId(reader)} (the
+     * security plugin's DLS/FLS wrapper, most importantly) can find
+     * the shard id, and run it through the IndexService reader
+     * wrapper if one is installed.
+     *
+     * <p>Lance-backed indexes are single-shard fixed, so the shard
+     * id is always {@code indexShard.shardId()} with shard number
+     * 0. This matches the shard path (see {@code
+     * LanceReadOnlyEngine.openLanceReader}) so wrapper behaviour is
+     * consistent across the two paths.
      *
      * <p>{@code IndexService.getReaderWrapper()} is package-private
      * in OpenSearch core; the reflective handle is set up once at
@@ -581,19 +617,20 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * plugin-security.policy already grants {@code
      * ReflectPermission "suppressAccessChecks"}. If no wrapper is
      * installed (empty cluster, no security plugin), the accessor
-     * returns {@code null} and the raw Lance reader is returned
-     * unchanged.
+     * returns {@code null} and the {@link OpenSearchDirectoryReader}
+     * wrap is returned as-is (wrapping is still needed for shard id
+     * extraction by other code paths, e.g. the search context).
      *
-     * <p>The wrapper contract in OpenSearch is that {@code close()}
-     * on the returned reader also closes the inner reader, so the
-     * caller only needs to close the return value of this method
-     * (typically via try-with-resources). If wrapper application
-     * throws, the raw Lance reader is closed here so callers do not
-     * have to handle the partial-construction case.
+     * <p>The reader contract is that {@code close()} on the
+     * returned reader also closes any nested reader, so the caller
+     * only needs to close the return value of this method
+     * (typically via try-with-resources). Errors during construction
+     * clean up the partially-built chain here.
      */
     @SuppressWarnings("unchecked")
     private DirectoryReader openWrappedReader(
         IndexService indexService,
+        IndexShard indexShard,
         Dataset readerDataset,
         String pkField,
         org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
@@ -609,7 +646,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             multiFields,
             effectiveFragmentIds
         );
+        OpenSearchDirectoryReader wrapped = null;
         try {
+            wrapped = OpenSearchDirectoryReader.wrap(lanceReader, indexShard.shardId());
             CheckedFunction<DirectoryReader, DirectoryReader, IOException> wrapper;
             try {
                 wrapper = (CheckedFunction<DirectoryReader, DirectoryReader, IOException>) INDEX_SERVICE_GET_READER_WRAPPER.invoke(
@@ -628,12 +667,17 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 throw new IllegalStateException("failed to obtain IndexService reader wrapper", cause);
             }
             if (wrapper == null) {
-                return lanceReader;
+                return wrapped;
             }
-            return wrapper.apply(lanceReader);
+            return wrapper.apply(wrapped);
         } catch (Exception e) {
+            // Close the outermost reader we successfully built.
+            // OpenSearchDirectoryReader.close() closes the inner
+            // Lance reader; if wrap itself failed before returning,
+            // the inner reader is still ours to close directly.
+            DirectoryReader toClose = wrapped != null ? wrapped : lanceReader;
             try {
-                lanceReader.close();
+                toClose.close();
             } catch (Exception suppressed) {
                 e.addSuppressed(suppressed);
             }
