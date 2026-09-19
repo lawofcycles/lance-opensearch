@@ -118,7 +118,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         long start = System.currentTimeMillis();
         SearchSourceBuilder source = searchRequest.source();
 
-        String filterSql = resolveFilterSql(source);
         org.opensearch.index.query.QueryBuilder query = source == null ? null : source.query();
         org.opensearch.index.query.QueryBuilder postFilter = source == null ? null : source.postFilter();
         List<org.opensearch.search.sort.SortBuilder<?>> sorts = source == null || source.sorts() == null
@@ -156,8 +155,15 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // Per-index fan-out results, collected sequentially.
         // Sequential loop keeps the merge trivial; parallel per-index
         // fan-out is future work if it becomes a hot spot.
+        // filterSql lives on the spec but is recomputed per target
+        // inside runIndexLoop so each target uses its own mapping to
+        // encode date literals (see issue #48). The placeholder value
+        // here is only used when a target's per-mapping recomputation
+        // returns the same value, i.e. when the target's mapping does
+        // not affect the emitted SQL (all-integer filter, match_all
+        // etc.). Any other case is overwritten inside the loop.
         FragmentQuerySpec spec = new FragmentQuerySpec(
-            filterSql,
+            null,
             query,
             postFilter,
             sorts,
@@ -169,7 +175,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         boolean versionRequested = source != null && Boolean.TRUE.equals(source.version());
         boolean seqNoAndPrimaryTermRequested = source != null && Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
         MergeState merged = new MergeState(aggregations, from, size, versionRequested, seqNoAndPrimaryTermRequested);
-        runIndexLoop(targets, 0, nodeList, spec, merged, start, listener);
+        runIndexLoop(targets, 0, nodeList, spec, source, merged, start, listener);
     }
 
     /**
@@ -182,6 +188,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         int index,
         List<DiscoveryNode> nodeList,
         FragmentQuerySpec spec,
+        SearchSourceBuilder source,
         MergeState merged,
         long startMillis,
         ActionListener<SearchResponse> listener
@@ -191,14 +198,31 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             return;
         }
         IndexTarget target = targets.get(index);
+        // filterSql is re-derived per target because Lance SQL literal
+        // encoding depends on the target's mapping. Two targets in the
+        // same request could have different types for the same field
+        // name (say `ts` mapped to `date` on one index and to `long`
+        // on another); a shared filterSql would silently misencode
+        // one of them. Fixing this at the target level is the
+        // resolution to issue #48.
+        FragmentQuerySpec perTargetSpec = new FragmentQuerySpec(
+            resolveFilterSql(source, target.fieldTypeLookup()),
+            spec.query(),
+            spec.postFilter(),
+            spec.sorts(),
+            spec.searchAfter(),
+            spec.effectiveSize(),
+            spec.aggregations(),
+            spec.trackScores()
+        );
         try {
             fanOutForTarget(
                 target,
                 nodeList,
-                spec,
+                perTargetSpec,
                 merged,
                 ActionListener.wrap(
-                    v -> runIndexLoop(targets, index + 1, nodeList, spec, merged, startMillis, listener),
+                    v -> runIndexLoop(targets, index + 1, nodeList, spec, source, merged, startMillis, listener),
                     listener::onFailure
                 )
             );
@@ -474,7 +498,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * pass). In those cases the per-node executor falls back to
      * {@link org.apache.lucene.search.IndexSearcher#count}.
      */
-    private static String resolveFilterSql(SearchSourceBuilder source) {
+    private static String resolveFilterSql(SearchSourceBuilder source, java.util.function.Function<String, String> fieldTypeLookup) {
         if (source == null) {
             return null;
         }
@@ -483,7 +507,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             return null;
         }
         try {
-            return LanceKnnFilterTranslator.toLanceSql((org.opensearch.index.query.QueryBuilder) query);
+            return LanceKnnFilterTranslator.toLanceSql((org.opensearch.index.query.QueryBuilder) query, fieldTypeLookup);
         } catch (IllegalArgumentException ignored) {
             // Query shape outside the translator's whitelist (match,
             // knn, ...). No filter push-down; the per-node hits path
@@ -519,9 +543,51 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 continue;
             }
             StorageOptions storageOptions = StorageOptions.fromIndexSettings(indexMetadata.getSettings());
-            targets.add(new IndexTarget(index.getName(), tableUri, storageOptions));
+            targets.add(new IndexTarget(index.getName(), tableUri, storageOptions, buildFieldTypeLookup(indexMetadata)));
         }
         return targets;
+    }
+
+    /**
+     * Build a field-type lookup for {@code indexMetadata} that reads
+     * the mapping straight out of cluster state so
+     * {@link LanceKnnFilterTranslator} can consult it while emitting
+     * SQL literals. The lookup returns the mapping's {@code type}
+     * string ({@code "date"}, {@code "long"}, {@code "keyword"}, ...)
+     * for a top-level field name and {@code null} for unmapped or
+     * sub-field names — the translator's
+     * {@link LanceKnnFilterTranslator#rejectMultiFieldPath} guard
+     * already refuses dotted paths, so multi-field paths never reach
+     * the literal encoder in the first place.
+     *
+     * <p>Cluster-state metadata carries the mapping as the same JSON
+     * the operator sent to {@code POST /_lance/attach}, deserialised
+     * into a {@code Map<String, Object>} tree. The top-level
+     * {@code properties} entry holds one entry per column, keyed by
+     * the OpenSearch field name; the {@code type} field on each
+     * entry is what we need. Nested objects are not surfaced yet
+     * (issues #4 / #5) so this shallow walk covers today's mappings.
+     */
+    @SuppressWarnings("unchecked")
+    private static java.util.function.Function<String, String> buildFieldTypeLookup(IndexMetadata indexMetadata) {
+        org.opensearch.cluster.metadata.MappingMetadata mapping = indexMetadata.mapping();
+        if (mapping == null) {
+            return LanceKnnFilterTranslator.NO_MAPPING;
+        }
+        java.util.Map<String, Object> source = mapping.getSourceAsMap();
+        Object properties = source == null ? null : source.get("properties");
+        if (!(properties instanceof java.util.Map)) {
+            return LanceKnnFilterTranslator.NO_MAPPING;
+        }
+        final java.util.Map<String, Object> propertyMap = (java.util.Map<String, Object>) properties;
+        return name -> {
+            Object field = propertyMap.get(name);
+            if (!(field instanceof java.util.Map)) {
+                return null;
+            }
+            Object type = ((java.util.Map<String, Object>) field).get("type");
+            return type instanceof String ? (String) type : null;
+        };
     }
 
     private SearchResponse emptyResponse(long took) {
@@ -533,7 +599,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         return new SearchResponse(sections, null, 1, 1, 0, took, ShardSearchFailure.EMPTY_ARRAY, SearchResponse.Clusters.EMPTY);
     }
 
-    private record IndexTarget(String indexName, String tableUri, StorageOptions storageOptions) {
+    private record IndexTarget(String indexName, String tableUri, StorageOptions storageOptions, java.util.function.Function<
+        String,
+        String> fieldTypeLookup) {
     }
 
     /**

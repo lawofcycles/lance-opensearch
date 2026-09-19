@@ -780,9 +780,104 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeAnswersDateRangeQueryWithEpochMillisLiterals() throws Exception {
+        // Issue #48 (follow-up to #43): a `range` on a Lance
+        // Timestamp column with a numeric epoch-millis literal —
+        // {"gte": 1709251200000} — used to return 400 with
+        // `Received literal Int64(...) and could not convert to
+        // literal of type 'Timestamp(...)'` because the translator
+        // emitted the number as a bare Int64. The #43 fix only
+        // handled ISO-8601 strings because the translator had no
+        // mapping context to know whether a numeric literal was
+        // meant to be a date or a plain integer.
+        //
+        // The follow-up plumbs a field-type lookup through
+        // {@link org.opensearch.lance.query.LanceKnnFilterTranslator#toLanceSql(QueryBuilder, Function)}
+        // so both the coordinator (via
+        // {@code TransportLanceCoordinatorAction.resolveTargets} +
+        // {@code IndexMetadata.mapping()}) and the knn inner filter
+        // ({@code LanceKnnQueryBuilder.doToQuery} via
+        // {@code QueryShardContext.fieldMapper}) can tell the
+        // translator that a given field is mapped as `date`. When
+        // the field is a date, a numeric literal gets wrapped in
+        // {@code to_timestamp_millis(...)} so DataFusion coerces
+        // to whatever Timestamp unit the Lance column carries.
+        //
+        // Shapes exercised:
+        // (a) range ts with epoch-millis literals only
+        // (b) bool filter combining a keyword term with an
+        // epoch-millis date range (same intersection as the
+        // ISO-8601 variant in #43's IT)
+        // (c) regression fence: ISO-8601 string literals still
+        // resolve on the mapping-aware path
+        String suffix = "dateml-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeDatedTable(scratchDir, tableName);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // Epoch-millis anchor points (UTC midnight, matching what
+            // OpenSearch's date field emits from a numeric literal
+            // input by default):
+            // 2024-03-01T00:00:00Z = 1709251200000
+            // 2024-04-01T00:00:00Z = 1711929600000
+            // 2024-05-01T00:00:00Z = 1714521600000
+
+            // (a) numeric range: id 2 (2024-03-10) and id 3
+            // (2024-03-25) sit inside [1709251200000, 1711929600000),
+            // matching the ISO-8601 variant of the same interval in
+            // testFragmentDispatchModeAnswersDateRangeQuery.
+            String numeric = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"ts\":{\"gte\":1709251200000,\"lt\":1711929600000}}}}")
+            );
+            assertEquals(
+                "numeric range must count only the two March rows: " + numeric,
+                2,
+                extractIntPath(numeric, "hits", "total", "value")
+            );
+            assertTrue("numeric range must include id=2: " + numeric, numeric.contains("\"id\":2"));
+            assertTrue("numeric range must include id=3: " + numeric, numeric.contains("\"id\":3"));
+
+            // (b) bool + term + numeric range: category=odd narrows
+            // to {1, 3, 5}, the date range keeps rows in
+            // [2024-01-01, 2024-05-01), and id 5 (2024-05-30) falls
+            // outside the upper bound. Intersection: {1, 3}.
+            String bool = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"bool\":{\"filter\":["
+                        + "{\"term\":{\"category\":\"odd\"}},"
+                        + "{\"range\":{\"ts\":{\"gte\":1704067200000,\"lt\":1714521600000}}}"
+                        + "]}}}"
+                )
+            );
+            assertEquals("bool + numeric range must intersect: " + bool, 2, extractIntPath(bool, "hits", "total", "value"));
+            assertTrue("bool + numeric range must include id=1: " + bool, bool.contains("\"id\":1"));
+            assertTrue("bool + numeric range must include id=3: " + bool, bool.contains("\"id\":3"));
+
+            // (c) regression fence: ISO-8601 string variant of (a)
+            // must resolve to the same two rows through the
+            // mapping-aware translator (the shape heuristic and the
+            // mapping-driven branch converge on the same output for
+            // this shape).
+            String iso = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"ts\":{\"gte\":\"2024-03-01\",\"lt\":\"2024-04-01\"}}}}")
+            );
+            assertEquals("ISO-8601 regression fence: " + iso, 2, extractIntPath(iso, "hits", "total", "value"));
+            assertTrue("ISO regression must include id=2: " + iso, iso.contains("\"id\":2"));
+            assertTrue("ISO regression must include id=3: " + iso, iso.contains("\"id\":3"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFragmentDispatchModeCountsFtsHitsWithoutWeightMaterialisation() throws Exception {
-        // Issue #42 Phase A / Step A-1: `size:0` on a pure FTS shape
-        // used to route through IndexSearcher.count(luceneQuery), which
         // triggered LanceFtsQuery's Weight to fully materialise every
         // hit's row address and score into the sparse buffer. On a 20M
         // row table with 500k matching hits QA measured 4.6 s for a

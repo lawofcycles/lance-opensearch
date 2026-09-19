@@ -388,7 +388,17 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
                     + ")"
             );
         }
-        String filterSql = filter == null ? null : LanceKnnFilterTranslator.toLanceSql(filter);
+        String filterSql = filter == null ? null : LanceKnnFilterTranslator.toLanceSql(filter, name -> {
+            // Resolve the field's OpenSearch mapping type through
+            // the QueryShardContext. Returns null for unmapped
+            // fields (the translator falls back to shape heuristics
+            // there). This is what makes numeric-epoch-millis on
+            // date columns and ISO-8601 strings on non-date
+            // columns route through the correct SQL literal form
+            // for the pre-filter path — see issue #48.
+            org.opensearch.index.mapper.MappedFieldType mft = context.fieldMapper(name);
+            return mft == null ? null : mft.typeName();
+        });
         return new LanceKnnQuery(field, vector, k, nprobes, refineFactor, ef, parseDistance(metric), useIndex, filterSql);
     }
 
