@@ -769,6 +769,99 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeAnswersTermsWithDeferredMetricSubAggregation() throws Exception {
+        // Regression for issue #40: `terms` with a deferred metric
+        // sub-aggregation (`avg` / `sum` / `max`) or a nested `terms`
+        // used to return 500 `Already been replayed` on the fragment
+        // path because the executor invoked postCollection() and
+        // buildAggregations() manually after
+        // ContextIndexSearcher.search had already run
+        // BucketCollectorProcessor#processPostCollection. The second
+        // pass drove BestBucketsDeferringCollector#prepareSelectedBuckets
+        // a second time, which is what throws. Fix reads the built
+        // aggregations back through Aggregator#getPostCollectionAggregation,
+        // matching the shard path.
+        //
+        // Shapes covered: default collect_mode (breadth_first is the
+        // default when a metric sub-agg is present, and it is the shape
+        // that triggers the defer path). Sibling coverage without
+        // pipeline aggregations (Phase 1a rejects the pipeline shape).
+        String suffix = "tds-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // terms + avg (issue #40 primary reproducer). 6 rows with
+            // unique ids 0..5 yields 6 buckets each holding a single
+            // doc; avg over each bucket equals the id itself. Also
+            // check the bucket for id=0 to confirm sub-agg values
+            // actually round trip (the pre-fix path threw before
+            // reaching sub-agg serialisation).
+            String avgBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":10},"
+                        + "\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}}"
+                )
+            );
+            assertEquals("terms + avg total unchanged", 6, extractIntPath(avgBody, "hits", "total", "value"));
+            assertTrue("terms + avg carries buckets: " + avgBody, avgBody.contains("\"buckets\":"));
+            assertTrue("terms + avg carries sub-agg value: " + avgBody, avgBody.contains("\"a\":{\"value\":0.0}"));
+
+            // terms + sum (same defer path, different metric).
+            String sumBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":10},"
+                        + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}}"
+                )
+            );
+            assertEquals("terms + sum total unchanged", 6, extractIntPath(sumBody, "hits", "total", "value"));
+
+            // terms + max (same defer path).
+            String maxBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":10},"
+                        + "\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}}}"
+                )
+            );
+            assertEquals("terms + max total unchanged", 6, extractIntPath(maxBody, "hits", "total", "value"));
+
+            // terms + nested terms (also defer-driven; QA also
+            // reproduced 500 with this shape).
+            String nestedBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":10},"
+                        + "\"aggs\":{\"nest\":{\"terms\":{\"field\":\"id\",\"size\":10}}}}}}"
+                )
+            );
+            assertEquals("nested terms total unchanged", 6, extractIntPath(nestedBody, "hits", "total", "value"));
+
+            // depth_first should have kept working before the fix
+            // (defer is skipped). Include it so a regression that
+            // breaks depth_first is caught too.
+            String depthBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":10,\"collect_mode\":\"depth_first\"},"
+                        + "\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}}"
+                )
+            );
+            assertEquals("depth_first terms + avg total unchanged", 6, extractIntPath(depthBody, "hits", "total", "value"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFragmentDispatchModeAnswersMatchKnnAndSort() throws Exception {
         // Direction 1 Stage 3: match on lance_text, knn on
         // lance_knn, and sort now flow through the fragment

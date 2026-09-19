@@ -557,14 +557,24 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         }
         BucketCollector wrapped = MultiBucketCollector.wrap(topLevelAggregators);
         searcher.search(query, wrapped);
-        for (Aggregator agg : aggregators) {
-            agg.postCollection();
-        }
 
+        // ContextIndexSearcher.search() ends by calling
+        // searchContext.bucketCollectorProcessor().processPostCollection(collector),
+        // which already runs postCollection() and buildTopLevel() on
+        // every top-level aggregator in the collector tree and stores
+        // the result inside the aggregator (Aggregator#internalAggregation).
+        // Read those stored results back out through
+        // getPostCollectionAggregation(), matching the shard path
+        // (BucketCollectorProcessor#toInternalAggregations).
+        //
+        // Calling postCollection() or buildAggregations() a second
+        // time here would drive DeferableBucketAggregator (breadth_first
+        // terms with metric sub-aggregations such as avg / sum / max /
+        // terms) through BestBucketsDeferringCollector#prepareSelectedBuckets
+        // twice; the second call throws "Already been replayed" (issue #40).
         List<InternalAggregation> results = new ArrayList<>(aggregators.length);
         for (Aggregator agg : aggregators) {
-            InternalAggregation[] built = agg.buildAggregations(new long[] { 0L });
-            results.add(built[0]);
+            results.add(agg.getPostCollectionAggregation());
         }
         return InternalAggregations.from(results);
     }
