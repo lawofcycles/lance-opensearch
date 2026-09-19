@@ -272,6 +272,17 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields = org.opensearch.lance.rest.RestAttachAction
                 .deserialiseMultiFields(indexMetadata.getSettings().get("index.lance.multi_fields", ""));
 
+            // Fetch the IndexService reader wrapper once so both
+            // openWrappedReader and computeMatched see the same
+            // wrapper reference. A non-null wrapper here is the
+            // signal that DLS/FLS or a similar reader-level
+            // transform may filter documents; computeMatched uses
+            // that signal to route counts through the searcher
+            // instead of Lance-side metadata paths, which would
+            // bypass the wrapper and return the pre-DLS count.
+            CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper = resolveReaderWrapper(indexService);
+            boolean hasSecurityWrapper = readerWrapper != null;
+
             // Open a fresh Dataset for the reader: LanceDirectoryReader
             // takes ownership of the Dataset and closes it in doClose.
             // The node-scoped Lance Session cache makes the second
@@ -283,7 +294,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             try (
                 Dataset readerDataset = LanceRegistry.openDataset(request.tableUri(), request.storageOptions());
                 DirectoryReader dr = openWrappedReader(
-                    indexService,
                     indexShard,
                     readerDataset,
                     pkField,
@@ -305,7 +315,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     // and the leaf reader falls back to unfiltered
                     // full-column scans, matching the pre-Phase-C
                     // behaviour for those shapes.
-                    request.filterSql()
+                    request.filterSql(),
+                    readerWrapper
                 )
             ) {
                 MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
@@ -364,7 +375,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         request.trackScores()
                     );
                     InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query);
-                    long matched = computeMatched(dataset, request, searcher, countQuery);
+                    long matched = computeMatched(dataset, request, searcher, countQuery, hasSecurityWrapper);
                     return new LanceFragmentQueryResponse(matched, fragmentCount, hits, aggregations);
                 }
             }
@@ -754,13 +765,50 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
+     * Fetch the reader wrapper installed on the {@link IndexService}
+     * via the package-private
+     * {@code IndexService#getReaderWrapper()} accessor. Returns
+     * {@code null} if no wrapper is installed (no security plugin,
+     * or the plugin is present but has not yet registered a
+     * wrapper). See {@link #INDEX_SERVICE_GET_READER_WRAPPER} for
+     * why this goes through reflection.
+     *
+     * <p>Split out from {@link #openWrappedReader} so the caller in
+     * {@link #execute} can inspect whether a wrapper is installed
+     * without also opening the reader. This is what lets
+     * {@link #computeMatched} route counts through
+     * {@link org.apache.lucene.search.IndexSearcher#count(Query)}
+     * whenever a wrapper is present, so a DLS/FLS reader wrapper
+     * can restrict {@code hits.total.value} the same way it
+     * restricts the returned hits.
+     */
+    @SuppressWarnings("unchecked")
+    private CheckedFunction<DirectoryReader, DirectoryReader, IOException> resolveReaderWrapper(IndexService indexService)
+        throws IOException {
+        try {
+            return (CheckedFunction<DirectoryReader, DirectoryReader, IOException>) INDEX_SERVICE_GET_READER_WRAPPER.invoke(indexService);
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("cannot access IndexService#getReaderWrapper via reflection", e);
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException) {
+                throw (IOException) cause;
+            }
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            throw new IllegalStateException("failed to obtain IndexService reader wrapper", cause);
+        }
+    }
+
+    /**
      * Open the Lance-backed {@link DirectoryReader} for the caller's
      * fragment subset, wrap it as an
      * {@link OpenSearchDirectoryReader} so downstream code that
      * relies on {@code ShardUtils.extractShardId(reader)} (the
      * security plugin's DLS/FLS wrapper, most importantly) can find
-     * the shard id, and run it through the IndexService reader
-     * wrapper if one is installed.
+     * the shard id, and apply the {@code readerWrapper} the caller
+     * fetched from {@link IndexService}.
      *
      * <p>Lance-backed indexes are single-shard fixed, so the shard
      * id is always {@code indexShard.shardId()} with shard number
@@ -768,15 +816,16 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * LanceReadOnlyEngine.openLanceReader}) so wrapper behaviour is
      * consistent across the two paths.
      *
-     * <p>{@code IndexService.getReaderWrapper()} is package-private
-     * in OpenSearch core; the reflective handle is set up once at
-     * class load ({@link #INDEX_SERVICE_GET_READER_WRAPPER}) and the
-     * plugin-security.policy already grants {@code
-     * ReflectPermission "suppressAccessChecks"}. If no wrapper is
-     * installed (empty cluster, no security plugin), the accessor
-     * returns {@code null} and the {@link OpenSearchDirectoryReader}
-     * wrap is returned as-is (wrapping is still needed for shard id
-     * extraction by other code paths, e.g. the search context).
+     * <p>{@code readerWrapper} is the value returned by
+     * {@link #resolveReaderWrapper}. Passing it in rather than
+     * resolving it here lets {@link #execute} record whether a
+     * wrapper is installed so {@link #computeMatched} can route
+     * counts through the searcher whenever a wrapper may restrict
+     * the visible document set. A {@code null} wrapper means no
+     * wrapper is installed (empty cluster, no security plugin) and
+     * the {@link OpenSearchDirectoryReader} is returned as-is —
+     * wrapping is still needed for shard id extraction by other
+     * code paths (e.g. the search context).
      *
      * <p>The reader contract is that {@code close()} on the
      * returned reader also closes any nested reader, so the caller
@@ -784,16 +833,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * (typically via try-with-resources). Errors during construction
      * clean up the partially-built chain here.
      */
-    @SuppressWarnings("unchecked")
     private DirectoryReader openWrappedReader(
-        IndexService indexService,
         IndexShard indexShard,
         Dataset readerDataset,
         String pkField,
         org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
         java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
         List<Integer> effectiveFragmentIds,
-        String filterSql
+        String filterSql,
+        CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper
     ) throws IOException {
         DirectoryReader lanceReader = LanceDirectoryReader.openForFragments(
             new ByteBuffersDirectory(),
@@ -808,27 +856,10 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         OpenSearchDirectoryReader wrapped = null;
         try {
             wrapped = OpenSearchDirectoryReader.wrap(lanceReader, indexShard.shardId());
-            CheckedFunction<DirectoryReader, DirectoryReader, IOException> wrapper;
-            try {
-                wrapper = (CheckedFunction<DirectoryReader, DirectoryReader, IOException>) INDEX_SERVICE_GET_READER_WRAPPER.invoke(
-                    indexService
-                );
-            } catch (IllegalAccessException e) {
-                throw new IllegalStateException("cannot access IndexService#getReaderWrapper via reflection", e);
-            } catch (InvocationTargetException e) {
-                Throwable cause = e.getCause();
-                if (cause instanceof IOException) {
-                    throw (IOException) cause;
-                }
-                if (cause instanceof RuntimeException) {
-                    throw (RuntimeException) cause;
-                }
-                throw new IllegalStateException("failed to obtain IndexService reader wrapper", cause);
-            }
-            if (wrapper == null) {
+            if (readerWrapper == null) {
                 return wrapped;
             }
-            return wrapper.apply(wrapped);
+            return readerWrapper.apply(wrapped);
         } catch (Exception e) {
             // Close the outermost reader we successfully built.
             // OpenSearchDirectoryReader.close() closes the inner
@@ -867,9 +898,41 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * The searcher iterates the same doc set the hits phase does,
      * so this is a second pass in exchange for the exact total
      * (versus underestimating when {@code size} clips).
+     *
+     * <p>The {@code hasSecurityWrapper} flag overrides every
+     * Lance-side fast path. A non-null reader wrapper on
+     * {@link IndexService} indicates that DLS/FLS or another
+     * reader-level transform may restrict the visible document
+     * set; Lance's metadata-only counts and its native filter scan
+     * see the raw Dataset, not the wrapper's view, so serving
+     * {@code hits.total.value} from Lance would over-count and
+     * disagree with the {@code _count} API (which does route
+     * through the searcher). Route every count path through
+     * {@link org.apache.lucene.search.IndexSearcher#count(Query)}
+     * whenever a wrapper is installed so the count matches the
+     * hits the same request returns and the {@code _count} API
+     * agrees.
      */
-    private long computeMatched(Dataset dataset, LanceFragmentQueryRequest request, ContextIndexSearcher searcher, Query luceneQuery)
-        throws Exception {
+    private long computeMatched(
+        Dataset dataset,
+        LanceFragmentQueryRequest request,
+        ContextIndexSearcher searcher,
+        Query luceneQuery,
+        boolean hasSecurityWrapper
+    ) throws Exception {
+        if (hasSecurityWrapper) {
+            // A reader wrapper is installed on the IndexService,
+            // most likely the security plugin's DLS/FLS wrapper.
+            // Any Lance-side count would bypass the wrapper and
+            // return the pre-wrapper row count, so route every
+            // count through the searcher instead. The searcher's
+            // BitSet iteration honours the wrapper's liveDocs the
+            // same way the hits phase does, keeping
+            // hits.total.value consistent with both the returned
+            // hits and the _count API for security-restricted
+            // users.
+            return searcher.count(luceneQuery);
+        }
         List<Integer> fragmentIds = request.fragmentIdsOrNull();
         String filterSql = request.filterSql();
         boolean hasScoringQuery = request.query() != null && filterSql == null;
