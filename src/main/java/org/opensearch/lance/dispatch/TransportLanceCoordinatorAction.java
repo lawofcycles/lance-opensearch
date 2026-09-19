@@ -506,8 +506,22 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         if (query == null || query instanceof org.opensearch.index.query.MatchAllQueryBuilder) {
             return null;
         }
+        org.opensearch.index.query.QueryBuilder qb = (org.opensearch.index.query.QueryBuilder) query;
+        // Refuse to emit SQL when any leaf in the tree names a
+        // field this target does not map. The translator itself
+        // would happily produce "unmapped >= 1" here, but Lance's
+        // Dataset.countRows(sql) evaluates that and rejects the
+        // scan with SchemaError. Falling back to filterSql=null
+        // lets the per-node executor use the rewritten Lucene
+        // query (RangeQueryBuilder.doRewrite folds an unmapped
+        // range to MatchNone) and count through the same
+        // IndexSearcher.count path shard search uses. See issue
+        // #50.
+        if (LanceKnnFilterTranslator.hasUnmappedField(qb, fieldTypeLookup)) {
+            return null;
+        }
         try {
-            return LanceKnnFilterTranslator.toLanceSql((org.opensearch.index.query.QueryBuilder) query, fieldTypeLookup);
+            return LanceKnnFilterTranslator.toLanceSql(qb, fieldTypeLookup);
         } catch (IllegalArgumentException ignored) {
             // Query shape outside the translator's whitelist (match,
             // knn, ...). No filter push-down; the per-node hits path

@@ -72,6 +72,106 @@ public final class LanceKnnFilterTranslator {
     public static final Function<String, String> NO_MAPPING = name -> null;
 
     /**
+     * Return {@code true} when any leaf in {@code builder} names a
+     * field that {@code fieldTypeLookup} reports as unmapped
+     * ({@code null} return). Callers that pass {@link #NO_MAPPING}
+     * always get {@code false} here — every field looks unmapped,
+     * so the walker treats "no mapping context" as "cannot say" and
+     * defers to whatever the translator or the shape heuristic
+     * would emit.
+     *
+     * <p>This is the pre-flight the coordinator uses to skip
+     * emitting a Lance SQL filter for a query that references an
+     * unmapped field. Without it the translator happily generates
+     * {@code unmapped >= 1}, the per-node counter reaches
+     * {@code Dataset.countRows(sql)}, and Lance rejects with
+     * {@code SchemaError(No field named unmapped)}. Skipping
+     * emission drops the coordinator's coarse count path and lets
+     * the per-node executor fall back to
+     * {@link org.apache.lucene.search.IndexSearcher#count} against
+     * the rewritten Lucene {@link org.apache.lucene.search.Query}
+     * (which resolves the unmapped range to {@code MatchNoDocsQuery}
+     * via {@code RangeQueryBuilder.doRewrite}). See issue #50.
+     *
+     * <p>Only the {@link QueryBuilder} shapes this translator
+     * already supports at
+     * {@link #toLanceSql(QueryBuilder, Function)} are inspected;
+     * shapes outside the whitelist (match, knn, ...) are ignored
+     * here because {@code resolveFilterSql} would already return
+     * {@code null} for them via the
+     * {@link IllegalArgumentException} catch in the coordinator.
+     */
+    public static boolean hasUnmappedField(QueryBuilder builder, Function<String, String> fieldTypeLookup) {
+        if (fieldTypeLookup == null || fieldTypeLookup == NO_MAPPING) {
+            return false;
+        }
+        if (builder == null) {
+            return false;
+        }
+        if (builder instanceof MatchAllQueryBuilder) {
+            return false;
+        }
+        if (builder instanceof TermQueryBuilder t) {
+            return isFieldUnmapped(t.fieldName(), fieldTypeLookup);
+        }
+        if (builder instanceof TermsQueryBuilder t) {
+            return isFieldUnmapped(t.fieldName(), fieldTypeLookup);
+        }
+        if (builder instanceof ExistsQueryBuilder e) {
+            return isFieldUnmapped(e.fieldName(), fieldTypeLookup);
+        }
+        if (builder instanceof RangeQueryBuilder r) {
+            return isFieldUnmapped(r.fieldName(), fieldTypeLookup);
+        }
+        if (builder instanceof BoolQueryBuilder b) {
+            for (QueryBuilder q : b.filter()) {
+                if (hasUnmappedField(q, fieldTypeLookup)) {
+                    return true;
+                }
+            }
+            for (QueryBuilder q : b.must()) {
+                if (hasUnmappedField(q, fieldTypeLookup)) {
+                    return true;
+                }
+            }
+            for (QueryBuilder q : b.mustNot()) {
+                if (hasUnmappedField(q, fieldTypeLookup)) {
+                    return true;
+                }
+            }
+            for (QueryBuilder q : b.should()) {
+                if (hasUnmappedField(q, fieldTypeLookup)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        // Shape outside the translator's whitelist. Return false so
+        // the caller does not fall into the "skip SQL translation"
+        // branch for something the translator would refuse anyway.
+        return false;
+    }
+
+    private static boolean isFieldUnmapped(String fieldName, Function<String, String> lookup) {
+        // rejectMultiFieldPath will fire inside toLanceSql for
+        // dotted names, so no need to guard against them here — the
+        // walker is a strict subset of the translator's shape gate.
+        if (fieldName == null) {
+            return false;
+        }
+        if (fieldName.indexOf('.') >= 0) {
+            // multi_field sub-fields (body.raw) resolve at Lucene
+            // scan time even though the mapping only carries the
+            // base field. Do not treat them as unmapped; the
+            // translator itself will reject them with
+            // rejectMultiFieldPath and the coordinator's
+            // IllegalArgumentException catch will kick in.
+            return false;
+        }
+        return lookup.apply(fieldName) == null;
+    }
+
+    /**
      * Convert {@code builder} to a Lance SQL expression. Never returns null.
      *
      * <p>Equivalent to {@link #toLanceSql(QueryBuilder, Function)}

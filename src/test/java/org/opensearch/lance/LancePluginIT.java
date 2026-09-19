@@ -877,6 +877,103 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeAnswersQueriesAgainstUnmappedFieldsWithoutError() throws Exception {
+        // Issue #50: a range / bool query against a field that
+        // derive() left unmapped used to return 500 with
+        // `illegal_state_exception: Rewrite first`. The exception
+        // comes from RangeQueryBuilder.doToQuery reaching for a
+        // MappedFieldType that is null; the shard path never hits
+        // it because SearchService.parseSource calls
+        // Rewriteable.rewrite before toQuery, which folds an
+        // unmapped range into MatchNoneQueryBuilder via
+        // RangeQueryBuilder.doRewrite. The fragment executor
+        // skipped that rewrite step.
+        //
+        // After the fix (a) TransportLanceFragmentQueryAction
+        // rewrites request.query() and request.postFilter() before
+        // handing them to toQuery, and (b) the coordinator's
+        // resolveFilterSql refuses to emit Lance SQL when any leaf
+        // names an unmapped field so Dataset.countRows(sql) does
+        // not surface a second 500 from the count path. Behaviour
+        // now matches the shard path: 200 with 0 hits, no error.
+        //
+        // Shapes exercised:
+        // (a) `range unmapped_int {gte:1}` — pure unmapped range,
+        // which is the exact repro from the issue.
+        // (b) `range unmapped_str {gte:"aa"}` — string-shaped
+        // range against an unmapped field (regression fence
+        // for the ISO-8601 shape-heuristic branch in the
+        // translator's literal encoder).
+        // (c) `bool must [term body="alpha", range unmapped_int]`
+        // — nested case where the coordinator's
+        // hasUnmappedField walker has to recurse into the
+        // bool tree, and Rewriteable.rewrite on the per-node
+        // side has to fold the range clause inside the bool.
+        // (d) Regression fence: a range against the mapped `id`
+        // column still returns the correct hit set on the
+        // same index (no over-broad match-none rewrite).
+        String suffix = "unmapped-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // (a) numeric range on unmapped field
+            String numeric = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"unmapped_int\":{\"gte\":1}}}}"));
+            assertEquals("unmapped range must return 0 hits: " + numeric, 0, extractIntPath(numeric, "hits", "total", "value"));
+
+            // (b) string range on unmapped field. Also exercises
+            // the branch in LanceKnnFilterTranslator.literal where
+            // a shape-heuristic ISO-8601 detection would fire on a
+            // string literal; the coordinator's hasUnmappedField
+            // walker skips translation before we get there.
+            String stringRange = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"unmapped_str\":{\"gte\":\"aa\"}}}}")
+            );
+            assertEquals(
+                "unmapped string range must return 0 hits: " + stringRange,
+                0,
+                extractIntPath(stringRange, "hits", "total", "value")
+            );
+
+            // (c) bool must with one mapped and one unmapped
+            // clause. RangeQueryBuilder.doRewrite folds the
+            // unmapped range to MatchNone, then
+            // BoolQueryBuilder.doRewrite collapses the whole
+            // bool to a query that matches nothing. Both the
+            // per-node hits path and the count path have to see
+            // this or hits.total.value would collapse to only
+            // the term-clause matches.
+            String bool = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"bool\":{\"must\":["
+                        + "{\"term\":{\"body\":\"alpha\"}},"
+                        + "{\"range\":{\"unmapped_int\":{\"gte\":1}}}"
+                        + "]}}}"
+                )
+            );
+            assertEquals("bool must with unmapped clause must return 0 hits: " + bool, 0, extractIntPath(bool, "hits", "total", "value"));
+
+            // (d) regression fence: range on the mapped `id`
+            // column still resolves normally on the same index.
+            // Ensures the rewrite step does not accidentally
+            // treat mapped fields as MatchNone.
+            String mapped = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"id\":{\"gte\":1,\"lt\":3}}},\"size\":10}")
+            );
+            assertEquals("mapped range must return 2 hits: " + mapped, 2, extractIntPath(mapped, "hits", "total", "value"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFragmentDispatchModeCountsFtsHitsWithoutWeightMaterialisation() throws Exception {
         // triggered LanceFtsQuery's Weight to fully materialise every
         // hit's row address and score into the sparse buffer. On a 20M

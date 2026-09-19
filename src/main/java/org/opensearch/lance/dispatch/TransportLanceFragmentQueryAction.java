@@ -426,7 +426,21 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
 
     private Query resolveLuceneQuery(LanceFragmentQueryRequest request, QueryShardContext qsc) throws java.io.IOException {
         if (request.query() != null) {
-            Query base = request.query().toQuery(qsc);
+            // Rewrite before toQuery so that shapes which rely on
+            // doRewrite to fold themselves away — most notably
+            // RangeQueryBuilder against an unmapped field, which
+            // rewrites to MatchNone via
+            // RangeQueryBuilder.getRelation returning DISJOINT —
+            // are resolved before Lucene translation. Without this
+            // step RangeQueryBuilder.doToQuery throws
+            // IllegalStateException("Rewrite first"), which the
+            // OpenSearch error handler surfaces as a 500. See
+            // issue #50 and the shard-path counterpart in
+            // QueryShardContext.toQuery (which does the same
+            // Rewriteable.rewrite call before invoking
+            // doToQuery).
+            org.opensearch.index.query.QueryBuilder rewritten = org.opensearch.index.query.Rewriteable.rewrite(request.query(), qsc, true);
+            Query base = rewritten.toQuery(qsc);
             // If the request shape allows top-k pushdown and the
             // resulting Lucene tree is a bare LanceFtsQuery (single
             // lance_match / lance_match_phrase / etc. at the root),
@@ -531,7 +545,12 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (request.postFilter() == null) {
             return base;
         }
-        Query pf = request.postFilter().toQuery(qsc);
+        // Same rewrite-before-toQuery pattern as resolveLuceneQuery;
+        // post_filter can also carry a range against an unmapped
+        // field and would otherwise raise "Rewrite first" from
+        // doToQuery.
+        org.opensearch.index.query.QueryBuilder rewritten = org.opensearch.index.query.Rewriteable.rewrite(request.postFilter(), qsc, true);
+        Query pf = rewritten.toQuery(qsc);
         return new org.apache.lucene.search.BooleanQuery.Builder().add(base, org.apache.lucene.search.BooleanClause.Occur.MUST)
             .add(pf, org.apache.lucene.search.BooleanClause.Occur.FILTER)
             .build();
