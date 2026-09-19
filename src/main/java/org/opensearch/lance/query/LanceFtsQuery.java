@@ -201,8 +201,22 @@ public final class LanceFtsQuery extends Query {
                 // is 1 (Lance rejects limit == 0); shapes that must
                 // see every match keep the sentinel and get maxDoc.
                 long effectiveLimit = scanLimit == SCAN_LIMIT_UNBOUNDED ? (long) maxDoc : Math.min((long) scanLimit, (long) maxDoc);
-                float[] scores = new float[maxDoc];
-                org.apache.lucene.util.FixedBitSet matches = new org.apache.lucene.util.FixedBitSet(maxDoc);
+                // Accumulate hits into a packed long array
+                // (docId << 32 | Float.floatToIntBits(score)) sized
+                // to the effective limit rather than the fragment's
+                // maxDoc. A fragment with maxDoc = 250,000 and a
+                // size:10 query used to allocate 1 MB of scores and
+                // 31 KB of bitset per query; the packed form uses
+                // 8 bytes * hitCount, an order of magnitude smaller
+                // in the common case and unchanged when the caller
+                // asks for the full match set. Growth is capped by
+                // effectiveLimit so an unbounded scan cannot overrun.
+                int capacity = (int) Math.min(effectiveLimit, 128L);
+                if (capacity <= 0) {
+                    capacity = 1;
+                }
+                long[] packed = new long[capacity];
+                int hitCount = 0;
                 ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(leaf.fragmentId()))
                     .fullTextQuery(fullTextQuery)
                     .withRowAddress(true)
@@ -214,9 +228,13 @@ public final class LanceFtsQuery extends Query {
                         UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
                         Float4Vector score = (Float4Vector) root.getVector("_score");
                         for (int i = 0; i < root.getRowCount(); i++) {
+                            if (hitCount == packed.length) {
+                                int nextSize = Math.min(packed.length * 2, Math.max((int) effectiveLimit, packed.length + 1));
+                                packed = java.util.Arrays.copyOf(packed, nextSize);
+                            }
                             int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
-                            matches.set(offset);
-                            scores[offset] = score.get(i) * boost;
+                            float s = score.get(i) * boost;
+                            packed[hitCount++] = ((long) offset << 32) | (Float.floatToIntBits(s) & 0xFFFFFFFFL);
                         }
                     }
                 } catch (IOException e) {
@@ -224,8 +242,26 @@ public final class LanceFtsQuery extends Query {
                 } catch (Exception e) {
                     throw new IOException(e);
                 }
-
-                var iterator = new org.apache.lucene.util.BitSetIterator(matches, matches.cardinality());
+                if (hitCount == 0) {
+                    return null;
+                }
+                // Sort by packed key so docIds land ascending; scores
+                // ride along in the low 32 bits. Java Arrays.sort on
+                // long uses the natural (signed) ordering, but offsets
+                // are non-negative int values, so the high 32 bits
+                // stay in 0..Integer.MAX_VALUE and the sort is
+                // effectively docId ascending, score ascending as a
+                // stable secondary — the Lucene DocIdSetIterator
+                // contract asks for ascending docIds and does not
+                // care about score order at equal docIds.
+                java.util.Arrays.sort(packed, 0, hitCount);
+                int[] docIds = new int[hitCount];
+                float[] hitScores = new float[hitCount];
+                for (int i = 0; i < hitCount; i++) {
+                    docIds[i] = (int) (packed[i] >>> 32);
+                    hitScores[i] = Float.intBitsToFloat((int) (packed[i] & 0xFFFFFFFFL));
+                }
+                LanceSparseHitIterator iterator = new LanceSparseHitIterator(docIds, hitScores, hitCount);
                 Scorer scorer = new Scorer() {
                     @Override
                     public DocIdSetIterator iterator() {
@@ -239,7 +275,7 @@ public final class LanceFtsQuery extends Query {
 
                     @Override
                     public float score() {
-                        return scores[iterator.docID()];
+                        return iterator.currentScore();
                     }
 
                     @Override

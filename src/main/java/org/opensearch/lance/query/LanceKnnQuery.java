@@ -26,8 +26,6 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.Weight;
-import org.apache.lucene.util.BitSetIterator;
-import org.apache.lucene.util.FixedBitSet;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.opensearch.lance.LanceCircuitBreaker;
@@ -139,15 +137,35 @@ public final class LanceKnnQuery extends Query {
                 return null;
             }
 
-            int maxDoc = leaf.maxDoc();
-            FixedBitSet matches = new FixedBitSet(maxDoc);
-            float[] scores = new float[maxDoc];
-            for (int i = 0; i < hits.size; i++) {
+            // FragmentHits.offsets / distances is already the sparse
+            // list Lance's nearest scan returned for this fragment,
+            // so materialise the hit set directly rather than
+            // allocating float[maxDoc] and FixedBitSet(maxDoc). On
+            // a 250k-row fragment this drops per-fragment heap from
+            // 1 MB + 31 KB to 8 bytes * hits.size (typically <= k).
+            // Multiplied by 80 fragments and 64 concurrent queries
+            // this was the main driver behind #47 (parent breaker
+            // latching under raised max_concurrent).
+            //
+            // Lance's nearest scan returns rows in score order; the
+            // Lucene DocIdSetIterator contract asks for ascending
+            // docIds, so pack (offset, score) into longs, sort, and
+            // hand a LanceSparseHitIterator to the Scorer.
+            int hitCount = hits.size;
+            long[] packed = new long[hitCount];
+            for (int i = 0; i < hitCount; i++) {
                 int offset = hits.offsets[i];
-                matches.set(offset);
-                scores[offset] = boost / (1f + hits.distances[i]);
+                float score = boost / (1f + hits.distances[i]);
+                packed[i] = ((long) offset << 32) | (Float.floatToIntBits(score) & 0xFFFFFFFFL);
             }
-            BitSetIterator iterator = new BitSetIterator(matches, hits.size);
+            Arrays.sort(packed);
+            int[] docIds = new int[hitCount];
+            float[] hitScores = new float[hitCount];
+            for (int i = 0; i < hitCount; i++) {
+                docIds[i] = (int) (packed[i] >>> 32);
+                hitScores[i] = Float.intBitsToFloat((int) (packed[i] & 0xFFFFFFFFL));
+            }
+            LanceSparseHitIterator iterator = new LanceSparseHitIterator(docIds, hitScores, hitCount);
             Scorer scorer = new Scorer() {
                 @Override
                 public DocIdSetIterator iterator() {
@@ -161,7 +179,7 @@ public final class LanceKnnQuery extends Query {
 
                 @Override
                 public float score() {
-                    return scores[iterator.docID()];
+                    return iterator.currentScore();
                 }
 
                 @Override
