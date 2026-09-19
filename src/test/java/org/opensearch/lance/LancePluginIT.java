@@ -2616,6 +2616,123 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testSortPushdownMatchesLuceneOrderAndSortValues() throws Exception {
+        // Sorted scalar-filter pages (match_all or a filter the
+        // coordinator translated to Lance SQL, no aggregations, no
+        // post_filter, no search_after) run as one Lance scan with
+        // ColumnOrderings + limit instead of a Lucene TopFieldCollector
+        // over every matching row. The pushdown has to reproduce
+        // Lucene's order, its handling of missing values (`_last` /
+        // `_first`), and the typed sort values clients feed back as
+        // search_after. Adding a trivial aggregation to the same
+        // request forces the Lucene path (aggregations need the full
+        // match set), which gives an in-cluster oracle: the hits of
+        // the two requests must be identical.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpNullable("sortpush")) {
+            String indexName = fixture.indexName();
+            String oracleAgg = ",\"aggs\":{\"n\":{\"value_count\":{\"field\":\"id\"}}}";
+
+            // Single numeric key, descending, one null row (id=5).
+            // `_last` on a descending sort puts the null at the end
+            // and Lucene reports Long.MIN_VALUE as its sort value.
+            String desc = "{\"size\":12,\"sort\":[{\"count16\":\"desc\"}]";
+            java.util.List<java.util.Map<String, Object>> descHits = hitsOf(readAll(postJson("/" + indexName + "/_search", desc + "}")));
+            java.util.List<java.util.Map<String, Object>> descOracle = hitsOf(
+                readAll(postJson("/" + indexName + "/_search", desc + oracleAgg + "}"))
+            );
+            assertEquals("count16 desc must match the Lucene path", descOracle, descHits);
+            assertEquals(
+                java.util.List.of("0-11", "0-10", "0-9", "0-8", "0-7", "0-6", "0-4", "0-3", "0-2", "0-1", "0-0", "0-5"),
+                idsOf(descHits)
+            );
+            assertEquals(java.util.List.of(1100), sortValuesOf(descHits.get(0)));
+            // count16 is mapped as `short`, which OpenSearch sorts with
+            // SortField.Type.INT, so the `_last` sentinel on a
+            // descending sort is Integer.MIN_VALUE, not Long.MIN_VALUE.
+            assertEquals(java.util.List.of(Integer.MIN_VALUE), sortValuesOf(descHits.get(11)));
+
+            // Two keys with a boolean primary key and a numeric
+            // tie-break, plus the null row (flag is null on id=5) at
+            // the end.
+            String multi = "{\"size\":12,\"sort\":[{\"flag\":\"asc\"},{\"id\":\"desc\"}]";
+            java.util.List<java.util.Map<String, Object>> multiHits = hitsOf(readAll(postJson("/" + indexName + "/_search", multi + "}")));
+            java.util.List<java.util.Map<String, Object>> multiOracle = hitsOf(
+                readAll(postJson("/" + indexName + "/_search", multi + oracleAgg + "}"))
+            );
+            assertEquals("flag asc, id desc must match the Lucene path", multiOracle, multiHits);
+            assertEquals(
+                java.util.List.of("0-11", "0-10", "0-8", "0-7", "0-4", "0-2", "0-1", "0-9", "0-6", "0-3", "0-0", "0-5"),
+                idsOf(multiHits)
+            );
+            assertEquals(java.util.List.of(0, 11), sortValuesOf(multiHits.get(0)));
+            assertEquals(java.util.List.of(1, 9), sortValuesOf(multiHits.get(7)));
+
+            // missing:_first flips where the null row lands.
+            String first = "{\"size\":3,\"sort\":[{\"count64\":{\"order\":\"asc\",\"missing\":\"_first\"}}]";
+            java.util.List<java.util.Map<String, Object>> firstHits = hitsOf(readAll(postJson("/" + indexName + "/_search", first + "}")));
+            java.util.List<java.util.Map<String, Object>> firstOracle = hitsOf(
+                readAll(postJson("/" + indexName + "/_search", first + oracleAgg + "}"))
+            );
+            assertEquals("count64 asc missing:_first must match the Lucene path", firstOracle, firstHits);
+            assertEquals(java.util.List.of("0-5", "0-0", "0-1"), idsOf(firstHits));
+
+            // Filter + sort + limit: Lance evaluates the filter and the
+            // top-k in one pass; hits.total still reports the full
+            // match count.
+            String filtered = "{\"size\":3,\"query\":{\"range\":{\"id\":{\"gte\":3,\"lt\":10}}},\"sort\":[{\"count8\":\"desc\"}]";
+            String filteredBody = readAll(postJson("/" + indexName + "/_search", filtered + "}"));
+            java.util.List<java.util.Map<String, Object>> filteredHits = hitsOf(filteredBody);
+            java.util.List<java.util.Map<String, Object>> filteredOracle = hitsOf(
+                readAll(postJson("/" + indexName + "/_search", filtered + oracleAgg + "}"))
+            );
+            assertEquals("range + count8 desc must match the Lucene path", filteredOracle, filteredHits);
+            assertEquals(java.util.List.of("0-9", "0-8", "0-7"), idsOf(filteredHits));
+            assertEquals(7, extractIntPath(filteredBody, "hits", "total", "value"));
+
+            // A literal missing value has no ColumnOrdering equivalent
+            // and must keep working through the Lucene fallback.
+            String literalMissing = "{\"size\":12,\"sort\":[{\"count16\":{\"order\":\"asc\",\"missing\":250}}]}";
+            java.util.List<java.util.Map<String, Object>> literalHits = hitsOf(
+                readAll(postJson("/" + indexName + "/_search", literalMissing))
+            );
+            assertEquals(
+                java.util.List.of("0-0", "0-1", "0-2", "0-5", "0-3", "0-4", "0-6", "0-7", "0-8", "0-9", "0-10", "0-11"),
+                idsOf(literalHits)
+            );
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static java.util.List<java.util.Map<String, Object>> hitsOf(String searchBody) throws IOException {
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, searchBody)) {
+            java.util.Map<String, Object> map = parser.map();
+            java.util.List<Object> hits = (java.util.List<Object>) ((java.util.Map<String, Object>) map.get("hits")).get("hits");
+            java.util.List<java.util.Map<String, Object>> out = new java.util.ArrayList<>(hits.size());
+            for (Object hit : hits) {
+                java.util.Map<String, Object> copy = new java.util.LinkedHashMap<>((java.util.Map<String, Object>) hit);
+                // _score is NaN on both paths and serialises as null;
+                // drop it so the comparison is about order, ids, sort
+                // values and _source only.
+                copy.remove("_score");
+                out.add(copy);
+            }
+            return out;
+        }
+    }
+
+    private static java.util.List<String> idsOf(java.util.List<java.util.Map<String, Object>> hits) {
+        java.util.List<String> ids = new java.util.ArrayList<>(hits.size());
+        for (java.util.Map<String, Object> hit : hits) {
+            ids.add((String) hit.get("_id"));
+        }
+        return ids;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static java.util.List<Object> sortValuesOf(java.util.Map<String, Object> hit) {
+        return (java.util.List<Object>) hit.get("sort");
+    }
+
     public void testAttachRecreateAtSamePathServesNewContent() throws Exception {
         // Issue #46: recreating a Lance table at the same filesystem
         // path left stale index-page entries in the shared Lance

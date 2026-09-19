@@ -1550,7 +1550,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * per leaf; a doc that was not prefetched triggers a single-row
      * take here so the method stays correct for any caller.
      */
-    void materialiseStoredFields(int docID, StoredFieldVisitor visitor) throws IOException {
+    public void materialiseStoredFields(int docID, StoredFieldVisitor visitor) throws IOException {
         FieldInfo idInfo = storedOnly("_id", 1);
         FieldInfo sourceInfo = storedOnly("_source", 2);
         boolean needsId = visitor.needsField(idInfo) == StoredFieldVisitor.Status.YES;
@@ -1705,7 +1705,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
     // nulls; this method assumes the input index has a value. Date/Timestamp
     // vectors are normalized to epoch milliseconds so the DateFieldMapper
     // reads them through the same numeric doc value path as integers.
-    static long readAsLong(FieldVector v, int i) {
+    public static long readAsLong(FieldVector v, int i) {
         if (v instanceof org.apache.arrow.vector.TinyIntVector t) {
             return t.get(i);
         }
