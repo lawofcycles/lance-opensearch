@@ -149,6 +149,29 @@ public final class LanceFragmentLeafReader extends LeafReader {
     private final FieldInfos fieldInfos;
     private final Dataset dataset;
     private final int fragmentId;
+    /**
+     * SQL predicate the caller wants applied to every per-column scan
+     * this reader issues, or {@code null} for an unfiltered scan.
+     *
+     * <p>Fragment path queries whose top-level shape is a scalar
+     * filter that {@code LanceKnnFilterTranslator} can translate to
+     * Lance SQL ship the translated predicate as
+     * {@code LanceFragmentQueryRequest.filterSql()}. The fragment
+     * dispatch handler now forwards that predicate all the way to
+     * the leaf reader so the lazy column loads inside
+     * {@link #ensureNumericLoaded} et al. only materialise the rows
+     * that match. Without the predicate, {@code filter + terms} or
+     * {@code filter + sum} on a 20M row fragment reads every value
+     * in the aggregated column, throwing the fragment path back to
+     * the pre-Phase-A pattern despite the Weight side already
+     * filtering.
+     *
+     * <p>Kept {@code null} when the query cannot be expressed in
+     * Lance SQL (FTS, knn, unsupported shapes) so the reader falls
+     * back to full-column scans and the aggregator still runs on
+     * every doc the Weight yields.
+     */
+    private final String filterSql;
     // Column kind resolved eagerly during construction. Preserves schema order
     // so materialiseStoredFields emits _source keys in schema order regardless
     // of which columns have been loaded so far.
@@ -202,6 +225,28 @@ public final class LanceFragmentLeafReader extends LeafReader {
         org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
         java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
     ) throws IOException {
+        this(dataset, fragmentId, physicalRows, intField, pkType, multiFields, null);
+    }
+
+    /**
+     * Same as {@link #LanceFragmentLeafReader(Dataset, int, long, String,
+     * org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType,
+     * java.util.Map)}, but attaches a Lance SQL predicate that
+     * every {@link #ensureNumericLoaded} / {@link #ensureBooleanLoaded}
+     * / {@link #ensureTextLoaded} / {@link #ensureKeywordArrayLoaded}
+     * / {@link #ensureBinaryLoaded} call layers into its
+     * {@link ScanOptions#filter} before scanning. See the
+     * {@link #filterSql} field doc for the details.
+     */
+    public LanceFragmentLeafReader(
+        Dataset dataset,
+        int fragmentId,
+        long physicalRows,
+        String intField,
+        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+        String filterSql
+    ) throws IOException {
         this.dataset = dataset;
         this.fragmentId = fragmentId;
         this.fieldName = intField;
@@ -214,6 +259,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
         this.pkType = intField.isEmpty() ? org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.NONE : pkType;
         this.maxDoc = (int) physicalRows;
         this.values = new long[maxDoc];
+        this.filterSql = filterSql;
         // pkStrings is a separate per-doc array so LONG PKs do not pay
         // for a parallel object array they never read from. Allocated
         // eagerly only for KEYWORD PKs.
@@ -445,6 +491,29 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     /**
+     * Build the {@link ScanOptions} the per-column
+     * {@code ensureXxxLoaded} helpers share: pin to this fragment,
+     * project a single column, ask for row addresses so the caller
+     * can splice the values back into the offset-indexed arrays,
+     * and layer {@link #filterSql} into
+     * {@link ScanOptions.Builder#filter} when the top-level query
+     * pushed one down.
+     *
+     * <p>Consolidating the option assembly here means every column
+     * loader agrees on the same shape; the filter push-down would
+     * otherwise be six near-identical edits that could drift.
+     */
+    private ScanOptions singleColumnScan(String name) {
+        ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
+            .columns(Collections.singletonList(name))
+            .withRowAddress(true);
+        if (filterSql != null) {
+            builder = builder.filter(filterSql);
+        }
+        return builder.build();
+    }
+
+    /**
      * Lance-scan the single column identified by {@code name} into
      * {@code numericColumns} / {@code numericPresence}. Only the caller that
      * wins the {@link #columnLock} does the scan; others block briefly and
@@ -460,10 +529,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             }
             long[] col = new long[maxDoc];
             FixedBitSet presence = new FixedBitSet(maxDoc);
-            ScanOptions colOptions = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
-                .columns(Collections.singletonList(name))
-                .withRowAddress(true)
-                .build();
+            ScanOptions colOptions = singleColumnScan(name);
             try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -495,10 +561,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             }
             long[] col = new long[maxDoc];
             FixedBitSet presence = new FixedBitSet(maxDoc);
-            ScanOptions colOptions = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
-                .columns(Collections.singletonList(name))
-                .withRowAddress(true)
-                .build();
+            ScanOptions colOptions = singleColumnScan(name);
             try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -535,10 +598,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 return;
             }
             String[] raw = new String[maxDoc];
-            ScanOptions colOptions = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
-                .columns(Collections.singletonList(name))
-                .withRowAddress(true)
-                .build();
+            ScanOptions colOptions = singleColumnScan(name);
             try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -596,10 +656,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 return;
             }
             String[][] rows = new String[maxDoc][];
-            ScanOptions colOptions = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
-                .columns(Collections.singletonList(name))
-                .withRowAddress(true)
-                .build();
+            ScanOptions colOptions = singleColumnScan(name);
             try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -676,10 +733,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 return;
             }
             byte[][] col = new byte[maxDoc][];
-            ScanOptions colOptions = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
-                .columns(Collections.singletonList(name))
-                .withRowAddress(true)
-                .build();
+            ScanOptions colOptions = singleColumnScan(name);
             try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();

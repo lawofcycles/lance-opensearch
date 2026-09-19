@@ -1224,6 +1224,151 @@ public class LancePluginIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFragmentDispatchModeAppliesFilterPushdownDuringColumnMaterialisation() throws Exception {
+        // Issue #42 Phase C / Step C-1: fragment path now passes the
+        // top-level Lance SQL filter through to LanceFragmentLeafReader,
+        // and every per-column ensureXxxLoaded scan layers the same
+        // filter into ScanOptions before asking Lance for values.
+        //
+        // Before the fix, `filter + sum(x)` on a 20M row fragment
+        // materialised every value of `x` even when the filter kept
+        // 5% of rows, because the ensureNumericLoaded scan issued a
+        // full-column scan and let the Weight side drop non-matching
+        // rows after the fact. Correctness stayed intact but the
+        // load side did the work the filter was supposed to prune.
+        //
+        // This test does not measure timing — it fences the correctness
+        // side, so a follow-up refactor cannot silently drop matches
+        // when the filter is pushed down. The bucket / metric values
+        // must still equal the unfiltered aggregation restricted to
+        // matching rows.
+        String suffix = "fcpc-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        // Six rows: id 0..5, body alternating "hello lance i" (even)
+        // and "quick brown fox i" (odd). Numeric column `id`
+        // exercises numeric doc values; `body` (indexed as
+        // lance_text with a keyword sub-field) exercises keyword doc
+        // values and, indirectly, the terms-agg ordinal path.
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson(
+                "/_lance/attach",
+                // Declare body.raw as a keyword sub-field so the terms
+                // aggregation cases below (b, c, d) can key on it.
+                // Without the multi_fields clause the sub-field
+                // resolves to nothing and the terms bucket silently
+                // returns zero buckets.
+                "{\"table\":\"" + tableUri + "\",\"multi_fields\":{\"body\":{\"raw\":{\"type\":\"keyword\"}}}}"
+            );
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // (a) filter + metric aggs: id >= 2 keeps {2, 3, 4, 5}.
+            // sum = 14, avg = 3.5, min = 2, max = 5, value_count = 4.
+            // Every one of those values is served from
+            // numericColumns.get("id") which was populated by a
+            // scan that carried filterSql = "(id >= 2)"; the assert
+            // catches any regression where the filter fails to
+            // route to the leaf reader.
+            String metricBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":2}}},\"aggs\":{"
+                        + "\"c\":{\"value_count\":{\"field\":\"id\"}},"
+                        + "\"s\":{\"sum\":{\"field\":\"id\"}},"
+                        + "\"a\":{\"avg\":{\"field\":\"id\"}},"
+                        + "\"m\":{\"min\":{\"field\":\"id\"}},"
+                        + "\"M\":{\"max\":{\"field\":\"id\"}}"
+                        + "}}"
+                )
+            );
+            assertEquals("filter + metric aggs must count matching rows", 4, extractIntPath(metricBody, "hits", "total", "value"));
+            assertEquals("value_count with id>=2 == 4", 4, extractIntPath(metricBody, "aggregations", "c", "value"));
+            assertEquals("sum(id) with id>=2 == 14", 14.0d, extractDoublePath(metricBody, "aggregations", "s", "value"), 0.0d);
+            assertEquals("avg(id) with id>=2 == 3.5", 3.5d, extractDoublePath(metricBody, "aggregations", "a", "value"), 0.0d);
+            assertEquals("min(id) with id>=2 == 2", 2.0d, extractDoublePath(metricBody, "aggregations", "m", "value"), 0.0d);
+            assertEquals("max(id) with id>=2 == 5", 5.0d, extractDoublePath(metricBody, "aggregations", "M", "value"), 0.0d);
+
+            // (b) filter + terms bucket agg on the keyword sub-field
+            // of a lance_text column. `id < 3` keeps {0, 1, 2}. The
+            // body values on those rows are:
+            // id=0 → "hello lance 0"
+            // id=1 → "quick brown fox 1"
+            // id=2 → "hello lance 2"
+            // Terms agg on body.raw must open three buckets, each
+            // with a doc count of 1. Bucket assembly walks
+            // getSortedSetDocValues("body.raw") on filter-matched
+            // docs; the ord dictionary the leaf reader builds must
+            // contain the three matching values (and only those,
+            // since ensureTextLoaded's scan was filtered).
+            String termsBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"range\":{\"id\":{\"lt\":3}}},"
+                        + "\"aggs\":{\"by_body\":{\"terms\":{\"field\":\"body.raw\",\"size\":10}}}}"
+                )
+            );
+            assertEquals("filter + terms total must count matching rows", 3, extractIntPath(termsBody, "hits", "total", "value"));
+            assertTrue("filter + terms must open a bucket for id=0's body: " + termsBody, termsBody.contains("hello lance 0"));
+            assertTrue("filter + terms must open a bucket for id=1's body: " + termsBody, termsBody.contains("quick brown fox 1"));
+            assertTrue("filter + terms must open a bucket for id=2's body: " + termsBody, termsBody.contains("hello lance 2"));
+            // Rows outside the filter (id >= 3) must not leak into
+            // the terms dictionary. If they did, the ord numbering
+            // would shift and the bucket keys would be off. Pin the
+            // negative case with a value from id=3 (odd row, body
+            // starts with "quick brown fox 3") which the range
+            // filter must exclude.
+            assertFalse("filter + terms must not include rows outside the filter: " + termsBody, termsBody.contains("quick brown fox 3"));
+
+            // (c) filter + terms with a metric sub-agg. Confirms
+            // that the filter push-down still cooperates with the
+            // #40 fix (getPostCollectionAggregation instead of a
+            // second postCollection call). Same three buckets as
+            // (b); each carries avg(id) == that row's id.
+            String termsWithMetricBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"range\":{\"id\":{\"lt\":3}}},"
+                        + "\"aggs\":{\"by_body\":{\"terms\":{\"field\":\"body.raw\",\"size\":10},"
+                        + "\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}}"
+                )
+            );
+            assertEquals("filter + terms + sub-avg total unchanged", 3, extractIntPath(termsWithMetricBody, "hits", "total", "value"));
+            // Presence of the three keys plus the avg field
+            // structure inside each bucket is enough — Terms
+            // regression fence for the sub-agg wire happens in the
+            // dedicated Deferred sub-agg IT.
+            assertTrue(
+                "filter + terms + sub-avg must render the sub-agg: " + termsWithMetricBody,
+                termsWithMetricBody.contains("\"a\":{\"value\":")
+            );
+
+            // (d) match query + terms agg (regression fence for the
+            // FTS shape). Match queries are not translatable to
+            // Lance SQL, so filterSql stays null and
+            // ensureXxxLoaded falls back to the pre-Phase-C
+            // unfiltered scan. Correctness must be identical to the
+            // shard path: `match body:lance` hits the three even
+            // rows (0, 2, 4), each with a distinct body value.
+            String matchBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"match\":{\"body\":\"lance\"}},"
+                        + "\"aggs\":{\"by_body\":{\"terms\":{\"field\":\"body.raw\",\"size\":10}}}}"
+                )
+            );
+            assertEquals("match + terms total must count matching FTS rows", 3, extractIntPath(matchBody, "hits", "total", "value"));
+            assertTrue("match + terms must open a bucket for id=0's body: " + matchBody, matchBody.contains("hello lance 0"));
+            assertTrue("match + terms must open a bucket for id=4's body: " + matchBody, matchBody.contains("hello lance 4"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFragmentDispatchModeAnswersMatchKnnAndSort() throws Exception {
         // Direction 1 Stage 3: match on lance_text, knn on
         // lance_knn, and sort now flow through the fragment

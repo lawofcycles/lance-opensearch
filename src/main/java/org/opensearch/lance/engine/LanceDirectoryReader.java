@@ -137,6 +137,31 @@ public final class LanceDirectoryReader extends DirectoryReader {
         java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
         List<Integer> fragmentIds
     ) throws IOException {
+        return openForFragments(directory, commit, dataset, intField, pkType, multiFields, fragmentIds, null);
+    }
+
+    /**
+     * Same as
+     * {@link #openForFragments(Directory, IndexCommit, Dataset, String,
+     * org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType,
+     * java.util.Map, List)}, plus a Lance SQL predicate the caller
+     * wants attached to every per-column Lance scan the resulting
+     * leaves issue. See {@link LanceFragmentLeafReader#filterSql} for
+     * the rationale and semantics; {@code filterSql} is nullable and
+     * absent by default so existing callers (whole-table {@code open}
+     * used by the shard engine, tests that build a reader without
+     * a top-level filter) continue to run unfiltered column scans.
+     */
+    public static LanceDirectoryReader openForFragments(
+        Directory directory,
+        IndexCommit commit,
+        Dataset dataset,
+        String intField,
+        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+        List<Integer> fragmentIds,
+        String filterSql
+    ) throws IOException {
         java.util.Set<Integer> wanted = new java.util.HashSet<>(fragmentIds);
         List<LeafReader> leaves = new ArrayList<>(wanted.size());
         for (Fragment fragment : dataset.getFragments()) {
@@ -151,7 +176,8 @@ public final class LanceDirectoryReader extends DirectoryReader {
                         fragment.metadata().getPhysicalRows(),
                         intField,
                         pkType,
-                        multiFields
+                        multiFields,
+                        filterSql
                     )
                 )
             );

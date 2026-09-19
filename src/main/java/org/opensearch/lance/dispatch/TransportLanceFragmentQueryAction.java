@@ -289,7 +289,23 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     pkField,
                     pkType,
                     multiFields,
-                    effectiveFragmentIds
+                    effectiveFragmentIds,
+                    // Push the coordinator-translated Lance SQL down
+                    // to the leaf reader. When the top-level query is
+                    // a scalar filter LanceKnnFilterTranslator can
+                    // express (bool / term / terms / range / exists /
+                    // match_all), request.filterSql() carries the SQL
+                    // and every per-column Lance scan the leaf reader
+                    // issues inside ensureXxxLoaded is layered with
+                    // that filter, so `filter + terms agg` and
+                    // `filter + sum` no longer materialise every row
+                    // of the aggregated column when only a fraction
+                    // matches. FTS and knn queries do not have a
+                    // SQL representation so filterSql is null there
+                    // and the leaf reader falls back to unfiltered
+                    // full-column scans, matching the pre-Phase-C
+                    // behaviour for those shapes.
+                    request.filterSql()
                 )
             ) {
                 MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
@@ -757,7 +773,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         String pkField,
         org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
         java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
-        List<Integer> effectiveFragmentIds
+        List<Integer> effectiveFragmentIds,
+        String filterSql
     ) throws IOException {
         DirectoryReader lanceReader = LanceDirectoryReader.openForFragments(
             new ByteBuffersDirectory(),
@@ -766,7 +783,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             pkField,
             pkType,
             multiFields,
-            effectiveFragmentIds
+            effectiveFragmentIds,
+            filterSql
         );
         OpenSearchDirectoryReader wrapped = null;
         try {
