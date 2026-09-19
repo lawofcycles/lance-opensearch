@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Locale;
 import java.util.Map;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -94,7 +95,7 @@ final class LanceTableFactory {
      *         {@code /_lance/attach} or namespace register).
      */
     static String writeTable(Path parent, String name, int rowCount) throws Exception {
-        return retryOnFfiFlake(() -> writeTableOnce(parent, name, rowCount));
+        return withLocaleRoot(() -> writeTableOnce(parent, name, rowCount));
     }
 
     private static String writeTableOnce(Path parent, String name, int rowCount) throws Exception {
@@ -226,7 +227,7 @@ final class LanceTableFactory {
      * Rows with {@code i == 5} set every nullable column to Arrow null.
      */
     static String writeNullableTable(Path parent, String name) throws Exception {
-        return retryOnFfiFlake(() -> writeNullableTableOnce(parent, name));
+        return withLocaleRoot(() -> writeNullableTableOnce(parent, name));
     }
 
     private static String writeNullableTableOnce(Path parent, String name) throws Exception {
@@ -343,7 +344,7 @@ final class LanceTableFactory {
      *         {@code /_lance/attach} or namespace register.
      */
     static String writeKeywordOnlyTable(Path parent, String name, int rowCount) throws Exception {
-        return retryOnFfiFlake(() -> writeKeywordOnlyTableOnce(parent, name, rowCount));
+        return withLocaleRoot(() -> writeKeywordOnlyTableOnce(parent, name, rowCount));
     }
 
     /**
@@ -363,7 +364,7 @@ final class LanceTableFactory {
      * {@code GET /{index}/_doc/{key}} resolves via a quoted Lance filter.
      */
     static String writeStringPkTable(Path parent, String name, int rowCount) throws Exception {
-        return retryOnFfiFlake(() -> writeStringPkTableOnce(parent, name, rowCount));
+        return withLocaleRoot(() -> writeStringPkTableOnce(parent, name, rowCount));
     }
 
     private static String writeStringPkTableOnce(Path parent, String name, int rowCount) throws Exception {
@@ -446,7 +447,7 @@ final class LanceTableFactory {
      * both round-trip.
      */
     static String writeUnsignedLongPkTable(Path parent, String name) throws Exception {
-        return retryOnFfiFlake(() -> writeUnsignedLongPkTableOnce(parent, name));
+        return withLocaleRoot(() -> writeUnsignedLongPkTableOnce(parent, name));
     }
 
     private static String writeUnsignedLongPkTableOnce(Path parent, String name) throws Exception {
@@ -603,7 +604,7 @@ final class LanceTableFactory {
      *         {@code /_lance/attach} or namespace register.
      */
     static String writeDatedTable(Path parent, String name) throws Exception {
-        return retryOnFfiFlake(() -> writeDatedTableOnce(parent, name));
+        return withLocaleRoot(() -> writeDatedTableOnce(parent, name));
     }
 
     private static String writeDatedTableOnce(Path parent, String name) throws Exception {
@@ -684,55 +685,89 @@ final class LanceTableFactory {
     }
 
     /**
-     * Retry helper for the known Lance 11 FFI flake documented in
-     * research/opensearch/lance-integration/lance-11-ffi-flake.md.
-     * The flake manifests as a RuntimeException carrying the string
-     * "The FixedSizeList type requires an integer parameter" thrown
-     * inside Dataset.create's Arrow C Data bridge; retrying almost
-     * always succeeds. Multi-node integTest exercises the flake at
-     * a higher rate because three cluster JVMs and the test JVM
-     * share the same Lance native allocator pool.
+     * Pins the JVM's default {@link Locale} to {@link Locale#ROOT}
+     * for the duration of a Lance write, saving and restoring the
+     * previous default in a {@code finally} block.
      *
-     * <p>Any exception that does not match the flake signature is
-     * rethrown unchanged so real failures still surface.
+     * <h2>Why this is necessary</h2>
+     *
+     * <p>Apache Arrow Java 18.1.0 formats the C Data interface schema
+     * string in {@code org.apache.arrow.c.Format#asString} using
+     * {@code String.format("+w:%d", listSize)} without an explicit
+     * locale. {@code String.format(String, Object...)} routes through
+     * {@code Locale.getDefault(Locale.Category.FORMAT)} and Java's
+     * {@code Formatter} Number Localization Algorithm rewrites each
+     * digit using the current locale's
+     * {@code DecimalFormatSymbols.getZeroDigit()}. Roughly 9.2% of the
+     * locales available on JDK 21.0.6 (98 of 1069) use a non-ASCII zero
+     * digit: Arabic-Indic ({@code ar-*}, {@code fa-*}, {@code ur-IN}),
+     * Bengali ({@code as}, {@code bn-*}), Devanagari ({@code mr},
+     * {@code ne}), Myanmar ({@code my}), Tibetan ({@code dz}) and
+     * others. When the default locale is one of those, the schema
+     * string becomes {@code "+w:٨"} (or similar), and the arrow-rs 58
+     * side (which is what Lance 11 embeds) tries to parse the digits
+     * with {@code num_elems.parse::<i32>()}. The {@code i32::from_str}
+     * parser only accepts ASCII digits, so the call fails with
+     * {@code "The FixedSizeList type requires an integer parameter
+     * representing number of elements per list"}.
+     *
+     * <p>The same {@code %d} pattern is used in the Format helper for
+     * {@code FixedSizeBinary} and {@code Decimal}, so any of those
+     * three types passed through the Arrow C Data bridge from Java is
+     * affected. Every fixture in this factory is wrapped for
+     * uniformity even when the current schema does not contain one of
+     * the three, so future edits that add {@code FixedSizeList} to a
+     * fixture inherit the fix automatically.
+     *
+     * <h2>Why the JVM default is randomised inside integTest</h2>
+     *
+     * <p>Lucene's test framework rule
+     * {@code TestRuleSetupAndRestoreClassEnv#before} picks a locale
+     * from {@code LuceneTestCase.randomLocale(Random)} on every test
+     * class and installs it with {@code Locale.setDefault(...)}
+     * before the class runs. {@code OpenSearchTestCase.ensureSupportedLocale}
+     * only overrides that to English on a FIPS JVM, so under a normal
+     * integTest the seed of the run drives a decision that lands on
+     * an "Arabic-Indic digits" locale about 9 out of 100 seeds. The
+     * result is a decisive, seed-deterministic failure that looked
+     * like a "flake" only because the reproducer had never been run
+     * with the same seed twice.
+     *
+     * <h2>Why we scope the pin to the write region</h2>
+     *
+     * <p>{@code Locale.setDefault(...)} mutates a JVM-global piece of
+     * state, so pinning it for the entire test run would erase the
+     * Locale-randomization coverage that OpenSearch and Lucene rely
+     * on to catch locale-sensitive bugs in the code under test. Only
+     * the Lance write path needs ASCII digits, so scoping the pin to
+     * that region keeps the coverage for everything else. The tests
+     * run single-threaded so there is no window where another thread
+     * observes the temporary {@code Locale.ROOT}.
+     *
+     * <h2>Follow-up: fix in Apache Arrow Java</h2>
+     *
+     * <p>The upstream fix is to add {@code Locale.ROOT} to the four
+     * {@code String.format} calls in
+     * {@code org.apache.arrow.c.Format#asString} (or replace them with
+     * plain string concatenation, since {@code Integer.toString} is
+     * locale-independent). Tracked as a separate follow-up in
+     * {@code research/opensearch/lance-integration/lance-11-ffi-flake.md};
+     * once a fixed arrow-java is released and the {@code arrow-c-data}
+     * dependency in {@code build.gradle} is bumped, this workaround
+     * can be deleted.
      */
     @FunctionalInterface
     private interface ThrowingSupplier {
         String get() throws Exception;
     }
 
-    private static String retryOnFfiFlake(ThrowingSupplier supplier) throws Exception {
-        int maxAttempts = 5;
-        Exception lastFlake = null;
-        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-                return supplier.get();
-            } catch (RuntimeException e) {
-                if (!isFfiFlake(e)) {
-                    throw e;
-                }
-                lastFlake = e;
-                Thread.sleep(200L * attempt);
-            }
+    private static String withLocaleRoot(ThrowingSupplier supplier) throws Exception {
+        Locale saved = Locale.getDefault();
+        Locale.setDefault(Locale.ROOT);
+        try {
+            return supplier.get();
+        } finally {
+            Locale.setDefault(saved);
         }
-        if (lastFlake != null) {
-            throw lastFlake;
-        }
-        throw new AssertionError("retryOnFfiFlake exhausted attempts without an exception");
-    }
-
-    private static boolean isFfiFlake(Throwable t) {
-        // Match the exception chain because Dataset.create wraps the
-        // native error message inside a RuntimeException whose cause
-        // chain can be one or two levels deep.
-        Throwable cursor = t;
-        while (cursor != null) {
-            String message = cursor.getMessage();
-            if (message != null && message.contains("FixedSizeList type requires an integer parameter")) {
-                return true;
-            }
-            cursor = cursor.getCause();
-        }
-        return false;
     }
 }
