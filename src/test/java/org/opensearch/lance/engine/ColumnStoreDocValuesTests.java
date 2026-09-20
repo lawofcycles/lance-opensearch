@@ -11,15 +11,23 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.SortedDocValues;
+import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.ByteBuffersDirectory;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.BytesRefBuilder;
 import org.lance.Dataset;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
@@ -33,11 +41,13 @@ import org.opensearch.lance.engine.LanceWarmCache.Snapshot;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
- * Off-heap numeric and boolean doc values served from {@link ColumnStore}
- * through {@link LanceDirectoryReader#openForSnapshot}: every value and
- * presence bit equals the heap {@code long[]} path, one scan per
- * (snapshot, column), pins block eviction, the budget fallback loads into
- * heap, deleted rows are masked, and the breaker sees the footprint.
+ * Off-heap doc values served from {@link ColumnStore} through
+ * {@link LanceDirectoryReader#openForSnapshot}: every numeric value and
+ * presence bit equals the heap {@code long[]} path, every keyword
+ * dictionary, ordinal and term lookup equals the heap {@code BytesRef[]}
+ * path, one scan per (snapshot, column), pins block eviction, the budget
+ * fallback loads into heap, deleted rows are masked, and the breaker sees
+ * the footprint.
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
@@ -374,6 +384,459 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
                 assertEquals(rating(0), readByAdvanceExact(leaf, "rating")[0]);
                 CircuitBreakingException tripped = expectThrows(CircuitBreakingException.class, () -> readByAdvanceExact(leaf, "id"));
                 assertTrue(tripped.getMessage(), tripped.getMessage().contains(ColumnStore.BREAKER_LABEL));
+            }
+        }
+    }
+
+    // Keyword columns: dictionary and ordinals in the store.
+
+    private static String category(int i) {
+        return i % 4 == 3 ? null : "c" + (i % 3);
+    }
+
+    private static List<String> tags(int i) {
+        if (i % 6 == 5) {
+            return null;
+        }
+        return new ArrayList<>(new TreeSet<>(List.of("t" + (i % 2), "t" + (i % 5))));
+    }
+
+    /** Every term of {@code values} in ordinal order, copied out of whatever scratch the instance returns. */
+    private static List<String> dictionaryOf(SortedDocValues values) throws IOException {
+        List<String> terms = new ArrayList<>();
+        for (int ord = 0; ord < values.getValueCount(); ord++) {
+            terms.add(values.lookupOrd(ord).utf8ToString());
+        }
+        return terms;
+    }
+
+    private static List<String> dictionaryOf(SortedSetDocValues values) throws IOException {
+        List<String> terms = new ArrayList<>();
+        for (long ord = 0; ord < values.getValueCount(); ord++) {
+            terms.add(values.lookupOrd(ord).utf8ToString());
+        }
+        return terms;
+    }
+
+    /** Ordinal of every doc through advanceExact, {@code -1} where the doc has no value. */
+    private static int[] ordsByDoc(SortedDocValues values, int maxDoc) throws IOException {
+        int[] ords = new int[maxDoc];
+        for (int doc = 0; doc < maxDoc; doc++) {
+            ords[doc] = values.advanceExact(doc) ? values.ordValue() : -1;
+        }
+        return ords;
+    }
+
+    /** Ordinals of every doc through advanceExact / nextOrd, an empty array where the doc has no value. */
+    private static List<int[]> rowsByDoc(SortedSetDocValues values, int maxDoc) throws IOException {
+        List<int[]> rows = new ArrayList<>();
+        for (int doc = 0; doc < maxDoc; doc++) {
+            if (!values.advanceExact(doc)) {
+                rows.add(new int[0]);
+                continue;
+            }
+            int[] row = new int[values.docValueCount()];
+            for (int i = 0; i < row.length; i++) {
+                row[i] = (int) values.nextOrd();
+            }
+            rows.add(row);
+        }
+        return rows;
+    }
+
+    /** Doc ids yielded by nextDoc iteration. */
+    private static List<Integer> iterate(DocIdSetIterator values) throws IOException {
+        List<Integer> docs = new ArrayList<>();
+        for (int doc = values.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = values.nextDoc()) {
+            docs.add(doc);
+        }
+        return docs;
+    }
+
+    private static void assertSortedUnique(List<String> terms) {
+        for (int i = 1; i < terms.size(); i++) {
+            assertTrue(
+                "dictionary must ascend in unsigned byte order: " + terms,
+                new BytesRef(terms.get(i - 1)).compareTo(new BytesRef(terms.get(i))) < 0
+            );
+        }
+    }
+
+    private static final String[] ABSENT_TERMS = { "", "b", "c", "c0a", "c1\u0000", "c9", "d", "t", "t5", "zzz", "\u00ff" };
+
+    /** The store and heap instances of the single-valued keyword {@code column} agree on every read. */
+    private static void assertSameKeyword(String column, LanceFragmentLeafReader heap, LanceFragmentLeafReader offHeap) throws IOException {
+        SortedDocValues expected = heap.getSortedDocValues(column);
+        SortedDocValues actual = offHeap.getSortedDocValues(column);
+        assertEquals(column + " value count on fragment " + heap.fragmentId(), expected.getValueCount(), actual.getValueCount());
+        List<String> expectedTerms = dictionaryOf(expected);
+        List<String> actualTerms = dictionaryOf(actual);
+        assertEquals(column + " dictionary on fragment " + heap.fragmentId(), expectedTerms, actualTerms);
+        assertSortedUnique(actualTerms);
+        assertArrayEquals(
+            column + " ordinals on fragment " + heap.fragmentId(),
+            ordsByDoc(expected, heap.maxDoc()),
+            ordsByDoc(actual, offHeap.maxDoc())
+        );
+        assertEquals(column + " iteration on fragment " + heap.fragmentId(), iterate(expected), iterate(actual));
+        for (String term : actualTerms) {
+            BytesRef key = new BytesRef(term);
+            assertEquals("lookupTerm(" + term + ")", expected.lookupTerm(key), actual.lookupTerm(key));
+            assertEquals(term, actual.lookupOrd(actual.lookupTerm(key)).utf8ToString());
+        }
+        for (String absent : ABSENT_TERMS) {
+            BytesRef key = new BytesRef(absent);
+            int found = actual.lookupTerm(key);
+            assertTrue("absent term " + absent + " must report an insertion point", found < 0);
+            assertEquals("lookupTerm(absent " + absent + ")", expected.lookupTerm(key), found);
+        }
+        // Lucene's termsEnum walks the dictionary through lookupOrd.
+        List<String> viaTermsEnum = new ArrayList<>();
+        TermsEnum termsEnum = actual.termsEnum();
+        for (BytesRef term = termsEnum.next(); term != null; term = termsEnum.next()) {
+            viaTermsEnum.add(term.utf8ToString());
+        }
+        assertEquals(actualTerms, viaTermsEnum);
+    }
+
+    /** The store and heap instances of the multi-valued keyword {@code column} agree on every read. */
+    private static void assertSameKeywordArray(String column, LanceFragmentLeafReader heap, LanceFragmentLeafReader offHeap)
+        throws IOException {
+        SortedSetDocValues expected = heap.getSortedSetDocValues(column);
+        SortedSetDocValues actual = offHeap.getSortedSetDocValues(column);
+        assertEquals(column + " value count on fragment " + heap.fragmentId(), expected.getValueCount(), actual.getValueCount());
+        List<String> expectedTerms = dictionaryOf(expected);
+        List<String> actualTerms = dictionaryOf(actual);
+        assertEquals(column + " dictionary on fragment " + heap.fragmentId(), expectedTerms, actualTerms);
+        assertSortedUnique(actualTerms);
+        List<int[]> expectedRows = rowsByDoc(expected, heap.maxDoc());
+        List<int[]> actualRows = rowsByDoc(actual, offHeap.maxDoc());
+        assertEquals(expectedRows.size(), actualRows.size());
+        for (int doc = 0; doc < expectedRows.size(); doc++) {
+            assertArrayEquals(
+                column + " ordinals of doc " + doc + " on fragment " + heap.fragmentId(),
+                expectedRows.get(doc),
+                actualRows.get(doc)
+            );
+            int[] row = actualRows.get(doc);
+            for (int i = 1; i < row.length; i++) {
+                assertTrue("row ordinals must strictly ascend", row[i - 1] < row[i]);
+            }
+        }
+        assertEquals(column + " iteration on fragment " + heap.fragmentId(), iterate(expected), iterate(actual));
+        for (String term : actualTerms) {
+            BytesRef key = new BytesRef(term);
+            assertEquals("lookupTerm(" + term + ")", expected.lookupTerm(key), actual.lookupTerm(key));
+        }
+        for (String absent : ABSENT_TERMS) {
+            BytesRef key = new BytesRef(absent);
+            assertEquals("lookupTerm(absent " + absent + ")", expected.lookupTerm(key), actual.lookupTerm(key));
+        }
+    }
+
+    public void testKeywordDictionaryAndOrdinalsEqualTheHeapPath() throws Exception {
+        ColumnStore store = cache.columnStore();
+        try (Lease lease = acquire()) {
+            Snapshot snapshot = lease.snapshot();
+            try (
+                LanceDirectoryReader offHeap = openCached(snapshot, allFragments);
+                LanceDirectoryReader heap = openHeap(snapshot, allFragments)
+            ) {
+                List<LanceFragmentLeafReader> offHeapLeaves = leavesOf(offHeap);
+                List<LanceFragmentLeafReader> heapLeaves = leavesOf(heap);
+                BytesRefBuilder scratch = new BytesRefBuilder();
+                long entryBytes = 0L;
+                for (int f = 0; f < FRAGMENTS; f++) {
+                    LanceFragmentLeafReader leaf = offHeapLeaves.get(f);
+                    assertSameKeyword("category", heapLeaves.get(f), leaf);
+                    assertSameKeywordArray("tags", heapLeaves.get(f), leaf);
+                    assertTrue(leaf.isServingOffHeap("category"));
+                    assertTrue(leaf.isServingOffHeap("tags"));
+                    assertTrue(heapLeaves.get(f).isColumnFullyLoaded("category"));
+                    assertFalse("the reference reader has no store", heapLeaves.get(f).isServingOffHeap("category"));
+                    assertFalse(heapLeaves.get(f).isServingOffHeap("tags"));
+
+                    // Against the fixture formulas: c0 < c1 < c2, null every fourth row.
+                    CachedKeywordColumn category = leaf.offHeapKeywordColumn("category");
+                    assertEquals(3, category.valueCount());
+                    assertEquals(ROWS, category.rows());
+                    for (int offset = 0; offset < ROWS; offset++) {
+                        int i = f * ROWS + offset;
+                        String expected = category(i);
+                        if (expected == null) {
+                            assertEquals("row " + i + " is null", -1, category.ord(offset));
+                        } else {
+                            assertEquals("row " + i, expected, category.term(category.ord(offset), scratch).utf8ToString());
+                            assertEquals(i % 3, category.ord(offset));
+                        }
+                    }
+                    assertEquals(1, category.lookupTerm(new BytesRef("c1")));
+                    assertEquals(-1, category.lookupTerm(new BytesRef("a")));
+                    assertEquals(-4, category.lookupTerm(new BytesRef("c3")));
+
+                    // Offsets are contiguous; a null list is an empty range; rows are sorted and unique.
+                    CachedKeywordArrayColumn tags = leaf.offHeapKeywordArrayColumn("tags");
+                    assertEquals(5, tags.valueCount());
+                    assertEquals(0, tags.rowStart(0));
+                    for (int offset = 0; offset < ROWS; offset++) {
+                        int i = f * ROWS + offset;
+                        int start = tags.rowStart(offset);
+                        int end = tags.rowEnd(offset);
+                        assertTrue(start <= end);
+                        if (offset + 1 < ROWS) {
+                            assertEquals(end, tags.rowStart(offset + 1));
+                        }
+                        List<String> expected = tags(i);
+                        List<String> actual = new ArrayList<>();
+                        for (int k = start; k < end; k++) {
+                            actual.add(tags.term(tags.ordinal(k), scratch).utf8ToString());
+                        }
+                        assertEquals("tags of row " + i, expected == null ? List.of() : expected, actual);
+                    }
+                    entryBytes += category.bytes() + tags.bytes();
+                }
+                assertEquals("one scan per keyword column", 2L, store.loadCount());
+                assertEquals(2 * FRAGMENTS, store.entryCount());
+                assertTrue(entryBytes > 0L);
+                assertTrue(
+                    "entry bytes are the buffer capacities, at most what the allocator accounts",
+                    entryBytes <= store.allocatedBytes()
+                );
+                assertEquals(store.allocatedBytes(), cache.columnCacheBytes());
+            }
+        }
+    }
+
+    public void testKeywordSubFieldOfAnFtsColumnIsServedFromTheStore() throws Exception {
+        LinkedHashMap<String, String> raw = new LinkedHashMap<>();
+        raw.put("raw", "keyword");
+        Map<String, LinkedHashMap<String, String>> multiFields = Map.of("body", raw);
+        ColumnStore store = cache.columnStore();
+        try (Lease lease = cache.acquire(UUID, uri, StorageOptions.empty(), Optional.empty(), "", LancePrimaryKeyType.NONE, multiFields)) {
+            Snapshot snapshot = lease.snapshot();
+            try (
+                LanceDirectoryReader offHeap = openCached(snapshot, allFragments);
+                LanceDirectoryReader heap = openHeap(snapshot, allFragments)
+            ) {
+                for (int f = 0; f < FRAGMENTS; f++) {
+                    LanceFragmentLeafReader leaf = leavesOf(offHeap).get(f);
+                    assertSameKeyword("body.raw", leavesOf(heap).get(f), leaf);
+                    // Every body is distinct, so the dictionary has one term per row.
+                    assertEquals(ROWS, leaf.getSortedDocValues("body.raw").getValueCount());
+                    assertTrue("the sub field resolves to the base column's store entry", leaf.isServingOffHeap("body"));
+                    assertTrue(store.contains(snapshot.key(), "body", f));
+                }
+                assertEquals(1L, store.loadCount());
+            }
+        }
+    }
+
+    public void testSecondReaderReadsTheKeywordStoreWithoutAScan() throws Exception {
+        ColumnStore store = cache.columnStore();
+        try (Lease lease = acquire()) {
+            try (LanceDirectoryReader first = openCached(lease.snapshot(), allFragments)) {
+                LanceFragmentLeafReader leaf = leavesOf(first).get(0);
+                ordsByDoc(leaf.getSortedDocValues("category"), leaf.maxDoc());
+                rowsByDoc(leaf.getSortedSetDocValues("tags"), leaf.maxDoc());
+                assertEquals(2L, store.loadCount());
+                assertEquals(0L, store.hitCount());
+            }
+        }
+        long bytesAfterFirst = store.allocatedBytes();
+        try (Lease lease = acquire()) {
+            try (LanceDirectoryReader second = openCached(lease.snapshot(), allFragments)) {
+                for (LanceFragmentLeafReader leaf : leavesOf(second)) {
+                    SortedDocValues category = leaf.getSortedDocValues("category");
+                    for (int offset = 0; offset < ROWS; offset++) {
+                        int i = leaf.fragmentId() * ROWS + offset;
+                        assertEquals(category(i) != null, category.advanceExact(offset));
+                        if (category(i) != null) {
+                            assertEquals(category(i), category.lookupOrd(category.ordValue()).utf8ToString());
+                        }
+                    }
+                    SortedSetDocValues tags = leaf.getSortedSetDocValues("tags");
+                    // Rows 2, 202 and 402 carry t0 and t2; row 0 of each fragment carries t0 twice.
+                    assertTrue(tags.advanceExact(2));
+                    assertEquals(2, tags.docValueCount());
+                    assertTrue(tags.advanceExact(0));
+                    assertEquals(1, tags.docValueCount());
+                    assertTrue(leaf.isServingOffHeap("category"));
+                    assertTrue(leaf.isServingOffHeap("tags"));
+                }
+                assertEquals("no second scan", 2L, store.loadCount());
+                assertEquals(2L, store.hitCount());
+                assertEquals("no new allocation", bytesAfterFirst, store.allocatedBytes());
+            }
+        }
+    }
+
+    public void testKeywordBudgetFallbackBuildsTheHeapDictionaryForTheRequest() throws Exception {
+        cache.close();
+        cache = new LanceWarmCache(allocator, 64L, 64, true);
+        ColumnStore store = cache.columnStore();
+        try (Lease lease = acquire()) {
+            Snapshot snapshot = lease.snapshot();
+            try (
+                LanceDirectoryReader reader = openCached(snapshot, allFragments);
+                LanceDirectoryReader heap = openHeap(snapshot, allFragments)
+            ) {
+                List<LanceFragmentLeafReader> leaves = leavesOf(reader);
+                List<LanceFragmentLeafReader> heapLeaves = leavesOf(heap);
+                for (int f = 0; f < FRAGMENTS; f++) {
+                    assertSameKeyword("category", heapLeaves.get(f), leaves.get(f));
+                    assertSameKeywordArray("tags", heapLeaves.get(f), leaves.get(f));
+                    assertFalse("served from heap for this request", leaves.get(f).isServingOffHeap("category"));
+                    assertFalse(leaves.get(f).isServingOffHeap("tags"));
+                    assertTrue(leaves.get(f).isColumnFullyLoaded("category"));
+                    assertTrue(leaves.get(f).isColumnFullyLoaded("tags"));
+                }
+                assertEquals("one miss per keyword column", 2L, store.budgetMissCount());
+                assertEquals(0L, store.loadCount());
+                assertEquals(0, store.entryCount());
+                assertEquals(0L, store.allocatedBytes());
+            }
+        }
+    }
+
+    public void testKeywordEntriesAreEvictedWhenIdleAndReleasedOnClose() throws Exception {
+        ColumnStore store = cache.columnStore();
+        long oneNumericColumn = FRAGMENTS * ColumnStore.estimateBytes(ROWS, false);
+        cache.close();
+        // Room for exactly one numeric column of three fragments; the
+        // three-term category dictionaries are far smaller.
+        cache = new LanceWarmCache(allocator, oneNumericColumn, 64, true);
+        store = cache.columnStore();
+        try (Lease lease = acquire()) {
+            Snapshot snapshot = lease.snapshot();
+            long categoryBytes;
+            try (LanceDirectoryReader pinning = openCached(snapshot, allFragments)) {
+                LanceFragmentLeafReader leaf = leavesOf(pinning).get(0);
+                ordsByDoc(leaf.getSortedDocValues("category"), leaf.maxDoc());
+                assertEquals(3, store.entryCount());
+                categoryBytes = store.allocatedBytes();
+                assertTrue(categoryBytes > 0L);
+                assertTrue("category must be smaller than the numeric column for the eviction below", categoryBytes < oneNumericColumn);
+
+                // The numeric column does not fit beside the pinned
+                // dictionaries and nothing can be evicted: heap for this
+                // request, the dictionaries stay.
+                Long[] ratings = readByAdvanceExact(leaf, "rating");
+                assertEquals(rating(0), ratings[0]);
+                assertFalse(leaf.isServingOffHeap("rating"));
+                assertEquals(1L, store.budgetMissCount());
+                assertEquals(0L, store.evictionCount());
+                assertTrue(store.contains(snapshot.key(), "category", 0));
+            }
+            // Unpinned now: the numeric column evicts all three dictionaries.
+            try (LanceDirectoryReader second = openCached(snapshot, allFragments)) {
+                LanceFragmentLeafReader leaf = leavesOf(second).get(1);
+                assertEquals(rating(ROWS), readByAdvanceExact(leaf, "rating")[0]);
+                assertTrue(leaf.isServingOffHeap("rating"));
+                assertEquals(3L, store.evictionCount());
+                assertFalse(store.contains(snapshot.key(), "category", 0));
+                assertTrue(store.contains(snapshot.key(), "rating", 1));
+                assertEquals(3, store.entryCount());
+                assertEquals("the dictionaries' bytes went back to the allocator", oneNumericColumn, store.allocatedBytes());
+            }
+        }
+        // A fresh store, filled with keyword entries, releases them on close.
+        cache.close();
+        cache = new LanceWarmCache(allocator, 64L * 1024 * 1024, 64, true);
+        store = cache.columnStore();
+        try (Lease lease = acquire()) {
+            try (LanceDirectoryReader reader = openCached(lease.snapshot(), allFragments)) {
+                LanceFragmentLeafReader leaf = leavesOf(reader).get(0);
+                ordsByDoc(leaf.getSortedDocValues("category"), leaf.maxDoc());
+                rowsByDoc(leaf.getSortedSetDocValues("tags"), leaf.maxDoc());
+                assertEquals(6, store.entryCount());
+                assertTrue(store.allocatedBytes() > 0L);
+            }
+        }
+        cache.close();
+        assertEquals(0, store.entryCount());
+        assertEquals(0L, store.allocatedBytes());
+        cache = null;
+    }
+
+    public void testDeletedRowsHaveNoKeywordValueInBothPaths() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            // Rows 205 and 210 sit in fragment 1; 205 (c1, tags t1/t0) and 210 (c0, tags t0) both carry values.
+            dataset.delete("id = 205 OR id = 210");
+        }
+        try (Lease lease = acquire()) {
+            Snapshot snapshot = lease.snapshot();
+            try (
+                LanceDirectoryReader offHeap = openCached(snapshot, allFragments);
+                LanceDirectoryReader heap = openHeap(snapshot, allFragments)
+            ) {
+                LanceFragmentLeafReader offHeapLeaf = leavesOf(offHeap).get(1);
+                LanceFragmentLeafReader heapLeaf = leavesOf(heap).get(1);
+                assertEquals(ROWS - 2, offHeapLeaf.numDocs());
+                assertSameKeyword("category", heapLeaf, offHeapLeaf);
+                assertSameKeywordArray("tags", heapLeaf, offHeapLeaf);
+                SortedDocValues category = offHeapLeaf.getSortedDocValues("category");
+                assertFalse("deleted row reports no value", category.advanceExact(5));
+                assertFalse(category.advanceExact(10));
+                assertTrue(category.advanceExact(6));
+                assertEquals(category(206), category.lookupOrd(category.ordValue()).utf8ToString());
+                assertEquals(-1, offHeapLeaf.offHeapKeywordColumn("category").ord(5));
+                CachedKeywordArrayColumn tags = offHeapLeaf.offHeapKeywordArrayColumn("tags");
+                assertEquals("deleted row has an empty ordinal range", tags.rowStart(5), tags.rowEnd(5));
+                assertEquals(tags.rowStart(10), tags.rowEnd(10));
+                // The term still exists on the fragment through other rows.
+                assertEquals(3, offHeapLeaf.offHeapKeywordColumn("category").valueCount());
+            }
+        }
+    }
+
+    public void testExclusiveHintKeepsKeywordSparseAndFallsBackToTheStoreForOneFragment() throws Exception {
+        ColumnStore store = cache.columnStore();
+        try (Lease lease = acquire()) {
+            Snapshot snapshot = lease.snapshot();
+            try (LanceDirectoryReader reader = openCached(snapshot, allFragments)) {
+                LanceFragmentLeafReader leaf = leavesOf(reader).get(1);
+                // Rows 201 (c0), 202 (c1), 203 (null), 208 (c1), 210 (c0), 212 (c2)
+                int[] hint = { 1, 2, 3, 8, 10, 12 };
+                leaf.hintMatchedOffsets(hint, true);
+                SortedDocValues category = leaf.getSortedDocValues("category");
+                assertEquals(3, category.getValueCount());
+                assertTrue(category.advanceExact(2));
+                assertEquals("c1", category.lookupOrd(category.ordValue()).utf8ToString());
+                assertTrue("an exclusive sparse hint wins over the store", leaf.isServingSparse("category"));
+                assertFalse(leaf.isServingOffHeap("category"));
+                assertFalse(leaf.isColumnFullyLoaded("category"));
+                assertEquals(0L, store.loadCount());
+                assertEquals(0, store.entryCount());
+
+                // Row 204 (c0) is outside the hint: the instance learns its
+                // term from the full column, which the store serves for
+                // this fragment alone, and answers with the sparse ordinal.
+                assertTrue(category.advanceExact(4));
+                assertEquals(0, category.ordValue());
+                assertEquals("c0", category.lookupOrd(category.ordValue()).utf8ToString());
+                assertTrue(leaf.isServingOffHeap("category"));
+                assertEquals(1L, store.loadCount());
+                assertEquals(1, store.entryCount());
+                assertTrue(store.contains(snapshot.key(), "category", 1));
+                assertFalse(leavesOf(reader).get(0).isColumnFullyLoaded("category"));
+                // Row 207 is outside the hint and null.
+                assertFalse(category.advanceExact(7));
+                // The decision sticks: later instances stay sparse.
+                assertTrue(leaf.isServingSparse("category"));
+                assertEquals(3, leaf.getSortedDocValues("category").getValueCount());
+
+                // Same for the multi-valued column: hinted rows carry
+                // t0..t3; row 206 (t0, t1) is outside the hint.
+                SortedSetDocValues tags = leaf.getSortedSetDocValues("tags");
+                assertEquals(4L, tags.getValueCount());
+                assertTrue(leaf.isServingSparse("tags"));
+                assertTrue(tags.advanceExact(6));
+                assertEquals(2, tags.docValueCount());
+                assertEquals(0L, tags.nextOrd());
+                assertEquals(1L, tags.nextOrd());
+                assertTrue(leaf.isServingOffHeap("tags"));
+                assertEquals(2L, store.loadCount());
+                assertTrue(store.contains(snapshot.key(), "tags", 1));
             }
         }
     }
