@@ -5,15 +5,29 @@
 
 package org.opensearch.lance.query;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
+
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.lucene.search.QueryVisitor;
-import org.opensearch.test.OpenSearchTestCase;
+import org.lance.Dataset;
+import org.lance.Fragment;
 import org.lance.ipc.FullTextQuery;
+import org.lance.ipc.ScanOptions;
+import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.LanceTableFactory;
+import org.opensearch.lance.StorageOptions;
+import org.opensearch.test.OpenSearchTestCase;
 
+// The fragment coverage tests open a real Lance dataset; Lance JNI
+// spins up native worker threads that outlive the test method.
+@ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class LanceFtsQueryTests extends OpenSearchTestCase {
 
     public void testEqualsAndHashCode() {
@@ -118,5 +132,86 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
         FullTextQuery boosted = FullTextQuery.boost(pos, neg, 0.5f);
         Set<String> columns = LanceFtsQuery.collectColumns(boosted);
         assertEquals(Set.of("body", "title"), columns);
+    }
+
+    public void testCoversAllFragmentsWhenExecutorHoldsEveryFragment() throws Exception {
+        // 12 rows, 4 per file: fragments 0, 1, 2. An executor that
+        // holds exactly that set covers the dataset, and the scan
+        // builder must stay free of a fragmentIds restriction.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeMultiFragmentTable(scratchDir, "coverage-all", 12, 4);
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            List<Integer> all = fragmentIdsOf(dataset);
+            assertEquals("fixture must produce three fragments", 3, all.size());
+
+            assertTrue(LanceFtsQuery.coversAllFragments(all, dataset));
+            // Order and duplicates do not matter: coverage is a set check.
+            List<Integer> shuffled = new ArrayList<>(all);
+            Collections.reverse(shuffled);
+            shuffled.add(all.get(0));
+            assertTrue(LanceFtsQuery.coversAllFragments(shuffled, dataset));
+
+            ScanOptions options = LanceFtsQuery.restrictToFragmentsUnlessAll(new ScanOptions.Builder(), all, dataset).build();
+            assertFalse("full coverage must not set fragmentIds", options.getFragmentIds().isPresent());
+        }
+    }
+
+    public void testCoversAllFragmentsIsFalseForProperSubset() throws Exception {
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeMultiFragmentTable(scratchDir, "coverage-subset", 12, 4);
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            List<Integer> all = fragmentIdsOf(dataset);
+            assertEquals(3, all.size());
+
+            // Drop one fragment: the remaining two have the same size
+            // as a two-node round-robin slice and must be reported as
+            // a subset regardless of which fragment is missing.
+            for (int missing = 0; missing < all.size(); missing++) {
+                List<Integer> subset = new ArrayList<>(all);
+                subset.remove(missing);
+                assertFalse("subset missing fragment " + all.get(missing), LanceFtsQuery.coversAllFragments(subset, dataset));
+
+                ScanOptions options = LanceFtsQuery.restrictToFragmentsUnlessAll(new ScanOptions.Builder(), subset, dataset).build();
+                assertEquals("subset must be passed through as fragmentIds", Optional.of(subset), options.getFragmentIds());
+            }
+            assertFalse("empty executor set never covers a non-empty dataset", LanceFtsQuery.coversAllFragments(List.of(), dataset));
+        }
+    }
+
+    public void testCoversAllFragmentsIgnoresIdsUnknownToDataset() throws Exception {
+        // A superset that carries ids the manifest does not know (for
+        // example a fragment id the coordinator saw before a
+        // compaction rewrote the table) still covers every fragment
+        // the dataset has, so the scan can run unrestricted. A size
+        // comparison alone would call this a mismatch.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeMultiFragmentTable(scratchDir, "coverage-superset", 12, 4);
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            List<Integer> all = fragmentIdsOf(dataset);
+            assertEquals(3, all.size());
+
+            List<Integer> superset = new ArrayList<>(all);
+            superset.add(1_000);
+            superset.add(1_001);
+            assertTrue(LanceFtsQuery.coversAllFragments(superset, dataset));
+            ScanOptions options = LanceFtsQuery.restrictToFragmentsUnlessAll(new ScanOptions.Builder(), superset, dataset).build();
+            assertFalse(options.getFragmentIds().isPresent());
+
+            // Same size as the dataset but one real id swapped for an
+            // unknown one: not a cover, because a real fragment is
+            // missing. This is the case a size comparison gets wrong.
+            List<Integer> sameSizeButMissingOne = new ArrayList<>(all.subList(1, all.size()));
+            sameSizeButMissingOne.add(1_000);
+            assertEquals(all.size(), sameSizeButMissingOne.size());
+            assertFalse(LanceFtsQuery.coversAllFragments(sameSizeButMissingOne, dataset));
+        }
+    }
+
+    private static List<Integer> fragmentIdsOf(Dataset dataset) {
+        List<Integer> ids = new ArrayList<>();
+        for (Fragment fragment : dataset.getFragments()) {
+            ids.add(fragment.getId());
+        }
+        return ids;
     }
 }
