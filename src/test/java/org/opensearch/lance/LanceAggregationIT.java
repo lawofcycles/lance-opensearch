@@ -294,4 +294,87 @@ public class LanceAggregationIT extends LanceRestTestCase {
             } catch (Exception ignored) {}
         }
     }
+
+    public void testRepeatedRequestsAndDisabledCacheAgreeOnEveryShape() throws Exception {
+        // The first request against a table version builds the node's
+        // snapshot and loads the numeric and boolean columns it reads
+        // into the off-heap column store; the second request reads them
+        // from there. Both must answer the same, and so must the request
+        // path that runs with lance.cache.enabled false (per request
+        // dataset open, heap columns with the filter pushed into the
+        // column scan). The hint fixture has 3 fragments of 200 rows with
+        // nullable rating (int), flag (bool), category (keyword) and an
+        // FTS body.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "cache-agree")) {
+            String index = fixture.indexName();
+            String matchAll = "{\"query\":{\"match_all\":{}}}";
+            String[] shapes = new String[] {
+                // hits pages
+                "{\"size\":10,\"query\":{\"match_all\":{}}}",
+                "{\"size\":10,\"query\":{\"match_all\":{}},\"sort\":[{\"rating\":\"desc\"},{\"id\":\"asc\"}]}",
+                "{\"size\":10,\"query\":{\"term\":{\"flag\":true}},\"sort\":[{\"rating\":\"asc\"},{\"id\":\"asc\"}]}",
+                "{\"size\":10,\"query\":{\"range\":{\"rating\":{\"lt\":100}}},\"sort\":[{\"id\":\"asc\"}]}",
+                // numeric and boolean aggregations over every row
+                "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":20}}}}",
+                "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}},\"a\":{\"avg\":{\"field\":\"rating\"}},"
+                    + "\"m\":{\"min\":{\"field\":\"rating\"}},\"M\":{\"max\":{\"field\":\"rating\"}},\"c\":{\"value_count\":{\"field\":\"rating\"}}}}",
+                "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"f\":{\"terms\":{\"field\":\"flag\"}}}}",
+                // a filter the coordinator translates to Lance SQL: the
+                // store loads the whole column and the Weight filters
+                "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":500}}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}},\"c\":{\"value_count\":{\"field\":\"id\"}}}}",
+                "{\"size\":0,\"query\":{\"term\":{\"flag\":false}},\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":20}}}}",
+                // keyword aggregation (heap path) beside a numeric sub-aggregation
+                "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"a\":{\"avg\":{\"field\":\"rating\"}}}}}}",
+                // full-text hits with sort and aggregation (sparse take, then the store on a second clause)
+                "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}},\"sort\":[{\"rating\":\"desc\"},{\"id\":\"asc\"}]}",
+                "{\"size\":0,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}",
+                "{\"size\":5,\"query\":{\"bool\":{\"should\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}},{\"term\":{\"id\":1}}]}},"
+                    + "\"sort\":[{\"rating\":\"desc\"},{\"id\":\"asc\"}]}",
+                // vector hits
+                "{\"size\":5,\"query\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":[250.4,0,0,0,0,0,0,0],\"k\":5}},"
+                    + "\"sort\":[{\"rating\":\"desc\"},{\"id\":\"asc\"}]}" };
+
+            // Warm: every shape twice against the cache.
+            java.util.List<String> first = new java.util.ArrayList<>();
+            for (String shape : shapes) {
+                first.add(withoutTook(readAll(postJson("/" + index + "/_search", shape))));
+            }
+            assertEquals(600, extractIntPath(readAll(postJson("/" + index + "/_search", matchAll)), "hits", "total", "value"));
+            for (int i = 0; i < shapes.length; i++) {
+                String second = withoutTook(readAll(postJson("/" + index + "/_search", shapes[i])));
+                assertEquals("second request differs for " + shapes[i], first.get(i), second);
+            }
+            // Sanity on the content, not only on the equality: 480 rows
+            // have a rating, ratings are (i * 37) % 1000.
+            String metrics = first.get(5);
+            assertEquals(480, extractIntPath(metrics, "aggregations", "c", "value"));
+            assertEquals(0.0d, extractDoublePath(metrics, "aggregations", "m", "value"), 0.0d);
+
+            // Disabled cache: same answers from the per request path.
+            Request disable = new Request("PUT", "/_cluster/settings");
+            disable.setJsonEntity("{\"transient\":{\"lance.cache.enabled\":false}}");
+            client().performRequest(disable);
+            try {
+                for (int i = 0; i < shapes.length; i++) {
+                    String uncached = withoutTook(readAll(postJson("/" + index + "/_search", shapes[i])));
+                    assertEquals("uncached request differs for " + shapes[i], first.get(i), uncached);
+                }
+            } finally {
+                Request enable = new Request("PUT", "/_cluster/settings");
+                enable.setJsonEntity("{\"transient\":{\"lance.cache.enabled\":null}}");
+                client().performRequest(enable);
+            }
+            // Back on: the snapshots were retired by the disable, so this
+            // rebuilds them and must still agree.
+            for (int i = 0; i < shapes.length; i++) {
+                String rebuilt = withoutTook(readAll(postJson("/" + index + "/_search", shapes[i])));
+                assertEquals("request after re-enable differs for " + shapes[i], first.get(i), rebuilt);
+            }
+        }
+    }
+
+    /** Response body with the {@code took} field removed so two runs compare on content. */
+    private static String withoutTook(String body) {
+        return body.replaceFirst("\"took\":\\d+,", "");
+    }
 }
