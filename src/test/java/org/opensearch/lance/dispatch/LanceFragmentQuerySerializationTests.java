@@ -174,6 +174,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             /* matchedIsLowerBound */ false,
             1,
             List.of(hit),
+            new long[] { 3L },
             aggregations
         );
 
@@ -194,6 +195,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         assertEquals(1, restored.hits().size());
         assertEquals("0-3", restored.hits().get(0).getId());
         assertEquals("{\"id\":3}", restored.hits().get(0).getSourceAsString());
+        assertArrayEquals(new long[] { 3L }, restored.rowAddrs());
         assertNotNull(restored.aggregations());
         org.opensearch.search.aggregations.metrics.InternalSum restoredSum =
             (org.opensearch.search.aggregations.metrics.InternalSum) restored.aggregations().get("s");
@@ -211,6 +213,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             /* matchedIsLowerBound */ true,
             1,
             List.of(hit),
+            new long[] { 3L },
             null
         );
 
@@ -225,6 +228,16 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         assertEquals(original.matched(), restored.matched());
         assertTrue(restored.matchedIsLowerBound());
         assertEquals(1, restored.hits().size());
+        assertArrayEquals(new long[] { 3L }, restored.rowAddrs());
         assertNull(restored.aggregations());
+    }
+
+    public void testResponseRejectsRowAddressCountMismatch() {
+        SearchHit hit = new SearchHit(0, "0-3", Collections.emptyMap(), Collections.emptyMap());
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new LanceFragmentQueryResponse(1L, false, 1, List.of(hit), new long[0], null)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("0 entries for 1 hits"));
     }
 }
