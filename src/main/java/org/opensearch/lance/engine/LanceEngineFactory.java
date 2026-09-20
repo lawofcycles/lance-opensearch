@@ -38,6 +38,7 @@ import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.ReadOnlyEngine;
+import org.opensearch.index.engine.Segment;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 
@@ -326,6 +327,16 @@ public final class LanceEngineFactory implements EngineFactory {
             // an empty stats object so the request completes with sane zeros
             // instead of blowing up on Lucene.segmentReader(reader).
             return new org.opensearch.index.engine.SegmentsStats();
+        }
+
+        // Same reason as segmentsStats(): the inherited implementation walks
+        // the searcher's leaves through Lucene.segmentReader to describe each
+        // segment, which fails the shard on _segments. Lance fragments are
+        // not Lucene segments, so report none rather than invent entries.
+        @Override
+        public List<Segment> segments(boolean verbose) {
+            ensureOpen();
+            return Collections.emptyList();
         }
 
         @Override
