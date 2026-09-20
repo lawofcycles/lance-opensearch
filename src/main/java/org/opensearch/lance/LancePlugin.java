@@ -406,6 +406,31 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.Dynamic
     );
 
+    /**
+     * How many Lance scans a pushed down aggregation runs side by side
+     * on one executor. The executor cuts its fragments into that many
+     * contiguous groups (fewer when it holds fewer fragments), scans each
+     * with its own Substrait aggregate and merges the group rows in Java.
+     * Lance runs the aggregate of one scan in a single DataFusion
+     * partition, so a node holding many fragments hashes every row on
+     * one thread unless the plugin splits the scan. Default: half the
+     * CPUs the JVM sees ({@link NativeMemoryLimit#availableCpus()}),
+     * at least 1 and at most 32. Half because each scan already keeps
+     * Lance's decode threads busy alongside the aggregating thread, so
+     * the aggregates and the decoding share the cores instead of
+     * oversubscribing them; the cap keeps the fan-out and the memory of
+     * the concurrent hash tables bounded on large hosts. 1 restores the
+     * single scan.
+     */
+    public static final Setting<Integer> AGGREGATION_PUSHDOWN_PARALLELISM_SETTING = Setting.intSetting(
+        "lance.aggregation.pushdown_parallelism",
+        Math.max(1, Math.min(32, NativeMemoryLimit.availableCpus() / 2)),
+        1,
+        32,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -431,7 +456,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             FTS_SUBSET_PROBE_LIMIT_SETTING,
             FTS_SUBSET_PROBE_RATIO_SETTING,
             FTS_SUBSET_PROBE_MIN_ROWS_SETTING,
-            AGGREGATION_PUSHDOWN_SETTING
+            AGGREGATION_PUSHDOWN_SETTING,
+            AGGREGATION_PUSHDOWN_PARALLELISM_SETTING
         );
     }
 

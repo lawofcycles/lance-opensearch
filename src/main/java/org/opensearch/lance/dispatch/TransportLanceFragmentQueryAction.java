@@ -17,6 +17,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Executor;
 import java.util.function.Function;
 
 import org.apache.arrow.vector.UInt8Vector;
@@ -233,6 +234,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      */
     private final java.util.concurrent.Semaphore concurrencyLimit;
     /**
+     * Pool the aggregation pushdown runs its extra fragment group scans
+     * on: the SEARCH pool this action itself executes on. No pool is
+     * added for it, and the pushdown never blocks on a scan the pool has
+     * not started, so a saturated SEARCH pool degrades the pushdown to
+     * one scan on the request's own thread instead of parking it.
+     */
+    private final Executor pushdownExecutor;
+    /**
      * Node scoped snapshot and column cache every request acquires its
      * table view from; created by {@code LancePlugin.createComponents}.
      */
@@ -256,6 +265,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         this.warmCache = warmCache;
         int permits = LancePlugin.FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING.get(clusterService.getSettings());
         this.concurrencyLimit = new java.util.concurrent.Semaphore(permits, /*fair*/ false);
+        this.pushdownExecutor = transportService.getThreadPool().executor(ThreadPool.Names.SEARCH);
     }
 
     @Override
@@ -684,17 +694,23 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     // The scan groups and aggregates on the Lance side and
                     // also yields the row total, so neither the Lucene
                     // aggregators nor computeMatched run for this request.
+                    // The node's fragments are scanned in up to
+                    // pushdown_parallelism groups; the extra scans run on
+                    // the SEARCH pool this request already executes on.
                     long pushdownStart = System.nanoTime();
                     LanceAggregatePushdown.Result result = pushdown.execute(
                         dataset,
-                        request.fragmentIdsOrNull(),
+                        effectiveFragmentIds,
                         request.filterSql(),
+                        clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING),
+                        pushdownExecutor,
                         name -> emptyTopLevelAggregation(request, searchContext, qsc, name)
                     );
                     LOGGER.debug(
-                        "lance.dispatch: aggregation pushdown for [{}] over {} rows took {} us",
+                        "lance.dispatch: aggregation pushdown for [{}] over {} rows in {} scans took {} us",
                         request.indexName(),
                         result.totalRows(),
+                        result.scans(),
                         (System.nanoTime() - pushdownStart) / 1_000L
                     );
                     aggregations = result.aggregations();
