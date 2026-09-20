@@ -746,8 +746,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         boolean hasSecurityWrapper,
         IndexMetadata indexMetadata
     ) throws IOException {
+        // Top-k pushdown clips the Lance scan to the first `size`
+        // rows before the reader wrapper sees them. Under a wrapper
+        // (DLS) some of those rows are hidden afterwards and the page
+        // would come back short of `size` although more visible rows
+        // match, so the scan stays unbounded and the Lucene collector
+        // does the clipping after the liveDocs are applied.
+        int scanLimit = hasSecurityWrapper ? LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED : resolveScanFilterTopK(request);
         if (request.filterSql() != null) {
-            return new LanceScanFilterQuery(request.filterSql(), resolveScanFilterTopK(request));
+            return new LanceScanFilterQuery(request.filterSql(), scanLimit);
         }
         if (request.query() != null) {
             // Rewrite before toQuery so that shapes which rely on
@@ -762,7 +769,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // path does the same Rewriteable.rewrite call in
             // QueryShardContext.toQuery before invoking doToQuery.
             QueryBuilder rewritten = Rewriteable.rewrite(request.query(), qsc, true);
-            int scanLimit = resolveScanFilterTopK(request);
             if (!hasSecurityWrapper) {
                 FtsPrefilterShape shape = resolveFtsPrefilterShape(
                     rewritten,
@@ -783,9 +789,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // stop after k score-sorted rows. Callers wrapping the
             // FTS clause in a bool / boost / dis_max keep the
             // sentinel: mixing the top-k with other scorers would
-            // clip the wrong side.
-            if (scanLimit != LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED && base instanceof LanceFtsQuery fts) {
-                return fts.withScanLimit(scanLimit);
+            // clip the wrong side. LanceFtsQuery has its own
+            // unbounded sentinel, so translate before comparing.
+            int ftsScanLimit = scanLimit == LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED ? LanceFtsQuery.SCAN_LIMIT_UNBOUNDED : scanLimit;
+            if (ftsScanLimit != LanceFtsQuery.SCAN_LIMIT_UNBOUNDED && base instanceof LanceFtsQuery fts) {
+                return fts.withScanLimit(ftsScanLimit);
             }
             return base;
         }
@@ -913,6 +921,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *   <li>No post_filter — post_filter narrows below the scan and
      *       would leave the caller short of the requested rows.</li>
      * </ul>
+     * The caller additionally keeps the scan unbounded when a reader
+     * wrapper is installed: the wrapper's liveDocs narrow the result
+     * after the scan the same way a post_filter would.
      *
      * <p>The coordinator already folds the top-level {@code from} into
      * {@code size} before shipping the request (see

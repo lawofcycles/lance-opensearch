@@ -159,6 +159,17 @@ public class ReaderWrapperMatchAllTotalTests extends OpenSearchSingleNodeTestCas
             "match_all size 5 track_total_hits true",
             new SearchSourceBuilder().query(new MatchAllQueryBuilder()).size(5).trackTotalHits(true)
         );
+        // Shapes whose Lance scan would be clipped to `size` rows
+        // before the wrapper hides any of them: a scalar filter the
+        // coordinator translates to Lance SQL, and a bare FTS clause.
+        // Every row of the fixture matches both.
+        for (int size : new int[] { 0, 5 }) {
+            requests.put("range id gte 0 size " + size, new SearchSourceBuilder().query(QueryBuilders.rangeQuery("id").gte(0)).size(size));
+            requests.put(
+                "lance_match title morning size " + size,
+                new SearchSourceBuilder().query(new LanceMatchQueryBuilder("title", "morning")).size(size)
+            );
+        }
         for (Map.Entry<String, SearchSourceBuilder> entry : requests.entrySet()) {
             SearchSourceBuilder source = entry.getValue();
             SearchResponse response = client().prepareSearch(indexName).setSource(source).get();
