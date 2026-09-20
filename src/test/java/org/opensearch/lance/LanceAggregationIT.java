@@ -7,6 +7,7 @@ package org.opensearch.lance;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -297,9 +298,9 @@ public class LanceAggregationIT extends LanceRestTestCase {
 
     public void testRepeatedRequestsAndDisabledCacheAgreeOnEveryShape() throws Exception {
         // The first request against a table version builds the node's
-        // snapshot and loads the numeric and boolean columns it reads
-        // into the off-heap column store; the second request reads them
-        // from there. Both must answer the same, and so must the request
+        // snapshot and loads the numeric, boolean and keyword columns it
+        // reads into the off-heap column store; the second request reads
+        // them from there. Both must answer the same, and so must the request
         // path that runs with lance.cache.enabled false (per request
         // dataset open, heap columns with the filter pushed into the
         // column scan). The hint fixture has 3 fragments of 200 rows with
@@ -323,8 +324,21 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 // store loads the whole column and the Weight filters
                 "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":500}}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}},\"c\":{\"value_count\":{\"field\":\"id\"}}}}",
                 "{\"size\":0,\"query\":{\"term\":{\"flag\":false}},\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":20}}}}",
-                // keyword aggregation (heap path) beside a numeric sub-aggregation
+                // keyword aggregations and sorts over every row: the
+                // dictionary and ordinals come from the store on the
+                // second request
                 "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"a\":{\"avg\":{\"field\":\"rating\"}}}}}}",
+                "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"size\":10}}}}",
+                "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"t\":{\"terms\":{\"field\":\"tags\",\"size\":10}}}}",
+                "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"t\":{\"terms\":{\"field\":\"tags\"}}}}}}",
+                "{\"size\":10,\"query\":{\"match_all\":{}},\"sort\":[{\"category\":\"asc\"},{\"id\":\"asc\"}],\"aggs\":{\"n\":{\"value_count\":{\"field\":\"id\"}}}}",
+                "{\"size\":10,\"query\":{\"match_all\":{}},\"sort\":[{\"category\":\"desc\"},{\"id\":\"desc\"}]}",
+                "{\"size\":0,\"query\":{\"term\":{\"category\":\"c1\"}},\"aggs\":{\"t\":{\"terms\":{\"field\":\"tags\"}}}}",
+                // a translated filter keeps the keyword dictionary on the
+                // request scoped heap path
+                "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":500}}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
+                "{\"size\":10,\"query\":{\"range\":{\"rating\":{\"lt\":100}}},\"sort\":[{\"category\":\"asc\"},{\"id\":\"asc\"}],"
+                    + "\"aggs\":{\"n\":{\"value_count\":{\"field\":\"id\"}}}}",
                 // full-text hits with sort and aggregation (sparse take, then the store on a second clause)
                 "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}},\"sort\":[{\"rating\":\"desc\"},{\"id\":\"asc\"}]}",
                 "{\"size\":0,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}",
@@ -349,6 +363,16 @@ public class LanceAggregationIT extends LanceRestTestCase {
             String metrics = first.get(5);
             assertEquals(480, extractIntPath(metrics, "aggregations", "c", "value"));
             assertEquals(0.0d, extractDoublePath(metrics, "aggregations", "m", "value"), 0.0d);
+            // 450 rows have a category, 150 of each of c0, c1, c2.
+            String categories = first.get(10);
+            for (String key : new String[] { "c0", "c1", "c2" }) {
+                assertTrue(key + " bucket in " + categories, categories.contains("{\"key\":\"" + key + "\",\"doc_count\":150}"));
+            }
+            // category asc, id asc: c0 rows in id order, skipping the null rows (id % 4 == 3).
+            assertEquals(
+                List.of("0-0", "0-6", "0-9", "0-12", "0-18", "0-21", "0-24", "0-30", "0-33", "0-36"),
+                idsOf(hitsOf(first.get(13)))
+            );
 
             // Disabled cache: same answers from the per request path.
             Request disable = new Request("PUT", "/_cluster/settings");

@@ -7,6 +7,9 @@ package org.opensearch.lance;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -206,6 +209,68 @@ public class LanceSortIT extends LanceRestTestCase {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
+        }
+    }
+
+    public void testKeywordSortAgreesAcrossCacheStates() throws Exception {
+        // A keyword sort through the Lucene comparator reads the
+        // fragment's dictionary and ordinals: from the off-heap store
+        // when the snapshot cache holds them (the second request), from
+        // a request scoped heap dictionary when the cache is disabled.
+        // The order and the sort values must not depend on the source.
+        // A trivial aggregation keeps the request on the comparator path
+        // rather than the ordered Lance scan pushdown; the pushdown is
+        // asked too as a third oracle.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "kwsort")) {
+            String index = fixture.indexName();
+            String oracleAgg = ",\"aggs\":{\"n\":{\"value_count\":{\"field\":\"id\"}}}";
+            String asc = "{\"size\":10,\"query\":{\"match_all\":{}},\"sort\":[{\"category\":\"asc\"},{\"id\":\"asc\"}]";
+            String desc = "{\"size\":10,\"query\":{\"match_all\":{}},\"sort\":[{\"category\":\"desc\"},{\"id\":\"asc\"}]";
+            String filtered =
+                "{\"size\":10,\"query\":{\"range\":{\"rating\":{\"gte\":500}}},\"sort\":[{\"category\":\"asc\"},{\"id\":\"desc\"}]";
+            String[] shapes = { asc + oracleAgg + "}", desc + oracleAgg + "}", filtered + oracleAgg + "}" };
+            // category is "c" + (i % 3), null when i % 4 == 3: the c0 rows
+            // in id order are 0, 6, 9, 12, 18, 21, 24, 30, 33, 36.
+            List<String> ascIds = List.of("0-0", "0-6", "0-9", "0-12", "0-18", "0-21", "0-24", "0-30", "0-33", "0-36");
+            List<String> descIds = List.of("0-2", "0-5", "0-8", "0-14", "0-17", "0-20", "0-26", "0-29", "0-32", "0-38");
+
+            List<List<Map<String, Object>>> cold = new ArrayList<>();
+            for (String shape : shapes) {
+                cold.add(hitsOf(readAll(postJson("/" + index + "/_search", shape))));
+            }
+            assertEquals(ascIds, idsOf(cold.get(0)));
+            assertEquals(List.of("c0", 0), sortValuesOf(cold.get(0).get(0)));
+            assertEquals(descIds, idsOf(cold.get(1)));
+            assertEquals(List.of("c2", 2), sortValuesOf(cold.get(1).get(0)));
+
+            // Warm: the dictionaries now come from the store.
+            for (int i = 0; i < shapes.length; i++) {
+                assertEquals(
+                    "warm request differs for " + shapes[i],
+                    cold.get(i),
+                    hitsOf(readAll(postJson("/" + index + "/_search", shapes[i])))
+                );
+            }
+            // The ordered Lance scan pushdown agrees with the comparator.
+            assertEquals(ascIds, idsOf(hitsOf(readAll(postJson("/" + index + "/_search", asc + "}")))));
+            assertEquals(descIds, idsOf(hitsOf(readAll(postJson("/" + index + "/_search", desc + "}")))));
+
+            Request disable = new Request("PUT", "/_cluster/settings");
+            disable.setJsonEntity("{\"transient\":{\"lance.cache.enabled\":false}}");
+            client().performRequest(disable);
+            try {
+                for (int i = 0; i < shapes.length; i++) {
+                    assertEquals(
+                        "uncached request differs for " + shapes[i],
+                        cold.get(i),
+                        hitsOf(readAll(postJson("/" + index + "/_search", shapes[i])))
+                    );
+                }
+            } finally {
+                Request enable = new Request("PUT", "/_cluster/settings");
+                enable.setJsonEntity("{\"transient\":{\"lance.cache.enabled\":null}}");
+                client().performRequest(enable);
+            }
         }
     }
 }
