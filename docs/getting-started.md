@@ -470,6 +470,60 @@ lance.native_memory.circuit_breaker.poll_interval: 5s   # default; how fast the 
 
 Both are dynamic, so changes take effect without a restart. The byte limit itself is not directly configurable through the breaker; it always follows `lance.native_memory.limit` so operators reason about one number.
 
+### Inspect the snapshot and column cache
+
+`GET /_lance/stats` shows, per node, what the plugin holds in its caches: how many table snapshots (open Lance datasets) it keeps, how the off-heap column store is doing against its budget, and how the two add up to the `lance_native` breaker reading.
+
+```
+curl -sS localhost:9200/_lance/stats?pretty
+```
+
+```json
+{
+  "_nodes" : { "total" : 1, "successful" : 1, "failed" : 0 },
+  "cluster_name" : "opensearch",
+  "nodes" : {
+    "Xc3...": {
+      "name" : "node-1",
+      "snapshots" : {
+        "enabled" : true,
+        "count" : 2,
+        "retired" : 0,
+        "dataset_open_count" : 3,
+        "snapshot_build_count" : 3,
+        "snapshot_hit_count" : 41
+      },
+      "column_store" : {
+        "bytes" : 838860800,
+        "limit_bytes" : 4294967296,
+        "entries" : 96,
+        "hits" : 120,
+        "loads" : 12,
+        "evictions" : 0,
+        "budget_misses" : 0
+      },
+      "native_memory" : {
+        "estimated_bytes" : 1258291200,
+        "session_bytes" : 419430400,
+        "column_store_bytes" : 838860800
+      },
+      "fts" : {
+        "subset_probe_limit" : 1000000
+      }
+    }
+  }
+}
+```
+
+How to read it:
+
+- `snapshots.count` is normally the number of Lance-backed shards on the node (each shard reader holds its version's snapshot) plus any version a request is still reading. It grows by one when a table advances and the poll has not refreshed the shard yet, and comes back down when the poll retires the old version. A `retired` value that stays above zero means a reader of an old version has not closed.
+- `snapshot_build_count` and `dataset_open_count` should stop growing once every table version in use has been seen; `snapshot_hit_count` grows with every `_search`. Builds that keep growing on a table that is not changing mean requests are not finding the cached version.
+- `column_store.bytes` against `limit_bytes` tells you how much of `lance.cache.column_share` is in use. `loads` grows on the first request that reads a column of a fragment, `hits` on every later one. `budget_misses` above zero means requests fell back to heap loads because the store was full; raise `lance.cache.column_share` or `lance.native_memory.limit`, or reduce the number of columns aggregated or sorted on.
+- `native_memory.estimated_bytes` is what the breaker enforces against `lance.native_memory.limit`; it lags `session_bytes + column_store_bytes` by at most one `lance.native_memory.circuit_breaker.poll_interval`. Compare it with the process RSS to see how much of the native footprint the plugin accounts for.
+
+The endpoint is read only. With the security plugin, grant `cluster:monitor/lance/stats`.
+
 ### Full-text lookups on several data nodes
 
 With more than one data node each node executes a share of the table's fragments, but a full-text query still looks the whole table up from the inverted index and keeps its own rows, because passing Lance a fragment list makes it read `_rowid` over those fragments first. Shapes that need every match (aggregations, sort by a field, post_filter, `size 0`, `track_total_hits: true`) run that lookup as a probe capped by one dynamic cluster setting:
