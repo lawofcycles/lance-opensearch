@@ -52,6 +52,14 @@ import org.lance.ipc.ScanOptions;
  * populates atomically for every leaf on the first request rather than
  * lazily per leaf.
  *
+ * <p>When the reader was opened over a {@link LanceWarmCache} snapshot the
+ * cache also carries the node's {@link ColumnStore}: numeric and boolean
+ * columns are then served from (or loaded into) the store's off-heap
+ * vectors, published through
+ * {@link LanceFragmentLeafReader#publishOffHeapColumn} and pinned until
+ * the reader closes, and the heap scan above runs only when the store has
+ * no room. Keyword columns always take the heap path.
+ *
  * <p>Concurrency: a per-column {@code Object} lock serialises
  * concurrent loads of the same column. Different columns load in
  * parallel. The {@code loaded*} sets are used as short-circuit
