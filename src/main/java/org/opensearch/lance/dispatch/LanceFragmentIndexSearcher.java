@@ -6,9 +6,11 @@
 package org.opensearch.lance.dispatch;
 
 import java.io.IOException;
+import java.util.Collections;
 
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.search.Collector;
+import org.apache.lucene.search.CollectorManager;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryCachingPolicy;
@@ -84,5 +86,39 @@ final class LanceFragmentIndexSearcher extends ContextIndexSearcher {
             searchLeaf(partition.ctx, partition.minDocId, partition.maxDocId, weight, collector);
         }
         fragmentContext.bucketCollectorProcessor().processPostCollection(collector);
+    }
+
+    /**
+     * Run {@code collector} over every leaf with a {@link Weight} the
+     * caller created, instead of a {@link Query} the searcher would
+     * turn into a fresh Weight. {@code Weight}s of the Lance-backed
+     * queries hold the result of one native Lance scan for the life of
+     * the Weight, so a caller that drives hits, aggregations and the
+     * match count off the same Weight runs that scan once per request
+     * rather than once per phase. Mirrors
+     * {@link ContextIndexSearcher#search(Query, Collector)} minus the
+     * rewrite / createWeight steps; the caller is responsible for
+     * having created the Weight against this searcher with the score
+     * mode the collector needs (a {@link org.apache.lucene.search.ScoreMode#COMPLETE}
+     * Weight satisfies any collector).
+     */
+    void search(Weight weight, Collector collector) throws IOException {
+        LeafReaderContextPartition[] partitions = (getLeafContexts() == null)
+            ? new LeafReaderContextPartition[0]
+            : getLeafContexts().stream().map(LeafReaderContextPartition::createForEntireSegment).toArray(LeafReaderContextPartition[]::new);
+        search(partitions, weight, collector);
+    }
+
+    /**
+     * {@link CollectorManager} counterpart of {@link #search(Weight, Collector)}.
+     * The searcher has no executor, so a single collector covers every
+     * leaf and {@code manager.reduce} sees exactly one collector, the
+     * same shape {@link org.apache.lucene.search.IndexSearcher#search(Query, CollectorManager)}
+     * produces here.
+     */
+    <C extends Collector, T> T search(Weight weight, CollectorManager<C, T> manager) throws IOException {
+        C collector = manager.newCollector();
+        search(weight, collector);
+        return manager.reduce(Collections.singletonList(collector));
     }
 }

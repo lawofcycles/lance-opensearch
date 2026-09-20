@@ -21,9 +21,14 @@ import org.opensearch.search.aggregations.InternalAggregations;
  * {@link org.opensearch.action.search.SearchResponse}:
  * <ul>
  *   <li>{@link #matched()} — number of rows in the node's fragment
- *       subset that satisfied the filter. Coordinator sums these
- *       across all nodes to populate
- *       {@code hits.total.value}.</li>
+ *       subset that satisfied the query, counted up to the request's
+ *       {@link LanceFragmentQueryRequest#trackTotalHitsUpTo()} bound.
+ *       {@link #matchedIsLowerBound()} says whether the executor
+ *       stopped counting at the bound, in which case the true count
+ *       is at least {@code matched}. The coordinator sums the values
+ *       across all nodes to populate {@code hits.total.value} and
+ *       turns the relation into {@code gte} when any node reported a
+ *       lower bound or the sum exceeds the bound.</li>
  *   <li>{@link #fragmentCount()} — number of fragments the node
  *       scanned. Coordinator sums these to populate
  *       {@code _shards.total} on the merged response so operators
@@ -55,12 +60,20 @@ import org.opensearch.search.aggregations.InternalAggregations;
 public final class LanceFragmentQueryResponse extends ActionResponse {
 
     private final long matched;
+    private final boolean matchedIsLowerBound;
     private final int fragmentCount;
     private final List<SearchHit> hits;
     private final InternalAggregations aggregations;
 
-    public LanceFragmentQueryResponse(long matched, int fragmentCount, List<SearchHit> hits, InternalAggregations aggregations) {
+    public LanceFragmentQueryResponse(
+        long matched,
+        boolean matchedIsLowerBound,
+        int fragmentCount,
+        List<SearchHit> hits,
+        InternalAggregations aggregations
+    ) {
         this.matched = matched;
+        this.matchedIsLowerBound = matchedIsLowerBound;
         this.fragmentCount = fragmentCount;
         this.hits = List.copyOf(hits);
         this.aggregations = aggregations;
@@ -69,6 +82,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
     public LanceFragmentQueryResponse(StreamInput in) throws IOException {
         super(in);
         this.matched = in.readVLong();
+        this.matchedIsLowerBound = in.readBoolean();
         this.fragmentCount = in.readVInt();
         int hitCount = in.readVInt();
         List<SearchHit> readHits = new ArrayList<>(hitCount);
@@ -82,6 +96,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         out.writeVLong(matched);
+        out.writeBoolean(matchedIsLowerBound);
         out.writeVInt(fragmentCount);
         out.writeVInt(hits.size());
         for (SearchHit hit : hits) {
@@ -97,6 +112,15 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
 
     public long matched() {
         return matched;
+    }
+
+    /**
+     * Whether {@link #matched()} is a lower bound rather than the
+     * exact count: the executor stopped counting once it had seen more
+     * than the request's {@code trackTotalHitsUpTo} matches.
+     */
+    public boolean matchedIsLowerBound() {
+        return matchedIsLowerBound;
     }
 
     public int fragmentCount() {

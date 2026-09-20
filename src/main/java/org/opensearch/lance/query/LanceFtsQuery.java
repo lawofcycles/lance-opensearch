@@ -252,7 +252,7 @@ public final class LanceFtsQuery extends Query {
     /**
      * Weight for a Lance FTS query. Runs a single Lance scan across
      * every Lance-backed leaf in the shard (the "shard-level scan"
-     * pattern that {@link LanceKnnQuery.LanceKnnWeight} already uses
+     * pattern that {@code LanceKnnQuery.LanceKnnWeight} already uses
      * for nearest-neighbour queries), buckets the hits by fragment
      * id from the returned {@code _rowaddr}, and hands each per-leaf
      * {@link ScorerSupplier} its fragment's slice out of the shared
@@ -269,8 +269,13 @@ public final class LanceFtsQuery extends Query {
      * subset, so a request of {@code size=20} over 20 fragments per
      * node transfers 20 hits, not 400, matching the shape the
      * coordinator merges anyway.
+     *
+     * <p>The class is public so the fragment executor, which creates
+     * the Weight itself and drives hits and aggregations through it,
+     * can read {@link #hitCount()} afterwards instead of running a
+     * second Lance scan to count the matches.
      */
-    final class LanceFtsWeight extends Weight {
+    public final class LanceFtsWeight extends Weight {
 
         private final float boost;
         // Cache populated by the first Lance-backed leaf we visit and
@@ -369,6 +374,31 @@ public final class LanceFtsQuery extends Query {
 
         private LanceFtsQuery query() {
             return (LanceFtsQuery) getQuery();
+        }
+
+        /**
+         * Number of rows the shard-level scan returned across every
+         * fragment, or {@code -1} when no leaf of this Weight has been
+         * scored yet and the scan has therefore not run. The value
+         * covers the fragments the enclosing reader exposes (the scan
+         * is restricted to them unless they are the whole table), and
+         * is bounded by {@link LanceFtsQuery#scanLimit()} when that is
+         * set: at the limit the true match count may be higher. Hits
+         * dropped on a leaf by the FLS column check in
+         * {@link #scorerSupplier} are still included, so the executor
+         * only relies on this count when no reader wrapper is
+         * installed.
+         */
+        public long hitCount() {
+            Map<Integer, FtsFragmentHits> hits = shardHits.get();
+            if (hits == null) {
+                return -1L;
+            }
+            long total = 0L;
+            for (FtsFragmentHits fragmentHits : hits.values()) {
+                total += fragmentHits.size;
+            }
+            return total;
         }
 
         private Map<Integer, FtsFragmentHits> ensureShardScan(LeafReaderContext context, LanceFragmentLeafReader leaf) throws IOException {

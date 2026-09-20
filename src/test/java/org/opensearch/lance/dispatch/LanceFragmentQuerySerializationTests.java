@@ -18,6 +18,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchModule;
+import org.opensearch.search.internal.SearchContext;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -56,7 +57,8 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             5,
             aggs,
             List.of(0, 2, 4),
-            /* trackScores */ true
+            /* trackScores */ true,
+            /* trackTotalHitsUpTo */ 3
         );
 
         LanceFragmentQueryRequest restored;
@@ -81,6 +83,39 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         assertEquals(7L, restored.pinnedVersion());
         assertEquals(Optional.of(7L), restored.pinnedVersionOrEmpty());
         assertEquals(original.trackScores(), restored.trackScores());
+        assertEquals(3, restored.trackTotalHitsUpTo());
+    }
+
+    public void testRequestTrackTotalHitsSentinelsRoundTrip() throws Exception {
+        // The two sentinels sit at the extremes of the int range
+        // (-1 and Integer.MAX_VALUE); a variable-length encoding would
+        // mangle the negative one, so the field is a plain int.
+        for (int upTo : new int[] { SearchContext.TRACK_TOTAL_HITS_DISABLED, SearchContext.TRACK_TOTAL_HITS_ACCURATE, 10_000 }) {
+            LanceFragmentQueryRequest original = new LanceFragmentQueryRequest(
+                "/tmp/table.lance",
+                "demo",
+                StorageOptions.empty(),
+                /* pinnedVersion */ -1L,
+                /* filterSql */ null,
+                /* query */ null,
+                /* postFilter */ null,
+                Collections.emptyList(),
+                /* searchAfter */ null,
+                0,
+                /* aggregations */ null,
+                Collections.emptyList(),
+                /* trackScores */ false,
+                upTo
+            );
+            LanceFragmentQueryRequest restored;
+            try (BytesStreamOutput out = new BytesStreamOutput()) {
+                original.writeTo(out);
+                try (StreamInput in = out.bytes().streamInput()) {
+                    restored = new LanceFragmentQueryRequest(in);
+                }
+            }
+            assertEquals(upTo, restored.trackTotalHitsUpTo());
+        }
     }
 
     public void testRequestWithNullFilterAndAllFragmentsRoundTrip() throws Exception {
@@ -112,6 +147,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         assertNull("empty list must expose as null through the SDK helper", restored.fragmentIdsOrNull());
         assertEquals(original.size(), restored.size());
         assertNull(restored.aggregations());
+        assertEquals("allFragments asks for an exact count", SearchContext.TRACK_TOTAL_HITS_ACCURATE, restored.trackTotalHitsUpTo());
     }
 
     public void testResponseRoundTrip() throws Exception {
@@ -133,7 +169,13 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             )
         );
 
-        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(1L, 1, List.of(hit), aggregations);
+        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(
+            1L,
+            /* matchedIsLowerBound */ false,
+            1,
+            List.of(hit),
+            aggregations
+        );
 
         LanceFragmentQueryResponse restored;
         try (BytesStreamOutput out = new BytesStreamOutput()) {
@@ -147,6 +189,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         }
 
         assertEquals(original.matched(), restored.matched());
+        assertFalse(restored.matchedIsLowerBound());
         assertEquals(original.fragmentCount(), restored.fragmentCount());
         assertEquals(1, restored.hits().size());
         assertEquals("0-3", restored.hits().get(0).getId());
@@ -161,7 +204,15 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         SearchHit hit = new SearchHit(0, "0-3", Collections.emptyMap(), Collections.emptyMap());
         hit.score(1.0f);
 
-        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(1L, 1, List.of(hit), null);
+        // matched 10001 with the lower-bound flag is what an executor
+        // reports after stopping a count at track_total_hits 10000 + 1.
+        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(
+            10_001L,
+            /* matchedIsLowerBound */ true,
+            1,
+            List.of(hit),
+            null
+        );
 
         LanceFragmentQueryResponse restored;
         try (BytesStreamOutput out = new BytesStreamOutput()) {
@@ -172,6 +223,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         }
 
         assertEquals(original.matched(), restored.matched());
+        assertTrue(restored.matchedIsLowerBound());
         assertEquals(1, restored.hits().size());
         assertNull(restored.aggregations());
     }
