@@ -583,7 +583,12 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     clusterService.localNode().getId()
                 )
             ) {
-                LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(dr, indexService.getIndexSettings(), searchContext);
+                LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(
+                    dr,
+                    indexService.getIndexSettings(),
+                    searchContext,
+                    circuitBreakerService.getBreaker(CircuitBreaker.REQUEST)
+                );
                 searchContext.withSearcher(searcher);
                 QueryShardContext qsc = indexService.newQueryShardContext(0, searcher, System::currentTimeMillis, null);
                 searchContext.withQueryShardContext(qsc);

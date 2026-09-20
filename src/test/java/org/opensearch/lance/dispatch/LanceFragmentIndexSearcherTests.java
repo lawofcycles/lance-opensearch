@@ -32,6 +32,8 @@ import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.BigArrays;
+import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.cache.query.DisabledQueryCache;
@@ -100,7 +102,12 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
     public void testCountAndTopDocsWithoutIndexShard() throws IOException {
         try (DirectoryReader reader = DirectoryReader.open(dir); LanceFragmentSearchContext context = newContext()) {
             assertNull(context.indexShard());
-            LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(reader, indexSettings, context);
+            LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(
+                reader,
+                indexSettings,
+                context,
+                new NoopCircuitBreaker(CircuitBreaker.REQUEST)
+            );
             assertTrue("fixture must span several leaves", reader.leaves().size() > 1);
             assertEquals(TOTAL, searcher.count(MatchAllDocsQuery.INSTANCE));
             TopDocs top = searcher.search(MatchAllDocsQuery.INSTANCE, 3, new Sort(new SortField("n", SortField.Type.LONG, true)));
@@ -147,7 +154,12 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
                     super.processPostCollection(collectorTree);
                 }
             });
-            LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(reader, indexSettings, context);
+            LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(
+                reader,
+                indexSettings,
+                context,
+                new NoopCircuitBreaker(CircuitBreaker.REQUEST)
+            );
             CountingBucketCollector collector = new CountingBucketCollector();
             searcher.search(MatchAllDocsQuery.INSTANCE, collector);
             assertEquals(TOTAL, collector.collected);
@@ -170,7 +182,12 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
                     super.processPostCollection(collectorTree);
                 }
             });
-            LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(reader, indexSettings, context);
+            LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(
+                reader,
+                indexSettings,
+                context,
+                new NoopCircuitBreaker(CircuitBreaker.REQUEST)
+            );
             Weight weight = searcher.createWeight(searcher.rewrite(MatchAllDocsQuery.INSTANCE), ScoreMode.COMPLETE, 1f);
 
             Sort sort = new Sort(new SortField("n", SortField.Type.LONG, true));

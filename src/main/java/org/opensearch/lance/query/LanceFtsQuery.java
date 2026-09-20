@@ -38,6 +38,7 @@ import org.lance.Fragment;
 import org.lance.ipc.FullTextQuery;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.lance.LanceCircuitBreaker;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 
@@ -58,6 +59,13 @@ public final class LanceFtsQuery extends Query {
 
     /** Sentinel that disables top-k pushdown; the scan is bounded only by fragment maxDoc. */
     public static final int SCAN_LIMIT_UNBOUNDED = 0;
+
+    /**
+     * Projection of the hits scan: the BM25 score only. The row address
+     * comes through {@code withRowAddress(true)}; no data column is
+     * read, see {@code LanceFtsWeight.newScanOptions}.
+     */
+    static final List<String> HITS_SCAN_COLUMNS = List.of("_score");
 
     /** Default for {@link #subsetProbeLimit()}. */
     public static final int DEFAULT_SUBSET_PROBE_LIMIT = 1_000_000;
@@ -311,7 +319,7 @@ public final class LanceFtsQuery extends Query {
 
     @Override
     public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) {
-        return new LanceFtsWeight(this, boost);
+        return new LanceFtsWeight(this, boost, LanceHitsAccounting.of(searcher));
     }
 
     /**
@@ -370,6 +378,30 @@ public final class LanceFtsQuery extends Query {
      * A reader that holds every fragment skips the filter and keeps
      * the single unrestricted scan it always ran.
      *
+     * <p>The scan asks Lance for {@code _rowaddr} and {@code _score}
+     * only. Without an explicit projection Lance materialises every
+     * column of every matching row (the text column the query ran on,
+     * vector columns) into the Arrow batches it hands back, although
+     * the Weight reads none of them: an unbounded scan that matched a
+     * quarter of a billion rows carried hundreds of gigabytes of
+     * native buffers that way and ended the node, and past about 2
+     * GiB of text in one take the Utf8 array's 32 bit offsets
+     * overflowed. With the projection the batches hold 12 bytes per
+     * match. The column visibility check ({@link #columnsVisible}) is
+     * unaffected: it looks at the leaf reader's field infos, not at
+     * what the scan returns.
+     *
+     * <p>The hits the scan produces are buffered on heap in one
+     * {@link LanceFragmentHits} per fragment, and every buffer is
+     * reserved with the request's {@link LanceHitsAccounting} before
+     * it is allocated. The bytes of a buffer the Weight drops (the
+     * probe of an unbounded scan that filled up, the result of a scan
+     * that lost the race to install itself) are released here; the
+     * bytes of the buffers the Weight keeps are released when the
+     * executor closes the search context the accounting belongs to.
+     * A refusal by the breaker propagates as
+     * {@link CircuitBreakingException} and the executor answers 429.
+     *
      * <p>The class is public so the fragment executor, which creates
      * the Weight itself and drives hits and aggregations through it,
      * can read {@link #hitCount()} and {@link #complete()} afterwards
@@ -381,15 +413,17 @@ public final class LanceFtsQuery extends Query {
     public final class LanceFtsWeight extends Weight implements LanceHintingWeight {
 
         private final float boost;
+        private final LanceHitsAccounting accounting;
         // Result of the shard scan, populated by the first Lance-backed
         // leaf we visit and reused for every other leaf in the same
         // Weight. Set once via CAS so concurrent readers see a fully
         // constructed map.
         private final AtomicReference<ShardScan> shardScan = new AtomicReference<>();
 
-        LanceFtsWeight(LanceFtsQuery query, float boost) {
+        LanceFtsWeight(LanceFtsQuery query, float boost, LanceHitsAccounting accounting) {
             super(query);
             this.boost = boost;
+            this.accounting = Objects.requireNonNull(accounting, "accounting must not be null");
         }
 
         @Override
@@ -629,7 +663,10 @@ public final class LanceFtsQuery extends Query {
                 if (returned >= probeLimit) {
                     // Too many matches to filter here: discard the
                     // probe and let Lance restrict the scan to the
-                    // reader's fragments.
+                    // reader's fragments. The probe rows leave the
+                    // heap, so their bytes go back to the breaker
+                    // before the restricted scan reserves its own.
+                    accounting.release(heapBytesOf(hits));
                     hits = new HashMap<>();
                     ScanOptions restricted = restrictToFragmentsUnlessAll(newScanOptions(), new ArrayList<>(fragmentIds), dataset).build();
                     issued.add(restricted);
@@ -638,24 +675,34 @@ public final class LanceFtsQuery extends Query {
                 complete = true;
             }
             ShardScan fresh = new ShardScan(hits, complete, List.copyOf(issued));
-            // Whichever thread wins the CAS installs the result; losers reuse it.
+            // Whichever thread wins the CAS installs the result; losers
+            // reuse it and drop the buffers of their own scan.
             if (shardScan.compareAndSet(null, fresh)) {
                 return fresh.hits();
             }
+            accounting.release(heapBytesOf(hits));
             return shardScan.get().hits();
         }
 
         /**
          * Scan options shared by every scan of this Weight: the
          * full-text query, the row address the hits are bucketed by,
-         * and the SQL prefilter of a collapsed bool query. The
-         * prefilter runs as a Lance prefilter: the planner evaluates
-         * it first (scalar index or filtered _rowid read) and hands
-         * the resulting row set to the inverted-index lookup, so a
-         * limit clips the already filtered hits.
+         * the score, and the SQL prefilter of a collapsed bool query.
+         * The projection names {@code _score} explicitly rather than
+         * leaving the column list empty: Lance adds {@code _score} to
+         * an empty projection of a full text scan today as a
+         * deprecated default and logs a warning for every scan that
+         * relies on it, while a projection that names the column is
+         * the form the default is moving to. Either way no data column
+         * is read. The prefilter runs as a Lance prefilter: the planner
+         * evaluates it first (scalar index or filtered _rowid read) and
+         * hands the resulting row set to the inverted-index lookup, so
+         * a limit clips the already filtered hits.
          */
         private ScanOptions.Builder newScanOptions() {
-            ScanOptions.Builder builder = new ScanOptions.Builder().fullTextQuery(query().fullTextQuery()).withRowAddress(true);
+            ScanOptions.Builder builder = new ScanOptions.Builder().fullTextQuery(query().fullTextQuery())
+                .columns(HITS_SCAN_COLUMNS)
+                .withRowAddress(true);
             String prefilterSql = query().prefilterSql();
             if (prefilterSql != null) {
                 builder = builder.filter(prefilterSql).prefilter(true);
@@ -669,6 +716,9 @@ public final class LanceFtsQuery extends Query {
          * row when {@code keep} is null) to {@code into}, bucketed by
          * fragment id. Returns the number of rows Lance returned
          * before the filter, which is what a limit is compared with.
+         * A refusal by the request breaker while the buffers grow
+         * closes the scan and propagates as is; the rows added so far
+         * stay in {@code into} and are released with it.
          */
         private long collectHits(Dataset dataset, ScanOptions options, Set<Integer> keep, Map<Integer, LanceFragmentHits> into)
             throws IOException {
@@ -688,10 +738,10 @@ public final class LanceFtsQuery extends Query {
                         }
                         int offset = (int) (addr & 0xFFFFFFFFL);
                         float s = score.get(i) * boost;
-                        into.computeIfAbsent(fragId, id -> new LanceFragmentHits()).add(offset, s);
+                        into.computeIfAbsent(fragId, id -> new LanceFragmentHits(accounting)).add(offset, s);
                     }
                 }
-            } catch (IOException e) {
+            } catch (IOException | CircuitBreakingException e) {
                 throw e;
             } catch (Exception e) {
                 // The Weight contract allows IOException only. Keep the
@@ -716,6 +766,15 @@ public final class LanceFtsQuery extends Query {
      * the scans that were issued to get there.
      */
     private record ShardScan(Map<Integer, LanceFragmentHits> hits, boolean complete, List<ScanOptions> scans) {
+    }
+
+    /** Bytes the hit buffers of {@code hits} hold, see {@link LanceFragmentHits#heapBytes()}. */
+    static long heapBytesOf(Map<Integer, LanceFragmentHits> hits) {
+        long total = 0L;
+        for (LanceFragmentHits fragmentHits : hits.values()) {
+            total += fragmentHits.heapBytes();
+        }
+        return total;
     }
 
     @Override
