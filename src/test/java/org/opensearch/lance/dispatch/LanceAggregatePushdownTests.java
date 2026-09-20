@@ -9,10 +9,14 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.nio.file.Path;
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 
 import org.lance.Dataset;
 import org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsRequest;
@@ -43,6 +47,7 @@ import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.PipelineAggregatorBuilders;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
+import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
 import org.opensearch.search.aggregations.bucket.histogram.InternalHistogram;
 import org.opensearch.search.aggregations.bucket.terms.IncludeExclude;
 import org.opensearch.search.aggregations.bucket.terms.LongTerms;
@@ -50,6 +55,7 @@ import org.opensearch.search.aggregations.bucket.terms.StringTerms;
 import org.opensearch.search.aggregations.metrics.InternalAvg;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
+import org.opensearch.threadpool.ThreadPool;
 
 /**
  * The Substrait aggregation pushdown against a real table: which trees
@@ -78,6 +84,10 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
         assertTrue(candidate(AggregationBuilders.terms("c").field("category").order(BucketOrder.key(false))));
         assertTrue(candidate(AggregationBuilders.histogram("h").field("rating").interval(100)));
         assertTrue(candidate(AggregationBuilders.dateHistogram("d").field("ts").fixedInterval(DateHistogramInterval.days(30))));
+        assertTrue(candidate(AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(DateHistogramInterval.MONTH)));
+        assertTrue(candidate(AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(new DateHistogramInterval("1w"))));
+        assertTrue(candidate(AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(DateHistogramInterval.QUARTER)));
+        assertTrue(candidate(AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(DateHistogramInterval.SECOND)));
 
         assertFalse("no aggregations", LanceAggregationSupport.isPushdownCandidate(null));
         assertFalse("no aggregations", LanceAggregationSupport.isPushdownCandidate(AggregatorFactories.builder()));
@@ -109,8 +119,17 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
             candidate(AggregationBuilders.histogram("h").field("rating").interval(100).extendedBounds(0, 2000))
         );
         assertFalse(
-            "calendar interval",
-            candidate(AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(DateHistogramInterval.MONTH))
+            "calendar interval with time zone",
+            candidate(
+                AggregationBuilders.dateHistogram("d")
+                    .field("ts")
+                    .calendarInterval(DateHistogramInterval.MONTH)
+                    .timeZone(ZoneId.of("+09:00"))
+            )
+        );
+        assertFalse(
+            "calendar interval with offset",
+            candidate(AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(DateHistogramInterval.DAY).offset("1h"))
         );
         assertFalse(
             "time zone",
@@ -322,6 +341,242 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
         assertEquals(480L, histogramRows);
     }
 
+    public void testParallelGroupScansAgreeWithOneScan() throws Exception {
+        // 8 fragments of 100 rows: 640 one row rating groups, 3
+        // category groups, so shard_size cuts the rating terms and
+        // sum_other_doc_count depends on every group being merged before
+        // the cut. The same requests are answered with 1, 2 and 8 scans
+        // and by the aggregators; the results have to be identical.
+        String indexName = "pushdown-parallel";
+        String tableUri = attach(indexName, 8, 100);
+        List<AggregatorFactories.Builder> trees = List.of(
+            AggregatorFactories.builder()
+                .addAggregator(AggregationBuilders.sum("s").field("rating"))
+                .addAggregator(AggregationBuilders.avg("a").field("rating"))
+                .addAggregator(AggregationBuilders.min("m").field("rating"))
+                .addAggregator(AggregationBuilders.max("M").field("rating"))
+                .addAggregator(AggregationBuilders.count("c").field("category")),
+            AggregatorFactories.builder().addAggregator(AggregationBuilders.terms("r").field("rating").size(3)),
+            AggregatorFactories.builder().addAggregator(AggregationBuilders.terms("r").field("rating").size(5).showTermDocCountError(true)),
+            AggregatorFactories.builder()
+                .addAggregator(AggregationBuilders.terms("r").field("rating").size(4).order(BucketOrder.key(false))),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .size(2)
+                        .subAggregation(AggregationBuilders.avg("a").field("rating"))
+                        .subAggregation(AggregationBuilders.min("m").field("rating"))
+                        .subAggregation(AggregationBuilders.max("M").field("rating"))
+                        .subAggregation(AggregationBuilders.count("n").field("flag"))
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.histogram("h")
+                        .field("rating")
+                        .interval(100)
+                        .subAggregation(AggregationBuilders.sum("s").field("id"))
+                )
+        );
+        List<QueryBuilder> queries = List.of(new MatchAllQueryBuilder(), new RangeQueryBuilder("rating").gte(500));
+        for (AggregatorFactories.Builder tree : trees) {
+            for (QueryBuilder query : queries) {
+                LanceFragmentQueryRequest request = request(tableUri, indexName, query, tree, List.of());
+                Map<Integer, LanceFragmentQueryResponse> byParallelism = new LinkedHashMap<>();
+                for (int parallelism : new int[] { 1, 2, 8 }) {
+                    setParallelism(parallelism);
+                    try {
+                        byParallelism.put(parallelism, execute(request));
+                    } finally {
+                        setParallelism(null);
+                    }
+                }
+                setPushdown(false);
+                LanceFragmentQueryResponse viaAggregators;
+                try {
+                    viaAggregators = execute(request);
+                } finally {
+                    setPushdown(null);
+                }
+                for (Map.Entry<Integer, LanceFragmentQueryResponse> entry : byParallelism.entrySet()) {
+                    String label = tree + " with " + query + " at parallelism " + entry.getKey();
+                    assertEquals(label, viaAggregators.matched(), entry.getValue().matched());
+                    assertEquals(label, viaAggregators.aggregations(), entry.getValue().aggregations());
+                }
+            }
+        }
+
+        // The shard side fields of the rating terms after 8 scans: the
+        // cut to shard_size 14 happens once over the 640 merged groups,
+        // so 626 rows are "other"; a cut per scan before the merge would
+        // leave 8 * 14 - 14 = 98.
+        setParallelism(8);
+        try {
+            LongTerms terms = execute(request(tableUri, indexName, new MatchAllQueryBuilder(), trees.get(1), List.of())).aggregations()
+                .get("r");
+            assertEquals(14, terms.getBuckets().size());
+            assertEquals(640L - 14L, terms.getSumOfOtherDocCounts());
+            assertEquals(0L, terms.getDocCountError());
+
+            // avg is assembled from the merged sum and count: the value
+            // equals the exact quotient over every non null rating.
+            InternalAggregations metrics = execute(request(tableUri, indexName, new MatchAllQueryBuilder(), trees.get(0), List.of()))
+                .aggregations();
+            long sum = 0;
+            long count = 0;
+            for (int i = 0; i < 800; i++) {
+                if (i % 5 != 4) {
+                    sum += (i * 37L) % 1000L;
+                    count++;
+                }
+            }
+            InternalAvg avg = metrics.get("a");
+            assertEquals((double) sum / count, avg.getValue(), 0d);
+        } finally {
+            setParallelism(null);
+        }
+    }
+
+    public void testGroupSplitIsContiguous() {
+        assertEquals(
+            List.of(List.of(0, 1, 2, 3, 4, 5, 6, 7)),
+            LanceAggregatePushdown.Plan.splitContiguous(List.of(0, 1, 2, 3, 4, 5, 6, 7), 1)
+        );
+        assertEquals(
+            List.of(List.of(0, 1, 2, 3), List.of(4, 5, 6, 7)),
+            LanceAggregatePushdown.Plan.splitContiguous(List.of(0, 1, 2, 3, 4, 5, 6, 7), 2)
+        );
+        assertEquals(
+            List.of(List.of(0, 1), List.of(2, 3, 4), List.of(5, 6, 7)),
+            LanceAggregatePushdown.Plan.splitContiguous(List.of(0, 1, 2, 3, 4, 5, 6, 7), 3)
+        );
+        assertEquals(
+            "more parallelism than fragments: one fragment per group",
+            List.of(List.of(3), List.of(9), List.of(12)),
+            LanceAggregatePushdown.Plan.splitContiguous(List.of(3, 9, 12), 8)
+        );
+        assertEquals(List.of(List.of(7)), LanceAggregatePushdown.Plan.splitContiguous(List.of(7), 4));
+        assertEquals(Collections.singletonList(null), LanceAggregatePushdown.Plan.splitContiguous(null, 4));
+        assertEquals(Collections.singletonList(null), LanceAggregatePushdown.Plan.splitContiguous(List.of(), 4));
+    }
+
+    public void testOneFailingGroupFailsTheRequestAndAStarvedPoolStillAnswers() throws Exception {
+        String indexName = "pushdown-failing-group";
+        String tableUri = attach(indexName, 8, 100);
+        IndexService indexService = getInstanceFromNode(IndicesService.class).indexService(resolveIndex(indexName));
+        QueryShardContext qsc = indexService.newQueryShardContext(0, null, () -> 0L, null);
+        Executor searchPool = getInstanceFromNode(ThreadPool.class).executor(ThreadPool.Names.SEARCH);
+        try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
+            LanceAggregatePushdown.Plan plan = plan(
+                dataset,
+                Map.of(),
+                qsc,
+                AggregationBuilders.terms("c").field("category").subAggregation(AggregationBuilders.sum("s").field("rating"))
+            );
+            List<Integer> every = List.of(0, 1, 2, 3, 4, 5, 6, 7);
+            LanceAggregatePushdown.Result reference = plan.execute(dataset, every, null, 1, searchPool, name -> null);
+            assertEquals(1, reference.scans());
+            assertEquals(800L, reference.totalRows());
+
+            // A fragment id the table does not have makes its group's
+            // scan fail inside Lance; the request fails instead of
+            // answering from the groups that did succeed.
+            List<Integer> withMissing = List.of(0, 1, 2, 3, 4, 5, 6, 7, 999);
+            Exception failure = expectThrows(Exception.class, () -> plan.execute(dataset, withMissing, null, 4, searchPool, name -> null));
+            assertNotNull(failure.getMessage());
+
+            // An executor that rejects everything, and one that accepts
+            // but never runs: the calling thread scans every group itself
+            // and the answer is the same.
+            Executor rejecting = task -> { throw new RejectedExecutionException("full"); };
+            LanceAggregatePushdown.Result rejected = plan.execute(dataset, every, null, 4, rejecting, name -> null);
+            assertEquals(4, rejected.scans());
+            assertEquals(reference.aggregations(), rejected.aggregations());
+            assertEquals(reference.totalRows(), rejected.totalRows());
+
+            List<Runnable> parked = new ArrayList<>();
+            LanceAggregatePushdown.Result starved = plan.execute(dataset, every, null, 4, parked::add, name -> null);
+            assertEquals(4, starved.scans());
+            assertEquals(3, parked.size());
+            assertEquals(reference.aggregations(), starved.aggregations());
+            // The parked tasks find nothing left to do when they finally run.
+            for (Runnable task : parked) {
+                task.run();
+            }
+
+            LanceAggregatePushdown.Result parallel = plan.execute(dataset, every, null, 8, searchPool, name -> null);
+            assertEquals(8, parallel.scans());
+            assertEquals(reference.aggregations(), parallel.aggregations());
+        }
+    }
+
+    public void testCalendarIntervalDateHistogramEqualsAggregatorResult() throws Exception {
+        // The dated fixture: six rows on a timestamp[us] column, two of
+        // them in March 2024. Every calendar unit date_trunc knows is
+        // compared with the aggregators, with and without a metric child
+        // and a filter.
+        String indexName = "pushdown-calendar";
+        Path dir = createTempDir();
+        String tableUri = LanceTableFactory.writeDatedTable(dir, indexName);
+        attachTable(indexName, tableUri);
+        List<DateHistogramInterval> intervals = List.of(
+            DateHistogramInterval.MONTH,
+            DateHistogramInterval.DAY,
+            DateHistogramInterval.WEEK,
+            DateHistogramInterval.QUARTER,
+            DateHistogramInterval.YEAR,
+            DateHistogramInterval.HOUR,
+            DateHistogramInterval.MINUTE,
+            new DateHistogramInterval("1M"),
+            new DateHistogramInterval("1d")
+        );
+        for (DateHistogramInterval interval : intervals) {
+            List<AggregatorFactories.Builder> trees = List.of(
+                AggregatorFactories.builder().addAggregator(AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(interval)),
+                AggregatorFactories.builder()
+                    .addAggregator(
+                        AggregationBuilders.dateHistogram("d")
+                            .field("ts")
+                            .calendarInterval(interval)
+                            .minDocCount(1)
+                            .keyed(true)
+                            .subAggregation(AggregationBuilders.sum("s").field("id"))
+                            .subAggregation(AggregationBuilders.max("last").field("ts"))
+                    ),
+                AggregatorFactories.builder()
+                    .addAggregator(
+                        AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(interval).order(BucketOrder.key(false))
+                    )
+            );
+            for (AggregatorFactories.Builder tree : trees) {
+                for (QueryBuilder query : List.of(new MatchAllQueryBuilder(), new TermQueryBuilder("category", "odd"))) {
+                    compare(tableUri, indexName, query, tree, List.of());
+                }
+            }
+        }
+        InternalDateHistogram months = execute(
+            request(
+                tableUri,
+                indexName,
+                new MatchAllQueryBuilder(),
+                AggregatorFactories.builder()
+                    .addAggregator(AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(DateHistogramInterval.MONTH)),
+                List.of()
+            )
+        ).aggregations().get("d");
+        assertEquals(
+            List.of(
+                "2024-01-01T00:00:00.000Z",
+                "2024-02-01T00:00:00.000Z",
+                "2024-03-01T00:00:00.000Z",
+                "2024-04-01T00:00:00.000Z",
+                "2024-05-01T00:00:00.000Z"
+            ),
+            months.getBuckets().stream().map(InternalDateHistogram.Bucket::getKeyAsString).toList()
+        );
+        assertEquals(List.of(1L, 1L, 2L, 1L, 1L), months.getBuckets().stream().map(InternalDateHistogram.Bucket::getDocCount).toList());
+    }
+
     private static boolean candidate(AggregationBuilder... builders) {
         AggregatorFactories.Builder tree = AggregatorFactories.builder();
         for (AggregationBuilder builder : builders) {
@@ -340,15 +595,23 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
     }
 
     private String attach(String indexName) throws Exception {
+        return attach(indexName, 3, 200);
+    }
+
+    private String attach(String indexName, int fragments, int rowsPerFragment) throws Exception {
         Path dir = createTempDir();
-        String tableUri = LanceTableFactory.writeHintFixtureTable(dir, indexName, 3, 200);
+        String tableUri = LanceTableFactory.writeHintFixtureTable(dir, indexName, fragments, rowsPerFragment);
+        attachTable(indexName, tableUri);
+        return tableUri;
+    }
+
+    private void attachTable(String indexName, String tableUri) throws Exception {
         LanceAttachResponse attached = client().execute(
             LanceAttachAction.INSTANCE,
             new LanceAttachRequest(tableUri, indexName, null, null, StorageOptions.empty(), null)
         ).actionGet();
         assertEquals(indexName, attached.index());
         ensureGreen(indexName);
-        return tableUri;
     }
 
     /**
@@ -379,6 +642,16 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
             settings.putNull(LancePlugin.AGGREGATION_PUSHDOWN_SETTING.getKey());
         } else {
             settings.put(LancePlugin.AGGREGATION_PUSHDOWN_SETTING.getKey(), value);
+        }
+        client().admin().cluster().updateSettings(new ClusterUpdateSettingsRequest().transientSettings(settings)).actionGet();
+    }
+
+    private void setParallelism(Integer value) {
+        Settings.Builder settings = Settings.builder();
+        if (value == null) {
+            settings.putNull(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING.getKey());
+        } else {
+            settings.put(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING.getKey(), value);
         }
         client().admin().cluster().updateSettings(new ClusterUpdateSettingsRequest().transientSettings(settings)).actionGet();
     }

@@ -7,11 +7,19 @@ package org.opensearch.lance.dispatch;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
 import org.apache.arrow.vector.BigIntVector;
@@ -85,8 +93,8 @@ import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder
  *
  * <p>Shapes: any number of top level metrics ({@code sum}, {@code avg},
  * {@code min}, {@code max}, {@code value_count}), or one bucket
- * aggregation ({@code terms}, {@code histogram}, fixed interval
- * {@code date_histogram}) with metric children. The structural rules
+ * aggregation ({@code terms}, {@code histogram}, {@code date_histogram}
+ * with a fixed or a calendar interval) with metric children. The structural rules
  * live in {@link LanceAggregationSupport#isPushdownCandidate}; this
  * class adds the field checks: every field is mapped, backed by a
  * scalar Lance column of a matching Arrow type ({@code keyword} on
@@ -115,8 +123,9 @@ import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder
  *       shard.</li>
  *   <li>{@code histogram} keys are
  *       {@code floor((value - offset) / interval) * interval + offset}
- *       on doubles, {@code date_histogram} keys are
- *       {@code floorDiv(millis, interval) * interval} on longs, both
+ *       on doubles, fixed interval {@code date_histogram} keys are
+ *       {@code floorDiv(millis, interval) * interval} on longs, calendar
+ *       interval keys are {@code date_trunc(unit, ts)} in UTC, all
  *       sorted ascending; empty bucket filling for {@code min_doc_count}
  *       0 stays with the coordinator's reduce, which reads the
  *       {@code EmptyBucketInfo} attached here.</li>
@@ -124,6 +133,15 @@ import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder
  *       scan with the leaf reader's conversion, booleans to 0 / 1, so
  *       {@code sum} / {@code min} / {@code max} on them return the
  *       same numbers the doc values path returns.</li>
+ *   <li>The fragments of a node are scanned in up to
+ *       {@code lance.aggregation.pushdown_parallelism} groups and the
+ *       per group rows are merged by key before any bucket is built:
+ *       counts, sums and value counts add, min and max take the
+ *       extreme, {@code avg} travels as a sum and a count. The
+ *       {@code terms} selection therefore sees the same groups one scan
+ *       would have returned, and {@code shard_size},
+ *       {@code sum_other_doc_count} and the error bound keep their
+ *       single scan meaning.</li>
  * </ul>
  */
 final class LanceAggregatePushdown {
@@ -135,8 +153,11 @@ final class LanceAggregatePushdown {
     /** Output column of the bucket key. */
     private static final String KEY_COLUMN = "k";
 
-    /** Aggregations plus the row total of the fragments this node scanned. */
-    record Result(InternalAggregations aggregations, long totalRows) {
+    /**
+     * Aggregations plus the row total of the fragments this node
+     * scanned, and the number of Lance scans that produced them.
+     */
+    record Result(InternalAggregations aggregations, long totalRows, int scans) {
     }
 
     private enum MetricKind {
@@ -157,6 +178,21 @@ final class LanceAggregatePushdown {
     private record Column(String name, int index, ArrowType type, MappedFieldType fieldType) {
         boolean isDate() {
             return type instanceof ArrowType.Date || type instanceof ArrowType.Timestamp;
+        }
+
+        /**
+         * A {@code Timestamp} column whose values DataFusion reads on the
+         * UTC calendar: no zone, or a zone that names UTC. Arrow stores
+         * a zoned timestamp as UTC epoch ticks whatever the zone, so
+         * epoch arithmetic is unaffected by it, but {@code date_trunc}
+         * truncates on the zone's calendar.
+         */
+        boolean isUtcTimestamp() {
+            if (!(type instanceof ArrowType.Timestamp timestamp)) {
+                return false;
+            }
+            String zone = timestamp.getTimezone();
+            return zone == null || zone.equals("UTC") || zone.equals("Etc/UTC") || zone.equals("+00:00");
         }
 
         boolean isBoolean() {
@@ -188,8 +224,10 @@ final class LanceAggregatePushdown {
      * One metric aggregation: its measures occupy the result columns
      * {@code prefix} ({@code sum} / {@code min} / {@code max} /
      * {@code value_count}) or {@code prefix + "_s"} and
-     * {@code prefix + "_c"} ({@code avg}, whose sum and count travel
-     * separately so the coordinator can merge averages).
+     * {@code prefix + "_c"} ({@code avg}, requested from Lance as a sum
+     * and a count rather than as DataFusion's {@code avg}, so the partial
+     * values of several scans add up and {@code InternalAvg} carries both
+     * for the coordinator's merge).
      */
     private record Metric(String name, MetricKind kind, Column column, DocValueFormat format, Map<String, Object> metadata, String prefix) {
 
@@ -208,31 +246,106 @@ final class LanceAggregatePushdown {
             }
         }
 
-        InternalAggregation read(VectorSchemaRoot root, int row) {
-            return switch (kind) {
-                case SUM -> new InternalSum(name, doubleOrZero(root.getVector(prefix), row), format, metadata);
-                case MIN -> new InternalMin(name, doubleOr(root.getVector(prefix), row, Double.POSITIVE_INFINITY), format, metadata);
-                case MAX -> new InternalMax(name, doubleOr(root.getVector(prefix), row, Double.NEGATIVE_INFINITY), format, metadata);
-                case VALUE_COUNT -> new InternalValueCount(name, longOrZero(root.getVector(prefix), row), metadata);
-                case AVG -> new InternalAvg(
-                    name,
-                    doubleOrZero(root.getVector(prefix + "_s"), row),
-                    longOrZero(root.getVector(prefix + "_c"), row),
-                    format,
-                    metadata
-                );
-            };
+        /** The metric's partial values on one group row of one scan. */
+        MetricState read(VectorSchemaRoot root, int row) {
+            MetricState state = new MetricState();
+            switch (kind) {
+                case SUM -> state.sum = doubleOrZero(root.getVector(prefix), row);
+                case MIN -> state.min = doubleOr(root.getVector(prefix), row, Double.POSITIVE_INFINITY);
+                case MAX -> state.max = doubleOr(root.getVector(prefix), row, Double.NEGATIVE_INFINITY);
+                case VALUE_COUNT -> state.count = longOrZero(root.getVector(prefix), row);
+                case AVG -> {
+                    state.sum = doubleOrZero(root.getVector(prefix + "_s"), row);
+                    state.count = longOrZero(root.getVector(prefix + "_c"), row);
+                }
+            }
+            return state;
         }
 
-        /** The value the aggregator reports for a bucket that saw no document. */
-        InternalAggregation empty() {
+        /** The aggregation the aggregator would report for the merged values. */
+        InternalAggregation toAggregation(MetricState state) {
             return switch (kind) {
-                case SUM -> new InternalSum(name, 0d, format, metadata);
-                case MIN -> new InternalMin(name, Double.POSITIVE_INFINITY, format, metadata);
-                case MAX -> new InternalMax(name, Double.NEGATIVE_INFINITY, format, metadata);
-                case VALUE_COUNT -> new InternalValueCount(name, 0L, metadata);
-                case AVG -> new InternalAvg(name, 0d, 0L, format, metadata);
+                case SUM -> new InternalSum(name, state.sum, format, metadata);
+                case MIN -> new InternalMin(name, state.min, format, metadata);
+                case MAX -> new InternalMax(name, state.max, format, metadata);
+                case VALUE_COUNT -> new InternalValueCount(name, state.count, metadata);
+                case AVG -> new InternalAvg(name, state.sum, state.count, format, metadata);
             };
+        }
+    }
+
+    /**
+     * Running values of one metric over the rows of one group. A fresh
+     * state holds the neutral element of every measure (0 for sums and
+     * counts, the infinities for min and max), which is also what the
+     * aggregator reports for a bucket without documents, so merging a
+     * state into a fresh one copies it and merging two partial states
+     * adds the sums and counts and keeps the smaller min and larger max.
+     */
+    private static final class MetricState {
+        double sum;
+        long count;
+        double min = Double.POSITIVE_INFINITY;
+        double max = Double.NEGATIVE_INFINITY;
+
+        void merge(MetricState other) {
+            sum += other.sum;
+            count += other.count;
+            min = Math.min(min, other.min);
+            max = Math.max(max, other.max);
+        }
+    }
+
+    /** Running values of one group: its row count and one state per metric, in the metric list's order. */
+    private static final class GroupState {
+        long count;
+        final MetricState[] metrics;
+
+        GroupState(long count, MetricState[] metrics) {
+            this.count = count;
+            this.metrics = metrics;
+        }
+
+        /** The state of a group no row contributed to: count 0 and every metric at its neutral element. */
+        static GroupState empty(int metricCount) {
+            MetricState[] metrics = new MetricState[metricCount];
+            for (int i = 0; i < metricCount; i++) {
+                metrics[i] = new MetricState();
+            }
+            return new GroupState(0L, metrics);
+        }
+
+        GroupState merge(GroupState other) {
+            count += other.count;
+            for (int i = 0; i < metrics.length; i++) {
+                metrics[i].merge(other.metrics[i]);
+            }
+            return this;
+        }
+    }
+
+    /**
+     * What one scan returned, and the merge of several. {@code total} is
+     * the row count over every group, null keyed rows included; a plan
+     * without groupings keeps its single row in {@code metricsOnly}
+     * ({@code null} until a row arrived), a plan with a grouping keeps
+     * one state per key in {@code groups}. Keys are the objects the
+     * bucket types expect ({@link BytesRef}, {@link Long}, {@link Double}),
+     * whose {@code equals} identifies the same group across scans.
+     */
+    private static final class Partial {
+        long total;
+        GroupState metricsOnly;
+        final Map<Object, GroupState> groups = new HashMap<>();
+
+        void merge(Partial other) {
+            total += other.total;
+            if (other.metricsOnly != null) {
+                metricsOnly = metricsOnly == null ? other.metricsOnly : metricsOnly.merge(other.metricsOnly);
+            }
+            for (Map.Entry<Object, GroupState> entry : other.groups.entrySet()) {
+                groups.merge(entry.getKey(), entry.getValue(), GroupState::merge);
+            }
         }
     }
 
@@ -279,16 +392,161 @@ final class LanceAggregatePushdown {
          * through its public {@code create(List)} instead. Only consulted
          * when {@link #needsDateHistogramPrototype()} is true.
          *
+         * <p>The fragments are cut into {@code min(fragments, parallelism)}
+         * contiguous groups and every group is scanned with its own copy
+         * of the plan, the groups after the first on {@code executor} and
+         * the first on the calling thread; the partial results are merged
+         * per group key in Java before the buckets are built. Lance runs
+         * the aggregate of one scan in a single DataFusion partition, so
+         * this is what gives a node with many fragments more than one
+         * core for the hash aggregation. One fragment, or a parallelism
+         * of 1, means one scan over {@code fragmentIds} as given.
+         *
          * <p>Failures inside Lance (a plan it cannot parse, a function
          * its DataFusion build lacks) propagate: falling back to the
          * aggregator path would hide the regression behind a slow answer.
+         * When one group fails, no further group is started, the groups
+         * already running are left to finish (a Lance scan has no cancel
+         * from the Java side) and the first failure is thrown.
          */
         Result execute(
             Dataset dataset,
             List<Integer> fragmentIds,
             String filterSql,
+            int parallelism,
+            Executor executor,
             Function<String, InternalAggregation> dateHistogramPrototype
         ) throws Exception {
+            List<List<Integer>> groups = splitContiguous(fragmentIds, parallelism);
+            Partial merged;
+            if (groups.size() == 1) {
+                merged = scan(dataset, groups.get(0), filterSql);
+            } else {
+                merged = new Partial();
+                for (Partial partial : scanInParallel(dataset, groups, filterSql, executor)) {
+                    merged.merge(partial);
+                }
+            }
+            return assemble(merged, groups.size(), dateHistogramPrototype);
+        }
+
+        /**
+         * Cuts the fragment list into {@code min(size, parallelism)}
+         * runs of consecutive fragments, as close to equal in count as
+         * the division allows. Consecutive rather than round robin so
+         * each scan reads fragments that are adjacent in the manifest,
+         * the order they were written in. A null or empty list (every
+         * fragment, handed to Lance as no fragment restriction) or a
+         * single fragment stays one group.
+         */
+        static List<List<Integer>> splitContiguous(List<Integer> fragmentIds, int parallelism) {
+            if (fragmentIds == null || fragmentIds.isEmpty()) {
+                return Collections.singletonList(null);
+            }
+            if (fragmentIds.size() == 1 || parallelism <= 1) {
+                return Collections.singletonList(fragmentIds);
+            }
+            int count = fragmentIds.size();
+            int groupCount = Math.min(count, parallelism);
+            List<List<Integer>> groups = new ArrayList<>(groupCount);
+            for (int g = 0; g < groupCount; g++) {
+                int from = (int) ((long) count * g / groupCount);
+                int to = (int) ((long) count * (g + 1) / groupCount);
+                groups.add(List.copyOf(fragmentIds.subList(from, to)));
+            }
+            return groups;
+        }
+
+        /**
+         * Scans every group, the first on the calling thread and the
+         * others as tasks on {@code executor}, and returns the partials
+         * in group order. The tasks and the caller draw group indexes
+         * from one shared counter, so a task that the executor has not
+         * started by the time the caller runs out of groups has nothing
+         * left to do: the caller marks it as taken over and does not wait
+         * for it, which keeps this method from blocking on a saturated
+         * pool (and from deadlocking when every thread of that pool is a
+         * caller waiting here) or on a task the pool rejected. Only tasks
+         * that did start are awaited.
+         */
+        private List<Partial> scanInParallel(Dataset dataset, List<List<Integer>> groups, String filterSql, Executor executor)
+            throws Exception {
+            int groupCount = groups.size();
+            Partial[] partials = new Partial[groupCount];
+            AtomicInteger next = new AtomicInteger();
+            AtomicReference<Exception> failure = new AtomicReference<>();
+            Runnable drain = () -> {
+                int index;
+                while (failure.get() == null && (index = next.getAndIncrement()) < groupCount) {
+                    try {
+                        partials[index] = scan(dataset, groups.get(index), filterSql);
+                    } catch (Exception e) {
+                        if (!failure.compareAndSet(null, e)) {
+                            failure.get().addSuppressed(e);
+                        }
+                    }
+                }
+            };
+            List<GroupTask> tasks = new ArrayList<>(groupCount - 1);
+            for (int i = 1; i < groupCount; i++) {
+                GroupTask task = new GroupTask(drain);
+                try {
+                    executor.execute(task);
+                    tasks.add(task);
+                } catch (RejectedExecutionException rejected) {
+                    // The pool is full; the calling thread scans what
+                    // the running tasks leave over.
+                    break;
+                }
+            }
+            drain.run();
+            for (GroupTask task : tasks) {
+                task.awaitIfStarted();
+            }
+            if (failure.get() != null) {
+                throw failure.get();
+            }
+            return Arrays.asList(partials);
+        }
+
+        /**
+         * One executor task of {@link #scanInParallel}. Whoever flips
+         * {@code taken} first owns the task: the pool thread runs the
+         * drain and signals {@code done}, or the caller declares the
+         * task never started and skips the wait, after which the pool
+         * thread returns at once when it eventually gets to it.
+         */
+        private static final class GroupTask implements Runnable {
+            private final Runnable drain;
+            private final AtomicBoolean taken = new AtomicBoolean();
+            private final CountDownLatch done = new CountDownLatch(1);
+
+            GroupTask(Runnable drain) {
+                this.drain = drain;
+            }
+
+            @Override
+            public void run() {
+                if (!taken.compareAndSet(false, true)) {
+                    return;
+                }
+                try {
+                    drain.run();
+                } finally {
+                    done.countDown();
+                }
+            }
+
+            void awaitIfStarted() throws InterruptedException {
+                if (taken.compareAndSet(false, true)) {
+                    return;
+                }
+                done.await();
+            }
+        }
+
+        /** One scan of the plan over {@code fragmentIds} (null: every fragment), read into a {@link Partial}. */
+        private Partial scan(Dataset dataset, List<Integer> fragmentIds, String filterSql) throws Exception {
             ScanOptions.Builder options = new ScanOptions.Builder().substraitAggregate(substrait.duplicate());
             if (fragmentIds != null) {
                 options.fragmentIds(fragmentIds);
@@ -296,18 +554,21 @@ final class LanceAggregatePushdown {
             if (filterSql != null) {
                 options.filter(filterSql);
             }
-            long total = 0L;
-            List<Group> groups = new ArrayList<>();
-            InternalAggregations metricsOnly = null;
+            Partial partial = new Partial();
+            List<Metric> metrics = bucket == null ? topMetrics : bucket.metrics();
             try (LanceScanner scanner = dataset.newScan(options.build()); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
                     FieldVector counts = root.getVector(COUNT_COLUMN);
                     for (int row = 0; row < root.getRowCount(); row++) {
-                        long count = longOrZero(counts, row);
-                        total += count;
+                        MetricState[] states = new MetricState[metrics.size()];
+                        for (int i = 0; i < states.length; i++) {
+                            states[i] = metrics.get(i).read(root, row);
+                        }
+                        GroupState state = new GroupState(longOrZero(counts, row), states);
+                        partial.total += state.count;
                         if (bucket == null) {
-                            metricsOnly = readMetrics(topMetrics, root, row);
+                            partial.metricsOnly = partial.metricsOnly == null ? state : partial.metricsOnly.merge(state);
                             continue;
                         }
                         FieldVector keys = root.getVector(KEY_COLUMN);
@@ -315,22 +576,26 @@ final class LanceAggregatePushdown {
                             // Documents without a value open no bucket.
                             continue;
                         }
-                        groups.add(new Group(key(keys, row), count, readMetrics(bucket.metrics(), root, row)));
+                        partial.groups.merge(key(keys, row), state, GroupState::merge);
                     }
                 }
             }
+            return partial;
+        }
+
+        /** Builds the node's aggregations from the merged partials. */
+        private Result assemble(Partial merged, int scans, Function<String, InternalAggregation> dateHistogramPrototype) {
             if (bucket == null) {
                 // Lance returns exactly one row for a plan without
-                // groupings, even over zero fragments; the guard only
+                // groupings, even over zero fragments; the fallback only
                 // covers a reader that yielded no batch at all.
-                if (metricsOnly == null) {
-                    List<InternalAggregation> empties = new ArrayList<>(topMetrics.size());
-                    for (Metric metric : topMetrics) {
-                        empties.add(metric.empty());
-                    }
-                    metricsOnly = InternalAggregations.from(empties);
-                }
-                return new Result(metricsOnly, total);
+                GroupState state = merged.metricsOnly != null ? merged.metricsOnly : GroupState.empty(topMetrics.size());
+                return new Result(toAggregations(topMetrics, state), merged.total, scans);
+            }
+            List<Group> groups = new ArrayList<>(merged.groups.size());
+            for (Map.Entry<Object, GroupState> entry : merged.groups.entrySet()) {
+                GroupState state = entry.getValue();
+                groups.add(new Group(entry.getKey(), state.count, toAggregations(bucket.metrics(), state)));
             }
             InternalAggregation aggregation;
             if (bucket.builder() instanceof TermsAggregationBuilder terms) {
@@ -342,7 +607,7 @@ final class LanceAggregatePushdown {
                 InternalAggregation prototype = dateHistogramPrototype.apply(dateHistogram.getName());
                 aggregation = buildDateHistogram(dateHistogram, (InternalDateHistogram) prototype, groups);
             }
-            return new Result(InternalAggregations.from(Collections.singletonList(aggregation)), total);
+            return new Result(InternalAggregations.from(Collections.singletonList(aggregation)), merged.total, scans);
         }
 
         private InternalAggregation buildTerms(TermsAggregationBuilder terms, List<Group> groups) {
@@ -501,7 +766,9 @@ final class LanceAggregatePushdown {
             InternalDateHistogram prototype,
             List<Group> groups
         ) {
-            long interval = fixedIntervalMillis(dateHistogram);
+            // A fixed interval scan returns the bucket ordinal, a
+            // calendar interval scan the bucket start in millis.
+            long interval = dateHistogram.getCalendarInterval() != null ? 1L : fixedIntervalMillis(dateHistogram);
             groups.sort(Comparator.comparingLong(group -> (Long) group.key()));
             List<InternalDateHistogram.Bucket> buckets = new ArrayList<>(groups.size());
             for (Group group : groups) {
@@ -583,16 +850,29 @@ final class LanceAggregatePushdown {
             if (!column.isDate()) {
                 return null;
             }
-            long interval;
-            try {
-                interval = fixedIntervalMillis(dateHistogram);
-            } catch (IllegalArgumentException unparseable) {
-                return null;
+            String calendarUnit = LanceAggregationSupport.calendarUnit(dateHistogram);
+            if (calendarUnit != null) {
+                // date_trunc takes a Timestamp array only (no Date32) and
+                // truncates in the column's zone, which has to be UTC to
+                // match the aggregator's rounding for a request without
+                // time_zone; other columns take the aggregator path.
+                if (!column.isUtcTimestamp()) {
+                    return null;
+                }
+                Expression truncated = SubstraitExpressions.dateTrunc(calendarUnit, new FieldReference(column.index()));
+                keyExpression = SubstraitExpressions.epochMillis(truncated, column.type());
+            } else {
+                long interval;
+                try {
+                    interval = fixedIntervalMillis(dateHistogram);
+                } catch (IllegalArgumentException unparseable) {
+                    return null;
+                }
+                if (interval <= 0L) {
+                    return null;
+                }
+                keyExpression = SubstraitExpressions.floorDivInt64(column.numericExpression(), dateHistogram.offset(), interval);
             }
-            if (interval <= 0L) {
-                return null;
-            }
-            keyExpression = SubstraitExpressions.floorDivInt64(column.numericExpression(), dateHistogram.offset(), interval);
             keyKind = KeyKind.LONG;
         }
         List<Metric> metrics = resolveMetrics(new ArrayList<>(bucketBuilder.getSubAggregations()), schema, multiFields, qsc);
@@ -723,26 +1003,19 @@ final class LanceAggregatePushdown {
         return TimeValue.parseTimeValue(dateHistogram.getFixedInterval().toString(), null, "fixed_interval").getMillis();
     }
 
-    private static InternalAggregations readMetrics(List<Metric> metrics, VectorSchemaRoot root, int row) {
+    private static InternalAggregations toAggregations(List<Metric> metrics, GroupState state) {
         if (metrics.isEmpty()) {
             return InternalAggregations.EMPTY;
         }
         List<InternalAggregation> values = new ArrayList<>(metrics.size());
-        for (Metric metric : metrics) {
-            values.add(metric.read(root, row));
+        for (int i = 0; i < metrics.size(); i++) {
+            values.add(metrics.get(i).toAggregation(state.metrics[i]));
         }
         return InternalAggregations.from(values);
     }
 
     private static InternalAggregations emptyMetrics(List<Metric> metrics) {
-        if (metrics.isEmpty()) {
-            return InternalAggregations.EMPTY;
-        }
-        List<InternalAggregation> values = new ArrayList<>(metrics.size());
-        for (Metric metric : metrics) {
-            values.add(metric.empty());
-        }
-        return InternalAggregations.from(values);
+        return toAggregations(metrics, GroupState.empty(metrics.size()));
     }
 
     /**
