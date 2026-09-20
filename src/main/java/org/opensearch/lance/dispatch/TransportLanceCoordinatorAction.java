@@ -8,10 +8,12 @@ package org.opensearch.lance.dispatch;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.Function;
 
 import org.apache.logging.log4j.LogManager;
@@ -50,6 +52,10 @@ import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.sort.FieldSortBuilder;
+import org.opensearch.search.sort.ScoreSortBuilder;
+import org.opensearch.search.sort.SortBuilder;
+import org.opensearch.search.sort.SortOrder;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
@@ -59,11 +65,13 @@ import org.opensearch.transport.TransportService;
  * {@link SearchRequest} the {@link LanceDispatchActionFilter}
  * already decided is fragment-dispatchable, resolves the target
  * indexes and query metadata, enumerates fragments through the
- * shared {@link LanceRegistry}, groups them by data node (currently
- * round-robin), and fans requests out via
- * {@link LanceFragmentQueryAction}. Once every per-node response
- * arrives, it merges the partial hits + partial metric state into
- * a single {@link SearchResponse}.
+ * shared {@link LanceRegistry}, groups them round-robin across the
+ * data nodes that hold a started copy of the index's shard, and fans
+ * requests out via {@link LanceFragmentQueryAction}. Once every
+ * per-node response arrives, it merges the per-node hit lists by the
+ * request's sort (or by score) and the per-node
+ * {@link InternalAggregations} through the stock reduce into a
+ * single {@link SearchResponse}.
  *
  * <p>Single-node clusters take this same path with a data-node list
  * of length one, so the transport hop reduces to a local
@@ -121,9 +129,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
         org.opensearch.index.query.QueryBuilder query = source == null ? null : source.query();
         org.opensearch.index.query.QueryBuilder postFilter = source == null ? null : source.postFilter();
-        List<org.opensearch.search.sort.SortBuilder<?>> sorts = source == null || source.sorts() == null
-            ? java.util.Collections.emptyList()
-            : source.sorts();
+        List<SortBuilder<?>> sorts = source == null || source.sorts() == null ? java.util.Collections.emptyList() : source.sorts();
         Object[] searchAfter = source == null ? null : source.searchAfter();
         AggregatorFactories.Builder aggregations = source == null ? null : source.aggregations();
         int size = resolveSize(source);
@@ -170,7 +176,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         );
         boolean versionRequested = source != null && Boolean.TRUE.equals(source.version());
         boolean seqNoAndPrimaryTermRequested = source != null && Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
-        MergeState merged = new MergeState(aggregations, from, size, versionRequested, seqNoAndPrimaryTermRequested);
+        MergeState merged = new MergeState(aggregations, sorts, from, size, versionRequested, seqNoAndPrimaryTermRequested);
         runIndexLoop(targets, 0, nodeList, spec, source, merged, start, listener);
     }
 
@@ -255,7 +261,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // Empty table + aggregations requested: the coordinator
             // still needs an aggregations block in the response
             // (matching shard path behaviour for an empty index).
-            // Send a single fan-out to the primary node with an
+            // Send a single fan-out to the first shard host with an
             // empty fragment set. The per-node executor opens a
             // LanceDirectoryReader with zero leaves, runs the
             // aggregators over zero docs, and returns an empty
@@ -263,24 +269,44 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // via topLevelReduce. Same wire format as any other
             // fan-out; the only novel case is the reader being
             // shaped to maxDoc=0.
-            List<DiscoveryNode> primaries = nodeListForTarget(target, nodeList);
-            if (primaries.isEmpty()) {
+            List<DiscoveryNode> hosts = nodeListForTarget(target, nodeList);
+            if (hosts.isEmpty()) {
                 done.onResponse(null);
                 return;
             }
-            dispatchEmptyAggregationRun(target, primaries.get(0), spec, merged, done);
+            dispatchEmptyAggregationRun(target, hosts.get(0), spec, merged, done);
             return;
         }
 
         Map<DiscoveryNode, List<Integer>> perNode = groupFragmentsByNode(allFragmentIds, nodeListForTarget(target, nodeList));
         int fanOutSize = perNode.size();
 
+        // Responses land in the slot of the node they came from, so
+        // the merge sees them in fan-out (node id) order rather than
+        // arrival order. That order is the tie-breaker for hits with
+        // equal sort values, and it has to be the same on every
+        // request for the response to be deterministic.
+        // GroupedActionListener's own collection is arrival-ordered
+        // and is only used here for the completion count.
+        AtomicReferenceArray<LanceFragmentQueryResponse> slots = new AtomicReferenceArray<>(fanOutSize);
+        // Any single per-node failure fails the whole request:
+        // GroupedActionListener forwards the first onFailure to
+        // `done` and ignores the remaining responses. There is no
+        // partial-result mode on the fragment path because a missing
+        // node means missing fragments, and a silently short result
+        // set is worse than an error.
         GroupedActionListener<LanceFragmentQueryResponse> gathered = new GroupedActionListener<>(ActionListener.wrap(responses -> {
-            merged.absorbTargetResponses(target, responses);
+            List<LanceFragmentQueryResponse> ordered = new ArrayList<>(fanOutSize);
+            for (int i = 0; i < fanOutSize; i++) {
+                ordered.add(slots.get(i));
+            }
+            merged.absorbTargetResponses(target, ordered);
             done.onResponse(null);
         }, done::onFailure), fanOutSize);
 
+        int slot = 0;
         for (Map.Entry<DiscoveryNode, List<Integer>> assignment : perNode.entrySet()) {
+            final int slotIndex = slot++;
             DiscoveryNode nodeTarget = assignment.getKey();
             List<Integer> fragmentsForNode = assignment.getValue();
             LanceFragmentQueryRequest fragmentRequest = new LanceFragmentQueryRequest(
@@ -326,6 +352,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
                     @Override
                     public void handleResponse(LanceFragmentQueryResponse response) {
+                        slots.set(slotIndex, response);
                         gathered.onResponse(response);
                     }
 
@@ -344,7 +371,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     }
 
     /**
-     * Send a single fan-out to the primary node with an empty
+     * Send a single fan-out to one shard host with an empty
      * fragment set so the per-node aggregator machinery still runs
      * over zero docs and returns an empty
      * {@link InternalAggregations} tree. Reserved for the
@@ -355,7 +382,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      */
     private void dispatchEmptyAggregationRun(
         IndexTarget target,
-        DiscoveryNode primary,
+        DiscoveryNode host,
         FragmentQuerySpec spec,
         MergeState merged,
         ActionListener<Void> done
@@ -376,13 +403,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             spec.trackScores()
         );
         LOGGER.info(
-            "lance.dispatch: fan-out index [{}] table [{}] empty aggregation run on primary node [{}]",
+            "lance.dispatch: fan-out index [{}] table [{}] empty aggregation run on node [{}]",
             target.indexName(),
             target.tableUri(),
-            primary.getId()
+            host.getId()
         );
         transportService.sendRequest(
-            primary,
+            host,
             LanceFragmentQueryAction.NAME,
             fragmentRequest,
             new org.opensearch.transport.TransportResponseHandler<LanceFragmentQueryResponse>() {
@@ -413,10 +440,12 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     /**
      * Round-robin fragment ids across the sorted data-node list.
      * Empty per-node bucket entries are omitted so downstream
-     * dispatch code only sees nodes that actually own work.
+     * dispatch code only sees nodes that actually own work. The map
+     * iterates in {@code nodeList} order so the fan-out (and the
+     * merge tie-break that follows it) is deterministic.
      */
     private static Map<DiscoveryNode, List<Integer>> groupFragmentsByNode(List<Integer> fragmentIds, List<DiscoveryNode> nodeList) {
-        Map<DiscoveryNode, List<Integer>> result = new HashMap<>();
+        Map<DiscoveryNode, List<Integer>> result = new LinkedHashMap<>();
         for (int i = 0; i < fragmentIds.size(); i++) {
             DiscoveryNode node = nodeList.get(i % nodeList.size());
             result.computeIfAbsent(node, k -> new ArrayList<>()).add(fragmentIds.get(i));
@@ -425,8 +454,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     }
 
     /**
-     * Return the single data node that hosts the primary shard of
-     * the target index.
+     * Return the data nodes that hold a started copy (primary or
+     * replica) of the target index's shard, sorted by node id.
      *
      * <p>The fragment path drives OpenSearch's aggregator machinery
      * through {@link org.opensearch.index.shard.IndexShard} so the
@@ -439,23 +468,21 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      *
      * <p>Lance-backed indices are single-shard. With the default
      * {@code number_of_replicas=0} exactly one data node holds the
-     * shard, and the fragment fan-out collapses to that node. With
+     * shard and the fan-out collapses to that node. With
      * {@code auto_expand_replicas} or an explicit replica count the
-     * routing table also carries replica copies; if the coordinator
-     * merged partials from both primary and replica hosts it would
-     * concatenate two disjoint sets of fragments and per-node sort
-     * order would leak into the top-level {@code hits} sequence.
-     * The fragment path has no per-node sort merge, so we pin
-     * fan-out to the primary. Every fragment still executes because
-     * Lance fragments live in external storage: the primary node can
-     * open any fragment through
-     * {@link org.opensearch.lance.LanceRegistry#openDataset}.
+     * routing table also carries replica copies, and every host of a
+     * started copy takes a round-robin share of the fragments. A
+     * replica copy is not a copy of the data: Lance fragments live in
+     * external storage and any node can open any fragment through
+     * {@link org.opensearch.lance.LanceRegistry#openDataset}; the
+     * copy only gives the node a reader and a
+     * {@code QueryShardContext} for the index.
      *
      * <p>If cluster state has no {@link IndexRoutingTable} for the
-     * index yet (very early in create-index handling) or the primary
-     * is not yet {@link ShardRouting#started()}, fall back to the
-     * caller's full node list. The receiving node then surfaces a
-     * clear {@code IndexNotFoundException} in that rare case.
+     * index yet (very early in create-index handling) or no copy is
+     * {@link ShardRouting#started()}, fall back to the caller's full
+     * node list. The receiving node then surfaces a clear
+     * {@code IndexNotFoundException} in that rare case.
      */
     private List<DiscoveryNode> nodeListForTarget(IndexTarget target, List<DiscoveryNode> fullList) {
         IndexMetadata indexMetadata = clusterService.state().metadata().index(target.indexName());
@@ -466,23 +493,28 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         if (routingTable == null) {
             return fullList;
         }
-        String primaryNodeId = null;
+        TreeSet<String> startedNodeIds = new TreeSet<>();
         for (IndexShardRoutingTable shardTable : routingTable) {
-            ShardRouting primary = shardTable.primaryShard();
-            if (primary != null && primary.started()) {
-                primaryNodeId = primary.currentNodeId();
-                break;
+            for (ShardRouting copy : shardTable) {
+                if (copy.started() && copy.currentNodeId() != null) {
+                    startedNodeIds.add(copy.currentNodeId());
+                }
             }
         }
-        if (primaryNodeId == null) {
+        if (startedNodeIds.isEmpty()) {
             return fullList;
         }
+        List<DiscoveryNode> hosts = new ArrayList<>(startedNodeIds.size());
         for (DiscoveryNode node : fullList) {
-            if (node.getId().equals(primaryNodeId)) {
-                return java.util.Collections.singletonList(node);
+            if (startedNodeIds.contains(node.getId())) {
+                hosts.add(node);
             }
         }
-        return fullList;
+        if (hosts.isEmpty()) {
+            return fullList;
+        }
+        hosts.sort(Comparator.comparing(DiscoveryNode::getId));
+        return hosts;
     }
 
     /**
@@ -621,6 +653,159 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         };
     }
 
+    /**
+     * Merge the per-node hit lists into one list ordered the way a
+     * single executor would have ordered the union.
+     *
+     * <p>Each inner list is one node's response, already sorted by
+     * that node's executor and cut to {@code from + size}. The merge
+     * re-sorts the union with a comparator built from {@code sorts}:
+     * <ul>
+     *   <li>no sort clause, or a single {@code _score} clause: score
+     *       descending ({@link SearchHit#getScore()});</li>
+     *   <li>a {@code _score} clause among others: the raw sort value
+     *       at that position (the executor stores the score there;
+     *       {@link SearchHit#getScore()} is NaN when the request did
+     *       not set {@code track_scores}), in the clause's order;</li>
+     *   <li>a {@code _doc} clause: node order then per-node order,
+     *       because Lucene doc ids are meaningless across nodes;</li>
+     *   <li>any other clause: {@link SearchHit#getRawSortValues()} at
+     *       that position, compared as {@link Comparable} in the
+     *       clause's order. The executor already substituted the
+     *       {@code missing} sentinel for numeric fields, so a null
+     *       only arrives for keyword fields; it sorts last unless the
+     *       clause says {@code "missing": "_first"}, the same default
+     *       OpenSearch's comparator sources apply.</li>
+     * </ul>
+     * Hits that compare equal keep node order (the fan-out order,
+     * node id ascending) and then their position in the node's list.
+     *
+     * <p>{@code search_after} needs no handling here: each executor
+     * already applied the cursor to its own hits, so every hit in
+     * every inner list is past the cursor and the merged order is the
+     * correct continuation.
+     */
+    static List<SearchHit> mergeHits(List<List<SearchHit>> perNodeHits, List<SortBuilder<?>> sorts) {
+        List<RankedHit> ranked = new ArrayList<>();
+        for (int node = 0; node < perNodeHits.size(); node++) {
+            List<SearchHit> nodeHits = perNodeHits.get(node);
+            for (int position = 0; position < nodeHits.size(); position++) {
+                ranked.add(new RankedHit(nodeHits.get(position), node, position));
+            }
+        }
+        if (ranked.size() > 1) {
+            ranked.sort(hitComparator(sorts));
+        }
+        List<SearchHit> out = new ArrayList<>(ranked.size());
+        for (RankedHit r : ranked) {
+            out.add(r.hit());
+        }
+        return out;
+    }
+
+    private record RankedHit(SearchHit hit, int node, int position) {
+    }
+
+    private static Comparator<RankedHit> hitComparator(List<SortBuilder<?>> sorts) {
+        Comparator<RankedHit> arrival = Comparator.comparingInt(RankedHit::node).thenComparingInt(RankedHit::position);
+        if (sorts == null || sorts.isEmpty()) {
+            return Comparator.<RankedHit>comparingDouble(r -> -scoreOf(r.hit())).thenComparing(arrival);
+        }
+        Comparator<RankedHit> comparator = null;
+        for (int i = 0; i < sorts.size(); i++) {
+            SortBuilder<?> sort = sorts.get(i);
+            Comparator<RankedHit> clause = clauseComparator(sort, i, arrival);
+            comparator = comparator == null ? clause : comparator.thenComparing(clause);
+        }
+        return comparator.thenComparing(arrival);
+    }
+
+    private static Comparator<RankedHit> clauseComparator(SortBuilder<?> sort, int index, Comparator<RankedHit> arrival) {
+        boolean descending = sort.order() == SortOrder.DESC;
+        if (sort instanceof ScoreSortBuilder) {
+            Comparator<RankedHit> byScore = (a, b) -> Float.compare(scoreAt(a.hit(), index), scoreAt(b.hit(), index));
+            return descending ? byScore.reversed() : byScore;
+        }
+        boolean nullsFirst = false;
+        if (sort instanceof FieldSortBuilder field) {
+            if (FieldSortBuilder.DOC_FIELD_NAME.equals(field.getFieldName())) {
+                return arrival;
+            }
+            nullsFirst = "_first".equals(field.missing());
+        }
+        final boolean nullsFirstFinal = nullsFirst;
+        return (a, b) -> {
+            Object left = rawSortValue(a.hit(), index);
+            Object right = rawSortValue(b.hit(), index);
+            if (left == null || right == null) {
+                if (left == null && right == null) {
+                    return 0;
+                }
+                // Missing placement is absolute (first or last in
+                // the response), not relative to the clause
+                // direction, so it is decided before the
+                // direction flip below.
+                return (left == null) == nullsFirstFinal ? -1 : 1;
+            }
+            int cmp = compareValues(left, right);
+            return descending ? -cmp : cmp;
+        };
+    }
+
+    private static float scoreOf(SearchHit hit) {
+        float score = hit.getScore();
+        // NaN would sort above every real score under Float.compare;
+        // treat "no score" as the lowest score instead.
+        return Float.isNaN(score) ? Float.NEGATIVE_INFINITY : score;
+    }
+
+    /**
+     * Score for a {@code _score} sort clause: the raw sort value at
+     * the clause position when the executor recorded one, else
+     * {@link SearchHit#getScore()}.
+     */
+    private static float scoreAt(SearchHit hit, int index) {
+        Object raw = rawSortValue(hit, index);
+        if (raw instanceof Number number) {
+            return number.floatValue();
+        }
+        return scoreOf(hit);
+    }
+
+    private static Object rawSortValue(SearchHit hit, int index) {
+        Object[] raw = hit.getRawSortValues();
+        if (raw == null || index >= raw.length) {
+            return null;
+        }
+        return raw[index];
+    }
+
+    /**
+     * Compare two non-null raw sort values. The executors type a
+     * given clause identically on every node (the type comes from
+     * the field mapping), so the common case is two values of the
+     * same {@link Comparable} class. Mixed numeric widths, which can
+     * only happen when two indexes in one request map a field
+     * differently, are compared by value.
+     */
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    static int compareValues(Object left, Object right) {
+        if (left.getClass() == right.getClass() && left instanceof Comparable) {
+            return ((Comparable) left).compareTo(right);
+        }
+        if (left instanceof Number l && right instanceof Number r) {
+            if (isIntegral(l) && isIntegral(r)) {
+                return Long.compare(l.longValue(), r.longValue());
+            }
+            return Double.compare(l.doubleValue(), r.doubleValue());
+        }
+        return left.toString().compareTo(right.toString());
+    }
+
+    private static boolean isIntegral(Number n) {
+        return n instanceof Long || n instanceof Integer || n instanceof Short || n instanceof Byte;
+    }
+
     private SearchResponse emptyResponse(long took) {
         SearchHits hits = new SearchHits(new SearchHit[0], new TotalHits(0, TotalHits.Relation.EQUAL_TO), Float.NaN);
         SearchResponseSections sections = new SearchResponseSections(hits, null, null, false, false, null, 1);
@@ -665,6 +850,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     private final class MergeState {
 
         private final AggregatorFactories.Builder aggregationsRequested;
+        // Sort clauses of the request; drive the cross-node hit merge
+        // in buildResponse. Empty means score order.
+        private final List<SortBuilder<?>> sorts;
         // Requested pagination window. `perNodeSize` on the wire is
         // `from + size` so every per-node executor already returned
         // enough hits for us to skip the first `from` and keep `size`.
@@ -681,24 +869,29 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         private final boolean versionRequested;
         private final boolean seqNoAndPrimaryTermRequested;
         private long totalMatched = 0L;
-        private final List<SearchHit> hits = new ArrayList<>();
+        // One entry per per-node response, in fan-out order (target
+        // order, then node id order within a target). Each inner list
+        // is already sorted by the executor and cut to from + size.
+        private final List<List<SearchHit>> perNodeHits = new ArrayList<>();
         private final List<InternalAggregations> perNodeAggregations = new ArrayList<>();
 
         MergeState(
             AggregatorFactories.Builder aggregationsRequested,
+            List<SortBuilder<?>> sorts,
             int from,
             int size,
             boolean versionRequested,
             boolean seqNoAndPrimaryTermRequested
         ) {
             this.aggregationsRequested = aggregationsRequested;
+            this.sorts = sorts;
             this.from = from;
             this.size = size;
             this.versionRequested = versionRequested;
             this.seqNoAndPrimaryTermRequested = seqNoAndPrimaryTermRequested;
         }
 
-        void absorbTargetResponses(IndexTarget target, Collection<LanceFragmentQueryResponse> responses) {
+        void absorbTargetResponses(IndexTarget target, List<LanceFragmentQueryResponse> responses) {
             // Every hit needs a SearchShardTarget so the response
             // envelope carries the {@code _index} key that clients
             // expect. Fragment path has no shard concept, so we
@@ -715,18 +908,15 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 );
             for (LanceFragmentQueryResponse response : responses) {
                 totalMatched += response.matched();
-                // Keep every hit until we finish collecting per-node
-                // responses; the skip/limit runs in buildResponse
-                // where we know the full merged set. Multi-node sort
-                // merge is future work — for now the coordinator
-                // concatenates in per-node arrival order and relies on
-                // the per-node executor's own sort/topN cut.
+                // Keep each node's list intact; the sort merge and
+                // the from/size cut run in buildResponse once every
+                // node of every target has answered.
+                List<SearchHit> nodeHits = new ArrayList<>(response.hits().size());
                 for (SearchHit hit : response.hits()) {
                     stampEnvelope(hit, shardTarget);
-                    if (hits.size() < from + size) {
-                        hits.add(hit);
-                    }
+                    nodeHits.add(hit);
                 }
+                perNodeHits.add(nodeHits);
                 if (response.aggregations() != null) {
                     perNodeAggregations.add(response.aggregations());
                 }
@@ -756,8 +946,12 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
         SearchResponse buildResponse(long startMillis) {
             long took = System.currentTimeMillis() - startMillis;
-            // Apply from/size to the collected hits so the response
-            // reflects the requested pagination window.
+            // Merge the per-node sorted lists into one ordered list,
+            // then apply from/size so the response reflects the
+            // requested pagination window. Every node returned up to
+            // from + size hits, so the merged list always holds the
+            // global top from + size.
+            List<SearchHit> hits = mergeHits(perNodeHits, sorts);
             SearchHit[] paged;
             if (hits.size() <= from) {
                 paged = new SearchHit[0];
