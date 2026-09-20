@@ -185,6 +185,27 @@ public class LanceAttachIT extends LanceRestTestCase {
             String pinnedBody = readAll(postJson("/" + pinnedIndex + "/_search", "{\"query\":{\"match_all\":{}}}"));
             assertEquals(6, extractIntPath(pinnedBody, "hits", "total", "value"));
 
+            // Advance the table past the pinned version. The pinned index
+            // must keep serving version 1 through both the shard engine
+            // (_count) and the fragment path (_search); the unpinned
+            // index follows the latest manifest on _search right away
+            // because the fragment path opens the table per request.
+            LanceTableFactory.deleteRows(tableUri, "id IN (1, 4)");
+            String pinnedAfterDelete = readAll(postJson("/" + pinnedIndex + "/_search", "{\"query\":{\"match_all\":{}}}"));
+            assertEquals(
+                "pinned _search must read version 1: " + pinnedAfterDelete,
+                6,
+                extractIntPath(pinnedAfterDelete, "hits", "total", "value")
+            );
+            String pinnedCount = readAll(client().performRequest(new Request("GET", "/" + pinnedIndex + "/_count")));
+            assertEquals("pinned _count must read version 1: " + pinnedCount, 6, extractIntPath(pinnedCount, "count"));
+            String latestAfterDelete = readAll(postJson("/" + latestIndex + "/_search", "{\"query\":{\"match_all\":{}}}"));
+            assertEquals(
+                "unpinned _search follows the delete: " + latestAfterDelete,
+                4,
+                extractIntPath(latestAfterDelete, "hits", "total", "value")
+            );
+
             // index.lance.version keeps the pin across node restarts.
             Response settings = client().performRequest(new Request("GET", "/" + pinnedIndex + "/_settings"));
             String settingsBody = readAll(settings);
