@@ -797,6 +797,9 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
 
     public void testKeywordBudgetFallbackBuildsTheHeapDictionaryForTheRequest() throws Exception {
         cache.close();
+        // Room for something, but not for a dictionary: the budget is
+        // positive so the keyword loaders take the store path, scan, and
+        // only then find that nothing fits.
         cache = new LanceWarmCache(allocator, 64L, 64, true);
         ColumnStore store = cache.columnStore();
         try (Lease lease = acquire()) {
@@ -819,6 +822,134 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
                 assertEquals(0L, store.loadCount());
                 assertEquals(0, store.entryCount());
                 assertEquals(0L, store.allocatedBytes());
+                // The scan that found the dictionaries too large is the
+                // one that served the request: one per column, and the
+                // reader's own heap loaders never ran.
+                assertEquals("one store scan per keyword column", 2L, store.scanCount());
+                assertEquals("no second scan on the heap path", 0L, leaves.get(0).shardColumnCache().heapScanCount());
+            }
+        }
+    }
+
+    public void testZeroKeywordBudgetSkipsTheStoreAndScansOnce() throws Exception {
+        cache.close();
+        // No budget at all: the outcome of a keyword load is known before
+        // its scan, so the reader takes the heap path directly.
+        cache = new LanceWarmCache(allocator, 0L, 64, true);
+        ColumnStore store = cache.columnStore();
+        assertEquals(0L, store.limitBytes());
+        try (Lease lease = acquire()) {
+            Snapshot snapshot = lease.snapshot();
+            try (
+                LanceDirectoryReader reader = openCached(snapshot, allFragments);
+                LanceDirectoryReader heap = openHeap(snapshot, allFragments)
+            ) {
+                List<LanceFragmentLeafReader> leaves = leavesOf(reader);
+                List<LanceFragmentLeafReader> heapLeaves = leavesOf(heap);
+                for (int f = 0; f < FRAGMENTS; f++) {
+                    assertSameKeyword("category", heapLeaves.get(f), leaves.get(f));
+                    assertSameKeywordArray("tags", heapLeaves.get(f), leaves.get(f));
+                    assertFalse(leaves.get(f).isServingOffHeap("category"));
+                    assertFalse(leaves.get(f).isServingOffHeap("tags"));
+                    assertTrue(leaves.get(f).isColumnFullyLoaded("category"));
+                    assertTrue(leaves.get(f).isColumnFullyLoaded("tags"));
+                }
+                assertEquals("the store was never asked", 0L, store.scanCount());
+                assertEquals(0L, store.budgetMissCount());
+                assertEquals(0L, store.loadCount());
+                assertEquals(0, store.entryCount());
+                assertEquals("one heap scan per keyword column", 2L, leaves.get(0).shardColumnCache().heapScanCount());
+                // Numeric columns keep their pre-scan budget check: one
+                // miss, and the heap loader scans once.
+                readByAdvanceExact(leaves.get(0), "rating");
+                assertEquals(1L, store.budgetMissCount());
+                assertEquals(0L, store.scanCount());
+                assertEquals(3L, leaves.get(0).shardColumnCache().heapScanCount());
+            }
+        }
+    }
+
+    public void testKeywordThatFitsTheBudgetStillEntersTheStore() throws Exception {
+        ColumnStore store = cache.columnStore();
+        try (Lease lease = acquire()) {
+            Snapshot snapshot = lease.snapshot();
+            try (LanceDirectoryReader reader = openCached(snapshot, allFragments)) {
+                List<LanceFragmentLeafReader> leaves = leavesOf(reader);
+                for (LanceFragmentLeafReader leaf : leaves) {
+                    ordsByDoc(leaf.getSortedDocValues("category"), leaf.maxDoc());
+                    rowsByDoc(leaf.getSortedSetDocValues("tags"), leaf.maxDoc());
+                    assertTrue(leaf.isServingOffHeap("category"));
+                    assertTrue(leaf.isServingOffHeap("tags"));
+                    assertTrue(store.contains(snapshot.key(), "category", leaf.fragmentId()));
+                    assertTrue(store.contains(snapshot.key(), "tags", leaf.fragmentId()));
+                }
+                assertEquals(2L, store.loadCount());
+                assertEquals(2L, store.scanCount());
+                assertEquals(0L, store.budgetMissCount());
+                assertEquals(2 * FRAGMENTS, store.entryCount());
+                assertEquals(0L, leaves.get(0).shardColumnCache().heapScanCount());
+            }
+        }
+    }
+
+    public void testKeywordBudgetFallbackKeepsTheFragmentsTheStoreAlreadyHeld() throws Exception {
+        ColumnStore store = cache.columnStore();
+        try (Lease lease = acquire()) {
+            Snapshot snapshot = lease.snapshot();
+            // Fragment 0's dictionary enters the store while there is room.
+            try (LanceDirectoryReader partial = openCached(snapshot, List.of(0))) {
+                LanceFragmentLeafReader leaf = leavesOf(partial).get(0);
+                ordsByDoc(leaf.getSortedDocValues("category"), leaf.maxDoc());
+                assertTrue(store.contains(snapshot.key(), "category", 0));
+            }
+            long heldBytes = store.allocatedBytes();
+            assertTrue(heldBytes > 0L);
+            // A store with room for one fragment's dictionary and a half:
+            // fragment 0 enters, fragments 1 and 2 together do not fit
+            // beside it, are scanned once, and are served from heap while
+            // fragment 0 keeps reading the store.
+            ColumnStore full = new ColumnStore(allocator, heldBytes + heldBytes / 2);
+            try {
+                try (
+                    LanceDirectoryReader pinning = LanceDirectoryReader.openForSnapshot(
+                        new ByteBuffersDirectory(),
+                        snapshot,
+                        full,
+                        List.of(0),
+                        null
+                    )
+                ) {
+                    LanceFragmentLeafReader leaf = leavesOf(pinning).get(0);
+                    ordsByDoc(leaf.getSortedDocValues("category"), leaf.maxDoc());
+                    assertTrue(leaf.isServingOffHeap("category"));
+                    assertEquals(1L, full.loadCount());
+                    try (
+                        LanceDirectoryReader all = LanceDirectoryReader.openForSnapshot(
+                            new ByteBuffersDirectory(),
+                            snapshot,
+                            full,
+                            allFragments,
+                            null
+                        );
+                        LanceDirectoryReader heap = openHeap(snapshot, allFragments)
+                    ) {
+                        List<LanceFragmentLeafReader> leaves = leavesOf(all);
+                        List<LanceFragmentLeafReader> heapLeaves = leavesOf(heap);
+                        for (int f = 0; f < FRAGMENTS; f++) {
+                            assertSameKeyword("category", heapLeaves.get(f), leaves.get(f));
+                        }
+                        assertTrue("fragment 0 reads the held entry", leaves.get(0).isServingOffHeap("category"));
+                        assertFalse("fragment 1 came back from the scan as heap", leaves.get(1).isServingOffHeap("category"));
+                        assertFalse(leaves.get(2).isServingOffHeap("category"));
+                        assertEquals("the pinned entry could not be evicted", 0L, full.evictionCount());
+                        assertEquals(1L, full.budgetMissCount());
+                        assertEquals("one scan for the two missing fragments", 2L, full.scanCount());
+                        assertEquals(1L, full.loadCount());
+                        assertEquals(0L, leaves.get(0).shardColumnCache().heapScanCount());
+                    }
+                }
+            } finally {
+                full.close();
             }
         }
     }
