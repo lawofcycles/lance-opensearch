@@ -542,6 +542,17 @@ lance.fts.subset_probe_limit: 1000000     # default; cap of the probe limit
 
 The effective probe limit is `min(subset_probe_limit, max(subset_probe_min_rows, floor(covered rows * subset_probe_ratio)))`. When the lookup returns that many rows the node discards them and repeats the scan restricted to its fragments. The ratio is where the two paths cost the same: the whole-table lookup makes every node receive every match and drop the rows of other nodes, about 0.5 to 0.9 µs per received row, while the restricted scan makes Lance read `_rowid` over the node's fragments first, about 21 ns per covered row (139 ms for 6.7M rows at 20M rows). The two are equal when the matches are about 3 percent of the covered rows. On a 20M row table over 3 nodes the limit is 200,000, so a term with 500,000 matches takes the restricted scan and a term with a few hits stays on the index-only lookup. Raise the ratio when the restricted scan is slower than the lookup on your hardware, lower the floor or the cap when the per-node heap for the probe rows matters.
 
+### Aggregations computed inside the scan
+
+A `size: 0` request over `match_all` or a scalar filter whose aggregations are metrics only, or one `terms` / `histogram` / `date_histogram` with metric children, is answered by a group by inside the Lance scan instead of the Lucene aggregators (the shapes are listed in [features.md](features.md#aggregation-pushdown)). Two dynamic cluster settings control it:
+
+```
+lance.aggregation.pushdown: true              # default; false answers every aggregation through the aggregators
+lance.aggregation.pushdown_parallelism: 4     # default: half the CPUs the JVM sees (at least 1, at most 32)
+```
+
+Lance aggregates one scan on a single thread, so a node that holds many fragments cuts them into `pushdown_parallelism` contiguous groups, scans the groups at once on the `search` thread pool and merges the group rows before it builds its buckets. Set it to `1` to compare against a single scan; raise it up to the node's core count when a `terms` over many rows is slower than the same request with the setting off.
+
 ## 7. Cleanup and restart
 
 The namespace registry is held in process memory. Restarting OpenSearch clears the registrations, and any Lance-backed indices survive as regular OpenSearch indices without a live sync loop. To resume auto-surface after a restart:
