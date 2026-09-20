@@ -7,7 +7,8 @@ Every Lance-backed index carries a single primary shard (attach rejects `number_
 ## Attach and namespace surface
 
 - `POST /_lance/namespace` registers a directory as a Lance namespace. The plugin polls it for `*.lance` tables and surfaces each as an OpenSearch index. Mapping is derived from the Lance Arrow schema on every surface.
-- `POST /_lance/attach` attaches a single Lance table URI directly. Idempotent: a repeated call for the same URI returns `already_attached: true`; a name clash with a non-Lance index or a Lance index for a different table returns 409.
+- `POST /_lance/attach` attaches a single Lance table URI directly. Idempotent: a repeated call for the same URI returns `already_attached: true`; a name clash with a non-Lance index or a Lance index for a different table returns 409. The body takes either `"version": N` (fixed pin, see below) or `"tag": "name"` (follow a Lance tag); both together return 400, and an unknown tag returns 400 with Lance's message.
+- `GET /_lance/refs/{index}` lists the tags (`name`, `version`) and branches (`name`) of the Lance table behind an index: `{"index": ..., "table": ..., "tags": [...], "branches": [...]}`. Unknown index returns 404, a non-Lance index 400.
 - `POST /_lance/namespace/tables {"path": "..."}` returns the table names the poll would surface from a registered namespace. Read-only preview, useful for spotting a table the poll skipped due to a name clash. Unregistered paths return 404.
 - `DELETE /_lance/namespace {"path": "..."}` stops polling that namespace. Already-surfaced indexes stay in place; delete them separately if the tables should disappear.
 - `POST /_lance/build_indexes/{index}` triggers Lance-side FTS / scalar / vector index builds from OpenSearch. Automatic builds happen for tables at or under `lance.builder.max_rows` (default 1,000,000 rows); larger tables use this explicit endpoint. `fts_columns` and `tokenizer` create inverted indexes on Utf8 columns that have none yet (see [Full-text search](#full-text-search)).
@@ -21,6 +22,7 @@ Every `/_lance/*` endpoint runs through a transport action, so a security plugin
 - `cluster:admin/lance/attach` for `POST /_lance/attach` (operator roles that may create Lance-backed indexes). The internal create-index call runs under a stashed thread context with the plugin's internal header, so the role is expected not to need `indices:admin/create` in addition; this is still to be confirmed with the security plugin installed.
 - `cluster:admin/lance/namespace/update` for `POST` / `DELETE /_lance/namespace` (the same operator roles).
 - `indices:admin/lance/build_indexes` as an index-level permission for `POST /_lance/build_indexes/{index}` (roles that own the Lance table behind that index; the build writes into the table). The refresh that follows the build runs as the caller, so the role also needs `indices:admin/refresh` on the index.
+- `indices:monitor/lance/refs` as an index-level permission for `GET /_lance/refs/{index}` (read-only roles; it reveals tag and branch names).
 - `cluster:monitor/lance/namespace` for `GET /_lance/namespace` and `POST /_lance/namespace/tables` (read-only roles; it reveals registered paths and table names).
 
 ## Query shapes
@@ -102,7 +104,8 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 ## Follow-forward and version pinning
 
 - The plugin follows the Lance manifest forward automatically. When Lance advances to a new version, the poller notices, `LanceReaderManager` swaps in a fresh reader, and the next `_search` sees the new fragments. No index close, no shard reallocation, no request downtime.
-- Attach also accepts `"version": N` in the body to pin an index to a specific manifest version. Pinned indices are excluded from the poll cycle (they must never advance, by design). Tag and branch checkout are not yet exposed by the Lance Java SDK.
+- Attach also accepts `"version": N` in the body to pin an index to a specific manifest version. Pinned indices are excluded from the poll cycle (they must never advance, by design).
+- Attach accepts `"tag": "name"` as a moving pin: the index reads the version the tag points at, stored in `index.lance.tag`. Every poll cycle resolves the tag again and refreshes the reader when the tag has been moved on the Lance side (forwards or backwards). Branches can only be listed (`GET /_lance/refs/{index}`); the Lance Java SDK has no branch checkout.
 - `_search` (fragment path) and `GET /_doc/{id}` (engine path) do not share a freshness view. Fragment path re-opens the latest dataset per query; engine path advances only with the poll cadence. See [limitations.md](limitations.md).
 
 ## Hybrid search
