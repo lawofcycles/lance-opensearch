@@ -308,10 +308,14 @@ public final class LanceFtsQuery extends Query {
             }
             Map<Integer, FtsFragmentHits> hitsByFragment = ensureShardScan(context, leaf);
             FtsFragmentHits hits = hitsByFragment.get(leaf.fragmentId());
-            if (hits == null || hits.size == 0) {
-                return null;
-            }
-            int hitCount = hits.size;
+            // A leaf without hits still gets a supplier (over an empty
+            // hit set) rather than null. Lucene then asks it for a
+            // BulkScorer exactly when it would have for a leaf with
+            // hits, and the leaf learns that nothing will be collected
+            // on it; a keyword terms aggregation built after the hits
+            // phase can then skip the leaf's dictionary instead of
+            // loading it for the global ordinal map.
+            int hitCount = hits == null ? 0 : hits.size;
             // Pack (offset, score) into longs sorted by offset so
             // the Lucene DocIdSetIterator contract (ascending docIds)
             // is satisfied. Offsets are non-negative ints so signed
