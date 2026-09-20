@@ -51,7 +51,7 @@ public final class SubstraitAggregatePlan {
     }
 
     /** An expression inside a grouping or a measure argument. */
-    public sealed interface Expression permits FieldReference, Int64Literal, Float64Literal, ScalarFunction, Cast {}
+    public sealed interface Expression permits FieldReference, Int64Literal, Float64Literal, StringLiteral, ScalarFunction, Cast {}
 
     /**
      * {@code Expression.selection}: a direct struct field reference into
@@ -73,6 +73,19 @@ public final class SubstraitAggregatePlan {
 
     /** {@code Expression.literal.fp64}. */
     public record Float64Literal(double value) implements Expression {
+    }
+
+    /**
+     * {@code Expression.literal.string}: a UTF-8 string constant, the
+     * form a function such as {@code date_trunc} takes its unit
+     * argument in.
+     */
+    public record StringLiteral(String value) implements Expression {
+        public StringLiteral {
+            if (value == null) {
+                throw new IllegalArgumentException("string literal must not be null");
+            }
+        }
     }
 
     /**
@@ -111,6 +124,7 @@ public final class SubstraitAggregatePlan {
         private static final String URN_ARITHMETIC = "extension:io.substrait:functions_arithmetic";
         private static final String URN_AGGREGATE_GENERIC = "extension:io.substrait:functions_aggregate_generic";
         private static final String URN_COMPARISON = "extension:io.substrait:functions_comparison";
+        private static final String URN_DATETIME = "extension:io.substrait:functions_datetime";
 
         private final List<Expression> groupings = new ArrayList<>();
         private final List<String> groupingNames = new ArrayList<>();
@@ -237,6 +251,9 @@ public final class SubstraitAggregatePlan {
             } else if (expression instanceof Float64Literal literal) {
                 // Literal: fp64 = 11, nullable = 50.
                 writer.message(1, new ProtoWriter().fixed64Double(11, literal.value()).bool(50, false));
+            } else if (expression instanceof StringLiteral literal) {
+                // Literal: string = 12, nullable = 50.
+                writer.message(1, new ProtoWriter().string(12, literal.value()).bool(50, false));
             } else if (expression instanceof ScalarFunction call) {
                 // ScalarFunction: function_reference = 1, arguments = 4.
                 ProtoWriter function = new ProtoWriter().varint(1, anchorOf(call.name()));
@@ -281,6 +298,7 @@ public final class SubstraitAggregatePlan {
             return switch (function) {
                 case "count" -> URN_AGGREGATE_GENERIC;
                 case "lt", "gt", "lte", "gte", "equal", "not_equal" -> URN_COMPARISON;
+                case "date_trunc" -> URN_DATETIME;
                 default -> URN_ARITHMETIC;
             };
         }
