@@ -168,18 +168,20 @@ public class LanceSnapshotIT extends LanceRestTestCase {
             assertEquals("us-east-1", extractPath(settings, indexName, "settings", "index", "lance", "storage_options", "aws_region"));
 
             // Version 1 predates the row deletion. The shard engine
-            // honours the pin, so _count and _stats report six rows; the
-            // fragment path behind _search opens the latest manifest
-            // without reading index.lance.version and reports the three
-            // rows that survived the delete.
-            int count = extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count");
-            int statsCount = engineDocCount(indexName);
+            // honours the pin, so _count and _stats report six rows once
+            // the engine has opened; the fragment path behind _search
+            // opens the latest manifest without reading
+            // index.lance.version and reports the three rows that
+            // survived the delete.
+            assertBusy(() -> {
+                int count = extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count");
+                int statsCount = engineDocCount(indexName);
+                String observed = "_count=" + count + " _stats=" + statsCount;
+                assertEquals(observed, 6, count);
+                assertEquals(observed, 6, statsCount);
+            }, 30, TimeUnit.SECONDS);
             String search = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
-            int searchTotal = extractIntPath(search, "hits", "total", "value");
-            String observed = "_count=" + count + " _stats=" + statsCount + " _search=" + searchTotal;
-            assertEquals(observed, 6, count);
-            assertEquals(observed, 6, statsCount);
-            assertEquals(observed, 3, searchTotal);
+            assertEquals(3, extractIntPath(search, "hits", "total", "value"));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
