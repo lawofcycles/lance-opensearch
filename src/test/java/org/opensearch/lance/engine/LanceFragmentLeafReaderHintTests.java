@@ -58,14 +58,22 @@ import org.opensearch.test.OpenSearchTestCase;
  * hinted rows of a column, answers docs outside the hint from the full
  * column, and keeps the ordinal space of keyword columns stable. The
  * fixture is {@link LanceTableFactory#writeHintFixtureTable} with three
- * fragments of 200 rows, so a hint of at most 10 rows per fragment
- * (5 percent) takes the sparse path.
+ * fragments of 10,000 rows, so a hint of at most 25 rows per fragment
+ * (0.25 percent, {@link LanceFragmentLeafReader#SPARSE_RATIO}) takes the
+ * sparse path. The full-text token {@code sp7} matches one row in 625
+ * (16 per fragment, 0.16 percent) and drives the sparse path from a
+ * Lance scorer; {@code grp7} matches one row in 25 (4 percent) and
+ * loads the full column.
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
 
     private static final int FRAGMENTS = 3;
-    private static final int ROWS_PER_FRAGMENT = 200;
+    private static final int ROWS_PER_FRAGMENT = 10_000;
+    /** Largest hint that stays sparse on a fragment of {@link #ROWS_PER_FRAGMENT} rows. */
+    private static final int SPARSE_ROWS = (int) (ROWS_PER_FRAGMENT * LanceFragmentLeafReader.SPARSE_RATIO);
+    /** Rows of one fragment the token {@code sp7} matches ({@code i % 625 == 7}). */
+    private static final int SP_HITS_PER_FRAGMENT = ROWS_PER_FRAGMENT / 625;
 
     private LanceDirectoryReader reader;
     private List<LanceFragmentLeafReader> leaves;
@@ -98,10 +106,12 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
             leaves.add(leaf);
         }
         // Fragments are written in id order and the reader lists them in
-        // that order, so leaves.get(f) holds rows f * 200 .. f * 200 + 199.
+        // that order, so leaves.get(f) holds rows f * 10,000 .. f * 10,000 + 9,999.
         for (int f = 0; f < FRAGMENTS; f++) {
             assertEquals(f, leaves.get(f).fragmentId());
         }
+        assertEquals(25, SPARSE_ROWS);
+        assertEquals(16, SP_HITS_PER_FRAGMENT);
     }
 
     @Override
@@ -136,6 +146,26 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
     private static Boolean flag(int i) {
         return i % 7 == 6 ? null : i % 2 == 0;
     }
+
+    /** Global ids of the rows the token {@code sp7} matches, in id order. */
+    private static List<Integer> sp7Rows() {
+        List<Integer> rows = new ArrayList<>();
+        for (int i = 0; i < FRAGMENTS * ROWS_PER_FRAGMENT; i++) {
+            if (i % 625 == 7) {
+                rows.add(i);
+            }
+        }
+        return rows;
+    }
+
+    /** Rating descending, Lucene's missing value 0 for null, ties on id. */
+    private static final Comparator<Integer> BY_RATING_DESC = Comparator.comparingLong((Integer i) -> rating(i) == null ? 0L : rating(i))
+        .reversed()
+        .thenComparing(i -> i);
+
+    /** Category ascending, missing terms first as for SortField.Type.STRING, ties on id. */
+    private static final Comparator<Integer> BY_CATEGORY = Comparator.comparing((Integer i) -> category(i) == null ? "" : category(i))
+        .thenComparing(i -> i);
 
     public void testHintedNumericAndBooleanValuesMatchTheFullColumn() throws Exception {
         LanceFragmentLeafReader leaf = leaves.get(1);
@@ -178,9 +208,9 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
         assertEquals(rating(rowId(2, 10)).longValue(), rating.longValue());
         assertFalse(leaf.isColumnFullyLoaded("rating"));
 
-        // Row 2 * 200 + 5 is outside the hint and has a value; row 2 * 200 + 9
-        // is outside the hint and null. Both must be answered correctly, not
-        // reported as missing.
+        // Row 2 * 10,000 + 5 is outside the hint and has a value; row
+        // 2 * 10,000 + 9 is outside the hint and null. Both must be
+        // answered correctly, not reported as missing.
         assertTrue(rating.advanceExact(5));
         assertEquals(rating(rowId(2, 5)).longValue(), rating.longValue());
         assertTrue("the miss loads the whole column", leaf.isColumnFullyLoaded("rating"));
@@ -201,29 +231,30 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
 
     public void testHintAboveSparseRatioLoadsTheFullColumnUpFront() throws Exception {
         LanceFragmentLeafReader sparseLeaf = leaves.get(1);
-        int[] ten = new int[10];
-        for (int i = 0; i < ten.length; i++) {
-            ten[i] = i * 3;
+        int[] atRatio = new int[SPARSE_ROWS];
+        for (int i = 0; i < atRatio.length; i++) {
+            atRatio[i] = i * 3;
         }
-        sparseLeaf.hintMatchedOffsets(ten, true);
+        sparseLeaf.hintMatchedOffsets(atRatio, true);
         NumericDocValues sparseRating = sparseLeaf.getNumericDocValues("rating");
         assertTrue(sparseRating.advanceExact(0));
-        assertTrue("10 of 200 rows is exactly 5 percent and stays sparse", sparseLeaf.isServingSparse("rating"));
+        assertTrue("25 of 10,000 rows is exactly 0.25 percent and stays sparse", sparseLeaf.isServingSparse("rating"));
         assertFalse(sparseLeaf.isColumnFullyLoaded("rating"));
-        // Rows 200, 203, ..., 227 are all c2 or null: one distinct term.
+        // Rows 10,000, 10,003, ..., 10,072 share i % 3 == 1: c1 or null,
+        // one distinct term.
         assertEquals(1L, sparseLeaf.getSortedSetDocValues("category").getValueCount());
         assertTrue(sparseLeaf.isServingSparse("category"));
 
         LanceFragmentLeafReader denseLeaf = leaves.get(0);
-        int[] eleven = new int[11];
-        for (int i = 0; i < eleven.length; i++) {
-            eleven[i] = i * 3;
+        int[] aboveRatio = new int[SPARSE_ROWS + 1];
+        for (int i = 0; i < aboveRatio.length; i++) {
+            aboveRatio[i] = i * 3;
         }
-        denseLeaf.hintMatchedOffsets(eleven, true);
+        denseLeaf.hintMatchedOffsets(aboveRatio, true);
         NumericDocValues rating = denseLeaf.getNumericDocValues("rating");
         assertTrue(rating.advanceExact(0));
         assertFalse(denseLeaf.isServingSparse("rating"));
-        assertTrue("11 of 200 rows is above 5 percent", denseLeaf.isColumnFullyLoaded("rating"));
+        assertTrue("26 of 10,000 rows is above 0.25 percent", denseLeaf.isColumnFullyLoaded("rating"));
         SortedSetDocValues category = denseLeaf.getSortedSetDocValues("category");
         assertEquals("full dictionary: c0, c1, c2", 3L, category.getValueCount());
         assertFalse(denseLeaf.isServingSparse("category"));
@@ -240,7 +271,8 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
 
     public void testExclusiveHintServesKeywordOrdinalsFromTheHintedRows() throws Exception {
         LanceFragmentLeafReader leaf = leaves.get(1);
-        // Rows 201 (c0), 202 (c1), 203 (null), 208 (c1), 210 (c0), 212 (c2)
+        // Rows 10,001 (c2), 10,002 (c0), 10,003 (null), 10,008 (c0),
+        // 10,010 (c2), 10,012 (c1)
         int[] hint = { 1, 2, 3, 8, 10, 12 };
         leaf.hintMatchedOffsets(hint, true);
 
@@ -259,11 +291,14 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
 
         // Ordinals compare like the terms: c0 < c1 < c2.
         SortedDocValues single = leaf.getSortedDocValues("category");
-        assertTrue(single.advanceExact(1));
-        int c0 = single.ordValue();
+        assertEquals("c0", category(rowId(1, 2)));
         assertTrue(single.advanceExact(2));
-        int c1 = single.ordValue();
+        int c0 = single.ordValue();
+        assertEquals("c1", category(rowId(1, 12)));
         assertTrue(single.advanceExact(12));
+        int c1 = single.ordValue();
+        assertEquals("c2", category(rowId(1, 1)));
+        assertTrue(single.advanceExact(1));
         int c2 = single.ordValue();
         assertTrue(c0 < c1 && c1 < c2);
         assertEquals(c1, single.lookupTerm(new BytesRef("c1")));
@@ -311,25 +346,31 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
 
     public void testKeywordInstanceOutsideHintAnswersFromTheFullColumnWithinItsDictionary() throws Exception {
         LanceFragmentLeafReader leaf = leaves.get(1);
-        // Rows 201, 204, 213 all carry c0, so the sparse dictionary is {c0}.
-        int[] hint = { 1, 4, 13 };
+        // Rows 10,002, 10,005, 10,008 all carry c0, so the sparse dictionary is {c0}.
+        int[] hint = { 2, 5, 8 };
+        for (int offset : hint) {
+            assertEquals("c0", category(rowId(1, offset)));
+        }
         leaf.hintMatchedOffsets(hint, true);
         SortedSetDocValues category = leaf.getSortedSetDocValues("category");
         assertEquals(1L, category.getValueCount());
         assertFalse(leaf.isColumnFullyLoaded("category"));
 
-        // Row 210 is outside the hint but its value c0 exists in the
+        // Row 10,014 is outside the hint but its value c0 exists in the
         // dictionary: the instance loads the column and answers with the
         // sparse ordinal.
-        assertTrue(category.advanceExact(10));
+        assertEquals("c0", category(rowId(1, 14)));
+        assertTrue(category.advanceExact(14));
         assertEquals(0L, category.nextOrd());
         assertTrue(leaf.isColumnFullyLoaded("category"));
-        // Row 207 is outside the hint and null.
+        // Row 10,007 is outside the hint and null.
+        assertNull(category(rowId(1, 7)));
         assertFalse(category.advanceExact(7));
-        // Row 202 carries c1, which has no ordinal in the space this
+        // Row 10,001 carries c2, which has no ordinal in the space this
         // instance has already exposed; reporting it as missing or as some
         // other term would be wrong, so the instance refuses.
-        IllegalStateException failure = expectThrows(IllegalStateException.class, () -> category.advanceExact(2));
+        assertEquals("c2", category(rowId(1, 1)));
+        IllegalStateException failure = expectThrows(IllegalStateException.class, () -> category.advanceExact(1));
         assertTrue(failure.getMessage(), failure.getMessage().contains("category"));
 
         // Later instances of the column under the same hint keep the
@@ -370,10 +411,11 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
         IndexSearcher searcher = new IndexSearcher(reader);
         Sort byRatingDesc = new Sort(new SortField("rating", SortField.Type.LONG, true));
 
-        // tok250 matches row 250 only: fragment 1, offset 50.
-        TopFieldDocs single = searcher.search(new LanceFtsQuery("body", "tok250"), 10, byRatingDesc);
-        assertEquals(1, single.totalHits.value());
-        assertEquals(rating(250).longValue(), ((Long) ((FieldDoc) single.scoreDocs[0]).fields[0]).longValue());
+        // tok10050 matches row 10,050 only: fragment 1, offset 50.
+        int single = rowId(1, 50);
+        TopFieldDocs singleDocs = searcher.search(new LanceFtsQuery("body", "tok" + single), 10, byRatingDesc);
+        assertEquals(1, singleDocs.totalHits.value());
+        assertEquals(rating(single).longValue(), ((Long) ((FieldDoc) singleDocs.scoreDocs[0]).fields[0]).longValue());
         assertArrayEquals(new int[] { 50 }, leaves.get(1).hintedOffsets());
         assertTrue("the searcher drove collection from the FTS scorer alone", leaves.get(1).hintExclusive());
         // Leaves without hits are told so, exclusively: the searcher asked
@@ -391,42 +433,50 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
         assertTrue(leaves.get(0).isServingSparse("category"));
         assertFalse(leaves.get(0).isColumnFullyLoaded("category"));
 
-        // grp7 matches 8 rows per fragment (4 percent): still sparse.
-        List<Integer> expected = new ArrayList<>();
-        for (int i = 0; i < FRAGMENTS * ROWS_PER_FRAGMENT; i++) {
-            if (i % 25 == 7) {
-                expected.add(i);
-            }
-        }
+        // sp7 matches 16 rows per fragment (0.16 percent): still sparse.
+        List<Integer> expected = sp7Rows();
         // Lucene treats a missing long as 0, so null ratings sort last in
         // descending order; ties break on doc id.
-        expected.sort(Comparator.comparingLong((Integer i) -> rating(i) == null ? 0L : rating(i)).reversed().thenComparing(i -> i));
-        TopFieldDocs group = searcher.search(new LanceFtsQuery("body", "grp7"), 30, byRatingDesc);
+        expected.sort(BY_RATING_DESC);
+        TopFieldDocs group = searcher.search(new LanceFtsQuery("body", "sp7"), 100, byRatingDesc);
         assertEquals(expected.size(), group.totalHits.value());
         assertEquals(expected, globalIds(group.scoreDocs));
         for (LanceFragmentLeafReader leaf : leaves) {
-            assertEquals(8, leaf.hintedOffsets().length);
+            assertEquals(SP_HITS_PER_FRAGMENT, leaf.hintedOffsets().length);
             assertTrue(leaf.hintExclusive());
             assertFalse(leaf.isColumnFullyLoaded("rating"));
+        }
+
+        // grp7 matches 400 rows per fragment (4 percent): above the
+        // ratio, so the sort loads the column instead of taking 400 rows.
+        List<Integer> dense = new ArrayList<>();
+        for (int i = 0; i < FRAGMENTS * ROWS_PER_FRAGMENT; i++) {
+            if (i % 25 == 7) {
+                dense.add(i);
+            }
+        }
+        dense.sort(BY_RATING_DESC);
+        TopFieldDocs denseDocs = searcher.search(new LanceFtsQuery("body", "grp7"), 50, byRatingDesc);
+        assertEquals(dense.size(), denseDocs.totalHits.value());
+        assertEquals(dense.subList(0, 50), globalIds(denseDocs.scoreDocs));
+        for (LanceFragmentLeafReader leaf : leaves) {
+            assertEquals(400, leaf.hintedOffsets().length);
+            assertFalse(leaf.isServingSparse("rating"));
+            assertTrue(leaf.isColumnFullyLoaded("rating"));
         }
     }
 
     public void testFtsWeightKeywordSortUsesTheSparseDictionaryOnEveryLeaf() throws Exception {
         IndexSearcher searcher = new IndexSearcher(reader);
         Sort byCategory = new Sort(new SortField("category", SortField.Type.STRING));
-        List<Integer> expected = new ArrayList<>();
-        for (int i = 0; i < FRAGMENTS * ROWS_PER_FRAGMENT; i++) {
-            if (i % 25 == 7) {
-                expected.add(i);
-            }
-        }
+        List<Integer> expected = sp7Rows();
         // Missing terms sort first for SortField.Type.STRING; ties break on doc id.
-        expected.sort(Comparator.comparing((Integer i) -> category(i) == null ? "" : category(i)).thenComparing(i -> i));
-        TopFieldDocs docs = searcher.search(new LanceFtsQuery("body", "grp7"), 30, byCategory);
+        expected.sort(BY_CATEGORY);
+        TopFieldDocs docs = searcher.search(new LanceFtsQuery("body", "sp7"), 100, byCategory);
         assertEquals(expected, globalIds(docs.scoreDocs));
         for (LanceFragmentLeafReader leaf : leaves) {
             assertTrue(leaf.hintExclusive());
-            assertFalse("keyword sort built its dictionary from the 8 hits", leaf.isColumnFullyLoaded("category"));
+            assertFalse("keyword sort built its dictionary from the 16 hits", leaf.isColumnFullyLoaded("category"));
         }
     }
 
@@ -439,15 +489,10 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
         // dictionary; the first leaf, whose comparator asks nothing
         // before scoring starts, stays sparse. Results are unaffected.
         IndexSearcher searcher = new IndexSearcher(reader);
-        List<Integer> expected = new ArrayList<>();
-        for (int i = 0; i < FRAGMENTS * ROWS_PER_FRAGMENT; i++) {
-            if (i % 25 == 7) {
-                expected.add(i);
-            }
-        }
-        expected.sort(Comparator.comparing((Integer i) -> category(i) == null ? "" : category(i)).thenComparing(i -> i));
+        List<Integer> expected = sp7Rows();
+        expected.sort(BY_CATEGORY);
         TopFieldDocs docs = searcher.search(
-            new LanceFtsQuery("body", "grp7"),
+            new LanceFtsQuery("body", "sp7"),
             5,
             new Sort(new SortField("category", SortField.Type.STRING))
         );
@@ -461,16 +506,16 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
     public void testKnnWeightHintsTheLeaf() throws Exception {
         IndexSearcher searcher = new IndexSearcher(reader);
         float[] vector = new float[8];
-        vector[0] = 250.4f;
-        // Nearest to 250.4: rows 250, 251, 249, all in fragment 1.
+        vector[0] = ROWS_PER_FRAGMENT + 50.4f;
+        // Nearest to 10,050.4: rows 10,050, 10,051, 10,049, all in fragment 1.
         TopFieldDocs docs = searcher.search(
             new LanceKnnQuery("embedding", vector, 3),
             10,
             new Sort(new SortField("rating", SortField.Type.LONG, true))
         );
         assertEquals(3, docs.totalHits.value());
-        List<Integer> expected = new ArrayList<>(List.of(249, 250, 251));
-        expected.sort(Comparator.comparingLong((Integer i) -> rating(i) == null ? 0L : rating(i)).reversed());
+        List<Integer> expected = new ArrayList<>(List.of(rowId(1, 49), rowId(1, 50), rowId(1, 51)));
+        expected.sort(BY_RATING_DESC);
         assertEquals(expected, globalIds(docs.scoreDocs));
         assertArrayEquals(new int[] { 49, 50, 51 }, leaves.get(1).hintedOffsets());
         assertTrue(leaves.get(1).hintExclusive());
@@ -482,42 +527,40 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
     }
 
     public void testDisjunctionOfTwoLanceClausesStaysCorrect() throws Exception {
-        // grp7 (8 rows per fragment) OR tok251 (row 251 only). Lucene
-        // builds a disjunction on every fragment (both clauses hand out
-        // a supplier, tok251's over an empty set outside fragment 1) and
-        // obtains plain scorers, so no leaf is hinted exclusively and the
-        // keyword sort loads the full dictionary. On fragment 1 the leaf
-        // is hinted with tok251's row (the last Weight to report) and the
-        // numeric sort falls back to the full column when a grp7 row is
-        // requested; on fragments 0 and 2 the empty tok251 hint does not
-        // displace grp7's, so the numeric sort stays sparse there.
+        // sp7 (16 rows per fragment) OR tok10051 (row 10,051 only).
+        // Lucene builds a disjunction on every fragment (both clauses
+        // hand out a supplier, tok10051's over an empty set outside
+        // fragment 1) and obtains plain scorers, so no leaf is hinted
+        // exclusively and the keyword sort loads the full dictionary. On
+        // fragment 1 the leaf is hinted with tok10051's row (the last
+        // Weight to report) and the numeric sort falls back to the full
+        // column when an sp7 row is requested; on fragments 0 and 2 the
+        // empty tok10051 hint does not displace sp7's, so the numeric
+        // sort stays sparse there.
         IndexSearcher searcher = new IndexSearcher(reader);
-        Query union = new BooleanQuery.Builder().add(new LanceFtsQuery("body", "grp7"), BooleanClause.Occur.SHOULD)
-            .add(new LanceFtsQuery("body", "tok251"), BooleanClause.Occur.SHOULD)
+        int single = rowId(1, 51);
+        Query union = new BooleanQuery.Builder().add(new LanceFtsQuery("body", "sp7"), BooleanClause.Occur.SHOULD)
+            .add(new LanceFtsQuery("body", "tok" + single), BooleanClause.Occur.SHOULD)
             .build();
-        List<Integer> expected = new ArrayList<>();
-        for (int i = 0; i < FRAGMENTS * ROWS_PER_FRAGMENT; i++) {
-            if (i % 25 == 7 || i == 251) {
-                expected.add(i);
-            }
-        }
+        List<Integer> expected = sp7Rows();
+        expected.add(single);
         List<Integer> byCategory = new ArrayList<>(expected);
-        byCategory.sort(Comparator.comparing((Integer i) -> category(i) == null ? "" : category(i)).thenComparing(i -> i));
-        TopFieldDocs categoryDocs = searcher.search(union, 40, new Sort(new SortField("category", SortField.Type.STRING)));
+        byCategory.sort(BY_CATEGORY);
+        TopFieldDocs categoryDocs = searcher.search(union, 100, new Sort(new SortField("category", SortField.Type.STRING)));
         assertEquals(byCategory, globalIds(categoryDocs.scoreDocs));
         assertFalse(leaves.get(1).hintExclusive());
         assertFalse(leaves.get(1).isServingSparse("category"));
         assertTrue("disjunction on fragment 1 reads the full dictionary", leaves.get(1).isColumnFullyLoaded("category"));
         assertFalse(leaves.get(0).hintExclusive());
-        assertEquals("grp7's rows stay hinted on fragment 0", 8, leaves.get(0).hintedOffsets().length);
+        assertEquals("sp7's rows stay hinted on fragment 0", SP_HITS_PER_FRAGMENT, leaves.get(0).hintedOffsets().length);
         assertFalse(leaves.get(0).isServingSparse("category"));
 
         List<Integer> byRating = new ArrayList<>(expected);
-        byRating.sort(Comparator.comparingLong((Integer i) -> rating(i) == null ? 0L : rating(i)).reversed().thenComparing(i -> i));
-        TopFieldDocs ratingDocs = searcher.search(union, 40, new Sort(new SortField("rating", SortField.Type.LONG, true)));
+        byRating.sort(BY_RATING_DESC);
+        TopFieldDocs ratingDocs = searcher.search(union, 100, new Sort(new SortField("rating", SortField.Type.LONG, true)));
         assertEquals(byRating, globalIds(ratingDocs.scoreDocs));
         assertTrue(
-            "a grp7 row outside the tok251 hint switched fragment 1 to the full column",
+            "an sp7 row outside the tok10051 hint switched fragment 1 to the full column",
             leaves.get(1).isColumnFullyLoaded("rating")
         );
         assertFalse(leaves.get(1).isServingSparse("rating"));
@@ -539,21 +582,16 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
                 assertFalse(LanceFragmentLeafReader.wrappedOnlyByOwnReaders(ctx.reader()));
                 assertNotNull(LanceFragmentLeafReader.unwrap(ctx.reader()));
             }
-            List<Integer> expected = new ArrayList<>();
-            for (int i = 0; i < FRAGMENTS * ROWS_PER_FRAGMENT; i++) {
-                if (i % 25 == 7) {
-                    expected.add(i);
-                }
-            }
-            expected.sort(Comparator.comparing((Integer i) -> category(i) == null ? "" : category(i)).thenComparing(i -> i));
+            List<Integer> expected = sp7Rows();
+            expected.sort(BY_CATEGORY);
             TopFieldDocs docs = searcher.search(
-                new LanceFtsQuery("body", "grp7"),
-                30,
+                new LanceFtsQuery("body", "sp7"),
+                100,
                 new Sort(new SortField("category", SortField.Type.STRING))
             );
             assertEquals(expected, globalIds(docs.scoreDocs));
             for (LanceFragmentLeafReader leaf : leaves) {
-                assertEquals("the hint is still delivered", 8, leaf.hintedOffsets().length);
+                assertEquals("the hint is still delivered", SP_HITS_PER_FRAGMENT, leaf.hintedOffsets().length);
                 assertFalse("but never marked exclusive under a foreign wrapper", leaf.hintExclusive());
                 assertFalse(leaf.isServingSparse("category"));
                 assertTrue(leaf.isColumnFullyLoaded("category"));
@@ -561,10 +599,10 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
             }
 
             List<Integer> byRating = new ArrayList<>(expected);
-            byRating.sort(Comparator.comparingLong((Integer i) -> rating(i) == null ? 0L : rating(i)).reversed().thenComparing(i -> i));
+            byRating.sort(BY_RATING_DESC);
             TopFieldDocs ratingDocs = searcher.search(
-                new LanceFtsQuery("body", "grp7"),
-                30,
+                new LanceFtsQuery("body", "sp7"),
+                100,
                 new Sort(new SortField("rating", SortField.Type.LONG, true))
             );
             assertEquals(byRating, globalIds(ratingDocs.scoreDocs));
@@ -588,11 +626,11 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
             }
             IndexSearcher searcher = new IndexSearcher(wrapped);
             TopFieldDocs docs = searcher.search(
-                new LanceFtsQuery("body", "grp7"),
-                30,
+                new LanceFtsQuery("body", "sp7"),
+                100,
                 new Sort(new SortField("category", SortField.Type.STRING))
             );
-            assertEquals(24, docs.totalHits.value());
+            assertEquals(FRAGMENTS * SP_HITS_PER_FRAGMENT, docs.totalHits.value());
             for (LanceFragmentLeafReader leaf : leaves) {
                 assertTrue(leaf.hintExclusive());
                 assertTrue(leaf.isServingSparse("category"));
@@ -610,7 +648,7 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
         // comparator is created; both happen before any scorer exists.
         // Under the early hint those reads see the sparse dictionary.
         WeightSearcher searcher = new WeightSearcher(reader);
-        Weight weight = searcher.createWeight(new LanceFtsQuery("body", "grp7"), ScoreMode.COMPLETE, 1f);
+        Weight weight = searcher.createWeight(new LanceFtsQuery("body", "sp7"), ScoreMode.COMPLETE, 1f);
         assertTrue(weight instanceof LanceHintingWeight);
         for (LeafReaderContext ctx : reader.leaves()) {
             ((LanceHintingWeight) weight).hintExclusive(ctx);
@@ -619,11 +657,11 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
         for (int f = 0; f < FRAGMENTS; f++) {
             LanceFragmentLeafReader leaf = leaves.get(f);
             assertTrue(leaf.hintExclusive());
-            assertEquals(8, leaf.hintedOffsets().length);
+            assertEquals(SP_HITS_PER_FRAGMENT, leaf.hintedOffsets().length);
             hinted.add(leaf.hintedOffsets());
             // What getMaxOrd does before collection: read the value count.
             SortedSetDocValues values = leaf.getSortedSetDocValues("category");
-            // grp7 rows are i % 25 == 7 (8 per fragment); category is
+            // sp7 rows are i % 625 == 7 (16 per fragment); category is
             // null for i % 4 == 3, else "c" + (i % 3).
             TreeSet<String> distinct = new TreeSet<>();
             for (int offset : leaf.hintedOffsets()) {
@@ -642,13 +680,8 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
         // look the bottom term up in the sparse dictionary now (without
         // the early hint they would have loaded the full one, see
         // testKeywordSortLoadsTheFullDictionaryOnLeavesVisitedWithAFullQueue).
-        List<Integer> expected = new ArrayList<>();
-        for (int i = 0; i < FRAGMENTS * ROWS_PER_FRAGMENT; i++) {
-            if (i % 25 == 7) {
-                expected.add(i);
-            }
-        }
-        expected.sort(Comparator.comparing((Integer i) -> category(i) == null ? "" : category(i)).thenComparing(i -> i));
+        List<Integer> expected = sp7Rows();
+        expected.sort(BY_CATEGORY);
         Sort byCategory = new Sort(new SortField("category", SortField.Type.STRING));
         TopFieldDocs docs = searcher.search(weight, new TopFieldCollectorManager(byCategory, 5, null, 1000));
         assertEquals(expected.subList(0, 5), globalIds(docs.scoreDocs));
@@ -662,7 +695,7 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
         // The same Weight serves a second collection (the executor's
         // aggregation phase after the hits phase) without touching the
         // dictionaries again.
-        TopFieldDocs again = searcher.search(weight, new TopFieldCollectorManager(byCategory, 30, null, 1000));
+        TopFieldDocs again = searcher.search(weight, new TopFieldCollectorManager(byCategory, 100, null, 1000));
         assertEquals(expected, globalIds(again.scoreDocs));
         for (LanceFragmentLeafReader leaf : leaves) {
             assertFalse(leaf.isColumnFullyLoaded("category"));
@@ -672,19 +705,22 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
     public void testEarlyExclusiveHintFromTheKnnWeight() throws Exception {
         WeightSearcher searcher = new WeightSearcher(reader);
         float[] vector = new float[8];
-        vector[0] = 250.4f;
+        vector[0] = ROWS_PER_FRAGMENT + 50.4f;
         Weight weight = searcher.createWeight(new LanceKnnQuery("embedding", vector, 3), ScoreMode.COMPLETE, 1f);
         for (LeafReaderContext ctx : reader.leaves()) {
             ((LanceHintingWeight) weight).hintExclusive(ctx);
         }
-        // Rows 249, 250, 251 are the three nearest, all in fragment 1.
+        // Rows 10,049, 10,050, 10,051 are the three nearest, all in fragment 1.
         assertArrayEquals(new int[] { 49, 50, 51 }, leaves.get(1).hintedOffsets());
         assertTrue(leaves.get(1).hintExclusive());
         assertEquals(0, leaves.get(0).hintedOffsets().length);
         assertTrue(leaves.get(0).hintExclusive());
         assertEquals(0, leaves.get(2).hintedOffsets().length);
         assertTrue(leaves.get(2).hintExclusive());
-        // 249 -> c0, 250 -> c1, 251 -> null.
+        // 10,049 -> c2, 10,050 -> c0, 10,051 -> null.
+        assertEquals("c2", category(rowId(1, 49)));
+        assertEquals("c0", category(rowId(1, 50)));
+        assertNull(category(rowId(1, 51)));
         assertEquals(2L, leaves.get(1).getSortedSetDocValues("category").getValueCount());
         assertEquals(0L, leaves.get(0).getSortedSetDocValues("category").getValueCount());
         assertEquals(0L, leaves.get(2).getSortedSetDocValues("category").getValueCount());
@@ -696,8 +732,8 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
             weight,
             new TopFieldCollectorManager(new Sort(new SortField("category", SortField.Type.STRING)), 10, null, 1000)
         );
-        // Missing terms sort first: 251 (null), then 249 (c0), 250 (c1).
-        assertEquals(List.of(251, 249, 250), globalIds(docs.scoreDocs));
+        // Missing terms sort first: 10,051 (null), then 10,050 (c0), 10,049 (c2).
+        assertEquals(List.of(rowId(1, 51), rowId(1, 50), rowId(1, 49)), globalIds(docs.scoreDocs));
         for (LanceFragmentLeafReader leaf : leaves) {
             assertFalse(leaf.isColumnFullyLoaded("category"));
         }
@@ -706,12 +742,12 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
     public void testEarlyHintUnderAForeignWrapperIsDeliveredButNotExclusive() throws Exception {
         try (DirectoryReader wrapped = new ForeignWrapper(reader)) {
             IndexSearcher searcher = new IndexSearcher(wrapped);
-            Weight weight = searcher.createWeight(new LanceFtsQuery("body", "grp7"), ScoreMode.COMPLETE, 1f);
+            Weight weight = searcher.createWeight(new LanceFtsQuery("body", "sp7"), ScoreMode.COMPLETE, 1f);
             for (LeafReaderContext ctx : wrapped.leaves()) {
                 ((LanceHintingWeight) weight).hintExclusive(ctx);
             }
             for (LanceFragmentLeafReader leaf : leaves) {
-                assertEquals(8, leaf.hintedOffsets().length);
+                assertEquals(SP_HITS_PER_FRAGMENT, leaf.hintedOffsets().length);
                 assertFalse(leaf.hintExclusive());
                 assertEquals("full dictionary of the fragment", 3L, leaf.getSortedSetDocValues("category").getValueCount());
                 assertFalse(leaf.isServingSparse("category"));

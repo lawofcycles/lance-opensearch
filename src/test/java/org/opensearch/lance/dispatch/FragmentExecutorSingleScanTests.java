@@ -49,7 +49,13 @@ import org.opensearch.test.OpenSearchSingleNodeTestCase;
 public class FragmentExecutorSingleScanTests extends OpenSearchSingleNodeTestCase {
 
     private static final int FRAGMENTS = 3;
-    private static final int ROWS_PER_FRAGMENT = 200;
+    /**
+     * Large enough for the hit sets below to stay under the reader's
+     * sparse ratio (0.25 percent), so the sort and aggregation columns
+     * are taken for the hit rows and never loaded through the column
+     * store, whose loads also check the breaker.
+     */
+    private static final int ROWS_PER_FRAGMENT = 10_000;
 
     @Override
     protected Collection<Class<? extends Plugin>> getPlugins() {
@@ -134,45 +140,45 @@ public class FragmentExecutorSingleScanTests extends OpenSearchSingleNodeTestCas
     public void testPostFilterPageWithKeywordSortAndTermsRunsOneScan() throws Exception {
         String indexName = "single-scan-post-filter";
         String tableUri = attach(indexName);
-        // grp3 matches rows i % 25 == 3 (8 per fragment, 24 in all);
-        // category is null for i % 4 == 3, else "c" + (i % 3), so six
+        // sp3 matches rows i % 625 == 3 (16 per fragment, 48 in all);
+        // category is null for i % 4 == 3, else "c" + (i % 3), so twelve
         // rows are c0. The early hint, the sorted page, the count and
         // the aggregation all read the hits of the one scan.
         Run run = run(
             request(
                 tableUri,
                 indexName,
-                new LanceMatchQueryBuilder("body", "grp3"),
+                new LanceMatchQueryBuilder("body", "sp3"),
                 new TermQueryBuilder("category", "c0"),
                 List.of(new FieldSortBuilder("category").order(SortOrder.ASC), new FieldSortBuilder("id").order(SortOrder.ASC)),
-                30,
+                50,
                 categoryTerms()
             )
         );
         assertEquals("scans", 1, run.scans());
-        assertEquals(6, run.response().matched());
-        assertEquals(6, run.response().hits().size());
+        assertEquals(12, run.response().matched());
+        assertEquals(12, run.response().hits().size());
         for (SearchHit hit : run.response().hits()) {
             assertEquals("c0", hit.getSortValues()[0].toString());
         }
-        assertEquals(List.of("c0=6", "c1=6", "c2=6"), buckets(run.response()));
+        assertEquals(List.of("c0=12", "c1=12", "c2=12"), buckets(run.response()));
 
         // Without the post_filter the same phases share the Weight directly.
         Run plain = run(
             request(
                 tableUri,
                 indexName,
-                new LanceMatchQueryBuilder("body", "grp3"),
+                new LanceMatchQueryBuilder("body", "sp3"),
                 null,
                 List.of(new FieldSortBuilder("category").order(SortOrder.ASC), new FieldSortBuilder("id").order(SortOrder.ASC)),
-                30,
+                50,
                 categoryTerms()
             )
         );
         assertEquals("scans", 1, plain.scans());
-        assertEquals(24, plain.response().matched());
-        assertEquals(24, plain.response().hits().size());
-        assertEquals(List.of("c0=6", "c1=6", "c2=6"), buckets(plain.response()));
+        assertEquals(48, plain.response().matched());
+        assertEquals(48, plain.response().hits().size());
+        assertEquals(List.of("c0=12", "c1=12", "c2=12"), buckets(plain.response()));
     }
 
     public void testKnnSizeZeroWithTermsRunsOneScan() throws Exception {
@@ -180,10 +186,10 @@ public class FragmentExecutorSingleScanTests extends OpenSearchSingleNodeTestCas
         String tableUri = attach(indexName);
         float[] vector = new float[8];
         vector[0] = 250.4f;
-        // Rows 248..252 are the five nearest: 248 -> c2, 249 -> c0,
-        // 250 -> c1, 251 -> null, 252 -> c0. The early hint scans, the
-        // aggregation reuses the Weight, and the count goes through the
-        // searcher with the same Weight.
+        // Rows 248..252 (fragment 0) are the five nearest: 248 -> c2,
+        // 249 -> c0, 250 -> c1, 251 -> null, 252 -> c0. The early hint
+        // scans, the aggregation reuses the Weight, and the count goes
+        // through the searcher with the same Weight.
         Run run = run(request(tableUri, indexName, new LanceKnnQueryBuilder("embedding", vector, 5), null, List.of(), 0, categoryTerms()));
         assertEquals("scans", 1, run.scans());
         assertEquals(5, run.response().matched());

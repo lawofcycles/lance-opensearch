@@ -1057,11 +1057,16 @@ public final class LanceTableFactory {
      * <ul>
      *   <li>{@code id}: int32, {@code i}</li>
      *   <li>{@code body}: Utf8 with an INVERTED index,
-     *       {@code "hello tok<i> grp<i % 25>"} followed by the token
-     *       {@code lance} repeated {@code (i % 5) + 1} times. {@code tok<i>}
-     *       matches exactly one row, {@code grp<n>} one row in twenty
-     *       five (below the reader's sparse ratio once a fragment has
-     *       more than 20 rows), {@code hello} every row.</li>
+     *       {@code "hello tok<i> grp<i % 25> sp<i % 625>"} followed by
+     *       the token {@code lance} repeated {@code (i % 5) + 1} times.
+     *       {@code tok<i>} matches exactly one row, {@code grp<n>} one
+     *       row in twenty five (4 percent, above the reader's sparse
+     *       ratio, so a hit set of it loads the whole column),
+     *       {@code sp<n>} one row in 625 (0.16 percent, below the sparse
+     *       ratio once a fragment has at least 400 rows, so a hit set of
+     *       it takes the hit rows; 625 is 1 modulo 3 and 1 modulo 4, so
+     *       {@code category} and its nulls cycle through the rows of one
+     *       group), {@code hello} every row.</li>
      *   <li>{@code rating}: int32, {@code (i * 37) % 1000}, distinct for
      *       {@code i < 1000} so a sort on it has no ties; Arrow null when
      *       {@code i % 5 == 4}</li>
@@ -1144,7 +1149,7 @@ public final class LanceTableFactory {
                     for (int slot = 0; slot < rowsPerFragment; slot++) {
                         int i = fragment * rowsPerFragment + slot;
                         idVector.set(slot, i);
-                        String body = "hello tok" + i + " grp" + (i % 25) + " lance".repeat((i % 5) + 1);
+                        String body = "hello tok" + i + " grp" + (i % 25) + " sp" + (i % 625) + " lance".repeat((i % 5) + 1);
                         bodyVector.setSafe(slot, body.getBytes(StandardCharsets.UTF_8));
                         if (i % 5 == 4) {
                             ratingVector.setNull(slot);
