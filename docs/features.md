@@ -2,7 +2,9 @@
 
 Reference of what the plugin surfaces on a Lance-backed OpenSearch index. Grouped by concern so each subsection can be read on its own; start with [getting-started.md](getting-started.md) for a walkthrough that stitches these together.
 
-Every Lance-backed index carries a single primary shard (attach rejects `number_of_shards`). Multi-node parallelism comes from replica placement (`index.number_of_replicas: data_nodes - 1`, or `auto_expand_replicas: 0-all`) so every data node holds a copy of the primary shard. `_search` runs through a fragment fan-out: the coordinator dispatches Lance fragments to the per-node executor holding the primary, and the executor drives OpenSearch's stock aggregator machinery and Lucene `IndexSearcher` against per-fragment leaves.
+Every Lance-backed index carries a single primary shard (attach rejects `number_of_shards`). `_search` runs through a fragment fan-out: the coordinator assigns Lance fragments round-robin to the data nodes that hold a started copy of the shard, each node's executor drives OpenSearch's stock aggregator machinery and Lucene `IndexSearcher` against per-fragment leaves, and the coordinator merges the per-node results (hits by the request's sort or by score, aggregations through the stock reduce).
+
+With the default `number_of_replicas: 0` one node holds the shard and every fragment runs there. To spread a query over the cluster, put a shard copy on every data node: `PUT /<index>/_settings {"index.auto_expand_replicas": "0-all"}` (or an explicit `index.number_of_replicas`). The copies are not copies of the data, because Lance fragments are read from external storage by whichever node gets them; a copy gives the node a reader and query context for the index. Fragments are then dealt round-robin to those nodes, each node returns its top `from + size` hits, and the coordinator merges them by sort value (or score) with ties broken by node id order, then applies `from` / `size`. `search_after` is applied by each node before the merge. A failure on any one node fails the request; there is no partial-result mode.
 
 ## Attach and namespace surface
 
