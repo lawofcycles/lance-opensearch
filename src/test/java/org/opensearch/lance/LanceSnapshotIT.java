@@ -29,7 +29,10 @@ import org.opensearch.core.xcontent.XContentParser;
  * commit; the rows and the Lance-side indexes stay in the Lance table.
  * Restore therefore re-creates the index pointing at the same
  * {@code index.lance.table}, and the outcome depends on whether that table
- * is still reachable.
+ * is still reachable. The reopen case reaches the same engine failure
+ * through close and open, where no restore decider stands between a
+ * retried allocation and the shard, so it shows what the allocation
+ * retries do once the table is back.
  */
 public class LanceSnapshotIT extends LanceRestTestCase {
 
@@ -229,11 +232,12 @@ public class LanceSnapshotIT extends LanceRestTestCase {
             }, 30, TimeUnit.SECONDS);
 
             // Retries keep failing until index.allocation.max_retries and
-            // the shard is left unassigned, so the index stays red. The
-            // retries after the first one fail on the shard lock: the
-            // engine constructor threw after ReadOnlyEngine had taken its
-            // store reference, so the store of the failed shard never
-            // closes and never releases the lock.
+            // the shard is left unassigned, so the index stays red. Every
+            // retry reports the Lance error: the engine constructor hands
+            // back the store reference and the shard lock it inherited
+            // from ReadOnlyEngine before rethrowing, so the next attempt
+            // opens the table again instead of failing on the lock the
+            // previous attempt left behind.
             assertBusy(() -> {
                 String health = readAll(client().performRequest(new Request("GET", "/_cluster/health/" + indexName)));
                 assertEquals("index health: " + health, "red", extractPath(health, "status"));
@@ -245,10 +249,12 @@ public class LanceSnapshotIT extends LanceRestTestCase {
                 String explain = allocationExplain(indexName);
                 assertEquals("allocation explain: " + explain, 2, extractIntPath(explain, "unassigned_info", "failed_allocation_attempts"));
                 assertEquals("allocation explain: " + explain, "no", extractPath(explain, "can_allocate"));
-                assertTrue(
-                    "later retries fail on the shard lock held by the failed shard: " + explain,
-                    ((String) extractPath(explain, "unassigned_info", "details")).contains("ShardLockObtainFailedException")
+                String details = (String) extractPath(explain, "unassigned_info", "details");
+                assertFalse(
+                    "later retries must not fail on the shard lock: " + explain,
+                    details.contains("ShardLockObtainFailedException")
                 );
+                assertTrue("later retries must still name the missing table: " + explain, details.contains("was not found"));
             }, 60, TimeUnit.SECONDS);
 
             // The index exists with its settings. _count (shard path) has
@@ -276,9 +282,12 @@ public class LanceSnapshotIT extends LanceRestTestCase {
             assertEquals(observed, 400, search.getResponse().getStatusLine().getStatusCode());
 
             // Putting the table back and retrying the failed allocation
-            // does not recover the index: once the restore has failed, the
-            // restore_in_progress decider refuses to allocate the primary
-            // again and asks for the index to be deleted and restored anew.
+            // does not recover the index. The shard lock is free, so the
+            // retry is not blocked by the failed shard; what blocks it is
+            // the restore_in_progress decider: exhausting
+            // index.allocation.max_retries marked the restore as failed,
+            // and OpenSearch refuses to allocate a primary whose restore
+            // has failed until the index is deleted and restored anew.
             Files.move(movedPath, tablePath, StandardCopyOption.ATOMIC_MOVE);
             Response reroute = postJson("/_cluster/reroute?retry_failed=true", "{}");
             assertEquals(RestStatus.OK.getStatus(), reroute.getStatusLine().getStatusCode());
@@ -304,6 +313,62 @@ public class LanceSnapshotIT extends LanceRestTestCase {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
             dropFsRepository(repo);
+            deleteRecursively(scratchDir);
+        }
+    }
+
+    public void testReopenWithMissingTableRecoversOnceTableIsBack() throws Exception {
+        // Same engine failure as the restore case, reached through close
+        // and open instead of a restore so no restore decider is involved.
+        // The reopened shard fails on the missing table until
+        // index.allocation.max_retries, and the retries name the table
+        // rather than the shard lock. Putting the table back and asking
+        // for a retry of the failed allocation then starts the shard, which
+        // requires the failed attempts to have released the shard's store.
+        String suffix = "reopenmiss-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        Path tablePath = scratchDir.resolve(tableName + ".lance");
+        Path movedPath = scratchDir.resolve(tableName + ".moved");
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tablePath + "\"}");
+            assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            ensureGreen(indexName);
+            Request retries = new Request("PUT", "/" + indexName + "/_settings");
+            retries.setJsonEntity("{\"index.allocation.max_retries\":2}");
+            client().performRequest(retries);
+
+            client().performRequest(new Request("POST", "/" + indexName + "/_close"));
+            Files.move(tablePath, movedPath, StandardCopyOption.ATOMIC_MOVE);
+            // Do not wait for the primary: it cannot start without the table.
+            client().performRequest(new Request("POST", "/" + indexName + "/_open?wait_for_active_shards=0"));
+
+            assertBusy(() -> {
+                String explain = allocationExplain(indexName);
+                assertEquals("allocation explain: " + explain, "ALLOCATION_FAILED", extractPath(explain, "unassigned_info", "reason"));
+                assertEquals("allocation explain: " + explain, 2, extractIntPath(explain, "unassigned_info", "failed_allocation_attempts"));
+                assertEquals("allocation explain: " + explain, "no", extractPath(explain, "can_allocate"));
+                String details = (String) extractPath(explain, "unassigned_info", "details");
+                assertFalse("retries must not fail on the shard lock: " + explain, details.contains("ShardLockObtainFailedException"));
+                assertTrue("retries must name the missing table: " + explain, details.contains("was not found"));
+            }, 60, TimeUnit.SECONDS);
+            String health = readAll(client().performRequest(new Request("GET", "/_cluster/health/" + indexName)));
+            assertEquals("index health while the table is missing: " + health, "red", extractPath(health, "status"));
+
+            Files.move(movedPath, tablePath, StandardCopyOption.ATOMIC_MOVE);
+            Response reroute = postJson("/_cluster/reroute?retry_failed=true", "{}");
+            assertEquals(RestStatus.OK.getStatus(), reroute.getStatusLine().getStatusCode());
+            ensureGreen(indexName);
+            String shards = readAll(client().performRequest(new Request("GET", "/_cat/shards/" + indexName + "?format=json&h=state")));
+            assertEquals("shard state after retry_failed: " + shards, "STARTED", extractPath(shards, "0", "state"));
+            assertEquals(6, extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count"));
+            assertEquals(6, engineDocCount(indexName));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
             deleteRecursively(scratchDir);
         }
     }
