@@ -18,8 +18,9 @@ import org.opensearch.core.xcontent.XContentBuilder;
  * One node's view of the plugin's caches at the moment
  * {@link LanceStatsCollector#collect()} ran: the snapshot cache, the
  * off-heap column store, the native memory the {@code lance_native}
- * breaker accounts for and the full-text probe limit in force. Read only;
- * every number is a plain counter or gauge read from the owning component.
+ * breaker accounts for, the index cache's capacity and shard layout and
+ * the full-text probe limit in force. Read only; every number is a plain
+ * counter or gauge read from the owning component.
  *
  * <p>Rendered as the {@code snapshots}, {@code column_store},
  * {@code native_memory} and {@code fts} objects of one node in
@@ -44,6 +45,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
     private final long nativeEstimatedBytes;
     private final long sessionBytes;
+    private final long indexCacheCapacityBytes;
+    private final int indexCacheShards;
+    private final long indexCacheShardShareBytes;
 
     private final int ftsSubsetProbeLimit;
 
@@ -63,6 +67,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         long columnStoreBudgetMisses,
         long nativeEstimatedBytes,
         long sessionBytes,
+        long indexCacheCapacityBytes,
+        int indexCacheShards,
+        long indexCacheShardShareBytes,
         int ftsSubsetProbeLimit
     ) {
         this.cacheEnabled = cacheEnabled;
@@ -80,6 +87,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.columnStoreBudgetMisses = columnStoreBudgetMisses;
         this.nativeEstimatedBytes = nativeEstimatedBytes;
         this.sessionBytes = sessionBytes;
+        this.indexCacheCapacityBytes = indexCacheCapacityBytes;
+        this.indexCacheShards = indexCacheShards;
+        this.indexCacheShardShareBytes = indexCacheShardShareBytes;
         this.ftsSubsetProbeLimit = ftsSubsetProbeLimit;
     }
 
@@ -99,6 +109,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.columnStoreBudgetMisses = in.readVLong();
         this.nativeEstimatedBytes = in.readLong();
         this.sessionBytes = in.readLong();
+        this.indexCacheCapacityBytes = in.readVLong();
+        this.indexCacheShards = in.readVInt();
+        this.indexCacheShardShareBytes = in.readVLong();
         this.ftsSubsetProbeLimit = in.readVInt();
     }
 
@@ -119,6 +132,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         out.writeVLong(columnStoreBudgetMisses);
         out.writeLong(nativeEstimatedBytes);
         out.writeLong(sessionBytes);
+        out.writeVLong(indexCacheCapacityBytes);
+        out.writeVInt(indexCacheShards);
+        out.writeVLong(indexCacheShardShareBytes);
         out.writeVInt(ftsSubsetProbeLimit);
     }
 
@@ -147,6 +163,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.field("estimated_bytes", nativeEstimatedBytes);
         builder.field("session_bytes", sessionBytes);
         builder.field("column_store_bytes", columnStoreBytes);
+        builder.field("index_cache_capacity", indexCacheCapacityBytes);
+        builder.field("index_cache_shards", indexCacheShards);
+        builder.field("index_cache_shard_share", indexCacheShardShareBytes);
         builder.endObject();
 
         builder.startObject("fts");
@@ -215,6 +234,18 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         return sessionBytes;
     }
 
+    public long indexCacheCapacityBytes() {
+        return indexCacheCapacityBytes;
+    }
+
+    public int indexCacheShards() {
+        return indexCacheShards;
+    }
+
+    public long indexCacheShardShareBytes() {
+        return indexCacheShardShareBytes;
+    }
+
     public int ftsSubsetProbeLimit() {
         return ftsSubsetProbeLimit;
     }
@@ -242,6 +273,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && columnStoreBudgetMisses == other.columnStoreBudgetMisses
             && nativeEstimatedBytes == other.nativeEstimatedBytes
             && sessionBytes == other.sessionBytes
+            && indexCacheCapacityBytes == other.indexCacheCapacityBytes
+            && indexCacheShards == other.indexCacheShards
+            && indexCacheShardShareBytes == other.indexCacheShardShareBytes
             && ftsSubsetProbeLimit == other.ftsSubsetProbeLimit;
     }
 
@@ -263,6 +297,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             columnStoreBudgetMisses,
             nativeEstimatedBytes,
             sessionBytes,
+            indexCacheCapacityBytes,
+            indexCacheShards,
+            indexCacheShardShareBytes,
             ftsSubsetProbeLimit
         );
     }
