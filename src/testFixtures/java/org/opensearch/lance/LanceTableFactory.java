@@ -171,7 +171,89 @@ final class LanceTableFactory {
         return uri;
     }
 
+    /**
+     * Append {@code rowCount} more rows with the same layout as
+     * {@link #writeTable} to an existing table, with ids starting at
+     * {@code startId}. Produces a new manifest version, which is what
+     * tests of tag following and manifest advance need.
+     */
+    static void appendRows(String tableUri, int startId, int rowCount) throws Exception {
+        withLocaleRoot(() -> {
+            Schema schema = new Schema(
+                Arrays.asList(
+                    new Field(PRIMARY_KEY, FieldType.nullable(new ArrowType.Int(32, true)), null),
+                    new Field(BODY_COLUMN, FieldType.nullable(new ArrowType.Utf8()), null),
+                    new Field(TITLE_COLUMN, FieldType.nullable(new ArrowType.Utf8()), null),
+                    new Field(
+                        VECTOR_COLUMN,
+                        FieldType.nullable(new ArrowType.FixedSizeList(VECTOR_DIM)),
+                        Collections.singletonList(
+                            new Field("item", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)), null)
+                        )
+                    )
+                ),
+                Map.of()
+            );
+            try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+                byte[] ipcBytes = writeIpcBatch(allocator, schema, startId, rowCount);
+                try (
+                    ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                    ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                    ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+                ) {
+                    Data.exportArrayStream(allocator, reader, stream);
+                    WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.APPEND).build();
+                    try (Dataset ignored = Dataset.create(allocator, stream, tableUri, writeParams)) {
+                        // Nothing to do: opening the appended dataset commits it.
+                    }
+                }
+            }
+            return tableUri;
+        });
+    }
+
+    /** Current (latest) manifest version of an existing table. */
+    static long currentVersion(String tableUri) throws Exception {
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
+        ) {
+            return dataset.version();
+        }
+    }
+
+    /**
+     * Create a tag pointing at {@code version}. Simulates
+     * {@code dataset.tags.create(...)} from Python / Rust.
+     */
+    static void createTag(String tableUri, String tag, long version) throws Exception {
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
+        ) {
+            dataset.tags().create(tag, version);
+        }
+    }
+
+    /**
+     * Move an existing tag to {@code version}. Simulates
+     * {@code dataset.tags.update(...)} from Python / Rust; the shape a
+     * writer uses to promote a new snapshot under a stable name.
+     */
+    static void updateTag(String tableUri, String tag, long version) throws Exception {
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
+        ) {
+            dataset.tags().update(tag, version);
+        }
+    }
+
     private static byte[] writeIpcBatch(RootAllocator allocator, Schema schema, int rowCount) throws Exception {
+        return writeIpcBatch(allocator, schema, 0, rowCount);
+    }
+
+    private static byte[] writeIpcBatch(RootAllocator allocator, Schema schema, int startId, int rowCount) throws Exception {
         try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             IntVector idVector = (IntVector) root.getVector(PRIMARY_KEY);
             VarCharVector bodyVector = (VarCharVector) root.getVector(BODY_COLUMN);
@@ -185,20 +267,21 @@ final class LanceTableFactory {
             vecVector.allocateNew();
             vecItems.allocateNew(rowCount * VECTOR_DIM);
 
-            for (int i = 0; i < rowCount; i++) {
-                idVector.set(i, i);
+            for (int slot = 0; slot < rowCount; slot++) {
+                int i = startId + slot;
+                idVector.set(slot, i);
                 String body = (i % 2 == 0 ? "hello lance " : "quick brown fox ") + i;
-                bodyVector.setSafe(i, body.getBytes(StandardCharsets.UTF_8));
+                bodyVector.setSafe(slot, body.getBytes(StandardCharsets.UTF_8));
                 String title = (i % 2 == 0 ? "sunny morning " : "cloudy morning ") + i;
-                titleVector.setSafe(i, title.getBytes(StandardCharsets.UTF_8));
+                titleVector.setSafe(slot, title.getBytes(StandardCharsets.UTF_8));
                 for (int j = 0; j < VECTOR_DIM; j++) {
                     // Row i lives at coordinate (i, 0, 0, ...). Distances
                     // between two rows become |i - k| so nearest-neighbour
                     // ordering is deterministic and easy to assert.
                     float value = (j == 0) ? (float) i : 0.0f;
-                    vecItems.set(i * VECTOR_DIM + j, value);
+                    vecItems.set(slot * VECTOR_DIM + j, value);
                 }
-                vecVector.setNotNull(i);
+                vecVector.setNotNull(slot);
             }
 
             idVector.setValueCount(rowCount);
