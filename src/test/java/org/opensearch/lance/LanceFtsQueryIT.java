@@ -276,12 +276,14 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
 
     public void testLanceMatchSortAndAggregationsMatchScalarReference() throws Exception {
         // Three fragments of 200 rows. grp3 matches 8 rows per fragment
-        // (4 percent, below the reader's sparse ratio), so the sort and
-        // aggregation columns are fetched for those rows only. The
+        // (4 percent, above the reader's sparse ratio), so the sort and
+        // aggregation columns load fully under the hit set. The
         // reference is a terms filter on id selecting the same rows,
         // which runs on the scalar path and never sees a hint; the
         // constant_score wrapping of the same FTS clause is compared as
         // well. Ids, sort values and buckets must agree on every path.
+        // The sparse take is covered by
+        // testSparseLanceMatchHitSetAgreesWithTheReferenceColdAndWarm.
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "lmatchhintsort")) {
             String indexName = fixture.indexName();
             String fts = "{\"lance_match\":{\"field\":\"body\",\"query\":\"grp3\"}}";
@@ -444,6 +446,149 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             );
             assertEquals(600, extractIntPath(dense, "hits", "total", "value"));
             assertEquals(idsAndSortValuesOf(matchAll), idsAndSortValuesOf(dense));
+        }
+    }
+
+    public void testSparseLanceMatchHitSetAgreesWithTheReferenceColdAndWarm() throws Exception {
+        // Three fragments of 10,000 rows. sp3 matches i % 625 == 3: 16
+        // rows per fragment (0.16 percent), below the reader's sparse
+        // ratio of 0.25 percent, so on a cold node the sort and
+        // aggregation columns are taken for those rows and the column
+        // store is not touched. grp3 matches 4 percent and loads the same
+        // columns into the node's off-heap column store; after it the sp3
+        // request reads the store instead of taking. The reference is a
+        // terms filter on id selecting the same rows, which runs on the
+        // scalar path and never sees a hint. Ids, sort values and buckets
+        // must agree in every state, and GET /_lance/stats shows which
+        // state the store is in: no load during the cold round, no load
+        // during the warm round.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 10_000, "lmatchsparse")) {
+            String indexName = fixture.indexName();
+            String sparse = "{\"lance_match\":{\"field\":\"body\",\"query\":\"sp3\"}}";
+            String dense = "{\"lance_match\":{\"field\":\"body\",\"query\":\"grp3\"}}";
+            StringBuilder sparseIds = new StringBuilder();
+            for (int i = 3; i < 30_000; i += 625) {
+                if (sparseIds.length() > 0) {
+                    sparseIds.append(',');
+                }
+                sparseIds.append(i);
+            }
+            String sparseReference = "{\"terms\":{\"id\":[" + sparseIds + "]}}";
+            String ratingSort = "\"sort\":[{\"rating\":\"desc\"},{\"id\":\"asc\"}]";
+            String categorySort = "\"sort\":[{\"category\":\"asc\"},{\"id\":\"asc\"}]";
+            String aggs = "\"aggs\":{"
+                + "\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}},"
+                + "\"by_tag\":{\"terms\":{\"field\":\"tags\",\"size\":10}},"
+                + "\"by_flag\":{\"terms\":{\"field\":\"flag\",\"size\":10}},"
+                + "\"avg_rating\":{\"avg\":{\"field\":\"rating\"}}}";
+            String[] shapes = new String[] {
+                "{\"size\":60,\"query\":" + sparse + "," + ratingSort + "}",
+                "{\"size\":60,\"query\":" + sparse + "," + categorySort + "}",
+                "{\"size\":5,\"query\":" + sparse + "," + categorySort + "}",
+                "{\"size\":0,\"query\":" + sparse + "," + aggs + "}",
+                "{\"size\":10,\"query\":" + sparse + "," + ratingSort + "," + aggs + "}" };
+
+            // Cold: the surfaced index has run no fragment path request
+            // yet, so the store holds nothing. The reference requests come
+            // afterwards because a scalar filter request loads its numeric
+            // columns into the store.
+            int loadsBefore = columnStoreLoads();
+            List<String> cold = new ArrayList<>();
+            for (String shape : shapes) {
+                cold.add(readAll(postJson("/" + indexName + "/_search", shape)));
+            }
+            assertEquals("a hit set below the ratio starts no store load", loadsBefore, columnStoreLoads());
+
+            String refByRating = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":60,\"query\":" + sparseReference + "," + ratingSort + "}")
+            );
+            String refByCategory = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":60,\"query\":" + sparseReference + "," + categorySort + "}")
+            );
+            String refAggs = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":" + sparseReference + "," + aggs + "}"));
+            assertEquals(48, extractIntPath(refByRating, "hits", "total", "value"));
+            // sp3 rows: i % 4 cycles with i % 625 == 3, so every fourth row
+            // has no category and the others split evenly.
+            assertEquals(List.of("c0=12", "c1=12", "c2=12"), bucketsOf(refAggs, "by_category"));
+            assertSparseResults("cold", cold, refByRating, refByCategory, refAggs);
+
+            // Above the ratio: the columns load into the store, and the
+            // answers still agree with the scalar reference.
+            StringBuilder denseIds = new StringBuilder();
+            for (int i = 3; i < 30_000; i += 25) {
+                if (denseIds.length() > 0) {
+                    denseIds.append(',');
+                }
+                denseIds.append(i);
+            }
+            String denseReference = "{\"terms\":{\"id\":[" + denseIds + "]}}";
+            String denseByRating = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":20,\"query\":" + dense + "," + ratingSort + "," + aggs + "}")
+            );
+            String denseRef = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":20,\"query\":" + denseReference + "," + ratingSort + "," + aggs + "}")
+            );
+            assertEquals(1200, extractIntPath(denseByRating, "hits", "total", "value"));
+            assertEquals(idsAndSortValuesOf(denseRef), idsAndSortValuesOf(denseByRating));
+            for (String name : List.of("by_category", "by_tag", "by_flag")) {
+                assertEquals(name, bucketsOf(denseRef, name), bucketsOf(denseByRating, name));
+            }
+            String denseByCategory = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":20,\"query\":" + dense + "," + categorySort + "}")
+            );
+            String denseRefByCategory = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":20,\"query\":" + denseReference + "," + categorySort + "}")
+            );
+            assertEquals(idsAndSortValuesOf(denseRefByCategory), idsAndSortValuesOf(denseByCategory));
+            int loadsWarm = columnStoreLoads();
+            assertTrue("the 4 percent hit set loaded columns into the store", loadsWarm > loadsBefore);
+
+            // Warm: the store holds rating, category, tags and flag; the
+            // sparse request reads them and scans nothing.
+            List<String> warm = new ArrayList<>();
+            for (String shape : shapes) {
+                warm.add(readAll(postJson("/" + indexName + "/_search", shape)));
+            }
+            assertEquals("a store-held column is read, not scanned again", loadsWarm, columnStoreLoads());
+            assertSparseResults("warm", warm, refByRating, refByCategory, refAggs);
+        }
+    }
+
+    /** The five sparse shapes of the test above against the reference answers. */
+    private static void assertSparseResults(String state, List<String> actual, String refByRating, String refByCategory, String refAggs)
+        throws IOException {
+        String byRating = actual.get(0);
+        String byCategory = actual.get(1);
+        String smallPage = actual.get(2);
+        String sizeZero = actual.get(3);
+        String withPage = actual.get(4);
+        assertEquals(state, 48, extractIntPath(byRating, "hits", "total", "value"));
+        assertEquals(state, idsAndSortValuesOf(refByRating), idsAndSortValuesOf(byRating));
+        assertEquals(state, idsAndSortValuesOf(refByCategory), idsAndSortValuesOf(byCategory));
+        assertEquals(state, idsAndSortValuesOf(refByCategory).subList(0, 5), idsAndSortValuesOf(smallPage));
+        for (String shape : List.of(sizeZero, withPage)) {
+            for (String name : List.of("by_category", "by_tag", "by_flag")) {
+                assertEquals(state + ", " + name, bucketsOf(refAggs, name), bucketsOf(shape, name));
+            }
+            assertEquals(
+                state,
+                extractDoublePath(refAggs, "aggregations", "avg_rating", "value"),
+                extractDoublePath(shape, "aggregations", "avg_rating", "value"),
+                1e-9
+            );
+        }
+        assertEquals(state, idsAndSortValuesOf(refByRating).subList(0, 10), idsAndSortValuesOf(withPage));
+    }
+
+    /** {@code column_store.loads} of the single test node from {@code GET /_lance/stats}. */
+    @SuppressWarnings("unchecked")
+    private static int columnStoreLoads() throws IOException {
+        String json = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
+            Map<String, Object> nodes = (Map<String, Object>) parser.map().get("nodes");
+            assertEquals("single node cluster", 1, nodes.size());
+            Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();
+            return ((Number) ((Map<String, Object>) node.get("column_store")).get("loads")).intValue();
         }
     }
 
