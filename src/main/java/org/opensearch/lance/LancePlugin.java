@@ -12,6 +12,7 @@ import java.util.function.Supplier;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.lance.Session;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.common.settings.ClusterSettings;
@@ -51,7 +52,11 @@ import org.opensearch.lance.refs.TransportLanceRefsAction;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.lance.rest.RestBuildIndexesAction;
 import org.opensearch.lance.rest.RestNamespaceAction;
+import org.opensearch.lance.rest.RestLanceStatsAction;
 import org.opensearch.lance.rest.RestRefsAction;
+import org.opensearch.lance.stats.LanceStatsAction;
+import org.opensearch.lance.stats.LanceStatsCollector;
+import org.opensearch.lance.stats.TransportLanceStatsAction;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.ActionPlugin.ActionHandler;
@@ -410,10 +415,19 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         NativeMemoryLimit.parse(value, "lance.native_memory.limit");
     }
 
+    /**
+     * Lance-backed indexes get the read-only engine over the node's
+     * {@link LanceWarmCache}, so the shard's reader and the fragment path
+     * share one snapshot per table version. Index services are created
+     * after {@link #createComponents} has run, so the cache is present;
+     * a {@code null} here (the factory asked for before the components
+     * exist, as a test harness may do) makes the engine open its own
+     * dataset per reader instead.
+     */
     @Override
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
         if (indexSettings.getSettings().get(LanceEngineFactory.TABLE_SETTING) != null) {
-            return Optional.of(new LanceEngineFactory());
+            return Optional.of(new LanceEngineFactory(warmCache));
         }
         return Optional.empty();
     }
@@ -542,6 +556,13 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             CACHE_ENABLED_SETTING.get(environment.settings())
         );
         clusterService.getClusterSettings().addSettingsUpdateConsumer(CACHE_ENABLED_SETTING, warmCache::setEnabled);
+        // Read side of GET /_lance/stats. The session size is read through
+        // the registry here because the stats package cannot see the
+        // registry's package-private session accessor.
+        LanceStatsCollector statsCollector = new LanceStatsCollector(warmCache, () -> {
+            Session session = LanceRegistry.currentSession();
+            return session == null || session.isClosed() ? 0L : session.sizeBytes();
+        });
 
         // Prime the circuit-breaker helper with the current cluster
         // settings and start the polling loop that keeps its accounting
@@ -586,7 +607,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // The components are injected into the plugin's transport
         // actions (attach, build_indexes, namespace list / update,
         // fragment query).
-        return List.of(namespaceService, allowedTableRoots, warmCache);
+        return List.of(namespaceService, allowedTableRoots, warmCache, statsCollector);
     }
 
     /**
@@ -701,7 +722,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             new ActionHandler<>(LanceNamespaceListAction.INSTANCE, TransportLanceNamespaceListAction.class),
             new ActionHandler<>(LanceAttachAction.INSTANCE, TransportLanceAttachAction.class),
             new ActionHandler<>(LanceBuildIndexesAction.INSTANCE, TransportLanceBuildIndexesAction.class),
-            new ActionHandler<>(LanceRefsAction.INSTANCE, TransportLanceRefsAction.class)
+            new ActionHandler<>(LanceRefsAction.INSTANCE, TransportLanceRefsAction.class),
+            new ActionHandler<>(LanceStatsAction.INSTANCE, TransportLanceStatsAction.class)
         );
     }
 
@@ -742,6 +764,12 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<DiscoveryNodes> nodesInCluster
     ) {
-        return List.of(new RestAttachAction(), new RestNamespaceAction(), new RestBuildIndexesAction(), new RestRefsAction());
+        return List.of(
+            new RestAttachAction(),
+            new RestNamespaceAction(),
+            new RestBuildIndexesAction(),
+            new RestRefsAction(),
+            new RestLanceStatsAction()
+        );
     }
 }
