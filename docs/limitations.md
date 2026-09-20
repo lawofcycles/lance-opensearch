@@ -86,6 +86,14 @@ OpenSearch's stock `match` and `match_phrase` queries against a `lance_text` fie
 ## Version pinning
 
 - `"version": N` on `POST /_lance/attach` pins a Lance-backed index to a specific manifest version for readonly snapshots. Tag and branch checkout are not exposed by the Lance Java SDK (v11 today), so they cannot be pinned from OpenSearch.
+- The pin is honoured by the shard engine only (`_count`, `_stats`, GET). The fragment path behind `_search` opens the latest manifest version and does not read `index.lance.version`, so `_search` on a pinned index returns rows from the current table state.
+
+## Snapshot and restore
+
+- `_snapshot` of a Lance-backed index stores the index metadata (settings including `index.lance.table`, `index.lance.version`, `index.lance.storage_options.*`, and the mapping) plus the shard's empty Lucene commit: one `segments_N` file of about 200 bytes. Rows and the Lance-side FTS / vector indexes stay in the Lance table and are not copied, so a snapshot is not a backup of the data. Back up the table with the storage layer's own tooling.
+- Restore re-creates the index with the same settings and mapping. If the table is reachable at `index.lance.table`, the shard opens and `_search`, `_count`, GET and `_stats` serve the table as it is at restore time. An index without `index.lance.version` reads the latest manifest version, so rows appended or deleted after the snapshot are visible; a pinned index keeps its pin.
+- If the table is not reachable, the engine fails to open (`Dataset at path ... was not found`). The failed shard keeps its store reference, so every retry up to `index.allocation.max_retries` fails on the shard lock (`ShardLockObtainFailedException`) and the index stays red with the primary `UNASSIGNED` / `ALLOCATION_FAILED`. `_count` returns 503 (`all shards failed`) and `_search` returns 400 with the Lance not-found message because the fragment path cannot open the table either. `POST /_cluster/reroute?retry_failed=true` does not help even after the table is back: OpenSearch refuses to allocate a primary whose restore has failed. Delete the index and restore it again.
+- A restored index is not tracked by the namespace poll or by attach bookkeeping: the poll logs `index exists but is not tracked` once and leaves it alone (no duplicate surface), but it also stops re-deriving the mapping and refreshing the engine reader when the manifest advances. `_search` still sees new versions; `_count`, `_stats` and GET stay at the restore-time version until `POST /{index}/_refresh`. Delete and re-attach the index to regain tracking.
 
 ## Not yet implemented (RFC future work)
 
