@@ -25,6 +25,7 @@ import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
 import org.apache.arrow.vector.TimeStampMicroVector;
+import org.apache.arrow.vector.TimeStampMilliVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -757,10 +758,12 @@ public final class LanceTableFactory {
      * {@code keyword}; term queries can pin the odd or even subset
      * without waking up FTS scoring.
      *
+     * Public because the query package's unit tests read it directly.
+     *
      * @return absolute URI of the table, usable as-is for
      *         {@code /_lance/attach} or namespace register.
      */
-    static String writeDatedTable(Path parent, String name) throws Exception {
+    public static String writeDatedTable(Path parent, String name) throws Exception {
         return withLocaleRoot(() -> writeDatedTableOnce(parent, name));
     }
 
@@ -905,6 +908,99 @@ public final class LanceTableFactory {
                 idVector.setValueCount(rowCount);
                 priceVector.setValueCount(rowCount);
                 weightVector.setValueCount(rowCount);
+                root.setRowCount(rowCount);
+
+                try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                }
+                ipcBytes = out.toByteArray();
+            }
+
+            try (
+                ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+            ) {
+                Data.exportArrayStream(allocator, reader, stream);
+                WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
+                Dataset.create(allocator, stream, uri, writeParams).close();
+            }
+        }
+        return uri;
+    }
+
+    /**
+     * Values of the {@code v} column of {@link #writeSignedValuesTable},
+     * chosen around the multiples of 100 so a histogram with interval 100
+     * has to floor negative quotients rather than truncate them: -250 and
+     * -201 belong to bucket -300, -200 and -101 to -200, -1 to -100.
+     */
+    public static final long[] SIGNED_VALUES = new long[] { -250L, -201L, -200L, -101L, -1L, 0L, 1L, 99L, 100L, 250L };
+
+    /**
+     * Writes a Lance table with signed integer, float and millisecond
+     * timestamp columns crossing zero, for tests of floor semantics in
+     * bucket key arithmetic.
+     *
+     * <p>Row layout ({@code i} from 0 to 9):
+     * <ul>
+     *   <li>{@code id}: int32, {@code i}</li>
+     *   <li>{@code v}: int64, {@link #SIGNED_VALUES}{@code [i]}</li>
+     *   <li>{@code f}: float64, {@code SIGNED_VALUES[i] + 0.5}</li>
+     *   <li>{@code ts}: timestamp[ms], {@code SIGNED_VALUES[i] * 86 400 000}
+     *       (days around the epoch, so the 1969 rows are negative
+     *       millis)</li>
+     * </ul>
+     * Public because the query package's unit tests read it directly.
+     *
+     * @return absolute URI of the table.
+     */
+    public static String writeSignedValuesTable(Path parent, String name) throws Exception {
+        return withLocaleRoot(() -> writeSignedValuesTableOnce(parent, name));
+    }
+
+    private static String writeSignedValuesTableOnce(Path parent, String name) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        int rowCount = SIGNED_VALUES.length;
+        Schema schema = new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("v", FieldType.nullable(new ArrowType.Int(64, true)), null),
+                new Field("f", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null),
+                new Field("ts", FieldType.nullable(new ArrowType.Timestamp(TimeUnit.MILLISECOND, null)), null)
+            ),
+            Map.of()
+        );
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            byte[] ipcBytes;
+            try (
+                VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                ByteArrayOutputStream out = new ByteArrayOutputStream()
+            ) {
+                IntVector idVector = (IntVector) root.getVector("id");
+                BigIntVector vVector = (BigIntVector) root.getVector("v");
+                Float8Vector fVector = (Float8Vector) root.getVector("f");
+                TimeStampMilliVector tsVector = (TimeStampMilliVector) root.getVector("ts");
+
+                idVector.allocateNew(rowCount);
+                vVector.allocateNew(rowCount);
+                fVector.allocateNew(rowCount);
+                tsVector.allocateNew(rowCount);
+
+                for (int i = 0; i < rowCount; i++) {
+                    idVector.set(i, i);
+                    vVector.set(i, SIGNED_VALUES[i]);
+                    fVector.set(i, SIGNED_VALUES[i] + 0.5d);
+                    tsVector.set(i, SIGNED_VALUES[i] * 86_400_000L);
+                }
+                idVector.setValueCount(rowCount);
+                vVector.setValueCount(rowCount);
+                fVector.setValueCount(rowCount);
+                tsVector.setValueCount(rowCount);
                 root.setRowCount(rowCount);
 
                 try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
