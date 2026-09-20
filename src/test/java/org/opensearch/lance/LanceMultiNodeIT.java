@@ -90,14 +90,13 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
     public void testFtsAcrossFragmentsOnThreeNodeCluster() throws Exception {
         // 12 rows written 4 per file give fragments 0, 1 and 2. The
-        // coordinator pins the fan-out to the node hosting the primary
-        // shard (see TransportLanceCoordinatorAction.nodeListForTarget),
-        // so on the three-node cluster one executor still receives all
-        // three fragments and its FTS scan runs without a fragmentIds
-        // restriction, while the other two nodes forward the request.
-        // The hits, their per-fragment _id layout and _count must match
-        // what the single-node LanceFtsQueryIT asserts for the same
-        // table.
+        // index keeps the default single shard copy, so the coordinator
+        // sends every fragment to the one node holding it (see
+        // TransportLanceCoordinatorAction.nodeListForTarget) and that
+        // executor's FTS scan runs without a fragmentIds restriction,
+        // while the other two nodes forward the request. The hits,
+        // their per-fragment _id layout and _count must match what the
+        // single-node LanceFtsQueryIT asserts for the same table.
         String suffix = "mn-fts-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
