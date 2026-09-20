@@ -46,6 +46,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             "s3://bucket/tables/demo.lance",
             "demo",
             storage,
+            /* pinnedVersion */ 7L,
             "id >= 2",
             /* query */ null,
             /* postFilter */ null,
@@ -76,6 +77,8 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         assertEquals(2, restored.aggregations().getAggregatorFactories().size());
         assertEquals(original.fragmentIds(), restored.fragmentIds());
         assertEquals(original.storageOptions().asMap(), restored.storageOptions().asMap());
+        assertEquals(7L, restored.pinnedVersion());
+        assertEquals(java.util.Optional.of(7L), restored.pinnedVersionOrEmpty());
         assertEquals(original.trackScores(), restored.trackScores());
     }
 
@@ -101,6 +104,8 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         }
 
         assertEquals(original.indexName(), restored.indexName());
+        assertEquals("allFragments follows the latest manifest", -1L, restored.pinnedVersion());
+        assertTrue("-1 must expose as an empty pin", restored.pinnedVersionOrEmpty().isEmpty());
         assertNull(restored.filterSql());
         assertTrue("empty fragmentIds is the all-fragments sentinel", restored.fragmentIds().isEmpty());
         assertNull("empty list must expose as null through the SDK helper", restored.fragmentIdsOrNull());

@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionRequestValidationException;
@@ -23,8 +24,9 @@ import org.opensearch.search.sort.SortBuilder;
  * Per-node dispatch request. The coordinator groups the target
  * dataset's fragment ids by data node and sends one of these to
  * each node. The receiving node opens the Lance table through the
- * shared registry with the same {@link StorageOptions} the
- * coordinator resolved, scans only the given fragments (or every
+ * shared registry with the same {@link StorageOptions} and pinned
+ * manifest version (see {@link #pinnedVersion()}) the coordinator
+ * resolved, scans only the given fragments (or every
  * fragment when {@link #fragmentIds()} is empty as a shorthand for
  * "all"), and honours the filter and aggregations alongside the
  * hits {@code size} allowance.
@@ -60,6 +62,19 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     private final String tableUri;
     private final String indexName;
     private final StorageOptions storageOptions;
+    /**
+     * Lance manifest version the index is pinned to through
+     * {@code index.lance.version}, or {@code -1} when the index
+     * follows the latest manifest. The coordinator resolves this
+     * from the target's {@code IndexMetadata} and ships it on the
+     * wire so every {@code Dataset} the fragment path opens (the
+     * coordinator's fragment enumeration and both per-node opens)
+     * reads the same manifest the shard engine serves for
+     * {@code _count}, {@code _stats}, and GET. Re-reading the
+     * setting on the receiving node would leave room for the two
+     * sides to observe different cluster states.
+     */
+    private final long pinnedVersion;
     private final String filterSql;
     private final QueryBuilder query;
     private final QueryBuilder postFilter;
@@ -81,6 +96,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         String tableUri,
         String indexName,
         StorageOptions storageOptions,
+        long pinnedVersion,
         String filterSql,
         QueryBuilder query,
         QueryBuilder postFilter,
@@ -94,6 +110,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.tableUri = tableUri;
         this.indexName = indexName;
         this.storageOptions = storageOptions;
+        this.pinnedVersion = pinnedVersion;
         this.filterSql = filterSql;
         this.query = query;
         this.postFilter = postFilter;
@@ -110,6 +127,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.tableUri = in.readString();
         this.indexName = in.readString();
         this.storageOptions = StorageOptions.readFromStream(in);
+        this.pinnedVersion = in.readLong();
         this.filterSql = in.readOptionalString();
         this.query = in.readOptionalNamedWriteable(QueryBuilder.class);
         this.postFilter = in.readOptionalNamedWriteable(QueryBuilder.class);
@@ -145,6 +163,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         out.writeString(tableUri);
         out.writeString(indexName);
         storageOptions.writeTo(out);
+        out.writeLong(pinnedVersion);
         out.writeOptionalString(filterSql);
         out.writeOptionalNamedWriteable(query);
         out.writeOptionalNamedWriteable(postFilter);
@@ -190,6 +209,24 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
 
     public StorageOptions storageOptions() {
         return storageOptions;
+    }
+
+    /**
+     * Pinned Lance manifest version, or {@code -1} when the index
+     * follows the latest manifest. Same encoding as the
+     * {@code index.lance.version} index setting.
+     */
+    public long pinnedVersion() {
+        return pinnedVersion;
+    }
+
+    /**
+     * {@link #pinnedVersion()} in the shape
+     * {@link org.opensearch.lance.LanceRegistry#openDataset(String, StorageOptions, Optional)}
+     * takes: empty when the index follows the latest manifest.
+     */
+    public Optional<Long> pinnedVersionOrEmpty() {
+        return pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();
     }
 
     /**
@@ -289,14 +326,15 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     }
 
     /**
-     * Convenience factory for single-node dispatch (all fragments).
+     * Convenience factory for single-node dispatch (all fragments,
+     * latest manifest version).
      *
      * <p>{@code trackScores} defaults to {@code false} because
      * every caller of this helper today either has no {@code sort}
      * clause (score-only queries collect scores automatically) or
      * runs in tests where the flag is not exercised. Callers that
-     * need {@code track_scores:true} alongside a sort should use
-     * the full constructor instead.
+     * need {@code track_scores:true} alongside a sort, or a pinned
+     * manifest version, should use the full constructor instead.
      */
     public static LanceFragmentQueryRequest allFragments(
         String tableUri,
@@ -312,6 +350,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             tableUri,
             indexName,
             storageOptions,
+            /* pinnedVersion */ -1L,
             filterSql,
             query,
             /* postFilter */ null,

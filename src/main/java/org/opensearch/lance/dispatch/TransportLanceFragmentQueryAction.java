@@ -11,6 +11,7 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -240,7 +241,12 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * that answers both.
      */
     LanceFragmentQueryResponse execute(LanceFragmentQueryRequest request) throws Exception {
-        try (Dataset dataset = LanceRegistry.openDataset(request.tableUri(), request.storageOptions())) {
+        // Both Dataset opens below use the manifest version the
+        // coordinator resolved from index.lance.version so a pinned
+        // index serves the same rows through _search as through
+        // _count / _stats / GET on the shard engine.
+        Optional<Long> pinnedVersion = request.pinnedVersionOrEmpty();
+        try (Dataset dataset = LanceRegistry.openDataset(request.tableUri(), request.storageOptions(), pinnedVersion)) {
             int fragmentCount = request.fragmentIds().isEmpty() ? dataset.getFragments().size() : request.fragmentIds().size();
 
             List<Integer> allFragmentIds = new ArrayList<>();
@@ -297,7 +303,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // field-level filtering apply to fragment path hits the
             // same way they apply to shard path hits.
             try (
-                Dataset readerDataset = LanceRegistry.openDataset(request.tableUri(), request.storageOptions());
+                Dataset readerDataset = LanceRegistry.openDataset(request.tableUri(), request.storageOptions(), pinnedVersion);
                 DirectoryReader dr = openWrappedReader(
                     indexShard,
                     readerDataset,

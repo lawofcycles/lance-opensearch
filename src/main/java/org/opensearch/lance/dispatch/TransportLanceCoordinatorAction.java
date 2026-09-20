@@ -11,6 +11,8 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.function.Function;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -237,7 +239,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         ActionListener<Void> done
     ) throws Exception {
         List<Integer> allFragmentIds;
-        try (Dataset dataset = LanceRegistry.openDataset(target.tableUri(), target.storageOptions())) {
+        try (Dataset dataset = LanceRegistry.openDataset(target.tableUri(), target.storageOptions(), target.pinnedVersionOrEmpty())) {
             allFragmentIds = new ArrayList<>(dataset.getFragments().size());
             dataset.getFragments().forEach(fragment -> allFragmentIds.add(fragment.getId()));
         }
@@ -285,6 +287,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 target.tableUri(),
                 target.indexName(),
                 target.storageOptions(),
+                target.pinnedVersion(),
                 spec.filterSql(),
                 spec.query(),
                 spec.postFilter(),
@@ -361,6 +364,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             target.tableUri(),
             target.indexName(),
             target.storageOptions(),
+            target.pinnedVersion(),
             spec.filterSql(),
             spec.query(),
             spec.postFilter(),
@@ -547,7 +551,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 continue;
             }
             StorageOptions storageOptions = StorageOptions.fromIndexSettings(indexMetadata.getSettings());
-            targets.add(new IndexTarget(index.getName(), tableUri, storageOptions, buildFieldTypeLookup(indexMetadata)));
+            // Same reading of index.lance.version as the shard engine
+            // (LanceEngineFactory.newReadWriteEngine): -1 follows the
+            // latest manifest, anything else pins. Resolving it here and
+            // shipping it to the per-node executor keeps _search on the
+            // manifest _count / _stats / GET already serve.
+            long pinnedVersion = indexMetadata.getSettings().getAsLong(LanceEngineFactory.VERSION_SETTING, -1L);
+            targets.add(new IndexTarget(index.getName(), tableUri, storageOptions, pinnedVersion, buildFieldTypeLookup(indexMetadata)));
         }
         return targets;
     }
@@ -603,9 +613,20 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         return new SearchResponse(sections, null, 1, 1, 0, took, ShardSearchFailure.EMPTY_ARRAY, SearchResponse.Clusters.EMPTY);
     }
 
-    private record IndexTarget(String indexName, String tableUri, StorageOptions storageOptions, java.util.function.Function<
+    /**
+     * One Lance-backed index in the request. {@code pinnedVersion}
+     * is the {@code index.lance.version} setting ({@code -1} when
+     * the index follows the latest manifest); it drives the
+     * coordinator's own fragment enumeration and travels with every
+     * per-node request so the executors open the same manifest.
+     */
+    private record IndexTarget(String indexName, String tableUri, StorageOptions storageOptions, long pinnedVersion, Function<
         String,
         String> fieldTypeLookup) {
+
+        Optional<Long> pinnedVersionOrEmpty() {
+            return pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();
+        }
     }
 
     /**
