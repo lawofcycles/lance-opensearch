@@ -1170,11 +1170,10 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     public void testBuildIndexesWithoutPositionRejectsLanceMatchPhraseWithLanceMessage() throws Exception {
         // Lance's default (and the plugin's) is no positions. Term
         // queries work; a phrase query is refused by Lance at query
-        // time and the caller sees Lance's wording. The status is not
-        // pinned: LanceFtsQuery.ensureShardScan wraps Lance's
-        // IllegalArgumentException in an IOException, which OpenSearch
-        // maps to 500 today, and turning that into the 400 an input
-        // error deserves is a change to LanceFtsQuery, not to the build.
+        // time as invalid input. The fragment executor reports Lance's
+        // IllegalArgumentException itself, so the client sees 400 with
+        // Lance's wording, the same status build_indexes answers when
+        // Lance refuses a tokenizer.
         try (SurfacedIndex fixture = SurfacedIndex.keywordOnly("nopos", 5)) {
             String indexName = fixture.indexName();
             String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
@@ -1186,19 +1185,37 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             );
             assertEquals("term query needs no positions: " + term, 1, extractIntPath(term, "hits", "total", "value"));
 
-            ResponseException failure = expectThrows(
-                ResponseException.class,
-                () -> postJson(
-                    "/" + indexName + "/_search",
-                    "{\"query\":{\"lance_match_phrase\":{\"field\":\"label\",\"query\":\"row 3\"}}}"
-                )
-            );
+            String phrase = "{\"query\":{\"lance_match_phrase\":{\"field\":\"label\",\"query\":\"row 3\"}}}";
+            ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", phrase));
             int status = failure.getResponse().getStatusLine().getStatusCode();
             String body = readAll(failure.getResponse());
-            assertTrue("expected an error status for a phrase query without positions, saw " + status + ": " + body, status >= 400);
+            assertEquals("expected 400 for a phrase query without positions, saw " + status + ": " + body, 400, status);
+            assertEquals("illegal_argument_exception", extractStringPath(body, "error", "type"));
             assertTrue(
                 "expected Lance's message about positions: " + body,
-                body.contains("position is not found but required for phrase queries")
+                extractStringPath(body, "error", "reason").contains("position is not found but required for phrase queries")
+            );
+            assertEquals(400, extractIntPath(body, "status"));
+
+            // The same query with `explain` runs on the shard path
+            // (see docs/limitations.md). Lucene's query phase wraps
+            // the failure in QueryPhaseExecutionException, which
+            // OpenSearch answers as 500; Lance's message still reaches
+            // the client. The 500 below is the documented limitation,
+            // not the wanted behaviour: when the shard path learns to
+            // answer 400 this assertion is expected to flip to 400 and
+            // the limitations entry goes away with it.
+            String explained = "{\"explain\":true,\"query\":{\"lance_match_phrase\":{\"field\":\"label\",\"query\":\"row 3\"}}}";
+            ResponseException shardPath = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", explained));
+            String shardBody = readAll(shardPath.getResponse());
+            assertEquals(
+                "shard path status for a phrase query without positions: " + shardBody,
+                500,
+                shardPath.getResponse().getStatusLine().getStatusCode()
+            );
+            assertTrue(
+                "expected Lance's message about positions on the shard path: " + shardBody,
+                shardBody.contains("position is not found but required for phrase queries")
             );
         }
     }
@@ -1293,6 +1310,31 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         String response = readAll(failure.getResponse());
         assertEquals("expected 400 for " + body + ", saw " + status + ": " + response, 400, status);
         assertTrue("expected '" + expectedMessage + "' for " + body + ": " + response, response.contains(expectedMessage));
+    }
+
+    /** String counterpart of {@link #extractIntPath}: the value at {@code path} as a string. */
+    private static String extractStringPath(String json, String... path) {
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
+            Object value = parser.map();
+            for (String step : path) {
+                if (value instanceof Map<?, ?> map) {
+                    value = map.get(step);
+                } else if (value instanceof List<?> list) {
+                    value = list.get(Integer.parseInt(step));
+                } else {
+                    throw new AssertionError("cannot descend into " + value + " with step " + step);
+                }
+                if (value == null) {
+                    throw new AssertionError("missing key " + step + " in path " + String.join(".", path) + ", json=" + json);
+                }
+            }
+            if (value instanceof String string) {
+                return string;
+            }
+            throw new AssertionError("expected string at " + String.join(".", path) + ", saw " + value);
+        } catch (IOException e) {
+            throw new AssertionError("could not parse JSON: " + json, e);
+        }
     }
 
     private static int lanceMatchHits(String indexName, String query) throws IOException {
