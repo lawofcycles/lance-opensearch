@@ -649,7 +649,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // keyword, so a plain build gives it a BTree scalar index and the
         // mapping stays keyword. fts_columns is the only way to ask for
         // an inverted index on such a column.
-        try (JapaneseIndex fixture = JapaneseIndex.surface("jabtree")) {
+        try (SurfacedIndex fixture = SurfacedIndex.japanese("jabtree")) {
             String indexName = fixture.indexName();
             String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{}"));
             assertTrue("expected no FTS index built: " + build, build.contains("\"fts\":[]"));
@@ -665,7 +665,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // splits on whitespace and punctuation only, so a Japanese
         // sentence without either is indexed as one token. A one-word
         // query finds nothing; the whole sentence finds its own row.
-        try (JapaneseIndex fixture = JapaneseIndex.surface("jasimple")) {
+        try (SurfacedIndex fixture = SurfacedIndex.japanese("jasimple")) {
             String indexName = fixture.indexName();
             String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"]}"));
             assertTrue("expected text in fts built list: " + build, build.contains("\"fts\":[\"text\"]"));
@@ -682,7 +682,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // segmentation data, so it needs no dictionary download and runs
         // on every CI host. 天気 sits in rows 0 and 1, 東京 in rows 0 and 3,
         // 京都 in row 2.
-        try (JapaneseIndex fixture = JapaneseIndex.surface("jaicu")) {
+        try (SurfacedIndex fixture = SurfacedIndex.japanese("jaicu")) {
             String indexName = fixture.indexName();
             String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"icu\"}"));
             assertTrue("expected text in fts built list: " + build, build.contains("\"fts\":[\"text\"]"));
@@ -720,7 +720,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             "LANCE_LANGUAGE_MODEL_HOME=" + home + " has no lindera/ipadic/config.yml; prepare the dictionary as docs/features.md describes",
             Files.isRegularFile(ipadic.resolve("config.yml"))
         );
-        try (JapaneseIndex fixture = JapaneseIndex.surface("jalindera")) {
+        try (SurfacedIndex fixture = SurfacedIndex.japanese("jalindera")) {
             String indexName = fixture.indexName();
             String build = readAll(
                 postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"lindera/ipadic\"}")
@@ -738,7 +738,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // The plugin has no allowlist; Lance's InvalidInput for the name
         // reaches the caller as 400 with Lance's own wording, under
         // failed.fts so the caller can tell which column it was.
-        try (JapaneseIndex fixture = JapaneseIndex.surface("jabadtok")) {
+        try (SurfacedIndex fixture = SurfacedIndex.japanese("jabadtok")) {
             String indexName = fixture.indexName();
             ResponseException failure = expectThrows(
                 ResponseException.class,
@@ -769,7 +769,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // it. Lance's CreateIndex fails with an I/O error, which must
         // reach the caller as 500 with the column under failed.scalar
         // and Lance's message, not as 200 with an empty built list.
-        try (JapaneseIndex fixture = JapaneseIndex.surface("jareadonly")) {
+        try (SurfacedIndex fixture = SurfacedIndex.japanese("jareadonly")) {
             String indexName = fixture.indexName();
             Path table = fixture.tablePath();
             setReadOnlyRecursively(table);
@@ -801,7 +801,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // First build covers id only. The second build, without a column
         // filter, builds text and reports id as skipped with the reason,
         // and answers 200 because a skip is not a failure.
-        try (JapaneseIndex fixture = JapaneseIndex.surface("jaskipped")) {
+        try (SurfacedIndex fixture = SurfacedIndex.japanese("jaskipped")) {
             String indexName = fixture.indexName();
             String first = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}"));
             assertTrue("expected id built: " + first, first.contains("\"built\":{\"fts\":[],\"scalar\":[\"id\"],\"vector\":[]}"));
@@ -820,6 +820,80 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
                 )
             );
             assertTrue("expected nothing failed: " + body, body.contains("\"failed\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
+        }
+    }
+
+    public void testBuildIndexesWithPositionEnablesLanceMatchPhrase() throws Exception {
+        // with_position: true makes Lance store token positions, so a
+        // phrase query resolves. Labels are "row-i"; the simple tokenizer
+        // splits them into "row" and "i", so "row 3" is a two-token
+        // phrase that only row 3 satisfies and "3 row" nothing does.
+        try (SurfacedIndex fixture = SurfacedIndex.keywordOnly("withpos", 5)) {
+            String indexName = fixture.indexName();
+            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"],\"with_position\":true}"));
+            assertTrue("expected label in fts built list: " + build, build.contains("\"fts\":[\"label\"]"));
+            awaitLanceTextMapping(indexName, "label");
+
+            String ordered = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"lance_match_phrase\":{\"field\":\"label\",\"query\":\"row 3\"}}}")
+            );
+            assertEquals("phrase 'row 3' must hit row 3 only: " + ordered, 1, extractIntPath(ordered, "hits", "total", "value"));
+            assertEquals(3, extractIntPath(ordered, "hits", "hits", "0", "_source", "id"));
+
+            String reversed = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"lance_match_phrase\":{\"field\":\"label\",\"query\":\"3 row\"}}}")
+            );
+            assertEquals("reversed phrase must hit nothing: " + reversed, 0, extractIntPath(reversed, "hits", "total", "value"));
+        }
+    }
+
+    public void testBuildIndexesWithoutPositionRejectsLanceMatchPhraseWithLanceMessage() throws Exception {
+        // Lance's default (and the plugin's) is no positions. Term
+        // queries work; a phrase query is refused by Lance at query
+        // time and the caller sees Lance's wording. The status is not
+        // pinned: LanceFtsQuery.ensureShardScan wraps Lance's
+        // IllegalArgumentException in an IOException, which OpenSearch
+        // maps to 500 today, and turning that into the 400 an input
+        // error deserves is a change to LanceFtsQuery, not to the build.
+        try (SurfacedIndex fixture = SurfacedIndex.keywordOnly("nopos", 5)) {
+            String indexName = fixture.indexName();
+            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
+            assertTrue("expected label in fts built list: " + build, build.contains("\"fts\":[\"label\"]"));
+            awaitLanceTextMapping(indexName, "label");
+
+            String term = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"lance_match\":{\"field\":\"label\",\"query\":\"3\"}}}")
+            );
+            assertEquals("term query needs no positions: " + term, 1, extractIntPath(term, "hits", "total", "value"));
+
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"lance_match_phrase\":{\"field\":\"label\",\"query\":\"row 3\"}}}"
+                )
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            String body = readAll(failure.getResponse());
+            assertTrue("expected an error status for a phrase query without positions, saw " + status + ": " + body, status >= 400);
+            assertTrue(
+                "expected Lance's message about positions: " + body,
+                body.contains("position is not found but required for phrase queries")
+            );
+        }
+    }
+
+    public void testBuildIndexesRejectsMalformedWithPosition() throws Exception {
+        try (SurfacedIndex fixture = SurfacedIndex.japanese("jawithposopt")) {
+            String indexName = fixture.indexName();
+            // Shape check happens in the REST layer.
+            assertBuildIndexesRejected(
+                indexName,
+                "{\"fts_columns\":[\"text\"],\"with_position\":\"yes\"}",
+                "with_position must be a boolean"
+            );
+            // with_position only shapes indexes this request creates.
+            assertBuildIndexesRejected(indexName, "{\"with_position\":true}", "name them in fts_columns");
         }
     }
 
@@ -873,7 +947,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testBuildIndexesRejectsMalformedFtsColumnsAndTokenizer() throws Exception {
-        try (JapaneseIndex fixture = JapaneseIndex.surface("jatokopt")) {
+        try (SurfacedIndex fixture = SurfacedIndex.japanese("jatokopt")) {
             String indexName = fixture.indexName();
 
             // tokenizer only shapes indexes this request creates.
@@ -916,6 +990,10 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
      * as "not yet".
      */
     private static void awaitLanceTextMapping(String indexName) throws Exception {
+        awaitLanceTextMapping(indexName, "text");
+    }
+
+    private static void awaitLanceTextMapping(String indexName, String column) throws Exception {
         assertBusy(() -> {
             String mapping;
             try {
@@ -923,21 +1001,27 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             } catch (ResponseException e) {
                 throw new AssertionError("index " + indexName + " is between delete and recreate: " + e.getMessage());
             }
-            assertTrue("waiting for text to become lance_text: " + mapping, mapping.contains("\"text\":{\"type\":\"lance_text\""));
+            assertTrue(
+                "waiting for " + column + " to become lance_text: " + mapping,
+                mapping.contains("\"" + column + "\":{\"type\":\"lance_text\"")
+            );
         }, 30, TimeUnit.SECONDS);
         ensureGreen(indexName);
     }
 
     /**
-     * Japanese fixture surfaced through a namespace registration rather
-     * than attach, so the poll keeps following the table after the
-     * build_indexes commit and the keyword to lance_text rebuild.
+     * Table without an FTS index, surfaced through a namespace
+     * registration rather than attach, so the poll keeps following the
+     * table after the build_indexes commit and the keyword to lance_text
+     * rebuild. {@link #japanese} writes the five Japanese sentences into
+     * a {@code text} column; {@link #keywordOnly} writes {@code row-i}
+     * labels into a {@code label} column.
      */
-    private static final class JapaneseIndex implements AutoCloseable {
+    private static final class SurfacedIndex implements AutoCloseable {
         private final Path scratchDir;
         private final String indexName;
 
-        private JapaneseIndex(Path scratchDir, String indexName) {
+        private SurfacedIndex(Path scratchDir, String indexName) {
             this.scratchDir = scratchDir;
             this.indexName = indexName;
         }
@@ -951,11 +1035,23 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             return scratchDir.resolve(indexName + ".lance");
         }
 
-        static JapaneseIndex surface(String testHint) throws Exception {
+        static SurfacedIndex japanese(String testHint) throws Exception {
+            return surface(testHint, "text", (dir, name) -> LanceTableFactory.writeJapaneseTable(dir, name));
+        }
+
+        static SurfacedIndex keywordOnly(String testHint, int rowCount) throws Exception {
+            return surface(testHint, "label", (dir, name) -> LanceTableFactory.writeKeywordOnlyTable(dir, name, rowCount));
+        }
+
+        private interface TableWriter {
+            void write(Path dir, String name) throws Exception;
+        }
+
+        private static SurfacedIndex surface(String testHint, String utf8Column, TableWriter writer) throws Exception {
             String suffix = testHint.toLowerCase(Locale.ROOT) + "-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
             Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
             String indexName = "demo-" + suffix;
-            LanceTableFactory.writeJapaneseTable(scratchDir, indexName);
+            writer.write(scratchDir, indexName);
 
             Response register = postJson("/_lance/namespace", "{\"path\":\"" + scratchDir + "\"}");
             assertEquals("namespace register failed: " + readAll(register), 200, register.getStatusLine().getStatusCode());
@@ -965,8 +1061,11 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             });
             ensureGreen(indexName);
             String mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
-            assertTrue("text must start as keyword (no FTS index yet): " + mapping, mapping.contains("\"text\":{\"type\":\"keyword\""));
-            return new JapaneseIndex(scratchDir, indexName);
+            assertTrue(
+                utf8Column + " must start as keyword (no FTS index yet): " + mapping,
+                mapping.contains("\"" + utf8Column + "\":{\"type\":\"keyword\"")
+            );
+            return new SurfacedIndex(scratchDir, indexName);
         }
 
         @Override

@@ -163,13 +163,20 @@ public final class LanceIndexBuilder {
      * directory that is missing under {@code LANCE_LANGUAGE_MODEL_HOME}) the
      * JNI layer raises {@link IllegalArgumentException}, which lands in
      * {@link BuildResult#failed()} with {@link Failed#invalidInput()} set.
+     *
+     * <p>{@code withPosition} asks Lance to store token positions in the
+     * inverted index (Lance's {@code with_position}). Phrase queries
+     * ({@code lance_match_phrase}) need them; an index built without
+     * positions rejects phrase queries at query time. Lance's default is
+     * false, and so is the plugin's.
      */
     public static BuildResult ensureFtsIndexes(
         Dataset dataset,
         Set<String> targetColumns,
         long maxRows,
         Optional<List<Integer>> fragmentIds,
-        String tokenizer
+        String tokenizer,
+        boolean withPosition
     ) {
         BuildResult result = new BuildResult();
         if (targetColumns.isEmpty()) {
@@ -178,7 +185,7 @@ public final class LanceIndexBuilder {
         if (rowsUnlessOverMaxRows(dataset, maxRows, "FTS", targetColumns, result).isEmpty()) {
             return result;
         }
-        String ftsParamsJson = ftsParamsJson(tokenizer);
+        String ftsParamsJson = ftsParamsJson(tokenizer, withPosition);
         for (Field field : dataset.getSchema().getFields()) {
             if (!(field.getType() instanceof ArrowType.Utf8)) {
                 continue;
@@ -208,9 +215,10 @@ public final class LanceIndexBuilder {
                 }
                 result.addBuilt(column);
                 LOG.info(
-                    "built FTS index over column {} (tokenizer={}, fragmentIds={}, version {})",
+                    "built FTS index over column {} (tokenizer={}, with_position={}, fragmentIds={}, version {})",
                     column,
                     tokenizer,
+                    withPosition,
                     fragmentIds.orElse(null),
                     dataset.version()
                 );
@@ -226,10 +234,12 @@ public final class LanceIndexBuilder {
      * Serialises the inverted index params Lance reads at CreateIndex.
      * Goes through an {@link XContentBuilder} so a tokenizer name with a
      * quote or backslash cannot break out of the JSON string.
+     * {@code with_position} is written even when false so the log and the
+     * params Lance stores say what was asked for.
      */
-    private static String ftsParamsJson(String tokenizer) {
+    private static String ftsParamsJson(String tokenizer, boolean withPosition) {
         try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
-            builder.startObject().field("base_tokenizer", tokenizer).endObject();
+            builder.startObject().field("base_tokenizer", tokenizer).field("with_position", withPosition).endObject();
             return builder.toString();
         } catch (IOException e) {
             throw new UncheckedIOException(e);
