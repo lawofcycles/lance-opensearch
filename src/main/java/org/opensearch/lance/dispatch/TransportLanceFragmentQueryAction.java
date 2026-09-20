@@ -12,11 +12,16 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 
+import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DirectoryReader;
@@ -46,6 +51,8 @@ import org.apache.lucene.util.FixedBitSet;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ipc.ColumnOrdering;
+import org.lance.ipc.LanceScanner;
+import org.lance.ipc.ScanOptions;
 import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
@@ -2026,12 +2033,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             if (ftsWeight != null) {
                 // The request's own Weight has scanned already when
                 // hits or aggregations were collected. Its count is
-                // the true total when the scan was unbounded, or when
-                // a bounded scan came back short of its limit (Lance
-                // returns exactly min(limit, matches) rows).
+                // the true total when the scan saw every match of
+                // this executor's fragments: an unbounded scan, or a
+                // bounded scan that came back short of its limit
+                // before the fragment filter (Lance returns exactly
+                // min(limit, matches) rows).
                 long scanned = ftsWeight.hitCount();
-                int scanLimit = ((LanceFtsQuery) ftsWeight.getQuery()).scanLimit();
-                if (scanned >= 0 && (scanLimit == LanceFtsQuery.SCAN_LIMIT_UNBOUNDED || scanned < scanLimit)) {
+                if (scanned >= 0 && ftsWeight.complete()) {
                     return MatchedCount.exact(scanned);
                 }
             }
@@ -2097,7 +2105,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
-     * Count FTS hits without materialising row addresses or scores.
+     * Count FTS hits without materialising scores or payload columns.
      *
      * <p>Lance's inverted-index scanner can walk the posting list
      * once and stream row counts when we ask for zero columns and
@@ -2115,13 +2123,38 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * overload today, so this method assembles a scan that yields
      * zero payload columns; the batches carry only the row count
      * that the aggregator returns via {@code getRowCount()}. When
-     * fragmentIds is null or covers every fragment of the dataset the
-     * scan runs without a fragment restriction, so Lance answers it
-     * from the inverted index alone; a proper subset is passed through
-     * and Lance filters the scan to it (matching the
-     * {@code Dataset.countRows(sql)} branch below). See
-     * {@link LanceFtsQuery#restrictToFragmentsUnlessAll} for why the
-     * restriction is skipped when it would not change the row set.
+     * {@code fragmentIds} is null or covers every fragment of the
+     * dataset that is the whole scan, and Lance answers it from the
+     * inverted index alone.
+     *
+     * <p>A proper subset (one executor of a multi node fan out) is
+     * not passed to Lance either, because a fragment list makes Lance
+     * read {@code _rowid} over the listed fragments as a prefilter
+     * (see {@link LanceFtsQuery#restrictToFragmentsUnlessAll}).
+     * Instead the scan runs over the whole table with
+     * {@code withRowAddress(true)} and the rows whose fragment id
+     * (upper 32 bits of {@code _rowaddr}) is in {@code fragmentIds}
+     * are counted here:
+     * <ul>
+     *   <li>{@code limit > 0} (the {@code track_total_hits} bound,
+     *       passed as {@code upTo + 1}): one scan with that limit.
+     *       Every executor sees the same {@code min(total, upTo + 1)}
+     *       rows and counts its own fragments' share; the fragments
+     *       are partitioned over the executors, so the per executor
+     *       counts sum to {@code min(total, upTo + 1)}, which is the
+     *       value the coordinator compares with {@code upTo} to
+     *       decide between {@code eq} and {@code gte}. The caller's
+     *       lower bound flag ({@code counted >= limit}) is usually
+     *       false for a subset executor and the coordinator decides
+     *       from the sum.</li>
+     *   <li>{@code limit == 0} ({@code track_total_hits: true}): a
+     *       probe scan with {@code limit(subsetProbeLimit)}. When it
+     *       comes back short every match has been seen and the
+     *       executor's share is the exact count. When it fills up the
+     *       probe is discarded and the count-only scan above runs with
+     *       the {@code fragmentIds} restriction, paying the prefilter
+     *       read for that one shape.</li>
+     * </ul>
      *
      * <p>A prefilter carried by {@code fts} (the scalar clauses of a
      * collapsed bool query) is passed the same way the hits scan
@@ -2135,29 +2168,77 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * to know whether more than {@code n} rows match passes
      * {@code n + 1} and stops the scan there.
      */
-    private long countFtsHitsDirectly(Dataset dataset, LanceFtsQuery fts, List<Integer> fragmentIds, long limit) throws Exception {
-        org.lance.ipc.ScanOptions.Builder builder = new org.lance.ipc.ScanOptions.Builder().fullTextQuery(fts.fullTextQuery())
+    static long countFtsHitsDirectly(Dataset dataset, LanceFtsQuery fts, List<Integer> fragmentIds, long limit) throws Exception {
+        boolean subset = fragmentIds != null && !LanceFtsQuery.coversAllFragments(fragmentIds, dataset);
+        if (!subset) {
+            ScanOptions.Builder builder = countOnlyScan(fts);
+            if (limit > 0) {
+                builder = builder.limit(limit);
+            }
+            return countRows(dataset, builder.build());
+        }
+        Set<Integer> own = new HashSet<>(fragmentIds);
+        if (limit > 0) {
+            return countOwnRows(dataset, rowAddressScan(fts).limit(limit).build(), own).own();
+        }
+        long probeLimit = LanceFtsQuery.subsetProbeLimit();
+        OwnRowCount probe = countOwnRows(dataset, rowAddressScan(fts).limit(probeLimit).build(), own);
+        if (probe.returned() < probeLimit) {
+            return probe.own();
+        }
+        return countRows(dataset, LanceFtsQuery.restrictToFragmentsUnlessAll(countOnlyScan(fts), fragmentIds, dataset).build());
+    }
+
+    /** Scan options for a count-only FTS scan: no columns, no row address, no row id. */
+    private static ScanOptions.Builder countOnlyScan(LanceFtsQuery fts) {
+        ScanOptions.Builder builder = new ScanOptions.Builder().fullTextQuery(fts.fullTextQuery())
             .columns(Collections.emptyList())
             .withRowAddress(false)
             .withRowId(false);
         if (fts.prefilterSql() != null) {
             builder = builder.filter(fts.prefilterSql()).prefilter(true);
         }
-        if (fragmentIds != null) {
-            builder = LanceFtsQuery.restrictToFragmentsUnlessAll(builder, fragmentIds, dataset);
-        }
-        if (limit > 0) {
-            builder = builder.limit(limit);
-        }
+        return builder;
+    }
+
+    /** Scan options for an FTS scan that returns {@code _rowaddr} only. */
+    private static ScanOptions.Builder rowAddressScan(LanceFtsQuery fts) {
+        return countOnlyScan(fts).withRowAddress(true);
+    }
+
+    private static long countRows(Dataset dataset, ScanOptions options) throws Exception {
         long total = 0L;
-        try (
-            org.lance.ipc.LanceScanner scanner = dataset.newScan(builder.build());
-            org.apache.arrow.vector.ipc.ArrowReader reader = scanner.scanBatches()
-        ) {
+        try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
             while (reader.loadNextBatch()) {
                 total += reader.getVectorSchemaRoot().getRowCount();
             }
         }
         return total;
+    }
+
+    /**
+     * Rows Lance returned for a scan, and how many of them belong to
+     * the fragments the executor holds.
+     */
+    private record OwnRowCount(long returned, long own) {
+    }
+
+    private static OwnRowCount countOwnRows(Dataset dataset, ScanOptions options, Set<Integer> own) throws Exception {
+        long returned = 0L;
+        long kept = 0L;
+        try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                int rows = root.getRowCount();
+                returned += rows;
+                for (int i = 0; i < rows; i++) {
+                    if (own.contains((int) (rowAddr.get(i) >>> 32))) {
+                        kept++;
+                    }
+                }
+            }
+        }
+        return new OwnRowCount(returned, kept);
     }
 }

@@ -22,6 +22,7 @@ import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.lucene.index.IndexReaderContext;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Explanation;
@@ -57,6 +58,33 @@ public final class LanceFtsQuery extends Query {
 
     /** Sentinel that disables top-k pushdown; the scan is bounded only by fragment maxDoc. */
     public static final int SCAN_LIMIT_UNBOUNDED = 0;
+
+    /** Default for {@link #subsetProbeLimit()}. */
+    public static final int DEFAULT_SUBSET_PROBE_LIMIT = 1_000_000;
+
+    /**
+     * Row cap of the probe scan an executor that holds a proper subset
+     * of the table's fragments runs for an unbounded FTS shape (see
+     * {@link LanceFtsWeight}). Runtime parameter, not query identity:
+     * two queries that differ only in the probe limit in force return
+     * the same rows, so it is not part of {@link #equals}. Written by
+     * the plugin from the {@code lance.fts.subset_probe_limit} cluster
+     * setting, read by every scan.
+     */
+    private static volatile int subsetProbeLimit = DEFAULT_SUBSET_PROBE_LIMIT;
+
+    /** Current value of the {@code lance.fts.subset_probe_limit} setting. */
+    public static int subsetProbeLimit() {
+        return subsetProbeLimit;
+    }
+
+    /** Install a new probe limit; the next scan picks it up. */
+    public static void setSubsetProbeLimit(int limit) {
+        if (limit < 1) {
+            throw new IllegalArgumentException("subset probe limit must be at least 1, was " + limit);
+        }
+        subsetProbeLimit = limit;
+    }
 
     private final FullTextQuery fullTextQuery;
     private final Set<String> columns;
@@ -236,25 +264,61 @@ public final class LanceFtsQuery extends Query {
      * One newScan per Weight instance makes the fixed cost
      * independent of fragment count.
      *
-     * <p>{@code scanLimit} caps the total transfer across the fragment
-     * subset, so a request of {@code size=20} over 20 fragments per
-     * node transfers 20 hits, not 400, matching the shape the
-     * coordinator merges anyway.
+     * <p>The scan never carries a {@code fragmentIds} restriction,
+     * also when the reader's leaves are a proper subset of the
+     * table's fragments (one executor of a multi node fan out). Lance
+     * plans a filtered read of {@code _rowid} over every listed
+     * fragment as soon as the list is set, and that read grows with
+     * the row count while the index lookup itself does not; see
+     * {@link LanceFtsQuery#restrictToFragmentsUnlessAll}. Instead the
+     * scan runs over the whole table and rows whose fragment id (the
+     * upper 32 bits of {@code _rowaddr}) is not one of the reader's
+     * fragments are dropped here. The two shapes:
+     *
+     * <ul>
+     *   <li>Bounded ({@code scanLimit} set, the pure top k shape):
+     *       one scan with {@code limit(scanLimit)} over the table.
+     *       Every executor computes the same global top k and keeps
+     *       its own fragments' rows out of it. The fragments are
+     *       partitioned over the executors, so the per executor
+     *       results are disjoint and their union is exactly the
+     *       global top k; the coordinator's k way merge of those
+     *       lists is the same top k a single executor holding the
+     *       whole table would return. The only slack is a tie in
+     *       score at rank k, where Lance's tie break decides which of
+     *       the tied rows is inside the k rows.</li>
+     *   <li>Unbounded (aggregations, sort by a field, post_filter,
+     *       {@code size 0}): a probe scan with
+     *       {@code limit(subsetProbeLimit)} over the table. When Lance
+     *       returns fewer rows than the probe limit every match has
+     *       been seen and the reader's rows are kept. When the probe
+     *       fills up the match set is too large to filter here, the
+     *       probe rows are discarded and the scan is repeated with the
+     *       {@code fragmentIds} restriction, which transfers the
+     *       executor's matches only at the price of the
+     *       {@code _rowid} prefilter read. Probe rows are never mixed
+     *       with the restricted rows: the restricted scan already
+     *       contains them and the union would double count.</li>
+     * </ul>
+     * A reader that holds every fragment skips the filter and keeps
+     * the single unrestricted scan it always ran.
      *
      * <p>The class is public so the fragment executor, which creates
      * the Weight itself and drives hits and aggregations through it,
-     * can read {@link #hitCount()} afterwards instead of running a
-     * second Lance scan to count the matches, and can deliver the hit
-     * sets to the fragment readers through {@link #hintExclusive}
-     * before it builds aggregators and sort comparators.
+     * can read {@link #hitCount()} and {@link #complete()} afterwards
+     * instead of running a second Lance scan to count the matches,
+     * and can deliver the hit sets to the fragment readers through
+     * {@link #hintExclusive} before it builds aggregators and sort
+     * comparators.
      */
     public final class LanceFtsWeight extends Weight implements LanceHintingWeight {
 
         private final float boost;
-        // Cache populated by the first Lance-backed leaf we visit and
-        // reused for every other leaf in the same Weight. Set once
-        // via CAS so concurrent readers see a fully constructed map.
-        private final AtomicReference<Map<Integer, LanceFragmentHits>> shardHits = new AtomicReference<>();
+        // Result of the shard scan, populated by the first Lance-backed
+        // leaf we visit and reused for every other leaf in the same
+        // Weight. Set once via CAS so concurrent readers see a fully
+        // constructed map.
+        private final AtomicReference<ShardScan> shardScan = new AtomicReference<>();
 
         LanceFtsWeight(LanceFtsQuery query, float boost) {
             super(query);
@@ -366,35 +430,61 @@ public final class LanceFtsQuery extends Query {
         }
 
         /**
-         * Number of rows the shard-level scan returned across every
-         * fragment, or {@code -1} when no leaf of this Weight has been
-         * scored yet and the scan has therefore not run. The value
-         * covers the fragments the enclosing reader exposes (the scan
-         * is restricted to them unless they are the whole table), and
-         * is bounded by {@link LanceFtsQuery#scanLimit()} when that is
-         * set: at the limit the true match count may be higher. Hits
-         * dropped on a leaf by the FLS column check in
-         * {@link #scorerSupplier} are still included, so the executor
-         * only relies on this count when no reader wrapper is
-         * installed.
+         * Number of rows of the shard-level scan that belong to the
+         * fragments the enclosing reader exposes, or {@code -1} when
+         * no leaf of this Weight has been scored yet and the scan has
+         * therefore not run. Rows Lance returned for other fragments
+         * of the table (the scan runs unrestricted, see the class
+         * javadoc) are not counted. The value is the executor's exact
+         * match count only when {@link #complete()} is true: a
+         * bounded scan that filled its limit may have left matches of
+         * the reader's fragments unseen, and the number of rows kept
+         * says nothing about how many were cut off. Hits dropped on a
+         * leaf by the FLS column check in {@link #scorerSupplier} are
+         * still included, so the executor only relies on this count
+         * when no reader wrapper is installed.
          */
         public long hitCount() {
-            Map<Integer, LanceFragmentHits> hits = shardHits.get();
-            if (hits == null) {
+            ShardScan scan = shardScan.get();
+            if (scan == null) {
                 return -1L;
             }
             long total = 0L;
-            for (LanceFragmentHits fragmentHits : hits.values()) {
+            for (LanceFragmentHits fragmentHits : scan.hits().values()) {
                 total += fragmentHits.size();
             }
             return total;
         }
 
+        /**
+         * Whether the shard-level scan saw every match of the reader's
+         * fragments, so {@link #hitCount()} is the exact match count.
+         * True for an unbounded scan (the probe came back short of its
+         * limit, or the restricted scan ran after it filled up) and
+         * for a bounded scan that returned fewer rows than its limit
+         * before any filtering; false for a bounded scan that filled
+         * its limit, and before the scan has run.
+         */
+        public boolean complete() {
+            ShardScan scan = shardScan.get();
+            return scan != null && scan.complete();
+        }
+
+        /**
+         * The {@link ScanOptions} of every Lance scan this Weight has
+         * issued, in order; empty before the first leaf is scored.
+         * For tests of the scan plan.
+         */
+        List<ScanOptions> issuedScans() {
+            ShardScan scan = shardScan.get();
+            return scan == null ? List.of() : scan.scans();
+        }
+
         private Map<Integer, LanceFragmentHits> ensureShardScan(LeafReaderContext context, LanceFragmentLeafReader leaf)
             throws IOException {
-            Map<Integer, LanceFragmentHits> cached = shardHits.get();
+            ShardScan cached = shardScan.get();
             if (cached != null) {
-                return cached;
+                return cached.hits();
             }
             // First scan on this shard is where Lance loads the
             // inverted index into native memory. Refuse to start it
@@ -403,24 +493,22 @@ public final class LanceFtsQuery extends Query {
             LanceCircuitBreaker.checkAndTrip("lance_fts_query");
 
             // Collect the fragment ids of every Lance-backed leaf in
-            // this shard. They decide whether the single scan below
-            // needs a fragmentIds restriction: when the leaves cover
-            // every fragment of the dataset none is passed, otherwise
-            // the scan is limited to the fragments this per-node
-            // executor was assigned. The IndexSearcher built by the
-            // fragment coordinator wraps exactly those fragments'
-            // leaves inside a LanceDirectoryReader, so walking the
-            // top-level context's leaves() gives the same subset the
-            // request was fanned out with — no more, no less. Walk up
-            // to the top-level context because
-            // LeafReaderContext.leaves() (inherited from
-            // IndexReaderContext) is only valid when isTopLevel is
-            // true.
-            org.apache.lucene.index.IndexReaderContext topCtx = context;
+            // this shard. They decide which rows of the unrestricted
+            // scan below are kept, and whether the filter is needed
+            // at all (a reader that holds every fragment keeps every
+            // row). The IndexSearcher built by the fragment
+            // coordinator wraps exactly those fragments' leaves
+            // inside a LanceDirectoryReader, so walking the top-level
+            // context's leaves() gives the same subset the request
+            // was fanned out with — no more, no less. Walk up to the
+            // top-level context because LeafReaderContext.leaves()
+            // (inherited from IndexReaderContext) is only valid when
+            // isTopLevel is true.
+            IndexReaderContext topCtx = context;
             while (!topCtx.isTopLevel) {
                 topCtx = topCtx.parent;
             }
-            List<Integer> fragmentIds = new ArrayList<>();
+            Set<Integer> fragmentIds = new LinkedHashSet<>();
             for (LeafReaderContext sibling : topCtx.leaves()) {
                 LanceFragmentLeafReader sl = LanceFragmentLeafReader.unwrap(sibling.reader());
                 if (sl != null) {
@@ -429,63 +517,107 @@ public final class LanceFtsQuery extends Query {
             }
             if (fragmentIds.isEmpty()) {
                 // No Lance-backed leaves at all: nothing to scan.
-                // Install an empty map so subsequent scorer calls
+                // Install an empty result so subsequent scorer calls
                 // short-circuit through the cache.
-                Map<Integer, LanceFragmentHits> empty = new HashMap<>();
-                shardHits.compareAndSet(null, empty);
-                return shardHits.get();
+                shardScan.compareAndSet(null, new ShardScan(new HashMap<>(), true, List.of()));
+                return shardScan.get().hits();
             }
 
-            // effectiveLimit applies to the whole scan (not per
-            // fragment). scanLimit == SCAN_LIMIT_UNBOUNDED asks for
-            // every match; otherwise Lance stops after that many
-            // score-sorted rows across the fragment subset. Callers
-            // that need every match (aggregation, sort by non-score,
-            // post_filter) keep the sentinel via
-            // TransportLanceFragmentQueryAction.resolveScanFilterTopK.
-            long effectiveLimit;
-            if (scanLimit == SCAN_LIMIT_UNBOUNDED) {
-                effectiveLimit = 0L; // Lance treats 0 as "no limit"
+            Dataset dataset = leaf.dataset();
+            // Rows of fragments outside the reader are dropped from
+            // the unrestricted scan; a reader over the whole table
+            // has nothing to drop.
+            Set<Integer> keep = coversAllFragments(fragmentIds, dataset) ? null : fragmentIds;
+            List<ScanOptions> issued = new ArrayList<>(2);
+            Map<Integer, LanceFragmentHits> hits = new HashMap<>();
+            boolean complete;
+            if (scanLimit != SCAN_LIMIT_UNBOUNDED) {
+                // Top k over the whole table; each executor keeps its
+                // share of the same k rows. Lance rejects limit == 0;
+                // if a caller passed scanLimit == 0 through some other
+                // route the clip is 1.
+                long limit = Math.max(1L, (long) scanLimit);
+                ScanOptions options = newScanOptions().limit(limit).build();
+                issued.add(options);
+                long returned = collectHits(dataset, options, keep, hits);
+                // Lance returns exactly min(limit, matches) rows, so a
+                // short result means every match of the table, and
+                // with it every match of the reader's fragments, has
+                // been seen.
+                complete = returned < limit;
+            } else if (keep == null) {
+                ScanOptions options = newScanOptions().build();
+                issued.add(options);
+                collectHits(dataset, options, null, hits);
+                complete = true;
             } else {
-                // Lance rejects limit == 0; if a caller passed
-                // scanLimit == 0 through some other route the top-k
-                // clip below is 1.
-                effectiveLimit = Math.max(1L, (long) scanLimit);
+                long probeLimit = subsetProbeLimit();
+                ScanOptions probe = newScanOptions().limit(probeLimit).build();
+                issued.add(probe);
+                long returned = collectHits(dataset, probe, keep, hits);
+                if (returned >= probeLimit) {
+                    // Too many matches to filter here: discard the
+                    // probe and let Lance restrict the scan to the
+                    // reader's fragments.
+                    hits = new HashMap<>();
+                    ScanOptions restricted = restrictToFragmentsUnlessAll(newScanOptions(), new ArrayList<>(fragmentIds), dataset).build();
+                    issued.add(restricted);
+                    collectHits(dataset, restricted, null, hits);
+                }
+                complete = true;
             }
+            ShardScan fresh = new ShardScan(hits, complete, List.copyOf(issued));
+            // Whichever thread wins the CAS installs the result; losers reuse it.
+            if (shardScan.compareAndSet(null, fresh)) {
+                return fresh.hits();
+            }
+            return shardScan.get().hits();
+        }
 
-            // Restrict the scan to the executor's fragments only when
-            // they are a proper subset of the table; a full set is
-            // scanned without fragmentIds so Lance does not plan a
-            // _rowid prefilter read over the whole table before the
-            // inverted-index lookup (see restrictToFragmentsUnlessAll).
-            ScanOptions.Builder builder = restrictToFragmentsUnlessAll(new ScanOptions.Builder(), fragmentIds, leaf.dataset())
-                .fullTextQuery(query().fullTextQuery())
-                .withRowAddress(true);
-            // A scalar predicate pushed down from a bool query runs
-            // as a Lance prefilter: the planner evaluates it first
-            // (scalar index or filtered _rowid read) and hands the
-            // resulting row set to the inverted-index lookup, so the
-            // limit below clips the already filtered hits.
+        /**
+         * Scan options shared by every scan of this Weight: the
+         * full-text query, the row address the hits are bucketed by,
+         * and the SQL prefilter of a collapsed bool query. The
+         * prefilter runs as a Lance prefilter: the planner evaluates
+         * it first (scalar index or filtered _rowid read) and hands
+         * the resulting row set to the inverted-index lookup, so a
+         * limit clips the already filtered hits.
+         */
+        private ScanOptions.Builder newScanOptions() {
+            ScanOptions.Builder builder = new ScanOptions.Builder().fullTextQuery(query().fullTextQuery()).withRowAddress(true);
             String prefilterSql = query().prefilterSql();
             if (prefilterSql != null) {
                 builder = builder.filter(prefilterSql).prefilter(true);
             }
-            if (effectiveLimit > 0) {
-                builder = builder.limit(effectiveLimit);
-            }
+            return builder;
+        }
 
-            Map<Integer, LanceFragmentHits> fresh = new HashMap<>();
-            try (LanceScanner scanner = leaf.dataset().newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
+        /**
+         * Run {@code options} against {@code dataset} and add every
+         * returned row whose fragment id is in {@code keep} (every
+         * row when {@code keep} is null) to {@code into}, bucketed by
+         * fragment id. Returns the number of rows Lance returned
+         * before the filter, which is what a limit is compared with.
+         */
+        private long collectHits(Dataset dataset, ScanOptions options, Set<Integer> keep, Map<Integer, LanceFragmentHits> into)
+            throws IOException {
+            long returned = 0L;
+            try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
                     UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
                     Float4Vector score = (Float4Vector) root.getVector("_score");
-                    for (int i = 0; i < root.getRowCount(); i++) {
+                    int rows = root.getRowCount();
+                    returned += rows;
+                    for (int i = 0; i < rows; i++) {
                         long addr = rowAddr.get(i);
                         int fragId = (int) (addr >>> 32);
+                        if (keep != null && !keep.contains(fragId)) {
+                            continue;
+                        }
                         int offset = (int) (addr & 0xFFFFFFFFL);
                         float s = score.get(i) * boost;
-                        fresh.computeIfAbsent(fragId, id -> new LanceFragmentHits()).add(offset, s);
+                        into.computeIfAbsent(fragId, id -> new LanceFragmentHits()).add(offset, s);
                     }
                 }
             } catch (IOException e) {
@@ -493,17 +625,21 @@ public final class LanceFtsQuery extends Query {
             } catch (Exception e) {
                 throw new IOException(e);
             }
-            // Whichever thread wins the CAS installs the map; losers reuse it.
-            if (shardHits.compareAndSet(null, fresh)) {
-                return fresh;
-            }
-            return shardHits.get();
+            return returned;
         }
 
         @Override
         public boolean isCacheable(LeafReaderContext ctx) {
             return false;
         }
+    }
+
+    /**
+     * Outcome of a Weight's shard-level scan: the hits of the reader's
+     * fragments, whether every match of those fragments was seen, and
+     * the scans that were issued to get there.
+     */
+    private record ShardScan(Map<Integer, LanceFragmentHits> hits, boolean complete, List<ScanOptions> scans) {
     }
 
     @Override
@@ -622,7 +758,7 @@ public final class LanceFtsQuery extends Query {
      * sizes. Ids in {@code executorFragmentIds} that the dataset does
      * not know are ignored: they cannot add rows to the scan.
      */
-    static boolean coversAllFragments(Collection<Integer> executorFragmentIds, Dataset dataset) {
+    public static boolean coversAllFragments(Collection<Integer> executorFragmentIds, Dataset dataset) {
         Set<Integer> executor = new HashSet<>(executorFragmentIds);
         for (Fragment fragment : dataset.getFragments()) {
             if (!executor.contains(fragment.getId())) {
@@ -643,23 +779,24 @@ public final class LanceFtsQuery extends Query {
      * the {@code _rowid} column over every target fragment and feeds
      * that as a prefilter into the inverted-index lookup, so the scan
      * reads one row id per row in the target fragments before it
-     * touches the posting lists. On a table where the executor holds
-     * every fragment that read covers the whole table and the query
-     * latency grows with the row count while the index lookup itself
-     * stays constant. Leaving {@code fragmentIds} unset in that case
-     * gives Lance the same plan pylance gets ({@code PreFilterSource::None})
-     * and the lookup runs from the index alone.
+     * touches the posting lists, and the query latency grows with the
+     * row count of those fragments while the index lookup itself stays
+     * constant. Leaving {@code fragmentIds} unset gives Lance the same
+     * plan pylance gets ({@code PreFilterSource::None}) and the lookup
+     * runs from the index alone.
      *
-     * <p>When the executor holds a proper subset the ids are still
-     * passed and the prefilter read still happens over that subset;
-     * the alternative (scan without {@code fragmentIds} and drop
-     * foreign rows in Java) is not taken because the bounded
-     * {@code limit} would then count rows that belong to other
-     * executors and the top-k per executor would be wrong, and
-     * without {@code limit} every match would be transferred. A
-     * Lance-side change that builds the prefilter from the fragment
-     * bitmap instead of a row id read would make the subset case an
-     * index-only lookup as well.
+     * <p>Because of that cost the FTS paths avoid the restriction even
+     * for a proper subset: the hits scan and the count scan run over
+     * the whole table and keep the rows of the executor's fragments by
+     * the fragment id in {@code _rowaddr} ({@link LanceFtsWeight} and
+     * the fragment executor's count path explain why the per executor
+     * results still merge to the same answer). This method is what
+     * those paths fall back to when an unbounded scan matches more
+     * rows than the probe limit, so the restriction is paid only when
+     * the alternative would transfer that many rows of other
+     * executors' fragments. A Lance-side change that builds the
+     * prefilter from the fragment bitmap instead of a row id read
+     * would make the restricted scan an index-only lookup as well.
      */
     public static ScanOptions.Builder restrictToFragmentsUnlessAll(
         ScanOptions.Builder builder,
