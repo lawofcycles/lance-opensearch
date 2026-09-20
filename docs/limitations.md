@@ -13,6 +13,8 @@ Everything documented here is a shape that either falls through to the shard pat
 
 Cross-index metrics also hit the shard path today.
 
+A request Lance refuses as invalid input (for example `lance_match_phrase` on an FTS index built without `with_position: true`) answers 400 `illegal_argument_exception` with Lance's message on the fragment path. On the shard path the same request answers 500: Lucene's query phase wraps the failure in `QueryPhaseExecutionException`, which OpenSearch reports as a server error, and the plugin does not intercept that phase. Lance's message is still in the response body.
+
 ## FTS query behaviour on stock `match` / `match_phrase`
 
 OpenSearch's stock `match` and `match_phrase` queries against a `lance_text` field ignore `operator`, `minimum_should_match`, phrase order, and `slop`. Reason: `lance_text` uses a keyword-analyzer `TextSearchInfo` so the whole query string reaches Lance as a single token and Lance's own tokenizer runs on the query text — OpenSearch's combining layer never sees multiple tokens. Use the plugin's DSL queries for that control:
