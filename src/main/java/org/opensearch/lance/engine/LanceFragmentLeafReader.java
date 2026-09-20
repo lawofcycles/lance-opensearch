@@ -1047,7 +1047,8 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * second Lance clause of a bool query) describes the docs the
      * collector is about to see better than the union would. When the
      * new array equals the current one the sparse structures already
-     * taken are kept; otherwise they are dropped.
+     * taken are kept; otherwise they are dropped. An empty array never
+     * displaces a non-empty hint (see the body for why that is safe).
      *
      * <p>{@code exclusive} states that the caller has established that
      * every doc the current search collects on this leaf is one of
@@ -1067,6 +1068,19 @@ public final class LanceFragmentLeafReader extends LeafReader {
     public void hintMatchedOffsets(int[] sortedOffsets, boolean exclusive) {
         int[] current = hintedOffsets;
         if (current != null && (current == sortedOffsets || Arrays.equals(current, sortedOffsets))) {
+            if (exclusive) {
+                hintExclusive = true;
+            }
+            return;
+        }
+        if (sortedOffsets.length == 0 && current != null && current.length > 0) {
+            // A scorer that matched nothing on this leaf does not
+            // displace the rows another scorer of the same request
+            // reported: whatever gets collected here is still inside
+            // the standing hint (a disjunction collects the other
+            // scorer's rows, a conjunction collects none), and an
+            // exclusive empty set only says that nothing is collected,
+            // which the standing hint covers as well.
             if (exclusive) {
                 hintExclusive = true;
             }

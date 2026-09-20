@@ -133,9 +133,11 @@ public final class LanceKnnQuery extends Query {
             }
             Map<Integer, FragmentHits> hitsByFragment = ensureShardScan(leaf);
             FragmentHits hits = hitsByFragment.get(leaf.fragmentId());
-            if (hits == null || hits.size == 0) {
-                return null;
-            }
+            // Same as LanceFtsQuery: a leaf outside the k nearest rows
+            // gets a supplier over an empty hit set rather than null, so
+            // Lucene's BulkScorer request reaches it and the leaf learns
+            // that nothing will be collected there.
+            int hitCount = hits == null ? 0 : hits.size;
 
             // FragmentHits.offsets / distances is already the sparse
             // list Lance's nearest scan returned for this fragment,
@@ -150,7 +152,6 @@ public final class LanceKnnQuery extends Query {
             // Lucene DocIdSetIterator contract asks for ascending
             // docIds, so pack (offset, score) into longs, sort, and
             // hand a LanceSparseHitIterator to the Scorer.
-            int hitCount = hits.size;
             long[] packed = new long[hitCount];
             for (int i = 0; i < hitCount; i++) {
                 int offset = hits.offsets[i];
