@@ -26,7 +26,6 @@ import org.opensearch.client.Response;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
-import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.test.rest.OpenSearchRestTestCase;
 
@@ -442,12 +441,15 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * true}), whose Lucene collectors break ties by doc id, which on the
      * whole-table reader is fragment order then offset. The doc value
      * fixture has ties everywhere: {@code lance} is repeated
-     * {@code (i % 5) + 1} times so sixty rows over the three fragments
+     * {@code (i % 5) + 1} times so sixty rows over the six fragments
      * share the top score, {@code flag} and {@code category} take two
-     * and three distinct values. Every page below crosses a tie group,
-     * and the {@code from} and {@code search_after} pages start inside
-     * one; ids and, where the request has them, sort values must agree
-     * hit for hit.
+     * and three distinct values. Six fragments over three nodes put
+     * fragments 0 and 3 on the first node, 1 and 4 on the second, 2 and
+     * 5 on the third, so a merge that fell back to node order would
+     * list the ties of fragment 3 before those of fragment 1. Every
+     * page below crosses a tie group, and the {@code from} and
+     * {@code search_after} pages start inside one; ids and, where the
+     * request has them, sort values must agree hit for hit.
      *
      * <p>The score-ordered shapes carry an explicit {@code _score} sort.
      * Without one the executor clips the Lance FTS scan to the page
@@ -460,14 +462,15 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String suffix = "mn-ties-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
-        int fragments = 3;
-        int rowsPerFragment = 100;
+        int fragments = 6;
+        int rowsPerFragment = 50;
         LanceTableFactory.writeHintFixtureTable(scratchDir, tableName, fragments, rowsPerFragment);
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         String tied = "{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}}";
         String filtered = "{\"bool\":{\"must\":[" + tied + "],\"filter\":[{\"term\":{\"category\":\"c1\"}}]}}";
         String byScore = ",\"sort\":[{\"_score\":\"desc\"}]";
+        String byCategoryThenScore = ",\"sort\":[{\"category\":\"asc\"},{\"_score\":\"desc\"}]";
         List<String> shapes = List.of(
             "\"size\":10,\"query\":" + tied + byScore,
             "\"from\":5,\"size\":5,\"query\":" + tied + byScore,
@@ -475,9 +478,14 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "\"size\":10,\"query\":" + filtered + byScore,
             "\"from\":3,\"size\":10,\"query\":" + filtered + byScore,
             "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"flag\":\"desc\"}]",
-            "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"category\":\"asc\"},{\"_score\":\"desc\"}]",
-            "\"from\":7,\"size\":10,\"query\":" + tied + ",\"sort\":[{\"category\":\"asc\"},{\"_score\":\"desc\"}]",
             "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"rating\":\"desc\"}]"
+        );
+        // A _score clause next to a field clause: the shard path copies
+        // the score sort value into _score, the fragment path does not,
+        // so these compare everything but the per-hit _score.
+        List<String> mixedShapes = List.of(
+            "\"size\":10,\"query\":" + tied + byCategoryThenScore,
+            "\"from\":7,\"size\":10,\"query\":" + tied + byCategoryThenScore
         );
         try {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
@@ -488,9 +496,13 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             for (String shape : shapes) {
                 assertFragmentPathMatchesShardPath(indexName, shape);
             }
+            for (String shape : mixedShapes) {
+                assertFragmentPathMatchesShardPath(indexName, shape, false);
+            }
             // The top ten of the score sort are the first ten rows with
             // i % 5 == 4, all in fragment 0, and the page starting at
-            // 55 crosses from fragment 2 into the next score group.
+            // 55 crosses from the last fragment into the next score
+            // group, which starts in fragment 0 again.
             Map<String, Object> top = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(0) + "}")));
             assertEquals(List.of(4, 9, 14, 19, 24, 29, 34, 39, 44, 49), sourceIds(top));
             Map<String, Object> crossing = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(2) + "}")));
@@ -507,21 +519,16 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 assertEquals(shape, hitIdsOf(shardPath), hitIdsOf(fragmentPath));
             }
 
-            // search_after with a cursor on a tied (field value, score)
-            // pair skips the whole tie group on both paths, and the next
-            // group starts with the lowest row addresses again. A cursor
-            // needs a field clause: OpenSearch rejects search_after on a
-            // bare _score sort.
-            List<String> cursorShapes = List.of(
-                "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"_score\":\"desc\"},{\"flag\":\"desc\"}]",
-                "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"category\":\"asc\"},{\"_score\":\"desc\"}]"
-            );
-            for (String shape : cursorShapes) {
-                Map<String, Object> firstPage = parse(readAll(postJson("/" + indexName + "/_search", "{\"explain\":true," + shape + "}")));
-                List<Object> cursor = sortValues(firstPage);
-                String withCursor = shape + ",\"search_after\":" + toJson(cursor.get(cursor.size() - 1));
-                assertFragmentPathMatchesShardPath(indexName, withCursor);
-            }
+            // search_after with a cursor on a tied value skips the whole
+            // tie group on both paths, and the next group starts with the
+            // lowest row addresses again: after flag 1 (even rows) come
+            // the odd rows, fragment by fragment. The cursor is written
+            // as the integer the INT sort compares, because the fragment
+            // executor hands search_after values to Lucene untyped.
+            String withCursor = "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"flag\":\"desc\"}],\"search_after\":[1]";
+            assertFragmentPathMatchesShardPath(indexName, withCursor);
+            Map<String, Object> secondPage = parse(readAll(postJson("/" + indexName + "/_search", "{" + withCursor + "}")));
+            assertEquals(List.of(1, 3, 5, 7, 9, 11, 15, 17, 19, 21), sourceIds(secondPage));
 
             // Bare shape: the page is ten of the sixty tied rows, and
             // whichever ten the clipped scan kept, the merge lists them
@@ -584,20 +591,34 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * compare the parts of the two responses that describe the result.
      */
     private static void assertFragmentPathMatchesShardPath(String indexName, String shape) throws IOException {
+        assertFragmentPathMatchesShardPath(indexName, shape, true);
+    }
+
+    /**
+     * As {@link #assertFragmentPathMatchesShardPath(String, String)};
+     * {@code compareScores} false skips the per-hit {@code _score}
+     * comparison, for a sort that has a {@code _score} clause next to a
+     * field clause: the shard path copies that clause's sort value into
+     * {@code _score}, the fragment path leaves {@code _score} null
+     * unless {@code track_scores} is set.
+     */
+    private static void assertFragmentPathMatchesShardPath(String indexName, String shape, boolean compareScores) throws IOException {
         Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
         Map<String, Object> shardPath = parse(readAll(postJson("/" + indexName + "/_search", "{\"explain\":true," + shape + "}")));
         assertEquals(shape, hitIdsOf(shardPath), hitIdsOf(fragmentPath));
         assertEquals(shape, sortValues(shardPath), sortValues(fragmentPath));
-        List<Double> expectedScores = scoresOrNull(shardPath);
-        List<Double> actualScores = scoresOrNull(fragmentPath);
-        assertEquals(shape, expectedScores.size(), actualScores.size());
-        for (int i = 0; i < expectedScores.size(); i++) {
-            Double expected = expectedScores.get(i);
-            Double actual = actualScores.get(i);
-            if (expected == null || actual == null) {
-                assertEquals(shape + " hit " + i, expected, actual);
-            } else {
-                assertEquals(shape + " hit " + i, expected, actual, 1e-6d);
+        if (compareScores) {
+            List<Double> expectedScores = scoresOrNull(shardPath);
+            List<Double> actualScores = scoresOrNull(fragmentPath);
+            assertEquals(shape, expectedScores.size(), actualScores.size());
+            for (int i = 0; i < expectedScores.size(); i++) {
+                Double expected = expectedScores.get(i);
+                Double actual = actualScores.get(i);
+                if (expected == null || actual == null) {
+                    assertEquals(shape + " hit " + i, expected, actual);
+                } else {
+                    assertEquals(shape + " hit " + i, expected, actual, 1e-6d);
+                }
             }
         }
         assertEquals(shape, extractIntPath(shardPath, "hits", "total", "value"), extractIntPath(fragmentPath, "hits", "total", "value"));
@@ -783,14 +804,6 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             return parser.map();
         } catch (IOException e) {
             throw new AssertionError("could not parse JSON: " + json, e);
-        }
-    }
-
-    /** JSON of a parsed value (a hit's {@code sort} array here), to feed back as {@code search_after}. */
-    private static String toJson(Object value) throws IOException {
-        try (XContentBuilder builder = MediaTypeRegistry.JSON.contentBuilder()) {
-            builder.value(value);
-            return builder.toString();
         }
     }
 
