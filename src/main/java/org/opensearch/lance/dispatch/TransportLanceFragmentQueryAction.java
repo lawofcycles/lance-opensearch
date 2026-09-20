@@ -85,6 +85,7 @@ import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceFtsQueryBuilder;
 import org.opensearch.lance.query.LanceHintingWeight;
+import org.opensearch.lance.query.LanceInvalidInput;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.lance.query.LanceKnnQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
@@ -272,14 +273,37 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             Thread.currentThread().interrupt();
             listener.onFailure(interrupted);
         } catch (Exception e) {
-            LOGGER.warn(
-                "fragment query failed on this node for [{}] filter [{}] fragments [{}]",
-                request.tableUri(),
-                request.filterSql() == null ? "<match_all>" : request.filterSql(),
-                request.fragmentIds().isEmpty() ? "<all>" : request.fragmentIds(),
-                e
-            );
-            listener.onFailure(e);
+            // Lance's IllegalArgumentException (a phrase query on an
+            // index without positions, a malformed predicate) reaches
+            // this catch as the cause of the IOException the Lucene
+            // Weight contract forces the query classes to throw. Report
+            // the IllegalArgumentException itself: it survives the
+            // transport layer as its own class, so the coordinator's
+            // RemoteTransportException unwraps to it and the client
+            // sees 400 illegal_argument_exception with Lance's message
+            // instead of 500 i_o_exception. The original exception,
+            // with the executor and Lucene frames, goes to the debug
+            // log so a plugin bug that surfaces this way stays
+            // visible. Everything else stays a server error and is
+            // logged as one.
+            Exception reported = LanceInvalidInput.unwrap(e);
+            if (reported != e) {
+                LOGGER.debug(
+                    "fragment query for [{}] rejected by Lance as invalid input: {}",
+                    request.tableUri(),
+                    reported.getMessage(),
+                    e
+                );
+            } else {
+                LOGGER.warn(
+                    "fragment query failed on this node for [{}] filter [{}] fragments [{}]",
+                    request.tableUri(),
+                    request.filterSql() == null ? "<match_all>" : request.filterSql(),
+                    request.fragmentIds().isEmpty() ? "<all>" : request.fragmentIds(),
+                    e
+                );
+            }
+            listener.onFailure(reported);
         } finally {
             if (acquired) {
                 concurrencyLimit.release();

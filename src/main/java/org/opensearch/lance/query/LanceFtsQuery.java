@@ -623,6 +623,11 @@ public final class LanceFtsQuery extends Query {
             } catch (IOException e) {
                 throw e;
             } catch (Exception e) {
+                // The Weight contract allows IOException only. Keep the
+                // Lance exception as the cause: the fragment executor
+                // reads an IllegalArgumentException (Lance's invalid
+                // input, such as a phrase query on an index without
+                // positions) back out of the chain to answer 400.
                 throw new IOException(e);
             }
             return returned;
