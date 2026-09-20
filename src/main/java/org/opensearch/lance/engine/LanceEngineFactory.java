@@ -20,8 +20,6 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.lucene.index.DirectoryReader;
-import org.apache.lucene.index.FilterDirectoryReader;
 import org.apache.lucene.index.IndexCommit;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentInfos;
@@ -41,6 +39,8 @@ import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.ReadOnlyEngine;
 import org.opensearch.index.engine.Segment;
+import org.opensearch.index.engine.SegmentsStats;
+import org.opensearch.index.shard.DocsStats;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 
@@ -311,13 +311,13 @@ public final class LanceEngineFactory implements EngineFactory {
         // fragment's deletion file, so the sums equal Dataset.countRows()
         // and the manifest's deletion total for the served version.
         // totalSizeInBytes is the manifest-recorded data file total the
-        // reader captured at open (LanceDirectoryReader.dataFileSizes()).
+        // reader captured at open (LanceDirectoryReader.dataFileSizesOf).
         // It is not what _cat/indices shows as store.size: that column is
         // IndexShard.storeStats() -> Store.stats(), which sums the files in
         // the shard's Lucene Directory (only the bootstrap commit here) and
         // has no engine-level override in OpenSearch 3.8.
         @Override
-        public org.opensearch.index.shard.DocsStats docStats() {
+        public DocsStats docStats() {
             try (Searcher searcher = acquireSearcher("docStats", SearcherScope.INTERNAL)) {
                 long numDocs = 0;
                 long numDeletedDocs = 0;
@@ -325,25 +325,20 @@ public final class LanceEngineFactory implements EngineFactory {
                     numDocs += ctx.reader().numDocs();
                     numDeletedDocs += ctx.reader().numDeletedDocs();
                 }
-                long sizeInBytes = 0L;
-                if (searcher.getIndexReader() instanceof DirectoryReader directoryReader
-                    && FilterDirectoryReader.unwrap(directoryReader) instanceof LanceDirectoryReader lanceReader) {
-                    sizeInBytes = lanceReader.dataFileSizes().knownBytes();
-                }
-                return new org.opensearch.index.shard.DocsStats.Builder().count(numDocs)
+                return new DocsStats.Builder().count(numDocs)
                     .deleted(numDeletedDocs)
-                    .totalSizeInBytes(sizeInBytes)
+                    .totalSizeInBytes(LanceDirectoryReader.dataFileSizesOf(searcher.getIndexReader()).knownBytes())
                     .build();
             }
         }
 
         @Override
-        public org.opensearch.index.engine.SegmentsStats segmentsStats(boolean includeSegmentFileSizes, boolean includeUnloadedSegments) {
+        public SegmentsStats segmentsStats(boolean includeSegmentFileSizes, boolean includeUnloadedSegments) {
             ensureOpen();
             // A Lance-backed index has no Lucene segments to report on. Return
             // an empty stats object so the request completes with sane zeros
             // instead of blowing up on Lucene.segmentReader(reader).
-            return new org.opensearch.index.engine.SegmentsStats();
+            return new SegmentsStats();
         }
 
         // Same reason as segmentsStats(): the inherited implementation walks
