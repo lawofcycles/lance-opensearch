@@ -15,11 +15,16 @@ import java.util.List;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.store.ByteBuffersDirectory;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.opensearch.action.support.ActionFilters;
@@ -36,7 +41,6 @@ import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.index.IndexService;
-import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.indices.IndicesService;
@@ -1292,6 +1296,34 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
+     * Number of live documents across {@code leaves}, read from each
+     * leaf's {@link LeafReader#getLiveDocs()} rather than
+     * {@link LeafReader#numDocs()}. The two agree for a plain reader;
+     * they differ under a DLS wrapper, which is why the caller uses
+     * this instead of the {@link MatchAllDocsQuery} count shortcut.
+     */
+    static long countLiveDocs(List<LeafReaderContext> leaves) {
+        long total = 0L;
+        for (LeafReaderContext ctx : leaves) {
+            LeafReader leaf = ctx.reader();
+            Bits liveDocs = leaf.getLiveDocs();
+            if (liveDocs == null) {
+                total += leaf.numDocs();
+            } else if (liveDocs instanceof FixedBitSet bits) {
+                total += bits.cardinality();
+            } else {
+                int maxDoc = leaf.maxDoc();
+                for (int doc = 0; doc < maxDoc; doc++) {
+                    if (liveDocs.get(doc)) {
+                        total++;
+                    }
+                }
+            }
+        }
+        return total;
+    }
+
+    /**
      * Determine the number of rows in this node's fragment subset
      * that satisfy the query. Uses Lance's metadata-only counting
      * whenever the query is a pure filter shape the coordinator has
@@ -1347,6 +1379,25 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // hits.total.value consistent with both the returned
             // hits and the _count API for security-restricted
             // users.
+            //
+            // MatchAllDocsQuery is the one shape IndexSearcher.count
+            // does not iterate: its Weight.count returns
+            // reader.numDocs(), and the security plugin's DLS leaf
+            // reader swaps in filtered liveDocs but leaves numDocs
+            // at the unfiltered value. Count that shape from the
+            // liveDocs directly so a DLS user's match_all total
+            // equals what _count reports. The normalisation mirrors
+            // the first two lines of IndexSearcher.count so a
+            // ConstantScoreQuery / BoostQuery / bool-filter wrapper
+            // around match_all is caught the same way count would
+            // unwrap it.
+            Query normalised = searcher.rewrite(new ConstantScoreQuery(luceneQuery));
+            if (normalised instanceof ConstantScoreQuery csq) {
+                normalised = csq.getQuery();
+            }
+            if (normalised instanceof MatchAllDocsQuery) {
+                return countLiveDocs(searcher.getIndexReader().leaves());
+            }
             return searcher.count(luceneQuery);
         }
         List<Integer> fragmentIds = request.fragmentIdsOrNull();
