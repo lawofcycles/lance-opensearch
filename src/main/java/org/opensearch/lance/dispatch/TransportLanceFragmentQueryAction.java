@@ -10,7 +10,9 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.function.Function;
 
@@ -30,6 +32,8 @@ import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
 import org.lance.Dataset;
 import org.lance.Fragment;
+import org.lance.ipc.ColumnOrdering;
+import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -42,22 +46,25 @@ import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.index.Index;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.index.IndexService;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.Rewriteable;
-import org.opensearch.index.shard.IndexShard;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.engine.LanceDirectoryReader;
+import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceFtsQueryBuilder;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.lance.query.LanceScanFilterQuery;
+import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
@@ -68,6 +75,7 @@ import org.opensearch.search.aggregations.MultiBucketCollector;
 import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer;
 import org.opensearch.search.aggregations.SearchContextAggregations;
 import org.opensearch.search.internal.ContextIndexSearcher;
+import org.opensearch.search.sort.SortAndFormats;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
@@ -163,6 +171,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             );
         }
     }
+
+    /**
+     * How many times a request re-resolves its {@link IndexService}
+     * when the cluster state applier registers or removes the node's
+     * instance while the request is between the lookup and the
+     * temporary creation.
+     */
+    private static final int INDEX_SERVICE_RACE_RETRIES = 2;
 
     private final ClusterService clusterService;
     private final IndicesService indicesService;
@@ -270,154 +286,249 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 throw new IllegalStateException("Fragment path cannot resolve OpenSearch index [" + request.indexName() + "] on this node");
             }
             Index index = indexMetadata.getIndex();
-            IndexService indexService = indicesService.indexServiceSafe(index);
-            IndexShard indexShard = indexService.getShard(0);
-            String pkField = indexMetadata.getSettings().get("index.lance.primary_key_field", "");
-            // Parse the type setting through the same fromSetting helper the
-            // engine uses so unknown values fall back to LONG. Empty pkField
-            // overrides whatever the type says (see the reader constructor
-            // for the canonicalisation).
-            org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType = pkField.isEmpty()
-                ? org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.NONE
-                : org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.fromSetting(
-                    indexMetadata.getSettings().get("index.lance.primary_key_type", "long")
+            // The executor needs an IndexService for the mapping, the
+            // QueryShardContext, the bitset cache and the reader
+            // wrapper the security plugin installs; see
+            // executeWithLocalOrTempIndexService for where it comes from.
+            return executeWithLocalOrTempIndexService(index, indexMetadata, dataset, request, fragmentCount, effectiveFragmentIds, 0);
+        }
+    }
+
+    /**
+     * Resolve the {@link IndexService} to run against and hand off to
+     * {@link #executeWithIndexService}. A node that hosts the shard
+     * copy has a registered instance; every other node builds a
+     * temporary one from cluster state for the duration of the
+     * request through {@link IndicesService#withTempIndexService}.
+     * Both go through the plugins' {@code onIndexModule} hooks, so the
+     * security plugin's reader wrapper is present in either case.
+     *
+     * <p>The cluster state applier can register or remove the node's
+     * instance while this runs. {@code withTempIndexService} throws
+     * {@link ResourceAlreadyExistsException} when a registered
+     * instance appeared after the lookup, and that instance can be
+     * gone again by the time it is looked up. The method therefore
+     * re-enters itself once per such race, up to a small bound, and
+     * then gives up with an {@link IllegalStateException} that names
+     * the flapping applier; the index is present in cluster state, so
+     * an {@code IndexNotFoundException} would misreport it as missing.
+     */
+    private LanceFragmentQueryResponse executeWithLocalOrTempIndexService(
+        Index index,
+        IndexMetadata indexMetadata,
+        Dataset dataset,
+        LanceFragmentQueryRequest request,
+        int fragmentCount,
+        List<Integer> effectiveFragmentIds,
+        int attempt
+    ) throws Exception {
+        IndexService localIndexService = indicesService.indexService(index);
+        if (localIndexService != null) {
+            return executeWithIndexService(localIndexService, indexMetadata, dataset, request, fragmentCount, effectiveFragmentIds);
+        }
+        long tempStart = System.nanoTime();
+        try {
+            return indicesService.withTempIndexService(indexMetadata, tempIndexService -> {
+                // withTempIndexService leaves the MapperService
+                // empty; apply the cluster state mapping the same
+                // way IndicesClusterStateService does for a fresh
+                // IndexService.
+                tempIndexService.updateMapping(null, indexMetadata);
+                LOGGER.debug(
+                    "lance.dispatch: temporary IndexService for [{}] ready in {} us",
+                    request.indexName(),
+                    (System.nanoTime() - tempStart) / 1_000L
                 );
-            // Multi-fields spec is persisted as JSON in a single setting.
-            // Empty (no attach-body clause) leaves the reader with an empty
-            // sub-field map. Malformed JSON falls through to
-            // IllegalArgumentException, which the outer catch turns into a
-            // 500 for the caller; that is loud enough to surface a bad
-            // index setting without hiding the failure behind an empty map.
-            java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields = org.opensearch.lance.rest.RestAttachAction
-                .deserialiseMultiFields(indexMetadata.getSettings().get("index.lance.multi_fields", ""));
+                return executeWithIndexService(tempIndexService, indexMetadata, dataset, request, fragmentCount, effectiveFragmentIds);
+            });
+        } catch (ResourceAlreadyExistsException raced) {
+            if (attempt >= INDEX_SERVICE_RACE_RETRIES) {
+                throw new IllegalStateException(
+                    "the cluster state applier on this node kept registering and removing the IndexService for ["
+                        + index.getName()
+                        + "] while a fragment query tried to resolve it ("
+                        + (attempt + 1)
+                        + " attempts)",
+                    raced
+                );
+            }
+            // The cluster state applier registered a local
+            // IndexService between the lookup above and the temp
+            // creation. Look it up again; if it has been removed in
+            // the meantime the lookup misses and the temp path runs
+            // once more.
+            return executeWithLocalOrTempIndexService(
+                index,
+                indexMetadata,
+                dataset,
+                request,
+                fragmentCount,
+                effectiveFragmentIds,
+                attempt + 1
+            );
+        }
+    }
 
-            // Fetch the IndexService reader wrapper once so both
-            // openWrappedReader and computeMatched see the same
-            // wrapper reference. A non-null wrapper here is the
-            // signal that DLS/FLS or a similar reader-level
-            // transform may filter documents; computeMatched uses
-            // that signal to route counts through the searcher
-            // instead of Lance-side metadata paths, which would
-            // bypass the wrapper and return the pre-DLS count.
-            CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper = resolveReaderWrapper(indexService);
-            boolean hasSecurityWrapper = readerWrapper != null;
+    /**
+     * Run the scan against a resolved {@link IndexService}, either
+     * the node's own registered instance or a request-scoped temporary
+     * one. Nothing below depends on an {@link org.opensearch.index.shard.IndexShard}:
+     * the shard id is fixed at 0 (Lance-backed indexes are
+     * single-shard) and the {@link IndexSettings} come from the
+     * IndexService.
+     */
+    private LanceFragmentQueryResponse executeWithIndexService(
+        IndexService indexService,
+        IndexMetadata indexMetadata,
+        Dataset dataset,
+        LanceFragmentQueryRequest request,
+        int fragmentCount,
+        List<Integer> effectiveFragmentIds
+    ) throws Exception {
+        Optional<Long> pinnedVersion = request.pinnedVersionOrEmpty();
+        ShardId shardId = new ShardId(indexMetadata.getIndex(), 0);
+        String pkField = indexMetadata.getSettings().get("index.lance.primary_key_field", "");
+        // Parse the type setting through the same fromSetting helper the
+        // engine uses so unknown values fall back to LONG. Empty pkField
+        // overrides whatever the type says (see the reader constructor
+        // for the canonicalisation).
+        LancePrimaryKeyType pkType = pkField.isEmpty()
+            ? LancePrimaryKeyType.NONE
+            : LancePrimaryKeyType.fromSetting(indexMetadata.getSettings().get("index.lance.primary_key_type", "long"));
+        // Multi-fields spec is persisted as JSON in a single setting.
+        // Empty (no attach-body clause) leaves the reader with an empty
+        // sub-field map. Malformed JSON falls through to
+        // IllegalArgumentException, which the outer catch turns into a
+        // 500 for the caller; that is loud enough to surface a bad
+        // index setting without hiding the failure behind an empty map.
+        Map<String, LinkedHashMap<String, String>> multiFields = RestAttachAction.deserialiseMultiFields(
+            indexMetadata.getSettings().get("index.lance.multi_fields", "")
+        );
 
-            // Open a fresh Dataset for the reader: LanceDirectoryReader
-            // takes ownership of the Dataset and closes it in doClose.
-            // The node-scoped Lance Session cache makes the second
-            // open cheap. Any reader wrapper installed on IndexService
-            // (most importantly the security plugin's DLS/FLS wrapper)
-            // is applied before the searcher is built so document- and
-            // field-level filtering apply to fragment path hits the
-            // same way they apply to shard path hits.
+        // Fetch the IndexService reader wrapper once so both
+        // openWrappedReader and computeMatched see the same
+        // wrapper reference. A non-null wrapper here is the
+        // signal that DLS/FLS or a similar reader-level
+        // transform may filter documents; computeMatched uses
+        // that signal to route counts through the searcher
+        // instead of Lance-side metadata paths, which would
+        // bypass the wrapper and return the pre-DLS count.
+        CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper = resolveReaderWrapper(indexService);
+        boolean hasSecurityWrapper = readerWrapper != null;
+
+        // Open a fresh Dataset for the reader: LanceDirectoryReader
+        // takes ownership of the Dataset and closes it in doClose.
+        // The node-scoped Lance Session cache makes the second
+        // open cheap. Any reader wrapper installed on IndexService
+        // (most importantly the security plugin's DLS/FLS wrapper)
+        // is applied before the searcher is built so document- and
+        // field-level filtering apply to fragment path hits the
+        // same way they apply to shard path hits.
+        try (
+            Dataset readerDataset = LanceRegistry.openDataset(request.tableUri(), request.storageOptions(), pinnedVersion);
+            DirectoryReader dr = openWrappedReader(
+                shardId,
+                readerDataset,
+                pkField,
+                pkType,
+                multiFields,
+                effectiveFragmentIds,
+                // Push the coordinator-translated Lance SQL down
+                // to the leaf reader. When the top-level query is
+                // a scalar filter LanceKnnFilterTranslator can
+                // express (bool / term / terms / range / exists /
+                // match_all), request.filterSql() carries the SQL
+                // and every per-column Lance scan the leaf reader
+                // issues inside ensureXxxLoaded is layered with
+                // that filter, so `filter + terms agg` and
+                // `filter + sum` materialise only the matching
+                // rows of the aggregated column. FTS and knn
+                // queries have no SQL representation so filterSql
+                // is null there and the leaf reader runs
+                // unfiltered full-column scans.
+                request.filterSql(),
+                readerWrapper
+            )
+        ) {
+            MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
+                Integer.MAX_VALUE,
+                circuitBreakerService.getBreaker(CircuitBreaker.REQUEST)
+            );
+            SearchContextAggregations searchContextAggregations = new SearchContextAggregations(AggregatorFactories.EMPTY, bucketConsumer);
+
+            // Placeholder query for the LanceFragmentSearchContext ctor;
+            // resolveLuceneQuery() runs after we have the QueryShardContext.
+            Query placeholderQuery = MatchAllDocsQuery.INSTANCE;
+
             try (
-                Dataset readerDataset = LanceRegistry.openDataset(request.tableUri(), request.storageOptions(), pinnedVersion);
-                DirectoryReader dr = openWrappedReader(
-                    indexShard,
-                    readerDataset,
-                    pkField,
-                    pkType,
-                    multiFields,
-                    effectiveFragmentIds,
-                    // Push the coordinator-translated Lance SQL down
-                    // to the leaf reader. When the top-level query is
-                    // a scalar filter LanceKnnFilterTranslator can
-                    // express (bool / term / terms / range / exists /
-                    // match_all), request.filterSql() carries the SQL
-                    // and every per-column Lance scan the leaf reader
-                    // issues inside ensureXxxLoaded is layered with
-                    // that filter, so `filter + terms agg` and
-                    // `filter + sum` materialise only the matching
-                    // rows of the aggregated column. FTS and knn
-                    // queries have no SQL representation so filterSql
-                    // is null there and the leaf reader runs
-                    // unfiltered full-column scans.
-                    request.filterSql(),
-                    readerWrapper
+                LanceFragmentSearchContext searchContext = new LanceFragmentSearchContext(
+                    shardId,
+                    indexService.mapperService(),
+                    placeholderQuery,
+                    searchContextAggregations,
+                    bigArrays,
+                    indexService.cache().bitsetFilterCache(),
+                    clusterService.localNode().getId()
                 )
             ) {
-                MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
-                    Integer.MAX_VALUE,
-                    circuitBreakerService.getBreaker(CircuitBreaker.REQUEST)
-                );
-                SearchContextAggregations searchContextAggregations = new SearchContextAggregations(
-                    AggregatorFactories.EMPTY,
-                    bucketConsumer
-                );
+                ContextIndexSearcher searcher = new LanceFragmentIndexSearcher(dr, indexService.getIndexSettings(), searchContext);
+                searchContext.withSearcher(searcher);
+                QueryShardContext qsc = indexService.newQueryShardContext(0, searcher, System::currentTimeMillis, null);
+                searchContext.withQueryShardContext(qsc);
 
-                // Placeholder query for the LanceFragmentSearchContext ctor;
-                // resolveLuceneQuery() runs after we have the QueryShardContext.
-                Query placeholderQuery = MatchAllDocsQuery.INSTANCE;
+                Query query = resolveLuceneQuery(request, qsc, hasSecurityWrapper, indexMetadata);
+                Query hitsQuery = applyPostFilter(query, request, qsc);
+                // Match count runs through the same Weight as the
+                // hits phase when the query is a scoring Lucene
+                // query (FTS, knn), so strip any scan-limit hint
+                // from the query before handing it to
+                // computeMatched. Without this, an FTS Weight
+                // that was clipped to `size` rows during
+                // scanHitsViaIndexSearcher would also clip the
+                // count and hits.total.value would collapse to
+                // `size`.
+                Query countQuery = withoutScanLimit(hitsQuery);
+                SortAndFormats sortAndFormats = resolveSort(request, qsc);
 
-                try (
-                    LanceFragmentSearchContext searchContext = new LanceFragmentSearchContext(
-                        indexShard,
-                        placeholderQuery,
-                        searchContextAggregations,
-                        bigArrays,
-                        indexService.cache().bitsetFilterCache(),
-                        clusterService.localNode().getId()
-                    )
-                ) {
-                    ContextIndexSearcher searcher = buildSearcher(dr, indexShard, searchContext);
-                    searchContext.withSearcher(searcher);
-                    QueryShardContext qsc = indexService.newQueryShardContext(0, searcher, System::currentTimeMillis, null);
-                    searchContext.withQueryShardContext(qsc);
-
-                    Query query = resolveLuceneQuery(request, qsc, hasSecurityWrapper, indexMetadata);
-                    Query hitsQuery = applyPostFilter(query, request, qsc);
-                    // Match count runs through the same Weight as the
-                    // hits phase when the query is a scoring Lucene
-                    // query (FTS, knn), so strip any scan-limit hint
-                    // from the query before handing it to
-                    // computeMatched. Without this, an FTS Weight
-                    // that was clipped to `size` rows during
-                    // scanHitsViaIndexSearcher would also clip the
-                    // count and hits.total.value would collapse to
-                    // `size`.
-                    Query countQuery = withoutScanLimit(hitsQuery);
-                    org.opensearch.search.sort.SortAndFormats sortAndFormats = resolveSort(request, qsc);
-
-                    // Aggregations run over the top-level query only —
-                    // OpenSearch semantics for post_filter say the
-                    // filter applies to hits (and hits.total.value)
-                    // but not to aggregations. Hits and matched
-                    // therefore use the AND-combined query.
-                    //
-                    // Sorted scalar-filter pages take the Lance sort
-                    // pushdown when every clause translates to a
-                    // ColumnOrdering (see resolvePushdownOrderings):
-                    // Lance returns the top `size` rows already
-                    // ordered, so the hits phase never materialises
-                    // the sort column for every matching row. Every
-                    // other shape goes through the Lucene collector.
-                    List<org.lance.ipc.ColumnOrdering> pushdownOrderings = hasSecurityWrapper || sortAndFormats == null
-                        ? null
-                        : resolvePushdownOrderings(request, readerDataset.getSchema(), multiFields, sortAndFormats);
-                    List<SearchHit> hits;
-                    if (pushdownOrderings != null) {
-                        hits = scanSortedHitsViaLance(
-                            readerDataset,
-                            request,
-                            pushdownOrderings,
-                            sortAndFormats,
-                            searcher.getIndexReader(),
-                            effectiveFragmentIds
-                        );
-                    } else {
-                        hits = scanHitsViaIndexSearcher(
-                            searcher,
-                            hitsQuery,
-                            sortAndFormats,
-                            request.searchAfter(),
-                            request.size(),
-                            request.trackScores()
-                        );
-                    }
-                    InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query);
-                    long matched = computeMatched(dataset, request, searcher, countQuery, hasSecurityWrapper);
-                    return new LanceFragmentQueryResponse(matched, fragmentCount, hits, aggregations);
+                // Aggregations run over the top-level query only —
+                // OpenSearch semantics for post_filter say the
+                // filter applies to hits (and hits.total.value)
+                // but not to aggregations. Hits and matched
+                // therefore use the AND-combined query.
+                //
+                // Sorted scalar-filter pages take the Lance sort
+                // pushdown when every clause translates to a
+                // ColumnOrdering (see resolvePushdownOrderings):
+                // Lance returns the top `size` rows already
+                // ordered, so the hits phase never materialises
+                // the sort column for every matching row. Every
+                // other shape goes through the Lucene collector.
+                List<ColumnOrdering> pushdownOrderings = hasSecurityWrapper || sortAndFormats == null
+                    ? null
+                    : resolvePushdownOrderings(request, readerDataset.getSchema(), multiFields, sortAndFormats);
+                List<SearchHit> hits;
+                if (pushdownOrderings != null) {
+                    hits = scanSortedHitsViaLance(
+                        readerDataset,
+                        request,
+                        pushdownOrderings,
+                        sortAndFormats,
+                        searcher.getIndexReader(),
+                        effectiveFragmentIds
+                    );
+                } else {
+                    hits = scanHitsViaIndexSearcher(
+                        searcher,
+                        hitsQuery,
+                        sortAndFormats,
+                        request.searchAfter(),
+                        request.size(),
+                        request.trackScores()
+                    );
                 }
+                InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query);
+                long matched = computeMatched(dataset, request, searcher, countQuery, hasSecurityWrapper);
+                return new LanceFragmentQueryResponse(matched, fragmentCount, hits, aggregations);
             }
         }
     }
@@ -711,14 +822,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     /**
      * Translate the request's sort clauses (native
      * {@link org.opensearch.search.sort.SortBuilder} shape) into an
-     * OpenSearch {@link org.opensearch.search.sort.SortAndFormats}
+     * OpenSearch {@link SortAndFormats}
      * pair the shared searcher can pass to
      * {@link org.apache.lucene.search.IndexSearcher#search(Query, int, org.apache.lucene.search.Sort)}.
      * Returns {@code null} when the request has no sort — the
      * searcher then orders by score.
      */
-    private org.opensearch.search.sort.SortAndFormats resolveSort(LanceFragmentQueryRequest request, QueryShardContext qsc)
-        throws java.io.IOException {
+    private SortAndFormats resolveSort(LanceFragmentQueryRequest request, QueryShardContext qsc) throws java.io.IOException {
         if (request.sorts().isEmpty()) {
             return null;
         }
@@ -779,7 +889,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     private List<SearchHit> scanHitsViaIndexSearcher(
         ContextIndexSearcher searcher,
         Query query,
-        org.opensearch.search.sort.SortAndFormats sortAndFormats,
+        SortAndFormats sortAndFormats,
         Object[] searchAfter,
         int size,
         boolean trackScores
@@ -864,7 +974,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
 
     /**
      * Translate the request's sort clauses into Lance
-     * {@link org.lance.ipc.ColumnOrdering}s so the hits phase can run
+     * {@link ColumnOrdering}s so the hits phase can run
      * as a single ordered, limited Lance scan instead of a Lucene
      * {@code TopFieldCollector} over every matching row. Returns
      * {@code null} when the request cannot take that path, in which
@@ -901,11 +1011,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * wrapper is installed, because the Lance-side hits would bypass
      * DLS / FLS the same way a Lance-side count would.
      */
-    private static List<org.lance.ipc.ColumnOrdering> resolvePushdownOrderings(
+    private static List<ColumnOrdering> resolvePushdownOrderings(
         LanceFragmentQueryRequest request,
         org.apache.arrow.vector.types.pojo.Schema schema,
         java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
-        org.opensearch.search.sort.SortAndFormats sortAndFormats
+        SortAndFormats sortAndFormats
     ) {
         if (request.size() <= 0 || request.searchAfter() != null || request.postFilter() != null) {
             return null;
@@ -953,7 +1063,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (request.sorts().isEmpty()) {
             return null;
         }
-        List<org.lance.ipc.ColumnOrdering> orderings = new ArrayList<>(request.sorts().size());
+        List<ColumnOrdering> orderings = new ArrayList<>(request.sorts().size());
         for (org.opensearch.search.sort.SortBuilder<?> sort : request.sorts()) {
             if (!(sort instanceof org.opensearch.search.sort.FieldSortBuilder field)) {
                 return null;
@@ -980,7 +1090,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             if (column == null) {
                 return null;
             }
-            org.lance.ipc.ColumnOrdering.Builder builder = new org.lance.ipc.ColumnOrdering.Builder();
+            ColumnOrdering.Builder builder = new ColumnOrdering.Builder();
             builder.setColumnName(column);
             builder.setAscending(field.order() != org.opensearch.search.sort.SortOrder.DESC);
             builder.setNullFirst(nullFirst);
@@ -1063,8 +1173,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     private List<SearchHit> scanSortedHitsViaLance(
         Dataset dataset,
         LanceFragmentQueryRequest request,
-        List<org.lance.ipc.ColumnOrdering> orderings,
-        org.opensearch.search.sort.SortAndFormats sortAndFormats,
+        List<ColumnOrdering> orderings,
+        SortAndFormats sortAndFormats,
         org.apache.lucene.index.IndexReader reader,
         List<Integer> fragmentIds
     ) throws IOException {
@@ -1077,7 +1187,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             }
         }
         List<String> sortColumns = new ArrayList<>();
-        for (org.lance.ipc.ColumnOrdering ordering : orderings) {
+        for (ColumnOrdering ordering : orderings) {
             if (!sortColumns.contains(ordering.getColumnName())) {
                 sortColumns.add(ordering.getColumnName());
             }
@@ -1302,34 +1412,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
-     * Wrap the {@link DirectoryReader} in a {@link ContextIndexSearcher}
-     * bound to the caller's {@link LanceFragmentSearchContext} substitute.
-     * The Lance-backed reader has its own freshness tracking (see the
-     * LanceReaderManager comment in {@code LanceEngineFactory}) so
-     * Lucene's per-query cache is redundant.
-     */
-    private ContextIndexSearcher buildSearcher(DirectoryReader dr, IndexShard indexShard, LanceFragmentSearchContext searchContext)
-        throws java.io.IOException {
-        return new ContextIndexSearcher(
-            dr,
-            org.apache.lucene.search.IndexSearcher.getDefaultSimilarity(),
-            new org.opensearch.index.cache.query.DisabledQueryCache(indexShard.indexSettings()),
-            new org.apache.lucene.search.QueryCachingPolicy() {
-                @Override
-                public void onUse(Query query) {}
-
-                @Override
-                public boolean shouldCache(Query query) {
-                    return false;
-                }
-            },
-            false,
-            null,
-            searchContext
-        );
-    }
-
-    /**
      * Fetch the reader wrapper installed on the {@link IndexService}
      * via the package-private
      * {@code IndexService#getReaderWrapper()} accessor. Returns
@@ -1348,7 +1430,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * restricts the returned hits.
      */
     @SuppressWarnings("unchecked")
-    private CheckedFunction<DirectoryReader, DirectoryReader, IOException> resolveReaderWrapper(IndexService indexService)
+    static CheckedFunction<DirectoryReader, DirectoryReader, IOException> resolveReaderWrapper(IndexService indexService)
         throws IOException {
         try {
             return (CheckedFunction<DirectoryReader, DirectoryReader, IOException>) INDEX_SERVICE_GET_READER_WRAPPER.invoke(indexService);
@@ -1375,11 +1457,12 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * the shard id, and apply the {@code readerWrapper} the caller
      * fetched from {@link IndexService}.
      *
-     * <p>Lance-backed indexes are single-shard fixed, so the shard
-     * id is always {@code indexShard.shardId()} with shard number
-     * 0. This matches the shard path (see {@code
+     * <p>Lance-backed indexes are single-shard fixed, so
+     * {@code shardId} is always shard number 0 of the index. This
+     * matches the shard path (see {@code
      * LanceReadOnlyEngine.openLanceReader}) so wrapper behaviour is
-     * consistent across the two paths.
+     * consistent across the two paths, and it needs no local shard
+     * copy.
      *
      * <p>{@code readerWrapper} is the value returned by
      * {@link #resolveReaderWrapper}. Passing it in rather than
@@ -1399,10 +1482,10 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * clean up the partially-built chain here.
      */
     private DirectoryReader openWrappedReader(
-        IndexShard indexShard,
+        ShardId shardId,
         Dataset readerDataset,
         String pkField,
-        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
+        LancePrimaryKeyType pkType,
         java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
         List<Integer> effectiveFragmentIds,
         String filterSql,
@@ -1420,7 +1503,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         );
         OpenSearchDirectoryReader wrapped = null;
         try {
-            wrapped = OpenSearchDirectoryReader.wrap(lanceReader, indexShard.shardId());
+            wrapped = OpenSearchDirectoryReader.wrap(lanceReader, shardId);
             if (readerWrapper == null) {
                 return wrapped;
             }
