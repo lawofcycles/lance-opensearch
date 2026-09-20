@@ -21,6 +21,8 @@ import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceTableFactory;
+import org.opensearch.lance.NativeMemoryLimit;
+import org.opensearch.lance.NativeMemoryLimit.IndexCacheSizing;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceWarmCache;
@@ -37,7 +39,27 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 public class LanceStatsSerializationTests extends OpenSearchTestCase {
 
     private static LanceNodeStats sample() {
-        return new LanceNodeStats(true, 3, 1, 7L, 4L, 12L, 4096L, 65536L, 9, 30L, 5L, 2L, 1L, 5000L, 900L, 1_000_000);
+        return new LanceNodeStats(
+            true,
+            3,
+            1,
+            7L,
+            4L,
+            12L,
+            4096L,
+            65536L,
+            9,
+            30L,
+            5L,
+            2L,
+            1L,
+            5000L,
+            900L,
+            17_179_869_183L,
+            2,
+            8_589_934_591L,
+            1_000_000
+        );
     }
 
     public void testNodeStatsRoundTrip() throws Exception {
@@ -63,7 +85,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"snapshot_hit_count\":12},"
                     + "\"column_store\":{\"bytes\":4096,\"limit_bytes\":65536,\"entries\":9,\"hits\":30,\"loads\":5,\"evictions\":2,"
                     + "\"budget_misses\":1},"
-                    + "\"native_memory\":{\"estimated_bytes\":5000,\"session_bytes\":900,\"column_store_bytes\":4096},"
+                    + "\"native_memory\":{\"estimated_bytes\":5000,\"session_bytes\":900,\"column_store_bytes\":4096,"
+                    + "\"index_cache_capacity\":17179869183,\"index_cache_shards\":2,\"index_cache_shard_share\":8589934591},"
                     + "\"fts\":{\"subset_probe_limit\":1000000}}",
                 builder.toString()
             );
@@ -121,12 +144,15 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
     }
 
     public void testCollectorWithoutACacheReportsZeroCacheFigures() {
-        LanceNodeStats stats = new LanceStatsCollector(null, () -> 42L).collect();
+        LanceNodeStats stats = new LanceStatsCollector(null, () -> 42L, () -> null).collect();
         assertFalse(stats.cacheEnabled());
         assertEquals(0, stats.snapshotCount());
         assertEquals(0L, stats.columnStoreBytes());
         assertEquals(0L, stats.columnStoreLimitBytes());
         assertEquals(42L, stats.sessionBytes());
+        assertEquals(0L, stats.indexCacheCapacityBytes());
+        assertEquals(0, stats.indexCacheShards());
+        assertEquals(0L, stats.indexCacheShardShareBytes());
         assertEquals(LanceFtsQuery.subsetProbeLimit(), stats.ftsSubsetProbeLimit());
     }
 
@@ -136,12 +162,16 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
             LanceWarmCache cache = new LanceWarmCache(allocator, 1024L * 1024, 8, true)
         ) {
-            LanceStatsCollector collector = new LanceStatsCollector(cache, () -> 0L);
+            IndexCacheSizing sizing = NativeMemoryLimit.sizeIndexCache(19L << 30, 16);
+            LanceStatsCollector collector = new LanceStatsCollector(cache, () -> 0L, () -> sizing);
             LanceNodeStats empty = collector.collect();
             assertTrue(empty.cacheEnabled());
             assertEquals(0, empty.snapshotCount());
             assertEquals(0L, empty.snapshotBuildCount());
             assertEquals(1024L * 1024, empty.columnStoreLimitBytes());
+            assertEquals((16L << 30) - 1, empty.indexCacheCapacityBytes());
+            assertEquals(2, empty.indexCacheShards());
+            assertEquals((8L << 30) - 1, empty.indexCacheShardShareBytes());
 
             try (
                 LanceWarmCache.Lease lease = cache.acquire(

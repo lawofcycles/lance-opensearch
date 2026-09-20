@@ -46,6 +46,15 @@ public class LanceStatsIT extends LanceRestTestCase {
             assertTrue(nativeMemory.containsKey("estimated_bytes"));
             assertTrue(nativeMemory.containsKey("session_bytes"));
             assertEquals(columnStore(afterSurface).get("bytes"), nativeMemory.get("column_store_bytes"));
+            // The index cache sizing is fixed at startup: a positive
+            // capacity split into at least one shard, and the share is
+            // the capacity divided by the shard count.
+            long indexCacheCapacity = ((Number) nativeMemory.get("index_cache_capacity")).longValue();
+            int indexCacheShards = number(nativeMemory.get("index_cache_shards"));
+            long indexCacheShardShare = ((Number) nativeMemory.get("index_cache_shard_share")).longValue();
+            assertTrue("index cache capacity must be positive, saw " + indexCacheCapacity, indexCacheCapacity > 0L);
+            assertTrue("index cache shards must be at least 1, saw " + indexCacheShards, indexCacheShards >= 1);
+            assertEquals(indexCacheCapacity / indexCacheShards, indexCacheShardShare);
 
             // Shard path: _stats docs.count reads the engine's reader over
             // the snapshot (GET on this fixture is answered 404 before the
