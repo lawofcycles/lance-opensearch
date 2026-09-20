@@ -342,6 +342,11 @@ check.dependsOn spotlessCheck
 // (see repositoryDir in that plugin's build.gradle) and lets `gradle
 // clean` wipe leftovers.
 File sharedTablesDir = new File(project.buildDir, "shared-tables")
+// Snapshot ITs register an `fs` repository, and OpenSearch only accepts
+// repository locations under `path.repo`. Both test clusters get the
+// sibling of the shared tables directory; LanceRestTestCase.repoRoot()
+// derives the same path from tests.lance.shared_tables_dir.
+File sharedRepoDir = new File(project.buildDir, "shared-repo")
 
 integTest {
     systemProperty 'tests.security.manager', 'false'
@@ -374,6 +379,7 @@ testClusters.integTest {
     // fine for real deployments but wastes wall-clock time for tests that
     // register a table then assertBusy for the index to appear.
     setting 'lance.namespace.poll_cadence', '1s'
+    setting 'path.repo', sharedRepoDir.absolutePath
 }
 
 // Multi-node integTest: verifies the coordinator's fragment fan-out,
@@ -412,6 +418,7 @@ testClusters.multiNodeIntegTest {
     jvmArgs('--add-opens=java.base/java.nio=ALL-UNNAMED')
     systemProperty('arrow.allocation.manager.type', 'Unsafe')
     setting 'lance.namespace.poll_cadence', '1s'
+    setting 'path.repo', sharedRepoDir.absolutePath
 }
 
 check.dependsOn multiNodeIntegTest
