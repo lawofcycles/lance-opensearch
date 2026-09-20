@@ -7,6 +7,7 @@ package org.opensearch.lance.namespace;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -85,6 +86,11 @@ public final class LanceNamespaceService {
     // Index names we've already flagged as unowned, so the poll doesn't shout
     // the same warning every ten seconds. Cleared if the collision resolves.
     private final Set<String> warnedUnowned = ConcurrentHashMap.newKeySet();
+    // Lance-backed indexes found in cluster state whose table could not be
+    // opened when the poll tried to adopt them. Warned once per index; the
+    // entry is dropped as soon as a later poll adopts the index or the
+    // index leaves cluster state.
+    private final Set<String> warnedUnreachableAdopt = ConcurrentHashMap.newKeySet();
     // Track rename warnings so a table that renamed the same field is not
     // logged on every poll. Keyed by "indexName:fieldId:oldName->newName" so
     // the same rename fires once, but a later re-rename still warns.
@@ -196,6 +202,7 @@ public final class LanceNamespaceService {
                 servedVersions.remove(prevIndex);
                 attachedIndexes.remove(prevIndex);
                 warnedUnowned.remove(prevIndex);
+                warnedUnreachableAdopt.remove(prevIndex);
                 warnedRenamed.remove(prevIndex);
                 warnedWaitPolicy.remove(prevIndex);
                 LOG.info("recording resurface tombstone for deleted Lance-backed index {} (table {})", prevIndex, table);
@@ -284,7 +291,14 @@ public final class LanceNamespaceService {
         if (!clusterService.state().nodes().isLocalNodeElectedClusterManager()) {
             return;
         }
-        LanceNamespaceMetadata metadata = currentMetadata(clusterService.state());
+        ClusterState state = clusterService.state();
+        // The tracking maps live only in this node's memory, so any index
+        // that carries index.lance.table in cluster state but is missing
+        // from servedVersions has to be picked up again before the two
+        // sync loops below run; otherwise those loops would treat it as a
+        // name collision and skip it for good.
+        adoptUntrackedIndexes(state);
+        LanceNamespaceMetadata metadata = currentMetadata(state);
         for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
             DirectoryNamespace directory = directoryCache.get(entry.rootUri());
             if (directory == null) {
@@ -326,6 +340,124 @@ public final class LanceNamespaceService {
         runSyncCycle(table, tableName, storageOptions, null);
     }
 
+    /**
+     * How an index found in cluster state relates to the poll's tracking.
+     * {@link #NOT_LANCE} and {@link #PINNED} are left alone; the other two
+     * name the bookkeeping the index has to be restored into.
+     */
+    enum Adoption {
+        /** No {@code index.lance.table}: an ordinary OpenSearch index. */
+        NOT_LANCE,
+        /** {@code index.lance.version} is set: a readonly snapshot that never advances. */
+        PINNED,
+        /** The table sits directly under a registered namespace root and is named after the index. */
+        NAMESPACE,
+        /** Any other Lance-backed index: created through attach, or its namespace is no longer registered. */
+        ATTACH
+    }
+
+    /**
+     * Classify an index from its settings alone. A namespace-surfaced
+     * index has {@code index.lance.table} equal to
+     * {@code <root>/<indexName>.lance} for one of the registered
+     * {@code namespaceRoots}, because that is the path the surface
+     * step builds; everything else Lance-backed and unpinned is treated
+     * the way an attached index is.
+     */
+    static Adoption classifyForAdoption(String indexName, Settings settings, Set<String> namespaceRoots) {
+        String table = settings.get(LanceEngineFactory.TABLE_SETTING, "");
+        if (table.isEmpty()) {
+            return Adoption.NOT_LANCE;
+        }
+        if (settings.getAsLong(LanceEngineFactory.VERSION_SETTING, -1L) >= 0) {
+            return Adoption.PINNED;
+        }
+        for (String root : namespaceRoots) {
+            if (table.equals(root + "/" + indexName + ".lance")) {
+                return Adoption.NAMESPACE;
+            }
+        }
+        return Adoption.ATTACH;
+    }
+
+    /**
+     * Put every Lance-backed, unpinned index that cluster state knows
+     * about but {@link #servedVersions} does not back into the poll's
+     * bookkeeping. Cluster state keeps {@code index.lance.table},
+     * {@code index.lance.tag} and {@code index.lance.storage_options.*}
+     * across a snapshot restore, a full cluster restart and a manager
+     * failover, while the tracking maps are per node and start empty, so
+     * they are rebuilt from those settings here.
+     *
+     * <p>The table is opened once before adopting so an index whose table
+     * is unreachable is not handed to the sync loops, which would fail on
+     * it every cycle; it is warned about once and retried on the next
+     * poll. The served version is recorded as {@code -1}, below any real
+     * manifest version, so the first {@link #runSyncCycle} after adoption
+     * sees a move and re-derives the mapping and refreshes the reader
+     * exactly once. That refresh is wanted: the engine may have opened an
+     * older manifest than the one the table is at now.
+     */
+    private void adoptUntrackedIndexes(ClusterState state) {
+        Set<String> roots = new HashSet<>();
+        for (LanceNamespaceMetadata.Entry entry : currentMetadata(state).entries()) {
+            roots.add(entry.rootUri());
+        }
+        for (IndexMetadata indexMetadata : state.metadata().indices().values()) {
+            String indexName = indexMetadata.getIndex().getName();
+            if (servedVersions.containsKey(indexName)) {
+                continue;
+            }
+            // One index with unparseable settings must not keep the rest
+            // of the scan from running this cycle.
+            try {
+                adoptIfLanceBacked(indexName, indexMetadata.getSettings(), roots);
+            } catch (Exception e) {
+                LOG.warn("adoption scan failed for index {}", indexName, e);
+            }
+        }
+    }
+
+    private void adoptIfLanceBacked(String indexName, Settings settings, Set<String> roots) {
+        Adoption adoption = classifyForAdoption(indexName, settings, roots);
+        if (adoption == Adoption.NOT_LANCE || adoption == Adoption.PINNED) {
+            return;
+        }
+        String table = settings.get(LanceEngineFactory.TABLE_SETTING);
+        StorageOptions storageOptions = StorageOptions.fromIndexSettings(settings);
+        try (Dataset ignored = LanceRegistry.openDataset(table, storageOptions)) {
+            // Reachability probe only; the version is read by the
+            // sync cycle that follows.
+        } catch (Exception e) {
+            if (warnedUnreachableAdopt.add(indexName)) {
+                LOG.warn(
+                    "cannot adopt Lance-backed index {} into the poll: table {} is unreachable ({}); retrying on the next poll",
+                    indexName,
+                    table,
+                    e.getMessage()
+                );
+            }
+            return;
+        }
+        if (adoption == Adoption.ATTACH) {
+            String tag = settings.get(LanceEngineFactory.TAG_SETTING, "");
+            attachedIndexes.put(indexName, new AttachedIndex(table, storageOptions, tag.isEmpty() ? null : tag));
+        }
+        servedVersions.put(indexName, -1L);
+        // A restore can bring back an index under a name that was
+        // deleted within the resurface grace; the index is present
+        // again, so the tombstone no longer describes anything.
+        tombstones.remove(indexName);
+        warnedUnreachableAdopt.remove(indexName);
+        warnedUnowned.remove(indexName);
+        LOG.info(
+            "adopting Lance-backed index {} (table {}, source {}) into the poll",
+            indexName,
+            table,
+            adoption == Adoption.NAMESPACE ? "namespace" : "attach"
+        );
+    }
+
     // Attach-created indexes carry the fully-qualified table path already,
     // so the rootUri / tableName join namespace tables use doesn't apply.
     // Everything downstream of the path resolution is identical, except
@@ -361,18 +493,12 @@ public final class LanceNamespaceService {
             }
             Long served = servedVersions.get(indexName);
             if (served == null) {
-                // Two ways to get here: the index name already existed before we saw
-                // the table (a classic OpenSearch index or another namespace beat us
-                // to the name), or the cluster restarted and we have not been asked
-                // to re-register. Both are recoverable with operator action, so we
-                // log once per index instead of silently skipping every poll.
+                // The index name already existed before we saw the table: a
+                // classic OpenSearch index, or another namespace beat us to
+                // the name. Recoverable with operator action, so log once
+                // per index instead of silently skipping every poll.
                 if (warnedUnowned.add(indexName)) {
-                    LOG.warn(
-                        "skipping table {}: index {} exists but is not tracked by this namespace "
-                            + "(name collision or cluster restart without re-registration)",
-                        table,
-                        indexName
-                    );
+                    LOG.warn("skipping table {}: index {} exists but is not tracked by this namespace (name collision)", table, indexName);
                 }
                 return;
             }
@@ -390,6 +516,9 @@ public final class LanceNamespaceService {
             String rederivedMappingJson = null;
             try (Dataset latestDataset = LanceRegistry.openDataset(table, storageOptions)) {
                 long latest = latestDataset.version();
+                // An index adopted from cluster state serves -1 until this
+                // point, so its first cycle always counts as a move and
+                // refreshes the reader once.
                 if (tag == null) {
                     target = latest;
                     moved = target > served;
