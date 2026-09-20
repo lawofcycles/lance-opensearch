@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Locale;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -81,6 +82,21 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
             Path scratchDir = Files.createDirectories(base.resolve("lance-it-" + suffix));
             String tableName = "demo-" + suffix;
             LanceTableFactory.writeNullableTable(scratchDir, tableName);
+            return registerAndWait(scratchDir, "demo-" + suffix);
+        }
+
+        /**
+         * Same rows and indexes as {@link #setUp(int, String)} but written
+         * with {@code maxRowsPerFile} rows per fragment, so the surfaced
+         * index has several Lance fragments (see
+         * {@link LanceTableFactory#writeMultiFragmentTable}).
+         */
+        static LanceTestCluster setUpMultiFragment(int rowCount, int maxRowsPerFile, String testHint) throws Exception {
+            Path base = sharedRoot();
+            String suffix = testHint.toLowerCase(Locale.ROOT) + "-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+            Path scratchDir = Files.createDirectories(base.resolve("lance-it-" + suffix));
+            String tableName = "demo-" + suffix;
+            LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, rowCount, maxRowsPerFile);
             return registerAndWait(scratchDir, "demo-" + suffix);
         }
 
