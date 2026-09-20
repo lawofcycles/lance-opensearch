@@ -12,12 +12,14 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Function;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
@@ -42,13 +44,19 @@ import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.index.IndexService;
+import org.opensearch.index.query.AbstractQueryBuilder;
+import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
+import org.opensearch.index.query.Rewriteable;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.lance.query.LanceFtsQuery;
+import org.opensearch.lance.query.LanceFtsQueryBuilder;
+import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.aggregations.Aggregator;
@@ -356,7 +364,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     QueryShardContext qsc = indexService.newQueryShardContext(0, searcher, System::currentTimeMillis, null);
                     searchContext.withQueryShardContext(qsc);
 
-                    Query query = resolveLuceneQuery(request, qsc);
+                    Query query = resolveLuceneQuery(request, qsc, hasSecurityWrapper, indexMetadata);
                     Query hitsQuery = applyPostFilter(query, request, qsc);
                     // Match count runs through the same Weight as the
                     // hits phase when the query is a scoring Lucene
@@ -473,7 +481,16 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *       unmapped field). Runs through the local
      *       {@link QueryShardContext#toQuery} so per-node mapping
      *       decisions (Lance FTS field types, knn field types, etc.)
-     *       apply.</li>
+     *       apply. A {@code bool} whose only scoring clause is one
+     *       Lance FTS clause and whose {@code filter} / {@code
+     *       must_not} clauses all translate to Lance SQL is collapsed
+     *       into a single {@link LanceFtsQuery} carrying that SQL as
+     *       a prefilter (see {@link #resolveFtsPrefilterShape}), so
+     *       Lance evaluates the scalar predicate before the
+     *       inverted-index lookup instead of Lucene intersecting two
+     *       full scans. The collapse is skipped when a reader wrapper
+     *       is installed because DLS filters would not be part of the
+     *       Lance-side predicate.</li>
      *   <li>Otherwise: {@link MatchAllDocsQuery}.</li>
      * </ol>
      * The coordinator ships the QueryBuilder on every request and
@@ -481,7 +498,12 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * commonly set at once; filterSql wins because it is the
      * cheaper, already-validated form of the same predicate.
      */
-    private Query resolveLuceneQuery(LanceFragmentQueryRequest request, QueryShardContext qsc) throws java.io.IOException {
+    private Query resolveLuceneQuery(
+        LanceFragmentQueryRequest request,
+        QueryShardContext qsc,
+        boolean hasSecurityWrapper,
+        IndexMetadata indexMetadata
+    ) throws IOException {
         if (request.filterSql() != null) {
             return new LanceScanFilterQuery(request.filterSql(), resolveScanFilterTopK(request));
         }
@@ -497,7 +519,20 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // OpenSearch error handler surfaces as a 500. The shard
             // path does the same Rewriteable.rewrite call in
             // QueryShardContext.toQuery before invoking doToQuery.
-            org.opensearch.index.query.QueryBuilder rewritten = org.opensearch.index.query.Rewriteable.rewrite(request.query(), qsc, true);
+            QueryBuilder rewritten = Rewriteable.rewrite(request.query(), qsc, true);
+            int scanLimit = resolveScanFilterTopK(request);
+            if (!hasSecurityWrapper) {
+                FtsPrefilterShape shape = resolveFtsPrefilterShape(
+                    rewritten,
+                    TransportLanceCoordinatorAction.buildFieldTypeLookup(indexMetadata)
+                );
+                if (shape != null) {
+                    Query pushed = shape.toQuery(qsc, scanLimit);
+                    if (pushed != null) {
+                        return pushed;
+                    }
+                }
+            }
             Query base = rewritten.toQuery(qsc);
             // If the request shape allows top-k pushdown and the
             // resulting Lucene tree is a bare LanceFtsQuery (single
@@ -507,13 +542,117 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // FTS clause in a bool / boost / dis_max keep the
             // sentinel: mixing the top-k with other scorers would
             // clip the wrong side.
-            int scanLimit = resolveScanFilterTopK(request);
             if (scanLimit != LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED && base instanceof LanceFtsQuery fts) {
                 return fts.withScanLimit(scanLimit);
             }
             return base;
         }
         return MatchAllDocsQuery.INSTANCE;
+    }
+
+    /**
+     * A {@code bool} query whose scoring part is exactly one Lance FTS
+     * clause and whose remaining clauses are scalar predicates Lance
+     * can evaluate as an FTS prefilter.
+     *
+     * @param ftsClause the single {@code must} clause; implements
+     *     {@link LanceFtsQueryBuilder} and is also a
+     *     {@link QueryBuilder}
+     * @param prefilterSql Lance SQL for {@code filter} AND NOT
+     *     {@code must_not}, produced by
+     *     {@link LanceKnnFilterTranslator#toLanceSql(QueryBuilder, Function)}
+     */
+    record FtsPrefilterShape(QueryBuilder ftsClause, String prefilterSql) {
+
+        /**
+         * Build the Lucene query for the collapsed shape: the FTS
+         * clause's own {@link LanceFtsQuery} with {@code prefilterSql}
+         * attached. The clause's {@code boost} survives as the
+         * {@link BoostQuery} wrapper {@code AbstractQueryBuilder.toQuery}
+         * adds, and the scan limit is applied only to the bare
+         * {@link LanceFtsQuery} form, matching what
+         * {@code resolveLuceneQuery} does for a top-level FTS clause.
+         * Returns {@code null} when the clause produced something else,
+         * in which case the caller falls back to the plain Lucene
+         * tree.
+         */
+        Query toQuery(QueryShardContext qsc, int scanLimit) throws IOException {
+            Query clause = ftsClause.toQuery(qsc);
+            if (clause instanceof LanceFtsQuery fts) {
+                LanceFtsQuery pushed = fts.withPrefilterSql(prefilterSql);
+                return scanLimit == LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED ? pushed : pushed.withScanLimit(scanLimit);
+            }
+            if (clause instanceof BoostQuery boosted && boosted.getQuery() instanceof LanceFtsQuery fts) {
+                return new BoostQuery(fts.withPrefilterSql(prefilterSql), boosted.getBoost());
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Decide whether {@code query} is a {@code bool} whose scalar
+     * clauses can be pushed into the Lance FTS scan as a prefilter,
+     * and produce the SQL if so. Returns {@code null} for every other
+     * shape, which the caller then translates to the ordinary Lucene
+     * tree with no change in behaviour.
+     *
+     * <p>Accepted shape, checked on the rewritten builder:
+     * <ul>
+     *   <li>{@link BoolQueryBuilder} with boost {@code 1.0} and no
+     *       {@code minimum_should_match}; a bool boost would scale
+     *       the FTS scores and is left to Lucene.</li>
+     *   <li>Exactly one {@code must} clause and it implements
+     *       {@link LanceFtsQueryBuilder} ({@code lance_match},
+     *       {@code lance_match_phrase}, {@code lance_multi_match},
+     *       {@code lance_fts_bool}, {@code lance_fts_boost}).</li>
+     *   <li>No {@code should} clause: OR semantics with the FTS
+     *       clause cannot be expressed as a prefilter.</li>
+     *   <li>At least one {@code filter} or {@code must_not} clause,
+     *       and every one of them translates through
+     *       {@link LanceKnnFilterTranslator#toLanceSql(QueryBuilder, Function)}
+     *       without naming a field {@code fieldTypeLookup} reports as
+     *       unmapped. A {@code match} or a dotted multi-field path in
+     *       any of them keeps the whole bool on Lucene.</li>
+     * </ul>
+     * The scalar clauses are wrapped in a synthetic bool ({@code filter}
+     * and {@code must_not} only) and translated as one expression, so
+     * the SQL is the translator's own {@code (f1 AND f2 AND NOT (m1))}
+     * form. The rewritten bool is used rather than the raw request so
+     * that a clause the rewrite folded to match_none has already
+     * turned the whole bool into a non-bool builder.
+     */
+    static FtsPrefilterShape resolveFtsPrefilterShape(QueryBuilder query, Function<String, String> fieldTypeLookup) {
+        if (!(query instanceof BoolQueryBuilder bool)) {
+            return null;
+        }
+        if (bool.boost() != AbstractQueryBuilder.DEFAULT_BOOST || bool.minimumShouldMatch() != null) {
+            return null;
+        }
+        if (bool.must().size() != 1 || !bool.should().isEmpty()) {
+            return null;
+        }
+        QueryBuilder must = bool.must().get(0);
+        if (!(must instanceof LanceFtsQueryBuilder)) {
+            return null;
+        }
+        if (bool.filter().isEmpty() && bool.mustNot().isEmpty()) {
+            return null;
+        }
+        BoolQueryBuilder scalar = new BoolQueryBuilder();
+        for (QueryBuilder clause : bool.filter()) {
+            scalar.filter(clause);
+        }
+        for (QueryBuilder clause : bool.mustNot()) {
+            scalar.mustNot(clause);
+        }
+        if (LanceKnnFilterTranslator.hasUnmappedField(scalar, fieldTypeLookup)) {
+            return null;
+        }
+        try {
+            return new FtsPrefilterShape(must, LanceKnnFilterTranslator.toLanceSql(scalar, fieldTypeLookup));
+        } catch (IllegalArgumentException outsideTranslator) {
+            return null;
+        }
     }
 
     /**
@@ -1418,7 +1557,10 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // when we do not ask it for row addresses or scores;
             // pylance measures this at low milliseconds independent of
             // hit count, versus seconds for the Weight-based path on a
-            // 20M-row table with 500k hits.
+            // 20M-row table with 500k hits. A collapsed bool query
+            // arrives here as the same LanceFtsQuery carrying its
+            // scalar clauses as prefilterSql, which the count scan
+            // applies too.
             return countFtsHitsDirectly(dataset, fts, fragmentIds);
         }
         if (hasScoringQuery || hasPostFilter) {
@@ -1502,12 +1644,20 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * {@code Dataset.countRows(sql)} branch below). See
      * {@link LanceFtsQuery#restrictToFragmentsUnlessAll} for why the
      * restriction is skipped when it would not change the row set.
+     *
+     * <p>A prefilter carried by {@code fts} (the scalar clauses of a
+     * collapsed bool query) is passed the same way the hits scan
+     * passes it, so the count covers exactly the rows the hits phase
+     * can return.
      */
     private long countFtsHitsDirectly(Dataset dataset, LanceFtsQuery fts, List<Integer> fragmentIds) throws Exception {
         org.lance.ipc.ScanOptions.Builder builder = new org.lance.ipc.ScanOptions.Builder().fullTextQuery(fts.fullTextQuery())
             .columns(Collections.emptyList())
             .withRowAddress(false)
             .withRowId(false);
+        if (fts.prefilterSql() != null) {
+            builder = builder.filter(fts.prefilterSql()).prefilter(true);
+        }
         if (fragmentIds != null) {
             builder = LanceFtsQuery.restrictToFragmentsUnlessAll(builder, fragmentIds, dataset);
         }

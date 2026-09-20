@@ -593,9 +593,14 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * the OpenSearch field name; the {@code type} field on each
      * entry is what we need. Nested objects are not surfaced yet,
      * so this shallow walk covers today's mappings.
+     *
+     * <p>Package-private so the per-node executor can build the same
+     * lookup from its own copy of the index metadata when it decides
+     * whether a bool query's scalar clauses can travel to Lance as an
+     * FTS prefilter.
      */
     @SuppressWarnings("unchecked")
-    private static java.util.function.Function<String, String> buildFieldTypeLookup(IndexMetadata indexMetadata) {
+    static java.util.function.Function<String, String> buildFieldTypeLookup(IndexMetadata indexMetadata) {
         org.opensearch.cluster.metadata.MappingMetadata mapping = indexMetadata.mapping();
         if (mapping == null) {
             return LanceKnnFilterTranslator.NO_MAPPING;
