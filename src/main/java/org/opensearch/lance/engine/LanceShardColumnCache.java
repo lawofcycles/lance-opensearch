@@ -6,6 +6,7 @@
 package org.opensearch.lance.engine;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -19,6 +20,8 @@ import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.util.FixedBitSet;
 import org.lance.Dataset;
 import org.lance.ipc.LanceScanner;
@@ -57,9 +60,22 @@ import org.lance.ipc.ScanOptions;
  */
 public final class LanceShardColumnCache {
 
+    private static final Logger LOGGER = LogManager.getLogger(LanceShardColumnCache.class);
+
     private final Dataset dataset;
     private final String filterSql;
     private final Map<Integer, LanceFragmentLeafReader> leavesByFragmentId;
+    /**
+     * Off-heap column store of the node's {@link LanceWarmCache} and the
+     * snapshot key the leaves belong to, or {@code null} when the reader
+     * was opened outside the cache (shard path, cache disabled, tests).
+     * When present, numeric and boolean loads go to the store first and
+     * only fall back to the heap arrays when the store has no room.
+     */
+    private final ColumnStore columnStore;
+    private final LanceWarmCache.SnapshotKey snapshotKey;
+    /** Columns pinned in the store on behalf of this reader's leaves; unpinned by {@link #releasePins}. */
+    private final List<CachedColumn> pinned = Collections.synchronizedList(new ArrayList<>());
     private final Map<String, Object> columnLocks = new ConcurrentHashMap<>();
     private final Map<String, Boolean> loadedNumericColumns = new ConcurrentHashMap<>();
     private final Map<String, Boolean> loadedBooleanColumns = new ConcurrentHashMap<>();
@@ -67,30 +83,133 @@ public final class LanceShardColumnCache {
     private final Map<String, Boolean> loadedKeywordArrayColumns = new ConcurrentHashMap<>();
 
     /**
+     * Build a cache scoped to {@code leaves} against {@code dataset}
+     * without an off-heap store: every column loads into the leaves'
+     * heap arrays.
+     */
+    LanceShardColumnCache(Dataset dataset, String filterSql, List<LanceFragmentLeafReader> leaves) {
+        this(dataset, filterSql, leaves, null, null);
+    }
+
+    /**
      * Build a cache scoped to {@code leaves} against {@code dataset}.
      * The list is copied into a fragment-id map so per-leaf lookups
      * during scan iteration are constant time.
      *
-     * @param dataset   the shared Lance dataset the reader was opened
-     *                  against; every scan in the cache is issued
-     *                  against this same handle.
-     * @param filterSql top-level filter to layer into every column
-     *                  scan (currently the same value the leaves use
-     *                  in their own {@code singleColumnScan}); may
-     *                  be {@code null} when the reader was opened
-     *                  without a top-level filter push-down.
-     * @param leaves    the {@link LanceFragmentLeafReader}s attached
-     *                  to the reader, one per fragment in the
-     *                  reader's subset.
+     * @param dataset     the shared Lance dataset the reader was opened
+     *                    against; every scan in the cache is issued
+     *                    against this same handle.
+     * @param filterSql   top-level filter to layer into every heap column
+     *                    scan (the same value the leaves use in their own
+     *                    {@code singleColumnScan}); may be {@code null}
+     *                    when the reader was opened without a top-level
+     *                    filter push-down. Never applied to store loads.
+     * @param leaves      the {@link LanceFragmentLeafReader}s attached
+     *                    to the reader, one per fragment in the
+     *                    reader's subset.
+     * @param columnStore off-heap store to serve numeric and boolean
+     *                    columns from, or {@code null}
+     * @param snapshotKey key of the snapshot the leaves read, required
+     *                    when {@code columnStore} is set
      */
-    LanceShardColumnCache(Dataset dataset, String filterSql, List<LanceFragmentLeafReader> leaves) {
+    LanceShardColumnCache(
+        Dataset dataset,
+        String filterSql,
+        List<LanceFragmentLeafReader> leaves,
+        ColumnStore columnStore,
+        LanceWarmCache.SnapshotKey snapshotKey
+    ) {
         this.dataset = dataset;
         this.filterSql = filterSql;
+        this.columnStore = columnStore;
+        this.snapshotKey = snapshotKey;
         Map<Integer, LanceFragmentLeafReader> byId = new HashMap<>(leaves.size() * 2);
         for (LanceFragmentLeafReader leaf : leaves) {
             byId.put(leaf.fragmentId(), leaf);
         }
         this.leavesByFragmentId = Collections.unmodifiableMap(byId);
+    }
+
+    /**
+     * Serve {@code name} to every leaf from the off-heap store, loading
+     * the fragments the store does not hold yet in one scan. Returns
+     * {@code false} when there is no store or the store has no room, in
+     * which case the caller loads into heap.
+     */
+    private boolean publishFromStore(String name, boolean isBoolean) throws IOException {
+        if (columnStore == null) {
+            return false;
+        }
+        Map<Integer, Integer> fragmentRows = new HashMap<>(leavesByFragmentId.size() * 2);
+        for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
+            fragmentRows.put(leaf.fragmentId(), leaf.maxDoc());
+        }
+        Map<Integer, CachedColumn> columns = columnStore.acquire(snapshotKey, dataset, name, isBoolean, fragmentRows);
+        if (columns == null) {
+            LOGGER.debug(
+                "column cache budget exhausted; loading [{}] of {} into heap for this request ({} fragments)",
+                name,
+                snapshotKey,
+                fragmentRows.size()
+            );
+            return false;
+        }
+        pinned.addAll(columns.values());
+        for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
+            leaf.publishOffHeapColumn(name, columns.get(leaf.fragmentId()));
+        }
+        return true;
+    }
+
+    /**
+     * Serve {@code name} to {@code leaf} alone from the off-heap store,
+     * scanning that one fragment when the store does not hold it. Used
+     * by a doc values instance that leaves its sparse hint for a doc
+     * outside it: the fallback should cost one fragment, not one scan of
+     * every fragment in the reader. Returns {@code false} when there is
+     * no store or no room, in which case the leaf loads its fragment into
+     * heap.
+     */
+    boolean publishFromStoreForLeaf(LanceFragmentLeafReader leaf, String name, boolean isBoolean) throws IOException {
+        if (columnStore == null) {
+            return false;
+        }
+        Map<Integer, CachedColumn> columns = columnStore.acquire(
+            snapshotKey,
+            dataset,
+            name,
+            isBoolean,
+            Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc())
+        );
+        if (columns == null) {
+            LOGGER.debug(
+                "column cache budget exhausted; loading [{}] of {} fragment {} into heap for this request",
+                name,
+                snapshotKey,
+                leaf.fragmentId()
+            );
+            return false;
+        }
+        pinned.addAll(columns.values());
+        leaf.publishOffHeapColumn(name, columns.get(leaf.fragmentId()));
+        return true;
+    }
+
+    /**
+     * Unpin every store column this reader's leaves were served. Called
+     * once from {@link LanceDirectoryReader#doClose}; the store may evict
+     * the columns afterwards.
+     */
+    void releasePins() {
+        if (columnStore == null) {
+            return;
+        }
+        List<CachedColumn> toRelease;
+        synchronized (pinned) {
+            toRelease = new ArrayList<>(pinned);
+            pinned.clear();
+        }
+        columnStore.unpin(toRelease);
     }
 
     /**
@@ -120,6 +239,10 @@ public final class LanceShardColumnCache {
         Object lock = columnLocks.computeIfAbsent(name, k -> new Object());
         synchronized (lock) {
             if (loadedNumericColumns.containsKey(name)) {
+                return;
+            }
+            if (publishFromStore(name, false)) {
+                loadedNumericColumns.put(name, Boolean.TRUE);
                 return;
             }
             Map<Integer, long[]> valuesByFragment = new HashMap<>(leavesByFragmentId.size() * 2);
@@ -184,6 +307,10 @@ public final class LanceShardColumnCache {
         Object lock = columnLocks.computeIfAbsent(name, k -> new Object());
         synchronized (lock) {
             if (loadedBooleanColumns.containsKey(name)) {
+                return;
+            }
+            if (publishFromStore(name, true)) {
+                loadedBooleanColumns.put(name, Boolean.TRUE);
                 return;
             }
             Map<Integer, long[]> valuesByFragment = new HashMap<>(leavesByFragmentId.size() * 2);
