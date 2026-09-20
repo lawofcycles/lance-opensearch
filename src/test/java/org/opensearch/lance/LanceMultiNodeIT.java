@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Stream;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -89,14 +90,12 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     public void testFtsAcrossFragmentsOnThreeNodeCluster() throws Exception {
-        // 12 rows written 4 per file give fragments 0, 1 and 2. Attach
-        // expands a shard copy to every data node, so depending on how
-        // far recovery has progressed when a request arrives the
-        // coordinator sends all three fragments to one node (FTS scan
-        // without a fragmentIds restriction) or one fragment to each
-        // (FTS scan carrying its subset). The hits, their per-fragment
-        // _id layout and _count must match what the single-node
-        // LanceFtsQueryIT asserts for the same table in both cases.
+        // 12 rows written 4 per file give fragments 0, 1 and 2. The
+        // coordinator sends one fragment to each of the three data
+        // nodes (only one of which holds the shard copy), so every FTS
+        // scan carries its fragment subset. The hits, their
+        // per-fragment _id layout and _count must match what the
+        // single-node LanceFtsQueryIT asserts for the same table.
         String suffix = "mn-fts-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -140,19 +139,19 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
-     * With a shard copy on every data node the coordinator hands each
-     * fragment to a different node and has to merge three sorted (or
-     * scored) lists. Attach creates the index with
-     * {@code auto_expand_replicas: 0-all}, so the single-host baseline
-     * is obtained by switching the expansion off and dropping the
-     * replicas (one node answers, no merge); the same requests are
-     * then rerun with the expansion restored and a copy on all three
-     * nodes. Ids, sort values, totals and buckets must not change.
-     * The fixture interleaves ids across fragments so a merge that
-     * only concatenated per-node lists would reorder every page.
+     * The coordinator hands each fragment to a different data node
+     * whether or not that node holds a shard copy, and merges three
+     * sorted (or scored) lists. The index keeps the default
+     * {@code number_of_replicas: 0}, so exactly one node has an
+     * {@code IndexService} and the other two build a temporary one
+     * from cluster state per request. The expected ids, sort values,
+     * totals and buckets are the values a single node returns for
+     * this fixture ({@code LanceTableFactory.writeInterleavedTable}
+     * interleaves ids across fragments, so a merge that only
+     * concatenated per-node lists would reorder every page).
      */
-    public void testFanOutAcrossReplicaHostsMatchesSingleHost() throws Exception {
-        String suffix = "mn-merge-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+    public void testFanOutAcrossAllDataNodesWithoutShardCopies() throws Exception {
+        String suffix = "mn-noshard-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         int fragments = 3;
@@ -167,59 +166,96 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "{\"from\":2,\"size\":3,\"sort\":[{\"id\":\"asc\"}]}",
             "{\"size\":0,\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}}}}" };
         try {
+            // Surface the executor's per-request IndexService timing in
+            // the cluster log so the cost of the temporary IndexService
+            // can be read from build/testclusters/*/logs.
+            updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
-            client().performRequest(
-                new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&wait_for_active_shards=3&timeout=60s")
-            );
-            assertEquals("attach expands to every data node", 3, activeShards(indexName));
-
-            Request collapse = new Request("PUT", "/" + indexName + "/_settings");
-            collapse.setJsonEntity("{\"index.auto_expand_replicas\":\"false\",\"index.number_of_replicas\":0}");
-            assertEquals(RestStatus.OK.getStatus(), client().performRequest(collapse).getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
-            assertBusy(() -> assertEquals(1, activeShards(indexName)));
+            assertEquals("attach keeps a single shard copy", 1, activeShards(indexName));
+            String settingsBody = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
+            assertFalse("attach must not expand replicas: " + settingsBody, settingsBody.contains("auto_expand_replicas"));
+            assertTrue("attach keeps number_of_replicas 0: " + settingsBody, settingsBody.contains("\"number_of_replicas\":\"0\""));
 
-            List<Map<String, Object>> single = new ArrayList<>();
+            List<Map<String, Object>> responses = new ArrayList<>();
             for (String request : requests) {
-                single.add(parse(readAll(postJson("/" + indexName + "/_search", request))));
+                responses.add(parse(readAll(postJson("/" + indexName + "/_search", request))));
             }
-            // Sanity on the single-host baseline before comparing.
-            assertEquals(List.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9), sourceIds(single.get(0)));
-            assertEquals(List.of(11, 10, 9, 8, 7), sourceIds(single.get(1)));
+            assertEquals(List.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9), sourceIds(responses.get(0)));
+            assertEquals(List.of(11, 10, 9, 8, 7), sourceIds(responses.get(1)));
             // BM25 grows with the term frequency, which is id + 1.
-            assertEquals(List.of(11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0), sourceIds(single.get(2)));
-            assertEquals(List.of(2, 3, 4), sourceIds(single.get(3)));
-            assertEquals(3, buckets(single.get(4)).size());
-            for (Map<String, Object> response : single) {
+            assertEquals(List.of(11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0), sourceIds(responses.get(2)));
+            assertEquals(List.of(2, 3, 4), sourceIds(responses.get(3)));
+            assertEquals(3, buckets(responses.get(4)).size());
+            for (Map<String, Object> response : responses) {
                 assertEquals(fragments * rowsPerFragment, extractIntPath(response, "hits", "total", "value"));
             }
-
-            Request expand = new Request("PUT", "/" + indexName + "/_settings");
-            expand.setJsonEntity("{\"index.auto_expand_replicas\":\"0-all\"}");
-            assertEquals(RestStatus.OK.getStatus(), client().performRequest(expand).getStatusLine().getStatusCode());
-            client().performRequest(
-                new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&wait_for_active_shards=3&timeout=60s")
-            );
-            assertEquals(3, activeShards(indexName));
-
-            for (int i = 0; i < requests.length; i++) {
-                Map<String, Object> multi = parse(readAll(postJson("/" + indexName + "/_search", requests[i])));
-                Map<String, Object> expected = single.get(i);
-                String label = "request " + requests[i];
-                assertEquals(label, sourceIds(expected), sourceIds(multi));
-                assertEquals(label, sortValues(expected), sortValues(multi));
-                assertEquals(label, extractIntPath(expected, "hits", "total", "value"), extractIntPath(multi, "hits", "total", "value"));
-                assertEquals(label, expected.get("aggregations"), multi.get("aggregations"));
+            // Sort values travel with the hits through the merge.
+            List<Object> idSortValues = sortValues(responses.get(0));
+            for (int i = 0; i < idSortValues.size(); i++) {
+                assertEquals(List.of(i), idSortValues.get(i));
             }
+            // Every category bucket is a full merge of the three
+            // per-node partials: 12 rows over 3 categories.
+            long bucketDocs = 0;
+            for (Map<String, Object> bucket : buckets(responses.get(4))) {
+                bucketDocs += ((Number) bucket.get("doc_count")).longValue();
+            }
+            assertEquals(fragments * rowsPerFragment, bucketDocs);
             // The scored request must come back in strictly descending
             // score order after the merge; every row has a distinct
             // term frequency so no two scores tie.
-            List<Double> scores = scores(parse(readAll(postJson("/" + indexName + "/_search", requests[2]))));
+            List<Double> scores = scores(responses.get(2));
             for (int i = 1; i < scores.size(); i++) {
                 assertTrue("scores not descending: " + scores, scores.get(i - 1) > scores.get(i));
             }
+            // The same shapes answer identically on repeat, so the
+            // temporary IndexService leaves nothing behind that changes
+            // the next request.
+            for (int i = 0; i < requests.length; i++) {
+                Map<String, Object> again = parse(readAll(postJson("/" + indexName + "/_search", requests[i])));
+                assertEquals(requests[i], sourceIds(responses.get(i)), sourceIds(again));
+                assertEquals(requests[i], responses.get(i).get("aggregations"), again.get("aggregations"));
+            }
+            // Matching results would also hold if every fragment ran on
+            // the one node that holds the shard, so read the cluster
+            // logs: the coordinator names the node of each fragment
+            // assignment, and a node that had to build a temporary
+            // IndexService logs that it did. With one fragment per data
+            // node every data node must appear in the fan-out, and every
+            // data node except the single shard host must have built a
+            // temporary IndexService.
+            int dataNodes = dataNodeCount();
+            assertEquals("fixture assumes one fragment per data node", fragments, dataNodes);
+            assertBusy(() -> {
+                Set<String> fanOutNodes = new HashSet<>();
+                Set<String> temporaryIndexServiceNodes = new HashSet<>();
+                for (String line : clusterLogLines()) {
+                    if (!line.contains("[" + indexName + "]")) {
+                        continue;
+                    }
+                    int at = line.indexOf(" to node [");
+                    if (line.contains("lance.dispatch: fan-out index") && at >= 0) {
+                        int close = line.indexOf(']', at + " to node [".length());
+                        fanOutNodes.add(line.substring(at + " to node [".length(), close));
+                    }
+                    if (line.contains("lance.dispatch: temporary IndexService for")) {
+                        temporaryIndexServiceNodes.add(loggingNodeName(line));
+                    }
+                }
+                assertEquals("fragments went to " + fanOutNodes, dataNodes, fanOutNodes.size());
+                assertEquals(
+                    "temporary IndexService built on " + temporaryIndexServiceNodes,
+                    dataNodes - 1,
+                    temporaryIndexServiceNodes.size()
+                );
+            });
         } finally {
+            try {
+                updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", null);
+            } catch (Exception ignored) {}
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
@@ -256,6 +292,47 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    /** Number of data nodes in the cluster, from {@code GET /_nodes/data:true}. */
+    private static int dataNodeCount() throws IOException {
+        return extractIntPath(readAll(client().performRequest(new Request("GET", "/_nodes/data:true"))), "_nodes", "total");
+    }
+
+    /**
+     * The node name of a log line, which log4j prints in the fourth
+     * bracket: {@code [time][level][logger] [node] message}.
+     */
+    private static String loggingNodeName(String line) {
+        int open = -1;
+        for (int i = 0; i < 4; i++) {
+            open = line.indexOf('[', open + 1);
+            assertTrue("unexpected log line shape: " + line, open >= 0);
+        }
+        int close = line.indexOf(']', open);
+        assertTrue("unexpected log line shape: " + line, close > open);
+        return line.substring(open + 1, close);
+    }
+
+    /**
+     * Every line of every node log under the test clusters directory
+     * the build passes in {@code tests.lance.cluster_logs_dir}. The
+     * testclusters plugin keeps one {@code <task>-<n>/logs/<task>.log}
+     * per node.
+     */
+    private static List<String> clusterLogLines() throws IOException {
+        String property = System.getProperty("tests.lance.cluster_logs_dir");
+        assertNotNull("tests.lance.cluster_logs_dir must be set by the Gradle build", property);
+        List<String> lines = new ArrayList<>();
+        try (Stream<Path> files = Files.walk(Path.of(property))) {
+            for (Path file : files.filter(Files::isRegularFile).toList()) {
+                if (!file.toString().endsWith(".log") || !file.getParent().getFileName().toString().equals("logs")) {
+                    continue;
+                }
+                lines.addAll(Files.readAllLines(file, StandardCharsets.UTF_8));
+            }
+        }
+        return lines;
+    }
+
     private static Response postJson(String path, String body) throws IOException {
         Request request = new Request("POST", path);
         request.setJsonEntity(body);
@@ -270,7 +347,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
     private static void updateClusterSetting(String key, String value) throws IOException {
         Request request = new Request("PUT", "/_cluster/settings");
-        request.setJsonEntity("{\"transient\":{\"" + key + "\":\"" + value + "\"}}");
+        String encoded = value == null ? "null" : "\"" + value + "\"";
+        request.setJsonEntity("{\"transient\":{\"" + key + "\":" + encoded + "}}");
         Response response = client().performRequest(request);
         assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
     }
