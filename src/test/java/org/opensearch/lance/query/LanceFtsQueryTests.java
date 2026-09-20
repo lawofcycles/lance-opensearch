@@ -106,6 +106,34 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
         assertEquals(a, b);
     }
 
+    public void testPrefilterSqlParticipatesInEqualsHashCodeAndToString() {
+        LanceFtsQuery plain = new LanceFtsQuery("body", "camera");
+        LanceFtsQuery filtered = plain.withPrefilterSql("rating = 5");
+        LanceFtsQuery filteredAgain = new LanceFtsQuery(FullTextQuery.match("camera", "body"), Set.of("body"), 0, "rating = 5");
+
+        assertNotEquals(plain, filtered);
+        assertNotEquals(plain.hashCode(), filtered.hashCode());
+        assertEquals(filtered, filteredAgain);
+        assertEquals(filtered.hashCode(), filteredAgain.hashCode());
+        assertNotEquals(filtered, plain.withPrefilterSql("rating = 4"));
+
+        assertNull(plain.prefilterSql());
+        assertEquals("rating = 5", filtered.prefilterSql());
+        assertSame("same prefilter returns the same instance", filtered, filtered.withPrefilterSql("rating = 5"));
+        assertEquals("null removes the prefilter", plain, filtered.withPrefilterSql(null));
+
+        // The scan limit copy keeps the prefilter, so the count-path
+        // copy (withScanLimit(UNBOUNDED)) still filters the same rows.
+        LanceFtsQuery limited = filtered.withScanLimit(10);
+        assertEquals("rating = 5", limited.prefilterSql());
+        assertEquals(10, limited.scanLimit());
+        assertEquals(filtered, limited.withScanLimit(LanceFtsQuery.SCAN_LIMIT_UNBOUNDED));
+
+        String text = filtered.toString("body");
+        assertTrue("toString should mention the prefilter, saw: " + text, text.contains("rating = 5"));
+        assertFalse(plain.toString("body").contains("prefilter"));
+    }
+
     public void testDirectFullTextQueryConstructorAndColumnsCollection() {
         // A LanceFtsQuery built from a MatchQuery with fuzziness must not
         // compare equal to one without it, because the parameter change
@@ -230,6 +258,55 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
             List<Integer> subset = List.of(all.get(0), all.get(2));
             Map<Integer, Integer> restricted = hitsByFragment(dataset, subset);
             assertEquals("restricted scan must not return rows of the excluded fragment", Map.of(all.get(0), 2, all.get(2), 2), restricted);
+        }
+    }
+
+    public void testFtsScanWithSqlPrefilterReturnsOnlyRowsPassingThePredicate() throws Exception {
+        // The ScanOptions shape ensureShardScan builds for a collapsed
+        // bool query: fullTextQuery + filter(sql) + prefilter(true) +
+        // row address + limit. "hello" sits in the even rows; the
+        // predicate keeps rows 4..11, so fragments 1 and 2 answer two
+        // rows each and fragment 0 answers none. The count-only shape
+        // (no columns, no row address) must agree on the total.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeMultiFragmentTable(scratchDir, "prefilter-scan", 12, 4);
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            List<Integer> all = fragmentIdsOf(dataset);
+            assertEquals(3, all.size());
+
+            ScanOptions hitsOptions = new ScanOptions.Builder().fullTextQuery(FullTextQuery.match("hello", "body"))
+                .filter("(id >= 4 AND NOT (id = 6))")
+                .prefilter(true)
+                .withRowAddress(true)
+                .limit(100L)
+                .build();
+            Map<Integer, Integer> counts = new HashMap<>();
+            try (LanceScanner scanner = dataset.newScan(hitsOptions); ArrowReader reader = scanner.scanBatches()) {
+                while (reader.loadNextBatch()) {
+                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                    assertNotNull("prefiltered FTS scan must still return _score", root.getVector("_score"));
+                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                    for (int i = 0; i < root.getRowCount(); i++) {
+                        counts.merge((int) (rowAddr.get(i) >>> 32), 1, Integer::sum);
+                    }
+                }
+            }
+            assertEquals("rows 4, 8, 10 pass the predicate", Map.of(all.get(1), 1, all.get(2), 2), counts);
+
+            ScanOptions countOptions = new ScanOptions.Builder().fullTextQuery(FullTextQuery.match("hello", "body"))
+                .filter("(id >= 4 AND NOT (id = 6))")
+                .prefilter(true)
+                .columns(Collections.emptyList())
+                .withRowAddress(false)
+                .withRowId(false)
+                .build();
+            long total = 0L;
+            try (LanceScanner scanner = dataset.newScan(countOptions); ArrowReader reader = scanner.scanBatches()) {
+                while (reader.loadNextBatch()) {
+                    total += reader.getVectorSchemaRoot().getRowCount();
+                }
+            }
+            assertEquals(3L, total);
         }
     }
 
