@@ -15,6 +15,18 @@ Cross-index metrics also hit the shard path today.
 
 A request Lance refuses as invalid input (for example `lance_match_phrase` on an FTS index built without `with_position: true`) answers 400 `illegal_argument_exception` with Lance's message on the fragment path. On the shard path the same request answers 500: Lucene's query phase wraps the failure in `QueryPhaseExecutionException`, which OpenSearch reports as a server error, and the plugin does not intercept that phase. Lance's message is still in the response body.
 
+## Aggregation shapes the scan does not compute
+
+The Substrait aggregation pushdown ([features.md](features.md#aggregation-pushdown)) covers metric only trees and one bucket level with metric children. Everything else runs through the Lucene aggregators over the fragment readers, which walk every document of the aggregated column:
+
+- Nested buckets (`terms` under `terms`, `terms` under `date_histogram`), `composite`, `cardinality`, `percentiles`, `range` / `date_range`, `filters`, `multi_terms`, `rare_terms`, `significant_terms`. `cardinality` needs a HyperLogLog sketch the coordinator can merge; the scan returns exact distinct counts per executor, which do not merge, so it may stay with the aggregators unless the sketch is built on the executor from a `group by` on the field.
+- `terms` ordered by `_count` ascending or by a sub-aggregation, `min_doc_count` other than 1, `include` / `exclude`, `missing`; `terms` on a `list<utf8>` column (a group by on the list counts rows, not elements).
+- `histogram` with `offset`, `extended_bounds` or `hard_bounds`, or on a `date` / `boolean` field; `date_histogram` with `calendar_interval`, `offset`, `time_zone` or bounds.
+- Metrics with a script, `missing` or `value_type`; `sum` / `avg` / `min` / `max` on a `keyword`.
+- Any aggregation over a full-text or `lance_knn` query, with a `post_filter`, with hits, or under a reader wrapper (security plugin DLS / FLS).
+- A `meta` object that is present but empty is not echoed by the pushdown (the builder exposes an empty map for both cases).
+- `sum` and `avg` on `float` / `double` columns add the values in the scan's order without the aggregators' compensated summation, so the last bits of a floating point sum can differ between the two paths.
+
 ## FTS query behaviour on stock `match` / `match_phrase`
 
 OpenSearch's stock `match` and `match_phrase` queries against a `lance_text` field ignore `operator`, `minimum_should_match`, phrase order, and `slop`. Reason: `lance_text` uses a keyword-analyzer `TextSearchInfo` so the whole query string reaches Lance as a single token and Lance's own tokenizer runs on the query text — OpenSearch's combining layer never sees multiple tokens. Use the plugin's DSL queries for that control:
