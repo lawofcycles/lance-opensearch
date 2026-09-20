@@ -14,6 +14,15 @@ Every Lance-backed index carries a single primary shard (attach rejects `number_
 - Poll cadence is controlled by the cluster setting `lance.namespace.poll_cadence` (default 10s).
 - Resurface guard: when an operator runs `DELETE /{index}` on a Lance-backed index, the poll cycle honours that deletion for `lance.namespace.resurface_guard_grace` (default 1 hour, node-scoped dynamic). Once the grace expires the poll recreates the index if the underlying Lance table is still there. Set to `0` to disable the guard entirely.
 
+### Authorization
+
+Every `/_lance/*` endpoint runs through a transport action, so a security plugin evaluates the caller before the plugin opens a table, probes a path, or lists anything. Grant these action names to roles:
+
+- `cluster:admin/lance/attach` for `POST /_lance/attach` (operator roles that may create Lance-backed indexes; the internal create-index call runs as the plugin, so `indices:admin/create` is not needed in addition).
+- `cluster:admin/lance/namespace/update` for `POST` / `DELETE /_lance/namespace` (the same operator roles).
+- `indices:admin/lance/build_indexes` as an index-level permission for `POST /_lance/build_indexes/{index}` (roles that own the Lance table behind that index; the build writes into the table). The refresh that follows the build runs as the caller, so the role also needs `indices:admin/refresh` on the index.
+- `cluster:monitor/lance/namespace` for `GET /_lance/namespace` and `POST /_lance/namespace/tables` (read-only roles; it reveals registered paths and table names).
+
 ## Query shapes
 
 Full-text, vector, filter, and hit-shape queries all run on the fragment executor unless noted otherwise. Refer to [limitations.md](limitations.md) for shapes that fall through to the shard path.
