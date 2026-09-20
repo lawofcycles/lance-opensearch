@@ -29,6 +29,7 @@ import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.FixedSizeListVector;
+import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
@@ -1023,6 +1024,181 @@ public final class LanceTableFactory {
             }
             // The FTS index goes on last so it covers every fragment;
             // same parameters as writeTable.
+            try (Dataset dataset = Dataset.open().allocator(allocator).uri(uri).build()) {
+                ScalarIndexParams scalarParams = ScalarIndexParams.create(
+                    "inverted",
+                    "{\"base_tokenizer\":\"simple\",\"language\":\"English\",\"with_position\":true}"
+                );
+                IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+                dataset.createIndex(
+                    IndexOptions.builder(Collections.singletonList(BODY_COLUMN), IndexType.INVERTED, indexParams)
+                        .withIndexName(BODY_COLUMN + "_fts")
+                        .build()
+                );
+            }
+        }
+        return uri;
+    }
+
+    /**
+     * Writes a Lance table made of {@code fragments} contiguous fragments
+     * of {@code rowsPerFragment} rows each, with one column of every doc
+     * value kind the fragment reader serves, for tests of hinted
+     * (per-hit) doc value loading. Fragment {@code f} holds the rows
+     * with global id {@code f * rowsPerFragment <= i < (f + 1) *
+     * rowsPerFragment}; the fragment ids are assigned in write order
+     * starting at 0, so the physical offset of row {@code i} inside its
+     * fragment is {@code i % rowsPerFragment}.
+     *
+     * <p>Columns, for a row with global id {@code i}:
+     * <ul>
+     *   <li>{@code id}: int32, {@code i}</li>
+     *   <li>{@code body}: Utf8 with an INVERTED index,
+     *       {@code "hello tok<i> grp<i % 25>"} followed by the token
+     *       {@code lance} repeated {@code (i % 5) + 1} times. {@code tok<i>}
+     *       matches exactly one row, {@code grp<n>} one row in twenty
+     *       five (below the reader's sparse ratio once a fragment has
+     *       more than 20 rows), {@code hello} every row.</li>
+     *   <li>{@code rating}: int32, {@code (i * 37) % 1000}, distinct for
+     *       {@code i < 1000} so a sort on it has no ties; Arrow null when
+     *       {@code i % 5 == 4}</li>
+     *   <li>{@code category}: Utf8 without an index (derives to
+     *       {@code keyword}), {@code "c" + (i % 3)}; Arrow null when
+     *       {@code i % 4 == 3}</li>
+     *   <li>{@code tags}: List&lt;Utf8&gt; (derives to multi-valued
+     *       {@code keyword}), {@code ["t" + (i % 2), "t" + (i % 5)]} so
+     *       rows with {@code i % 10 == 0} or {@code i % 10 == 1} carry a
+     *       duplicate element; Arrow null when {@code i % 6 == 5}</li>
+     *   <li>{@code flag}: bool, {@code i % 2 == 0}; Arrow null when
+     *       {@code i % 7 == 6}</li>
+     *   <li>{@code embedding}: FixedSizeList&lt;Float32, 8&gt; with
+     *       {@code embedding[0] = i} and zeros elsewhere, so the
+     *       nearest neighbours of {@code (x, 0, ...)} are the rows whose
+     *       id is closest to {@code x}</li>
+     * </ul>
+     * The first fragment is written with {@code CREATE}, the rest with
+     * {@code APPEND}; the FTS index is built last so it covers every
+     * fragment. Public because the engine package's unit tests and the
+     * REST ITs both need this layout.
+     *
+     * @return absolute URI of the table.
+     */
+    public static String writeHintFixtureTable(Path parent, String name, int fragments, int rowsPerFragment) throws Exception {
+        return withLocaleRoot(() -> writeHintFixtureTableOnce(parent, name, fragments, rowsPerFragment));
+    }
+
+    private static String writeHintFixtureTableOnce(Path parent, String name, int fragments, int rowsPerFragment) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        Schema schema = new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field(BODY_COLUMN, FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("rating", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("category", FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field(
+                    "tags",
+                    FieldType.nullable(new ArrowType.List()),
+                    Collections.singletonList(new Field("item", FieldType.nullable(new ArrowType.Utf8()), null))
+                ),
+                new Field("flag", FieldType.nullable(new ArrowType.Bool()), null),
+                new Field(
+                    VECTOR_COLUMN,
+                    FieldType.nullable(new ArrowType.FixedSizeList(VECTOR_DIM)),
+                    Collections.singletonList(
+                        new Field("item", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)), null)
+                    )
+                )
+            ),
+            Map.of()
+        );
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            for (int fragment = 0; fragment < fragments; fragment++) {
+                byte[] ipcBytes;
+                try (
+                    VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                    ByteArrayOutputStream out = new ByteArrayOutputStream()
+                ) {
+                    IntVector idVector = (IntVector) root.getVector("id");
+                    VarCharVector bodyVector = (VarCharVector) root.getVector(BODY_COLUMN);
+                    IntVector ratingVector = (IntVector) root.getVector("rating");
+                    VarCharVector categoryVector = (VarCharVector) root.getVector("category");
+                    ListVector tagsVector = (ListVector) root.getVector("tags");
+                    VarCharVector tagItems = (VarCharVector) tagsVector.getDataVector();
+                    BitVector flagVector = (BitVector) root.getVector("flag");
+                    FixedSizeListVector vecVector = (FixedSizeListVector) root.getVector(VECTOR_COLUMN);
+                    Float4Vector vecItems = (Float4Vector) vecVector.getDataVector();
+                    idVector.allocateNew(rowsPerFragment);
+                    bodyVector.allocateNew();
+                    ratingVector.allocateNew(rowsPerFragment);
+                    categoryVector.allocateNew();
+                    tagsVector.allocateNew();
+                    flagVector.allocateNew(rowsPerFragment);
+                    vecVector.allocateNew();
+                    vecItems.allocateNew(rowsPerFragment * VECTOR_DIM);
+                    int tagCount = 0;
+                    for (int slot = 0; slot < rowsPerFragment; slot++) {
+                        int i = fragment * rowsPerFragment + slot;
+                        idVector.set(slot, i);
+                        String body = "hello tok" + i + " grp" + (i % 25) + " lance".repeat((i % 5) + 1);
+                        bodyVector.setSafe(slot, body.getBytes(StandardCharsets.UTF_8));
+                        if (i % 5 == 4) {
+                            ratingVector.setNull(slot);
+                        } else {
+                            ratingVector.set(slot, (i * 37) % 1000);
+                        }
+                        if (i % 4 == 3) {
+                            categoryVector.setNull(slot);
+                        } else {
+                            categoryVector.setSafe(slot, ("c" + (i % 3)).getBytes(StandardCharsets.UTF_8));
+                        }
+                        if (i % 6 == 5) {
+                            tagsVector.setNull(slot);
+                        } else {
+                            tagsVector.startNewValue(slot);
+                            tagItems.setSafe(tagCount++, ("t" + (i % 2)).getBytes(StandardCharsets.UTF_8));
+                            tagItems.setSafe(tagCount++, ("t" + (i % 5)).getBytes(StandardCharsets.UTF_8));
+                            tagsVector.endValue(slot, 2);
+                        }
+                        if (i % 7 == 6) {
+                            flagVector.setNull(slot);
+                        } else {
+                            flagVector.set(slot, i % 2 == 0 ? 1 : 0);
+                        }
+                        for (int j = 0; j < VECTOR_DIM; j++) {
+                            vecItems.set(slot * VECTOR_DIM + j, j == 0 ? (float) i : 0.0f);
+                        }
+                        vecVector.setNotNull(slot);
+                    }
+                    idVector.setValueCount(rowsPerFragment);
+                    bodyVector.setValueCount(rowsPerFragment);
+                    ratingVector.setValueCount(rowsPerFragment);
+                    categoryVector.setValueCount(rowsPerFragment);
+                    tagItems.setValueCount(tagCount);
+                    tagsVector.setValueCount(rowsPerFragment);
+                    flagVector.setValueCount(rowsPerFragment);
+                    vecItems.setValueCount(rowsPerFragment * VECTOR_DIM);
+                    vecVector.setValueCount(rowsPerFragment);
+                    root.setRowCount(rowsPerFragment);
+                    try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                        writer.start();
+                        writer.writeBatch();
+                        writer.end();
+                    }
+                    ipcBytes = out.toByteArray();
+                }
+                try (
+                    ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                    ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                    ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+                ) {
+                    Data.exportArrayStream(allocator, reader, stream);
+                    WriteParams.WriteMode mode = fragment == 0 ? WriteParams.WriteMode.CREATE : WriteParams.WriteMode.APPEND;
+                    WriteParams writeParams = new WriteParams.Builder().withMode(mode).build();
+                    Dataset.create(allocator, stream, uri, writeParams).close();
+                }
+            }
             try (Dataset dataset = Dataset.open().allocator(allocator).uri(uri).build()) {
                 ScalarIndexParams scalarParams = ScalarIndexParams.create(
                     "inverted",
