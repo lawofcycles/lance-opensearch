@@ -30,6 +30,7 @@ import org.opensearch.lance.attach.TransportLanceAttachAction;
 import org.opensearch.lance.dispatch.LanceDispatchActionFilter;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.engine.LanceEngineFactory;
+import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.index.LanceBuildIndexesAction;
 import org.opensearch.lance.index.TransportLanceBuildIndexesAction;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
@@ -288,6 +289,48 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.NodeScope
     );
 
+    /**
+     * Whether the fragment path keeps a node scoped snapshot of each
+     * Lance table version it has served (open dataset, fragment metadata,
+     * schema) and an off-heap cache of the numeric and boolean columns it
+     * has read, so a second request against the same version opens no
+     * dataset and scans no column it already holds. Dynamic: turning it
+     * off retires every snapshot at once and later requests open the
+     * table per request as before.
+     */
+    public static final Setting<Boolean> CACHE_ENABLED_SETTING = Setting.boolSetting(
+        "lance.cache.enabled",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * How many table snapshots {@link org.opensearch.lance.engine.LanceWarmCache}
+     * keeps before it closes the least recently used one that no request
+     * holds. Each snapshot is one open Lance dataset plus a few kilobytes
+     * of metadata per fragment. Static, node scope.
+     */
+    public static final Setting<Integer> CACHE_MAX_SNAPSHOTS_SETTING = Setting.intSetting(
+        "lance.cache.max_snapshots",
+        64,
+        1,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Fraction of {@link #NATIVE_MEMORY_LIMIT_SETTING} reserved for the
+     * off-heap column cache. The remainder goes to the Lance Session's
+     * index and metadata caches in their 6:1 ratio. Static, node scope.
+     */
+    public static final Setting<Double> CACHE_COLUMN_SHARE_SETTING = Setting.doubleSetting(
+        "lance.cache.column_share",
+        0.4,
+        0.0,
+        0.95,
+        Setting.Property.NodeScope
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -306,7 +349,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             NATIVE_MEMORY_LIMIT_SETTING,
             NATIVE_MEMORY_CB_ENABLED_SETTING,
             NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING,
-            FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING
+            FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING,
+            CACHE_ENABLED_SETTING,
+            CACHE_MAX_SNAPSHOTS_SETTING,
+            CACHE_COLUMN_SHARE_SETTING
         );
     }
 
@@ -368,6 +414,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     private AllowedTableRoots allowedTableRoots;
     private LanceDispatchActionFilter dispatchActionFilter;
     private LanceCreateIndexActionFilter createIndexActionFilter;
+    private volatile LanceWarmCache warmCache;
 
     /**
      * Cancellable handle for the scheduled task that samples the shared
@@ -442,27 +489,45 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // LanceRegistry.openDataset, so once the Session is set here
         // every shard on the node will share its index and metadata
         // caches instead of each shard allocating its own 6 GiB / 1 GiB
-        // budget out of native memory.
+        // budget out of native memory. The column cache takes its share
+        // of the same limit first; the Session gets the rest.
         String rawLimit = NATIVE_MEMORY_LIMIT_SETTING.get(environment.settings());
         long totalBytes = NativeMemoryLimit.parse(rawLimit, NATIVE_MEMORY_LIMIT_SETTING.getKey());
-        long indexCacheBytes = NativeMemoryLimit.indexCacheBytes(totalBytes);
-        long metadataCacheBytes = NativeMemoryLimit.metadataCacheBytes(totalBytes);
+        double columnShare = CACHE_COLUMN_SHARE_SETTING.get(environment.settings());
+        long columnCacheBytes = NativeMemoryLimit.columnCacheBytes(totalBytes, columnShare);
+        long sessionBytes = NativeMemoryLimit.sessionCacheBytes(totalBytes, columnShare);
+        long indexCacheBytes = NativeMemoryLimit.indexCacheBytes(sessionBytes);
+        long metadataCacheBytes = NativeMemoryLimit.metadataCacheBytes(sessionBytes);
         LanceRegistry.initSession(indexCacheBytes, metadataCacheBytes);
         LOGGER.info(
-            "installed shared Lance Session: limit [{}] -> index cache [{}], metadata cache [{}] (from lance.native_memory.limit [{}])",
+            "installed shared Lance Session: limit [{}] -> index cache [{}], metadata cache [{}], column cache [{}] "
+                + "(from lance.native_memory.limit [{}], lance.cache.column_share [{}])",
             NativeMemoryLimit.humanReadable(totalBytes),
             NativeMemoryLimit.humanReadable(indexCacheBytes),
             NativeMemoryLimit.humanReadable(metadataCacheBytes),
-            rawLimit
+            NativeMemoryLimit.humanReadable(columnCacheBytes),
+            rawLimit,
+            columnShare
         );
+
+        // Node scoped snapshot and column cache for the fragment path.
+        // Created before the transport actions so Guice can inject it
+        // into TransportLanceFragmentQueryAction.
+        this.warmCache = new LanceWarmCache(
+            LanceRegistry.allocator(),
+            columnCacheBytes,
+            CACHE_MAX_SNAPSHOTS_SETTING.get(environment.settings()),
+            CACHE_ENABLED_SETTING.get(environment.settings())
+        );
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(CACHE_ENABLED_SETTING, warmCache::setEnabled);
 
         // Prime the circuit-breaker helper with the current cluster
         // settings and start the polling loop that keeps its accounting
-        // aligned with Session.sizeBytes(). The listener below picks up
-        // dynamic changes to both the enabled flag and the poll
-        // cadence; the breaker itself has already been handed to
-        // LanceCircuitBreaker by setCircuitBreaker earlier in the node
-        // lifecycle.
+        // aligned with Session.sizeBytes() plus the column cache. The
+        // listener below picks up dynamic changes to both the enabled
+        // flag and the poll cadence; the breaker itself has already been
+        // handed to LanceCircuitBreaker by setCircuitBreaker earlier in
+        // the node lifecycle.
         LanceCircuitBreaker.setEnabled(NATIVE_MEMORY_CB_ENABLED_SETTING.get(environment.settings()));
         this.circuitBreakerPollInterval = NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING.get(environment.settings());
         this.circuitBreakerPollTask = scheduleCircuitBreakerPoll(threadPool, circuitBreakerPollInterval);
@@ -484,23 +549,26 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             threadPool,
             cadence,
             builderMaxRows,
-            NAMESPACE_RESURFACE_GRACE_SETTING.get(environment.settings())
+            NAMESPACE_RESURFACE_GRACE_SETTING.get(environment.settings()),
+            warmCache
         );
         // Register a reactive consumer so an operator can adjust the grace
         // period at runtime without a rolling restart.
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(NAMESPACE_RESURFACE_GRACE_SETTING, namespaceService::setResurfaceGrace);
-        // Both components are injected into the plugin's transport
-        // actions (attach, build_indexes, namespace list / update).
-        return List.of(namespaceService, allowedTableRoots);
+        // The components are injected into the plugin's transport
+        // actions (attach, build_indexes, namespace list / update,
+        // fragment query).
+        return List.of(namespaceService, allowedTableRoots, warmCache);
     }
 
     /**
      * Schedule the periodic sampler that reads the current
-     * {@code Session.sizeBytes()} and pushes the reading into the
-     * circuit breaker via {@link LanceCircuitBreaker#updateUsage(long)}.
-     * Runs on the generic thread pool so it does not steal capacity
-     * from the search or write executors.
+     * {@code Session.sizeBytes()} and the column cache's allocated bytes
+     * and pushes their sum into the circuit breaker via
+     * {@link LanceCircuitBreaker#updateUsage(long, long)}. Runs on the
+     * generic thread pool so it does not steal capacity from the search
+     * or write executors.
      */
     private Cancellable scheduleCircuitBreakerPoll(ThreadPool pool, TimeValue interval) {
         Runnable sampler = () -> {
@@ -509,8 +577,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
                 if (session == null || session.isClosed()) {
                     return;
                 }
-                long bytes = session.sizeBytes();
-                LanceCircuitBreaker.updateUsage(bytes);
+                long sessionBytes = session.sizeBytes();
+                LanceWarmCache cache = warmCache;
+                long columnBytes = cache == null ? 0L : cache.columnCacheBytes();
+                LanceCircuitBreaker.updateUsage(sessionBytes, columnBytes);
             } catch (Throwable t) {
                 // Never let a poll iteration throw out of the
                 // scheduler; a failed reading just means the breaker's
@@ -542,6 +612,13 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         if (task != null) {
             task.cancel();
             circuitBreakerPollTask = null;
+        }
+        // Close every cached snapshot (their datasets) and the column
+        // cache allocator before the Session goes away.
+        LanceWarmCache cache = warmCache;
+        if (cache != null) {
+            cache.close();
+            warmCache = null;
         }
         // Release the shared native Session so a test-framework restart
         // within the same JVM doesn't accumulate stale Session handles.

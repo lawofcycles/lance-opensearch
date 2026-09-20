@@ -118,6 +118,17 @@ public final class LanceCircuitBreaker {
     }
 
     /**
+     * Report the two native footprints the plugin owns as one reading:
+     * the Lance Session's index and metadata caches and the fragment
+     * path's off-heap column cache. Both share the
+     * {@code lance.native_memory.limit} budget, so {@code _nodes/stats/breaker}
+     * shows their sum under {@code lance_native}.
+     */
+    public static void updateUsage(long sessionBytes, long columnCacheBytes) {
+        updateUsage(sessionBytes + columnCacheBytes);
+    }
+
+    /**
      * Throw {@link CircuitBreakingException} if the breaker is enabled
      * and its currently-tracked usage has caught up to (or exceeded)
      * the configured limit. Called before every native scan on the
@@ -143,7 +154,7 @@ public final class LanceCircuitBreaker {
         if (used >= limit) {
             String message = "Lance native memory limit reached during ["
                 + operation
-                + "]. Session cache used ["
+                + "]. Session and column cache used ["
                 + used
                 + "] bytes, limit ["
                 + limit

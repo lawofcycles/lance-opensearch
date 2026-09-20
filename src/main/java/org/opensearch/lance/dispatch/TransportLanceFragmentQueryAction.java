@@ -15,7 +15,6 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.function.Function;
 
 import org.apache.logging.log4j.LogManager;
@@ -70,9 +69,11 @@ import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.Rewriteable;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.engine.ColumnStore;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
+import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceFtsQueryBuilder;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
@@ -95,8 +96,10 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 /**
- * Per-node handler for {@link LanceFragmentQueryAction}. Opens the
- * Lance dataset through the shared {@link LanceRegistry} and runs
+ * Per-node handler for {@link LanceFragmentQueryAction}. Takes the
+ * table snapshot for the request's version from the node's
+ * {@link LanceWarmCache} (which opens the Lance dataset through the
+ * shared {@link LanceRegistry} the first time) and runs
  * the requested scan on the node this instance lives on. The
  * coordinator groups fragments by node so each handler only scans
  * its subset, keeping the total work proportional to the fragments
@@ -214,6 +217,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * the transport layer applies its own queue limits.
      */
     private final java.util.concurrent.Semaphore concurrencyLimit;
+    /**
+     * Node scoped snapshot and column cache every request acquires its
+     * table view from; created by {@code LancePlugin.createComponents}.
+     */
+    private final LanceWarmCache warmCache;
 
     @Inject
     public TransportLanceFragmentQueryAction(
@@ -222,13 +230,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         ClusterService clusterService,
         IndicesService indicesService,
         BigArrays bigArrays,
-        CircuitBreakerService circuitBreakerService
+        CircuitBreakerService circuitBreakerService,
+        LanceWarmCache warmCache
     ) {
         super(LanceFragmentQueryAction.NAME, transportService, actionFilters, LanceFragmentQueryRequest::new, ThreadPool.Names.SEARCH);
         this.clusterService = clusterService;
         this.indicesService = indicesService;
         this.bigArrays = bigArrays;
         this.circuitBreakerService = circuitBreakerService;
+        this.warmCache = warmCache;
         int permits = org.opensearch.lance.LancePlugin.FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING.get(clusterService.getSettings());
         this.concurrencyLimit = new java.util.concurrent.Semaphore(permits, /*fair*/ false);
     }
@@ -279,32 +289,72 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * that answers both.
      */
     LanceFragmentQueryResponse execute(LanceFragmentQueryRequest request) throws Exception {
-        // Both Dataset opens below use the manifest version the
-        // coordinator resolved from index.lance.version so a pinned
-        // index serves the same rows through _search and _count as
-        // through _stats / GET on the shard engine.
-        Optional<Long> pinnedVersion = request.pinnedVersionOrEmpty();
-        try (Dataset dataset = LanceRegistry.openDataset(request.tableUri(), request.storageOptions(), pinnedVersion)) {
-            int fragmentCount = request.fragmentIds().isEmpty() ? dataset.getFragments().size() : request.fragmentIds().size();
-
-            List<Integer> allFragmentIds = new ArrayList<>();
-            for (Fragment fragment : dataset.getFragments()) {
-                allFragmentIds.add(fragment.getId());
+        IndexMetadata indexMetadata = clusterService.state().metadata().index(request.indexName());
+        if (indexMetadata == null) {
+            throw new IllegalStateException("Fragment path cannot resolve OpenSearch index [" + request.indexName() + "] on this node");
+        }
+        Index index = indexMetadata.getIndex();
+        String pkField = indexMetadata.getSettings().get("index.lance.primary_key_field", "");
+        // Parse the type setting through the same fromSetting helper the
+        // engine uses so unknown values fall back to LONG. Empty pkField
+        // overrides whatever the type says (see the schema derivation
+        // for the canonicalisation).
+        LancePrimaryKeyType pkType = pkField.isEmpty()
+            ? LancePrimaryKeyType.NONE
+            : LancePrimaryKeyType.fromSetting(indexMetadata.getSettings().get("index.lance.primary_key_type", "long"));
+        // Multi-fields spec is persisted as JSON in a single setting.
+        // Empty (no attach-body clause) leaves the reader with an empty
+        // sub-field map. Malformed JSON falls through to
+        // IllegalArgumentException, which the outer catch turns into a
+        // 500 for the caller; that is loud enough to surface a bad
+        // index setting without hiding the failure behind an empty map.
+        Map<String, LinkedHashMap<String, String>> multiFields = RestAttachAction.deserialiseMultiFields(
+            indexMetadata.getSettings().get("index.lance.multi_fields", "")
+        );
+        // The snapshot is keyed on the manifest version the coordinator
+        // enumerated the fragments from (the pinned or tag version, or
+        // the latest it observed), so every node of this request reads
+        // the same manifest, a pinned index serves the same rows through
+        // _search and _count as through _stats / GET on the shard
+        // engine, and a warm request makes no Lance call to find its
+        // version. Every Lance call of this request (reader leaves,
+        // counts, sorted scans) goes through the snapshot's dataset; the
+        // lease keeps it open until the reader has been closed.
+        try (
+            LanceWarmCache.Lease lease = warmCache.acquire(
+                indexMetadata.getIndexUUID(),
+                request.tableUri(),
+                request.storageOptions(),
+                request.pinnedVersionOrEmpty(),
+                pkField,
+                pkType,
+                multiFields
+            )
+        ) {
+            LanceWarmCache.Snapshot snapshot = lease.snapshot();
+            List<Integer> allFragmentIds = new ArrayList<>(snapshot.fragments().size());
+            for (LanceWarmCache.FragmentMeta fragment : snapshot.fragments()) {
+                allFragmentIds.add(fragment.id());
             }
+            int fragmentCount = request.fragmentIds().isEmpty() ? allFragmentIds.size() : request.fragmentIds().size();
             List<Integer> effectiveFragmentIds = (request.fragmentIdsOrNull() == null || request.fragmentIdsOrNull().isEmpty())
                 ? allFragmentIds
                 : request.fragmentIdsOrNull();
 
-            IndexMetadata indexMetadata = clusterService.state().metadata().index(request.indexName());
-            if (indexMetadata == null) {
-                throw new IllegalStateException("Fragment path cannot resolve OpenSearch index [" + request.indexName() + "] on this node");
-            }
-            Index index = indexMetadata.getIndex();
             // The executor needs an IndexService for the mapping, the
             // QueryShardContext, the bitset cache and the reader
             // wrapper the security plugin installs; see
             // executeWithLocalOrTempIndexService for where it comes from.
-            return executeWithLocalOrTempIndexService(index, indexMetadata, dataset, request, fragmentCount, effectiveFragmentIds, 0);
+            return executeWithLocalOrTempIndexService(
+                index,
+                indexMetadata,
+                snapshot,
+                multiFields,
+                request,
+                fragmentCount,
+                effectiveFragmentIds,
+                0
+            );
         }
     }
 
@@ -330,7 +380,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     private LanceFragmentQueryResponse executeWithLocalOrTempIndexService(
         Index index,
         IndexMetadata indexMetadata,
-        Dataset dataset,
+        LanceWarmCache.Snapshot snapshot,
+        Map<String, LinkedHashMap<String, String>> multiFields,
         LanceFragmentQueryRequest request,
         int fragmentCount,
         List<Integer> effectiveFragmentIds,
@@ -338,7 +389,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     ) throws Exception {
         IndexService localIndexService = indicesService.indexService(index);
         if (localIndexService != null) {
-            return executeWithIndexService(localIndexService, indexMetadata, dataset, request, fragmentCount, effectiveFragmentIds);
+            return executeWithIndexService(
+                localIndexService,
+                indexMetadata,
+                snapshot,
+                multiFields,
+                request,
+                fragmentCount,
+                effectiveFragmentIds
+            );
         }
         long tempStart = System.nanoTime();
         try {
@@ -353,7 +412,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     request.indexName(),
                     (System.nanoTime() - tempStart) / 1_000L
                 );
-                return executeWithIndexService(tempIndexService, indexMetadata, dataset, request, fragmentCount, effectiveFragmentIds);
+                return executeWithIndexService(
+                    tempIndexService,
+                    indexMetadata,
+                    snapshot,
+                    multiFields,
+                    request,
+                    fragmentCount,
+                    effectiveFragmentIds
+                );
             });
         } catch (ResourceAlreadyExistsException raced) {
             if (attempt >= INDEX_SERVICE_RACE_RETRIES) {
@@ -374,7 +441,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             return executeWithLocalOrTempIndexService(
                 index,
                 indexMetadata,
-                dataset,
+                snapshot,
+                multiFields,
                 request,
                 fragmentCount,
                 effectiveFragmentIds,
@@ -394,30 +462,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     private LanceFragmentQueryResponse executeWithIndexService(
         IndexService indexService,
         IndexMetadata indexMetadata,
-        Dataset dataset,
+        LanceWarmCache.Snapshot snapshot,
+        Map<String, LinkedHashMap<String, String>> multiFields,
         LanceFragmentQueryRequest request,
         int fragmentCount,
         List<Integer> effectiveFragmentIds
     ) throws Exception {
-        Optional<Long> pinnedVersion = request.pinnedVersionOrEmpty();
         ShardId shardId = new ShardId(indexMetadata.getIndex(), 0);
-        String pkField = indexMetadata.getSettings().get("index.lance.primary_key_field", "");
-        // Parse the type setting through the same fromSetting helper the
-        // engine uses so unknown values fall back to LONG. Empty pkField
-        // overrides whatever the type says (see the reader constructor
-        // for the canonicalisation).
-        LancePrimaryKeyType pkType = pkField.isEmpty()
-            ? LancePrimaryKeyType.NONE
-            : LancePrimaryKeyType.fromSetting(indexMetadata.getSettings().get("index.lance.primary_key_type", "long"));
-        // Multi-fields spec is persisted as JSON in a single setting.
-        // Empty (no attach-body clause) leaves the reader with an empty
-        // sub-field map. Malformed JSON falls through to
-        // IllegalArgumentException, which the outer catch turns into a
-        // 500 for the caller; that is loud enough to surface a bad
-        // index setting without hiding the failure behind an empty map.
-        Map<String, LinkedHashMap<String, String>> multiFields = RestAttachAction.deserialiseMultiFields(
-            indexMetadata.getSettings().get("index.lance.multi_fields", "")
-        );
+        Dataset dataset = snapshot.dataset();
 
         // Fetch the IndexService reader wrapper once so both
         // openWrappedReader and computeMatched see the same
@@ -430,36 +482,34 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper = resolveReaderWrapper(indexService);
         boolean hasSecurityWrapper = readerWrapper != null;
 
-        // Open a fresh Dataset for the reader: LanceDirectoryReader
-        // takes ownership of the Dataset and closes it in doClose.
-        // The node-scoped Lance Session cache makes the second
-        // open cheap. Any reader wrapper installed on IndexService
-        // (most importantly the security plugin's DLS/FLS wrapper)
-        // is applied before the searcher is built so document- and
-        // field-level filtering apply to fragment path hits the
-        // same way they apply to shard path hits.
+        // The reader's leaves are views over the snapshot: no dataset
+        // open, no schema pass. Numeric and boolean columns come from
+        // the node's off-heap column store when the snapshot is cached;
+        // with the cache disabled the snapshot is request scoped and the
+        // columns load into heap for this request as before. Any reader
+        // wrapper installed on IndexService (most importantly the
+        // security plugin's DLS/FLS wrapper) is applied before the
+        // searcher is built so document- and field-level filtering apply
+        // to fragment path hits the same way they apply to shard path
+        // hits.
         try (
-            Dataset readerDataset = LanceRegistry.openDataset(request.tableUri(), request.storageOptions(), pinnedVersion);
             DirectoryReader dr = openWrappedReader(
                 shardId,
-                readerDataset,
-                pkField,
-                pkType,
-                multiFields,
+                snapshot,
+                snapshot.isCached() ? warmCache.columnStore() : null,
                 effectiveFragmentIds,
                 // Push the coordinator-translated Lance SQL down
                 // to the leaf reader. When the top-level query is
                 // a scalar filter LanceKnnFilterTranslator can
                 // express (bool / term / terms / range / exists /
                 // match_all), request.filterSql() carries the SQL
-                // and every per-column Lance scan the leaf reader
-                // issues inside ensureXxxLoaded is layered with
-                // that filter, so `filter + terms agg` and
-                // `filter + sum` materialise only the matching
-                // rows of the aggregated column. FTS and knn
-                // queries have no SQL representation so filterSql
-                // is null there and the leaf reader runs
-                // unfiltered full-column scans.
+                // and every request scoped heap column scan the
+                // leaf reader issues inside ensureXxxLoaded is
+                // layered with that filter, so `filter + terms agg`
+                // and `filter + sum` materialise only the matching
+                // rows of the aggregated column when the column
+                // store cannot serve them. FTS and knn queries have
+                // no SQL representation so filterSql is null there.
                 request.filterSql(),
                 readerWrapper
             )
@@ -538,11 +588,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // other shape goes through the Lucene collector.
                 List<ColumnOrdering> pushdownOrderings = hasSecurityWrapper || sortAndFormats == null
                     ? null
-                    : resolvePushdownOrderings(request, readerDataset.getSchema(), multiFields, sortAndFormats);
+                    : resolvePushdownOrderings(request, dataset.getSchema(), multiFields, sortAndFormats);
                 List<SearchHit> hits;
                 if (pushdownOrderings != null) {
                     hits = scanSortedHitsViaLance(
-                        readerDataset,
+                        dataset,
                         request,
                         pushdownOrderings,
                         sortAndFormats,
@@ -1645,21 +1695,16 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      */
     private DirectoryReader openWrappedReader(
         ShardId shardId,
-        Dataset readerDataset,
-        String pkField,
-        LancePrimaryKeyType pkType,
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+        LanceWarmCache.Snapshot snapshot,
+        ColumnStore columnStore,
         List<Integer> effectiveFragmentIds,
         String filterSql,
         CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper
     ) throws IOException {
-        DirectoryReader lanceReader = LanceDirectoryReader.openForFragments(
+        DirectoryReader lanceReader = LanceDirectoryReader.openForSnapshot(
             new ByteBuffersDirectory(),
-            null,
-            readerDataset,
-            pkField,
-            pkType,
-            multiFields,
+            snapshot,
+            columnStore,
             effectiveFragmentIds,
             filterSql
         );

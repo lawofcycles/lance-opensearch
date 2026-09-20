@@ -64,16 +64,18 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     private final String indexName;
     private final StorageOptions storageOptions;
     /**
-     * Lance manifest version the index is pinned to through
-     * {@code index.lance.version}, or {@code -1} when the index
-     * follows the latest manifest. The coordinator resolves this
-     * from the target's {@code IndexMetadata} and ships it on the
-     * wire so every {@code Dataset} the fragment path opens (the
-     * coordinator's fragment enumeration and both per-node opens)
-     * reads the same manifest the shard engine serves for
-     * {@code _stats} and GET. Re-reading the
-     * setting on the receiving node would leave room for the two
-     * sides to observe different cluster states.
+     * Lance manifest version the coordinator enumerated the fragments
+     * of this request from: the version {@code index.lance.version}
+     * or the index's tag pins, or the latest version the coordinator
+     * observed when it opened a table that follows the manifest. The
+     * coordinator resolves it once per request and ships it on the
+     * wire so every executor reads the same manifest the coordinator
+     * assigned fragments from and keys its {@code LanceWarmCache}
+     * snapshot on it without asking Lance for the latest version;
+     * a pinned index thereby serves the same rows through
+     * {@code _search} as through {@code _stats} and GET. {@code -1}
+     * means no version was resolved and the executor falls back to
+     * the table's latest version.
      */
     private final long pinnedVersion;
     private final String filterSql;
@@ -236,9 +238,9 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     }
 
     /**
-     * Pinned Lance manifest version, or {@code -1} when the index
-     * follows the latest manifest. Same encoding as the
-     * {@code index.lance.version} index setting.
+     * Manifest version the executor reads, or {@code -1} when none
+     * was resolved. Same encoding as the {@code index.lance.version}
+     * index setting.
      */
     public long pinnedVersion() {
         return pinnedVersion;
@@ -247,7 +249,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     /**
      * {@link #pinnedVersion()} in the shape
      * {@link org.opensearch.lance.LanceRegistry#openDataset(String, StorageOptions, Optional)}
-     * takes: empty when the index follows the latest manifest.
+     * takes: empty when no version was resolved.
      */
     public Optional<Long> pinnedVersionOrEmpty() {
         return pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();
