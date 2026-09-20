@@ -11,6 +11,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -188,7 +189,7 @@ public final class LanceEngineFactory implements EngineFactory {
             : LancePrimaryKeyType.fromSetting(config.getIndexSettings().getSettings().get(PRIMARY_KEY_TYPE_SETTING, "long"));
         int shardId = config.getShardId().id();
         long versionSetting = config.getIndexSettings().getSettings().getAsLong(VERSION_SETTING, -1L);
-        java.util.Optional<Long> pinnedVersion = versionSetting >= 0 ? java.util.Optional.of(versionSetting) : java.util.Optional.empty();
+        Optional<Long> pinnedVersion = versionSetting >= 0 ? Optional.of(versionSetting) : Optional.empty();
         String tagSetting = config.getIndexSettings().getSettings().get(TAG_SETTING, "");
         String tag = tagSetting.isEmpty() ? null : tagSetting;
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(config.getIndexSettings().getSettings());
@@ -212,7 +213,7 @@ public final class LanceEngineFactory implements EngineFactory {
          * reads the same fixed snapshot and {@code refreshIfNeeded}
          * short-circuits.
          */
-        final java.util.Optional<Long> pinnedVersion;
+        final Optional<Long> pinnedVersion;
         /**
          * Lance tag the shard follows, or {@code null}. When set (and no
          * version is pinned), {@link #resolveVersion()} asks Lance which
@@ -235,7 +236,7 @@ public final class LanceEngineFactory implements EngineFactory {
             String field,
             LancePrimaryKeyType pkType,
             int shardId,
-            java.util.Optional<Long> pinnedVersion,
+            Optional<Long> pinnedVersion,
             String tag,
             StorageOptions storageOptions,
             java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
@@ -261,11 +262,17 @@ public final class LanceEngineFactory implements EngineFactory {
             OpenSearchDirectoryReader initial = null;
             LanceReaderManager manager = null;
             try {
-                java.util.Optional<Long> target = resolveVersion();
+                Optional<Long> target = resolveVersion();
                 initial = openLanceReader(target);
                 long initialVersion;
-                try (Dataset probe = LanceRegistry.openDataset(tablePath, storageOptions, target)) {
-                    initialVersion = probe.version();
+                if (target.isPresent()) {
+                    // Pinned or tag-resolved: the version is known, no
+                    // probe open needed.
+                    initialVersion = target.get();
+                } else {
+                    try (Dataset probe = LanceRegistry.openDataset(tablePath, storageOptions)) {
+                        initialVersion = probe.version();
+                    }
                 }
                 manager = new LanceReaderManager(initial, this, initialVersion);
             } catch (Throwable t) {
@@ -311,23 +318,22 @@ public final class LanceEngineFactory implements EngineFactory {
         /**
          * Manifest version the shard should read right now: the pinned
          * version when one is set, the version the followed tag resolves to
-         * when the index follows a tag, otherwise empty (latest). Resolving a
-         * tag opens the table once, so callers resolve a single time per
-         * open or refresh and pass the result to both the probe and
-         * {@link #openLanceReader(java.util.Optional)} so the two agree even
-         * if the tag moves in between.
+         * when the index follows a tag, otherwise empty (latest). Used on
+         * the initial open; {@link LanceReaderManager#refreshIfNeeded} reads
+         * the tag from the latest dataset it opens anyway instead of paying
+         * for the separate open this method does.
          */
-        java.util.Optional<Long> resolveVersion() {
+        Optional<Long> resolveVersion() {
             if (pinnedVersion.isPresent()) {
                 return pinnedVersion;
             }
             if (tag != null) {
-                return java.util.Optional.of(LanceRegistry.resolveTagVersion(tablePath, storageOptions, tag));
+                return Optional.of(LanceRegistry.resolveTagVersion(tablePath, storageOptions, tag));
             }
-            return java.util.Optional.empty();
+            return Optional.empty();
         }
 
-        OpenSearchDirectoryReader openLanceReader(java.util.Optional<Long> version) throws IOException {
+        OpenSearchDirectoryReader openLanceReader(Optional<Long> version) throws IOException {
             Directory directory = engineConfig.getStore().directory();
             SegmentInfos infos = getLastCommittedSegmentInfos();
             IndexCommit commit = Lucene.getIndexCommit(infos, directory);
@@ -637,20 +643,30 @@ public final class LanceEngineFactory implements EngineFactory {
             // safe: a concurrent `maybeRefresh()` blocks on refreshLock
             // and will observe the updated version once we return.
             //
-            // The target is resolved once per refresh: for a tag-following
-            // shard this is the version the tag points at right now, so a
-            // tag moved on the Lance side (forwards or backwards) produces
-            // a version different from servedVersion and swaps the reader.
-            java.util.Optional<Long> target = engine.resolveVersion();
-            long latest;
-            try (Dataset probe = LanceRegistry.openDataset(engine.tablePath, engine.storageOptions, target)) {
-                latest = probe.version();
-            }
-            if (latest == servedVersion) {
+            if (engine.pinnedVersion.isPresent()) {
+                // A version pin never moves: the initial reader already
+                // serves it, so there is nothing to probe.
                 return null;
             }
-            OpenSearchDirectoryReader newReader = engine.openLanceReader(target);
-            servedVersion = latest;
+            // One open of the latest manifest answers both questions: the
+            // latest version for a latest-following shard, and the version
+            // the tag points at right now for a tag-following one (tags
+            // live in the table's refs, so they are readable from any
+            // checkout). A tag moved on the Lance side, forwards or
+            // backwards, yields a version different from servedVersion and
+            // swaps the reader.
+            long target;
+            try (Dataset latest = LanceRegistry.openDataset(engine.tablePath, engine.storageOptions)) {
+                target = engine.tag != null ? latest.tags().getVersion(engine.tag) : latest.version();
+            }
+            if (target == servedVersion) {
+                return null;
+            }
+            // A tag-following shard opens the resolved version explicitly;
+            // a latest-following shard opens latest again, as before.
+            Optional<Long> openAt = engine.tag != null ? Optional.of(target) : Optional.empty();
+            OpenSearchDirectoryReader newReader = engine.openLanceReader(openAt);
+            servedVersion = target;
             return newReader;
         }
 

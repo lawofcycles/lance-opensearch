@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -242,7 +243,7 @@ public final class LanceNamespaceService {
 
     /**
      * List the tables the poll cycle would surface from the namespace
-     * registered at {@code rootUri}. Returns an empty {@link java.util.Optional} when
+     * registered at {@code rootUri}. Returns an empty {@link Optional} when
      * the namespace is not registered (or the local applier has not yet
      * built the runtime handle for it), a populated set otherwise. The
      * value comes straight from {@link DirectoryNamespace#listTables}, so
@@ -255,14 +256,14 @@ public final class LanceNamespaceService {
      * or to spot tables the poller failed to surface due to a name
      * clash with an existing OpenSearch index.
      */
-    public java.util.Optional<java.util.Set<String>> listTables(String rootUri) throws Exception {
+    public Optional<java.util.Set<String>> listTables(String rootUri) throws Exception {
         DirectoryNamespace directory = directoryCache.get(rootUri);
         if (directory == null) {
-            return java.util.Optional.empty();
+            return Optional.empty();
         }
         ListTablesResponse response = directory.listTables(new ListTablesRequest());
         java.util.Set<String> tables = response.getTables();
-        return java.util.Optional.of(tables == null ? java.util.Collections.emptySet() : tables);
+        return Optional.of(tables == null ? java.util.Collections.emptySet() : tables);
     }
 
     private void poll() {
@@ -421,7 +422,7 @@ public final class LanceNamespaceService {
                         // The tag points at an older manifest: derive from
                         // that snapshot so the mapping matches the schema
                         // the shard is about to read.
-                        try (Dataset tagged = LanceRegistry.openDataset(table, storageOptions, java.util.Optional.of(target))) {
+                        try (Dataset tagged = LanceRegistry.openDataset(table, storageOptions, Optional.of(target))) {
                             RestAttachAction.Derivation derivation = RestAttachAction.derive(tagged, storedMultiFields);
                             rederivedMappingJson = derivation.mappingJson();
                             warnOnLanceFieldRename(indexName, tagged.getLanceSchema());
