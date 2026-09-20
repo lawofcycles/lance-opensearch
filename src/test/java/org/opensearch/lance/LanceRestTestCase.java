@@ -9,7 +9,10 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -97,6 +100,24 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
             Path scratchDir = Files.createDirectories(base.resolve("lance-it-" + suffix));
             String tableName = "demo-" + suffix;
             LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, rowCount, maxRowsPerFile);
+            return registerAndWait(scratchDir, "demo-" + suffix);
+        }
+
+        /**
+         * The doc value fixture of
+         * {@link LanceTableFactory#writeHintFixtureTable}: {@code fragments}
+         * contiguous fragments of {@code rowsPerFragment} rows with an FTS
+         * body, numeric, keyword, multi-valued keyword, boolean and vector
+         * columns. Row {@code i} lives at fragment {@code i / rowsPerFragment},
+         * offset {@code i % rowsPerFragment}, so its {@code _id} is
+         * {@code (i / rowsPerFragment) + "-" + (i % rowsPerFragment)}.
+         */
+        static LanceTestCluster setUpHintFixture(int fragments, int rowsPerFragment, String testHint) throws Exception {
+            Path base = sharedRoot();
+            String suffix = testHint.toLowerCase(Locale.ROOT) + "-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+            Path scratchDir = Files.createDirectories(base.resolve("lance-it-" + suffix));
+            String tableName = "demo-" + suffix;
+            LanceTableFactory.writeHintFixtureTable(scratchDir, tableName, fragments, rowsPerFragment);
             return registerAndWait(scratchDir, "demo-" + suffix);
         }
 
@@ -274,5 +295,36 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
     @SuppressWarnings("unchecked")
     static java.util.List<Object> sortValuesOf(java.util.Map<String, Object> hit) {
         return (java.util.List<Object>) hit.get("sort");
+    }
+
+    /**
+     * {@code (key, doc_count)} pairs of the buckets of the named
+     * aggregation, in response order, as {@code "key=count"} strings so
+     * two responses can be compared with a plain list equality.
+     */
+    @SuppressWarnings("unchecked")
+    static List<String> bucketsOf(String searchBody, String aggregationName) throws IOException {
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, searchBody)) {
+            Map<String, Object> map = parser.map();
+            Map<String, Object> aggregations = (Map<String, Object>) map.get("aggregations");
+            assertNotNull("no aggregations in " + searchBody, aggregations);
+            Map<String, Object> aggregation = (Map<String, Object>) aggregations.get(aggregationName);
+            assertNotNull("no aggregation " + aggregationName + " in " + searchBody, aggregation);
+            List<Map<String, Object>> buckets = (List<Map<String, Object>>) aggregation.get("buckets");
+            List<String> out = new ArrayList<>(buckets.size());
+            for (Map<String, Object> bucket : buckets) {
+                out.add(bucket.get("key") + "=" + bucket.get("doc_count"));
+            }
+            return out;
+        }
+    }
+
+    /** {@code _id} followed by the {@code sort} array of every hit, in response order. */
+    static List<String> idsAndSortValuesOf(String searchBody) throws IOException {
+        List<String> out = new ArrayList<>();
+        for (Map<String, Object> hit : hitsOf(searchBody)) {
+            out.add(hit.get("_id") + " " + sortValuesOf(hit));
+        }
+        return out;
     }
 }

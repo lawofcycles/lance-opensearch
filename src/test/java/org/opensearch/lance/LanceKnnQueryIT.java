@@ -5,6 +5,8 @@
 
 package org.opensearch.lance;
 
+import java.util.List;
+
 import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
 
@@ -150,6 +152,53 @@ public class LanceKnnQueryIT extends LanceRestTestCase {
             assertEquals("expected 400 for unsupported filter, saw " + status, 400, status);
             String body = readAll(failure.getResponse());
             assertTrue("expected message about MatchQueryBuilder, saw: " + body, body.contains("MatchQueryBuilder"));
+        }
+    }
+
+    public void testLanceKnnWithSortAndAggregationsMatchesScalarReference() throws Exception {
+        // Rows sit at (id, 0, ...), so the five nearest to 250.4 are rows
+        // 248..252, all in fragment 1 (offsets 48..52). The knn Weight
+        // hints the leaf with those rows and the sort and aggregation
+        // columns are fetched for them alone; a terms filter on the same
+        // ids is the hint-free reference. Row 249 has a null rating, so
+        // the missing handling is part of the comparison.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "knnhintsort")) {
+            String indexName = fixture.indexName();
+            String knn = "{\"lance_knn\":{\"field\":\"embedding\",\"vector\":[250.4,0,0,0,0,0,0,0],\"k\":5}}";
+            String reference = "{\"terms\":{\"id\":[248,249,250,251,252]}}";
+            for (String sort : List.of(
+                "\"sort\":[{\"rating\":\"desc\"},{\"id\":\"asc\"}]",
+                "\"sort\":[{\"category\":\"asc\"},{\"id\":\"asc\"}]",
+                "\"sort\":[{\"flag\":\"desc\"},{\"id\":\"asc\"}]"
+            )) {
+                String actual = readAll(postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":" + knn + "," + sort + "}"));
+                String expected = readAll(postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":" + reference + "," + sort + "}"));
+                assertEquals(5, extractIntPath(actual, "hits", "total", "value"));
+                assertEquals(sort, idsAndSortValuesOf(expected), idsAndSortValuesOf(actual));
+            }
+            String byRating = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":10,\"query\":" + knn + ",\"sort\":[{\"rating\":\"desc\"},{\"id\":\"asc\"}]}"
+                )
+            );
+            // 252 * 37 mod 1000 = 324, 251 -> 287, 250 -> 250, 248 -> 176, 249 -> null last.
+            assertEquals(List.of("1-52", "1-51", "1-50", "1-48", "1-49"), idsOf(hitsOf(byRating)));
+
+            String aggs = "\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}},"
+                + "\"by_tag\":{\"terms\":{\"field\":\"tags\",\"size\":10}},"
+                + "\"max_rating\":{\"max\":{\"field\":\"rating\"}}}";
+            for (String size : List.of("0", "3")) {
+                String actual = readAll(
+                    postJson("/" + indexName + "/_search", "{\"size\":" + size + ",\"query\":" + knn + "," + aggs + "}")
+                );
+                String expected = readAll(
+                    postJson("/" + indexName + "/_search", "{\"size\":" + size + ",\"query\":" + reference + "," + aggs + "}")
+                );
+                assertEquals(bucketsOf(expected, "by_category"), bucketsOf(actual, "by_category"));
+                assertEquals(bucketsOf(expected, "by_tag"), bucketsOf(actual, "by_tag"));
+                assertEquals(324d, extractDoublePath(actual, "aggregations", "max_rating", "value"), 0d);
+            }
         }
     }
 
