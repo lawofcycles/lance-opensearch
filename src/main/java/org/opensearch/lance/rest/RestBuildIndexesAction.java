@@ -20,13 +20,15 @@ import org.opensearch.rest.action.RestToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
- * POST /_lance/build_indexes/{index} [{"columns": [...], "fragment_ids": [...], "optimize": bool, "retrain": bool}]
+ * POST /_lance/build_indexes/{index} [{"columns": [...], "fragment_ids": [...], "optimize": bool, "retrain": bool, "tokenizer": "..."}]
  *
  * Manual index build endpoint. The handler parses the body and hands a
  * {@link LanceBuildIndexesRequest} to {@link LanceBuildIndexesAction};
  * resolving the table, running the Lance builders, and refreshing the
  * index happen in the transport action so a security plugin evaluates
  * the caller's index-level privilege before the plugin opens the table.
+ * {@code tokenizer} is forwarded to Lance as the FTS {@code base_tokenizer}
+ * without an allowlist; validation of the name is Lance's.
  */
 public class RestBuildIndexesAction extends BaseRestHandler {
 
@@ -52,6 +54,7 @@ public class RestBuildIndexesAction extends BaseRestHandler {
         List<Number> fragmentIdsRaw = (List<Number>) body.get("fragment_ids");
         boolean optimize = Boolean.TRUE.equals(body.get("optimize"));
         boolean retrain = Boolean.TRUE.equals(body.get("retrain"));
+        Object tokenizerRaw = body.get("tokenizer");
 
         if (optimize && fragmentIdsRaw != null) {
             return channel -> channel.sendResponse(
@@ -66,6 +69,14 @@ public class RestBuildIndexesAction extends BaseRestHandler {
                 new BytesRestResponse(RestStatus.BAD_REQUEST, "retrain is only valid with optimize=true")
             );
         }
+        if (tokenizerRaw != null && !(tokenizerRaw instanceof String)) {
+            return channel -> channel.sendResponse(
+                new BytesRestResponse(
+                    RestStatus.BAD_REQUEST,
+                    "tokenizer must be a string naming a Lance base_tokenizer, saw " + tokenizerRaw
+                )
+            );
+        }
 
         List<Integer> fragmentIds = null;
         if (fragmentIdsRaw != null) {
@@ -74,7 +85,14 @@ public class RestBuildIndexesAction extends BaseRestHandler {
                 fragmentIds.add(n.intValue());
             }
         }
-        LanceBuildIndexesRequest build = new LanceBuildIndexesRequest(indexName, columnsFilterRaw, fragmentIds, optimize, retrain);
+        LanceBuildIndexesRequest build = new LanceBuildIndexesRequest(
+            indexName,
+            columnsFilterRaw,
+            fragmentIds,
+            optimize,
+            retrain,
+            (String) tokenizerRaw
+        );
         return channel -> client.execute(LanceBuildIndexesAction.INSTANCE, build, new RestToXContentListener<>(channel));
     }
 }

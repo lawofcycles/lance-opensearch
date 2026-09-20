@@ -19,7 +19,14 @@ import org.opensearch.test.OpenSearchTestCase;
 public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
 
     public void testRequestRoundTrip() throws Exception {
-        LanceBuildIndexesRequest original = new LanceBuildIndexesRequest("demo", List.of("body", "id"), List.of(0, 2), false, false);
+        LanceBuildIndexesRequest original = new LanceBuildIndexesRequest(
+            "demo",
+            List.of("body", "id"),
+            List.of(0, 2),
+            false,
+            false,
+            "lindera/ipadic"
+        );
 
         LanceBuildIndexesRequest restored = roundTrip(original);
 
@@ -29,11 +36,23 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
         assertEquals(List.of(0, 2), restored.fragmentIds());
         assertFalse(restored.optimize());
         assertFalse(restored.retrain());
+        assertEquals("lindera/ipadic", restored.tokenizer());
+        assertNull(restored.validate());
+    }
+
+    public void testRequestWithoutTokenizerRoundTripsAsNull() throws Exception {
+        // Absent tokenizer stays null on the wire so the transport action
+        // applies LanceIndexBuilder.DEFAULT_FTS_TOKENIZER itself.
+        LanceBuildIndexesRequest original = new LanceBuildIndexesRequest("demo", null, null, false, false, null);
+
+        LanceBuildIndexesRequest restored = roundTrip(original);
+
+        assertNull(restored.tokenizer());
         assertNull(restored.validate());
     }
 
     public void testOptimizeRequestWithNullFiltersRoundTrip() throws Exception {
-        LanceBuildIndexesRequest original = new LanceBuildIndexesRequest("demo", null, null, true, true);
+        LanceBuildIndexesRequest original = new LanceBuildIndexesRequest("demo", null, null, true, true, null);
 
         LanceBuildIndexesRequest restored = roundTrip(original);
 
@@ -41,16 +60,26 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
         assertNull(restored.fragmentIds());
         assertTrue(restored.optimize());
         assertTrue(restored.retrain());
+        assertNull(restored.tokenizer());
         assertNull(restored.validate());
     }
 
     public void testRequestValidation() {
-        assertNotNull(new LanceBuildIndexesRequest("", null, null, false, false).validate());
+        assertNotNull(new LanceBuildIndexesRequest("", null, null, false, false, null).validate());
         // fragment_ids only scopes an initial build; optimize covers every
         // uncovered fragment on its own.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of(1), true, false).validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of(1), true, false, null).validate());
         // retrain is an optimize option.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, false, true).validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, false, true, null).validate());
+        // tokenizer only applies to indexes this request creates; optimize
+        // reuses the params of the existing index.
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, true, false, "simple").validate());
+        // An empty tokenizer is a caller mistake, not a request for the
+        // default.
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, false, false, "").validate());
+        // Any non-empty name passes plugin validation; Lance decides
+        // whether it exists.
+        assertNull(new LanceBuildIndexesRequest("demo", null, null, false, false, "no-such-tokenizer").validate());
     }
 
     public void testResponseRoundTrip() throws Exception {

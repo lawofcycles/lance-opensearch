@@ -5,6 +5,8 @@
 
 package org.opensearch.lance.engine;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -26,6 +28,8 @@ import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.index.vector.VectorIndexParams;
+import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.rest.RestAttachAction;
 
 /**
@@ -56,6 +60,13 @@ public final class LanceIndexBuilder {
     private static final Logger LOG = LogManager.getLogger(LanceIndexBuilder.class);
     private static final long IVF_PQ_MIN_ROWS = 256L;
 
+    /**
+     * Lance {@code base_tokenizer} used for FTS indexes when the caller does
+     * not name one. Splits on whitespace and punctuation, which is what the
+     * plugin always did before the tokenizer became selectable.
+     */
+    public static final String DEFAULT_FTS_TOKENIZER = "simple";
+
     private LanceIndexBuilder() {}
 
     /**
@@ -63,12 +74,24 @@ public final class LanceIndexBuilder {
      * an FTS index are skipped unless {@code fragmentIds} is present, in which
      * case the specified fragments are added to the existing index. Returns
      * the columns that received a CreateIndex commit.
+     *
+     * <p>{@code tokenizer} is handed to Lance verbatim as the inverted
+     * index's {@code base_tokenizer} ({@code simple}, {@code whitespace},
+     * {@code raw}, {@code icu}, {@code lindera/ipadic}, {@code jieba/default}
+     * and whatever else the loaded Lance native library accepts). The plugin
+     * keeps no list of valid names because the set changes with the Lance
+     * version; when Lance rejects the value (unknown name, or a dictionary
+     * directory that is missing under {@code LANCE_LANGUAGE_MODEL_HOME}) the
+     * JNI layer raises {@link IllegalArgumentException} and this method lets
+     * it propagate so the caller answers 400 with Lance's message instead
+     * of a 200 that lists nothing as built.
      */
     public static List<String> ensureFtsIndexes(
         Dataset dataset,
         Set<String> targetColumns,
         long maxRows,
-        Optional<List<Integer>> fragmentIds
+        Optional<List<Integer>> fragmentIds,
+        String tokenizer
     ) {
         if (targetColumns.isEmpty()) {
             return Collections.emptyList();
@@ -76,6 +99,7 @@ public final class LanceIndexBuilder {
         if (exceedsMaxRows(dataset, maxRows, "FTS", targetColumns)) {
             return Collections.emptyList();
         }
+        String ftsParamsJson = ftsParamsJson(tokenizer);
         List<String> built = new ArrayList<>();
         for (Field field : dataset.getSchema().getFields()) {
             if (!(field.getType() instanceof ArrowType.Utf8)) {
@@ -95,7 +119,7 @@ public final class LanceIndexBuilder {
                     LOG.warn("FTS index for column {} exists; use optimize=true to add fragments, skipping partial build", column);
                     continue;
                 }
-                ScalarIndexParams fts = ScalarIndexParams.create("inverted", "{\"base_tokenizer\":\"simple\"}");
+                ScalarIndexParams fts = ScalarIndexParams.create("inverted", ftsParamsJson);
                 String indexName = column + "_fts";
                 IndexOptions.Builder builder = IndexOptions.builder(
                     Collections.singletonList(column),
@@ -109,16 +133,37 @@ public final class LanceIndexBuilder {
                 }
                 built.add(column);
                 LOG.info(
-                    "built FTS index over column {} (fragmentIds={}, version {})",
+                    "built FTS index over column {} (tokenizer={}, fragmentIds={}, version {})",
                     column,
+                    tokenizer,
                     fragmentIds.orElse(null),
                     dataset.version()
                 );
+            } catch (IllegalArgumentException e) {
+                // Lance's JNI maps InvalidInput (unknown base_tokenizer,
+                // missing dictionary directory, malformed params) to this
+                // type. Surface it instead of logging: the caller chose the
+                // tokenizer and needs the message, not a silent `built: []`.
+                throw e;
             } catch (Exception e) {
                 LOG.warn("FTS build failed for column {}", column, e);
             }
         }
         return built;
+    }
+
+    /**
+     * Serialises the inverted index params Lance reads at CreateIndex.
+     * Goes through an {@link XContentBuilder} so a tokenizer name with a
+     * quote or backslash cannot break out of the JSON string.
+     */
+    private static String ftsParamsJson(String tokenizer) {
+        try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
+            builder.startObject().field("base_tokenizer", tokenizer).endObject();
+            return builder.toString();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /**
