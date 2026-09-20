@@ -47,7 +47,9 @@ import org.opensearch.transport.client.Client;
  *       columns discovered by {@link RestAttachAction#derive}. Columns
  *       already carrying an index are skipped. {@code fragment_ids}
  *       produces a partial initial index over the requested fragments
- *       only.</li>
+ *       only. {@code tokenizer} names the Lance {@code base_tokenizer}
+ *       for the FTS indexes this call creates (default {@code simple});
+ *       Lance's rejection of the name comes back as 400.</li>
  *   <li>{@code optimize=true} runs {@link Dataset#optimizeIndices} for the
  *       filtered indexes. Lance incrementally merges fragments not yet
  *       covered. {@code retrain=true} rebuilds the index (vector codebook
@@ -145,7 +147,8 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
                 vectorBuilt = LanceIndexBuilder.optimizeExistingVectorIndexes(dataset, vectorTarget, request.retrain());
             } else {
                 Optional<List<Integer>> fragmentIds = Optional.ofNullable(request.fragmentIds());
-                ftsBuilt = LanceIndexBuilder.ensureFtsIndexes(dataset, ftsTarget, Long.MAX_VALUE, fragmentIds);
+                String tokenizer = request.tokenizer() != null ? request.tokenizer() : LanceIndexBuilder.DEFAULT_FTS_TOKENIZER;
+                ftsBuilt = LanceIndexBuilder.ensureFtsIndexes(dataset, ftsTarget, Long.MAX_VALUE, fragmentIds, tokenizer);
                 scalarBuilt = LanceIndexBuilder.ensureScalarIndexes(dataset, scalarTarget, Long.MAX_VALUE, fragmentIds);
                 vectorBuilt = LanceIndexBuilder.ensureVectorIndexes(dataset, vectorTarget, Long.MAX_VALUE, fragmentIds);
             }

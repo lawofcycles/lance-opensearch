@@ -29,6 +29,7 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
     private final List<Integer> fragmentIds;
     private final boolean optimize;
     private final boolean retrain;
+    private final String tokenizer;
 
     /**
      * @param index       OpenSearch index whose Lance table gets the indexes.
@@ -40,13 +41,26 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
      * @param optimize    merge existing indexes over uncovered fragments
      *                    instead of creating new ones.
      * @param retrain     with {@code optimize}, rebuild instead of merging.
+     * @param tokenizer   Lance {@code base_tokenizer} for the FTS indexes this
+     *                    request creates, or {@code null} for Lance's
+     *                    {@code simple}. Passed to Lance verbatim. Only valid
+     *                    without {@code optimize}: an existing index keeps the
+     *                    tokenizer it was built with.
      */
-    public LanceBuildIndexesRequest(String index, List<String> columns, List<Integer> fragmentIds, boolean optimize, boolean retrain) {
+    public LanceBuildIndexesRequest(
+        String index,
+        List<String> columns,
+        List<Integer> fragmentIds,
+        boolean optimize,
+        boolean retrain,
+        String tokenizer
+    ) {
         this.index = index;
         this.columns = columns == null ? null : List.copyOf(columns);
         this.fragmentIds = fragmentIds == null ? null : List.copyOf(fragmentIds);
         this.optimize = optimize;
         this.retrain = retrain;
+        this.tokenizer = tokenizer;
     }
 
     public LanceBuildIndexesRequest(StreamInput in) throws IOException {
@@ -56,6 +70,7 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
         this.fragmentIds = in.readBoolean() ? in.readList(StreamInput::readVInt) : null;
         this.optimize = in.readBoolean();
         this.retrain = in.readBoolean();
+        this.tokenizer = in.readOptionalString();
     }
 
     @Override
@@ -71,6 +86,7 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
         }
         out.writeBoolean(optimize);
         out.writeBoolean(retrain);
+        out.writeOptionalString(tokenizer);
     }
 
     @Override
@@ -87,6 +103,12 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
         }
         if (retrain && !optimize) {
             ex = add(ex, "retrain is only valid with optimize=true");
+        }
+        if (tokenizer != null && tokenizer.isEmpty()) {
+            ex = add(ex, "tokenizer must not be empty; omit it to use Lance's default (simple)");
+        }
+        if (tokenizer != null && optimize) {
+            ex = add(ex, "tokenizer is only valid with optimize=false (an existing FTS index keeps the tokenizer it was built with)");
         }
         return ex;
     }
@@ -129,5 +151,13 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
 
     public boolean retrain() {
         return retrain;
+    }
+
+    /**
+     * Lance {@code base_tokenizer} for FTS indexes created by this request,
+     * or {@code null} when the caller left the choice to the default.
+     */
+    public String tokenizer() {
+        return tokenizer;
     }
 }
