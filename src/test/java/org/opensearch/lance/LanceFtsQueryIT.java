@@ -99,6 +99,135 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         }
     }
 
+    public void testLanceMatchWithScalarFilterMatchesLuceneComposition() throws Exception {
+        // bool { must: [lance_match], filter: [term] } is collapsed on
+        // the executor into one Lance FTS scan with a SQL prefilter.
+        // The control query wraps the same filter in constant_score,
+        // which the SQL translator refuses, so it runs as the plain
+        // Lucene BooleanQuery over the unfiltered FTS scan. Both
+        // must agree on ids, order, scores and the total.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpMultiFragment(12, 4, "lmatchprefilter")) {
+            String indexName = fixture.indexName();
+            String fts = "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}";
+
+            // term on the id column: one hit, row 4 lives at fragment 1 offset 0.
+            String termFilter = "{\"term\":{\"id\":4}}";
+            assertPushdownMatchesControl(indexName, fts, termFilter, null, List.of("1-0"));
+
+            // range keeps rows 4..11; the hello rows among them are 4, 6, 8, 10.
+            String rangeFilter = "{\"range\":{\"id\":{\"gte\":4}}}";
+            assertPushdownMatchesControl(indexName, fts, rangeFilter, null, List.of("1-0", "1-2", "2-0", "2-2"));
+
+            // A filter that excludes every hello row: empty result on both paths.
+            String oddOnly = "{\"terms\":{\"id\":[1,3,5,7,9,11]}}";
+            assertPushdownMatchesControl(indexName, fts, oddOnly, null, List.of());
+
+            // The one-hit token 4 with a filter that keeps it and one that drops it.
+            String token4 = "{\"lance_match\":{\"field\":\"body\",\"query\":\"4\"}}";
+            assertPushdownMatchesControl(indexName, token4, "{\"range\":{\"id\":{\"lt\":8}}}", null, List.of("1-0"));
+            assertPushdownMatchesControl(indexName, token4, "{\"range\":{\"id\":{\"gte\":8}}}", null, List.of());
+        }
+    }
+
+    public void testLanceMatchWithRangeFilterAndMustNotMatchesLuceneComposition() throws Exception {
+        // bool { must: [lance_match], filter: [range], must_not: [term] }:
+        // rows 2..10 minus 6 leaves the hello rows 2, 4, 8, 10.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpMultiFragment(12, 4, "lmatchprefilternot")) {
+            String indexName = fixture.indexName();
+            String fts = "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}";
+            String rangeFilter = "{\"range\":{\"id\":{\"gte\":2,\"lte\":10}}}";
+            String mustNot = "{\"term\":{\"id\":6}}";
+            assertPushdownMatchesControl(indexName, fts, rangeFilter, mustNot, List.of("0-2", "1-0", "2-0", "2-2"));
+
+            // must_not alone (no filter clause) is pushed down as well.
+            String pushed = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":10,\"query\":{\"bool\":{\"must\":[" + fts + "],\"must_not\":[" + mustNot + "]}}}"
+                )
+            );
+            assertEquals(5, extractIntPath(pushed, "hits", "total", "value"));
+            assertEquals(Set.of("0-0", "0-2", "1-0", "2-0", "2-2"), new HashSet<>(idsOf(hitsOf(pushed))));
+
+            // A boost on the FTS clause is kept: scores double, ids stay.
+            String boosted = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":10,\"query\":{\"bool\":{\"must\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\",\"boost\":2.0}}],"
+                        + "\"filter\":["
+                        + rangeFilter
+                        + "],\"must_not\":["
+                        + mustNot
+                        + "]}}}"
+                )
+            );
+            String plain = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":10,\"query\":{\"bool\":{\"must\":["
+                        + fts
+                        + "],\"filter\":["
+                        + rangeFilter
+                        + "],\"must_not\":["
+                        + mustNot
+                        + "]}}}"
+                )
+            );
+            assertEquals(idsOf(hitsOf(plain)), idsOf(hitsOf(boosted)));
+            List<Double> plainScores = scoresOf(plain);
+            List<Double> boostedScores = scoresOf(boosted);
+            for (int i = 0; i < plainScores.size(); i++) {
+                assertEquals("boost 2.0 doubles the score at rank " + i, plainScores.get(i) * 2d, boostedScores.get(i), 1e-4);
+            }
+        }
+    }
+
+    /**
+     * Runs {@code bool { must: [fts], filter: [filter], must_not: [mustNot] }}
+     * twice: once as written (collapsed into a prefiltered Lance FTS
+     * scan on the executor) and once with the filter wrapped in
+     * {@code constant_score} so the SQL translator refuses it and the
+     * bool stays a Lucene BooleanQuery. Asserts the two agree on ids
+     * (in score order), scores, {@code hits.total.value} with and
+     * without {@code size:0}, and that the ids are {@code expectedIds}.
+     */
+    private static void assertPushdownMatchesControl(String indexName, String fts, String filter, String mustNot, List<String> expectedIds)
+        throws IOException {
+        String mustNotClause = mustNot == null ? "" : ",\"must_not\":[" + mustNot + "]";
+        String pushdownBool = "{\"bool\":{\"must\":[" + fts + "],\"filter\":[" + filter + "]" + mustNotClause + "}}";
+        String controlBool = "{\"bool\":{\"must\":["
+            + fts
+            + "],\"filter\":[{\"constant_score\":{\"filter\":"
+            + filter
+            + "}}]"
+            + mustNotClause
+            + "}}";
+
+        String pushed = readAll(postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":" + pushdownBool + "}"));
+        String control = readAll(postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":" + controlBool + "}"));
+
+        List<String> pushedIds = idsOf(hitsOf(pushed));
+        assertEquals("ids in score order, pushdown vs Lucene: " + pushed, idsOf(hitsOf(control)), pushedIds);
+        assertEquals("expected id set: " + pushed, new HashSet<>(expectedIds), new HashSet<>(pushedIds));
+        assertEquals(expectedIds.size(), extractIntPath(pushed, "hits", "total", "value"));
+        assertEquals(extractIntPath(control, "hits", "total", "value"), extractIntPath(pushed, "hits", "total", "value"));
+
+        List<Double> pushedScores = scoresOf(pushed);
+        List<Double> controlScores = scoresOf(control);
+        assertEquals(controlScores.size(), pushedScores.size());
+        for (int i = 0; i < pushedScores.size(); i++) {
+            assertEquals("score at rank " + i + ": " + pushed, controlScores.get(i), pushedScores.get(i), 1e-4);
+            if (i > 0) {
+                assertTrue("_score must be non-increasing, saw " + pushedScores, pushedScores.get(i - 1) >= pushedScores.get(i));
+            }
+        }
+
+        String pushedCount = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":" + pushdownBool + "}"));
+        String controlCount = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":" + controlBool + "}"));
+        assertEquals(expectedIds.size(), extractIntPath(pushedCount, "hits", "total", "value"));
+        assertEquals(extractIntPath(controlCount, "hits", "total", "value"), extractIntPath(pushedCount, "hits", "total", "value"));
+    }
+
     private static List<Double> scoresOf(String searchBody) throws IOException {
         try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, searchBody)) {
             Map<String, Object> map = parser.map();

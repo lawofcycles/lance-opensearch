@@ -38,6 +38,7 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 - `lance_multi_match` for multi-field FTS with per-field boosts and a shared operator (`Lance MultiMatchQuery`).
 - `lance_fts_boost` combines a positive and a negative FTS clause with a `negative_boost` scale, evaluated on Lance rather than layered on Lucene's `BooleanQuery`.
 - `lance_fts_bool` composes `must` / `should` / `must_not` FTS clause arrays on Lance's side.
+- A `bool` whose `must` is a single `lance_*` FTS clause and whose `filter` / `must_not` clauses are `term`, `terms`, `range`, `exists`, `match_all`, or a `bool` of those on mapped columns runs as one Lance FTS scan with the scalar clauses as a SQL prefilter (`filter(sql)` + `prefilter(true)`), the same way `lance_knn`'s `filter` does. Lance evaluates the predicate first, through the column's scalar index when it has one, and looks up the inverted index only for the selected rows; `hits.total.value` comes from the same prefiltered scan. The bool must have no `should`, no `minimum_should_match`, and a boost of `1.0` (the FTS clause's own boost is kept); any other composition, a clause the translator cannot express (stock `match`, multi-field sub-fields, unmapped fields), or a security plugin reader wrapper (DLS / FLS) keeps the bool on the Lucene side with unchanged results.
 
 #### Building an FTS index and choosing its tokenizer
 
