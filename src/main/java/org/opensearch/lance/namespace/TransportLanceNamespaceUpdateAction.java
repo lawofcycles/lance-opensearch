@@ -6,10 +6,15 @@
 package org.opensearch.lance.namespace;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.clustermanager.TransportClusterManagerNodeAction;
 import org.opensearch.cluster.AckedClusterStateUpdateTask;
@@ -23,6 +28,7 @@ import org.opensearch.common.Priority;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
@@ -37,6 +43,10 @@ import org.opensearch.transport.TransportService;
  * bit so the REST layer can 404 a request that hit a URI the
  * cluster never had, even when the caller's local view lags
  * behind the manager.
+ *
+ * <p>Register requests are also validated here (allowlist, filesystem
+ * path existence) rather than in the REST handler, so the checks run
+ * only after the {@link ActionFilters} chain has admitted the caller.
  */
 public final class TransportLanceNamespaceUpdateAction extends TransportClusterManagerNodeAction<
     LanceNamespaceUpdateRequest,
@@ -44,13 +54,16 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
 
     private static final Logger LOG = LogManager.getLogger(TransportLanceNamespaceUpdateAction.class);
 
+    private final AllowedTableRoots allowedRoots;
+
     @Inject
     public TransportLanceNamespaceUpdateAction(
         TransportService transportService,
         ClusterService clusterService,
         ThreadPool threadPool,
         ActionFilters actionFilters,
-        IndexNameExpressionResolver indexNameExpressionResolver
+        IndexNameExpressionResolver indexNameExpressionResolver,
+        AllowedTableRoots allowedRoots
     ) {
         super(
             LanceNamespaceUpdateAction.NAME,
@@ -61,6 +74,7 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
             LanceNamespaceUpdateRequest::new,
             indexNameExpressionResolver
         );
+        this.allowedRoots = allowedRoots;
     }
 
     @Override
@@ -89,6 +103,68 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
         ClusterState state,
         ActionListener<LanceNamespaceUpdateResponse> listener
     ) {
+        if (request.operation() == LanceNamespaceUpdateRequest.Operation.REGISTER) {
+            LanceNamespaceMetadata current = state.metadata().custom(LanceNamespaceMetadata.TYPE);
+            if (current != null) {
+                for (LanceNamespaceMetadata.Entry entry : current.entries()) {
+                    if (entry.rootUri().equals(request.rootUri())) {
+                        // Already registered: acknowledge without a state
+                        // update so a repeated register stays a no-op even
+                        // if the directory has since gone away.
+                        listener.onResponse(new LanceNamespaceUpdateResponse(true, false));
+                        return;
+                    }
+                }
+            }
+            try {
+                validateRegisterPath(request.rootUri());
+            } catch (Exception e) {
+                listener.onFailure(e);
+                return;
+            }
+        }
+        submitUpdate(request, listener);
+    }
+
+    /**
+     * Rejects a register target that is outside the configured allowlist
+     * or, for filesystem paths, does not exist as a directory. Runs here
+     * rather than in the REST handler so the checks sit behind the
+     * {@link ActionFilters} chain: a caller without the privilege gets
+     * the security plugin's response regardless of whether the path
+     * exists, and a caller with it does not spin the poller against a
+     * typo'd path forever.
+     *
+     * <p>Object-store schemes ({@code s3://}, {@code gs://}, ...) route
+     * through Lance's own storage layer and cannot be probed from here,
+     * so only the allowlist applies to them; Lance surfaces a missing
+     * root on the first list-tables call.
+     */
+    private void validateRegisterPath(String path) {
+        if (!allowedRoots.allows(path)) {
+            throw new OpenSearchStatusException(
+                "path [" + path + "] is not under any of the configured lance.allowed_table_roots",
+                RestStatus.FORBIDDEN
+            );
+        }
+        if (path.contains("://")) {
+            return;
+        }
+        Path fsPath;
+        try {
+            fsPath = Path.of(path);
+        } catch (InvalidPathException e) {
+            throw new IllegalArgumentException("path [" + path + "] is not a valid filesystem path: " + e.getReason(), e);
+        }
+        if (!Files.exists(fsPath)) {
+            throw new IllegalArgumentException("path [" + path + "] does not exist");
+        }
+        if (!Files.isDirectory(fsPath)) {
+            throw new IllegalArgumentException("path [" + path + "] exists but is not a directory");
+        }
+    }
+
+    private void submitUpdate(LanceNamespaceUpdateRequest request, ActionListener<LanceNamespaceUpdateResponse> listener) {
         // Capture whether the state update actually transitioned so
         // the REST layer can distinguish "already at target state"
         // (unregister of an unknown path, register of a duplicate
@@ -97,7 +173,7 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
         // authoritative decision has to happen here on the manager.
         AtomicBoolean changed = new AtomicBoolean(false);
         clusterService.submitStateUpdateTask(
-            "lance-namespace-" + request.operation().name().toLowerCase(java.util.Locale.ROOT) + " [" + request.rootUri() + "]",
+            "lance-namespace-" + request.operation().name().toLowerCase(Locale.ROOT) + " [" + request.rootUri() + "]",
             new AckedClusterStateUpdateTask<LanceNamespaceUpdateResponse>(Priority.NORMAL, request, ActionListener.wrap(response -> {
                 listener.onResponse(new LanceNamespaceUpdateResponse(response.isAcknowledged(), changed.get()));
             }, listener::onFailure)) {
