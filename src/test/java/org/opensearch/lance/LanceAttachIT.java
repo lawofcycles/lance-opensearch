@@ -228,6 +228,162 @@ public class LanceAttachIT extends LanceRestTestCase {
         assertTrue("expected message about [version], saw: " + body, body.contains("[version]"));
     }
 
+    public void testAttachRejectsVersionAndTagTogether() throws IOException {
+        // `version` is a fixed pin and `tag` a moving one; the body may
+        // carry only one of them.
+        String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"version\":1,\"tag\":\"v1\"}";
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        assertEquals("expected 400 for version + tag, saw " + status, 400, status);
+        String body = readAll(failure.getResponse());
+        assertTrue("expected mutual exclusion message, saw: " + body, body.contains("[version] and [tag] are mutually exclusive"));
+    }
+
+    public void testAttachRejectsUnknownTag() throws Exception {
+        // The table opens fine but the tag does not exist: a 400 that
+        // names the tag, with Lance's own message, not a 500.
+        String suffix = "badtag-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 2);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        try {
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"tag\":\"no-such-tag\"}")
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            assertEquals("expected 400 for unknown tag, saw " + status, 400, status);
+            String body = readAll(failure.getResponse());
+            assertTrue("expected message to name the tag, saw: " + body, body.contains("no-such-tag"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + tableName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testAttachWithTagFollowsTagMoves() throws Exception {
+        // Version A has six rows; an append produces version B with ten.
+        // Tag v1 starts at A. An index attached with tag v1 reads six
+        // rows; moving v1 to B makes the poll refresh it to ten. A second
+        // index pinned to version A must stay at six throughout.
+        String suffix = "tag-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        long versionA = LanceTableFactory.currentVersion(tableUri);
+        LanceTableFactory.appendRows(tableUri, 6, 4);
+        long versionB = LanceTableFactory.currentVersion(tableUri);
+        assertTrue("append must advance the manifest", versionB > versionA);
+        LanceTableFactory.createTag(tableUri, "v1", versionA);
+
+        String tagIndex = tableName + "-tag";
+        String pinnedIndex = tableName + "-pinned";
+        // track_total_hits routes the search to the shard path, which
+        // reads through the engine's reader; that reader is what honours
+        // the tag and the version pin.
+        String countBody = "{\"query\":{\"match_all\":{}},\"track_total_hits\":true,\"size\":0}";
+        try {
+            Response attachTag = postJson(
+                "/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"name\":\"" + tagIndex + "\",\"tag\":\"v1\"}"
+            );
+            String attachTagBody = readAll(attachTag);
+            assertEquals("attach with tag failed: " + attachTagBody, RestStatus.OK.getStatus(), attachTag.getStatusLine().getStatusCode());
+            assertEquals("attach must report the tag's version", (int) versionA, extractIntPath(attachTagBody, "version"));
+            Response attachPinned = postJson(
+                "/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"name\":\"" + pinnedIndex + "\",\"version\":" + versionA + "}"
+            );
+            assertEquals(RestStatus.OK.getStatus(), attachPinned.getStatusLine().getStatusCode());
+
+            String settingsBody = readAll(client().performRequest(new Request("GET", "/" + tagIndex + "/_settings")));
+            assertTrue("expected index.lance.tag=v1 to persist: " + settingsBody, settingsBody.contains("\"tag\":\"v1\""));
+
+            assertEquals(6, extractIntPath(readAll(postJson("/" + tagIndex + "/_search", countBody)), "hits", "total", "value"));
+            assertEquals(6, extractIntPath(readAll(postJson("/" + pinnedIndex + "/_search", countBody)), "hits", "total", "value"));
+
+            LanceTableFactory.updateTag(tableUri, "v1", versionB);
+            assertBusy(() -> {
+                String body = readAll(postJson("/" + tagIndex + "/_search", countBody));
+                assertEquals("tag index should follow v1 to version B: " + body, 10, extractIntPath(body, "hits", "total", "value"));
+            }, 60, java.util.concurrent.TimeUnit.SECONDS);
+            assertEquals(6, extractIntPath(readAll(postJson("/" + pinnedIndex + "/_search", countBody)), "hits", "total", "value"));
+
+            // Moving the tag back is a move too: the poll compares for
+            // inequality, not for a forward advance.
+            LanceTableFactory.updateTag(tableUri, "v1", versionA);
+            assertBusy(() -> {
+                String body = readAll(postJson("/" + tagIndex + "/_search", countBody));
+                assertEquals("tag index should follow v1 back to version A: " + body, 6, extractIntPath(body, "hits", "total", "value"));
+            }, 60, java.util.concurrent.TimeUnit.SECONDS);
+        } finally {
+            for (String idx : new String[] { tagIndex, pinnedIndex }) {
+                try {
+                    client().performRequest(new Request("DELETE", "/" + idx));
+                } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    public void testRefsListsTagsAndBranches() throws Exception {
+        String suffix = "refs-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 3);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        long version = LanceTableFactory.currentVersion(tableUri);
+        LanceTableFactory.createTag(tableUri, "release", version);
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            Response refs = client().performRequest(new Request("GET", "/_lance/refs/" + indexName));
+            assertEquals(RestStatus.OK.getStatus(), refs.getStatusLine().getStatusCode());
+            String body = readAll(refs);
+            assertTrue("expected index in body: " + body, body.contains("\"index\":\"" + indexName + "\""));
+            assertTrue("expected table in body: " + body, body.contains("\"table\":\"" + tableUri + "\""));
+            assertTrue(
+                "expected the release tag with its version: " + body,
+                body.contains("{\"name\":\"release\",\"version\":" + version + "}")
+            );
+            assertTrue("expected an empty branches array: " + body, body.contains("\"branches\":[]"));
+
+            ResponseException missing = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/_lance/refs/does-not-exist-" + suffix))
+            );
+            assertEquals(404, missing.getResponse().getStatusLine().getStatusCode());
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testRefsRejectsPlainIndex() throws IOException {
+        String indexName = "plain-refs-" + randomAlphaOfLength(6).toLowerCase(java.util.Locale.ROOT);
+        Request create = new Request("PUT", "/" + indexName);
+        create.setJsonEntity("{}");
+        create.setOptions(create.getOptions().toBuilder().addHeader("Content-Type", "application/json"));
+        client().performRequest(create);
+        try {
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/_lance/refs/" + indexName))
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            assertEquals("expected 400 for a non-Lance index, saw " + status, 400, status);
+            String body = readAll(failure.getResponse());
+            assertTrue("expected message about not a Lance index: " + body, body.contains("is not a Lance index"));
+        } finally {
+            client().performRequest(new Request("DELETE", "/" + indexName));
+        }
+    }
+
     public void testAttachRejectsNonObjectStorageOptions() throws IOException {
         String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"storage_options\":\"not-an-object\"}";
         ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
