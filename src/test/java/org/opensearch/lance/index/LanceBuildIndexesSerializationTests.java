@@ -8,7 +8,12 @@ package org.opensearch.lance.index;
 import java.util.List;
 
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.rest.RestStatus;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.lance.index.LanceBuildIndexesResponse.ColumnResult;
+import org.opensearch.lance.index.LanceBuildIndexesResponse.KindResult;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -96,11 +101,20 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
     public void testResponseRoundTrip() throws Exception {
         LanceBuildIndexesResponse original = new LanceBuildIndexesResponse(
             "demo",
-            List.of("body"),
-            List.of("id", "category"),
-            List.of(),
-            List.of("body", "id", "category"),
-            List.of(0, 2)
+            new KindResult(List.of("body"), List.of(), List.of()),
+            new KindResult(
+                List.of("id", "category"),
+                List.of(new ColumnResult("rating", "scalar index already exists; use optimize=true to extend it over new fragments")),
+                List.of(new ColumnResult("price", "LanceError(IO): Permission denied (os error 13)"))
+            ),
+            new KindResult(
+                List.of(),
+                List.of(new ColumnResult("embedding", "table has 5 rows, below the IVF_PQ training minimum of 256")),
+                List.of()
+            ),
+            List.of("body", "id", "category", "rating", "price", "embedding"),
+            List.of(0, 2),
+            RestStatus.INTERNAL_SERVER_ERROR
         );
 
         LanceBuildIndexesResponse restored = roundTrip(original);
@@ -109,18 +123,65 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
         assertEquals(List.of("body"), restored.ftsBuilt());
         assertEquals(List.of("id", "category"), restored.scalarBuilt());
         assertTrue(restored.vectorBuilt().isEmpty());
-        assertEquals(List.of("body", "id", "category"), restored.columnsFilter());
+        assertEquals(original.scalar().skipped(), restored.scalar().skipped());
+        assertEquals(original.scalar().failed(), restored.scalar().failed());
+        assertEquals(original.vector().skipped(), restored.vector().skipped());
+        assertTrue(restored.fts().skipped().isEmpty());
+        assertTrue(restored.fts().failed().isEmpty());
+        assertTrue(restored.vector().failed().isEmpty());
+        assertTrue(restored.hasFailures());
+        assertEquals(RestStatus.INTERNAL_SERVER_ERROR, restored.status());
+        assertEquals(List.of("body", "id", "category", "rating", "price", "embedding"), restored.columnsFilter());
         assertEquals(List.of(0, 2), restored.fragmentIds());
     }
 
     public void testResponseWithoutFiltersRoundTrip() throws Exception {
-        LanceBuildIndexesResponse original = new LanceBuildIndexesResponse("demo", List.of(), List.of("id"), List.of("vec"), null, null);
+        LanceBuildIndexesResponse original = new LanceBuildIndexesResponse(
+            "demo",
+            new KindResult(List.of(), List.of(), List.of()),
+            new KindResult(List.of("id"), List.of(), List.of()),
+            new KindResult(List.of("vec"), List.of(), List.of()),
+            null,
+            null,
+            RestStatus.OK
+        );
 
         LanceBuildIndexesResponse restored = roundTrip(original);
 
         assertNull(restored.columnsFilter());
         assertNull(restored.fragmentIds());
         assertEquals(List.of("vec"), restored.vectorBuilt());
+        assertFalse(restored.hasFailures());
+        assertEquals(RestStatus.OK, restored.status());
+    }
+
+    public void testResponseXContentListsBuiltSkippedAndFailedPerKind() throws Exception {
+        LanceBuildIndexesResponse response = new LanceBuildIndexesResponse(
+            "demo",
+            new KindResult(List.of(), List.of(), List.of(new ColumnResult("text", "unknown base tokenizer no-such-tokenizer"))),
+            new KindResult(List.of("id"), List.of(new ColumnResult("category", "already")), List.of()),
+            new KindResult(List.of(), List.of(), List.of()),
+            null,
+            null,
+            RestStatus.BAD_REQUEST
+        );
+
+        String json = Strings.toString(MediaTypeRegistry.JSON, response);
+
+        // The pre-existing built shape is unchanged; skipped and failed
+        // sit next to it with one {column, reason} object per column.
+        assertTrue(json, json.contains("\"built\":{\"fts\":[],\"scalar\":[\"id\"],\"vector\":[]}"));
+        assertTrue(
+            json,
+            json.contains("\"skipped\":{\"fts\":[],\"scalar\":[{\"column\":\"category\",\"reason\":\"already\"}],\"vector\":[]}")
+        );
+        assertTrue(
+            json,
+            json.contains(
+                "\"failed\":{\"fts\":[{\"column\":\"text\",\"reason\":\"unknown base tokenizer no-such-tokenizer\"}],\"scalar\":[],\"vector\":[]}"
+            )
+        );
+        assertFalse("status is transport metadata, not body", json.contains("status"));
     }
 
     private static LanceBuildIndexesRequest roundTrip(LanceBuildIndexesRequest original) throws Exception {

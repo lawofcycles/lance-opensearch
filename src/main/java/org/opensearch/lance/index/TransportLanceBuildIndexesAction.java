@@ -5,6 +5,7 @@
 
 package org.opensearch.lance.index;
 
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
@@ -22,6 +23,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
@@ -53,7 +55,8 @@ import org.opensearch.transport.client.Client;
  *       index instead of the BTree a keyword column would otherwise
  *       receive; {@code tokenizer} names the Lance {@code base_tokenizer}
  *       for those indexes (default {@code simple}), and Lance's rejection
- *       of the name comes back as 400.</li>
+ *       of the name comes back as 400 with the column under
+ *       {@code failed.fts}.</li>
  *   <li>{@code optimize=true} runs {@link Dataset#optimizeIndices} for the
  *       filtered indexes. Lance incrementally merges fragments not yet
  *       covered. {@code retrain=true} rebuilds the index (vector codebook
@@ -62,6 +65,13 @@ import org.opensearch.transport.client.Client;
  *
  * <p>Skips the {@code lance.builder.max_rows} check so operators can force
  * a build on tables the automatic path passed over.
+ *
+ * <p>Outcome reporting: the response carries, per index kind, the names
+ * that were built, the columns that were skipped with a reason, and the
+ * columns whose Lance call threw with Lance's message. The HTTP status
+ * comes from {@link #statusOf}: 200 when nothing failed, 400 when every
+ * failure is Lance's invalid-input rejection, 500 otherwise. The body is
+ * the same in all three cases so a partial success stays readable.
  *
  * <p>Threading: {@link Dataset#open} and the builders block on native I/O,
  * so {@link #doExecute} hands the operation to the generic pool. The
@@ -113,9 +123,9 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
         ActionListener<LanceBuildIndexesResponse> listener
     ) throws Exception {
         String indexName = request.index();
-        List<String> ftsBuilt;
-        List<String> scalarBuilt;
-        List<String> vectorBuilt;
+        LanceIndexBuilder.BuildResult fts;
+        LanceIndexBuilder.BuildResult scalar;
+        LanceIndexBuilder.BuildResult vector;
         try (Dataset dataset = LanceRegistry.openDataset(tableUri, storageOptions)) {
             RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset);
             Set<String> columnsFilter = request.columns() != null ? new LinkedHashSet<>(request.columns()) : null;
@@ -165,25 +175,30 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
                 // `<col>_fts` / `<col>_btree` / `<col>_vec` convention. Lance
                 // silently ignores unknown names, so guessing would return
                 // 200 with `built: [...]` even when nothing was touched.
-                ftsBuilt = LanceIndexBuilder.optimizeExistingFtsIndexes(dataset, ftsTarget, request.retrain());
-                scalarBuilt = LanceIndexBuilder.optimizeExistingScalarIndexes(dataset, scalarTarget, request.retrain());
-                vectorBuilt = LanceIndexBuilder.optimizeExistingVectorIndexes(dataset, vectorTarget, request.retrain());
+                fts = LanceIndexBuilder.optimizeExistingFtsIndexes(dataset, ftsTarget, request.retrain());
+                scalar = LanceIndexBuilder.optimizeExistingScalarIndexes(dataset, scalarTarget, request.retrain());
+                vector = LanceIndexBuilder.optimizeExistingVectorIndexes(dataset, vectorTarget, request.retrain());
             } else {
                 Optional<List<Integer>> fragmentIds = Optional.ofNullable(request.fragmentIds());
                 String tokenizer = request.tokenizer() != null ? request.tokenizer() : LanceIndexBuilder.DEFAULT_FTS_TOKENIZER;
-                ftsBuilt = LanceIndexBuilder.ensureFtsIndexes(dataset, ftsTarget, Long.MAX_VALUE, fragmentIds, tokenizer);
-                scalarBuilt = LanceIndexBuilder.ensureScalarIndexes(dataset, scalarTarget, Long.MAX_VALUE, fragmentIds);
-                vectorBuilt = LanceIndexBuilder.ensureVectorIndexes(dataset, vectorTarget, Long.MAX_VALUE, fragmentIds);
+                fts = LanceIndexBuilder.ensureFtsIndexes(dataset, ftsTarget, Long.MAX_VALUE, fragmentIds, tokenizer);
+                scalar = LanceIndexBuilder.ensureScalarIndexes(dataset, scalarTarget, Long.MAX_VALUE, fragmentIds);
+                vector = LanceIndexBuilder.ensureVectorIndexes(dataset, vectorTarget, Long.MAX_VALUE, fragmentIds);
             }
         }
 
+        List<LanceIndexBuilder.Failed> failures = new ArrayList<>();
+        failures.addAll(fts.failed());
+        failures.addAll(scalar.failed());
+        failures.addAll(vector.failed());
         LanceBuildIndexesResponse response = new LanceBuildIndexesResponse(
             indexName,
-            ftsBuilt,
-            scalarBuilt,
-            vectorBuilt,
+            toKindResult(fts),
+            toKindResult(scalar),
+            toKindResult(vector),
             request.columns(),
-            request.fragmentIds()
+            request.fragmentIds(),
+            statusOf(failures)
         );
         client.admin()
             .indices()
@@ -191,6 +206,38 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
                 new RefreshRequest(indexName),
                 ActionListener.wrap((RefreshResponse r) -> listener.onResponse(response), listener::onFailure)
             );
+    }
+
+    /**
+     * The one place that turns per-column failures into an HTTP status.
+     * No failure is 200 (skipped columns are not failures). Any failure is
+     * 500, unless every failure is Lance's invalid-input rejection
+     * (unknown tokenizer, malformed index params), which is the caller's
+     * mistake and answers 400. A mix stays 500 because the I/O error is
+     * the one the operator has to act on.
+     */
+    static RestStatus statusOf(List<LanceIndexBuilder.Failed> failures) {
+        if (failures.isEmpty()) {
+            return RestStatus.OK;
+        }
+        for (LanceIndexBuilder.Failed failure : failures) {
+            if (!failure.invalidInput()) {
+                return RestStatus.INTERNAL_SERVER_ERROR;
+            }
+        }
+        return RestStatus.BAD_REQUEST;
+    }
+
+    private static LanceBuildIndexesResponse.KindResult toKindResult(LanceIndexBuilder.BuildResult result) {
+        List<LanceBuildIndexesResponse.ColumnResult> skipped = new ArrayList<>(result.skipped().size());
+        for (LanceIndexBuilder.Skipped s : result.skipped()) {
+            skipped.add(new LanceBuildIndexesResponse.ColumnResult(s.column(), s.reason()));
+        }
+        List<LanceBuildIndexesResponse.ColumnResult> failed = new ArrayList<>(result.failed().size());
+        for (LanceIndexBuilder.Failed f : result.failed()) {
+            failed.add(new LanceBuildIndexesResponse.ColumnResult(f.column(), f.reason()));
+        }
+        return new LanceBuildIndexesResponse.KindResult(result.built(), skipped, failed);
     }
 
     private static Set<String> utf8Columns(Dataset dataset) {

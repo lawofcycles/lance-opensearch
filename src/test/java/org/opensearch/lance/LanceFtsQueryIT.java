@@ -8,7 +8,9 @@ package org.opensearch.lance;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -734,7 +736,8 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
 
     public void testBuildIndexesRejectsUnknownTokenizerWithLanceMessage() throws Exception {
         // The plugin has no allowlist; Lance's InvalidInput for the name
-        // reaches the caller as 400 with Lance's own wording.
+        // reaches the caller as 400 with Lance's own wording, under
+        // failed.fts so the caller can tell which column it was.
         try (JapaneseIndex fixture = JapaneseIndex.surface("jabadtok")) {
             String indexName = fixture.indexName();
             ResponseException failure = expectThrows(
@@ -746,6 +749,11 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             String body = readAll(failure.getResponse());
             assertTrue("expected Lance's message naming the tokenizer: " + body, body.contains("no-such-tokenizer"));
             assertTrue("expected Lance's 'unknown base tokenizer' wording: " + body, body.contains("unknown base tokenizer"));
+            assertTrue(
+                "expected the column under failed.fts: " + body,
+                body.contains("\"failed\":{\"fts\":[{\"column\":\"text\",\"reason\":\"")
+            );
+            assertTrue("expected an empty fts built list: " + body, body.contains("\"built\":{\"fts\":[]"));
 
             // Nothing was committed: the column is still keyword.
             String mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
@@ -754,6 +762,114 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
                 mapping.contains("\"text\":{\"type\":\"keyword\"")
             );
         }
+    }
+
+    public void testBuildIndexesOnReadOnlyTableAnswers500WithLanceMessage() throws Exception {
+        // The OpenSearch process can read the table but not write into
+        // it. Lance's CreateIndex fails with an I/O error, which must
+        // reach the caller as 500 with the column under failed.scalar
+        // and Lance's message, not as 200 with an empty built list.
+        try (JapaneseIndex fixture = JapaneseIndex.surface("jareadonly")) {
+            String indexName = fixture.indexName();
+            Path table = fixture.tablePath();
+            setReadOnlyRecursively(table);
+            try {
+                assumeFalse(
+                    "the table stayed writable after chmod (running as root?), so the write cannot be refused",
+                    canCreateFileIn(table)
+                );
+                ResponseException failure = expectThrows(
+                    ResponseException.class,
+                    () -> postJson("/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}")
+                );
+                int status = failure.getResponse().getStatusLine().getStatusCode();
+                String body = readAll(failure.getResponse());
+                assertEquals("expected 500 for a refused write, saw " + status + ": " + body, 500, status);
+                assertTrue("expected an empty built list: " + body, body.contains("\"built\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
+                assertTrue(
+                    "expected id under failed.scalar: " + body,
+                    body.contains("\"failed\":{\"fts\":[],\"scalar\":[{\"column\":\"id\",\"reason\":\"")
+                );
+                assertTrue("expected Lance's permission message: " + body, body.contains("Permission denied"));
+            } finally {
+                setWritableRecursively(table);
+            }
+        }
+    }
+
+    public void testBuildIndexesReportsAlreadyIndexedColumnAsSkipped() throws Exception {
+        // First build covers id only. The second build, without a column
+        // filter, builds text and reports id as skipped with the reason,
+        // and answers 200 because a skip is not a failure.
+        try (JapaneseIndex fixture = JapaneseIndex.surface("jaskipped")) {
+            String indexName = fixture.indexName();
+            String first = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}"));
+            assertTrue("expected id built: " + first, first.contains("\"built\":{\"fts\":[],\"scalar\":[\"id\"],\"vector\":[]}"));
+            assertTrue("expected nothing skipped: " + first, first.contains("\"skipped\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
+            assertTrue("expected nothing failed: " + first, first.contains("\"failed\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
+
+            Response second = postJson("/_lance/build_indexes/" + indexName, "{}");
+            assertEquals(200, second.getStatusLine().getStatusCode());
+            String body = readAll(second);
+            assertTrue("expected text built: " + body, body.contains("\"built\":{\"fts\":[],\"scalar\":[\"text\"],\"vector\":[]}"));
+            assertTrue(
+                "expected id skipped with the reason: " + body,
+                body.contains(
+                    "\"skipped\":{\"fts\":[],\"scalar\":[{\"column\":\"id\",\"reason\":\""
+                        + "scalar index already exists; use optimize=true to extend it over new fragments\"}],\"vector\":[]}"
+                )
+            );
+            assertTrue("expected nothing failed: " + body, body.contains("\"failed\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
+        }
+    }
+
+    /**
+     * Takes write permission away from every file and directory under
+     * {@code root} (owner read, plus execute on directories). Lance's local
+     * object store then gets EACCES when it tries to create the index
+     * directory or the new manifest.
+     */
+    private static void setReadOnlyRecursively(Path root) throws IOException {
+        try (var stream = Files.walk(root)) {
+            for (Path p : (Iterable<Path>) stream::iterator) {
+                Files.setPosixFilePermissions(
+                    p,
+                    Files.isDirectory(p)
+                        ? EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_EXECUTE)
+                        : EnumSet.of(PosixFilePermission.OWNER_READ)
+                );
+            }
+        }
+    }
+
+    /** Undoes {@link #setReadOnlyRecursively} so the fixture can delete the tree. */
+    private static void setWritableRecursively(Path root) throws IOException {
+        try (var stream = Files.walk(root)) {
+            for (Path p : (Iterable<Path>) stream::iterator) {
+                Files.setPosixFilePermissions(
+                    p,
+                    Files.isDirectory(p)
+                        ? EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE)
+                        : EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE)
+                );
+            }
+        }
+    }
+
+    /**
+     * True when this process can still create a file in {@code dir}. A
+     * root user ignores the mode bits, in which case the read-only test
+     * cannot observe a refused write and skips itself.
+     */
+    private static boolean canCreateFileIn(Path dir) throws IOException {
+        Path probe = dir.resolve("write-probe");
+        try {
+            Files.createFile(probe);
+        } catch (IOException denied) {
+            return false;
+        }
+        Files.delete(probe);
+        return true;
     }
 
     public void testBuildIndexesRejectsMalformedFtsColumnsAndTokenizer() throws Exception {
@@ -828,6 +944,11 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
 
         String indexName() {
             return indexName;
+        }
+
+        /** Filesystem path of the Lance table directory behind the index. */
+        Path tablePath() {
+            return scratchDir.resolve(indexName + ".lance");
         }
 
         static JapaneseIndex surface(String testHint) throws Exception {
