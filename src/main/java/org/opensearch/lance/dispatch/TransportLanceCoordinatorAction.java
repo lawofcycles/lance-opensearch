@@ -7,6 +7,7 @@ package org.opensearch.lance.dispatch;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -129,7 +130,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
         org.opensearch.index.query.QueryBuilder query = source == null ? null : source.query();
         org.opensearch.index.query.QueryBuilder postFilter = source == null ? null : source.postFilter();
-        List<SortBuilder<?>> sorts = source == null || source.sorts() == null ? java.util.Collections.emptyList() : source.sorts();
+        List<SortBuilder<?>> sorts = source == null || source.sorts() == null ? Collections.emptyList() : source.sorts();
         Object[] searchAfter = source == null ? null : source.searchAfter();
         AggregatorFactories.Builder aggregations = source == null ? null : source.aggregations();
         int size = resolveSize(source);
@@ -399,7 +400,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             spec.searchAfter(),
             spec.effectiveSize(),
             spec.aggregations(),
-            java.util.Collections.emptyList(),
+            Collections.emptyList(),
             spec.trackScores()
         );
         LOGGER.info(
@@ -466,17 +467,18 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * {@code IndexNotFoundException}), so the fragment query would
      * fail there.
      *
-     * <p>Lance-backed indices are single-shard. With the default
-     * {@code number_of_replicas=0} exactly one data node holds the
-     * shard and the fan-out collapses to that node. With
-     * {@code auto_expand_replicas} or an explicit replica count the
-     * routing table also carries replica copies, and every host of a
-     * started copy takes a round-robin share of the fragments. A
-     * replica copy is not a copy of the data: Lance fragments live in
-     * external storage and any node can open any fragment through
+     * <p>Lance-backed indices are single-shard and are created with
+     * {@code auto_expand_replicas: 0-all}, so once the copies have
+     * recovered every data node hosts one and takes a round-robin
+     * share of the fragments; on a single data node the fan-out
+     * collapses to that node. A replica copy is not a copy of the
+     * data: Lance fragments live in external storage and any node can
+     * open any fragment through
      * {@link org.opensearch.lance.LanceRegistry#openDataset}; the
      * copy only gives the node a reader and a
-     * {@code QueryShardContext} for the index.
+     * {@code QueryShardContext} for the index. Copies still
+     * initialising are skipped, so the spread grows as recovery
+     * completes.
      *
      * <p>If cluster state has no {@link IndexRoutingTable} for the
      * index yet (very early in create-index handling) or no copy is
@@ -729,7 +731,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         boolean nullsFirst = false;
         if (sort instanceof FieldSortBuilder field) {
             if (FieldSortBuilder.DOC_FIELD_NAME.equals(field.getFieldName())) {
-                return arrival;
+                return descending ? arrival.reversed() : arrival;
             }
             nullsFirst = "_first".equals(field.missing());
         }
@@ -786,7 +788,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * the field mapping), so the common case is two values of the
      * same {@link Comparable} class. Mixed numeric widths, which can
      * only happen when two indexes in one request map a field
-     * differently, are compared by value.
+     * differently, are compared by value. Any other pair has no
+     * defined order and would silently scramble the page, so it is
+     * refused.
      */
     @SuppressWarnings({ "unchecked", "rawtypes" })
     static int compareValues(Object left, Object right) {
@@ -799,7 +803,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             }
             return Double.compare(l.doubleValue(), r.doubleValue());
         }
-        return left.toString().compareTo(right.toString());
+        throw new IllegalStateException(
+            "cannot merge sort values of types [" + left.getClass().getName() + "] and [" + right.getClass().getName() + "]"
+        );
     }
 
     private static boolean isIntegral(Number n) {
