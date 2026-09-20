@@ -60,10 +60,12 @@ import org.lance.index.scalar.ScalarIndexParams;
  * "The FixedSizeList type requires an integer parameter representing number
  * of elements per list", so the IPC path is the reliable route.
  *
- * <p>Not part of the plugin runtime; kept under {@code src/test/java}
- * and only referenced from tests.
+ * <p>Not part of the plugin runtime; kept under {@code src/testFixtures}
+ * and only referenced from tests. The class is public so tests outside
+ * this package can reach {@link #writeMultiFragmentTable}; every other
+ * fixture is package-private.
  */
-final class LanceTableFactory {
+public final class LanceTableFactory {
 
     static final String VECTOR_COLUMN = "embedding";
     static final int VECTOR_DIM = 8;
@@ -107,10 +109,30 @@ final class LanceTableFactory {
      *         {@code /_lance/attach} or namespace register).
      */
     static String writeTable(Path parent, String name, int rowCount) throws Exception {
-        return withLocaleRoot(() -> writeTableOnce(parent, name, rowCount));
+        return withLocaleRoot(() -> writeTableOnce(parent, name, rowCount, 0));
     }
 
-    private static String writeTableOnce(Path parent, String name, int rowCount) throws Exception {
+    /**
+     * Same row layout and indexes as {@link #writeTable}, but the writer
+     * closes a data file (and therefore a fragment) every
+     * {@code maxRowsPerFile} rows, so a {@code rowCount} of 12 with
+     * {@code maxRowsPerFile} 4 yields three fragments holding rows
+     * 0..3, 4..7 and 8..11. Fragment ids are assigned in write order
+     * starting at 0, so the synthesised {@code _id} of row {@code i}
+     * is {@code (i / maxRowsPerFile) + "-" + (i % maxRowsPerFile)}.
+     *
+     * <p>Public because the query package's unit tests need a real
+     * multi-fragment {@link Dataset} to exercise fragment coverage
+     * checks; the other fixtures stay package-private.
+     */
+    public static String writeMultiFragmentTable(Path parent, String name, int rowCount, int maxRowsPerFile) throws Exception {
+        if (maxRowsPerFile <= 0) {
+            throw new IllegalArgumentException("maxRowsPerFile must be positive, was " + maxRowsPerFile);
+        }
+        return withLocaleRoot(() -> writeTableOnce(parent, name, rowCount, maxRowsPerFile));
+    }
+
+    private static String writeTableOnce(Path parent, String name, int rowCount, int maxRowsPerFile) throws Exception {
         Path tablePath = parent.resolve(name + ".lance");
         String uri = tablePath.toString();
         Schema schema = new Schema(
@@ -145,8 +167,13 @@ final class LanceTableFactory {
                 ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
             ) {
                 Data.exportArrayStream(allocator, reader, stream);
-                WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
-                try (Dataset dataset = Dataset.create(allocator, stream, uri, writeParams)) {
+                WriteParams.Builder writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE);
+                if (maxRowsPerFile > 0) {
+                    // Only the multi-fragment fixture sets this; writeTable
+                    // keeps Lance's default (one fragment for these sizes).
+                    writeParams = writeParams.withMaxRowsPerFile(maxRowsPerFile);
+                }
+                try (Dataset dataset = Dataset.create(allocator, stream, uri, writeParams.build())) {
                     // Build INVERTED indexes on body and title so derive()
                     // maps them to lance_text. Match the parameters
                     // LanceScannerFullTextSearchTest uses upstream.

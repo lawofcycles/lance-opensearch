@@ -1495,9 +1495,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * overload today, so this method assembles a scan that yields
      * zero payload columns; the batches carry only the row count
      * that the aggregator returns via {@code getRowCount()}. When
-     * fragmentIds is null every fragment is included; otherwise
-     * Lance filters the scan to the caller's subset (matching the
-     * {@code Dataset.countRows(sql)} branch below).
+     * fragmentIds is null or covers every fragment of the dataset the
+     * scan runs without a fragment restriction, so Lance answers it
+     * from the inverted index alone; a proper subset is passed through
+     * and Lance filters the scan to it (matching the
+     * {@code Dataset.countRows(sql)} branch below). See
+     * {@link LanceFtsQuery#restrictToFragmentsUnlessAll} for why the
+     * restriction is skipped when it would not change the row set.
      */
     private long countFtsHitsDirectly(Dataset dataset, LanceFtsQuery fts, List<Integer> fragmentIds) throws Exception {
         org.lance.ipc.ScanOptions.Builder builder = new org.lance.ipc.ScanOptions.Builder().fullTextQuery(fts.fullTextQuery())
@@ -1505,7 +1509,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             .withRowAddress(false)
             .withRowId(false);
         if (fragmentIds != null) {
-            builder = builder.fragmentIds(fragmentIds);
+            builder = LanceFtsQuery.restrictToFragmentsUnlessAll(builder, fragmentIds, dataset);
         }
         long total = 0L;
         try (

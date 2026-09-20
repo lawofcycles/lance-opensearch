@@ -8,7 +8,9 @@ package org.opensearch.lance.query;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -31,6 +33,8 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.Weight;
+import org.lance.Dataset;
+import org.lance.Fragment;
 import org.lance.ipc.FullTextQuery;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
@@ -322,13 +326,16 @@ public final class LanceFtsQuery extends Query {
             LanceCircuitBreaker.checkAndTrip("lance_fts_query");
 
             // Collect the fragment ids of every Lance-backed leaf in
-            // this shard so the single scan only touches the fragments
-            // this per-node executor was assigned. The IndexSearcher
-            // built by the fragment coordinator wraps exactly those
-            // fragments' leaves inside a LanceDirectoryReader, so
-            // walking the top-level context's leaves() gives the same
-            // subset the request was fanned out with — no more, no
-            // less. Walk up to the top-level context because
+            // this shard. They decide whether the single scan below
+            // needs a fragmentIds restriction: when the leaves cover
+            // every fragment of the dataset none is passed, otherwise
+            // the scan is limited to the fragments this per-node
+            // executor was assigned. The IndexSearcher built by the
+            // fragment coordinator wraps exactly those fragments'
+            // leaves inside a LanceDirectoryReader, so walking the
+            // top-level context's leaves() gives the same subset the
+            // request was fanned out with — no more, no less. Walk up
+            // to the top-level context because
             // LeafReaderContext.leaves() (inherited from
             // IndexReaderContext) is only valid when isTopLevel is
             // true.
@@ -369,7 +376,12 @@ public final class LanceFtsQuery extends Query {
                 effectiveLimit = Math.max(1L, (long) scanLimit);
             }
 
-            ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(fragmentIds)
+            // Restrict the scan to the executor's fragments only when
+            // they are a proper subset of the table; a full set is
+            // scanned without fragmentIds so Lance does not plan a
+            // _rowid prefilter read over the whole table before the
+            // inverted-index lookup (see restrictToFragmentsUnlessAll).
+            ScanOptions.Builder builder = restrictToFragmentsUnlessAll(new ScanOptions.Builder(), fragmentIds, leaf.dataset())
                 .fullTextQuery(query().fullTextQuery())
                 .withRowAddress(true);
             if (effectiveLimit > 0) {
@@ -501,6 +513,70 @@ public final class LanceFtsQuery extends Query {
             default:
                 return q.toString();
         }
+    }
+
+    /**
+     * Whether {@code executorFragmentIds} contains every fragment of
+     * {@code dataset}, so an FTS scan restricted to those ids would
+     * touch the same rows as an unrestricted scan.
+     *
+     * <p>Checked as set inclusion ({@code executor ⊇ dataset}) rather
+     * than by comparing sizes: the executor list comes from the leaves
+     * of the reader the coordinator built while the dataset's fragment
+     * list comes from the manifest version the reader pinned, and the
+     * two can legitimately disagree in membership (a fragment the
+     * coordinator saw that a later compaction removed) with equal
+     * sizes. Ids in {@code executorFragmentIds} that the dataset does
+     * not know are ignored: they cannot add rows to the scan.
+     */
+    static boolean coversAllFragments(Collection<Integer> executorFragmentIds, Dataset dataset) {
+        Set<Integer> executor = new HashSet<>(executorFragmentIds);
+        for (Fragment fragment : dataset.getFragments()) {
+            if (!executor.contains(fragment.getId())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Restrict {@code builder} to {@code fragmentIds} only when they are
+     * a proper subset of the dataset's fragments.
+     *
+     * <p>Lance's planner ({@code Scanner::prefilter_source} in
+     * {@code rust/lance/src/dataset/scanner.rs}) skips the prefilter
+     * stage only when there is no filter and no explicit fragment list.
+     * As soon as {@code fragmentIds} is set it plans a filtered read of
+     * the {@code _rowid} column over every target fragment and feeds
+     * that as a prefilter into the inverted-index lookup, so the scan
+     * reads one row id per row in the target fragments before it
+     * touches the posting lists. On a table where the executor holds
+     * every fragment that read covers the whole table and the query
+     * latency grows with the row count while the index lookup itself
+     * stays constant. Leaving {@code fragmentIds} unset in that case
+     * gives Lance the same plan pylance gets ({@code PreFilterSource::None})
+     * and the lookup runs from the index alone.
+     *
+     * <p>When the executor holds a proper subset the ids are still
+     * passed and the prefilter read still happens over that subset;
+     * the alternative (scan without {@code fragmentIds} and drop
+     * foreign rows in Java) is not taken because the bounded
+     * {@code limit} would then count rows that belong to other
+     * executors and the top-k per executor would be wrong, and
+     * without {@code limit} every match would be transferred. A
+     * Lance-side change that builds the prefilter from the fragment
+     * bitmap instead of a row id read would make the subset case an
+     * index-only lookup as well.
+     */
+    public static ScanOptions.Builder restrictToFragmentsUnlessAll(
+        ScanOptions.Builder builder,
+        List<Integer> fragmentIds,
+        Dataset dataset
+    ) {
+        if (coversAllFragments(fragmentIds, dataset)) {
+            return builder;
+        }
+        return builder.fragmentIds(fragmentIds);
     }
 
     /**
