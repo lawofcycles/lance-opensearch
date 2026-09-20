@@ -342,7 +342,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * returns this many rows the node repeats the scan restricted to
      * its fragments instead, which Lance answers through a
      * {@code _rowid} prefilter read. Dynamic: the next scan picks up
-     * a new value. See {@link org.opensearch.lance.query.LanceFtsQuery}.
+     * a new value. See {@link LanceFtsQuery}.
      */
     public static final Setting<Integer> FTS_SUBSET_PROBE_LIMIT_SETTING = Setting.intSetting(
         "lance.fts.subset_probe_limit",
