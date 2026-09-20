@@ -354,6 +354,7 @@ integTest {
     jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
     doFirst {
         sharedTablesDir.mkdirs()
+        sharedRepoDir.mkdirs()
     }
     systemProperty 'tests.lance.shared_tables_dir', sharedTablesDir.absolutePath
     // The default integTest stays single-node so the dev cycle is
@@ -400,6 +401,7 @@ task multiNodeIntegTest(type: org.opensearch.gradle.test.RestIntegTestTask) {
     jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
     doFirst {
         sharedTablesDir.mkdirs()
+        sharedRepoDir.mkdirs()
     }
     systemProperty 'tests.lance.shared_tables_dir', sharedTablesDir.absolutePath
     filter {
