@@ -21,7 +21,7 @@ The Substrait aggregation pushdown ([features.md](features.md#aggregation-pushdo
 
 - Nested buckets (`terms` under `terms`, `terms` under `date_histogram`), `composite`, `cardinality`, `percentiles`, `range` / `date_range`, `filters`, `multi_terms`, `rare_terms`, `significant_terms`. `cardinality` needs a HyperLogLog sketch the coordinator can merge; the scan returns exact distinct counts per executor, which do not merge, so it may stay with the aggregators unless the sketch is built on the executor from a `group by` on the field.
 - `terms` ordered by `_count` ascending or by a sub-aggregation, `min_doc_count` other than 1, `include` / `exclude`, `missing`; `terms` on a `list<utf8>` column (a group by on the list counts rows, not elements).
-- `histogram` with `offset`, `extended_bounds` or `hard_bounds`, or on a `date` / `boolean` field; `date_histogram` with `calendar_interval`, `offset`, `time_zone` or bounds.
+- `histogram` with `offset`, `extended_bounds` or `hard_bounds`, or on a `date` / `boolean` field; `date_histogram` with `offset`, `time_zone` or bounds; `date_histogram` with `calendar_interval` on a `date32` / `date64` column or on a timestamp column whose Arrow zone is not UTC (DataFusion's `date_trunc` takes a timestamp array and truncates on the column's zone).
 - Metrics with a script, `missing` or `value_type`; `sum` / `avg` / `min` / `max` on a `keyword`.
 - Any aggregation over a full-text or `lance_knn` query, with a `post_filter`, with hits, or under a reader wrapper (security plugin DLS / FLS).
 - A `meta` object that is present but empty is not echoed by the pushdown (the builder exposes an empty map for both cases).
