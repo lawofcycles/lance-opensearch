@@ -7,6 +7,7 @@ package org.opensearch.lance.engine;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashMap;
@@ -315,6 +316,32 @@ public class LanceWarmCacheTests extends OpenSearchTestCase {
         cache.retire(UUID_A, replacement.version() + 1);
         assertTrue(replacement.isClosed());
         assertFalse("the last snapshot of the key drops the columns", cache.columnStore().contains(replacement.key(), "rating", 0));
+    }
+
+    public void testAFailedLatestVersionProbeFallsBackToOpeningTheTable() throws Exception {
+        // A shard reopened after its table went missing acquires with no
+        // version while an idle snapshot of the index is still cached.
+        // The probe on that snapshot's dataset fails; the open that follows
+        // reports the table as not found, the same error a first open
+        // reports, and the idle snapshot stays for when the table is back.
+        Snapshot idle;
+        try (Lease lease = acquire(UUID_A, Optional.empty())) {
+            idle = lease.snapshot();
+        }
+        Path table = Path.of(uri);
+        Path moved = table.resolveSibling(table.getFileName() + ".moved");
+        Files.move(table, moved);
+        try {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> acquire(UUID_A, Optional.empty()));
+            assertTrue(e.getMessage(), e.getMessage().contains("was not found"));
+            assertEquals("the probe released its reference", 0, idle.refCount());
+            assertFalse(idle.isClosed());
+        } finally {
+            Files.move(moved, table);
+        }
+        try (Lease lease = acquire(UUID_A, Optional.empty())) {
+            assertSame("the table is back and the idle snapshot serves it again", idle, lease.snapshot());
+        }
     }
 
     public void testCloseReleasesEverySnapshot() throws Exception {
