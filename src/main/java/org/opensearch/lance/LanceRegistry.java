@@ -46,6 +46,16 @@ public final class LanceRegistry {
      */
     private static volatile Session SESSION;
 
+    /**
+     * How the installed Session's index cache is sized: the capacity
+     * handed to Lance, the shard count Lance derives from it and the
+     * per-shard share that bounds the heaviest admissible entry. Set
+     * together with {@link #SESSION} and cleared with it; read by the
+     * stats endpoint and by attach, which warns when a table's inverted
+     * index is heavier than the share.
+     */
+    private static volatile NativeMemoryLimit.IndexCacheSizing INDEX_CACHE_SIZING;
+
     private LanceRegistry() {}
 
     public static BufferAllocator allocator() {
@@ -54,19 +64,35 @@ public final class LanceRegistry {
 
     /**
      * Install a node-scoped {@link Session} with the given cache sizes.
-     * Called once from {@code LancePlugin.createComponents}. If a Session
-     * is already installed (e.g. an integration test framework restart
-     * within the same JVM) the existing Session is closed first so its
-     * native cache is released before the new one is built.
+     * If a Session is already installed (e.g. an integration test
+     * framework restart within the same JVM) the existing Session is
+     * closed first so its native cache is released before the new one is
+     * built. The index cache capacity is handed to Lance as is; the shard
+     * count and share recorded for it describe what Lance does with that
+     * capacity on this node's CPU count.
      *
      * @param indexCacheBytes    upper bound of the shared index cache
      * @param metadataCacheBytes upper bound of the shared metadata cache
      */
     public static synchronized void initSession(long indexCacheBytes, long metadataCacheBytes) {
+        initSession(NativeMemoryLimit.IndexCacheSizing.ofCapacity(indexCacheBytes, NativeMemoryLimit.availableCpus()), metadataCacheBytes);
+    }
+
+    /**
+     * Install a node-scoped {@link Session} whose index cache capacity
+     * is {@code sizing.capacityBytes()}. Called once from
+     * {@code LancePlugin.createComponents} with the sizing chosen by
+     * {@link NativeMemoryLimit#sizeIndexCache}.
+     *
+     * @param sizing             index cache capacity and its shard layout
+     * @param metadataCacheBytes upper bound of the shared metadata cache
+     */
+    public static synchronized void initSession(NativeMemoryLimit.IndexCacheSizing sizing, long metadataCacheBytes) {
         if (SESSION != null && !SESSION.isClosed()) {
             SESSION.close();
         }
-        SESSION = Session.builder().indexCacheSizeBytes(indexCacheBytes).metadataCacheSizeBytes(metadataCacheBytes).build();
+        SESSION = Session.builder().indexCacheSizeBytes(sizing.capacityBytes()).metadataCacheSizeBytes(metadataCacheBytes).build();
+        INDEX_CACHE_SIZING = sizing;
     }
 
     /**
@@ -83,6 +109,15 @@ public final class LanceRegistry {
             }
             SESSION = null;
         }
+        INDEX_CACHE_SIZING = null;
+    }
+
+    /**
+     * Index cache sizing of the installed Session, or {@code null} when
+     * no Session is installed.
+     */
+    public static NativeMemoryLimit.IndexCacheSizing indexCacheSizing() {
+        return INDEX_CACHE_SIZING;
     }
 
     /**

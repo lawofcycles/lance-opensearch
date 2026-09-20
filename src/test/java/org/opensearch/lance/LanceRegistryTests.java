@@ -50,16 +50,25 @@ public class LanceRegistryTests extends OpenSearchTestCase {
 
     public void testSessionLifecycleInstallsAndReleases() {
         assertNull("before initSession there is no shared Session", LanceRegistry.currentSession());
+        assertNull("before initSession there is no index cache sizing", LanceRegistry.indexCacheSizing());
 
         LanceRegistry.initSession(64L * 1024 * 1024, 8L * 1024 * 1024);
 
         Session session = LanceRegistry.currentSession();
         assertNotNull("initSession must install a Session", session);
         assertFalse("newly installed Session should be open", session.isClosed());
+        // A capacity below 4 GiB is one shard, so the share is the capacity.
+        NativeMemoryLimit.IndexCacheSizing sizing = LanceRegistry.indexCacheSizing();
+        assertNotNull("initSession must record the index cache sizing", sizing);
+        assertEquals(64L * 1024 * 1024, sizing.capacityBytes());
+        assertEquals(1, sizing.shards());
+        assertEquals(64L * 1024 * 1024, sizing.shardShareBytes());
+        assertEquals(0L, sizing.unusedBytes());
 
         LanceRegistry.closeSession();
 
         assertNull("closeSession must clear the field", LanceRegistry.currentSession());
+        assertNull("closeSession must clear the sizing", LanceRegistry.indexCacheSizing());
         assertTrue("released Session should be closed", session.isClosed());
     }
 
