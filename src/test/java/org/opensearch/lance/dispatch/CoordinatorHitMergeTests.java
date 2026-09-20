@@ -136,6 +136,29 @@ public class CoordinatorHitMergeTests extends OpenSearchTestCase {
         List<SearchHit> merged = TransportLanceCoordinatorAction.mergeHits(List.of(nodeA, nodeB), sorts);
 
         assertEquals(List.of("a1", "a2", "b1", "b2"), ids(merged));
+
+        List<SortBuilder<?>> descending = List.of(new FieldSortBuilder(FieldSortBuilder.DOC_FIELD_NAME).order(SortOrder.DESC));
+        assertEquals(List.of("b2", "b1", "a2", "a1"), ids(TransportLanceCoordinatorAction.mergeHits(List.of(nodeA, nodeB), descending)));
+    }
+
+    public void testUnrelatedSortValueTypesAreRefused() {
+        // A Long against a BytesRef in the same clause has no defined
+        // order; refusing beats a silently scrambled page.
+        List<SearchHit> nodeA = List.of(sorted("a1", 1L));
+        List<SearchHit> nodeB = List.of(sorted("b1", new BytesRef("x")));
+        List<SortBuilder<?>> sorts = List.of(new FieldSortBuilder("id"));
+
+        IllegalStateException e = expectThrows(
+            IllegalStateException.class,
+            () -> TransportLanceCoordinatorAction.mergeHits(List.of(nodeA, nodeB), sorts)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("java.lang.Long") && e.getMessage().contains("BytesRef"));
+
+        // Mixed numeric widths are still compared by value.
+        assertEquals(
+            List.of("i", "l"),
+            ids(TransportLanceCoordinatorAction.mergeHits(List.of(List.of(sorted("l", 5L)), List.of(sorted("i", 3))), sorts))
+        );
     }
 
     public void testEmptyAndSingleNodeInputs() {
