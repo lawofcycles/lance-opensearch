@@ -113,8 +113,8 @@ public class LanceSnapshotIT extends LanceRestTestCase {
                 // The delete dropped the index from the poll's tracking and
                 // the restore put it back into cluster state, so the poll
                 // adopts it again from index.lance.table. A later manifest
-                // advance therefore reaches the shard engine behind _count
-                // and _stats on the next poll cycle, not only _search
+                // advance therefore reaches the shard engine behind _stats
+                // on the next poll cycle, not only _search and _count
                 // (whose fragment path opens the latest version per query).
                 LanceTableFactory.deleteRows(f.tableUri(), "id >= 2");
                 Thread.sleep(3_500);
@@ -344,9 +344,9 @@ public class LanceSnapshotIT extends LanceRestTestCase {
                 assertTrue("later retries must still name the missing table: " + explain, details.contains("was not found"));
             }, 60, TimeUnit.SECONDS);
 
-            // The index exists with its settings. _count (shard path) has
-            // no shard to run on; _search (fragment path) opens the table
-            // itself and fails on the missing dataset.
+            // The index exists with its settings. _count and _search
+            // both run on the fragment path, which opens the table
+            // itself and fails on the missing dataset with the same 400.
             String settings = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
             assertEquals(tablePath.toString(), extractPath(settings, indexName, "settings", "index", "lance", "table"));
             ResponseException count = expectThrows(
@@ -365,7 +365,7 @@ public class LanceSnapshotIT extends LanceRestTestCase {
                 + search.getResponse().getStatusLine().getStatusCode()
                 + " body="
                 + readAll(search.getResponse());
-            assertEquals(observed, 503, count.getResponse().getStatusLine().getStatusCode());
+            assertEquals(observed, 400, count.getResponse().getStatusLine().getStatusCode());
             assertEquals(observed, 400, search.getResponse().getStatusLine().getStatusCode());
 
             // Putting the table back and retrying the failed allocation
@@ -513,10 +513,10 @@ public class LanceSnapshotIT extends LanceRestTestCase {
 
     /**
      * Row count as the shard engine's reader sees it ({@code _stats}
-     * docs.count comes from {@code Engine#docStats}). {@code _count} reads
-     * the same reader through the shard path because its
-     * {@code track_total_hits} flag keeps it off the fragment path;
-     * {@code _search} opens the table anew per query.
+     * docs.count comes from {@code Engine#docStats}). {@code _count} and
+     * {@code _search} both run on the fragment path, which opens the
+     * table anew per query, so this is the only REST view of the engine
+     * reader.
      */
     private static int engineDocCount(String indexName) throws IOException {
         String stats = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_stats/docs")));

@@ -5,8 +5,11 @@
 
 package org.opensearch.lance;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.stream.Stream;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -511,11 +514,11 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         }
     }
 
-    public void testMinScoreTerminateAfterTrackTotalHitsFallThroughToShardPath() throws Exception {
-        // min_score, terminate_after and track_total_hits are not
-        // implemented by the fragment dispatch path (it counts matches
-        // from Lance without those knobs); the dispatch filter sends
-        // those requests to the shard path.
+    public void testMinScoreTerminateAfterFallThroughToShardPath() throws Exception {
+        // min_score and terminate_after are not implemented by the
+        // fragment dispatch path (it counts matches from Lance without
+        // those knobs); the dispatch filter sends those requests to
+        // the shard path.
         String suffix = "s3-reject-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -543,22 +546,136 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
                 "terminate_after should set terminated_early=true on the shard path: " + terminateBody,
                 terminateBody.contains("\"terminated_early\":true")
             );
-
-            String trackBoundBody = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":3}")
-            );
-            assertTrue("track_total_hits:3 should return relation=gte: " + trackBoundBody, trackBoundBody.contains("\"relation\":\"gte\""));
-
-            // track_total_hits=false omits hits.total entirely.
-            String trackFalseBody = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":false}")
-            );
-            assertFalse("track_total_hits:false should omit hits.total: " + trackFalseBody, trackFalseBody.contains("\"total\":{"));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
         }
+    }
+
+    public void testTrackTotalHitsAndCountRunOnFragmentPath() throws Exception {
+        // track_total_hits in every form, and therefore _count (which
+        // sends track_total_hits: true with size 0), are answered by
+        // the fragment path. The match_all count comes from Lance
+        // metadata and is exact on the executor; the coordinator
+        // applies the bound, so an integer bound below the total
+        // yields the capped value with relation gte, `true` and the
+        // default yield the exact value, and `false` drops hits.total.
+        String suffix = "s3-track-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 12, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            String trackBoundBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":3}")
+            );
+            assertEquals(
+                "track_total_hits:3 caps the value: " + trackBoundBody,
+                3,
+                extractIntPath(trackBoundBody, "hits", "total", "value")
+            );
+            assertTrue("track_total_hits:3 should return relation=gte: " + trackBoundBody, trackBoundBody.contains("\"relation\":\"gte\""));
+
+            String trackTrueBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":true}")
+            );
+            assertEquals(12, extractIntPath(trackTrueBody, "hits", "total", "value"));
+            assertTrue("track_total_hits:true is exact: " + trackTrueBody, trackTrueBody.contains("\"relation\":\"eq\""));
+
+            String trackFalseBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":false}")
+            );
+            assertFalse("track_total_hits:false should omit hits.total: " + trackFalseBody, trackFalseBody.contains("\"total\":{"));
+
+            // A scalar filter counts through Dataset.countRows(sql):
+            // exact on the executor, capped by the coordinator.
+            String filterBound = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":5}")
+            );
+            assertEquals(5, extractIntPath(filterBound, "hits", "total", "value"));
+            assertTrue(filterBound.contains("\"relation\":\"gte\""));
+            String filterExact = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}}}"));
+            assertEquals(8, extractIntPath(filterExact, "hits", "total", "value"));
+            assertTrue(filterExact.contains("\"relation\":\"eq\""));
+
+            // _count agrees with `_search size 0` for match_all, a
+            // scalar filter and an FTS query, and each _count request
+            // adds one coordinator fan-out line for this index to the
+            // node log (one line per request on a single-node
+            // cluster), which is what shows it ran on the fragment
+            // path rather than through the shard engine.
+            String[] queries = new String[] {
+                "{\"match_all\":{}}",
+                "{\"range\":{\"id\":{\"gte\":4}}}",
+                "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}" };
+            int[] expected = new int[queries.length];
+            for (int i = 0; i < queries.length; i++) {
+                String search = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":" + queries[i] + "}"));
+                expected[i] = extractIntPath(search, "hits", "total", "value");
+            }
+            assertEquals(12, expected[0]);
+            assertEquals(8, expected[1]);
+            assertEquals(6, expected[2]);
+            long fanOutsBefore = fanOutLogLines(indexName);
+            for (int i = 0; i < queries.length; i++) {
+                String count = readAll(postJson("/" + indexName + "/_count", "{\"query\":" + queries[i] + "}"));
+                assertEquals(
+                    "_count must agree with hits.total.value for " + queries[i] + ": " + count,
+                    expected[i],
+                    extractIntPath(count, "count")
+                );
+            }
+            assertEquals(12, extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count"));
+            assertBusy(() -> {
+                long fanOuts = fanOutLogLines(indexName);
+                assertEquals("every _count request must fan out on the fragment path", fanOutsBefore + queries.length + 1, fanOuts);
+            });
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Number of coordinator fan-out log lines for {@code indexName}
+     * across the node logs of the test cluster. The testclusters plugin
+     * writes them under {@code build/testclusters/<task>-<n>/logs}, the
+     * sibling of the shared tables directory the build passes in. Only
+     * the log4j file ({@code <task>.log}) is read; the plugin also keeps
+     * the process's captured stdout ({@code opensearch.stdout.log}),
+     * which repeats every line.
+     */
+    private static long fanOutLogLines(String indexName) throws IOException {
+        Path clustersDir = sharedRoot().resolveSibling("testclusters");
+        assertTrue(
+            "testclusters directory not found at " + clustersDir + " (expected next to tests.lance.shared_tables_dir)",
+            Files.isDirectory(clustersDir)
+        );
+        String marker = "lance.dispatch: fan-out index [" + indexName + "]";
+        long count = 0;
+        int nodeLogs = 0;
+        try (Stream<Path> files = Files.walk(clustersDir)) {
+            for (Path file : files.filter(Files::isRegularFile).toList()) {
+                String name = file.getFileName().toString();
+                if (!name.endsWith(".log") || name.startsWith("opensearch.") || !file.getParent().getFileName().toString().equals("logs")) {
+                    continue;
+                }
+                nodeLogs++;
+                for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+                    if (line.contains(marker)) {
+                        count++;
+                    }
+                }
+            }
+        }
+        assertTrue("no node log (<task>-<n>/logs/<task>.log) found under " + clustersDir, nodeLogs > 0);
+        return count;
     }
 
     public void testFragmentDispatchModeStampsIndexAndVersionEnvelope() throws Exception {

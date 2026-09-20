@@ -88,8 +88,8 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             assertEquals(6, extractIntPath(pagedBody, "hits", "total", "value"));
             assertEquals(2, hitsOf(pagedBody).size());
 
-            // _count is answered by the shard engine's reader over the
-            // same three fragments and must agree with hits.total.value.
+            // _count runs on the fragment path with track_total_hits:
+            // true and must agree with hits.total.value.
             String countBody = readAll(
                 postJson("/" + indexName + "/_count", "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}}")
             );
@@ -98,6 +98,96 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
                 postJson("/" + indexName + "/_count", "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"4\"}}}")
             );
             assertEquals("_count for token 4: " + singleCountBody, 1, extractIntPath(singleCountBody, "count"));
+        }
+    }
+
+    public void testLanceMatchHonoursTrackTotalHits() throws Exception {
+        // 12 rows in three fragments, six of them "hello". The default
+        // bound (10,000) is out of reach for a fixture this size, so an
+        // explicit track_total_hits: 3 stands in for it: the executor
+        // stops counting past the bound and the coordinator reports
+        // the capped value with relation gte. Every size is covered
+        // because the executor takes a different count path for each:
+        // size 10 (the bounded hits scan returns all 6, short of its
+        // limit, so its own count is exact), size 2 (the hits scan is
+        // clipped, so a count scan limited to bound + 1 runs), size 0
+        // (no hits scan; the same limited count scan runs) and
+        // size 0 with an aggregation (the count comes from the
+        // aggregation's scan).
+        try (LanceTestCluster fixture = LanceTestCluster.setUpMultiFragment(12, 4, "lmatchtrackhits")) {
+            String indexName = fixture.indexName();
+            String hello = "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}";
+            String terms = ",\"aggs\":{\"ids\":{\"terms\":{\"field\":\"id\",\"size\":20}}}";
+
+            for (String shape : new String[] { "\"size\":10", "\"size\":2", "\"size\":0", "\"size\":0" + terms }) {
+                String bounded = readAll(
+                    postJson("/" + indexName + "/_search", "{" + shape + ",\"track_total_hits\":3,\"query\":" + hello + "}")
+                );
+                assertEquals(
+                    "track_total_hits:3 caps the value (" + shape + "): " + bounded,
+                    3,
+                    extractIntPath(bounded, "hits", "total", "value")
+                );
+                assertEquals("track_total_hits:3 relation (" + shape + "): " + bounded, "gte", totalRelation(bounded));
+
+                String accurate = readAll(
+                    postJson("/" + indexName + "/_search", "{" + shape + ",\"track_total_hits\":true,\"query\":" + hello + "}")
+                );
+                assertEquals(
+                    "track_total_hits:true is exact (" + shape + "): " + accurate,
+                    6,
+                    extractIntPath(accurate, "hits", "total", "value")
+                );
+                assertEquals("track_total_hits:true relation (" + shape + "): " + accurate, "eq", totalRelation(accurate));
+
+                String omitted = readAll(postJson("/" + indexName + "/_search", "{" + shape + ",\"query\":" + hello + "}"));
+                assertEquals(
+                    "default bound is exact below 10,000 (" + shape + "): " + omitted,
+                    6,
+                    extractIntPath(omitted, "hits", "total", "value")
+                );
+                assertEquals("default bound relation (" + shape + "): " + omitted, "eq", totalRelation(omitted));
+
+                String disabled = readAll(
+                    postJson("/" + indexName + "/_search", "{" + shape + ",\"track_total_hits\":false,\"query\":" + hello + "}")
+                );
+                assertFalse("track_total_hits:false omits hits.total (" + shape + "): " + disabled, disabled.contains("\"total\":{"));
+                assertTrue("hits array is still present (" + shape + "): " + disabled, disabled.contains("\"hits\":["));
+            }
+
+            // A bound the total does not reach stays exact.
+            String wide = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"track_total_hits\":100,\"query\":" + hello + "}"));
+            assertEquals(6, extractIntPath(wide, "hits", "total", "value"));
+            assertEquals("eq", totalRelation(wide));
+
+            // With the aggregation the buckets themselves are unaffected
+            // by the bound: six hello rows, one bucket each.
+            String aggBounded = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"track_total_hits\":3,\"query\":" + hello + terms + "}")
+            );
+            assertEquals("terms buckets ignore track_total_hits: " + aggBounded, 6, countOccurrences(aggBounded, "\"doc_count\":1"));
+
+            // The bound also applies to a bool collapsed into a
+            // prefiltered FTS scan (rows 4, 6, 8, 10 are the hello
+            // rows with id >= 4).
+            String prefiltered = "{\"bool\":{\"must\":[" + hello + "],\"filter\":[{\"range\":{\"id\":{\"gte\":4}}}]}}";
+            String prefilteredBounded = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":2,\"track_total_hits\":3,\"query\":" + prefiltered + "}")
+            );
+            assertEquals(3, extractIntPath(prefilteredBounded, "hits", "total", "value"));
+            assertEquals("gte", totalRelation(prefilteredBounded));
+            String prefilteredExact = readAll(postJson("/" + indexName + "/_search", "{\"size\":2,\"query\":" + prefiltered + "}"));
+            assertEquals(4, extractIntPath(prefilteredExact, "hits", "total", "value"));
+            assertEquals("eq", totalRelation(prefilteredExact));
+        }
+    }
+
+    private static String totalRelation(String searchBody) throws IOException {
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, searchBody)) {
+            Map<String, Object> map = parser.map();
+            @SuppressWarnings("unchecked")
+            Map<String, Object> total = (Map<String, Object>) ((Map<String, Object>) map.get("hits")).get("total");
+            return (String) total.get("relation");
         }
     }
 
