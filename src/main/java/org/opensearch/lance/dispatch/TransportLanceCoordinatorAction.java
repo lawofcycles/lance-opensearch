@@ -315,9 +315,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
         // Responses land in the slot of the node they came from, so
         // the merge sees them in fan-out (node id) order rather than
-        // arrival order. That order is the tie-breaker for hits with
-        // equal sort values, and it has to be the same on every
-        // request for the response to be deterministic.
+        // arrival order. The merge itself orders equal hits by row
+        // address and does not depend on this order; keeping it fixed
+        // keeps the per-node lists, and with them the logs and the
+        // aggregation partials, in the same order on every request.
         // GroupedActionListener's own collection is arrival-ordered
         // and is only used here for the completion count.
         AtomicReferenceArray<LanceFragmentQueryResponse> slots = new AtomicReferenceArray<>(fanOutSize);
@@ -476,8 +477,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * Round-robin fragment ids across the sorted data-node list.
      * Empty per-node bucket entries are omitted so downstream
      * dispatch code only sees nodes that actually own work. The map
-     * iterates in {@code nodeList} order so the fan-out (and the
-     * merge tie-break that follows it) is deterministic.
+     * iterates in {@code nodeList} order so the fan-out is
+     * deterministic.
      */
     private static Map<DiscoveryNode, List<Integer>> groupFragmentsByNode(List<Integer> fragmentIds, List<DiscoveryNode> nodeList) {
         Map<DiscoveryNode, List<Integer>> result = new LinkedHashMap<>();
@@ -629,8 +630,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * single executor would have ordered the union.
      *
      * <p>Each inner list is one node's response, already sorted by
-     * that node's executor and cut to {@code from + size}. The merge
-     * re-sorts the union with a comparator built from {@code sorts}:
+     * that node's executor and cut to {@code from + size}, with the
+     * Lance row address of every hit. The merge re-sorts the union
+     * with a comparator built from {@code sorts}:
      * <ul>
      *   <li>no sort clause, or a single {@code _score} clause: score
      *       descending ({@link SearchHit#getScore()});</li>
@@ -638,8 +640,12 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      *       at that position (the executor stores the score there;
      *       {@link SearchHit#getScore()} is NaN when the request did
      *       not set {@code track_scores}), in the clause's order;</li>
-     *   <li>a {@code _doc} clause: node order then per-node order,
-     *       because Lucene doc ids are meaningless across nodes;</li>
+     *   <li>a {@code _doc} clause: row address in the clause's order.
+     *       On a single reader over the whole table doc id order is
+     *       fragment order then offset, which is row address order,
+     *       so this is what the clause means there; the per-node doc
+     *       ids the executors report as sort values only order docs
+     *       within one node;</li>
      *   <li>any other clause: {@link SearchHit#getRawSortValues()} at
      *       that position, compared as {@link Comparable} in the
      *       clause's order. The executor already substituted the
@@ -648,21 +654,24 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      *       clause says {@code "missing": "_first"}, the same default
      *       OpenSearch's comparator sources apply.</li>
      * </ul>
-     * Hits that compare equal keep node order (the fan-out order,
-     * node id ascending) and then their position in the node's list.
+     * Hits that compare equal are ordered by index (the order of the
+     * request's targets) and then by row address ascending. Lucene's
+     * collectors break ties by doc id ascending, so every executor
+     * returns the tied rows of its fragments in row address order and
+     * the lowest addresses of the whole table are always among the
+     * per-node pages; sorting the union by the same key therefore
+     * yields the page one reader over the whole table would produce,
+     * whatever the number of nodes.
      *
      * <p>{@code search_after} needs no handling here: each executor
      * already applied the cursor to its own hits, so every hit in
      * every inner list is past the cursor and the merged order is the
      * correct continuation.
      */
-    static List<SearchHit> mergeHits(List<List<SearchHit>> perNodeHits, List<SortBuilder<?>> sorts) {
+    static List<SearchHit> mergeHits(List<List<RankedHit>> perNodeHits, List<SortBuilder<?>> sorts) {
         List<RankedHit> ranked = new ArrayList<>();
-        for (int node = 0; node < perNodeHits.size(); node++) {
-            List<SearchHit> nodeHits = perNodeHits.get(node);
-            for (int position = 0; position < nodeHits.size(); position++) {
-                ranked.add(new RankedHit(nodeHits.get(position), node, position));
-            }
+        for (List<RankedHit> nodeHits : perNodeHits) {
+            ranked.addAll(nodeHits);
         }
         if (ranked.size() > 1) {
             ranked.sort(hitComparator(sorts));
@@ -674,24 +683,31 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         return out;
     }
 
-    private record RankedHit(SearchHit hit, int node, int position) {
+    /**
+     * A per-node hit with what the merge needs to place it: the
+     * ordinal of the index it came from in the request's target list
+     * and its Lance row address ({@code fragmentId << 32 | offset}).
+     * Row addresses are unique within one table, so the pair is a
+     * total order over every hit of the request.
+     */
+    record RankedHit(SearchHit hit, int target, long rowAddr) {
     }
 
     private static Comparator<RankedHit> hitComparator(List<SortBuilder<?>> sorts) {
-        Comparator<RankedHit> arrival = Comparator.comparingInt(RankedHit::node).thenComparingInt(RankedHit::position);
+        Comparator<RankedHit> tieBreak = Comparator.comparingInt(RankedHit::target).thenComparingLong(RankedHit::rowAddr);
         if (sorts == null || sorts.isEmpty()) {
-            return Comparator.<RankedHit>comparingDouble(r -> -scoreOf(r.hit())).thenComparing(arrival);
+            return Comparator.<RankedHit>comparingDouble(r -> -scoreOf(r.hit())).thenComparing(tieBreak);
         }
         Comparator<RankedHit> comparator = null;
         for (int i = 0; i < sorts.size(); i++) {
             SortBuilder<?> sort = sorts.get(i);
-            Comparator<RankedHit> clause = clauseComparator(sort, i, arrival);
+            Comparator<RankedHit> clause = clauseComparator(sort, i);
             comparator = comparator == null ? clause : comparator.thenComparing(clause);
         }
-        return comparator.thenComparing(arrival);
+        return comparator.thenComparing(tieBreak);
     }
 
-    private static Comparator<RankedHit> clauseComparator(SortBuilder<?> sort, int index, Comparator<RankedHit> arrival) {
+    private static Comparator<RankedHit> clauseComparator(SortBuilder<?> sort, int index) {
         boolean descending = sort.order() == SortOrder.DESC;
         if (sort instanceof ScoreSortBuilder) {
             Comparator<RankedHit> byScore = (a, b) -> Float.compare(scoreAt(a.hit(), index), scoreAt(b.hit(), index));
@@ -700,7 +716,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         boolean nullsFirst = false;
         if (sort instanceof FieldSortBuilder field) {
             if (FieldSortBuilder.DOC_FIELD_NAME.equals(field.getFieldName())) {
-                return descending ? arrival.reversed() : arrival;
+                Comparator<RankedHit> byRowAddr = Comparator.comparingLong(RankedHit::rowAddr);
+                return descending ? byRowAddr.reversed() : byRowAddr;
             }
             nullsFirst = "_first".equals(field.missing());
         }
@@ -854,8 +871,15 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         private boolean matchedIsLowerBound = false;
         // One entry per per-node response, in fan-out order (target
         // order, then node id order within a target). Each inner list
-        // is already sorted by the executor and cut to from + size.
-        private final List<List<SearchHit>> perNodeHits = new ArrayList<>();
+        // is already sorted by the executor and cut to from + size,
+        // and carries the target ordinal and row address the merge
+        // breaks ties on.
+        private final List<List<RankedHit>> perNodeHits = new ArrayList<>();
+        // Ordinal of the target whose responses absorbTargetResponses
+        // is absorbing; targets arrive one after another in request
+        // order, so this is the position of the target in the
+        // request's index list.
+        private int targetOrdinal = -1;
         private final List<InternalAggregations> perNodeAggregations = new ArrayList<>();
 
         MergeState(
@@ -891,16 +915,20 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                     /* clusterAlias */ null,
                     org.opensearch.action.OriginalIndices.NONE
                 );
+            targetOrdinal++;
             for (LanceFragmentQueryResponse response : responses) {
                 totalMatched += response.matched();
                 matchedIsLowerBound |= response.matchedIsLowerBound();
                 // Keep each node's list intact; the sort merge and
                 // the from/size cut run in buildResponse once every
                 // node of every target has answered.
-                List<SearchHit> nodeHits = new ArrayList<>(response.hits().size());
-                for (SearchHit hit : response.hits()) {
+                List<SearchHit> hits = response.hits();
+                long[] rowAddrs = response.rowAddrs();
+                List<RankedHit> nodeHits = new ArrayList<>(hits.size());
+                for (int i = 0; i < hits.size(); i++) {
+                    SearchHit hit = hits.get(i);
                     stampEnvelope(hit, shardTarget);
-                    nodeHits.add(hit);
+                    nodeHits.add(new RankedHit(hit, targetOrdinal, rowAddrs[i]));
                 }
                 perNodeHits.add(nodeHits);
                 if (response.aggregations() != null) {
