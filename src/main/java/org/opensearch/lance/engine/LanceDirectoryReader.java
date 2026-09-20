@@ -85,6 +85,13 @@ public final class LanceDirectoryReader extends DirectoryReader {
     // dataset instead and leaves it open for the next request.
     private final Dataset dataset;
     private final boolean ownsDataset;
+    // Hold on the LanceWarmCache snapshot this reader was opened over, or
+    // null. The shard engine's whole-table reader owns its lease and
+    // releases it in doClose, which is when Lucene's ReferenceManager has
+    // seen the last searcher of a swapped out reader go away; a fragment
+    // path reader does not own one because its request releases the lease
+    // itself after closing the reader.
+    private final LanceWarmCache.Lease lease;
     // Column coordinator of this reader's leaves; its store pins are
     // released when the reader closes.
     private final LanceShardColumnCache columnCache;
@@ -97,17 +104,18 @@ public final class LanceDirectoryReader extends DirectoryReader {
     private final DirectoryReader cacheLifetimeBridge;
 
     /**
-     * Open a reader whose leaves are every fragment of {@code dataset}. Used
-     * by the shard-level engine ({@link LanceEngineFactory.LanceReadOnlyEngine})
-     * to expose the whole table through the single primary shard that a
-     * Lance-backed attach always produces. The RFC's shard-partitioning
-     * scheme (fragment id modulo shard count) was retired when
-     * {@code number_of_shards} was dropped from attach; {@link #openForFragments}
-     * is the fan-out variant used by the fragment path.
-     */
-    /**
-     * Open a whole-table reader for the shard-level engine's GET / stats /
-     * refresh needs. Every fragment in the dataset is surfaced as a leaf.
+     * Open a reader whose leaves are every fragment of {@code dataset},
+     * opening the table for itself. The shard-level engine
+     * ({@link LanceEngineFactory.LanceReadOnlyEngine}) uses this only when
+     * it has no {@link LanceWarmCache} to take a snapshot from; with one it
+     * goes through {@link #openForSnapshot(Directory, IndexCommit,
+     * LanceWarmCache.Lease, ColumnStore)} instead. The RFC's
+     * shard-partitioning scheme (fragment id modulo shard count) was
+     * retired when {@code number_of_shards} was dropped from attach;
+     * {@link #openForFragments} is the fan-out variant used by the fragment
+     * path.
+     *
+     * <p>Every fragment in the dataset is surfaced as a leaf.
      *
      * @param directory the Lucene {@link Directory} the reader reports to
      *                  Lucene's own bookkeeping.
@@ -163,7 +171,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         for (LanceFragmentLeafReader raw : rawLeaves) {
             raw.setShardColumnCache(cache);
         }
-        return openWithLeaves(directory, commit, dataset, true, cache, leaves, sumDataFileSizes(fragments));
+        return openWithLeaves(directory, commit, dataset, true, null, cache, leaves, sumDataFileSizes(fragments));
     }
 
     /**
@@ -266,7 +274,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         }
         // Per-request fragment readers do not report shard stats, so skip
         // the manifest walk here.
-        return openWithLeaves(directory, commit, dataset, true, cache, leaves, DataFileSizes.NONE);
+        return openWithLeaves(directory, commit, dataset, true, null, cache, leaves, DataFileSizes.NONE);
     }
 
     /**
@@ -318,7 +326,61 @@ public final class LanceDirectoryReader extends DirectoryReader {
         for (LanceFragmentLeafReader raw : rawLeaves) {
             raw.setShardColumnCache(cache);
         }
-        return openWithLeaves(directory, null, dataset, false, cache, leaves, DataFileSizes.NONE);
+        return openWithLeaves(directory, null, dataset, false, null, cache, leaves, DataFileSizes.NONE);
+    }
+
+    /**
+     * Open the shard engine's whole-table reader over a cached
+     * {@link LanceWarmCache.Snapshot}: every fragment the snapshot lists
+     * becomes a leaf, the same views {@link #openForSnapshot(Directory,
+     * LanceWarmCache.Snapshot, ColumnStore, List, String)} builds for the
+     * fragment path, so GET, {@code _stats} and the fragment path read one
+     * dataset and one column store per table version on a node. The
+     * returned reader owns {@code lease} and releases it when it closes,
+     * which for the engine is when Lucene's {@code ReferenceManager} has
+     * released the last searcher of a swapped out reader; the caller must
+     * not release the lease itself. The data file total the engine reports
+     * through {@code _stats} comes from the snapshot.
+     *
+     * @param directory   Lucene directory of the shard's store, reported to
+     *                    Lucene's bookkeeping and never written
+     * @param commit      the shard's bootstrap commit, returned by
+     *                    {@link #getIndexCommit()}
+     * @param lease       lease on the snapshot to read; owned by the
+     *                    returned reader on success, released here on
+     *                    failure
+     * @param columnStore off-heap store to serve columns from, or
+     *                    {@code null} to load into heap (cache disabled,
+     *                    the snapshot is then transient)
+     */
+    public static LanceDirectoryReader openForSnapshot(
+        Directory directory,
+        IndexCommit commit,
+        LanceWarmCache.Lease lease,
+        ColumnStore columnStore
+    ) throws IOException {
+        LanceWarmCache.Snapshot snapshot = lease.snapshot();
+        Dataset dataset = snapshot.dataset();
+        try {
+            List<LeafReader> leaves = new ArrayList<>(snapshot.fragments().size());
+            List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>(snapshot.fragments().size());
+            for (LanceWarmCache.FragmentMeta meta : snapshot.fragments()) {
+                meta.resolveLiveDocs(dataset);
+                LanceFragmentLeafReader raw = new LanceFragmentLeafReader(dataset, meta.id(), meta, snapshot.schema(), null);
+                rawLeaves.add(raw);
+                leaves.add(LanceSequentialLeafReader.wrap(raw));
+            }
+            LanceShardColumnCache cache = new LanceShardColumnCache(dataset, null, rawLeaves, columnStore, snapshot.key());
+            for (LanceFragmentLeafReader raw : rawLeaves) {
+                raw.setShardColumnCache(cache);
+            }
+            return openWithLeaves(directory, commit, dataset, false, lease, cache, leaves, snapshot.dataFileSizes());
+        } catch (Throwable t) {
+            // The reader never came to own the lease; give the snapshot
+            // reference back so a failed engine open does not pin it.
+            lease.release();
+            throw t;
+        }
     }
 
     private static LanceDirectoryReader openWithLeaves(
@@ -326,6 +388,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         IndexCommit commit,
         Dataset dataset,
         boolean ownsDataset,
+        LanceWarmCache.Lease lease,
         LanceShardColumnCache columnCache,
         List<LeafReader> leaves,
         DataFileSizes dataFileSizes
@@ -342,6 +405,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
             commit,
             dataset,
             ownsDataset,
+            lease,
             columnCache,
             bridge,
             dataFileSizes
@@ -354,6 +418,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         IndexCommit commit,
         Dataset dataset,
         boolean ownsDataset,
+        LanceWarmCache.Lease lease,
         LanceShardColumnCache columnCache,
         DirectoryReader cacheLifetimeBridge,
         DataFileSizes dataFileSizes
@@ -362,6 +427,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         this.commit = commit;
         this.dataset = dataset;
         this.ownsDataset = ownsDataset;
+        this.lease = lease;
         this.columnCache = columnCache;
         this.cacheLifetimeBridge = cacheLifetimeBridge;
         this.dataFileSizes = dataFileSizes;
@@ -391,6 +457,31 @@ public final class LanceDirectoryReader extends DirectoryReader {
             return lanceReader.dataFileSizes();
         }
         return DataFileSizes.NONE;
+    }
+
+    /**
+     * The {@link LanceWarmCache.Snapshot} this reader was opened over
+     * through {@link #openForSnapshot(Directory, IndexCommit,
+     * LanceWarmCache.Lease, ColumnStore)}, or {@code null} for a reader
+     * that opened its own dataset or does not own its lease.
+     */
+    public LanceWarmCache.Snapshot snapshot() {
+        return lease == null ? null : lease.snapshot();
+    }
+
+    /**
+     * Lance version of the snapshot behind an arbitrary reader handed out
+     * by the engine (unwrapping the {@link FilterDirectoryReader} chain as
+     * {@link #dataFileSizesOf} does), or {@code -1} when the innermost
+     * reader holds no snapshot lease.
+     */
+    public static long snapshotVersionOf(IndexReader reader) {
+        if (reader instanceof DirectoryReader directoryReader
+            && FilterDirectoryReader.unwrap(directoryReader) instanceof LanceDirectoryReader lanceReader
+            && lanceReader.snapshot() != null) {
+            return lanceReader.snapshot().version();
+        }
+        return -1L;
     }
 
     @Override
@@ -477,6 +568,13 @@ public final class LanceDirectoryReader extends DirectoryReader {
                     first = (IOException) e;
                 }
             }
+        }
+        // After the pins: the snapshot may close on release (retired, or
+        // transient with the cache disabled), and closing it drops its
+        // store columns, which must not happen while this reader still
+        // pins them.
+        if (lease != null) {
+            lease.release();
         }
         if (first != null) {
             throw first;
