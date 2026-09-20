@@ -473,7 +473,11 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
             assertEquals("one probe scan is enough", 1, weight.issuedScans().size());
             ScanOptions probe = weight.issuedScans().get(0);
             assertFalse(probe.getFragmentIds().isPresent());
-            assertEquals(Optional.of((long) LanceFtsQuery.DEFAULT_SUBSET_PROBE_LIMIT), probe.getLimit());
+            assertEquals(
+                "eight rows covered: the floor of the effective probe limit",
+                Optional.of((long) LanceFtsQuery.DEFAULT_SUBSET_PROBE_MIN_ROWS),
+                probe.getLimit()
+            );
         }
     }
 
@@ -534,6 +538,53 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
             assertEquals(1, LanceFtsQuery.subsetProbeLimit());
         } finally {
             LanceFtsQuery.setSubsetProbeLimit(before);
+        }
+    }
+
+    public void testSubsetProbeRatioAndMinRowsRejectValuesOutOfRange() {
+        double ratioBefore = LanceFtsQuery.subsetProbeRatio();
+        int minRowsBefore = LanceFtsQuery.subsetProbeMinRows();
+        try {
+            expectThrows(IllegalArgumentException.class, () -> LanceFtsQuery.setSubsetProbeRatio(-0.1d));
+            expectThrows(IllegalArgumentException.class, () -> LanceFtsQuery.setSubsetProbeRatio(1.1d));
+            expectThrows(IllegalArgumentException.class, () -> LanceFtsQuery.setSubsetProbeRatio(Double.NaN));
+            expectThrows(IllegalArgumentException.class, () -> LanceFtsQuery.setSubsetProbeMinRows(0));
+            LanceFtsQuery.setSubsetProbeRatio(0d);
+            LanceFtsQuery.setSubsetProbeRatio(1d);
+            LanceFtsQuery.setSubsetProbeMinRows(1);
+            assertEquals(1d, LanceFtsQuery.subsetProbeRatio(), 0d);
+            assertEquals(1, LanceFtsQuery.subsetProbeMinRows());
+        } finally {
+            LanceFtsQuery.setSubsetProbeRatio(ratioBefore);
+            LanceFtsQuery.setSubsetProbeMinRows(minRowsBefore);
+        }
+    }
+
+    public void testEffectiveSubsetProbeLimitFollowsTheCoveredRows() {
+        // Defaults: ratio 0.03, floor 10,000, cap 1,000,000.
+        assertEquals("2M table, 3 of 8 fragments (750k rows): 3 percent", 22_500L, LanceFtsQuery.effectiveSubsetProbeLimit(750_000L));
+        assertEquals("20M table on 3 nodes (6,666,667 rows): 3 percent", 200_000L, LanceFtsQuery.effectiveSubsetProbeLimit(6_666_667L));
+        assertEquals("3 percent of 100k rows is below the floor", 10_000L, LanceFtsQuery.effectiveSubsetProbeLimit(100_000L));
+        assertEquals("a reader over a handful of rows gets the floor", 10_000L, LanceFtsQuery.effectiveSubsetProbeLimit(8L));
+        assertEquals("the cap holds at 100M rows", 1_000_000L, LanceFtsQuery.effectiveSubsetProbeLimit(100_000_000L));
+
+        int limitBefore = LanceFtsQuery.subsetProbeLimit();
+        double ratioBefore = LanceFtsQuery.subsetProbeRatio();
+        int minRowsBefore = LanceFtsQuery.subsetProbeMinRows();
+        try {
+            LanceFtsQuery.setSubsetProbeRatio(0.1d);
+            assertEquals(75_000L, LanceFtsQuery.effectiveSubsetProbeLimit(750_000L));
+            LanceFtsQuery.setSubsetProbeMinRows(100_000);
+            assertEquals("the floor wins over the ratio", 100_000L, LanceFtsQuery.effectiveSubsetProbeLimit(750_000L));
+            LanceFtsQuery.setSubsetProbeLimit(50);
+            assertEquals("the cap wins over the floor", 50L, LanceFtsQuery.effectiveSubsetProbeLimit(750_000L));
+            LanceFtsQuery.setSubsetProbeRatio(0d);
+            LanceFtsQuery.setSubsetProbeLimit(limitBefore);
+            assertEquals("ratio 0 leaves the floor", 100_000L, LanceFtsQuery.effectiveSubsetProbeLimit(750_000L));
+        } finally {
+            LanceFtsQuery.setSubsetProbeLimit(limitBefore);
+            LanceFtsQuery.setSubsetProbeRatio(ratioBefore);
+            LanceFtsQuery.setSubsetProbeMinRows(minRowsBefore);
         }
     }
 

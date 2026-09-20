@@ -358,6 +358,37 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
 
     /**
+     * Share of the rows a subset node covers that the FTS probe may
+     * return before the node repeats the scan restricted to its
+     * fragments. The effective probe limit is
+     * {@code min(subset_probe_limit, max(subset_probe_min_rows,
+     * floor(covered rows * subset_probe_ratio)))}; the derivation of
+     * the default is in {@link LanceFtsQuery#effectiveSubsetProbeLimit}.
+     * Dynamic.
+     */
+    public static final Setting<Double> FTS_SUBSET_PROBE_RATIO_SETTING = Setting.doubleSetting(
+        "lance.fts.subset_probe_ratio",
+        LanceFtsQuery.DEFAULT_SUBSET_PROBE_RATIO,
+        0d,
+        1d,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Floor of the effective FTS probe limit, so small tables and few
+     * hit queries stay on the whole table lookup whatever the ratio
+     * gives. Dynamic.
+     */
+    public static final Setting<Integer> FTS_SUBSET_PROBE_MIN_ROWS_SETTING = Setting.intSetting(
+        "lance.fts.subset_probe_min_rows",
+        LanceFtsQuery.DEFAULT_SUBSET_PROBE_MIN_ROWS,
+        1,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * Whether a {@code size: 0} aggregation request whose shape the
      * scan can compute (metrics, or one {@code terms} / {@code histogram}
      * / fixed interval {@code date_histogram} with metric children, over
@@ -398,6 +429,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             CACHE_MAX_SNAPSHOTS_SETTING,
             CACHE_COLUMN_SHARE_SETTING,
             FTS_SUBSET_PROBE_LIMIT_SETTING,
+            FTS_SUBSET_PROBE_RATIO_SETTING,
+            FTS_SUBSET_PROBE_MIN_ROWS_SETTING,
             AGGREGATION_PUSHDOWN_SETTING
         );
     }
@@ -610,10 +643,15 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         clusterService.getClusterSettings().addSettingsUpdateConsumer(NATIVE_MEMORY_CB_ENABLED_SETTING, LanceCircuitBreaker::setEnabled);
         clusterService.getClusterSettings().addSettingsUpdateConsumer(NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING, this::updatePollInterval);
 
-        // The FTS probe limit lives in a static holder read by every
-        // scan, so the consumer only has to store the new value.
+        // The FTS probe parameters live in static holders read by every
+        // scan, so the consumers only have to store the new values.
         LanceFtsQuery.setSubsetProbeLimit(FTS_SUBSET_PROBE_LIMIT_SETTING.get(environment.settings()));
         clusterService.getClusterSettings().addSettingsUpdateConsumer(FTS_SUBSET_PROBE_LIMIT_SETTING, LanceFtsQuery::setSubsetProbeLimit);
+        LanceFtsQuery.setSubsetProbeRatio(FTS_SUBSET_PROBE_RATIO_SETTING.get(environment.settings()));
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(FTS_SUBSET_PROBE_RATIO_SETTING, LanceFtsQuery::setSubsetProbeRatio);
+        LanceFtsQuery.setSubsetProbeMinRows(FTS_SUBSET_PROBE_MIN_ROWS_SETTING.get(environment.settings()));
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(FTS_SUBSET_PROBE_MIN_ROWS_SETTING, LanceFtsQuery::setSubsetProbeMinRows);
 
         // Register the shard-free dispatch ActionFilter. It
         // intercepts every _search request against Lance-backed
