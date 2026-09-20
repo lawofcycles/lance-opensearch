@@ -70,7 +70,10 @@ import org.opensearch.common.unit.TimeValue;
  * {@code DefaultSearchContext} is bound to a full {@link IndexShard} lifecycle
  * (a shard-local {@code SearcherSupplier}, a bound {@code SearchRequest},
  * fetch phases, and so on) that the fragment handler does not have and does
- * not need. This class exposes only the pieces the aggregator base classes
+ * not need. The context is built from the {@link ShardId} and
+ * {@link MapperService} of the index alone, so it works on a node that
+ * holds no shard copy as long as the index is in cluster state.
+ * This class exposes only the pieces the aggregator base classes
  * touch during construction and per-leaf collection:
  * {@link #bigArrays()} for accumulator allocations,
  * {@link #searcher()} for {@link ContextIndexSearcher#search},
@@ -102,7 +105,6 @@ import org.opensearch.common.unit.TimeValue;
 public final class LanceFragmentSearchContext extends SearchContext {
 
     private final ShardId shardId;
-    private final IndexShard indexShard;
     private final MapperService mapperService;
     private QueryShardContext queryShardContext;
     private ContextIndexSearcher searcher;
@@ -130,16 +132,16 @@ public final class LanceFragmentSearchContext extends SearchContext {
      * ContextIndexSearcher refer to each other.
      */
     public LanceFragmentSearchContext(
-        IndexShard indexShard,
+        ShardId shardId,
+        MapperService mapperService,
         Query query,
         SearchContextAggregations aggregations,
         BigArrays bigArrays,
         BitsetFilterCache bitsetFilterCache,
         String localNodeId
     ) {
-        this.indexShard = indexShard;
-        this.shardId = indexShard.shardId();
-        this.mapperService = indexShard.mapperService();
+        this.shardId = shardId;
+        this.mapperService = mapperService;
         this.queryShardContext = null;
         this.searcher = null;
         this.bigArrays = bigArrays;
@@ -192,9 +194,28 @@ public final class LanceFragmentSearchContext extends SearchContext {
         return searcher;
     }
 
+    /**
+     * Always {@code null}. The fragment path runs on any node that
+     * has the index in cluster state, including nodes that hold no
+     * shard copy, so there is no {@link IndexShard} to hand out. The
+     * stock code reachable from this context does not dereference it:
+     * {@link LanceFragmentIndexSearcher} skips the
+     * {@code SearchOperationListener} slice callbacks that
+     * {@link ContextIndexSearcher} would fetch through it,
+     * {@code FilterRewriteOptimizationContext} returns before its
+     * {@code indexShard().shardId()} log line because
+     * {@link #maxAggRewriteFilters()} keeps the {@link SearchContext}
+     * default of 0, and {@code CardinalityAggregator} only reaches
+     * its {@code indexShard()} debug line after a successful terms
+     * pruning, which the Lance leaf reader never offers
+     * ({@code terms(field)} is null). {@code rare_terms}, whose
+     * constructor seeds itself from {@code indexShard().shardId()},
+     * is not on the {@link LanceAggregationSupport} whitelist and
+     * goes to the shard path.
+     */
     @Override
     public IndexShard indexShard() {
-        return indexShard;
+        return null;
     }
 
     @Override
