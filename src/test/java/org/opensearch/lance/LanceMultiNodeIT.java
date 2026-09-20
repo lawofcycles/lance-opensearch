@@ -563,6 +563,99 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    /**
+     * The Substrait aggregation pushdown on three executors, each
+     * holding one fragment of the interleaved fixture (ids
+     * {@code i % 3 == f} on fragment {@code f}). With
+     * {@code lance.aggregation.pushdown} on and off the responses have
+     * to be identical: for {@code terms} that covers the merge of three
+     * per node partials, {@code sum_other_doc_count} and
+     * {@code doc_count_error_upper_bound} included. With
+     * {@code terms(id, size 2)} every node has 100 groups of one row and
+     * keeps {@code shard_size} 13 of them, so the reduce derives an
+     * error of 1 per node and an other count of 87 per node plus the
+     * merged buckets it drops; values the aggregators and the pushdown
+     * have to agree on exactly.
+     * Buckets and counts are also checked against the single shard
+     * path, which does not share the per node error and other count
+     * (a single shard has no partials to lose buckets across).
+     */
+    public void testAggregationPushdownAcrossThreeNodesMatchesAggregators() throws Exception {
+        String suffix = "mn-agg-pushdown-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 3;
+        int rowsPerFragment = 100;
+        LanceTableFactory.writeInterleavedTable(scratchDir, tableName, fragments, rowsPerFragment);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        List<String> shapes = List.of(
+            "\"size\":0,\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}}}",
+            "\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":2}}}",
+            "\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":2,\"show_term_doc_count_error\":true}}}",
+            "\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":5,\"order\":{\"_key\":\"desc\"}}}}",
+            "\"size\":0,\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}},\"m\":{\"max\":{\"field\":\"ts\"}}}}}",
+            "\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":150}}},\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\"}}}",
+            "\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}},\"a\":{\"avg\":{\"field\":\"id\"}},\"c\":{\"value_count\":{\"field\":\"category\"}}}",
+            "\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"id\",\"interval\":50}}}",
+            "\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\"},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}"
+        );
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+            assertEquals("fixture assumes one fragment per data node", fragments, dataNodeCount());
+
+            List<Map<String, Object>> pushed = new ArrayList<>();
+            for (int i = 0; i < shapes.size(); i++) {
+                String shape = shapes.get(i);
+                Map<String, Object> response = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
+                pushed.add(response);
+                assertFragmentPathMatchesShardPath(indexName, shape);
+                // Whole aggregations block against the single shard,
+                // except for the size 2 terms whose three partials lose
+                // groups the single shard keeps.
+                if (i != 1 && i != 2) {
+                    Map<String, Object> shardPath = parse(
+                        readAll(postJson("/" + indexName + "/_search", "{\"explain\":true," + shape + "}"))
+                    );
+                    assertEquals(shape, shardPath.get("aggregations"), response.get("aggregations"));
+                }
+            }
+            // Analytic check of the size 2 terms, independent of the
+            // aggregators: 300 one row groups, 13 kept per node with an
+            // error of 1 each, and every row outside the two returned
+            // buckets in the other count.
+            Map<String, Object> sizeTwo = pushed.get(1);
+            assertEquals(300, extractIntPath(sizeTwo, "hits", "total", "value"));
+            assertEquals(2, buckets(sizeTwo).size());
+            assertEquals(298, extractIntPath(sizeTwo, "aggregations", "by_id", "sum_other_doc_count"));
+            assertEquals(3, extractIntPath(sizeTwo, "aggregations", "by_id", "doc_count_error_upper_bound"));
+
+            updateClusterSetting("lance.aggregation.pushdown", "false");
+            try {
+                for (int i = 0; i < shapes.size(); i++) {
+                    Map<String, Object> viaAggregators = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(i) + "}")));
+                    assertEquals(shapes.get(i), viaAggregators.get("aggregations"), pushed.get(i).get("aggregations"));
+                    assertEquals(shapes.get(i), viaAggregators.get("hits"), pushed.get(i).get("hits"));
+                }
+            } finally {
+                updateClusterSetting("lance.aggregation.pushdown", null);
+            }
+            // Every data node took part: the pushdown ran on three
+            // executors, not on one node holding every fragment.
+            assertBusy(() -> {
+                Map<String, String> assignments = fanOutAssignments(indexName);
+                assertEquals("fragments went to " + assignments, fragments, assignments.size());
+            });
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     /** Name of the elected cluster manager, from {@code GET /_cat/cluster_manager}. */
     private static String clusterManagerNodeName() throws IOException {
         String name = readAll(client().performRequest(new Request("GET", "/_cat/cluster_manager?h=node"))).trim();
@@ -846,11 +939,16 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         return scores;
     }
 
+    /** Buckets of the first bucket aggregation in the response, or an empty list when there is none. */
     @SuppressWarnings("unchecked")
     private static List<Map<String, Object>> buckets(Map<String, Object> response) {
         Map<String, Object> aggregations = (Map<String, Object>) response.get("aggregations");
-        Map<String, Object> byCategory = (Map<String, Object>) aggregations.get("by_category");
-        return (List<Map<String, Object>>) byCategory.get("buckets");
+        for (Object aggregation : aggregations.values()) {
+            if (aggregation instanceof Map<?, ?> map && map.get("buckets") instanceof List<?> list) {
+                return (List<Map<String, Object>>) list;
+            }
+        }
+        return List.of();
     }
 
     private static int extractIntPath(Map<String, Object> parsed, String... path) {

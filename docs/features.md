@@ -109,8 +109,19 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 
 - Metric: `sum`, `avg`, `min`, `max`, `value_count`.
 - Bucket: `terms`, `histogram`, `date_histogram`.
-- All run through OpenSearch's standard aggregator machinery over Lance-backed doc values.
+- All run through OpenSearch's standard aggregator machinery over Lance-backed doc values, except the shapes below, which the scan computes.
 - Pipeline aggregations (`avg_bucket`, `bucket_sort`, `cumulative_sum`, etc.) fall through to the shard path (see [limitations.md](limitations.md)).
+
+### Aggregation pushdown
+
+- A `size: 0` request whose query is `match_all` or a scalar filter the coordinator translates to Lance SQL (`term`, `terms`, `range`, `exists`, `bool` of those) and whose aggregation tree is one of the following runs as a Substrait `AggregateRel` inside the Lance scan: each executor asks Lance for one row per group over its fragments, builds the same per node `InternalAggregation` the aggregators would have built, and the coordinator reduces them as before. `hits.total` comes from the same scan's `count(*)`.
+  - Metric aggregations only (`sum`, `avg`, `min`, `max`, `value_count`), any number.
+  - One `terms` (`order` `_count` descending or `_key`, default `min_doc_count`, no `include` / `exclude`), one `histogram` (`offset` 0, no `extended_bounds` / `hard_bounds`) or one `date_histogram` (`fixed_interval` only, `offset` 0, no bounds, no `time_zone`), with metric children.
+  - Fields must be mapped and backed by a scalar column: `keyword` on `utf8` (a keyword sub-field resolves to its base column), the integer types, `float` / `double`, `boolean`, `date`. `terms` on a `list<utf8>` column, metrics on `keyword` other than `value_count`, `histogram` on `date` / `boolean` fields, `missing`, scripts and `value_type` take the aggregators.
+- `terms` keeps the top `shard_size` groups per executor (default `size * 1.5 + 10`), with `sum_other_doc_count` and `doc_count_error_upper_bound` following the shard rules, so a three node answer carries the same error bound a three shard index would. `histogram` and `date_histogram` return every bucket; `min_doc_count: 0` filling stays with the coordinator's reduce. Rows with a null bucket key open no bucket but count toward `hits.total`.
+- Requests with a full-text or `lance_knn` query, a `post_filter`, hits (`size > 0`), or a reader wrapper (security plugin DLS / FLS) stay on the aggregators.
+- A plan Lance rejects fails the request instead of falling back, so a missing function or a schema mismatch surfaces as an error rather than as a slow answer.
+- Setting: `lance.aggregation.pushdown` (dynamic, default `true`; `false` sends every aggregation through the aggregators, for before / after comparisons).
 
 ## Doc values for full-text and vector hits
 
