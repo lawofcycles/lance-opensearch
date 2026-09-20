@@ -43,6 +43,7 @@ import org.opensearch.lance.LanceInternalHeaders;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
+import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
@@ -119,6 +120,8 @@ public final class LanceNamespaceService {
      */
     private final java.util.concurrent.atomic.AtomicReference<TimeValue> resurfaceGrace;
     private final ThreadPool threadPool;
+    /** Fragment path snapshot cache to retire from, or {@code null}. */
+    private final LanceWarmCache warmCache;
 
     public LanceNamespaceService(
         Client client,
@@ -138,11 +141,30 @@ public final class LanceNamespaceService {
         long builderMaxRows,
         TimeValue resurfaceGrace
     ) {
+        this(client, clusterService, threadPool, cadence, builderMaxRows, resurfaceGrace, null);
+    }
+
+    /**
+     * @param warmCache fragment path snapshot cache to retire entries
+     *                  from when a table moves to a new version or an
+     *                  index is deleted; {@code null} when there is none
+     *                  (tests)
+     */
+    public LanceNamespaceService(
+        Client client,
+        ClusterService clusterService,
+        ThreadPool threadPool,
+        TimeValue cadence,
+        long builderMaxRows,
+        TimeValue resurfaceGrace,
+        LanceWarmCache warmCache
+    ) {
         this.client = client;
         this.clusterService = clusterService;
         this.threadPool = threadPool;
         this.cadence = cadence;
         this.builderMaxRows = builderMaxRows;
+        this.warmCache = warmCache;
         this.resurfaceGrace = new java.util.concurrent.atomic.AtomicReference<>(resurfaceGrace);
         // Subscribe before the first schedule fires so the poller
         // never runs against a stale cache. addListener returns
@@ -205,6 +227,16 @@ public final class LanceNamespaceService {
                 warnedUnreachableAdopt.remove(prevIndex);
                 warnedRenamed.remove(prevIndex);
                 warnedWaitPolicy.remove(prevIndex);
+                // The fragment path keys its snapshots on the index uuid,
+                // so nothing will ask for them again; close them as soon
+                // as the requests that hold them finish. Closing a
+                // snapshot releases a Lance dataset and Arrow vectors,
+                // which does not belong on the cluster state applier
+                // thread, so hand it to the generic pool.
+                if (warmCache != null) {
+                    String deletedUuid = prevMeta.getIndexUUID();
+                    threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> warmCache.retireAll(deletedUuid));
+                }
                 LOG.info("recording resurface tombstone for deleted Lance-backed index {} (table {})", prevIndex, table);
             }
         }
@@ -634,6 +666,16 @@ public final class LanceNamespaceService {
                 }
                 client.admin().indices().refresh(new RefreshRequest(indexName)).actionGet();
                 servedVersions.put(indexName, target);
+                // Fragment path requests key on the new version from now
+                // on; let the snapshots of the version left behind close
+                // as soon as no request holds them instead of waiting for
+                // the cache's size bound.
+                if (warmCache != null) {
+                    IndexMetadata movedMetadata = clusterService.state().metadata().index(indexName);
+                    if (movedMetadata != null) {
+                        warmCache.retire(movedMetadata.getIndexUUID(), target);
+                    }
+                }
             }
         } catch (Exception e) {
             LOG.warn("sync failed for table {}", table, e);

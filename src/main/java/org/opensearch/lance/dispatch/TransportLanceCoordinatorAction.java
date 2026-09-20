@@ -274,7 +274,15 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         ActionListener<Void> done
     ) throws Exception {
         List<Integer> allFragmentIds;
+        // The manifest version this fan-out enumerates fragments from.
+        // Every per-node request carries it, for a pinned or tag
+        // following index as well as for one that follows the table,
+        // so all executors of this request read the same version and
+        // key their LanceWarmCache snapshot on it without asking Lance
+        // for the latest version themselves.
+        long observedVersion;
         try (Dataset dataset = LanceRegistry.openDataset(target.tableUri(), target.storageOptions(), target.pinnedVersionOrEmpty())) {
+            observedVersion = dataset.version();
             allFragmentIds = new ArrayList<>(dataset.getFragments().size());
             dataset.getFragments().forEach(fragment -> allFragmentIds.add(fragment.getId()));
         }
@@ -298,7 +306,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // via topLevelReduce. Same wire format as any other
             // fan-out; the only novel case is the reader being
             // shaped to maxDoc=0.
-            dispatchEmptyAggregationRun(target, nodeList.get(0), spec, merged, done);
+            dispatchEmptyAggregationRun(target, observedVersion, nodeList.get(0), spec, merged, done);
             return;
         }
 
@@ -337,7 +345,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 target.tableUri(),
                 target.indexName(),
                 target.storageOptions(),
-                target.pinnedVersion(),
+                observedVersion,
                 spec.filterSql(),
                 spec.query(),
                 spec.postFilter(),
@@ -407,6 +415,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      */
     private void dispatchEmptyAggregationRun(
         IndexTarget target,
+        long observedVersion,
         DiscoveryNode host,
         FragmentQuerySpec spec,
         MergeState merged,
@@ -416,7 +425,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             target.tableUri(),
             target.indexName(),
             target.storageOptions(),
-            target.pinnedVersion(),
+            observedVersion,
             spec.filterSql(),
             spec.query(),
             spec.postFilter(),
@@ -783,10 +792,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
     /**
      * One Lance-backed index in the request. {@code pinnedVersion}
-     * is the {@code index.lance.version} setting ({@code -1} when
-     * the index follows the latest manifest); it drives the
-     * coordinator's own fragment enumeration and travels with every
-     * per-node request so the executors open the same manifest.
+     * is the {@code index.lance.version} setting or the resolved tag
+     * version ({@code -1} when the index follows the latest
+     * manifest); it drives the coordinator's own fragment
+     * enumeration, whose observed version then travels with every
+     * per-node request so the executors read the same manifest.
      */
     private record IndexTarget(String indexName, String tableUri, StorageOptions storageOptions, long pinnedVersion, Function<
         String,

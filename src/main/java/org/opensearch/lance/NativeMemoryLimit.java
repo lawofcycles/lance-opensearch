@@ -26,17 +26,18 @@ import org.opensearch.monitor.os.OsProbe;
  * roughly 38.8 GiB, while on t3.medium (4 GiB / 2 GiB heap) the same
  * 40% resolves to roughly 800 MiB.
  *
- * <p>The parsed value is split between the two Lance {@link org.lance.Session}
- * caches using Lance's own default ratio of 6:1 (index cache to metadata
- * cache), so operators configure one number rather than tracking two
- * caches separately.
+ * <p>The parsed value is split in two: a {@code lance.cache.column_share}
+ * fraction goes to the fragment path's off-heap column cache, and the
+ * rest to the two Lance {@link org.lance.Session} caches using Lance's own
+ * default ratio of 6:1 (index cache to metadata cache), so operators
+ * configure one number rather than tracking three caches separately.
  */
 public final class NativeMemoryLimit {
 
-    /** Index cache share of the total limit (6 / 7 in Lance's own defaults). */
+    /** Index cache share of the Session part of the limit (6 / 7 in Lance's own defaults). */
     static final double INDEX_SHARE = 6.0 / 7.0;
 
-    /** Metadata cache share of the total limit (1 / 7 in Lance's own defaults). */
+    /** Metadata cache share of the Session part of the limit (1 / 7 in Lance's own defaults). */
     static final double METADATA_SHARE = 1.0 / 7.0;
 
     private NativeMemoryLimit() {}
@@ -59,19 +60,37 @@ public final class NativeMemoryLimit {
     }
 
     /**
-     * Index-cache byte budget derived from the shared limit using the
-     * {@link #INDEX_SHARE} ratio.
+     * Off-heap budget of the fragment path's column cache: the
+     * {@code lance.cache.column_share} fraction of the total limit. The
+     * remainder ({@link #sessionCacheBytes}) goes to the Lance Session.
      */
-    public static long indexCacheBytes(long totalBytes) {
-        return (long) (totalBytes * INDEX_SHARE);
+    public static long columnCacheBytes(long totalBytes, double columnShare) {
+        return (long) (totalBytes * columnShare);
     }
 
     /**
-     * Metadata-cache byte budget derived from the shared limit using the
-     * {@link #METADATA_SHARE} ratio.
+     * Part of the total limit left for the Lance Session's index and
+     * metadata caches once the column cache has taken its share. Split
+     * further by {@link #indexCacheBytes} and {@link #metadataCacheBytes}.
      */
-    public static long metadataCacheBytes(long totalBytes) {
-        return (long) (totalBytes * METADATA_SHARE);
+    public static long sessionCacheBytes(long totalBytes, double columnShare) {
+        return totalBytes - columnCacheBytes(totalBytes, columnShare);
+    }
+
+    /**
+     * Index-cache byte budget derived from the Session part of the limit
+     * using the {@link #INDEX_SHARE} ratio.
+     */
+    public static long indexCacheBytes(long sessionBytes) {
+        return (long) (sessionBytes * INDEX_SHARE);
+    }
+
+    /**
+     * Metadata-cache byte budget derived from the Session part of the
+     * limit using the {@link #METADATA_SHARE} ratio.
+     */
+    public static long metadataCacheBytes(long sessionBytes) {
+        return (long) (sessionBytes * METADATA_SHARE);
     }
 
     private static long parsePercent(String rawValue, String settingName) {
