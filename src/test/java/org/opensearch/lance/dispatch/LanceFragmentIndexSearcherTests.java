@@ -25,6 +25,9 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.search.TopFieldCollectorManager;
+import org.apache.lucene.search.TopFieldDocs;
+import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.opensearch.common.settings.Settings;
@@ -149,6 +152,40 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
             searcher.search(MatchAllDocsQuery.INSTANCE, collector);
             assertEquals(TOTAL, collector.collected);
             assertEquals(List.of(collector), processed);
+        }
+    }
+
+    public void testWeightDrivenSearchMatchesQueryDrivenSearch() throws IOException {
+        // The executor builds one Weight per request and drives hits,
+        // aggregations and the count through it. The Weight entry
+        // points have to visit every leaf, hand the collector tree to
+        // the bucket collector processor once, and reduce to the same
+        // page the Query entry points produce.
+        try (DirectoryReader reader = DirectoryReader.open(dir); LanceFragmentSearchContext context = newContext()) {
+            List<Collector> processed = new ArrayList<>();
+            context.setBucketCollectorProcessor(new BucketCollectorProcessor() {
+                @Override
+                public void processPostCollection(Collector collectorTree) throws IOException {
+                    processed.add(collectorTree);
+                    super.processPostCollection(collectorTree);
+                }
+            });
+            LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(reader, indexSettings, context);
+            Weight weight = searcher.createWeight(searcher.rewrite(MatchAllDocsQuery.INSTANCE), ScoreMode.COMPLETE, 1f);
+
+            Sort sort = new Sort(new SortField("n", SortField.Type.LONG, true));
+            TopFieldDocs viaWeight = searcher.search(weight, new TopFieldCollectorManager(sort, 3, null, Integer.MAX_VALUE));
+            TopFieldDocs viaQuery = searcher.search(MatchAllDocsQuery.INSTANCE, 3, sort);
+            assertEquals(TOTAL, viaWeight.totalHits.value());
+            assertEquals(viaQuery.scoreDocs.length, viaWeight.scoreDocs.length);
+            for (int i = 0; i < viaQuery.scoreDocs.length; i++) {
+                assertEquals("doc at rank " + i, viaQuery.scoreDocs[i].doc, viaWeight.scoreDocs[i].doc);
+            }
+
+            CountingBucketCollector collector = new CountingBucketCollector();
+            searcher.search(weight, collector);
+            assertEquals(TOTAL, collector.collected);
+            assertTrue("collector tree must reach the bucket collector processor", processed.contains(collector));
         }
     }
 

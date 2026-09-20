@@ -20,7 +20,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.QueryVisitor;
+import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.store.ByteBuffersDirectory;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ipc.FullTextQuery;
@@ -29,6 +32,8 @@ import org.lance.ipc.ScanOptions;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.engine.LanceDirectoryReader;
+import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.test.OpenSearchTestCase;
 
 // The fragment coverage tests open a real Lance dataset; Lance JNI
@@ -307,6 +312,67 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
                 }
             }
             assertEquals(3L, total);
+        }
+    }
+
+    public void testWeightHitCountReportsScannedRowsAcrossFragments() throws Exception {
+        // The fragment executor reads hits.total from the Weight it
+        // built for the request instead of counting in a second scan.
+        // Before any leaf is scored the Weight has not scanned and
+        // reports -1; after the first scorerSupplier call the shard
+        // scan has run and hitCount covers every fragment of the
+        // reader, bounded by scanLimit when one is set.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeMultiFragmentTable(scratchDir, "weight-hit-count", 12, 4);
+        // The reader takes ownership of the Dataset and closes it.
+        Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty());
+        try (
+            LanceDirectoryReader reader = LanceDirectoryReader.openForFragments(
+                new ByteBuffersDirectory(),
+                null,
+                dataset,
+                "",
+                LanceEngineFactory.LancePrimaryKeyType.NONE,
+                Collections.emptyMap(),
+                fragmentIdsOf(dataset)
+            )
+        ) {
+            assertEquals("fixture must expose three leaves", 3, reader.leaves().size());
+            IndexSearcher searcher = new IndexSearcher(reader);
+
+            LanceFtsQuery unbounded = new LanceFtsQuery("body", "hello");
+            LanceFtsQuery.LanceFtsWeight weight = (LanceFtsQuery.LanceFtsWeight) searcher.createWeight(
+                searcher.rewrite(unbounded),
+                ScoreMode.COMPLETE,
+                1f
+            );
+            assertEquals("no leaf scored yet", -1L, weight.hitCount());
+            weight.scorerSupplier(reader.leaves().get(0));
+            assertEquals("two hello rows in each of three fragments", 6L, weight.hitCount());
+            // Later leaves reuse the cached scan; the count does not change.
+            weight.scorerSupplier(reader.leaves().get(2));
+            assertEquals(6L, weight.hitCount());
+
+            LanceFtsQuery bounded = unbounded.withScanLimit(2);
+            LanceFtsQuery.LanceFtsWeight boundedWeight = (LanceFtsQuery.LanceFtsWeight) searcher.createWeight(
+                searcher.rewrite(bounded),
+                ScoreMode.COMPLETE,
+                1f
+            );
+            boundedWeight.scorerSupplier(reader.leaves().get(0));
+            assertEquals("scanLimit clips the scan, so the count stops at the limit", 2L, boundedWeight.hitCount());
+
+            // A bound above the match count leaves the count exact,
+            // which is what lets the executor skip its count scan when
+            // a bounded hits scan comes back short of its limit.
+            LanceFtsQuery wide = unbounded.withScanLimit(10);
+            LanceFtsQuery.LanceFtsWeight wideWeight = (LanceFtsQuery.LanceFtsWeight) searcher.createWeight(
+                searcher.rewrite(wide),
+                ScoreMode.COMPLETE,
+                1f
+            );
+            wideWeight.scorerSupplier(reader.leaves().get(1));
+            assertEquals(6L, wideWeight.hitCount());
         }
     }
 

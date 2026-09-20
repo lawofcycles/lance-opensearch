@@ -49,6 +49,7 @@ import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.search.sort.ScoreSortBuilder;
 import org.opensearch.search.sort.SortBuilder;
@@ -140,6 +141,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // linear memory per node just like the shard path — no additional
         // fragment-level penalty.
         int perNodeSize = from + size;
+        int trackTotalHitsUpTo = resolveTrackTotalHitsUpTo(source);
 
         Index[] concrete = indexNameExpressionResolver.concreteIndices(clusterService.state(), searchRequest);
         List<IndexTarget> targets = resolveTargets(concrete);
@@ -173,12 +175,37 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             searchAfter,
             perNodeSize,
             aggregations,
-            source != null && source.trackScores()
+            source != null && source.trackScores(),
+            trackTotalHitsUpTo
         );
         boolean versionRequested = source != null && Boolean.TRUE.equals(source.version());
         boolean seqNoAndPrimaryTermRequested = source != null && Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
-        MergeState merged = new MergeState(aggregations, sorts, from, size, versionRequested, seqNoAndPrimaryTermRequested);
+        MergeState merged = new MergeState(
+            aggregations,
+            sorts,
+            from,
+            size,
+            versionRequested,
+            seqNoAndPrimaryTermRequested,
+            trackTotalHitsUpTo
+        );
         runIndexLoop(targets, 0, nodeList, spec, source, merged, start, listener);
+    }
+
+    /**
+     * The {@code track_total_hits} bound in the encoding
+     * {@link SearchSourceBuilder#trackTotalHitsUpTo()} uses. A request
+     * that leaves the flag out counts up to
+     * {@link SearchContext#DEFAULT_TRACK_TOTAL_HITS_UP_TO} (10,000),
+     * the same default the shard path applies; {@code true} maps to
+     * {@link SearchContext#TRACK_TOTAL_HITS_ACCURATE} and {@code false}
+     * to {@link SearchContext#TRACK_TOTAL_HITS_DISABLED}.
+     */
+    private static int resolveTrackTotalHitsUpTo(SearchSourceBuilder source) {
+        if (source == null || source.trackTotalHitsUpTo() == null) {
+            return SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO;
+        }
+        return source.trackTotalHitsUpTo();
     }
 
     /**
@@ -213,7 +240,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             spec.searchAfter(),
             spec.effectiveSize(),
             spec.aggregations(),
-            spec.trackScores()
+            spec.trackScores(),
+            spec.trackTotalHitsUpTo()
         );
         try {
             fanOutForTarget(
@@ -318,7 +346,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 spec.effectiveSize(),
                 spec.aggregations(),
                 fragmentsForNode,
-                spec.trackScores()
+                spec.trackScores(),
+                spec.trackTotalHitsUpTo()
             );
             LOGGER.info(
                 "lance.dispatch: fan-out index [{}] table [{}] to node [{}] with fragments {}",
@@ -396,7 +425,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             spec.effectiveSize(),
             spec.aggregations(),
             Collections.emptyList(),
-            spec.trackScores()
+            spec.trackScores(),
+            spec.trackTotalHitsUpTo()
         );
         LOGGER.info(
             "lance.dispatch: fan-out index [{}] table [{}] empty aggregation run on node [{}]",
@@ -518,8 +548,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // Same reading of index.lance.version as the shard engine
             // (LanceEngineFactory.newReadWriteEngine): -1 follows the
             // latest manifest, anything else pins. Resolving it here and
-            // shipping it to the per-node executor keeps _search on the
-            // manifest _count / _stats / GET already serve.
+            // shipping it to the per-node executor keeps _search and
+            // _count on the manifest _stats / GET already serve.
             long pinnedVersion = indexMetadata.getSettings().getAsLong(LanceEngineFactory.VERSION_SETTING, -1L);
             String tag = indexMetadata.getSettings().get(LanceEngineFactory.TAG_SETTING, "");
             if (pinnedVersion < 0 && !tag.isEmpty()) {
@@ -775,7 +805,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      */
     private record FragmentQuerySpec(String filterSql, org.opensearch.index.query.QueryBuilder query,
         org.opensearch.index.query.QueryBuilder postFilter, List<org.opensearch.search.sort.SortBuilder<?>> sorts, Object[] searchAfter,
-        int effectiveSize, AggregatorFactories.Builder aggregations, boolean trackScores) {
+        int effectiveSize, AggregatorFactories.Builder aggregations, boolean trackScores, int trackTotalHitsUpTo) {
     }
 
     /**
@@ -804,7 +834,14 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // behaviour where these fields default off.
         private final boolean versionRequested;
         private final boolean seqNoAndPrimaryTermRequested;
+        // track_total_hits bound the executors counted up to; decides
+        // the hits.total relation in buildResponse.
+        private final int trackTotalHitsUpTo;
         private long totalMatched = 0L;
+        // Set when any executor stopped counting at the bound, so the
+        // summed total is a lower bound even if it did not exceed
+        // trackTotalHitsUpTo itself.
+        private boolean matchedIsLowerBound = false;
         // One entry per per-node response, in fan-out order (target
         // order, then node id order within a target). Each inner list
         // is already sorted by the executor and cut to from + size.
@@ -817,7 +854,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             int from,
             int size,
             boolean versionRequested,
-            boolean seqNoAndPrimaryTermRequested
+            boolean seqNoAndPrimaryTermRequested,
+            int trackTotalHitsUpTo
         ) {
             this.aggregationsRequested = aggregationsRequested;
             this.sorts = sorts;
@@ -825,6 +863,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             this.size = size;
             this.versionRequested = versionRequested;
             this.seqNoAndPrimaryTermRequested = seqNoAndPrimaryTermRequested;
+            this.trackTotalHitsUpTo = trackTotalHitsUpTo;
         }
 
         void absorbTargetResponses(IndexTarget target, List<LanceFragmentQueryResponse> responses) {
@@ -844,6 +883,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 );
             for (LanceFragmentQueryResponse response : responses) {
                 totalMatched += response.matched();
+                matchedIsLowerBound |= response.matchedIsLowerBound();
                 // Keep each node's list intact; the sort merge and
                 // the from/size cut run in buildResponse once every
                 // node of every target has answered.
@@ -880,6 +920,43 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             }
         }
 
+        /**
+         * {@code hits.total} under the request's {@code track_total_hits}
+         * contract, composed the way
+         * {@code SearchPhaseController.TopDocsStats#getTotalHits} does
+         * it for shard results. {@code null} (no {@code total} block in
+         * the response) when tracking is disabled. With an integer
+         * bound the value is capped at the bound and the relation
+         * becomes {@code gte} when the sum exceeds it or any executor
+         * stopped counting early; otherwise, and always for
+         * {@code track_total_hits: true}, the sum is exact.
+         */
+        private TotalHits totalHits() {
+            if (trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_DISABLED) {
+                return null;
+            }
+            if (trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
+                if (matchedIsLowerBound) {
+                    // An executor may only stop counting under an
+                    // integer bound; a lower bound with an accurate
+                    // request is an executor contract bug. The value
+                    // is still reported as gte so the response does
+                    // not claim an exactness it does not have.
+                    LOGGER.warn(
+                        "lance.dispatch: executor reported hits.total as a lower bound [{}] although track_total_hits requested "
+                            + "an accurate count; reporting gte",
+                        totalMatched
+                    );
+                    return new TotalHits(totalMatched, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+                }
+                return new TotalHits(totalMatched, TotalHits.Relation.EQUAL_TO);
+            }
+            if (matchedIsLowerBound || totalMatched > trackTotalHitsUpTo) {
+                return new TotalHits(Math.min(totalMatched, trackTotalHitsUpTo), TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+            }
+            return new TotalHits(totalMatched, TotalHits.Relation.EQUAL_TO);
+        }
+
         SearchResponse buildResponse(long startMillis) {
             long took = System.currentTimeMillis() - startMillis;
             // Merge the per-node sorted lists into one ordered list,
@@ -912,7 +989,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                     maxScore = score;
                 }
             }
-            SearchHits searchHits = new SearchHits(paged, new TotalHits(totalMatched, TotalHits.Relation.EQUAL_TO), maxScore);
+            SearchHits searchHits = new SearchHits(paged, totalHits(), maxScore);
             InternalAggregations aggregations = null;
             if (aggregationsRequested != null && !perNodeAggregations.isEmpty()) {
                 // Feed every per-node InternalAggregations tree into the

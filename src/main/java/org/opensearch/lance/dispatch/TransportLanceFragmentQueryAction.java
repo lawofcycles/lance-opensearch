@@ -9,7 +9,9 @@ import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -21,12 +23,23 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.ReaderUtil;
 import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.ConstantScoreQuery;
+import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.search.Scorer;
+import org.apache.lucene.search.ScorerSupplier;
+import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.search.TopFieldCollector;
+import org.apache.lucene.search.TopFieldCollectorManager;
+import org.apache.lucene.search.TopFieldDocs;
+import org.apache.lucene.search.TopScoreDocCollectorManager;
+import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
@@ -75,6 +88,7 @@ import org.opensearch.search.aggregations.MultiBucketCollector;
 import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer;
 import org.opensearch.search.aggregations.SearchContextAggregations;
 import org.opensearch.search.internal.ContextIndexSearcher;
+import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.SortAndFormats;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
@@ -267,8 +281,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     LanceFragmentQueryResponse execute(LanceFragmentQueryRequest request) throws Exception {
         // Both Dataset opens below use the manifest version the
         // coordinator resolved from index.lance.version so a pinned
-        // index serves the same rows through _search as through
-        // _count / _stats / GET on the shard engine.
+        // index serves the same rows through _search and _count as
+        // through _stats / GET on the shard engine.
         Optional<Long> pinnedVersion = request.pinnedVersionOrEmpty();
         try (Dataset dataset = LanceRegistry.openDataset(request.tableUri(), request.storageOptions(), pinnedVersion)) {
             int fragmentCount = request.fragmentIds().isEmpty() ? dataset.getFragments().size() : request.fragmentIds().size();
@@ -471,7 +485,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     clusterService.localNode().getId()
                 )
             ) {
-                ContextIndexSearcher searcher = new LanceFragmentIndexSearcher(dr, indexService.getIndexSettings(), searchContext);
+                LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(dr, indexService.getIndexSettings(), searchContext);
                 searchContext.withSearcher(searcher);
                 QueryShardContext qsc = indexService.newQueryShardContext(0, searcher, System::currentTimeMillis, null);
                 searchContext.withQueryShardContext(qsc);
@@ -489,6 +503,25 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // `size`.
                 Query countQuery = withoutScanLimit(hitsQuery);
                 SortAndFormats sortAndFormats = resolveSort(request, qsc);
+
+                // A bare LanceFtsQuery (pure FTS shape, or a bool
+                // collapsed into one with a SQL prefilter, and no
+                // post_filter so hitsQuery is the same instance as
+                // query) gets one Weight for the whole request. Its
+                // shard-level Lance scan then runs once and serves the
+                // hits phase, the aggregators and, through
+                // LanceFtsWeight.hitCount, the match count. Letting
+                // each phase build its own Weight through the Query
+                // API would repeat the scan per phase. Skipped under a
+                // reader wrapper: the count has to go through the
+                // searcher there so DLS liveDocs apply.
+                LanceFtsQuery.LanceFtsWeight ftsWeight = null;
+                if (!hasSecurityWrapper && hitsQuery instanceof LanceFtsQuery fts) {
+                    Weight weight = searcher.createWeight(searcher.rewrite(fts), ScoreMode.COMPLETE, 1f);
+                    if (weight instanceof LanceFtsQuery.LanceFtsWeight lanceFtsWeight) {
+                        ftsWeight = lanceFtsWeight;
+                    }
+                }
 
                 // Aggregations run over the top-level query only —
                 // OpenSearch semantics for post_filter say the
@@ -520,16 +553,31 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     hits = scanHitsViaIndexSearcher(
                         searcher,
                         hitsQuery,
+                        ftsWeight,
                         sortAndFormats,
                         request.searchAfter(),
                         request.size(),
                         request.trackScores()
                     );
                 }
-                InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query);
-                long matched = computeMatched(dataset, request, searcher, countQuery, hasSecurityWrapper);
-                return new LanceFragmentQueryResponse(matched, fragmentCount, hits, aggregations);
+                InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query, ftsWeight);
+                MatchedCount matched = computeMatched(dataset, request, searcher, countQuery, hasSecurityWrapper, ftsWeight);
+                return new LanceFragmentQueryResponse(matched.value(), matched.lowerBound(), fragmentCount, hits, aggregations);
             }
+        }
+    }
+
+    /**
+     * Result of {@link #computeMatched}: the number of matching rows
+     * on this node, and whether counting stopped at the request's
+     * {@code trackTotalHitsUpTo} bound so {@code value} is only a
+     * lower bound of the true count.
+     */
+    record MatchedCount(long value, boolean lowerBound) {
+        static final MatchedCount NOT_TRACKED = new MatchedCount(0L, false);
+
+        static MatchedCount exact(long value) {
+            return new MatchedCount(value, false);
         }
     }
 
@@ -885,10 +933,22 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * collects scores through
      * {@link org.apache.lucene.search.IndexSearcher#search(Query, int)}
      * and ignores this flag.
+     *
+     * <p>When {@code sharedWeight} is non-null the collectors run
+     * through {@link LanceFragmentIndexSearcher#search(Weight, org.apache.lucene.search.CollectorManager)}
+     * with that Weight instead of letting {@link org.apache.lucene.search.IndexSearcher}
+     * create one from {@code query}; the collector managers, the
+     * {@code numHits} cap and the total-hits threshold are the ones
+     * the stock {@code search} / {@code searchAfter} overloads build
+     * internally, so the returned page is the same either way. The
+     * caller passes a Weight only for a bare {@link LanceFtsQuery}
+     * so that its Lance scan is shared with the aggregators and the
+     * match count.
      */
     private List<SearchHit> scanHitsViaIndexSearcher(
-        ContextIndexSearcher searcher,
+        LanceFragmentIndexSearcher searcher,
         Query query,
+        Weight sharedWeight,
         SortAndFormats sortAndFormats,
         Object[] searchAfter,
         int size,
@@ -908,12 +968,18 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // `maxDoc - 1` (or 0 when the reader is empty).
             int maxDoc = searcher.getIndexReader().maxDoc();
             int afterDoc = maxDoc > 0 ? maxDoc - 1 : 0;
-            org.apache.lucene.search.FieldDoc after = new org.apache.lucene.search.FieldDoc(afterDoc, 0f, searchAfter);
-            topDocs = searcher.searchAfter(after, query, size, sortAndFormats.sort, trackScores);
+            FieldDoc after = new FieldDoc(afterDoc, 0f, searchAfter);
+            topDocs = sharedWeight == null
+                ? searcher.searchAfter(after, query, size, sortAndFormats.sort, trackScores)
+                : searchSortedWithWeight(searcher, sharedWeight, after, size, sortAndFormats.sort, trackScores);
         } else if (sortAndFormats == null) {
-            topDocs = searcher.search(query, size);
+            topDocs = sharedWeight == null
+                ? searcher.search(query, size)
+                : searcher.search(sharedWeight, new TopScoreDocCollectorManager(cappedNumHits(searcher, size), null, TOTAL_HITS_THRESHOLD));
         } else {
-            topDocs = searcher.search(query, size, sortAndFormats.sort, trackScores);
+            topDocs = sharedWeight == null
+                ? searcher.search(query, size, sortAndFormats.sort, trackScores)
+                : searchSortedWithWeight(searcher, sharedWeight, null, size, sortAndFormats.sort, trackScores);
         }
         prefetchHitRows(searcher.getIndexReader(), topDocs.scoreDocs);
         List<SearchHit> out = new ArrayList<>(topDocs.scoreDocs.length);
@@ -926,12 +992,95 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             if (visitor.source != null) {
                 hit.sourceRef(new org.opensearch.core.common.bytes.BytesArray(visitor.source));
             }
-            if (sortAndFormats != null && scoreDoc instanceof org.apache.lucene.search.FieldDoc fieldDoc) {
+            if (sortAndFormats != null && scoreDoc instanceof FieldDoc fieldDoc) {
                 hit.sortValues(fieldDoc.fields, sortAndFormats.formats);
             }
             out.add(hit);
         }
         return out;
+    }
+
+    /**
+     * Total-hits threshold {@link org.apache.lucene.search.IndexSearcher}
+     * hands its own top-docs collector managers ({@code
+     * IndexSearcher.TOTAL_HITS_THRESHOLD}, which is private there).
+     * Only the {@code TopDocs.totalHits} accounting depends on it;
+     * this class reads {@code hits.total} from {@link #computeMatched}
+     * and never from the collector, so the value just keeps the
+     * Weight-driven page identical to the Query-driven one.
+     */
+    private static final int TOTAL_HITS_THRESHOLD = 1000;
+
+    /**
+     * {@code numHits} cap {@link org.apache.lucene.search.IndexSearcher#searchAfter}
+     * applies before building a collector: a top-docs collector
+     * rejects {@code numHits > maxDoc} and {@code numHits < 1}, so the
+     * result is clamped to {@code [1, max(1, maxDoc)]} whatever
+     * {@code size} is.
+     */
+    private static int cappedNumHits(LanceFragmentIndexSearcher searcher, int size) {
+        return Math.max(1, Math.min(size, Math.max(1, searcher.getIndexReader().maxDoc())));
+    }
+
+    /**
+     * Sorted top-{@code size} page driven by a caller-built
+     * {@link Weight}: the same steps as
+     * {@link org.apache.lucene.search.IndexSearcher#searchAfter(ScoreDoc, Query, int, org.apache.lucene.search.Sort, boolean)}
+     * ({@code Sort.rewrite}, {@link TopFieldCollectorManager} with the
+     * stock threshold, score population when {@code trackScores})
+     * with the Weight substituted for the Query.
+     */
+    private static TopFieldDocs searchSortedWithWeight(
+        LanceFragmentIndexSearcher searcher,
+        Weight weight,
+        FieldDoc after,
+        int size,
+        Sort sort,
+        boolean trackScores
+    ) throws IOException {
+        Sort rewrittenSort = sort.rewrite(searcher);
+        TopFieldCollectorManager manager = new TopFieldCollectorManager(
+            rewrittenSort,
+            cappedNumHits(searcher, size),
+            after,
+            TOTAL_HITS_THRESHOLD
+        );
+        TopFieldDocs topDocs = searcher.search(weight, manager);
+        if (trackScores) {
+            populateScores(topDocs.scoreDocs, searcher, weight);
+        }
+        return topDocs;
+    }
+
+    /**
+     * Fill {@link ScoreDoc#score} of a sorted page from {@code weight},
+     * the way {@link TopFieldCollector#populateScores(ScoreDoc[], org.apache.lucene.search.IndexSearcher, Query)}
+     * does, except that the caller's Weight is used instead of a new
+     * one created from the Query (which for a Lance-backed query
+     * would run the native scan again). Docs are visited in doc id
+     * order so each leaf's scorer is obtained once.
+     */
+    private static void populateScores(ScoreDoc[] scoreDocs, LanceFragmentIndexSearcher searcher, Weight weight) throws IOException {
+        ScoreDoc[] byDoc = scoreDocs.clone();
+        Arrays.sort(byDoc, Comparator.comparingInt(scoreDoc -> scoreDoc.doc));
+        List<LeafReaderContext> leaves = searcher.getIndexReader().leaves();
+        LeafReaderContext current = null;
+        Scorer scorer = null;
+        for (ScoreDoc scoreDoc : byDoc) {
+            if (current == null || scoreDoc.doc >= current.docBase + current.reader().maxDoc()) {
+                current = leaves.get(ReaderUtil.subIndex(scoreDoc.doc, leaves));
+                ScorerSupplier supplier = weight.scorerSupplier(current);
+                if (supplier == null) {
+                    throw new IllegalStateException("Doc id " + scoreDoc.doc + " does not match the query");
+                }
+                scorer = supplier.get(1L);
+            }
+            int leafDoc = scoreDoc.doc - current.docBase;
+            if (scorer.iterator().advance(leafDoc) != leafDoc) {
+                throw new IllegalStateException("Doc id " + scoreDoc.doc + " does not match the query");
+            }
+            scoreDoc.score = scorer.score();
+        }
     }
 
     /**
@@ -1368,13 +1517,22 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * <p>Returns {@code null} when the request carries no
      * aggregations; the response ships {@code aggregations == null}
      * in that case.
+     *
+     * <p>{@code sharedWeight}, when non-null, is the Weight the caller
+     * already built for {@code query}; the collector tree is then
+     * driven through it so a Lance-backed query's native scan is
+     * reused rather than repeated. The aggregators' collector is
+     * satisfied by a {@link ScoreMode#COMPLETE} Weight the same way it
+     * is by the no-scores Weight the searcher would otherwise build:
+     * it simply does not call {@code score()}.
      */
     private InternalAggregations aggregateViaIndexSearcher(
         LanceFragmentQueryRequest request,
         LanceFragmentSearchContext searchContext,
-        ContextIndexSearcher searcher,
+        LanceFragmentIndexSearcher searcher,
         QueryShardContext qsc,
-        Query query
+        Query query,
+        Weight sharedWeight
     ) throws Exception {
         AggregatorFactories.Builder factoriesBuilder = request.aggregations();
         if (factoriesBuilder == null || factoriesBuilder.getAggregatorFactories().isEmpty()) {
@@ -1388,7 +1546,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             agg.preCollection();
         }
         BucketCollector wrapped = MultiBucketCollector.wrap(topLevelAggregators);
-        searcher.search(query, wrapped);
+        if (sharedWeight != null) {
+            searcher.search(sharedWeight, wrapped);
+        } else {
+            searcher.search(query, wrapped);
+        }
 
         // ContextIndexSearcher.search() ends by calling
         // searchContext.bucketCollectorProcessor().processPostCollection(collector),
@@ -1553,10 +1715,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
 
     /**
      * Determine the number of rows in this node's fragment subset
-     * that satisfy the query. Uses Lance's metadata-only counting
-     * whenever the query is a pure filter shape the coordinator has
-     * already translated to Lance SQL
-     * ({@link LanceFragmentQueryRequest#filterSql()}):
+     * that satisfy the query, counted as far as the request's
+     * {@link LanceFragmentQueryRequest#trackTotalHitsUpTo()} asks.
+     * Uses Lance's metadata-only counting whenever the query is a
+     * pure filter shape the coordinator has already translated to
+     * Lance SQL ({@link LanceFragmentQueryRequest#filterSql()}):
      * <ul>
      *   <li>No filter: sum {@link org.lance.Fragment#countRows()}
      *       across the assigned fragments (Lance metadata, no
@@ -1566,14 +1729,31 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *   <li>Filter set, subset of fragments: run a bounded scan
      *       over the subset and count matching rows.</li>
      * </ul>
+     * These counts come from Lance metadata or a scan that reads no
+     * payload columns, so they are cheap regardless of the match
+     * count and are always reported exact; the {@code track_total_hits}
+     * bound only affects how the coordinator presents them.
      *
-     * <p>For scoring queries (match / knn) the coordinator leaves
-     * filterSql null and only ships the {@link QueryBuilder}. We
-     * cannot express those in Lance SQL, so we ask Lucene through
-     * {@link org.apache.lucene.search.IndexSearcher#count(Query)}.
-     * The searcher iterates the same doc set the hits phase does,
-     * so this is a second pass in exchange for the exact total
-     * (versus underestimating when {@code size} clips).
+     * <p>A bare {@link LanceFtsQuery} is counted from the Weight the
+     * caller built for the request when that Weight's scan has run
+     * (hits or aggregations were collected) and either was unbounded
+     * or returned fewer rows than its {@code scanLimit}, since then
+     * the scan saw every match. Otherwise the count comes from a
+     * dedicated Lance scan that yields no payload columns
+     * ({@link #countFtsHitsDirectly}), limited to
+     * {@code trackTotalHitsUpTo + 1} rows unless the request asked for
+     * an accurate total: reaching the limit proves there are more than
+     * {@code trackTotalHitsUpTo} matches, which is all the
+     * {@code gte} relation needs, and stops the scan from walking a
+     * posting list whose length is what makes large FTS results slow.
+     *
+     * <p>For every other scoring shape (knn, a bool mixing FTS with
+     * other scoring clauses, post_filter over any query) the
+     * coordinator leaves filterSql null and only ships the
+     * {@link QueryBuilder}. We cannot express those in Lance SQL, so
+     * we ask Lucene through
+     * {@link org.apache.lucene.search.IndexSearcher#count(Query)}
+     * and report the exact number.
      *
      * <p>The {@code hasSecurityWrapper} flag overrides every
      * Lance-side fast path. A non-null reader wrapper on
@@ -1582,20 +1762,27 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * set; Lance's metadata-only counts and its native filter scan
      * see the raw Dataset, not the wrapper's view, so serving
      * {@code hits.total.value} from Lance would over-count and
-     * disagree with the {@code _count} API (which does route
-     * through the searcher). Route every count path through
+     * disagree with the hits the same request returns. Route every
+     * count path through
      * {@link org.apache.lucene.search.IndexSearcher#count(Query)}
      * whenever a wrapper is installed so the count matches the
-     * hits the same request returns and the {@code _count} API
-     * agrees.
+     * hits, and {@code _count} (which takes this same path) agrees
+     * with {@code _search}.
      */
-    private long computeMatched(
+    private MatchedCount computeMatched(
         Dataset dataset,
         LanceFragmentQueryRequest request,
-        ContextIndexSearcher searcher,
+        LanceFragmentIndexSearcher searcher,
         Query luceneQuery,
-        boolean hasSecurityWrapper
+        boolean hasSecurityWrapper,
+        LanceFtsQuery.LanceFtsWeight ftsWeight
     ) throws Exception {
+        int upTo = request.trackTotalHitsUpTo();
+        if (upTo == SearchContext.TRACK_TOTAL_HITS_DISABLED) {
+            // track_total_hits: false. The coordinator leaves
+            // hits.total out of the response, so no count is needed.
+            return MatchedCount.NOT_TRACKED;
+        }
         if (hasSecurityWrapper) {
             // A reader wrapper is installed on the IndexService,
             // most likely the security plugin's DLS/FLS wrapper.
@@ -1604,9 +1791,19 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // count through the searcher instead. The searcher's
             // BitSet iteration honours the wrapper's liveDocs the
             // same way the hits phase does, keeping
-            // hits.total.value consistent with both the returned
-            // hits and the _count API for security-restricted
-            // users.
+            // hits.total.value consistent with the returned hits
+            // for security-restricted users.
+            //
+            // The track_total_hits bound is not applied here.
+            // IndexSearcher.count has no early-termination knob (it
+            // always iterates every match), so the value it returns
+            // is exact, and exact is within the contract for any
+            // bound. count creates a fresh Weight from luceneQuery,
+            // so for an FTS query the Lance scan runs a second time
+            // here (the hits phase's LanceFtsWeight and its shardHits
+            // are not reused). That repeat is accepted: it is the
+            // only count path that sees the wrapper's view, and DLS
+            // correctness outranks the saving.
             //
             // MatchAllDocsQuery is the one shape IndexSearcher.count
             // does not iterate: its Weight.count returns
@@ -1614,7 +1811,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // reader swaps in filtered liveDocs but leaves numDocs
             // at the unfiltered value. Count that shape from the
             // liveDocs directly so a DLS user's match_all total
-            // equals what _count reports. The normalisation mirrors
+            // equals the rows the user can see. The normalisation mirrors
             // the first two lines of IndexSearcher.count so a
             // ConstantScoreQuery / BoostQuery / bool-filter wrapper
             // around match_all is caught the same way count would
@@ -1624,9 +1821,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 normalised = csq.getQuery();
             }
             if (normalised instanceof MatchAllDocsQuery) {
-                return countLiveDocs(searcher.getIndexReader().leaves());
+                return MatchedCount.exact(countLiveDocs(searcher.getIndexReader().leaves()));
             }
-            return searcher.count(luceneQuery);
+            return MatchedCount.exact(searcher.count(luceneQuery));
         }
         List<Integer> fragmentIds = request.fragmentIdsOrNull();
         String filterSql = request.filterSql();
@@ -1634,17 +1831,28 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         boolean hasPostFilter = request.postFilter() != null;
         if (hasScoringQuery && !hasPostFilter && luceneQuery instanceof LanceFtsQuery fts) {
             // Pure FTS shape (no post_filter, no other scoring
-            // clause): count via Lance's inverted-index scan
-            // without materialising every match. Lance's FTS scan
-            // walks the posting list once and can stream row counts
-            // when we do not ask it for row addresses or scores;
-            // pylance measures this at low milliseconds independent of
-            // hit count, versus seconds for the Weight-based path on a
-            // 20M-row table with 500k hits. A collapsed bool query
-            // arrives here as the same LanceFtsQuery carrying its
-            // scalar clauses as prefilterSql, which the count scan
-            // applies too.
-            return countFtsHitsDirectly(dataset, fts, fragmentIds);
+            // clause). A collapsed bool query arrives here as the
+            // same LanceFtsQuery carrying its scalar clauses as
+            // prefilterSql, which every count path below applies
+            // too.
+            if (ftsWeight != null) {
+                // The request's own Weight has scanned already when
+                // hits or aggregations were collected. Its count is
+                // the true total when the scan was unbounded, or when
+                // a bounded scan came back short of its limit (Lance
+                // returns exactly min(limit, matches) rows).
+                long scanned = ftsWeight.hitCount();
+                int scanLimit = ((LanceFtsQuery) ftsWeight.getQuery()).scanLimit();
+                if (scanned >= 0 && (scanLimit == LanceFtsQuery.SCAN_LIMIT_UNBOUNDED || scanned < scanLimit)) {
+                    return MatchedCount.exact(scanned);
+                }
+            }
+            if (upTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
+                return MatchedCount.exact(countFtsHitsDirectly(dataset, fts, fragmentIds, 0L));
+            }
+            long limit = (long) upTo + 1L;
+            long counted = countFtsHitsDirectly(dataset, fts, fragmentIds, limit);
+            return new MatchedCount(counted, counted >= limit);
         }
         if (hasScoringQuery || hasPostFilter) {
             // post_filter narrows hits.total.value below what
@@ -1653,11 +1861,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // lands here (its LanceKnnQuery is not the LanceFtsQuery
             // branch above); Lucene serves the count via the shared
             // shard-level nearest scan the Weight already cached.
-            return searcher.count(luceneQuery);
+            return MatchedCount.exact(searcher.count(luceneQuery));
         }
         if (filterSql == null) {
             if (fragmentIds == null) {
-                return dataset.countRows();
+                return MatchedCount.exact(dataset.countRows());
             }
             long total = 0L;
             List<Fragment> allFragments = dataset.getFragments();
@@ -1666,10 +1874,10 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     total += fragment.countRows();
                 }
             }
-            return total;
+            return MatchedCount.exact(total);
         }
         if (fragmentIds == null) {
-            return dataset.countRows(filterSql);
+            return MatchedCount.exact(dataset.countRows(filterSql));
         }
         // Filter + fragment subset: scan and count. Cheap for
         // typical query workloads because the filter narrows the
@@ -1697,7 +1905,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 total += reader.getVectorSchemaRoot().getRowCount();
             }
         }
-        return total;
+        return MatchedCount.exact(total);
     }
 
     /**
@@ -1706,9 +1914,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * <p>Lance's inverted-index scanner can walk the posting list
      * once and stream row counts when we ask for zero columns and
      * no row address / row id. This is the count-only counterpart
-     * of {@code Dataset.countRows(sqlFilter)} for scalar filters,
-     * and pylance measures it at low milliseconds independent of
-     * the hit count. Without this path an FTS count goes through
+     * of {@code Dataset.countRows(sqlFilter)} for scalar filters.
+     * Without this path an FTS count goes through
      * {@code IndexSearcher.count(luceneQuery)}, which triggers
      * {@link LanceFtsQuery}'s Weight to materialise every match's
      * row address and score into a sparse array (see
@@ -1732,8 +1939,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * collapsed bool query) is passed the same way the hits scan
      * passes it, so the count covers exactly the rows the hits phase
      * can return.
+     *
+     * <p>{@code limit} caps the rows the scan returns; {@code 0}
+     * means no cap. Even with no payload columns the scan's cost
+     * grows with the number of matches (Lance scores and ranks every
+     * posting before it can emit rows), so a caller that only needs
+     * to know whether more than {@code n} rows match passes
+     * {@code n + 1} and stops the scan there.
      */
-    private long countFtsHitsDirectly(Dataset dataset, LanceFtsQuery fts, List<Integer> fragmentIds) throws Exception {
+    private long countFtsHitsDirectly(Dataset dataset, LanceFtsQuery fts, List<Integer> fragmentIds, long limit) throws Exception {
         org.lance.ipc.ScanOptions.Builder builder = new org.lance.ipc.ScanOptions.Builder().fullTextQuery(fts.fullTextQuery())
             .columns(Collections.emptyList())
             .withRowAddress(false)
@@ -1743,6 +1957,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         }
         if (fragmentIds != null) {
             builder = LanceFtsQuery.restrictToFragmentsUnlessAll(builder, fragmentIds, dataset);
+        }
+        if (limit > 0) {
+            builder = builder.limit(limit);
         }
         long total = 0L;
         try (

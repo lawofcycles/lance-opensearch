@@ -34,6 +34,7 @@ import org.opensearch.lance.attach.LanceAttachResponse;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.search.SearchHit;
+import org.opensearch.search.internal.SearchContext;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
 
 /**
@@ -120,7 +121,8 @@ public class TempIndexServiceReaderWrapperTests extends OpenSearchSingleNodeTest
             ROWS,
             /* aggregations */ null,
             List.of(),
-            false
+            false,
+            SearchContext.TRACK_TOTAL_HITS_ACCURATE
         );
 
         // With the node's own IndexService the wrapper is applied the way

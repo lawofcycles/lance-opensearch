@@ -18,6 +18,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.search.aggregations.AggregatorFactories;
+import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.SortBuilder;
 
 /**
@@ -70,7 +71,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
      * wire so every {@code Dataset} the fragment path opens (the
      * coordinator's fragment enumeration and both per-node opens)
      * reads the same manifest the shard engine serves for
-     * {@code _count}, {@code _stats}, and GET. Re-reading the
+     * {@code _stats} and GET. Re-reading the
      * setting on the receiving node would leave room for the two
      * sides to observe different cluster states.
      */
@@ -91,6 +92,22 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
      * asks for it alongside a {@code sort} clause.
      */
     private final boolean trackScores;
+    /**
+     * How far the executor has to count matches for
+     * {@code hits.total}, in the encoding
+     * {@link org.opensearch.search.builder.SearchSourceBuilder#trackTotalHitsUpTo()}
+     * uses: a positive bound (the request's {@code track_total_hits}
+     * integer, or {@link SearchContext#DEFAULT_TRACK_TOTAL_HITS_UP_TO}
+     * when the request left it out),
+     * {@link SearchContext#TRACK_TOTAL_HITS_ACCURATE} for
+     * {@code track_total_hits: true} (also what {@code _count}
+     * sends), or {@link SearchContext#TRACK_TOTAL_HITS_DISABLED} for
+     * {@code track_total_hits: false}. The executor may stop counting
+     * once it has seen more than the bound and report the count as a
+     * lower bound through
+     * {@link LanceFragmentQueryResponse#matchedIsLowerBound()}.
+     */
+    private final int trackTotalHitsUpTo;
 
     public LanceFragmentQueryRequest(
         String tableUri,
@@ -105,7 +122,8 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         int size,
         AggregatorFactories.Builder aggregations,
         List<Integer> fragmentIds,
-        boolean trackScores
+        boolean trackScores,
+        int trackTotalHitsUpTo
     ) {
         this.tableUri = tableUri;
         this.indexName = indexName;
@@ -120,6 +138,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.aggregations = aggregations;
         this.fragmentIds = List.copyOf(fragmentIds);
         this.trackScores = trackScores;
+        this.trackTotalHitsUpTo = trackTotalHitsUpTo;
     }
 
     public LanceFragmentQueryRequest(StreamInput in) throws IOException {
@@ -155,6 +174,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         }
         this.fragmentIds = List.copyOf(readFragments);
         this.trackScores = in.readBoolean();
+        this.trackTotalHitsUpTo = in.readInt();
     }
 
     @Override
@@ -189,6 +209,10 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             out.writeVInt(id);
         }
         out.writeBoolean(trackScores);
+        // Plain int rather than VInt: TRACK_TOTAL_HITS_DISABLED is -1
+        // and TRACK_TOTAL_HITS_ACCURATE is Integer.MAX_VALUE, neither
+        // of which VInt encodes compactly or (for -1) safely.
+        out.writeInt(trackTotalHitsUpTo);
     }
 
     @Override
@@ -326,15 +350,27 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     }
 
     /**
+     * Bound on the match count the executor has to establish for
+     * {@code hits.total}: a positive limit,
+     * {@link SearchContext#TRACK_TOTAL_HITS_ACCURATE}, or
+     * {@link SearchContext#TRACK_TOTAL_HITS_DISABLED}. See the field
+     * comment for the encoding.
+     */
+    public int trackTotalHitsUpTo() {
+        return trackTotalHitsUpTo;
+    }
+
+    /**
      * Convenience factory for single-node dispatch (all fragments,
-     * latest manifest version).
+     * latest manifest version, exact match count).
      *
      * <p>{@code trackScores} defaults to {@code false} because
      * every caller of this helper today either has no {@code sort}
      * clause (score-only queries collect scores automatically) or
      * runs in tests where the flag is not exercised. Callers that
-     * need {@code track_scores:true} alongside a sort, or a pinned
-     * manifest version, should use the full constructor instead.
+     * need {@code track_scores:true} alongside a sort, a pinned
+     * manifest version, or a {@code track_total_hits} bound should
+     * use the full constructor instead.
      */
     public static LanceFragmentQueryRequest allFragments(
         String tableUri,
@@ -359,7 +395,8 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             size,
             aggregations,
             Collections.emptyList(),
-            /* trackScores */ false
+            /* trackScores */ false,
+            SearchContext.TRACK_TOTAL_HITS_ACCURATE
         );
     }
 }
