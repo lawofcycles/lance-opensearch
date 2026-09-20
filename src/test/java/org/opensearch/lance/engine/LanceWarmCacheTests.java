@@ -9,6 +9,8 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.nio.file.Path;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 
 import org.apache.arrow.memory.RootAllocator;
@@ -268,6 +270,51 @@ public class LanceWarmCacheTests extends OpenSearchTestCase {
             assertTrue(lease.snapshot().isCached());
         }
         assertEquals(1, cache.snapshotCount());
+    }
+
+    public void testARetiredSnapshotStillLeasedKeepsTheColumnsOfItsReplacement() throws Exception {
+        // The shard engine's reader leases its snapshot for as long as it
+        // is open. Turning the cache off and on again retires that
+        // snapshot without releasing it, and the next fragment path
+        // request builds a replacement under the same key. When the old
+        // lease is finally released, the replacement's store columns stay:
+        // the key names the same rows for both.
+        Lease engine = acquire(UUID_A, Optional.empty());
+        Snapshot old = engine.snapshot();
+        cache.setEnabled(false);
+        cache.setEnabled(true);
+        assertTrue(old.isRetired());
+        assertEquals(1, cache.retiredSnapshotCount());
+
+        Snapshot replacement;
+        try (Lease request = acquire(UUID_A, Optional.empty())) {
+            replacement = request.snapshot();
+            assertNotSame(old, replacement);
+            assertEquals(old.key(), replacement.key());
+            assertEquals("the old snapshot is no longer counted as held", 1, cache.snapshotCount());
+            Map<Integer, Integer> fragmentRows = new HashMap<>();
+            for (LanceWarmCache.FragmentMeta meta : replacement.fragments()) {
+                fragmentRows.put(meta.id(), meta.physicalRows());
+            }
+            Map<Integer, CachedColumn> rating = cache.columnStore()
+                .acquire(replacement.key(), replacement.dataset(), "rating", false, fragmentRows);
+            assertNotNull(rating);
+            cache.columnStore().unpin(rating.values());
+        }
+        assertTrue(cache.columnStore().contains(replacement.key(), "rating", 0));
+
+        engine.release();
+        assertTrue(old.isClosed());
+        assertFalse(replacement.isClosed());
+        assertTrue(
+            "closing the retired snapshot must not drop the replacement's columns",
+            cache.columnStore().contains(replacement.key(), "rating", 0)
+        );
+        assertEquals(0, cache.retiredSnapshotCount());
+
+        cache.retire(UUID_A, replacement.version() + 1);
+        assertTrue(replacement.isClosed());
+        assertFalse("the last snapshot of the key drops the columns", cache.columnStore().contains(replacement.key(), "rating", 0));
     }
 
     public void testCloseReleasesEverySnapshot() throws Exception {
