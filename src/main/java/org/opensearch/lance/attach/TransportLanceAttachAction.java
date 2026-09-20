@@ -98,11 +98,33 @@ public final class TransportLanceAttachAction extends HandledTransportAction<Lan
             );
         }
         String indexName = request.indexName() != null ? request.indexName() : tableName(table);
+        // A tag is resolved to the version it points at right now so the
+        // derivation below reads the tagged snapshot. The engine and the
+        // namespace poll resolve it again on every open and poll, which is
+        // what makes the index follow the tag when Lance moves it.
+        Optional<Long> openVersion = request.pinnedVersion();
+        if (request.tag().isPresent()) {
+            String tag = request.tag().get();
+            try (Dataset latest = LanceRegistry.openDataset(table, request.storageOptions())) {
+                try {
+                    openVersion = Optional.of(latest.tags().getVersion(tag));
+                } catch (RuntimeException e) {
+                    // The table itself opened, so the failure is about the
+                    // tag (unknown name is the common case). Surface Lance's
+                    // message as a 400 rather than a generic 500.
+                    throw new OpenSearchStatusException(
+                        "tag [" + tag + "] could not be resolved on table [" + table + "]: " + e.getMessage(),
+                        RestStatus.BAD_REQUEST,
+                        e
+                    );
+                }
+            }
+        }
         RestAttachAction.Derivation derivation;
-        try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions(), request.pinnedVersion())) {
+        try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions(), openVersion)) {
             derivation = RestAttachAction.derive(dataset, request.multiFields());
         }
-        createIndex(indexName, table, derivation, request.storageOptions(), request.pinnedVersion(), listener);
+        createIndex(indexName, table, derivation, request.storageOptions(), request.pinnedVersion(), request.tag(), listener);
     }
 
     private void createIndex(
@@ -111,6 +133,7 @@ public final class TransportLanceAttachAction extends HandledTransportAction<Lan
         RestAttachAction.Derivation derivation,
         StorageOptions storageOptions,
         Optional<Long> pinnedVersion,
+        Optional<String> tag,
         ActionListener<LanceAttachResponse> listener
     ) {
         Settings.Builder settings = Settings.builder()
@@ -123,6 +146,7 @@ public final class TransportLanceAttachAction extends HandledTransportAction<Lan
             settings.put(LanceEngineFactory.MULTI_FIELDS_SETTING, derivation.multiFieldsJson());
         }
         pinnedVersion.ifPresent(v -> settings.put(LanceEngineFactory.VERSION_SETTING, v));
+        tag.ifPresent(t -> settings.put(LanceEngineFactory.TAG_SETTING, t));
         storageOptions.writeToSettings(settings);
         CreateIndexRequest create = new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson());
 
@@ -139,14 +163,16 @@ public final class TransportLanceAttachAction extends HandledTransportAction<Lan
                 @Override
                 public void onResponse(CreateIndexResponse response) {
                     // Register the attach-created index with the namespace
-                    // poller only when the operator is following the latest
-                    // version. Pinned indices stay on their manifest version
-                    // by design (readonly snapshot for reproducibility), so
-                    // the poll cycle does not need to touch them and would
-                    // otherwise burn cycles probing for a manifest advance
-                    // that must not change the reader.
+                    // poller unless the operator pinned a version. Pinned
+                    // indices stay on their manifest version by design
+                    // (readonly snapshot for reproducibility), so the poll
+                    // cycle does not need to touch them and would otherwise
+                    // burn cycles probing for a manifest advance that must
+                    // not change the reader. Tag-following indices are
+                    // registered with their tag so the poll re-resolves it
+                    // and refreshes when Lance moves the tag.
                     if (pinnedVersion.isEmpty()) {
-                        namespaceService.registerAttachedIndex(indexName, table, derivation.version(), storageOptions);
+                        namespaceService.registerAttachedIndex(indexName, table, derivation.version(), storageOptions, tag.orElse(null));
                     }
                     listener.onResponse(response(indexName, table, derivation, false));
                 }
@@ -161,7 +187,7 @@ public final class TransportLanceAttachAction extends HandledTransportAction<Lan
                     // for the same table before claiming success; otherwise
                     // attach would silently take credit for an unrelated
                     // index.
-                    verifyExistingLanceIndex(indexName, table, derivation, storageOptions, pinnedVersion, listener);
+                    verifyExistingLanceIndex(indexName, table, derivation, storageOptions, listener);
                 }
             });
         }
@@ -172,7 +198,6 @@ public final class TransportLanceAttachAction extends HandledTransportAction<Lan
         String table,
         RestAttachAction.Derivation derivation,
         StorageOptions storageOptions,
-        Optional<Long> pinnedVersion,
         ActionListener<LanceAttachResponse> listener
     ) {
         ClusterStateRequest stateRequest = new ClusterStateRequest();
@@ -199,12 +224,22 @@ public final class TransportLanceAttachAction extends HandledTransportAction<Lan
             }
             // Same table, so record the (index, table) pair with the
             // namespace poller in case this node has forgotten it
-            // (cluster restart after attach, for example). Pinned
-            // indices are readonly snapshots and stay outside the poll
-            // cycle so a manifest advance does not race with the
-            // intended version.
-            if (pinnedVersion.isEmpty()) {
-                namespaceService.registerAttachedIndex(indexName, table, derivation.version(), storageOptions);
+            // (cluster restart after attach, for example). The existing
+            // index's own settings decide how it is registered, because
+            // that is what its engine reads: a version pin keeps it out
+            // of the poll cycle (readonly snapshot), and a stored tag is
+            // what the poll has to re-resolve, even if this request named
+            // a different tag or none.
+            long existingVersion = md.getSettings().getAsLong(LanceEngineFactory.VERSION_SETTING, -1L);
+            String existingTag = md.getSettings().get(LanceEngineFactory.TAG_SETTING, "");
+            if (existingVersion < 0) {
+                namespaceService.registerAttachedIndex(
+                    indexName,
+                    table,
+                    derivation.version(),
+                    storageOptions,
+                    existingTag.isEmpty() ? null : existingTag
+                );
             }
             listener.onResponse(response(indexName, table, derivation, true));
         }, listener::onFailure));

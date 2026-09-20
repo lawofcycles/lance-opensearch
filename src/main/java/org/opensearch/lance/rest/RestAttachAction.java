@@ -35,8 +35,10 @@ import org.opensearch.transport.client.node.NodeClient;
  * a real engine backed index. The mapping follows the derivation defaults
  * (a string column carrying an FTS index maps to text, integers map to
  * numeric doc values fields), the shard count is always one, and the
- * primary key is detected from Lance field metadata. Optional override:
- * "name" (index name, defaults to the table directory name).
+ * primary key is detected from Lance field metadata. Optional overrides:
+ * "name" (index name, defaults to the table directory name), "version"
+ * (pin a manifest version) or "tag" (follow a Lance tag; not together
+ * with "version").
  *
  * <p>Attach always creates a single-shard index because the fragment path
  * (see {@code LanceDispatchActionFilter}) is the only search implementation
@@ -73,6 +75,7 @@ public class RestAttachAction extends BaseRestHandler {
         String table;
         String explicitName;
         Long pinnedVersion;
+        String tag;
         StorageOptions storageOptions;
         Map<String, LinkedHashMap<String, String>> multiFields;
         try {
@@ -99,6 +102,17 @@ public class RestAttachAction extends BaseRestHandler {
             if (pinnedVersion != null && pinnedVersion < 0) {
                 return channel -> channel.sendResponse(
                     new BytesRestResponse(RestStatus.BAD_REQUEST, "[version] must be a non-negative integer")
+                );
+            }
+            tag = readOptionalString(body, "tag");
+            if (tag != null && tag.isEmpty()) {
+                return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, "[tag] must not be empty"));
+            }
+            if (pinnedVersion != null && tag != null) {
+                // `version` is a fixed pin, `tag` follows wherever the tag
+                // points. The engine can honour only one of them per index.
+                return channel -> channel.sendResponse(
+                    new BytesRestResponse(RestStatus.BAD_REQUEST, "[version] and [tag] are mutually exclusive")
                 );
             }
             storageOptions = StorageOptions.parseFromRequestField(body.get("storage_options"), "[lance_attach]");
@@ -136,7 +150,7 @@ public class RestAttachAction extends BaseRestHandler {
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
         }
 
-        LanceAttachRequest attach = new LanceAttachRequest(table, explicitName, pinnedVersion, storageOptions, multiFields);
+        LanceAttachRequest attach = new LanceAttachRequest(table, explicitName, pinnedVersion, tag, storageOptions, multiFields);
         return channel -> client.execute(LanceAttachAction.INSTANCE, attach, new RestToXContentListener<>(channel));
     }
 
