@@ -8,12 +8,15 @@ package org.opensearch.lance.namespace;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.util.List;
+import java.util.Set;
 
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.client.NoOpClient;
@@ -26,8 +29,10 @@ import org.opensearch.threadpool.ThreadPool;
  * {@code TransportClusterManagerNodeAction}, so
  * {@link LanceNamespaceService#register} cannot be exercised without a
  * live transport stack; the tests here cover the surface that stands
- * on its own: cadence exposure and the metadata-backed
- * {@link LanceNamespaceService#namespaces} reader.
+ * on its own: cadence exposure, the metadata-backed
+ * {@link LanceNamespaceService#namespaces} reader, and the
+ * settings-only classification the poll uses to adopt indexes it does
+ * not track yet.
  *
  * <p>End-to-end register / unregister behaviour is exercised in
  * {@code LanceNamespaceIT}.
@@ -104,5 +109,59 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
         List<String> before = service.namespaces();
         expectThrows(UnsupportedOperationException.class, () -> before.add("/injected"));
         assertEquals(1, service.namespaces().size());
+    }
+
+    public void testClassifyForAdoptionSkipsIndexWithoutLanceTable() {
+        Settings plain = Settings.builder().put("index.number_of_shards", 1).build();
+        assertEquals(LanceNamespaceService.Adoption.NOT_LANCE, LanceNamespaceService.classifyForAdoption("plain", plain, Set.of("/ns")));
+        Settings emptyTable = Settings.builder().put(LanceEngineFactory.TABLE_SETTING, "").build();
+        assertEquals(
+            LanceNamespaceService.Adoption.NOT_LANCE,
+            LanceNamespaceService.classifyForAdoption("plain", emptyTable, Set.of("/ns"))
+        );
+    }
+
+    public void testClassifyForAdoptionSkipsPinnedIndex() {
+        // A pinned index is a readonly snapshot and stays outside the
+        // poll even when its table sits under a registered namespace.
+        Settings pinned = Settings.builder()
+            .put(LanceEngineFactory.TABLE_SETTING, "/ns/demo.lance")
+            .put(LanceEngineFactory.VERSION_SETTING, randomIntBetween(0, 100))
+            .build();
+        assertEquals(LanceNamespaceService.Adoption.PINNED, LanceNamespaceService.classifyForAdoption("demo", pinned, Set.of("/ns")));
+    }
+
+    public void testClassifyForAdoptionRecognisesNamespaceSurfacedIndex() {
+        // The surface step builds the table path as root + "/" + name +
+        // ".lance", so that exact shape under a registered root is a
+        // namespace index. An explicit -1 version (the follow-latest
+        // default) does not count as a pin.
+        Settings surfaced = Settings.builder()
+            .put(LanceEngineFactory.TABLE_SETTING, "/ns/demo.lance")
+            .put(LanceEngineFactory.VERSION_SETTING, -1L)
+            .build();
+        assertEquals(
+            LanceNamespaceService.Adoption.NAMESPACE,
+            LanceNamespaceService.classifyForAdoption("demo", surfaced, Set.of("/other", "/ns"))
+        );
+    }
+
+    public void testClassifyForAdoptionTreatsOtherLanceIndexesAsAttached() {
+        Settings attached = Settings.builder().put(LanceEngineFactory.TABLE_SETTING, "/elsewhere/demo.lance").build();
+        // Not under any registered root.
+        assertEquals(LanceNamespaceService.Adoption.ATTACH, LanceNamespaceService.classifyForAdoption("demo", attached, Set.of("/ns")));
+        // No namespace registered at all.
+        assertEquals(LanceNamespaceService.Adoption.ATTACH, LanceNamespaceService.classifyForAdoption("demo", attached, Set.of()));
+        // Under a registered root but attached under a different index
+        // name, so the namespace loop would never sync it by that name.
+        Settings renamed = Settings.builder().put(LanceEngineFactory.TABLE_SETTING, "/ns/demo.lance").build();
+        assertEquals(LanceNamespaceService.Adoption.ATTACH, LanceNamespaceService.classifyForAdoption("alias", renamed, Set.of("/ns")));
+        // A tag does not change the classification; it is carried into
+        // the attach bookkeeping by the caller.
+        Settings tagged = Settings.builder()
+            .put(LanceEngineFactory.TABLE_SETTING, "/elsewhere/demo.lance")
+            .put(LanceEngineFactory.TAG_SETTING, "release")
+            .build();
+        assertEquals(LanceNamespaceService.Adoption.ATTACH, LanceNamespaceService.classifyForAdoption("demo", tagged, Set.of("/ns")));
     }
 }
