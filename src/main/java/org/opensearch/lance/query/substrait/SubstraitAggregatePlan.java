@@ -56,6 +56,8 @@ public final class SubstraitAggregatePlan {
     /**
      * {@code Expression.selection}: a direct struct field reference into
      * the input schema by position.
+     *
+     * @param fieldIndex position of the column in the dataset schema
      */
     public record FieldReference(int fieldIndex) implements Expression {
         public FieldReference {
@@ -80,6 +82,9 @@ public final class SubstraitAggregatePlan {
      * {@code gt} and friends map onto DataFusion operators in the
      * consumer's {@code name_to_op}; anything else is looked up as a
      * scalar UDF.
+     *
+     * @param name      DataFusion side function name
+     * @param arguments the arguments, in order
      */
     public record ScalarFunction(String name, List<Expression> arguments) implements Expression {
         public ScalarFunction {

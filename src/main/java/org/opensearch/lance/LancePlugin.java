@@ -362,7 +362,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * scan can compute (metrics, or one {@code terms} / {@code histogram}
      * / fixed interval {@code date_histogram} with metric children, over
      * a {@code match_all} or scalar filter query; see
-     * {@link org.opensearch.lance.dispatch.LanceAggregatePushdown}) runs
+     * {@code LanceAggregatePushdown} in the dispatch package) runs
      * as a Substrait group by inside the Lance scan. Off, every
      * aggregation goes through the Lucene aggregators over the fragment
      * leaf readers. Dynamic so the two paths can be compared without a
