@@ -62,28 +62,94 @@ public final class LanceFtsQuery extends Query {
     /** Default for {@link #subsetProbeLimit()}. */
     public static final int DEFAULT_SUBSET_PROBE_LIMIT = 1_000_000;
 
+    /** Default for {@link #subsetProbeRatio()}. */
+    public static final double DEFAULT_SUBSET_PROBE_RATIO = 0.03d;
+
+    /** Default for {@link #subsetProbeMinRows()}. */
+    public static final int DEFAULT_SUBSET_PROBE_MIN_ROWS = 10_000;
+
     /**
-     * Row cap of the probe scan an executor that holds a proper subset
-     * of the table's fragments runs for an unbounded FTS shape (see
-     * {@link LanceFtsWeight}). Runtime parameter, not query identity:
-     * two queries that differ only in the probe limit in force return
-     * the same rows, so it is not part of {@link #equals}. Written by
-     * the plugin from the {@code lance.fts.subset_probe_limit} cluster
-     * setting, read by every scan.
+     * Absolute cap on the rows an executor that holds a proper subset
+     * of the table's fragments reads from the probe scan of an
+     * unbounded FTS shape (see {@link #effectiveSubsetProbeLimit}).
+     * Runtime parameter, not query identity: two queries that differ
+     * only in the probe limit in force return the same rows, so it is
+     * not part of {@link #equals}. Written by the plugin from the
+     * {@code lance.fts.subset_probe_limit} cluster setting, read by
+     * every scan. The two companions below come from
+     * {@code lance.fts.subset_probe_ratio} and
+     * {@code lance.fts.subset_probe_min_rows} the same way.
      */
     private static volatile int subsetProbeLimit = DEFAULT_SUBSET_PROBE_LIMIT;
+    private static volatile double subsetProbeRatio = DEFAULT_SUBSET_PROBE_RATIO;
+    private static volatile int subsetProbeMinRows = DEFAULT_SUBSET_PROBE_MIN_ROWS;
 
     /** Current value of the {@code lance.fts.subset_probe_limit} setting. */
     public static int subsetProbeLimit() {
         return subsetProbeLimit;
     }
 
-    /** Install a new probe limit; the next scan picks it up. */
+    /** Install a new probe cap; the next scan picks it up. */
     public static void setSubsetProbeLimit(int limit) {
         if (limit < 1) {
             throw new IllegalArgumentException("subset probe limit must be at least 1, was " + limit);
         }
         subsetProbeLimit = limit;
+    }
+
+    /** Current value of the {@code lance.fts.subset_probe_ratio} setting. */
+    public static double subsetProbeRatio() {
+        return subsetProbeRatio;
+    }
+
+    /** Install a new probe ratio (0.0 to 1.0); the next scan picks it up. */
+    public static void setSubsetProbeRatio(double ratio) {
+        if (Double.isNaN(ratio) || ratio < 0d || ratio > 1d) {
+            throw new IllegalArgumentException("subset probe ratio must be between 0.0 and 1.0, was " + ratio);
+        }
+        subsetProbeRatio = ratio;
+    }
+
+    /** Current value of the {@code lance.fts.subset_probe_min_rows} setting. */
+    public static int subsetProbeMinRows() {
+        return subsetProbeMinRows;
+    }
+
+    /** Install a new probe floor; the next scan picks it up. */
+    public static void setSubsetProbeMinRows(int rows) {
+        if (rows < 1) {
+            throw new IllegalArgumentException("subset probe min rows must be at least 1, was " + rows);
+        }
+        subsetProbeMinRows = rows;
+    }
+
+    /**
+     * Rows the probe scan of an unbounded FTS shape may return before
+     * an executor that covers {@code subsetRows} rows of the table
+     * gives it up and repeats the scan restricted to its fragments:
+     * {@code min(subsetProbeLimit, max(subsetProbeMinRows,
+     * floor(subsetRows * subsetProbeRatio)))}.
+     *
+     * <p>The ratio balances the two ways a subset executor can pay for
+     * an unbounded scan. The probe scans the whole table and the
+     * executor receives every match, keeps its own rows and drops the
+     * rest; its extra cost over a whole table executor is the received
+     * rows, about 0.5 to 0.9 µs per row on the measured hardware (rows
+     * with {@code _rowaddr} and {@code _score} transferred through
+     * Arrow and bucketed by fragment). The restricted scan makes Lance
+     * read {@code _rowid} over the executor's fragments as a prefilter
+     * before the index lookup; its extra cost grows with the rows the
+     * executor covers, about 21 ns per row (139 ms for 6.7M rows at
+     * 20M). The two are equal when the matches are about 3 percent of
+     * the covered rows, which is the default ratio: below it the probe
+     * is the cheaper path, above it the restricted scan is. The floor
+     * keeps small tables and one hit queries on the probe, where the
+     * prefilter read would be the larger cost in relative terms, and
+     * the cap bounds the heap the probe rows take on one node.
+     */
+    public static long effectiveSubsetProbeLimit(long subsetRows) {
+        long proportional = (long) Math.floor(Math.max(0L, subsetRows) * subsetProbeRatio);
+        return Math.min((long) subsetProbeLimit, Math.max((long) subsetProbeMinRows, proportional));
     }
 
     private final FullTextQuery fullTextQuery;
@@ -289,7 +355,8 @@ public final class LanceFtsQuery extends Query {
      *       the tied rows is inside the k rows.</li>
      *   <li>Unbounded (aggregations, sort by a field, post_filter,
      *       {@code size 0}): a probe scan with
-     *       {@code limit(subsetProbeLimit)} over the table. When Lance
+     *       {@code limit(effectiveSubsetProbeLimit(rows covered))}
+     *       over the table. When Lance
      *       returns fewer rows than the probe limit every match has
      *       been seen and the reader's rows are kept. When the probe
      *       fills up the match set is too large to filter here, the
@@ -509,10 +576,12 @@ public final class LanceFtsQuery extends Query {
                 topCtx = topCtx.parent;
             }
             Set<Integer> fragmentIds = new LinkedHashSet<>();
+            long subsetRows = 0L;
             for (LeafReaderContext sibling : topCtx.leaves()) {
                 LanceFragmentLeafReader sl = LanceFragmentLeafReader.unwrap(sibling.reader());
                 if (sl != null) {
                     fragmentIds.add(sl.fragmentId());
+                    subsetRows += sl.maxDoc();
                 }
             }
             if (fragmentIds.isEmpty()) {
@@ -551,7 +620,9 @@ public final class LanceFtsQuery extends Query {
                 collectHits(dataset, options, null, hits);
                 complete = true;
             } else {
-                long probeLimit = subsetProbeLimit();
+                // Probe limit proportional to the rows the reader
+                // covers, see effectiveSubsetProbeLimit.
+                long probeLimit = effectiveSubsetProbeLimit(subsetRows);
                 ScanOptions probe = newScanOptions().limit(probeLimit).build();
                 issued.add(probe);
                 long returned = collectHits(dataset, probe, keep, hits);

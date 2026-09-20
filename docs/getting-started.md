@@ -532,13 +532,15 @@ The endpoint is read only. With the security plugin, grant `cluster:monitor/lanc
 
 ### Full-text lookups on several data nodes
 
-With more than one data node each node executes a share of the table's fragments, but a full-text query still looks the whole table up from the inverted index and keeps its own rows, because passing Lance a fragment list makes it read `_rowid` over those fragments first. Shapes that need every match (aggregations, sort by a field, post_filter, `size 0`, `track_total_hits: true`) run that lookup as a probe capped by one dynamic cluster setting:
+With more than one data node each node executes a share of the table's fragments, but a full-text query still looks the whole table up from the inverted index and keeps its own rows, because passing Lance a fragment list makes it read `_rowid` over those fragments first. Shapes that need every match (aggregations, sort by a field, post_filter, `size 0`, `track_total_hits: true`) run that lookup as a probe whose row limit is derived from the rows the node covers, through three dynamic cluster settings:
 
 ```
-lance.fts.subset_probe_limit: 1000000   # default; rows a subset node accepts from the whole-table lookup before it repeats the scan restricted to its fragments
+lance.fts.subset_probe_ratio: 0.03        # default; share of the rows the node covers that the probe may return
+lance.fts.subset_probe_min_rows: 10000    # default; floor of the probe limit
+lance.fts.subset_probe_limit: 1000000     # default; cap of the probe limit
 ```
 
-Lower it when the per-node heap for the probe rows matters more than latency on queries that match millions of rows; raise it when such queries should stay on the index-only lookup.
+The effective probe limit is `min(subset_probe_limit, max(subset_probe_min_rows, floor(covered rows * subset_probe_ratio)))`. When the lookup returns that many rows the node discards them and repeats the scan restricted to its fragments. The ratio is where the two paths cost the same: the whole-table lookup makes every node receive every match and drop the rows of other nodes, about 0.5 to 0.9 µs per received row, while the restricted scan makes Lance read `_rowid` over the node's fragments first, about 21 ns per covered row (139 ms for 6.7M rows at 20M rows). The two are equal when the matches are about 3 percent of the covered rows. On a 20M row table over 3 nodes the limit is 200,000, so a term with 500,000 matches takes the restricted scan and a term with a few hits stays on the index-only lookup. Raise the ratio when the restricted scan is slower than the lookup on your hardware, lower the floor or the cap when the per-node heap for the probe rows matters.
 
 ## 7. Cleanup and restart
 

@@ -2316,7 +2316,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *       not sum to {@code upTo + 1}, since a tie in score at the
      *       limit lets each executor's scan pick a different row.</li>
      *   <li>{@code limit == 0} ({@code track_total_hits: true}): a
-     *       probe scan with {@code limit(subsetProbeLimit)}. When it
+     *       probe scan with {@code limit(effectiveSubsetProbeLimit)}
+     *       for the rows the executor's fragments hold. When it
      *       comes back short every match has been seen and the
      *       executor's share is the exact count. When it fills up the
      *       probe is discarded and the count-only scan above runs with
@@ -2349,7 +2350,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (limit > 0) {
             return countOwnRows(dataset, rowAddressScan(fts).limit(limit).build(), own);
         }
-        long probeLimit = LanceFtsQuery.subsetProbeLimit();
+        long subsetRows = 0L;
+        for (Fragment fragment : dataset.getFragments()) {
+            if (own.contains(fragment.getId())) {
+                subsetRows += fragment.countRows();
+            }
+        }
+        long probeLimit = LanceFtsQuery.effectiveSubsetProbeLimit(subsetRows);
         FtsHitCount probe = countOwnRows(dataset, rowAddressScan(fts).limit(probeLimit).build(), own);
         if (probe.scanned() < probeLimit) {
             return probe;
