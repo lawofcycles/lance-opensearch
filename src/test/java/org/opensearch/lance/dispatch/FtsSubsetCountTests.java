@@ -45,29 +45,39 @@ public class FtsSubsetCountTests extends OpenSearchTestCase {
         uri = LanceTableFactory.writeInterleavedTable(scratchDir, "count-" + getTestName(), 3, 4);
     }
 
-    private static long count(Dataset dataset, List<Integer> fragmentIds, long limit) throws Exception {
+    private static TransportLanceFragmentQueryAction.FtsHitCount count(Dataset dataset, List<Integer> fragmentIds, long limit)
+        throws Exception {
         return TransportLanceFragmentQueryAction.countFtsHitsDirectly(dataset, new LanceFtsQuery("body", "lance"), fragmentIds, limit);
+    }
+
+    private static void assertCount(long scanned, long own, TransportLanceFragmentQueryAction.FtsHitCount actual) {
+        assertEquals("scanned", scanned, actual.scanned());
+        assertEquals("own", own, actual.own());
     }
 
     public void testBoundedCountsSumToMinOfTotalAndBound() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
             // total < upTo + 1: every match is seen, the executors
-            // split the twelve rows 4 / 8.
-            assertEquals(4L, count(dataset, NODE_A, 21L));
-            assertEquals(8L, count(dataset, NODE_B, 21L));
+            // split the twelve rows 4 / 8, and the scan came back
+            // short of its limit on both.
+            assertCount(TOTAL, 4L, count(dataset, NODE_A, 21L));
+            assertCount(TOTAL, 8L, count(dataset, NODE_B, 21L));
             // total == upTo + 1: the limit is reached exactly at the
-            // last match; the sum still equals the total.
-            assertEquals(4L, count(dataset, NODE_A, 12L));
-            assertEquals(8L, count(dataset, NODE_B, 12L));
+            // last match; the sum still equals the total, and the
+            // scan filled its limit like it does on a whole table
+            // executor (whose countRows returns the same 12).
+            assertCount(12L, 4L, count(dataset, NODE_A, 12L));
+            assertCount(12L, 8L, count(dataset, NODE_B, 12L));
             // total > upTo + 1: the whole-table top 5 is ids 11..7, of
             // which id 9 sits in fragment 0 and 11, 10, 8, 7 in
-            // fragments 1 and 2; the sum is upTo + 1, which the
-            // coordinator reads as "more than upTo".
-            long a = count(dataset, NODE_A, 5L);
-            long b = count(dataset, NODE_B, 5L);
-            assertEquals(1L, a);
-            assertEquals(4L, b);
-            assertEquals(Math.min(TOTAL, 5L), a + b);
+            // fragments 1 and 2. Each executor's share is below the
+            // limit, but scanned is the limit on both, which is what
+            // the executor compares with the bound.
+            TransportLanceFragmentQueryAction.FtsHitCount a = count(dataset, NODE_A, 5L);
+            TransportLanceFragmentQueryAction.FtsHitCount b = count(dataset, NODE_B, 5L);
+            assertCount(5L, 1L, a);
+            assertCount(5L, 4L, b);
+            assertEquals(Math.min(TOTAL, 5L), a.own() + b.own());
         }
     }
 
@@ -75,16 +85,17 @@ public class FtsSubsetCountTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
             // Default probe limit: twelve matches come back short of
             // it, the executors count their own rows.
-            assertEquals(4L, count(dataset, NODE_A, 0L));
-            assertEquals(8L, count(dataset, NODE_B, 0L));
+            assertCount(TOTAL, 4L, count(dataset, NODE_A, 0L));
+            assertCount(TOTAL, 8L, count(dataset, NODE_B, 0L));
 
             int before = LanceFtsQuery.subsetProbeLimit();
             LanceFtsQuery.setSubsetProbeLimit(5);
             try {
                 // Twelve matches fill a probe of five, so the count
-                // comes from the restricted scan and is still exact.
-                assertEquals(4L, count(dataset, NODE_A, 0L));
-                assertEquals(8L, count(dataset, NODE_B, 0L));
+                // comes from the restricted scan and is still exact;
+                // that scan returns the executor's rows only.
+                assertCount(4L, 4L, count(dataset, NODE_A, 0L));
+                assertCount(8L, 8L, count(dataset, NODE_B, 0L));
             } finally {
                 LanceFtsQuery.setSubsetProbeLimit(before);
             }
@@ -93,9 +104,9 @@ public class FtsSubsetCountTests extends OpenSearchTestCase {
 
     public void testFullCoverageCountIsUnchanged() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
-            assertEquals(TOTAL, count(dataset, null, 0L));
-            assertEquals(TOTAL, count(dataset, List.of(0, 1, 2), 0L));
-            assertEquals(5L, count(dataset, List.of(0, 1, 2), 5L));
+            assertCount(TOTAL, TOTAL, count(dataset, null, 0L));
+            assertCount(TOTAL, TOTAL, count(dataset, List.of(0, 1, 2), 0L));
+            assertCount(5L, 5L, count(dataset, List.of(0, 1, 2), 5L));
         }
     }
 }
