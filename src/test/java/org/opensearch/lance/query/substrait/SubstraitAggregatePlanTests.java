@@ -11,6 +11,8 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -30,6 +32,7 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.lance.Dataset;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.opensearch.common.Rounding;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -279,6 +282,102 @@ public class SubstraitAggregatePlanTests extends OpenSearchTestCase {
                 mins.put((Long) row.get("k"), (Long) row.get("lo"));
             }
             assertEquals(expectedMin, mins);
+        }
+    }
+
+    public void testDateTruncGroupsByCalendarMonthAndDay() throws Exception {
+        Path dir = createTempDir();
+        String uri = LanceTableFactory.writeDatedTable(dir, "dated-calendar");
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            ArrowType tsType = fieldType(dataset, "ts");
+            Expression ts = new FieldReference(fieldIndex(dataset, "ts"));
+            String[] days = { "2024-01-15", "2024-02-20", "2024-03-10", "2024-03-25", "2024-04-05", "2024-05-30" };
+            for (String unit : new String[] { "month", "day" }) {
+                ByteBuffer plan = new SubstraitAggregatePlan.Builder().groupBy(
+                    SubstraitExpressions.epochMillis(SubstraitExpressions.dateTrunc(unit, ts), tsType),
+                    "k"
+                )
+                    .measure("count", List.of(), ScalarType.I64, "n")
+                    .measure("sum", List.of(new FieldReference(fieldIndex(dataset, "id"))), ScalarType.I64, "s")
+                    .build();
+                Map<Long, Long> expected = new TreeMap<>();
+                Map<Long, Long> expectedSums = new TreeMap<>();
+                for (int id = 0; id < days.length; id++) {
+                    LocalDate day = LocalDate.parse(days[id]);
+                    LocalDate start = unit.equals("month") ? day.withDayOfMonth(1) : day;
+                    long key = start.atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli();
+                    expected.merge(key, 1L, Long::sum);
+                    expectedSums.merge(key, (long) id, Long::sum);
+                }
+                List<Map<String, Object>> rows = scan(dataset, plan, null, null);
+                assertEquals(unit, expected, keyCounts(rows));
+                Map<Long, Long> sums = new TreeMap<>();
+                for (Map<String, Object> row : rows) {
+                    sums.put((Long) row.get("k"), (Long) row.get("s"));
+                }
+                assertEquals(unit, expectedSums, sums);
+            }
+            // The March bucket of the month plan holds two rows.
+            assertEquals(
+                Map.of(
+                    Instant.parse("2024-01-01T00:00:00Z").toEpochMilli(),
+                    1L,
+                    Instant.parse("2024-02-01T00:00:00Z").toEpochMilli(),
+                    1L,
+                    Instant.parse("2024-03-01T00:00:00Z").toEpochMilli(),
+                    2L,
+                    Instant.parse("2024-04-01T00:00:00Z").toEpochMilli(),
+                    1L,
+                    Instant.parse("2024-05-01T00:00:00Z").toEpochMilli(),
+                    1L
+                ),
+                keyCounts(
+                    scan(
+                        dataset,
+                        new SubstraitAggregatePlan.Builder().groupBy(
+                            SubstraitExpressions.epochMillis(SubstraitExpressions.dateTrunc("month", ts), tsType),
+                            "k"
+                        ).measure("count", List.of(), ScalarType.I64, "n").build(),
+                        null,
+                        null
+                    )
+                )
+            );
+        }
+    }
+
+    public void testDateTruncRoundsWeeksQuartersAndYearsLikeTheAggregator() throws Exception {
+        // Millisecond timestamps on the days around the epoch: 1969
+        // rows have negative millis, the week of the epoch starts on
+        // Monday 1969-12-29, and the quarter and year starts fall in
+        // 1969 for the negative rows.
+        Path dir = createTempDir();
+        String uri = LanceTableFactory.writeSignedValuesTable(dir, "signed-calendar");
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            ArrowType tsType = fieldType(dataset, "ts");
+            Expression ts = new FieldReference(fieldIndex(dataset, "ts"));
+            Map<String, Rounding.DateTimeUnit> units = Map.of(
+                "week",
+                Rounding.DateTimeUnit.WEEK_OF_WEEKYEAR,
+                "quarter",
+                Rounding.DateTimeUnit.QUARTER_OF_YEAR,
+                "year",
+                Rounding.DateTimeUnit.YEAR_OF_CENTURY,
+                "hour",
+                Rounding.DateTimeUnit.HOUR_OF_DAY
+            );
+            for (Map.Entry<String, Rounding.DateTimeUnit> entry : units.entrySet()) {
+                ByteBuffer plan = new SubstraitAggregatePlan.Builder().groupBy(
+                    SubstraitExpressions.epochMillis(SubstraitExpressions.dateTrunc(entry.getKey(), ts), tsType),
+                    "k"
+                ).measure("count", List.of(), ScalarType.I64, "n").build();
+                Rounding rounding = Rounding.builder(entry.getValue()).build();
+                Map<Long, Long> expected = new TreeMap<>();
+                for (long value : LanceTableFactory.SIGNED_VALUES) {
+                    expected.merge(rounding.round(value * 86_400_000L), 1L, Long::sum);
+                }
+                assertEquals(entry.getKey(), expected, keyCounts(scan(dataset, plan, null, null)));
+            }
         }
     }
 

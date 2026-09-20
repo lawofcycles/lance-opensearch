@@ -13,18 +13,37 @@ import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.Float64Litera
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.Int64Literal;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.ScalarFunction;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.ScalarType;
+import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.StringLiteral;
 
 /**
  * Expression shapes the aggregation pushdown needs on top of the raw
- * {@link SubstraitAggregatePlan} vocabulary. Everything here is spelled
+ * {@link SubstraitAggregatePlan} vocabulary. Arithmetic is spelled
  * with binary operators and casts only: the DataFusion build inside
  * Lance registers no math functions, so {@code floor} is not available
  * and floor semantics are derived from truncating division and a
- * comparison.
+ * comparison. Its datetime functions are registered, which is what
+ * {@link #dateTrunc} relies on.
  */
 public final class SubstraitExpressions {
 
     private SubstraitExpressions() {}
+
+    /**
+     * DataFusion's {@code date_trunc(unit, timestamp)}: the first
+     * instant of the calendar unit ({@code second}, {@code minute},
+     * {@code hour}, {@code day}, {@code week}, {@code month},
+     * {@code quarter}, {@code year}) that contains the timestamp, as a
+     * timestamp of the same Arrow unit. Weeks start on Monday and, for a
+     * column without a time zone, the calendar is UTC, which is the
+     * rounding {@code date_histogram} applies for a {@code calendar_interval}
+     * without {@code time_zone}. The input has to be an Arrow
+     * {@code Timestamp}: Lance builds the physical expression without
+     * DataFusion's coercion pass, and the function itself rejects a
+     * {@code Date32} array.
+     */
+    public static Expression dateTrunc(String unit, Expression timestamp) {
+        return ScalarFunction.of("date_trunc", new StringLiteral(unit), timestamp);
+    }
 
     /**
      * Epoch milliseconds of a date or timestamp column as an {@code i64},
