@@ -657,6 +657,11 @@ public final class LanceNamespaceService {
         Settings.Builder settings = Settings.builder()
             .put("index.number_of_shards", 1)
             .put("index.number_of_replicas", 0)
+            // A shard copy on every data node lets the coordinator fan
+            // fragments out to all of them. The copies are metadata
+            // only: the read-only engine holds no data, so expanding
+            // to every node costs a reader per node and nothing else.
+            .put("index.auto_expand_replicas", "0-all")
             .put(LanceEngineFactory.TABLE_SETTING, table)
             .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField())
             .put(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, derivation.keyFieldType());

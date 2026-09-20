@@ -89,14 +89,14 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     public void testFtsAcrossFragmentsOnThreeNodeCluster() throws Exception {
-        // 12 rows written 4 per file give fragments 0, 1 and 2. The
-        // index keeps the default single shard copy, so the coordinator
-        // sends every fragment to the one node holding it (see
-        // TransportLanceCoordinatorAction.nodeListForTarget) and that
-        // executor's FTS scan runs without a fragmentIds restriction,
-        // while the other two nodes forward the request. The hits,
-        // their per-fragment _id layout and _count must match what the
-        // single-node LanceFtsQueryIT asserts for the same table.
+        // 12 rows written 4 per file give fragments 0, 1 and 2. Attach
+        // expands a shard copy to every data node, so depending on how
+        // far recovery has progressed when a request arrives the
+        // coordinator sends all three fragments to one node (FTS scan
+        // without a fragmentIds restriction) or one fragment to each
+        // (FTS scan carrying its subset). The hits, their per-fragment
+        // _id layout and _count must match what the single-node
+        // LanceFtsQueryIT asserts for the same table in both cases.
         String suffix = "mn-fts-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -142,10 +142,12 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     /**
      * With a shard copy on every data node the coordinator hands each
      * fragment to a different node and has to merge three sorted (or
-     * scored) lists. The same requests are run first against the
-     * single-copy index (one node answers, no merge) and then after
-     * {@code auto_expand_replicas: 0-all} put a copy on all three
-     * nodes; ids, sort values, totals and buckets must not change.
+     * scored) lists. Attach creates the index with
+     * {@code auto_expand_replicas: 0-all}, so the single-host baseline
+     * is obtained by switching the expansion off and dropping the
+     * replicas (one node answers, no merge); the same requests are
+     * then rerun with the expansion restored and a copy on all three
+     * nodes. Ids, sort values, totals and buckets must not change.
      * The fixture interleaves ids across fragments so a merge that
      * only concatenated per-node lists would reorder every page.
      */
@@ -167,8 +169,16 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         try {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            client().performRequest(
+                new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&wait_for_active_shards=3&timeout=60s")
+            );
+            assertEquals("attach expands to every data node", 3, activeShards(indexName));
+
+            Request collapse = new Request("PUT", "/" + indexName + "/_settings");
+            collapse.setJsonEntity("{\"index.auto_expand_replicas\":\"false\",\"index.number_of_replicas\":0}");
+            assertEquals(RestStatus.OK.getStatus(), client().performRequest(collapse).getStatusLine().getStatusCode());
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
-            assertEquals(1, activeShards(indexName));
+            assertBusy(() -> assertEquals(1, activeShards(indexName)));
 
             List<Map<String, Object>> single = new ArrayList<>();
             for (String request : requests) {
@@ -177,7 +187,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // Sanity on the single-host baseline before comparing.
             assertEquals(List.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9), sourceIds(single.get(0)));
             assertEquals(List.of(11, 10, 9, 8, 7), sourceIds(single.get(1)));
-            assertEquals(12, sourceIds(single.get(2)).size());
+            // BM25 grows with the term frequency, which is id + 1.
+            assertEquals(List.of(11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0), sourceIds(single.get(2)));
             assertEquals(List.of(2, 3, 4), sourceIds(single.get(3)));
             assertEquals(3, buckets(single.get(4)).size());
             for (Map<String, Object> response : single) {

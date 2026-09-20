@@ -154,6 +154,13 @@ public class LanceAttachIT extends LanceRestTestCase {
             Response settings = client().performRequest(new Request("GET", "/" + indexName + "/_settings"));
             String settingsBody = readAll(settings);
             assertFalse("did not expect any storage_options in settings: " + settingsBody, settingsBody.contains("\"storage_options\""));
+            // Every attached index expands a shard copy to every data
+            // node so the coordinator can fan fragments out to all of
+            // them; GET /_settings flattens the setting into an object.
+            assertTrue(
+                "expected index.auto_expand_replicas 0-all in settings: " + settingsBody,
+                settingsBody.contains("\"auto_expand_replicas\":\"0-all\"")
+            );
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));

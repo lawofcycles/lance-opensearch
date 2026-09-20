@@ -278,6 +278,12 @@ public class LanceNamespaceIT extends LanceRestTestCase {
                 "expected namespace aws_region to propagate: " + settingsBody,
                 settingsBody.contains("\"aws_region\":\"eu-west-1\"")
             );
+            // The surface path creates indexes with the same replica
+            // expansion as attach, so every data node gets a copy.
+            assertTrue(
+                "expected index.auto_expand_replicas 0-all in settings: " + settingsBody,
+                settingsBody.contains("\"auto_expand_replicas\":\"0-all\"")
+            );
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
