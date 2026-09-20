@@ -394,9 +394,15 @@ public final class LanceWarmCache implements Closeable {
                 // the table's latest version instead of opening the
                 // table again. The probe holds a reference so a
                 // concurrent retire cannot close the dataset underneath
-                // it.
+                // it. A probe that fails (the table moved or vanished
+                // since the snapshot was built, which a shard reopened
+                // after its table went missing runs into) falls through
+                // to the open below, so the caller sees Lance's regular
+                // open error for the table rather than the probe's.
                 try {
                     resolved = latestKnown.dataset.latestVersion();
+                } catch (Exception e) {
+                    LOGGER.debug("latest version probe on snapshot {} failed; opening the table instead", latestKnown.key, e);
                 } finally {
                     release(latestKnown);
                 }
