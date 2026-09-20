@@ -83,6 +83,15 @@ public class LancePluginIT extends LanceRestTestCase {
         // deletions, and _cat/shards agrees with _cat/indices.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "catdocs")) {
             String indexName = fixture.indexName();
+            // _cluster/stats aggregates every index on the shared cluster, so
+            // compare against the value observed before the delete instead of
+            // a fixed number.
+            int clusterDocsBefore = extractIntPath(
+                readAll(client().performRequest(new Request("GET", "/_cluster/stats"))),
+                "indices",
+                "docs",
+                "count"
+            );
             LanceTableFactory.deleteRows(fixture.tableUri(), "id IN (1, 4)");
             Response refresh = client().performRequest(new Request("POST", "/" + indexName + "/_refresh"));
             assertEquals(RestStatus.OK.getStatus(), refresh.getStatusLine().getStatusCode());
@@ -119,7 +128,11 @@ public class LancePluginIT extends LanceRestTestCase {
 
             String clusterStats = readAll(client().performRequest(new Request("GET", "/_cluster/stats")));
             assertEquals("node failures in " + clusterStats, 0, extractIntPath(clusterStats, "_nodes", "failed"));
-            assertTrue("indices.docs.count in " + clusterStats, extractIntPath(clusterStats, "indices", "docs", "count") >= 14);
+            assertEquals(
+                "indices.docs.count in " + clusterStats + " (before delete: " + clusterDocsBefore + ")",
+                clusterDocsBefore - 2,
+                extractIntPath(clusterStats, "indices", "docs", "count")
+            );
         }
     }
 
