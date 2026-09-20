@@ -19,6 +19,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Stream;
 
+import org.apache.hc.core5.http.HttpHost;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
 import org.opensearch.core.rest.RestStatus;
@@ -259,6 +260,110 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Attach is routed to the elected cluster manager, so a request that
+     * lands on any other node has to succeed as well. The round-robin
+     * {@link #client()} does not say which node answered, so this test
+     * pins a REST client to one node that is not the manager, attaches
+     * through it, and then checks from the shared client that the index
+     * exists cluster-wide. A repeated attach through the same node has to
+     * report {@code already_attached}, which exercises the existing-index
+     * lookup on the manager too.
+     *
+     * <p>HTTP 200 alone would also hold for a locally executed attach
+     * (without a security plugin the internal create-index header
+     * survives transport forwarding), so the test reads the cluster logs
+     * as well: the transport action logs the node it runs on at DEBUG,
+     * and that node has to be the manager for both attach calls.
+     */
+    public void testAttachThroughNonManagerNode() throws Exception {
+        String suffix = "mn-attach-follower-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String managerName = clusterManagerNodeName();
+        HttpHost follower = null;
+        String followerName = null;
+        for (HttpHost host : getClusterHosts()) {
+            String name = localNodeName(host);
+            if (!managerName.equals(name)) {
+                follower = host;
+                followerName = name;
+                break;
+            }
+        }
+        assertNotNull("a three-node cluster has at least one node that is not the cluster manager [" + managerName + "]", follower);
+        try (var followerClient = buildClient(restClientSettings(), new HttpHost[] { follower })) {
+            updateClusterSetting("logger.org.opensearch.lance.attach.TransportLanceAttachAction", "DEBUG");
+            Request attach = new Request("POST", "/_lance/attach");
+            attach.setJsonEntity("{\"table\":\"" + tableUri + "\"}");
+            Response first = followerClient.performRequest(attach);
+            assertEquals(RestStatus.OK.getStatus(), first.getStatusLine().getStatusCode());
+            String firstBody = readAll(first);
+            assertEquals(6, extractIntPath(firstBody, "rows"));
+            assertTrue("first attach creates the index: " + firstBody, firstBody.contains("\"already_attached\":false"));
+
+            Response second = followerClient.performRequest(attach);
+            assertEquals(RestStatus.OK.getStatus(), second.getStatusLine().getStatusCode());
+            String secondBody = readAll(second);
+            assertTrue("repeated attach is idempotent: " + secondBody, secondBody.contains("\"already_attached\":true"));
+
+            String body = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
+            assertEquals(6, extractIntPath(body, "hits", "total", "value"));
+
+            // Both attach calls entered the cluster on the follower and
+            // must have executed on the manager: every "attaching table"
+            // line for this index names the manager and nothing else.
+            // Deduplicated into a set because each node writes the same
+            // line to its main log and its stdout log.
+            String expectedFollower = followerName;
+            assertBusy(() -> {
+                Set<String> executingNodes = new HashSet<>();
+                for (String line : clusterLogLines()) {
+                    if (line.contains("lance.attach: attaching table") && line.contains("as index [" + indexName + "]")) {
+                        executingNodes.add(loggingNodeName(line));
+                    }
+                }
+                assertFalse("no attach log line for [" + indexName + "] in the cluster logs yet", executingNodes.isEmpty());
+                assertEquals(
+                    "attach sent to [" + expectedFollower + "] must run on the manager, saw " + executingNodes,
+                    Set.of(managerName),
+                    executingNodes
+                );
+            });
+        } finally {
+            try {
+                updateClusterSetting("logger.org.opensearch.lance.attach.TransportLanceAttachAction", null);
+            } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** Name of the elected cluster manager, from {@code GET /_cat/cluster_manager}. */
+    private static String clusterManagerNodeName() throws IOException {
+        String name = readAll(client().performRequest(new Request("GET", "/_cat/cluster_manager?h=node"))).trim();
+        assertFalse("_cat/cluster_manager returned no node name", name.isEmpty());
+        return name;
+    }
+
+    /** Name of the node listening on {@code host}, read through a client pinned to that host alone. */
+    @SuppressWarnings("unchecked")
+    private String localNodeName(HttpHost host) throws IOException {
+        try (var pinned = buildClient(restClientSettings(), new HttpHost[] { host })) {
+            Map<String, Object> response = parse(
+                readAll(pinned.performRequest(new Request("GET", "/_nodes/_local?filter_path=nodes.*.name")))
+            );
+            Map<String, Object> nodes = (Map<String, Object>) response.get("nodes");
+            assertEquals("_nodes/_local names exactly one node: " + response, 1, nodes.size());
+            Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();
+            return (String) node.get("name");
         }
     }
 
