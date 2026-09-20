@@ -10,7 +10,7 @@ Every Lance-backed index carries a single primary shard (attach rejects `number_
 - `POST /_lance/attach` attaches a single Lance table URI directly. Idempotent: a repeated call for the same URI returns `already_attached: true`; a name clash with a non-Lance index or a Lance index for a different table returns 409.
 - `POST /_lance/namespace/tables {"path": "..."}` returns the table names the poll would surface from a registered namespace. Read-only preview, useful for spotting a table the poll skipped due to a name clash. Unregistered paths return 404.
 - `DELETE /_lance/namespace {"path": "..."}` stops polling that namespace. Already-surfaced indexes stay in place; delete them separately if the tables should disappear.
-- `POST /_lance/build_indexes/{index}` triggers Lance-side FTS / scalar / vector index builds from OpenSearch. Automatic builds happen for tables at or under `lance.builder.max_rows` (default 1,000,000 rows); larger tables use this explicit endpoint.
+- `POST /_lance/build_indexes/{index}` triggers Lance-side FTS / scalar / vector index builds from OpenSearch. Automatic builds happen for tables at or under `lance.builder.max_rows` (default 1,000,000 rows); larger tables use this explicit endpoint. `fts_columns` and `tokenizer` create inverted indexes on Utf8 columns that have none yet (see [Full-text search](#full-text-search)).
 - Poll cadence is controlled by the cluster setting `lance.namespace.poll_cadence` (default 10s).
 - Resurface guard: when an operator runs `DELETE /{index}` on a Lance-backed index, the poll cycle honours that deletion for `lance.namespace.resurface_guard_grace` (default 1 hour, node-scoped dynamic). Once the grace expires the poll recreates the index if the underlying Lance table is still there. Set to `0` to disable the guard entirely.
 
@@ -35,6 +35,19 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 - `lance_multi_match` for multi-field FTS with per-field boosts and a shared operator (`Lance MultiMatchQuery`).
 - `lance_fts_boost` combines a positive and a negative FTS clause with a `negative_boost` scale, evaluated on Lance rather than layered on Lucene's `BooleanQuery`.
 - `lance_fts_bool` composes `must` / `should` / `must_not` FTS clause arrays on Lance's side.
+
+#### Building an FTS index and choosing its tokenizer
+
+- A Utf8 column is `lance_text` only when the Lance table already carries an inverted index on it; otherwise it is `keyword`, and a plain `POST /_lance/build_indexes/{index}` gives it a BTree scalar index. To create the inverted index from OpenSearch, name the column in `fts_columns`; the next namespace poll re-derives the mapping and rebuilds the index as `lance_text`:
+
+  ```json
+  POST /_lance/build_indexes/demo
+  { "fts_columns": ["text"], "tokenizer": "lindera/ipadic" }
+  ```
+
+- `tokenizer` (default `simple`) is passed to Lance as the inverted index `base_tokenizer` without an allowlist; Lance 12 accepts `simple`, `whitespace`, `raw`, `ngram`, `icu`, `icu/split`, `lindera/<model>`, `jieba/<model>`. A name Lance rejects returns 400 with Lance's message. `tokenizer` requires `fts_columns`; neither is accepted with `optimize`.
+- The tokenizer is fixed when the index is created. A later `build_indexes` naming a column that already has an FTS index skips it (`"fts": []` in the response) and the existing index keeps its tokenizer; to switch, drop or replace the index on the Lance side (`Dataset.drop_index` / `create_scalar_index(..., replace=True)`) and build again.
+- Japanese and Chinese text has no word separators, so `simple` indexes a whole sentence as one token and word queries miss. `icu` (ICU dictionary segmentation, compiled into the Lance native library) works with no setup. `lindera/ipadic`, `lindera/unidic`, `jieba/default` need a dictionary under `$LANCE_LANGUAGE_MODEL_HOME` (default `~/.local/share/lance/language_models` on Linux) on every data node, readable by the OpenSearch process: for Lindera, download `lindera-ipadic-<version>.zip` from the [lindera releases](https://github.com/lindera/lindera/releases), unpack it to `$LANCE_LANGUAGE_MODEL_HOME/lindera/ipadic/main`, and write `$LANCE_LANGUAGE_MODEL_HOME/lindera/ipadic/config.yml` containing `segmenter: {mode: normal, dictionary: <absolute path to main>}`; for Jieba, place jieba-rs's `dict.txt` at `$LANCE_LANGUAGE_MODEL_HOME/jieba/default/dict.txt`. Lance loads the dictionary when it builds the index and again whenever it opens the index for a query, so the files must stay in place on every node that serves the index.
 
 ### Vector nearest neighbour
 
