@@ -449,7 +449,9 @@ lance.native_memory.limit: 40%      # default; percent of (physical - heap)
 lance.native_memory.limit: 10gb     # or an absolute byte value
 ```
 
-The parsed value is split 6:1 between the index cache and the metadata cache, mirroring Lance's own default ratio. On startup the plugin logs the resolved sizes so the operator can confirm the split, for example `installed shared Lance Session: limit [10gb] -> index cache [8.5gb], metadata cache [1.4gb] (from lance.native_memory.limit [10gb])`. This is a static setting today, so a change requires a rolling restart to take effect.
+The parsed value is split first by `lance.cache.column_share` (default 0.4), which goes to the off-heap column store; the rest belongs to the Lance `Session` and is split 6:1 between the index cache and the metadata cache, mirroring Lance's own default ratio. On startup the plugin logs the resolved sizes so the operator can confirm the split, for example `installed shared Lance Session: limit [37gb] -> index cache [15.9gb] (shards 2, share 7.9gb per shard), metadata cache [3.1gb], column cache [14.8gb], unused [3gb] (from lance.native_memory.limit [40%], lance.cache.column_share [0.4], 16 cpus)`. This is a static setting today, so a change requires a rolling restart to take effect.
+
+The index cache does not receive its whole 6/7 share, and the log line says why. Lance backs the index cache with a sharded cache whose shards do not borrow capacity from one another, and an entry heavier than one shard's share is refused without an error. The shard count is `min(cpus / 2, capacity / 4 GiB)` rounded down to a power of two (at least 1, at most 1024), so the share per shard is not monotonic in the capacity: on 16 CPUs a 19 GiB cache is 4 shards of 4.75 GiB, 16 GiB minus one byte is 2 shards of 8 GiB, and 32 GiB is 8 shards of 4 GiB. An inverted index is kept as one entry per full-text column (about 52 bytes per row, 4.8 GiB at 100M rows), so a cache whose share is below that reloads the index from storage on every full-text query. The plugin therefore chooses, within the 6/7 budget, the capacity whose share per shard is largest (the candidates are the budget itself and each `k * 4 GiB - 1` for `k = 2, 4, 8, ...`), hands that to Lance and leaves the difference unused; it is not given to the column store. `GET /_lance/stats` reports the chosen capacity, shard count and share under `native_memory`, and `POST /_lance/attach` logs a warning when a table's estimated inverted index entry is heavier than the share. To raise the share, raise `lance.native_memory.limit` or lower `lance.cache.column_share`; with the choice above a larger budget never yields a smaller share.
 
 ### Circuit breaker for Lance native memory
 
@@ -505,7 +507,10 @@ curl -sS localhost:9200/_lance/stats?pretty
       "native_memory" : {
         "estimated_bytes" : 1258291200,
         "session_bytes" : 419430400,
-        "column_store_bytes" : 838860800
+        "column_store_bytes" : 838860800,
+        "index_cache_capacity" : 17179869183,
+        "index_cache_shards" : 2,
+        "index_cache_shard_share" : 8589934591
       },
       "fts" : {
         "subset_probe_limit" : 1000000
@@ -521,6 +526,7 @@ How to read it:
 - `snapshot_build_count` and `dataset_open_count` should stop growing once every table version in use has been seen; `snapshot_hit_count` grows with every `_search`. Builds that keep growing on a table that is not changing mean requests are not finding the cached version.
 - `column_store.bytes` against `limit_bytes` tells you how much of `lance.cache.column_share` is in use. `loads` grows on the first request that reads a column of a fragment, `hits` on every later one. `budget_misses` above zero means requests fell back to heap loads because the store was full; raise `lance.cache.column_share` or `lance.native_memory.limit`, or reduce the number of columns aggregated or sorted on.
 - `native_memory.estimated_bytes` is what the breaker enforces against `lance.native_memory.limit`; it lags `session_bytes + column_store_bytes` by at most one `lance.native_memory.circuit_breaker.poll_interval`. Compare it with the process RSS to see how much of the native footprint the plugin accounts for.
+- `native_memory.index_cache_capacity`, `index_cache_shards` and `index_cache_shard_share` are the index cache the plugin handed Lance at startup and the shard layout Lance derives from it (see "Cap Lance's native memory footprint"). `index_cache_shard_share` is the heaviest entry the cache admits; a table whose inverted index is heavier than it (about 52 bytes per row per full-text column) is reloaded on every full-text query.
 
 The endpoint is read only. With the security plugin, grant `cluster:monitor/lance/stats`.
 
