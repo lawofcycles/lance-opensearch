@@ -70,6 +70,17 @@ final class LanceTableFactory {
     static final String BODY_COLUMN = "body";
     static final String TITLE_COLUMN = "title";
     static final String PRIMARY_KEY = "id";
+    static final String JAPANESE_TEXT_COLUMN = "text";
+
+    /**
+     * Rows of {@link #writeJapaneseTable}. None of the sentences contains
+     * whitespace or punctuation, so Lance's {@code simple} tokenizer keeps
+     * each one as a single token and a one-word query only matches after a
+     * morphological tokenizer ({@code icu}, {@code lindera/ipadic}) has
+     * split it. Word counts the ITs rely on: 天気 in rows 0 and 1, 東京 in
+     * rows 0 and 3, 京都 in row 2 only.
+     */
+    static final String[] JAPANESE_SENTENCES = new String[] { "東京の天気は晴れです", "大阪の天気は雨です", "京都には古い寺が多い", "今日は東京で会議があります", "日本語の形態素解析を試す" };
 
     private LanceTableFactory() {}
 
@@ -527,7 +538,53 @@ final class LanceTableFactory {
             ),
             Map.of()
         );
+        String[] labels = new String[rowCount];
+        for (int i = 0; i < rowCount; i++) {
+            labels[i] = "row-" + i;
+        }
+        writeIdAndUtf8Table(uri, schema, "label", labels);
+        return uri;
+    }
 
+    /**
+     * Writes a two-column Lance table ({@code id} int32, {@code text} Utf8)
+     * holding the five Japanese sentences in {@link #JAPANESE_SENTENCES},
+     * without an FTS index. The ITs build the index afterwards through
+     * {@code POST /_lance/build_indexes/{index}} with a chosen tokenizer,
+     * so the attach derivation first maps {@code text} as {@code keyword}
+     * and the namespace poll flips it to {@code lance_text} once the
+     * build lands.
+     *
+     * @return absolute URI of the table, usable as-is for
+     *         {@code /_lance/attach} or namespace register.
+     */
+    static String writeJapaneseTable(Path parent, String name) throws Exception {
+        return withLocaleRoot(() -> writeJapaneseTableOnce(parent, name));
+    }
+
+    private static String writeJapaneseTableOnce(Path parent, String name) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        Schema schema = new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field(JAPANESE_TEXT_COLUMN, FieldType.nullable(new ArrowType.Utf8()), null)
+            ),
+            Map.of()
+        );
+        writeIdAndUtf8Table(uri, schema, JAPANESE_TEXT_COLUMN, JAPANESE_SENTENCES);
+        return uri;
+    }
+
+    /**
+     * Shared writer for the {@code id} int32 + one Utf8 column fixtures.
+     * Row {@code i} gets {@code id = i} and {@code values[i]} in the Utf8
+     * column. Deliberately no createIndex call: leaving the Utf8 column
+     * without an inverted index is what makes the attach derivation map
+     * it as {@code keyword}.
+     */
+    private static void writeIdAndUtf8Table(String uri, Schema schema, String utf8Column, String[] values) throws Exception {
+        int rowCount = values.length;
         try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
             byte[] ipcBytes;
             try (
@@ -535,15 +592,15 @@ final class LanceTableFactory {
                 ByteArrayOutputStream out = new ByteArrayOutputStream()
             ) {
                 IntVector idVector = (IntVector) root.getVector("id");
-                VarCharVector labelVector = (VarCharVector) root.getVector("label");
+                VarCharVector textVector = (VarCharVector) root.getVector(utf8Column);
                 idVector.allocateNew(rowCount);
-                labelVector.allocateNew();
+                textVector.allocateNew();
                 for (int i = 0; i < rowCount; i++) {
                     idVector.set(i, i);
-                    labelVector.setSafe(i, ("row-" + i).getBytes(StandardCharsets.UTF_8));
+                    textVector.setSafe(i, values[i].getBytes(StandardCharsets.UTF_8));
                 }
                 idVector.setValueCount(rowCount);
-                labelVector.setValueCount(rowCount);
+                textVector.setValueCount(rowCount);
                 root.setRowCount(rowCount);
                 try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
                     writer.start();
@@ -560,13 +617,9 @@ final class LanceTableFactory {
             ) {
                 Data.exportArrayStream(allocator, reader, stream);
                 WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
-                // Deliberately no createIndex call: leaving the Utf8
-                // column without an inverted index is what triggers
-                // the keyword code path in LanceFragmentLeafReader.
                 Dataset.create(allocator, stream, uri, writeParams).close();
             }
         }
-        return uri;
     }
 
     /**

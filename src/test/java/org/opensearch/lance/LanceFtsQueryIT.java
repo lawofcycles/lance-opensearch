@@ -5,6 +5,13 @@
 
 package org.opensearch.lance;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Locale;
+import java.util.concurrent.TimeUnit;
+
+import org.opensearch.client.Request;
 import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
 
@@ -12,7 +19,10 @@ import org.opensearch.client.ResponseException;
  * Full-text query types backed by the Lance inverted index: {@code
  * lance_match}, {@code lance_match_phrase}, {@code lance_multi_match},
  * {@code lance_fts_boost} and {@code lance_fts_bool}, including their
- * validation errors.
+ * validation errors. Also the {@code tokenizer} option of
+ * {@code POST /_lance/build_indexes/{index}}, checked against Japanese
+ * text where the choice of tokenizer decides whether a one-word query
+ * matches at all.
  */
 public class LanceFtsQueryIT extends LanceRestTestCase {
 
@@ -424,6 +434,228 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             assertEquals("expected 400 for empty bool, saw " + status, 400, status);
             String body = readAll(failure.getResponse());
             assertTrue("expected message about must/should/must_not: " + body, body.contains("must_not"));
+        }
+    }
+
+    public void testBuildIndexesWithoutFtsColumnsGivesUtf8ColumnABtreeIndex() throws Exception {
+        // derive() classifies a Utf8 column without an FTS index as
+        // keyword, so a plain build gives it a BTree scalar index and the
+        // mapping stays keyword. fts_columns is the only way to ask for
+        // an inverted index on such a column.
+        try (JapaneseIndex fixture = JapaneseIndex.surface("jabtree")) {
+            String indexName = fixture.indexName();
+            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{}"));
+            assertTrue("expected no FTS index built: " + build, build.contains("\"fts\":[]"));
+            assertTrue("expected text among the scalar builds: " + build, build.contains("\"scalar\":[\"id\",\"text\"]"));
+
+            String mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+            assertTrue("text must stay keyword: " + mapping, mapping.contains("\"text\":{\"type\":\"keyword\""));
+        }
+    }
+
+    public void testBuildIndexesDefaultTokenizerKeepsJapaneseSentenceWhole() throws Exception {
+        // Baseline for the tokenizer option: Lance's simple tokenizer
+        // splits on whitespace and punctuation only, so a Japanese
+        // sentence without either is indexed as one token. A one-word
+        // query finds nothing; the whole sentence finds its own row.
+        try (JapaneseIndex fixture = JapaneseIndex.surface("jasimple")) {
+            String indexName = fixture.indexName();
+            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"]}"));
+            assertTrue("expected text in fts built list: " + build, build.contains("\"fts\":[\"text\"]"));
+            assertTrue("text must not also get a BTree index: " + build, build.contains("\"scalar\":[\"id\"]"));
+            awaitLanceTextMapping(indexName);
+
+            assertEquals("simple tokenizer must not find 天気 inside a sentence", 0, lanceMatchHits(indexName, "天気"));
+            assertEquals("simple tokenizer matches the whole sentence as one token", 1, lanceMatchHits(indexName, "東京の天気は晴れです"));
+        }
+    }
+
+    public void testBuildIndexesWithIcuTokenizerMatchesJapaneseWords() throws Exception {
+        // icu is compiled into the Lance native library with its own
+        // segmentation data, so it needs no dictionary download and runs
+        // on every CI host. 天気 sits in rows 0 and 1, 東京 in rows 0 and 3,
+        // 京都 in row 2.
+        try (JapaneseIndex fixture = JapaneseIndex.surface("jaicu")) {
+            String indexName = fixture.indexName();
+            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"icu\"}"));
+            assertTrue("expected text in fts built list: " + build, build.contains("\"fts\":[\"text\"]"));
+            awaitLanceTextMapping(indexName);
+
+            assertEquals("icu must split 天気 out of the sentences", 2, lanceMatchHits(indexName, "天気"));
+            assertEquals("icu must split 東京 out of the sentences", 2, lanceMatchHits(indexName, "東京"));
+            assertEquals("icu must split 京都 out of the sentence", 1, lanceMatchHits(indexName, "京都"));
+
+            // A second build naming another tokenizer does not touch the
+            // existing index: the column is skipped, the response lists
+            // nothing under fts, and queries keep the icu segmentation.
+            String rebuild = readAll(
+                postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"simple\"}")
+            );
+            assertTrue("expected empty fts list on rebuild: " + rebuild, rebuild.contains("\"fts\":[]"));
+            assertEquals("existing index keeps its tokenizer after a rebuild request", 2, lanceMatchHits(indexName, "天気"));
+        }
+    }
+
+    public void testBuildIndexesWithLinderaIpadicMatchesJapaneseWords() throws Exception {
+        // lindera/ipadic needs a compiled IPADIC dictionary and a
+        // config.yml under $LANCE_LANGUAGE_MODEL_HOME/lindera/ipadic
+        // (docs/features.md, "Full-text search"). build.gradle forwards
+        // the variable to the cluster JVM and exposes it to this JVM as
+        // tests.lance.language_model_home; without it the test skips.
+        String home = System.getProperty("tests.lance.language_model_home");
+        assumeTrue(
+            "LANCE_LANGUAGE_MODEL_HOME is not set; lindera/ipadic needs a compiled IPADIC dictionary and config.yml under "
+                + "$LANCE_LANGUAGE_MODEL_HOME/lindera/ipadic, so this test only runs where an operator prepared one",
+            home != null && !home.isEmpty()
+        );
+        Path ipadic = Path.of(home).resolve("lindera").resolve("ipadic");
+        assumeTrue(
+            "LANCE_LANGUAGE_MODEL_HOME=" + home + " has no lindera/ipadic/config.yml; prepare the dictionary as docs/features.md describes",
+            Files.isRegularFile(ipadic.resolve("config.yml"))
+        );
+        try (JapaneseIndex fixture = JapaneseIndex.surface("jalindera")) {
+            String indexName = fixture.indexName();
+            String build = readAll(
+                postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"lindera/ipadic\"}")
+            );
+            assertTrue("expected text in fts built list: " + build, build.contains("\"fts\":[\"text\"]"));
+            awaitLanceTextMapping(indexName);
+
+            assertEquals("lindera/ipadic must split 天気 out of the sentences", 2, lanceMatchHits(indexName, "天気"));
+            assertEquals("lindera/ipadic must split 東京 out of the sentences", 2, lanceMatchHits(indexName, "東京"));
+            assertEquals("lindera/ipadic must split 京都 out of the sentence", 1, lanceMatchHits(indexName, "京都"));
+        }
+    }
+
+    public void testBuildIndexesRejectsUnknownTokenizerWithLanceMessage() throws Exception {
+        // The plugin has no allowlist; Lance's InvalidInput for the name
+        // reaches the caller as 400 with Lance's own wording.
+        try (JapaneseIndex fixture = JapaneseIndex.surface("jabadtok")) {
+            String indexName = fixture.indexName();
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"no-such-tokenizer\"}")
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            assertEquals("expected 400 for unknown tokenizer, saw " + status, 400, status);
+            String body = readAll(failure.getResponse());
+            assertTrue("expected Lance's message naming the tokenizer: " + body, body.contains("no-such-tokenizer"));
+            assertTrue("expected Lance's 'unknown base tokenizer' wording: " + body, body.contains("unknown base tokenizer"));
+
+            // Nothing was committed: the column is still keyword.
+            String mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+            assertTrue(
+                "text must still be keyword after the rejected build: " + mapping,
+                mapping.contains("\"text\":{\"type\":\"keyword\"")
+            );
+        }
+    }
+
+    public void testBuildIndexesRejectsMalformedFtsColumnsAndTokenizer() throws Exception {
+        try (JapaneseIndex fixture = JapaneseIndex.surface("jatokopt")) {
+            String indexName = fixture.indexName();
+
+            // tokenizer only shapes indexes this request creates.
+            assertBuildIndexesRejected(indexName, "{\"tokenizer\":\"icu\"}", "name them in fts_columns");
+            // optimize extends existing indexes and creates none.
+            assertBuildIndexesRejected(
+                indexName,
+                "{\"optimize\":true,\"fts_columns\":[\"text\"]}",
+                "fts_columns is only valid with optimize=false"
+            );
+            // Shape checks happen in the REST layer.
+            assertBuildIndexesRejected(indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":[\"icu\"]}", "tokenizer must be a string");
+            assertBuildIndexesRejected(indexName, "{\"fts_columns\":\"text\"}", "fts_columns must be an array");
+            // Only Utf8 columns can carry an inverted index.
+            assertBuildIndexesRejected(indexName, "{\"fts_columns\":[\"id\"]}", "is not a Utf8 column");
+            assertBuildIndexesRejected(indexName, "{\"fts_columns\":[\"nope\"]}", "is not a Utf8 column");
+        }
+    }
+
+    private static void assertBuildIndexesRejected(String indexName, String body, String expectedMessage) throws IOException {
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/build_indexes/" + indexName, body));
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        String response = readAll(failure.getResponse());
+        assertEquals("expected 400 for " + body + ", saw " + status + ": " + response, 400, status);
+        assertTrue("expected '" + expectedMessage + "' for " + body + ": " + response, response.contains(expectedMessage));
+    }
+
+    private static int lanceMatchHits(String indexName, String query) throws IOException {
+        String body = readAll(
+            postJson("/" + indexName + "/_search", "{\"query\":{\"lance_match\":{\"field\":\"text\",\"query\":\"" + query + "\"}}}")
+        );
+        return extractIntPath(body, "hits", "total", "value");
+    }
+
+    /**
+     * Waits until the namespace poll has noticed the FTS index the build
+     * committed and re-derived the mapping. The keyword to lance_text
+     * change cannot go through PutMapping, so the poll deletes and
+     * recreates the index; a GET in that window answers 404 and counts
+     * as "not yet".
+     */
+    private static void awaitLanceTextMapping(String indexName) throws Exception {
+        assertBusy(() -> {
+            String mapping;
+            try {
+                mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+            } catch (ResponseException e) {
+                throw new AssertionError("index " + indexName + " is between delete and recreate: " + e.getMessage());
+            }
+            assertTrue("waiting for text to become lance_text: " + mapping, mapping.contains("\"text\":{\"type\":\"lance_text\""));
+        }, 30, TimeUnit.SECONDS);
+        ensureGreen(indexName);
+    }
+
+    /**
+     * Japanese fixture surfaced through a namespace registration rather
+     * than attach, so the poll keeps following the table after the
+     * build_indexes commit and the keyword to lance_text rebuild.
+     */
+    private static final class JapaneseIndex implements AutoCloseable {
+        private final Path scratchDir;
+        private final String indexName;
+
+        private JapaneseIndex(Path scratchDir, String indexName) {
+            this.scratchDir = scratchDir;
+            this.indexName = indexName;
+        }
+
+        String indexName() {
+            return indexName;
+        }
+
+        static JapaneseIndex surface(String testHint) throws Exception {
+            String suffix = testHint.toLowerCase(Locale.ROOT) + "-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+            Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+            String indexName = "demo-" + suffix;
+            LanceTableFactory.writeJapaneseTable(scratchDir, indexName);
+
+            Response register = postJson("/_lance/namespace", "{\"path\":\"" + scratchDir + "\"}");
+            assertEquals("namespace register failed: " + readAll(register), 200, register.getStatusLine().getStatusCode());
+            assertBusy(() -> {
+                String cat = readAll(client().performRequest(new Request("GET", "/_cat/indices?format=json")));
+                assertTrue("waiting for index " + indexName + ", saw: " + cat, cat.contains("\"" + indexName + "\""));
+            });
+            ensureGreen(indexName);
+            String mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+            assertTrue("text must start as keyword (no FTS index yet): " + mapping, mapping.contains("\"text\":{\"type\":\"keyword\""));
+            return new JapaneseIndex(scratchDir, indexName);
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir + "\"}");
+            } catch (Exception ignored) {
+                // best-effort cleanup
+            }
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {
+                // best-effort cleanup
+            }
+            deleteRecursively(scratchDir);
         }
     }
 }

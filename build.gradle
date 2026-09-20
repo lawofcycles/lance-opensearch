@@ -348,6 +348,15 @@ File sharedTablesDir = new File(project.buildDir, "shared-tables")
 // derives the same path from tests.lance.shared_tables_dir.
 File sharedRepoDir = new File(project.buildDir, "shared-repo")
 
+// Lance resolves `lindera/<name>` and `jieba/<name>` FTS tokenizers to
+// dictionaries under $LANCE_LANGUAGE_MODEL_HOME (see docs/features.md).
+// The dictionaries are not part of the build, so the IT that exercises
+// lindera/ipadic skips itself unless the variable points at one. Pass the
+// same value to the cluster JVM (where the Lance native library reads it)
+// and, as a system property, to the test JVM (which decides whether to
+// skip). Everything else in the suite runs regardless.
+String lanceLanguageModelHome = System.getenv('LANCE_LANGUAGE_MODEL_HOME')
+
 integTest {
     systemProperty 'tests.security.manager', 'false'
     systemProperty 'arrow.allocation.manager.type', 'Unsafe'
@@ -357,6 +366,9 @@ integTest {
         sharedRepoDir.mkdirs()
     }
     systemProperty 'tests.lance.shared_tables_dir', sharedTablesDir.absolutePath
+    if (lanceLanguageModelHome != null) {
+        systemProperty 'tests.lance.language_model_home', lanceLanguageModelHome
+    }
     // The default integTest stays single-node so the dev cycle is
     // around a minute. A separate multiNodeIntegTest
     // task below runs a focused set of tests against a 3-node
@@ -381,6 +393,9 @@ testClusters.integTest {
     // register a table then assertBusy for the index to appear.
     setting 'lance.namespace.poll_cadence', '1s'
     setting 'path.repo', sharedRepoDir.absolutePath
+    if (lanceLanguageModelHome != null) {
+        environment 'LANCE_LANGUAGE_MODEL_HOME', lanceLanguageModelHome
+    }
 }
 
 // Multi-node integTest: verifies the coordinator's fragment fan-out,
