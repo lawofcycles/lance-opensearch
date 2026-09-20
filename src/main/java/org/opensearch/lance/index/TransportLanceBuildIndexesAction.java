@@ -56,7 +56,9 @@ import org.opensearch.transport.client.Client;
  *       receive; {@code tokenizer} names the Lance {@code base_tokenizer}
  *       for those indexes (default {@code simple}), and Lance's rejection
  *       of the name comes back as 400 with the column under
- *       {@code failed.fts}.</li>
+ *       {@code failed.fts}; {@code with_position} (default false) stores
+ *       token positions in them, which {@code lance_match_phrase}
+ *       needs.</li>
  *   <li>{@code optimize=true} runs {@link Dataset#optimizeIndices} for the
  *       filtered indexes. Lance incrementally merges fragments not yet
  *       covered. {@code retrain=true} rebuilds the index (vector codebook
@@ -181,7 +183,14 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
             } else {
                 Optional<List<Integer>> fragmentIds = Optional.ofNullable(request.fragmentIds());
                 String tokenizer = request.tokenizer() != null ? request.tokenizer() : LanceIndexBuilder.DEFAULT_FTS_TOKENIZER;
-                fts = LanceIndexBuilder.ensureFtsIndexes(dataset, ftsTarget, Long.MAX_VALUE, fragmentIds, tokenizer);
+                fts = LanceIndexBuilder.ensureFtsIndexes(
+                    dataset,
+                    ftsTarget,
+                    Long.MAX_VALUE,
+                    fragmentIds,
+                    tokenizer,
+                    request.withPosition()
+                );
                 scalar = LanceIndexBuilder.ensureScalarIndexes(dataset, scalarTarget, Long.MAX_VALUE, fragmentIds);
                 vector = LanceIndexBuilder.ensureVectorIndexes(dataset, vectorTarget, Long.MAX_VALUE, fragmentIds);
             }

@@ -20,7 +20,7 @@ import org.opensearch.rest.action.RestStatusToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
- * POST /_lance/build_indexes/{index} [{"columns": [...], "fts_columns": [...], "fragment_ids": [...], "optimize": bool, "retrain": bool, "tokenizer": "..."}]
+ * POST /_lance/build_indexes/{index} [{"columns": [...], "fts_columns": [...], "fragment_ids": [...], "optimize": bool, "retrain": bool, "tokenizer": "...", "with_position": bool}]
  *
  * Manual index build endpoint. The handler parses the body and hands a
  * {@link LanceBuildIndexesRequest} to {@link LanceBuildIndexesAction};
@@ -30,7 +30,8 @@ import org.opensearch.transport.client.node.NodeClient;
  * {@code fts_columns} names Utf8 columns that receive a new FTS index;
  * {@code tokenizer} is forwarded to Lance as that index's
  * {@code base_tokenizer} without an allowlist, so validation of the name
- * is Lance's. The response status (200 / 400 / 500) is the one the
+ * is Lance's; {@code with_position} (default false) makes Lance store
+ * token positions in that index, which {@code lance_match_phrase} needs. The response status (200 / 400 / 500) is the one the
  * transport action put on the response; the body always lists
  * {@code built}, {@code skipped} and {@code failed} per index kind.
  */
@@ -60,6 +61,7 @@ public class RestBuildIndexesAction extends BaseRestHandler {
         boolean retrain = Boolean.TRUE.equals(body.get("retrain"));
         Object ftsColumnsRaw = body.get("fts_columns");
         Object tokenizerRaw = body.get("tokenizer");
+        Object withPositionRaw = body.get("with_position");
 
         if (optimize && fragmentIdsRaw != null) {
             return channel -> channel.sendResponse(
@@ -87,6 +89,11 @@ public class RestBuildIndexesAction extends BaseRestHandler {
                 )
             );
         }
+        if (withPositionRaw != null && !(withPositionRaw instanceof Boolean)) {
+            return channel -> channel.sendResponse(
+                new BytesRestResponse(RestStatus.BAD_REQUEST, "with_position must be a boolean, saw " + withPositionRaw)
+            );
+        }
 
         List<Integer> fragmentIds = null;
         if (fragmentIdsRaw != null) {
@@ -104,7 +111,8 @@ public class RestBuildIndexesAction extends BaseRestHandler {
             fragmentIds,
             optimize,
             retrain,
-            (String) tokenizerRaw
+            (String) tokenizerRaw,
+            Boolean.TRUE.equals(withPositionRaw)
         );
         return channel -> client.execute(LanceBuildIndexesAction.INSTANCE, build, new RestStatusToXContentListener<>(channel));
     }

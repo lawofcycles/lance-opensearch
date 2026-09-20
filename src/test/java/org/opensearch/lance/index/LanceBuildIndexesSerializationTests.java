@@ -31,7 +31,8 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
             List.of(0, 2),
             false,
             false,
-            "lindera/ipadic"
+            "lindera/ipadic",
+            true
         );
 
         LanceBuildIndexesRequest restored = roundTrip(original);
@@ -44,24 +45,27 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
         assertFalse(restored.optimize());
         assertFalse(restored.retrain());
         assertEquals("lindera/ipadic", restored.tokenizer());
+        assertTrue(restored.withPosition());
         assertNull(restored.validate());
     }
 
     public void testRequestWithoutFtsOptionsRoundTripsAsNull() throws Exception {
         // Absent fts_columns and tokenizer stay null on the wire so the
         // transport action applies LanceIndexBuilder.DEFAULT_FTS_TOKENIZER
-        // itself and derives the FTS targets from the table.
-        LanceBuildIndexesRequest original = new LanceBuildIndexesRequest("demo", null, null, null, false, false, null);
+        // itself and derives the FTS targets from the table; with_position
+        // defaults to false like Lance's own default.
+        LanceBuildIndexesRequest original = new LanceBuildIndexesRequest("demo", null, null, null, false, false, null, false);
 
         LanceBuildIndexesRequest restored = roundTrip(original);
 
         assertNull(restored.ftsColumns());
         assertNull(restored.tokenizer());
+        assertFalse(restored.withPosition());
         assertNull(restored.validate());
     }
 
     public void testOptimizeRequestWithNullFiltersRoundTrip() throws Exception {
-        LanceBuildIndexesRequest original = new LanceBuildIndexesRequest("demo", null, null, null, true, true, null);
+        LanceBuildIndexesRequest original = new LanceBuildIndexesRequest("demo", null, null, null, true, true, null, false);
 
         LanceBuildIndexesRequest restored = roundTrip(original);
 
@@ -75,27 +79,31 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
     }
 
     public void testRequestValidation() {
-        assertNotNull(new LanceBuildIndexesRequest("", null, null, null, false, false, null).validate());
+        assertNotNull(new LanceBuildIndexesRequest("", null, null, null, false, false, null, false).validate());
         // fragment_ids only scopes an initial build; optimize covers every
         // uncovered fragment on its own.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, List.of(1), true, false, null).validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, List.of(1), true, false, null, false).validate());
         // retrain is an optimize option.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, null, false, true, null).validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, null, false, true, null, false).validate());
         // fts_columns creates indexes; optimize creates none.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, true, false, null).validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, true, false, null, false).validate());
         // An empty fts_columns list is a caller mistake.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of(), null, false, false, null).validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of(), null, false, false, null, false).validate());
         // tokenizer only applies to indexes this request creates, which
         // are the fts_columns ones.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, null, false, false, "simple").validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, null, false, false, "simple", false).validate());
         // An empty tokenizer is a caller mistake, not a request for the
         // default.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, "").validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, "", false).validate());
         // Any non-empty name passes plugin validation; Lance decides
         // whether it exists.
-        assertNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, "no-such-tokenizer").validate());
+        assertNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, "no-such-tokenizer", false).validate());
         // fts_columns without a tokenizer builds with the default.
-        assertNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, null).validate());
+        assertNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, null, false).validate());
+        // with_position, like tokenizer, only shapes the indexes this
+        // request creates.
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, null, false, false, null, true).validate());
+        assertNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, null, true).validate());
     }
 
     public void testResponseRoundTrip() throws Exception {
