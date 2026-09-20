@@ -8,6 +8,7 @@ package org.opensearch.lance.engine;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -17,13 +18,18 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.OutOfMemoryException;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.ValueVector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -34,23 +40,31 @@ import org.opensearch.lance.LanceCircuitBreaker;
 import org.opensearch.lance.engine.LanceWarmCache.SnapshotKey;
 
 /**
- * Node-wide off-heap store of numeric and boolean columns, one
- * {@link CachedColumn} per (snapshot, column, fragment). Every entry is an
- * Arrow vector allocated from one child allocator whose limit is the
- * column cache budget, so {@link #allocatedBytes()} is the exact off-heap
- * footprint the {@code lance_native} circuit breaker has to account for.
+ * Node-wide off-heap store of columns, one {@link StoreEntry} per
+ * (snapshot, column, fragment): a {@link CachedColumn} for numeric and
+ * boolean columns, a {@link CachedKeywordColumn} for single-valued
+ * keyword columns and a {@link CachedKeywordArrayColumn} for
+ * {@code List<Utf8>} columns. Every entry is made of Arrow vectors
+ * allocated from one child allocator whose limit is the column cache
+ * budget, so {@link #allocatedBytes()} is the exact off-heap footprint
+ * the {@code lance_native} circuit breaker has to account for.
  *
  * <p>Loading is one Lance scan per (snapshot, column) over the fragments
  * a request needs and does not have yet, without any filter, so the
  * loaded slice serves every later request over the same snapshot
- * regardless of its query. The scan's batches are read once and each
- * value is written, normalised, into the fragment's vector.
+ * regardless of its query. Numeric columns are sized from the fragment's
+ * row count before the scan and written while the batches stream.
+ * Keyword columns cannot be sized up front (the dictionary size depends
+ * on the values), so their scan interns the values into a heap
+ * {@link KeywordDictionaryBuilder} per fragment, the budget is checked
+ * against the resulting sizes, and only then are the vectors allocated
+ * and written; the heap structures live for the load only.
  *
  * <p>Eviction is least recently used at (column, fragment) granularity
  * and skips entries a running request has pinned. When the budget cannot
- * be met even after evicting everything unpinned, {@link #acquire}
- * returns {@code null} and the caller falls back to its request scoped
- * heap load.
+ * be met even after evicting everything unpinned, the {@code acquire}
+ * methods return {@code null} and the caller falls back to its request
+ * scoped heap load.
  */
 public final class ColumnStore implements Closeable {
 
@@ -62,13 +76,29 @@ public final class ColumnStore implements Closeable {
     /** Buffers at or above this size are allocated exactly; smaller ones round up to a power of two. */
     private static final long ALLOCATOR_CHUNK_SIZE = 16L * 1024 * 1024;
 
+    /**
+     * A column's Arrow type is fixed by the table schema, so one key maps
+     * to exactly one entry kind; the {@code acquire} methods cast on
+     * lookup.
+     */
     private record ColumnKey(SnapshotKey snapshot, String column, int fragmentId) {
+    }
+
+    /**
+     * Loads the missing fragments of one column into new entries. Returns
+     * {@code null} when they do not fit the budget; may throw
+     * {@link OutOfMemoryException} when an allocation exceeds the
+     * allocator's limit despite the budget check.
+     */
+    @FunctionalInterface
+    private interface Loader<T extends StoreEntry> {
+        Map<Integer, T> load(Dataset dataset, String column, Map<Integer, Integer> missing) throws IOException;
     }
 
     private final BufferAllocator allocator;
     private final long limitBytes;
     /** Access ordered so iteration starts at the least recently used entry. Guarded by {@code this}. */
-    private final LinkedHashMap<ColumnKey, CachedColumn> columns = new LinkedHashMap<>(256, 0.75f, true);
+    private final LinkedHashMap<ColumnKey, StoreEntry> columns = new LinkedHashMap<>(256, 0.75f, true);
     /** Serialises the load of one (snapshot, column) so two requests do not scan it twice. */
     private final Map<String, Object> loadLocks = new ConcurrentHashMap<>();
     private final AtomicLong hits = new AtomicLong();
@@ -90,10 +120,10 @@ public final class ColumnStore implements Closeable {
     }
 
     /**
-     * Return the columns for {@code fragmentRows} (fragment id to row
-     * count), loading the missing ones with one scan of {@code dataset},
-     * and pin every returned column. The caller unpins them through
-     * {@link #unpin} when its request ends.
+     * Return the numeric or boolean columns for {@code fragmentRows}
+     * (fragment id to row count), loading the missing ones with one scan
+     * of {@code dataset}, and pin every returned column. The caller
+     * unpins them through {@link #unpin} when its request ends.
      *
      * @return one {@link CachedColumn} per requested fragment, or
      *         {@code null} when the missing fragments do not fit the
@@ -110,7 +140,54 @@ public final class ColumnStore implements Closeable {
         boolean isBoolean,
         Map<Integer, Integer> fragmentRows
     ) throws IOException {
-        Map<Integer, CachedColumn> found = lookupAndPin(snapshot, column, fragmentRows.keySet());
+        return acquire(snapshot, dataset, column, fragmentRows, CachedColumn.class, (d, c, missing) -> {
+            long needed = 0L;
+            for (int rows : missing.values()) {
+                needed += estimateBytes(rows, isBoolean);
+            }
+            if (!makeRoom(needed)) {
+                return null;
+            }
+            return loadNumeric(d, c, isBoolean, missing);
+        });
+    }
+
+    /**
+     * Same as {@link #acquire(SnapshotKey, Dataset, String, boolean, Map)}
+     * for a single-valued keyword (Utf8) column: each returned entry holds
+     * the fragment's sorted term dictionary and per-row ordinals.
+     */
+    public Map<Integer, CachedKeywordColumn> acquireKeyword(
+        SnapshotKey snapshot,
+        Dataset dataset,
+        String column,
+        Map<Integer, Integer> fragmentRows
+    ) throws IOException {
+        return acquire(snapshot, dataset, column, fragmentRows, CachedKeywordColumn.class, this::loadKeyword);
+    }
+
+    /**
+     * Same as {@link #acquire(SnapshotKey, Dataset, String, boolean, Map)}
+     * for a multi-valued keyword ({@code List<Utf8>}) column.
+     */
+    public Map<Integer, CachedKeywordArrayColumn> acquireKeywordArray(
+        SnapshotKey snapshot,
+        Dataset dataset,
+        String column,
+        Map<Integer, Integer> fragmentRows
+    ) throws IOException {
+        return acquire(snapshot, dataset, column, fragmentRows, CachedKeywordArrayColumn.class, this::loadKeywordArray);
+    }
+
+    private <T extends StoreEntry> Map<Integer, T> acquire(
+        SnapshotKey snapshot,
+        Dataset dataset,
+        String column,
+        Map<Integer, Integer> fragmentRows,
+        Class<T> type,
+        Loader<T> loader
+    ) throws IOException {
+        Map<Integer, T> found = lookupAndPin(snapshot, column, fragmentRows.keySet(), type);
         if (found.size() == fragmentRows.size()) {
             hits.incrementAndGet();
             return found;
@@ -121,7 +198,7 @@ public final class ColumnStore implements Closeable {
             try {
                 // Another request may have loaded the same slice while
                 // this one waited for the lock.
-                found.putAll(lookupAndPin(snapshot, column, missingOf(fragmentRows.keySet(), found)));
+                found.putAll(lookupAndPin(snapshot, column, missingOf(fragmentRows.keySet(), found), type));
                 if (found.size() == fragmentRows.size()) {
                     hits.incrementAndGet();
                     handedOut = true;
@@ -134,30 +211,26 @@ public final class ColumnStore implements Closeable {
                     }
                 }
                 LanceCircuitBreaker.checkAndTrip(BREAKER_LABEL);
-                long needed = 0L;
-                for (int rows : missing.values()) {
-                    needed += estimateBytes(rows, isBoolean);
-                }
-                if (!makeRoom(needed)) {
-                    budgetMisses.incrementAndGet();
-                    return null;
-                }
-                Map<Integer, CachedColumn> loaded;
+                Map<Integer, T> loaded;
                 try {
-                    loaded = load(dataset, column, isBoolean, missing);
+                    loaded = loader.load(dataset, column, missing);
                 } catch (OutOfMemoryException oom) {
                     // The estimate undershot the allocator's rounding, or
                     // a concurrent load of another column took the room.
                     // Serve this request from heap; the next one
                     // estimates against the new footprint.
                     budgetMisses.incrementAndGet();
-                    LOGGER.debug("column cache has no room for [{}] of {} ({} bytes needed)", column, snapshot, needed, oom);
+                    LOGGER.debug("column cache has no room for [{}] of {}", column, snapshot, oom);
+                    return null;
+                }
+                if (loaded == null) {
+                    budgetMisses.incrementAndGet();
                     return null;
                 }
                 loads.incrementAndGet();
                 synchronized (this) {
-                    for (Map.Entry<Integer, CachedColumn> entry : loaded.entrySet()) {
-                        CachedColumn previous = columns.put(new ColumnKey(snapshot, column, entry.getKey()), entry.getValue());
+                    for (Map.Entry<Integer, T> entry : loaded.entrySet()) {
+                        StoreEntry previous = columns.put(new ColumnKey(snapshot, column, entry.getKey()), entry.getValue());
                         if (previous != null) {
                             // Cannot happen while the per-column lock is
                             // held, but never leak a vector if it does.
@@ -178,7 +251,7 @@ public final class ColumnStore implements Closeable {
         }
     }
 
-    private static List<Integer> missingOf(Iterable<Integer> wanted, Map<Integer, CachedColumn> found) {
+    private static List<Integer> missingOf(Iterable<Integer> wanted, Map<Integer, ?> found) {
         List<Integer> missing = new ArrayList<>();
         for (int fragmentId : wanted) {
             if (!found.containsKey(fragmentId)) {
@@ -188,22 +261,27 @@ public final class ColumnStore implements Closeable {
         return missing;
     }
 
-    private synchronized Map<Integer, CachedColumn> lookupAndPin(SnapshotKey snapshot, String column, Iterable<Integer> fragmentIds) {
-        Map<Integer, CachedColumn> found = new HashMap<>();
+    private synchronized <T extends StoreEntry> Map<Integer, T> lookupAndPin(
+        SnapshotKey snapshot,
+        String column,
+        Iterable<Integer> fragmentIds,
+        Class<T> type
+    ) {
+        Map<Integer, T> found = new HashMap<>();
         for (int fragmentId : fragmentIds) {
-            CachedColumn cached = columns.get(new ColumnKey(snapshot, column, fragmentId));
+            StoreEntry cached = columns.get(new ColumnKey(snapshot, column, fragmentId));
             if (cached != null) {
                 cached.pin();
-                found.put(fragmentId, cached);
+                found.put(fragmentId, type.cast(cached));
             }
         }
         return found;
     }
 
-    /** Release the pins {@link #acquire} took. Safe to call with columns that were already evicted. */
-    public void unpin(Iterable<CachedColumn> pinned) {
-        for (CachedColumn column : pinned) {
-            column.unpin();
+    /** Release the pins the {@code acquire} methods took. Safe to call with entries that were already evicted. */
+    public void unpin(Iterable<? extends StoreEntry> pinned) {
+        for (StoreEntry entry : pinned) {
+            entry.unpin();
         }
     }
 
@@ -217,11 +295,11 @@ public final class ColumnStore implements Closeable {
         if (needed > limitBytes) {
             return false;
         }
-        Iterator<Map.Entry<ColumnKey, CachedColumn>> eldest = columns.entrySet().iterator();
+        Iterator<Map.Entry<ColumnKey, StoreEntry>> eldest = columns.entrySet().iterator();
         while (allocator.getAllocatedMemory() + needed > limitBytes) {
-            CachedColumn victim = null;
+            StoreEntry victim = null;
             while (eldest.hasNext()) {
-                Map.Entry<ColumnKey, CachedColumn> candidate = eldest.next();
+                Map.Entry<ColumnKey, StoreEntry> candidate = eldest.next();
                 if (!candidate.getValue().isPinned()) {
                     victim = candidate.getValue();
                     eldest.remove();
@@ -237,12 +315,53 @@ public final class ColumnStore implements Closeable {
         return true;
     }
 
+    /** Scan of {@code column} over {@code fragmentIds} with {@code _rowaddr}, the shape every load here uses. */
+    private static ScanOptions scanOf(String column, Iterable<Integer> fragmentIds) {
+        List<Integer> ids = new ArrayList<>();
+        for (int id : fragmentIds) {
+            ids.add(id);
+        }
+        return new ScanOptions.Builder().fragmentIds(ids).columns(Collections.singletonList(column)).withRowAddress(true).build();
+    }
+
+    /** Receives one scanned cell: the fragment id and row offset from {@code _rowaddr}, the column vector and the row inside it. */
+    @FunctionalInterface
+    private interface ScannedCellConsumer {
+        void accept(int fragmentId, int offset, FieldVector vector, int row);
+    }
+
+    /** Run {@code scan} and hand every non-null cell to {@code consumer}. */
+    private static void scan(Dataset dataset, String column, Iterable<Integer> fragmentIds, ScannedCellConsumer consumer)
+        throws IOException {
+        try (LanceScanner scanner = dataset.newScan(scanOf(column, fragmentIds)); ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                FieldVector source = root.getVector(column);
+                int rowCount = root.getRowCount();
+                for (int i = 0; i < rowCount; i++) {
+                    if (source.isNull(i)) {
+                        continue;
+                    }
+                    long addr = rowAddr.get(i);
+                    consumer.accept((int) (addr >>> 32), (int) (addr & 0xFFFFFFFFL), source, i);
+                }
+            }
+        } catch (OutOfMemoryException oom) {
+            throw oom;
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e);
+        }
+    }
+
     /**
      * One scan of {@code column} over the fragments in {@code missing},
      * bucketed by the fragment id carried in {@code _rowaddr}. Returns the
      * vectors as {@link CachedColumn}s (not yet in the map, not pinned).
      */
-    private Map<Integer, CachedColumn> load(Dataset dataset, String column, boolean isBoolean, Map<Integer, Integer> missing)
+    private Map<Integer, CachedColumn> loadNumeric(Dataset dataset, String column, boolean isBoolean, Map<Integer, Integer> missing)
         throws IOException {
         Map<Integer, FieldVector> vectors = new HashMap<>(missing.size() * 2);
         boolean success = false;
@@ -261,40 +380,17 @@ public final class ColumnStore implements Closeable {
                     vectors.put(entry.getKey(), v);
                 }
             }
-            ScanOptions options = new ScanOptions.Builder().fragmentIds(new ArrayList<>(missing.keySet()))
-                .columns(Collections.singletonList(column))
-                .withRowAddress(true)
-                .build();
-            try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
-                while (reader.loadNextBatch()) {
-                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                    FieldVector source = root.getVector(column);
-                    int rowCount = root.getRowCount();
-                    for (int i = 0; i < rowCount; i++) {
-                        if (source.isNull(i)) {
-                            continue;
-                        }
-                        long addr = rowAddr.get(i);
-                        FieldVector target = vectors.get((int) (addr >>> 32));
-                        if (target == null) {
-                            continue;
-                        }
-                        int offset = (int) (addr & 0xFFFFFFFFL);
-                        if (isBoolean) {
-                            ((BitVector) target).set(offset, ((BitVector) source).get(i));
-                        } else {
-                            ((BigIntVector) target).set(offset, LanceFragmentLeafReader.readAsLong(source, i));
-                        }
-                    }
+            scan(dataset, column, missing.keySet(), (fragmentId, offset, source, row) -> {
+                FieldVector target = vectors.get(fragmentId);
+                if (target == null) {
+                    return;
                 }
-            } catch (OutOfMemoryException oom) {
-                throw oom;
-            } catch (IOException e) {
-                throw e;
-            } catch (Exception e) {
-                throw new IOException(e);
-            }
+                if (isBoolean) {
+                    ((BitVector) target).set(offset, ((BitVector) source).get(row));
+                } else {
+                    ((BigIntVector) target).set(offset, LanceFragmentLeafReader.readAsLong(source, row));
+                }
+            });
             Map<Integer, CachedColumn> loaded = new HashMap<>(vectors.size() * 2);
             for (Map.Entry<Integer, FieldVector> entry : vectors.entrySet()) {
                 loaded.put(entry.getKey(), new CachedColumn(entry.getValue(), missing.get(entry.getKey())));
@@ -303,10 +399,174 @@ public final class ColumnStore implements Closeable {
             return loaded;
         } finally {
             if (!success) {
-                for (FieldVector vector : vectors.values()) {
-                    vector.close();
+                closeAll(vectors.values());
+            }
+        }
+    }
+
+    /**
+     * One scan of the Utf8 column {@code column} over the fragments in
+     * {@code missing}. The values are interned per fragment into a heap
+     * {@link KeywordDictionaryBuilder} with one {@code int} id per row;
+     * once the scan is done the dictionary and ordinal sizes are known,
+     * the budget is checked, and the sorted terms and remapped ordinals
+     * are written into freshly allocated vectors. Returns {@code null}
+     * when the budget cannot be met.
+     */
+    private Map<Integer, CachedKeywordColumn> loadKeyword(Dataset dataset, String column, Map<Integer, Integer> missing)
+        throws IOException {
+        Map<Integer, int[]> idsByFragment = new HashMap<>(missing.size() * 2);
+        Map<Integer, KeywordDictionaryBuilder> builders = new HashMap<>(missing.size() * 2);
+        for (Map.Entry<Integer, Integer> entry : missing.entrySet()) {
+            int[] ids = new int[entry.getValue()];
+            Arrays.fill(ids, -1);
+            idsByFragment.put(entry.getKey(), ids);
+            builders.put(entry.getKey(), new KeywordDictionaryBuilder());
+        }
+        scan(dataset, column, missing.keySet(), (fragmentId, offset, source, row) -> {
+            int[] ids = idsByFragment.get(fragmentId);
+            if (ids != null) {
+                ids[offset] = builders.get(fragmentId).intern((VarCharVector) source, row);
+            }
+        });
+        long needed = 0L;
+        for (Map.Entry<Integer, Integer> entry : missing.entrySet()) {
+            KeywordDictionaryBuilder builder = builders.get(entry.getKey());
+            needed += dictionaryBytes(builder.size(), builder.termBytes()) + intVectorBytes(entry.getValue());
+        }
+        if (!makeRoom(needed)) {
+            return null;
+        }
+        List<ValueVector> allocated = new ArrayList<>(missing.size() * 2);
+        boolean success = false;
+        try {
+            Map<Integer, CachedKeywordColumn> loaded = new HashMap<>(missing.size() * 2);
+            for (Map.Entry<Integer, Integer> entry : missing.entrySet()) {
+                int rows = entry.getValue();
+                KeywordDictionaryBuilder builder = builders.get(entry.getKey());
+                int[] ids = idsByFragment.get(entry.getKey());
+                int[] idToOrd = builder.sort();
+                VarCharVector terms = new VarCharVector(column, allocator);
+                allocated.add(terms);
+                terms.allocateNew(builder.termBytes(), builder.size());
+                builder.writeTerms(terms);
+                IntVector ordinals = new IntVector(column, allocator);
+                allocated.add(ordinals);
+                ordinals.allocateNew(rows);
+                ArrowBuf data = ordinals.getDataBuffer();
+                data.setOne(0L, (long) rows * Integer.BYTES);
+                for (int doc = 0; doc < rows; doc++) {
+                    if (ids[doc] >= 0) {
+                        data.setInt((long) doc << 2, idToOrd[ids[doc]]);
+                    }
+                }
+                ordinals.setValueCount(rows);
+                loaded.put(entry.getKey(), new CachedKeywordColumn(terms, ordinals, rows));
+            }
+            success = true;
+            return loaded;
+        } finally {
+            if (!success) {
+                closeAll(allocated);
+            }
+        }
+    }
+
+    /**
+     * {@link #loadKeyword} for a {@code List<Utf8>} column: each row's
+     * non-null elements are interned, remapped to strictly ascending
+     * duplicate-free ordinals after the sort, and flattened into one
+     * ordinal vector addressed through a row offset vector.
+     */
+    private Map<Integer, CachedKeywordArrayColumn> loadKeywordArray(Dataset dataset, String column, Map<Integer, Integer> missing)
+        throws IOException {
+        Map<Integer, int[][]> rowsByFragment = new HashMap<>(missing.size() * 2);
+        Map<Integer, KeywordDictionaryBuilder> builders = new HashMap<>(missing.size() * 2);
+        for (Map.Entry<Integer, Integer> entry : missing.entrySet()) {
+            rowsByFragment.put(entry.getKey(), new int[entry.getValue()][]);
+            builders.put(entry.getKey(), new KeywordDictionaryBuilder());
+        }
+        scan(dataset, column, missing.keySet(), (fragmentId, offset, source, row) -> {
+            int[][] rows = rowsByFragment.get(fragmentId);
+            if (rows != null) {
+                ListVector list = (ListVector) source;
+                rows[offset] = LanceFragmentLeafReader.internListElements(
+                    builders.get(fragmentId),
+                    list,
+                    (VarCharVector) list.getDataVector(),
+                    row
+                );
+            }
+        });
+        Map<Integer, int[]> idToOrdByFragment = new HashMap<>(missing.size() * 2);
+        Map<Integer, Integer> totalOrdinals = new HashMap<>(missing.size() * 2);
+        long needed = 0L;
+        for (Map.Entry<Integer, Integer> entry : missing.entrySet()) {
+            KeywordDictionaryBuilder builder = builders.get(entry.getKey());
+            int[] idToOrd = builder.sort();
+            idToOrdByFragment.put(entry.getKey(), idToOrd);
+            int[][] rows = rowsByFragment.get(entry.getKey());
+            int total = 0;
+            for (int r = 0; r < rows.length; r++) {
+                if (rows[r] != null) {
+                    rows[r] = KeywordDictionaryBuilder.remapSortedUnique(idToOrd, rows[r]);
+                    total += rows[r].length;
                 }
             }
+            totalOrdinals.put(entry.getKey(), total);
+            needed += dictionaryBytes(builder.size(), builder.termBytes()) + intVectorBytes(rows.length + 1) + intVectorBytes(total);
+        }
+        if (!makeRoom(needed)) {
+            return null;
+        }
+        List<ValueVector> allocated = new ArrayList<>(missing.size() * 3);
+        boolean success = false;
+        try {
+            Map<Integer, CachedKeywordArrayColumn> loaded = new HashMap<>(missing.size() * 2);
+            for (Map.Entry<Integer, Integer> entry : missing.entrySet()) {
+                int rowCount = entry.getValue();
+                KeywordDictionaryBuilder builder = builders.get(entry.getKey());
+                int[][] rows = rowsByFragment.get(entry.getKey());
+                int total = totalOrdinals.get(entry.getKey());
+                VarCharVector terms = new VarCharVector(column, allocator);
+                allocated.add(terms);
+                terms.allocateNew(builder.termBytes(), builder.size());
+                builder.writeTerms(terms);
+                IntVector offsets = new IntVector(column, allocator);
+                allocated.add(offsets);
+                offsets.allocateNew(rowCount + 1);
+                IntVector ordinals = new IntVector(column, allocator);
+                allocated.add(ordinals);
+                ordinals.allocateNew(total);
+                ArrowBuf offsetData = offsets.getDataBuffer();
+                ArrowBuf ordinalData = ordinals.getDataBuffer();
+                int position = 0;
+                offsetData.setInt(0L, 0);
+                for (int doc = 0; doc < rowCount; doc++) {
+                    int[] row = rows[doc];
+                    if (row != null) {
+                        for (int ord : row) {
+                            ordinalData.setInt((long) position++ << 2, ord);
+                        }
+                    }
+                    offsetData.setInt((long) (doc + 1) << 2, position);
+                }
+                offsets.setValueCount(rowCount + 1);
+                ordinals.setValueCount(total);
+                loaded.put(entry.getKey(), new CachedKeywordArrayColumn(terms, offsets, ordinals, rowCount));
+            }
+            success = true;
+            return loaded;
+        } finally {
+            if (!success) {
+                closeAll(allocated);
+            }
+        }
+    }
+
+    private static void closeAll(Iterable<? extends ValueVector> vectors) {
+        for (ValueVector vector : vectors) {
+            vector.close();
         }
     }
 
@@ -323,12 +583,29 @@ public final class ColumnStore implements Closeable {
         return roundedAllocation(validity + data);
     }
 
+    /** Bytes the allocator accounts for an {@link IntVector} of {@code count} values (validity and data as one region). */
+    static long intVectorBytes(int count) {
+        return roundedAllocation(roundUp8((count + 7) / 8) + roundUp8((long) count * Integer.BYTES));
+    }
+
+    /**
+     * Bytes the allocator accounts for a {@link VarCharVector} of
+     * {@code terms} values totalling {@code termBytes}: the data buffer
+     * is one allocation, the validity and offset buffers ({@code terms +
+     * 1} offsets) another.
+     */
+    static long dictionaryBytes(int terms, long termBytes) {
+        long offsets = roundUp8((long) (terms + 1) * Integer.BYTES);
+        long validity = roundUp8((terms + 1 + 7) / 8);
+        return roundedAllocation(termBytes) + roundedAllocation(validity + offsets);
+    }
+
     private static long roundUp8(long size) {
         return (size + 7) & ~7L;
     }
 
     private static long roundedAllocation(long size) {
-        if (size >= ALLOCATOR_CHUNK_SIZE) {
+        if (size == 0L || size >= ALLOCATOR_CHUNK_SIZE) {
             return size;
         }
         long rounded = 1L;
@@ -340,9 +617,9 @@ public final class ColumnStore implements Closeable {
 
     /** Drop every column of {@code snapshot}. Called when the snapshot closes, so nothing pins them. */
     synchronized void dropSnapshot(SnapshotKey snapshot) {
-        Iterator<Map.Entry<ColumnKey, CachedColumn>> it = columns.entrySet().iterator();
+        Iterator<Map.Entry<ColumnKey, StoreEntry>> it = columns.entrySet().iterator();
         while (it.hasNext()) {
-            Map.Entry<ColumnKey, CachedColumn> entry = it.next();
+            Map.Entry<ColumnKey, StoreEntry> entry = it.next();
             if (entry.getKey().snapshot().equals(snapshot)) {
                 it.remove();
                 entry.getValue().close();
@@ -393,8 +670,8 @@ public final class ColumnStore implements Closeable {
 
     @Override
     public synchronized void close() {
-        for (CachedColumn column : columns.values()) {
-            column.close();
+        for (StoreEntry entry : columns.values()) {
+            entry.close();
         }
         columns.clear();
         allocator.close();
