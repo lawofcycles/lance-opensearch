@@ -217,6 +217,30 @@ public final class LanceShardColumnCache {
         return columnStore != null && filterSql == null;
     }
 
+    /**
+     * Whether the off-heap store holds the numeric or boolean column
+     * {@code name} of {@code leaf}'s fragment for this reader's snapshot.
+     * A lookup in the store's index only: nothing is pinned or loaded,
+     * so a leaf can consult it while deciding whether to take its hinted
+     * rows instead. {@code false} when the reader has no store.
+     */
+    boolean storeHoldsColumn(LanceFragmentLeafReader leaf, String name) {
+        return columnStore != null && columnStore.contains(snapshotKey, name, leaf.fragmentId());
+    }
+
+    /**
+     * Keyword counterpart of {@link #storeHoldsColumn}: whether the store
+     * holds the dictionary and ordinals of the Utf8 or {@code List<Utf8>}
+     * column {@code name} for {@code leaf}'s fragment, in a form this
+     * reader may read. {@code false} when the reader carries a top-level
+     * filter, because the keyword loaders then stay on the heap path
+     * (see {@link #keywordStoreUsable}) and a held entry would not be
+     * used.
+     */
+    boolean storeHoldsKeyword(LanceFragmentLeafReader leaf, String name) {
+        return keywordStoreUsable() && columnStore.contains(snapshotKey, name, leaf.fragmentId());
+    }
+
     private Map<Integer, Integer> allFragmentRows() {
         Map<Integer, Integer> fragmentRows = new HashMap<>(leavesByFragmentId.size() * 2);
         for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {

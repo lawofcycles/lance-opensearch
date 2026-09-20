@@ -272,16 +272,34 @@ public final class LanceFragmentLeafReader extends LeafReader {
     /**
      * Largest fraction of {@link #maxDoc} a hinted hit set may cover
      * before the doc value accessors stop taking the hit rows by
-     * address and load the whole column instead. A
-     * {@code _rowaddr IN (...)} take costs one Lance scan per
-     * {@link #TAKE_CHUNK} rows plus a per-row random read, while the
-     * full column load is one sequential scan of the fragment; at
-     * around one row in twenty the two are of the same order on the
-     * fixtures measured, so above that the sequential scan is used.
-     * Kept as a single constant so the threshold can be tuned in one
-     * place.
+     * address and load the whole column instead.
+     *
+     * <p>A {@code _rowaddr IN (...)} take costs about 8 µs per row
+     * (500,860 rows took 3.9 s on a 20M row table, one node), because
+     * every row is a random read through the Lance take path. A full
+     * column load is one sequential scan and costs about 20 ns per row
+     * once the column is decoded (a 250,000 row fragment in a few
+     * milliseconds; the seconds a first load of a 20M row column takes
+     * are dominated by building the per request heap arrays, which the
+     * off-heap {@link ColumnStore} pays once per table version). The
+     * two meet at {@code 20 ns / 8 µs = 0.0025}, one row in four
+     * hundred, so above that the sequential scan is used. The value is
+     * a ratio of per-row costs and does not depend on the fragment's
+     * row count.
+     *
+     * <p>Measured on the same table with a query matching 2.5 percent
+     * of the rows ({@code sort ts desc}, 20M rows: 3.7 s with the
+     * column scan against 4.13 s with the take; 100M rows, 2,502,753
+     * hits: 19.2 s against 20.9 s), so a threshold above the ratio
+     * makes such queries slower than the scan.
+     *
+     * <p>The ratio is only consulted when the column is not already at
+     * hand: rows the store holds for the fragment are read from the
+     * store whatever the hit set's size (see
+     * {@link HintedNumericDocValues#resolve}). Kept as a single
+     * constant so the threshold can be tuned in one place.
      */
-    static final double SPARSE_RATIO = 0.05;
+    static final double SPARSE_RATIO = 0.0025;
 
     /**
      * Request-scoped hit set for this leaf, or {@code null} when no
@@ -996,6 +1014,78 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     /**
+     * Serve the numeric or boolean column {@code name} to this leaf from
+     * the off-heap {@link ColumnStore} when the store already holds this
+     * fragment's slice, and report whether it did. Consulted before a
+     * hinted take: a held column is read at the cost of one pin, so the
+     * per-row take is never cheaper than it, whatever the hit set's
+     * size. Only this fragment is pinned; the store is not asked to load
+     * anything for fragments it does not hold, so a small hit set never
+     * starts a store load as a side effect (the leaf falls through to
+     * the take instead). Should the entry be evicted between the lookup
+     * and the pin, the shard cache reloads this one fragment, which is
+     * the same single fragment scan the leaf would run when a doc
+     * outside the hint is requested.
+     */
+    private boolean serveHeldFromStore(String name, boolean isBoolean) throws IOException {
+        LanceShardColumnCache cache = shardColumnCache;
+        // No filterSql gate here, unlike the keyword lookup: a numeric
+        // store entry holds one value per physical row, so a request
+        // that carries a top-level filter still reads exactly its own
+        // docs from it. A keyword dictionary built under a filter would
+        // have a different ordinal space, which is why
+        // storeHoldsKeyword declines when a filter is present.
+        return cache != null && cache.storeHoldsColumn(this, name) && cache.publishFromStoreForLeaf(this, name, isBoolean);
+    }
+
+    /**
+     * Whether the off-heap store holds the dictionary and ordinals of
+     * the Utf8 or {@code List<Utf8>} column {@code name} for this
+     * fragment, in a form this reader may read (no top-level filter).
+     * {@link #serveKeywordSparse} declines the sparse dictionary when it
+     * does, since the held dictionary is complete and costs no scan.
+     */
+    private boolean storeHoldsKeyword(String name) {
+        LanceShardColumnCache cache = shardColumnCache;
+        return cache != null && cache.storeHoldsKeyword(this, name);
+    }
+
+    /**
+     * Keyword counterpart of {@link #serveHeldFromStore}, called by the
+     * ordinal-based doc values once {@link #serveKeywordSparse} has
+     * declined the sparse dictionary for an exclusive hint below
+     * {@link #SPARSE_RATIO}. In that case the store holds this fragment's
+     * dictionary, and this publishes it to this leaf alone, so the
+     * {@code ensureXxxLoaded} call that follows finds the column present
+     * instead of loading it for every leaf of the reader. A no-op when
+     * the decision was not driven by the store (no exclusive sparse
+     * hint, or a full dictionary already on the leaf). Should the entry
+     * be evicted between the lookup and the pin, the shard cache
+     * reloads this one fragment, the same single fragment scan the leaf
+     * runs when a doc outside the hint is requested.
+     */
+    private void serveHeldKeywordInsteadOfTake(String name, int[] hint, boolean exclusive, boolean multiValued) throws IOException {
+        if (!exclusive || !isSparseHint(hint)) {
+            return;
+        }
+        boolean present = multiValued
+            ? keywordArrayOrds.containsKey(name) || offHeapKeywordArrayColumns.containsKey(name)
+            : keywordOrds.containsKey(name) || offHeapKeywordColumns.containsKey(name);
+        if (present) {
+            return;
+        }
+        LanceShardColumnCache cache = shardColumnCache;
+        if (cache == null || !cache.storeHoldsKeyword(this, name)) {
+            return;
+        }
+        if (multiValued) {
+            cache.publishKeywordArrayFromStoreForLeaf(this, name);
+        } else {
+            cache.publishKeywordFromStoreForLeaf(this, name);
+        }
+    }
+
+    /**
      * Values of one numeric or boolean column for the hinted rows.
      * {@code offsets} is the hint array itself; {@code values[i]} and
      * {@code presence.get(i)} describe the row at {@code offsets[i]}.
@@ -1207,9 +1297,14 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * Decide, once per column and hint, whether the ordinal-based doc
      * values of {@code name} are served from the sparse dictionary.
      * The first decision sticks (see {@link #keywordServedSparse}).
-     * Sparse requires an exclusive hint below {@link #SPARSE_RATIO}
-     * and no full dictionary already present; a dictionary published
-     * by the shard cache on behalf of another leaf is free to use.
+     * Sparse requires an exclusive hint below {@link #SPARSE_RATIO},
+     * no full dictionary already present on the leaf, and no dictionary
+     * of this fragment in the off-heap store: a dictionary published by
+     * the shard cache on behalf of another leaf, or held by the store
+     * from an earlier request, is complete and free to read, so the take
+     * cannot beat it. The exclusivity condition is what keeps the
+     * ordinal space stable; the other two only choose the cheaper
+     * complete source.
      */
     private boolean serveKeywordSparse(String name, int[] hint, boolean exclusive) {
         Boolean served = keywordServedSparse.get(name);
@@ -1221,7 +1316,8 @@ public final class LanceFragmentLeafReader extends LeafReader {
             && !keywordOrds.containsKey(name)
             && !keywordArrayOrds.containsKey(name)
             && !offHeapKeywordColumns.containsKey(name)
-            && !offHeapKeywordArrayColumns.containsKey(name);
+            && !offHeapKeywordArrayColumns.containsKey(name)
+            && !storeHoldsKeyword(name);
         Boolean previous = keywordServedSparse.putIfAbsent(name, sparse);
         return previous != null ? previous : sparse;
     }
@@ -1245,10 +1341,23 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * {@link #advanceExact}. Deferring the choice to that call lets
      * the hint be used.
      *
-     * <p>On first use: if the full column is already loaded on this
-     * leaf, read it; else if a hint below {@link #SPARSE_RATIO} is
-     * present, take the hinted rows and read those; else load the
-     * full column. A sparse instance that is asked about a doc outside
+     * <p>On first use the data source is chosen in this order:
+     * <ol>
+     *   <li>rows already taken for the current hint on this leaf (a
+     *       previous instance of the column took them, and none has
+     *       since left them for the full column);</li>
+     *   <li>the full column, when it is already present on this leaf
+     *       (loaded by an earlier accessor, or published by the shard
+     *       cache on behalf of another leaf);</li>
+     *   <li>with a hint below {@link #SPARSE_RATIO}: the off-heap
+     *       {@link ColumnStore} when it holds this fragment's column
+     *       from an earlier request, read for this fragment alone and
+     *       without loading anything else; otherwise a take of the
+     *       hinted rows;</li>
+     *   <li>otherwise the full column, loaded through the shard cache
+     *       (into the store when it has room, into heap when not).</li>
+     * </ol>
+     * A sparse instance that is asked about a doc outside
      * the hint loads the full column at that moment and answers from
      * it for the rest of its life, so a Lucene clause that collects
      * docs the Lance scorer did not produce still sees correct values.
@@ -1294,6 +1403,13 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 return;
             }
             if (isSparseHint(hint)) {
+                // A slice the store already holds for this fragment is
+                // read for one pin; the take is only cheaper than a load
+                // the store has not done yet.
+                if (serveHeldFromStore(name, isBoolean)) {
+                    useFullColumn();
+                    return;
+                }
                 SparseNumeric candidate = sparseNumericFor(name, isBoolean, hint);
                 if (!candidate.fellBack) {
                     sparse = candidate;
@@ -1487,16 +1603,30 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * <p>Unlike numeric values, an ordinal space cannot change after a
      * consumer has seen it: a sort comparator keeps the ordinal of its
      * current bottom slot, and a global ordinal map records every
-     * segment ordinal it saw when it was built. The sparse dictionary
-     * is therefore used only when the hint is exclusive (every doc the
-     * search collects on this leaf is a hinted doc) and the decision
-     * for the column is recorded in {@link #keywordServedSparse} so
-     * every later instance under the same hint uses the same
-     * dictionary. Should a doc outside the hint still be requested,
-     * the full column is loaded and the doc's term is looked up in the
-     * sparse dictionary; a term that is not there has no ordinal in
-     * the space the consumer is using, and the instance fails rather
-     * than report the doc as missing or reorder the values.
+     * segment ordinal it saw when it was built. The source is chosen on
+     * first use in this order, and the decision for the column is
+     * recorded in {@link #keywordServedSparse} so every later instance
+     * under the same hint uses the same dictionary:
+     * <ol>
+     *   <li>the decision already recorded for the column under the
+     *       current hint;</li>
+     *   <li>the full dictionary, when it is already present on this
+     *       leaf;</li>
+     *   <li>with an exclusive hint (every doc the search collects on
+     *       this leaf is a hinted doc) below {@link #SPARSE_RATIO}: the
+     *       off-heap {@link ColumnStore} when it holds this fragment's
+     *       dictionary from an earlier request, read for this fragment
+     *       alone; otherwise the sparse dictionary built from the hinted
+     *       rows;</li>
+     *   <li>otherwise the full dictionary, loaded through the shard
+     *       cache.</li>
+     * </ol>
+     * Should a doc outside the hint still be requested from a sparse
+     * instance, the full column is loaded and the doc's term is looked
+     * up in the sparse dictionary; a term that is not there has no
+     * ordinal in the space the consumer is using, and the instance
+     * fails rather than report the doc as missing or reorder the
+     * values.
      *
      * <p>The full dictionary is either the heap {@code BytesRef[]} plus
      * {@code int[]} built for this request or a {@link CachedKeywordColumn}
@@ -1529,10 +1659,12 @@ public final class LanceFragmentLeafReader extends LeafReader {
             resolved = true;
             try {
                 int[] hint = hintedOffsets;
-                if (serveKeywordSparse(name, hint, hintExclusive)) {
+                boolean exclusive = hintExclusive;
+                if (serveKeywordSparse(name, hint, exclusive)) {
                     sparse = sparseKeywordFor(name, hint);
                     terms = sparse.terms;
                 } else {
+                    serveHeldKeywordInsteadOfTake(name, hint, exclusive, false);
                     ensureTextLoaded(name);
                     useFullColumn();
                 }
@@ -1694,7 +1826,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
     /**
      * Multi-valued keyword doc values over a List&lt;Utf8&gt; column.
-     * Same source selection and ordinal-space rules as
+     * Same source selection order and ordinal-space rules as
      * {@link HintedSortedDocValues}. Over the off-heap store the current
      * doc's ordinals are the flat range
      * {@code [rowStart, rowStart + rowCount)} of the
@@ -1726,10 +1858,12 @@ public final class LanceFragmentLeafReader extends LeafReader {
             resolved = true;
             try {
                 int[] hint = hintedOffsets;
-                if (serveKeywordSparse(name, hint, hintExclusive)) {
+                boolean exclusive = hintExclusive;
+                if (serveKeywordSparse(name, hint, exclusive)) {
                     sparse = sparseKeywordArrayFor(name, hint);
                     terms = sparse.terms;
                 } else {
+                    serveHeldKeywordInsteadOfTake(name, hint, exclusive, true);
                     ensureKeywordArrayLoaded(name);
                     useFullColumn();
                 }
