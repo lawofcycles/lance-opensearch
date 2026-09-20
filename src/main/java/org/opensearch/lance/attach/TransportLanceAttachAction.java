@@ -5,32 +5,38 @@
 
 package org.opensearch.lance.attach;
 
+import java.io.IOException;
 import java.util.Optional;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.lance.Dataset;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.ResourceAlreadyExistsException;
-import org.opensearch.action.ActionRunnable;
-import org.opensearch.action.admin.cluster.state.ClusterStateRequest;
-import org.opensearch.action.admin.cluster.state.ClusterStateResponse;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexResponse;
 import org.opensearch.action.support.ActionFilters;
-import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.action.support.clustermanager.TransportClusterManagerNodeAction;
+import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.block.ClusterBlockException;
+import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.lance.LanceInternalHeaders;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.namespace.AllowedTableRoots;
 import org.opensearch.lance.namespace.LanceNamespaceService;
 import org.opensearch.lance.rest.RestAttachAction;
-import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.Client;
@@ -43,10 +49,25 @@ import org.opensearch.transport.client.Client;
  * without {@code cluster:admin/lance/attach} before the plugin touches
  * the table.
  *
+ * <p>Routing: the action is cluster-manager scoped. Whichever node
+ * receives {@code POST /_lance/attach} forwards the request to the
+ * elected cluster manager, and {@link #clusterManagerOperation} runs
+ * there. Attach reads and writes cluster state (index existence check,
+ * create index, poll tracking), so the manager is where that work
+ * belongs. It is also what keeps the internal create-index header
+ * intact: the create call below runs through the node client on the
+ * manager itself, so {@code indices:admin/create} executes locally and
+ * is never forwarded over transport. A security plugin stashes the
+ * thread context on every outbound transport request and copies only
+ * its own headers, so a create that had to hop to the manager would
+ * arrive without the header and {@link LanceCreateIndexActionFilter}
+ * would reject it.
+ *
  * <p>Threading: {@link Dataset#open} and the schema walk block on
- * native I/O, so {@link #doExecute} hands the whole operation to the
- * generic pool instead of running it on the transport thread the REST
- * layer called from.
+ * native I/O, so {@link #executor()} names the generic pool. The base
+ * class hands {@link #clusterManagerOperation} to that pool instead of
+ * running it on the transport thread or the cluster state update
+ * thread of the manager.
  *
  * <p>The index is created through the node client with the internal
  * create-index header stamped on a stashed thread context. The
@@ -61,9 +82,10 @@ import org.opensearch.transport.client.Client;
  * different table) is a 409 so the operator picks a different name
  * explicitly.
  */
-public final class TransportLanceAttachAction extends HandledTransportAction<LanceAttachRequest, LanceAttachResponse> {
+public final class TransportLanceAttachAction extends TransportClusterManagerNodeAction<LanceAttachRequest, LanceAttachResponse> {
 
-    private final ThreadPool threadPool;
+    private static final Logger LOG = LogManager.getLogger(TransportLanceAttachAction.class);
+
     private final Client client;
     private final LanceNamespaceService namespaceService;
     private final AllowedTableRoots allowedRoots;
@@ -71,22 +93,58 @@ public final class TransportLanceAttachAction extends HandledTransportAction<Lan
     @Inject
     public TransportLanceAttachAction(
         TransportService transportService,
-        ActionFilters actionFilters,
+        ClusterService clusterService,
         ThreadPool threadPool,
+        ActionFilters actionFilters,
+        IndexNameExpressionResolver indexNameExpressionResolver,
         Client client,
         LanceNamespaceService namespaceService,
         AllowedTableRoots allowedRoots
     ) {
-        super(LanceAttachAction.NAME, transportService, actionFilters, LanceAttachRequest::new, ThreadPool.Names.GENERIC);
-        this.threadPool = threadPool;
+        super(
+            LanceAttachAction.NAME,
+            transportService,
+            clusterService,
+            threadPool,
+            actionFilters,
+            LanceAttachRequest::new,
+            indexNameExpressionResolver
+        );
         this.client = client;
         this.namespaceService = namespaceService;
         this.allowedRoots = allowedRoots;
     }
 
     @Override
-    protected void doExecute(Task task, LanceAttachRequest request, ActionListener<LanceAttachResponse> listener) {
-        threadPool.executor(ThreadPool.Names.GENERIC).execute(ActionRunnable.wrap(listener, l -> attach(request, l)));
+    protected String executor() {
+        // Opening the table is blocking native I/O; keep it off the
+        // transport and cluster state threads of the manager.
+        return ThreadPool.Names.GENERIC;
+    }
+
+    @Override
+    protected LanceAttachResponse read(StreamInput in) throws IOException {
+        return new LanceAttachResponse(in);
+    }
+
+    @Override
+    protected ClusterBlockException checkBlock(LanceAttachRequest request, ClusterState state) {
+        // Attach ends in a create-index metadata write. The index name
+        // may still be derived from the table, so check the global
+        // metadata-write block rather than a per-index one.
+        return state.blocks().globalBlockedException(ClusterBlockLevel.METADATA_WRITE);
+    }
+
+    @Override
+    protected void clusterManagerOperation(LanceAttachRequest request, ClusterState state, ActionListener<LanceAttachResponse> listener)
+        throws Exception {
+        // The state handed in here is not used: nothing before the
+        // create depends on cluster state (allowlist and derivation
+        // read the request and the table), and the one read that does,
+        // the existing-index check, happens after the create has
+        // failed with ResourceAlreadyExistsException, which this state
+        // predates. verifyExistingLanceIndex reads a fresher state then.
+        attach(request, listener);
     }
 
     private void attach(LanceAttachRequest request, ActionListener<LanceAttachResponse> listener) throws Exception {
@@ -98,6 +156,9 @@ public final class TransportLanceAttachAction extends HandledTransportAction<Lan
             );
         }
         String indexName = request.indexName() != null ? request.indexName() : tableName(table);
+        // Names the node that runs the attach, so a cluster log shows
+        // where a forwarded request ended up.
+        LOG.debug("lance.attach: attaching table [{}] as index [{}] on this node", table, indexName);
         // A tag is resolved to the version it points at right now so the
         // derivation below reads the tagged snapshot. The engine and the
         // namespace poll resolve it again on every open and poll, which is
@@ -152,10 +213,13 @@ public final class TransportLanceAttachAction extends HandledTransportAction<Lan
 
         // LanceCreateIndexActionFilter blocks user PUT /{index} that
         // tries to set index.lance.table. Stamp the internal header so
-        // this plugin-issued call is recognised as legitimate. The stash
-        // also drops the caller's identity for this one call, which is
-        // intended: the caller was authorised against the attach action,
-        // not against creating an index of this name.
+        // this plugin-issued call is recognised as legitimate. The
+        // header lives in this node's ThreadContext only, which is
+        // enough because this code runs on the elected cluster manager
+        // and the create therefore executes locally. The stash also
+        // drops the caller's identity for this one call, which is
+        // intended: the caller was authorised against the attach
+        // action, not against creating an index of this name.
         ThreadContext threadContext = client.threadPool().getThreadContext();
         try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
             threadContext.putHeader(LanceInternalHeaders.LANCE_INTERNAL_CREATE_INDEX, "true");
@@ -163,7 +227,10 @@ public final class TransportLanceAttachAction extends HandledTransportAction<Lan
                 @Override
                 public void onResponse(CreateIndexResponse response) {
                     // Register the attach-created index with the namespace
-                    // poller unless the operator pinned a version. Pinned
+                    // poller unless the operator pinned a version. The
+                    // poll runs on the elected cluster manager, which is
+                    // the node this code runs on, so the registration
+                    // lands in the memory the poll reads. Pinned
                     // indices stay on their manifest version by design
                     // (readonly snapshot for reproducibility), so the poll
                     // cycle does not need to touch them and would otherwise
@@ -200,49 +267,63 @@ public final class TransportLanceAttachAction extends HandledTransportAction<Lan
         StorageOptions storageOptions,
         ActionListener<LanceAttachResponse> listener
     ) {
-        ClusterStateRequest stateRequest = new ClusterStateRequest();
-        stateRequest.clear().metadata(true).indices(indexName);
-        client.admin().cluster().state(stateRequest, ActionListener.wrap((ClusterStateResponse response) -> {
-            IndexMetadata md = response.getState().metadata().index(indexName);
-            if (md == null) {
-                // Race: the index disappeared between create and state.
-                // Treat as conflict rather than pretend attach succeeded.
-                throw new OpenSearchStatusException("index " + indexName + " conflicts with a concurrent request", RestStatus.CONFLICT);
-            }
-            String existing = md.getSettings().get(LanceEngineFactory.TABLE_SETTING);
-            if (existing == null) {
-                throw new OpenSearchStatusException(
+        // This runs on the elected cluster manager, whose applied state
+        // already contains the index the create just collided with:
+        // the manager publishes and applies each state update before it
+        // executes the next task. The read is a direct clusterService
+        // lookup rather than a cluster state request through the client
+        // on purpose: the caller was already authorised under
+        // cluster:admin/lance/attach, and this is plugin bookkeeping on
+        // the manager, so the indices:monitor/state filter chain has
+        // nothing to add.
+        IndexMetadata md = clusterService.state().metadata().index(indexName);
+        if (md == null) {
+            // Race: the index disappeared between create and this read.
+            // Treat as conflict rather than pretend attach succeeded.
+            listener.onFailure(
+                new OpenSearchStatusException("index " + indexName + " conflicts with a concurrent request", RestStatus.CONFLICT)
+            );
+            return;
+        }
+        String existing = md.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+        if (existing == null) {
+            listener.onFailure(
+                new OpenSearchStatusException(
                     "index " + indexName + " already exists and is not a Lance index; choose a different `name`",
                     RestStatus.CONFLICT
-                );
-            }
-            if (!existing.equals(table)) {
-                throw new OpenSearchStatusException(
+                )
+            );
+            return;
+        }
+        if (!existing.equals(table)) {
+            listener.onFailure(
+                new OpenSearchStatusException(
                     "index " + indexName + " already attached to a different table: " + existing,
                     RestStatus.CONFLICT
-                );
-            }
-            // Same table, so record the (index, table) pair with the
-            // namespace poller in case this node has forgotten it
-            // (cluster restart after attach, for example). The existing
-            // index's own settings decide how it is registered, because
-            // that is what its engine reads: a version pin keeps it out
-            // of the poll cycle (readonly snapshot), and a stored tag is
-            // what the poll has to re-resolve, even if this request named
-            // a different tag or none.
-            long existingVersion = md.getSettings().getAsLong(LanceEngineFactory.VERSION_SETTING, -1L);
-            String existingTag = md.getSettings().get(LanceEngineFactory.TAG_SETTING, "");
-            if (existingVersion < 0) {
-                namespaceService.registerAttachedIndex(
-                    indexName,
-                    table,
-                    derivation.version(),
-                    storageOptions,
-                    existingTag.isEmpty() ? null : existingTag
-                );
-            }
-            listener.onResponse(response(indexName, table, derivation, true));
-        }, listener::onFailure));
+                )
+            );
+            return;
+        }
+        // Same table, so record the (index, table) pair with the
+        // namespace poller in case this node has forgotten it
+        // (cluster restart after attach, for example). The existing
+        // index's own settings decide how it is registered, because
+        // that is what its engine reads: a version pin keeps it out
+        // of the poll cycle (readonly snapshot), and a stored tag is
+        // what the poll has to re-resolve, even if this request named
+        // a different tag or none.
+        long existingVersion = md.getSettings().getAsLong(LanceEngineFactory.VERSION_SETTING, -1L);
+        String existingTag = md.getSettings().get(LanceEngineFactory.TAG_SETTING, "");
+        if (existingVersion < 0) {
+            namespaceService.registerAttachedIndex(
+                indexName,
+                table,
+                derivation.version(),
+                storageOptions,
+                existingTag.isEmpty() ? null : existingTag
+            );
+        }
+        listener.onResponse(response(indexName, table, derivation, true));
     }
 
     private static LanceAttachResponse response(

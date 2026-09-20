@@ -11,8 +11,8 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 
-import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionRequestValidationException;
+import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.lance.StorageOptions;
@@ -20,8 +20,13 @@ import org.opensearch.lance.StorageOptions;
 /**
  * Request for {@link LanceAttachAction}: the parsed body of
  * {@code POST /_lance/attach}.
+ *
+ * <p>A {@link ClusterManagerNodeRequest} so the transport action can
+ * forward it to the elected cluster manager; the inherited
+ * {@code clusterManagerNodeTimeout} bounds how long the node that
+ * received the REST call waits for a manager to be known.
  */
-public final class LanceAttachRequest extends ActionRequest {
+public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAttachRequest> {
 
     private final String table;
     private final String indexName;

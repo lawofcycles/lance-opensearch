@@ -10,7 +10,9 @@ import java.util.List;
 import java.util.Map;
 
 import org.opensearch.action.ActionRequestValidationException;
+import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.test.OpenSearchTestCase;
@@ -39,6 +41,7 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
             StorageOptions.of(Map.of("aws_region", "eu-west-1")),
             multiFields
         );
+        original.clusterManagerNodeTimeout(TimeValue.timeValueSeconds(75));
 
         LanceAttachRequest restored = roundTrip(original);
 
@@ -48,6 +51,9 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
         assertTrue(restored.tag().isEmpty());
         assertEquals(original.storageOptions().asMap(), restored.storageOptions().asMap());
         assertEquals(original.multiFields(), restored.multiFields());
+        // The request is forwarded to the cluster manager, so the
+        // manager-node timeout has to travel with it.
+        assertEquals(TimeValue.timeValueSeconds(75), restored.clusterManagerNodeTimeout());
         // Sub-field order drives the order of the emitted mapping, so it
         // has to survive the wire as declared.
         assertEquals(List.of("body", "title"), List.copyOf(restored.multiFields().keySet()));
@@ -66,6 +72,7 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
         assertTrue(restored.tag().isEmpty());
         assertTrue(restored.storageOptions().isEmpty());
         assertTrue(restored.multiFields().isEmpty());
+        assertEquals(ClusterManagerNodeRequest.DEFAULT_CLUSTER_MANAGER_NODE_TIMEOUT, restored.clusterManagerNodeTimeout());
         assertNull(restored.validate());
     }
 
