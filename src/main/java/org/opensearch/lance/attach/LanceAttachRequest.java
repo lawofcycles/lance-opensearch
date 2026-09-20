@@ -26,6 +26,7 @@ public final class LanceAttachRequest extends ActionRequest {
     private final String table;
     private final String indexName;
     private final Long pinnedVersion;
+    private final String tag;
     private final StorageOptions storageOptions;
     private final Map<String, LinkedHashMap<String, String>> multiFields;
 
@@ -35,6 +36,8 @@ public final class LanceAttachRequest extends ActionRequest {
      *                       from the table directory name.
      * @param pinnedVersion  manifest version to pin, or {@code null} to
      *                       follow the latest version.
+     * @param tag            Lance tag to follow, or {@code null}. Not
+     *                       accepted together with {@code pinnedVersion}.
      * @param storageOptions object-store options for the table.
      * @param multiFields    base column to (sub-field name to sub-field
      *                       type), already merged from the {@code multi_fields}
@@ -44,12 +47,14 @@ public final class LanceAttachRequest extends ActionRequest {
         String table,
         String indexName,
         Long pinnedVersion,
+        String tag,
         StorageOptions storageOptions,
         Map<String, LinkedHashMap<String, String>> multiFields
     ) {
         this.table = table;
         this.indexName = indexName;
         this.pinnedVersion = pinnedVersion;
+        this.tag = tag;
         this.storageOptions = storageOptions == null ? StorageOptions.empty() : storageOptions;
         this.multiFields = multiFields == null ? Collections.emptyMap() : copyMultiFields(multiFields);
     }
@@ -59,6 +64,7 @@ public final class LanceAttachRequest extends ActionRequest {
         this.table = in.readString();
         this.indexName = in.readOptionalString();
         this.pinnedVersion = in.readOptionalLong();
+        this.tag = in.readOptionalString();
         this.storageOptions = StorageOptions.readFromStream(in);
         int columns = in.readVInt();
         LinkedHashMap<String, LinkedHashMap<String, String>> read = new LinkedHashMap<>();
@@ -80,6 +86,7 @@ public final class LanceAttachRequest extends ActionRequest {
         out.writeString(table);
         out.writeOptionalString(indexName);
         out.writeOptionalLong(pinnedVersion);
+        out.writeOptionalString(tag);
         storageOptions.writeTo(out);
         // Written by hand rather than through writeMap so the sub-field
         // order the operator declared survives the wire; the mapping
@@ -116,6 +123,20 @@ public final class LanceAttachRequest extends ActionRequest {
             }
             ex.addValidationError("[version] must be a non-negative integer");
         }
+        if (tag != null && tag.isEmpty()) {
+            if (ex == null) {
+                ex = new ActionRequestValidationException();
+            }
+            ex.addValidationError("[tag] must not be empty");
+        }
+        if (pinnedVersion != null && tag != null) {
+            // A version is an immutable pin and a tag is a moving one; the
+            // engine cannot honour both, so refuse instead of picking.
+            if (ex == null) {
+                ex = new ActionRequestValidationException();
+            }
+            ex.addValidationError("[version] and [tag] are mutually exclusive");
+        }
         return ex;
     }
 
@@ -130,6 +151,11 @@ public final class LanceAttachRequest extends ActionRequest {
 
     public Optional<Long> pinnedVersion() {
         return Optional.ofNullable(pinnedVersion);
+    }
+
+    /** Lance tag the index should follow, or empty when it does not follow a tag. */
+    public Optional<String> tag() {
+        return Optional.ofNullable(tag);
     }
 
     public StorageOptions storageOptions() {

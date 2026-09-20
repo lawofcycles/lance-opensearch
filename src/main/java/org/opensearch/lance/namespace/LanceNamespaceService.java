@@ -313,7 +313,7 @@ public final class LanceNamespaceService {
         for (Map.Entry<String, AttachedIndex> entry : attachedIndexes.entrySet()) {
             AttachedIndex attached = entry.getValue();
             try {
-                syncAttachedTable(entry.getKey(), attached.tablePath, attached.storageOptions);
+                syncAttachedTable(entry.getKey(), attached.tablePath, attached.storageOptions, attached.tag);
             } catch (Exception e) {
                 LOG.warn("attach poll failed for index {} at {}", entry.getKey(), attached.tablePath, e);
             }
@@ -322,17 +322,19 @@ public final class LanceNamespaceService {
 
     private void syncTable(String rootUri, String tableName, StorageOptions storageOptions) {
         String table = rootUri + "/" + tableName + ".lance";
-        runSyncCycle(table, tableName, storageOptions);
+        runSyncCycle(table, tableName, storageOptions, null);
     }
 
     // Attach-created indexes carry the fully-qualified table path already,
     // so the rootUri / tableName join namespace tables use doesn't apply.
-    // Everything downstream of the path resolution is identical.
-    private void syncAttachedTable(String indexName, String tablePath, StorageOptions storageOptions) {
-        runSyncCycle(tablePath, indexName, storageOptions);
+    // Everything downstream of the path resolution is identical, except
+    // that a tag-following index compares against the version its tag
+    // resolves to instead of the latest manifest.
+    private void syncAttachedTable(String indexName, String tablePath, StorageOptions storageOptions, String tag) {
+        runSyncCycle(tablePath, indexName, storageOptions, tag);
     }
 
-    private void runSyncCycle(String table, String indexName, StorageOptions storageOptions) {
+    private void runSyncCycle(String table, String indexName, StorageOptions storageOptions, String tag) {
         try {
             boolean exists = client.admin().indices().exists(new IndicesExistsRequest(indexName)).actionGet().isExists();
             if (!exists) {
@@ -377,11 +379,26 @@ public final class LanceNamespaceService {
             // us), allow future warnings again.
             warnedUnowned.remove(indexName);
             String policy = readUncoveredFragmentPolicy(indexName);
-            long latest;
+            // `target` is the version the index should serve after this
+            // cycle: the latest manifest for a latest-following index, or
+            // the version the tag points at for a tag-following one. The
+            // latest dataset is opened in both cases because tags are read
+            // from the table's refs, not from a particular manifest.
+            long target;
+            boolean moved;
             String rederivedMappingJson = null;
-            try (Dataset dataset = LanceRegistry.openDataset(table, storageOptions)) {
-                latest = dataset.version();
-                if (latest > served) {
+            try (Dataset latestDataset = LanceRegistry.openDataset(table, storageOptions)) {
+                long latest = latestDataset.version();
+                if (tag == null) {
+                    target = latest;
+                    moved = target > served;
+                } else {
+                    target = latestDataset.tags().getVersion(tag);
+                    // A tag can move backwards as well as forwards, so any
+                    // difference from the served version is a move.
+                    moved = target != served;
+                }
+                if (moved) {
                     // The RFC's Mapping interface states the mapping is re-derived at
                     // every checkout. We derive first so the builder only touches
                     // columns that derived to lance_text; keyword columns stay untouched.
@@ -396,9 +413,20 @@ public final class LanceNamespaceService {
                         : rederivationMetadata.getSettings().get(LanceEngineFactory.MULTI_FIELDS_SETTING, "");
                     java.util.Map<String, java.util.LinkedHashMap<String, String>> storedMultiFields = RestAttachAction
                         .deserialiseMultiFields(storedMultiFieldsJson);
-                    RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, storedMultiFields);
-                    rederivedMappingJson = derivation.mappingJson();
-                    warnOnLanceFieldRename(indexName, dataset.getLanceSchema());
+                    if (target == latest) {
+                        RestAttachAction.Derivation derivation = RestAttachAction.derive(latestDataset, storedMultiFields);
+                        rederivedMappingJson = derivation.mappingJson();
+                        warnOnLanceFieldRename(indexName, latestDataset.getLanceSchema());
+                    } else {
+                        // The tag points at an older manifest: derive from
+                        // that snapshot so the mapping matches the schema
+                        // the shard is about to read.
+                        try (Dataset tagged = LanceRegistry.openDataset(table, storageOptions, java.util.Optional.of(target))) {
+                            RestAttachAction.Derivation derivation = RestAttachAction.derive(tagged, storedMultiFields);
+                            rederivedMappingJson = derivation.mappingJson();
+                            warnOnLanceFieldRename(indexName, tagged.getLanceSchema());
+                        }
+                    }
                     if ("wait".equals(policy)) {
                         // `wait` is accepted but converges with the
                         // immediate branch: the plugin never writes to a
@@ -418,8 +446,19 @@ public final class LanceNamespaceService {
                     // not slow down queries on covered fragments.
                 }
             }
-            if (latest > served) {
-                LOG.info("table {} moved to version {} (serving {}), refreshing {}", table, latest, served, indexName);
+            if (moved) {
+                if (tag == null) {
+                    LOG.info("table {} moved to version {} (serving {}), refreshing {}", table, target, served, indexName);
+                } else {
+                    LOG.info(
+                        "tag {} on table {} now points at version {} (serving {}), refreshing {}",
+                        tag,
+                        table,
+                        target,
+                        served,
+                        indexName
+                    );
+                }
                 if (rederivedMappingJson != null) {
                     try {
                         client.admin()
@@ -444,7 +483,7 @@ public final class LanceNamespaceService {
                                 "mapping re-derivation for {} at version {} hit a keyword <-> lance_text type change ({}); "
                                     + "rebuilding the OpenSearch index (Lance data is untouched)",
                                 indexName,
-                                latest,
+                                target,
                                 message
                             );
                             try {
@@ -459,12 +498,12 @@ public final class LanceNamespaceService {
                                 LOG.warn("rebuild after type change failed for {}: {}", indexName, rebuild.getMessage());
                             }
                         } else {
-                            LOG.warn("mapping re-derivation failed for {} at version {}: {}", indexName, latest, message);
+                            LOG.warn("mapping re-derivation failed for {} at version {}: {}", indexName, target, message);
                         }
                     }
                 }
                 client.admin().indices().refresh(new RefreshRequest(indexName)).actionGet();
-                servedVersions.put(indexName, latest);
+                servedVersions.put(indexName, target);
             }
         } catch (Exception e) {
             LOG.warn("sync failed for table {}", table, e);
@@ -546,7 +585,17 @@ public final class LanceNamespaceService {
     }
 
     public void registerAttachedIndex(String indexName, String tablePath, long version, StorageOptions storageOptions) {
-        attachedIndexes.put(indexName, new AttachedIndex(tablePath, storageOptions));
+        registerAttachedIndex(indexName, tablePath, version, storageOptions, null);
+    }
+
+    /**
+     * Variant for indexes that follow a Lance tag. {@code tag} is the tag
+     * name the poll re-resolves on every cycle, or {@code null} for an
+     * index that follows the latest manifest. {@code version} is the
+     * version currently served (the tag's version at attach time).
+     */
+    public void registerAttachedIndex(String indexName, String tablePath, long version, StorageOptions storageOptions, String tag) {
+        attachedIndexes.put(indexName, new AttachedIndex(tablePath, storageOptions, tag));
         servedVersions.put(indexName, version);
     }
 
@@ -850,6 +899,11 @@ public final class LanceNamespaceService {
         }
     }
 
-    private record AttachedIndex(String tablePath, StorageOptions storageOptions) {
+    /**
+     * Poll bookkeeping for an attach-created index. {@code tag} is the
+     * Lance tag the index follows, or {@code null} when it follows the
+     * latest manifest.
+     */
+    private record AttachedIndex(String tablePath, StorageOptions storageOptions, String tag) {
     }
 }

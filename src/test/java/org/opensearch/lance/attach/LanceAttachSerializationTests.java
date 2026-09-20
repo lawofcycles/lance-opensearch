@@ -9,6 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.lance.StorageOptions;
@@ -34,6 +35,7 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
             "s3://bucket/tables/demo.lance",
             "demo-index",
             7L,
+            null,
             StorageOptions.of(Map.of("aws_region", "eu-west-1")),
             multiFields
         );
@@ -43,6 +45,7 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
         assertEquals(original.table(), restored.table());
         assertEquals(original.indexName(), restored.indexName());
         assertEquals(original.pinnedVersion(), restored.pinnedVersion());
+        assertTrue(restored.tag().isEmpty());
         assertEquals(original.storageOptions().asMap(), restored.storageOptions().asMap());
         assertEquals(original.multiFields(), restored.multiFields());
         // Sub-field order drives the order of the emitted mapping, so it
@@ -53,21 +56,38 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
     }
 
     public void testRequestWithDefaultsRoundTrip() throws Exception {
-        LanceAttachRequest original = new LanceAttachRequest("/tmp/demo.lance", null, null, null, null);
+        LanceAttachRequest original = new LanceAttachRequest("/tmp/demo.lance", null, null, null, null, null);
 
         LanceAttachRequest restored = roundTrip(original);
 
         assertEquals("/tmp/demo.lance", restored.table());
         assertNull(restored.indexName());
         assertTrue(restored.pinnedVersion().isEmpty());
+        assertTrue(restored.tag().isEmpty());
         assertTrue(restored.storageOptions().isEmpty());
         assertTrue(restored.multiFields().isEmpty());
         assertNull(restored.validate());
     }
 
+    public void testRequestWithTagRoundTrip() throws Exception {
+        LanceAttachRequest original = new LanceAttachRequest("/tmp/demo.lance", "demo", null, "release-2026-09", null, null);
+
+        LanceAttachRequest restored = roundTrip(original);
+
+        assertEquals("release-2026-09", restored.tag().orElseThrow());
+        assertTrue(restored.pinnedVersion().isEmpty());
+        assertNull(restored.validate());
+    }
+
     public void testRequestValidation() {
-        assertNotNull(new LanceAttachRequest("", null, null, null, null).validate());
-        assertNotNull(new LanceAttachRequest("/tmp/demo.lance", null, -1L, null, null).validate());
+        assertNotNull(new LanceAttachRequest("", null, null, null, null, null).validate());
+        assertNotNull(new LanceAttachRequest("/tmp/demo.lance", null, -1L, null, null, null).validate());
+        // An empty tag name cannot resolve to anything.
+        assertNotNull(new LanceAttachRequest("/tmp/demo.lance", null, null, "", null, null).validate());
+        // A fixed version pin and a moving tag cannot both be honoured.
+        ActionRequestValidationException both = new LanceAttachRequest("/tmp/demo.lance", null, 3L, "v1", null, null).validate();
+        assertNotNull(both);
+        assertTrue(both.getMessage(), both.getMessage().contains("[version] and [tag] are mutually exclusive"));
     }
 
     public void testResponseRoundTrip() throws Exception {
