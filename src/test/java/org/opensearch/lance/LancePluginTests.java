@@ -54,6 +54,7 @@ public class LancePluginTests extends OpenSearchTestCase {
         Set<String> names = plugin.getActions().stream().map(h -> h.getAction().name()).collect(java.util.stream.Collectors.toSet());
         assertTrue(names.toString(), names.contains("cluster:admin/lance/attach"));
         assertTrue(names.toString(), names.contains("indices:admin/lance/build_indexes"));
+        assertTrue(names.toString(), names.contains("indices:monitor/lance/refs"));
         assertTrue(names.toString(), names.contains("cluster:monitor/lance/namespace"));
         assertTrue(names.toString(), names.contains("cluster:admin/lance/namespace/update"));
     }
@@ -70,6 +71,7 @@ public class LancePluginTests extends OpenSearchTestCase {
         assertTrue(settingKeys.contains(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING));
         assertTrue(settingKeys.contains(LanceEngineFactory.MULTI_FIELDS_SETTING));
         assertTrue(settingKeys.contains("index.lance.uncovered_fragment_policy"));
+        assertTrue(settingKeys.contains(LanceEngineFactory.TAG_SETTING));
         assertTrue(settingKeys.contains("lance.namespace.poll_cadence"));
         assertTrue(settingKeys.contains("lance.builder.max_rows"));
     }

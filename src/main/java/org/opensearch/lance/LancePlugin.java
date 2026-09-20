@@ -44,9 +44,12 @@ import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.lance.query.LanceMatchPhraseQueryBuilder;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.lance.query.LanceMultiMatchQueryBuilder;
+import org.opensearch.lance.refs.LanceRefsAction;
+import org.opensearch.lance.refs.TransportLanceRefsAction;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.lance.rest.RestBuildIndexesAction;
 import org.opensearch.lance.rest.RestNamespaceAction;
+import org.opensearch.lance.rest.RestRefsAction;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.ActionPlugin.ActionHandler;
@@ -127,6 +130,17 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LanceEngineFactory.VERSION_SETTING,
         -1L,
         -1L,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+    /**
+     * Lance tag the index follows, written by attach when the body carries
+     * {@code "tag"}. Empty means the index follows the latest manifest (or
+     * a pinned version when {@link #VERSION_SETTING} is set).
+     */
+    public static final Setting<String> TAG_SETTING = Setting.simpleString(
+        LanceEngineFactory.TAG_SETTING,
+        "",
         Setting.Property.IndexScope,
         Setting.Property.Final
     );
@@ -281,6 +295,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             PRIMARY_KEY_FIELD_SETTING,
             PRIMARY_KEY_TYPE_SETTING,
             VERSION_SETTING,
+            TAG_SETTING,
             MULTI_FIELDS_SETTING,
             UNCOVERED_FRAGMENT_POLICY_SETTING,
             NAMESPACE_POLL_CADENCE_SETTING,
@@ -581,7 +596,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             ),
             new ActionHandler<>(LanceNamespaceListAction.INSTANCE, TransportLanceNamespaceListAction.class),
             new ActionHandler<>(LanceAttachAction.INSTANCE, TransportLanceAttachAction.class),
-            new ActionHandler<>(LanceBuildIndexesAction.INSTANCE, TransportLanceBuildIndexesAction.class)
+            new ActionHandler<>(LanceBuildIndexesAction.INSTANCE, TransportLanceBuildIndexesAction.class),
+            new ActionHandler<>(LanceRefsAction.INSTANCE, TransportLanceRefsAction.class)
         );
     }
 
@@ -622,6 +638,6 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<DiscoveryNodes> nodesInCluster
     ) {
-        return List.of(new RestAttachAction(), new RestNamespaceAction(), new RestBuildIndexesAction());
+        return List.of(new RestAttachAction(), new RestNamespaceAction(), new RestBuildIndexesAction(), new RestRefsAction());
     }
 }
