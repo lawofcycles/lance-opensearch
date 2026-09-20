@@ -20,11 +20,60 @@ import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.lance.Dataset;
 import org.lance.Fragment;
+import org.lance.fragment.DataFile;
 
 /** DirectoryReader whose leaves are Lance fragments. */
 public final class LanceDirectoryReader extends DirectoryReader {
 
+    /**
+     * Byte total the Lance manifest records for the data files behind a
+     * set of fragments.
+     *
+     * @param knownBytes       sum of {@code DataFile.getFileSizeBytes()} over
+     *                         every data file whose size the manifest
+     *                         records
+     * @param filesWithoutSize number of data files the manifest lists
+     *                         without a size (older writers did not record
+     *                         one); those files contribute nothing to
+     *                         {@code knownBytes}, so the total is a lower
+     *                         bound whenever this is non-zero
+     */
+    public record DataFileSizes(long knownBytes, int filesWithoutSize) {
+        public static final DataFileSizes NONE = new DataFileSizes(0L, 0);
+    }
+
+    /**
+     * Sum the manifest-recorded sizes of every data file the given fragments
+     * reference. Reads only the in-memory manifest ({@code Fragment.metadata()}
+     * is a field access on an already materialised {@code FragmentMetadata});
+     * no object-store request is made, which is why this runs on every
+     * reader open rather than {@code Dataset.calculateDataSize()}, which
+     * fetches each data file's footer. Data overlay files are included
+     * through {@code getReferencedLanceFiles()}; deletion files and index
+     * files are not data files and are left out.
+     */
+    public static DataFileSizes sumDataFileSizes(List<Fragment> fragments) {
+        long knownBytes = 0L;
+        int filesWithoutSize = 0;
+        for (Fragment fragment : fragments) {
+            for (DataFile dataFile : fragment.metadata().getReferencedLanceFiles()) {
+                Long size = dataFile.getFileSizeBytes();
+                if (size == null) {
+                    filesWithoutSize++;
+                } else {
+                    knownBytes += size;
+                }
+            }
+        }
+        return new DataFileSizes(knownBytes, filesWithoutSize);
+    }
+
     private final IndexCommit commit;
+    // Data file byte total of the fragments this reader exposes, computed
+    // once at open from the manifest the reader was built from. The engine
+    // reports it through DocsStats.totalSizeInBytes; a refresh that swaps
+    // in a new reader recomputes it for the new manifest version.
+    private final DataFileSizes dataFileSizes;
     // The engine hands us a freshly opened Dataset when it builds a new reader,
     // so this reader takes ownership of it and closes it when the reader is
     // closed. Lucene's ReferenceManager releases the previous reader once the
@@ -82,7 +131,8 @@ public final class LanceDirectoryReader extends DirectoryReader {
         // schema pass reads the resulting set instead of calling into
         // Lance per (leaf, Utf8 column).
         java.util.Set<String> ftsColumns = LanceFragmentLeafReader.resolveFtsColumns(dataset);
-        for (Fragment fragment : dataset.getFragments()) {
+        List<Fragment> fragments = dataset.getFragments();
+        for (Fragment fragment : fragments) {
             LanceFragmentLeafReader raw = new LanceFragmentLeafReader(
                 dataset,
                 fragment.getId(),
@@ -105,7 +155,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         for (LanceFragmentLeafReader raw : rawLeaves) {
             raw.setShardColumnCache(cache);
         }
-        return openWithLeaves(directory, commit, dataset, leaves);
+        return openWithLeaves(directory, commit, dataset, leaves, sumDataFileSizes(fragments));
     }
 
     /**
@@ -208,18 +258,25 @@ public final class LanceDirectoryReader extends DirectoryReader {
         for (LanceFragmentLeafReader raw : rawLeaves) {
             raw.setShardColumnCache(cache);
         }
-        return openWithLeaves(directory, commit, dataset, leaves);
+        // Per-request fragment readers do not report shard stats, so skip
+        // the manifest walk here.
+        return openWithLeaves(directory, commit, dataset, leaves, DataFileSizes.NONE);
     }
 
-    private static LanceDirectoryReader openWithLeaves(Directory directory, IndexCommit commit, Dataset dataset, List<LeafReader> leaves)
-        throws IOException {
+    private static LanceDirectoryReader openWithLeaves(
+        Directory directory,
+        IndexCommit commit,
+        Dataset dataset,
+        List<LeafReader> leaves,
+        DataFileSizes dataFileSizes
+    ) throws IOException {
         ByteBuffersDirectory bridgeDir = new ByteBuffersDirectory();
         try (IndexWriter writer = new IndexWriter(bridgeDir, new IndexWriterConfig())) {
             writer.addDocument(new Document());
             writer.commit();
         }
         DirectoryReader bridge = DirectoryReader.open(bridgeDir);
-        return new LanceDirectoryReader(directory, leaves.toArray(new LeafReader[0]), commit, dataset, bridge);
+        return new LanceDirectoryReader(directory, leaves.toArray(new LeafReader[0]), commit, dataset, bridge, dataFileSizes);
     }
 
     private LanceDirectoryReader(
@@ -227,12 +284,23 @@ public final class LanceDirectoryReader extends DirectoryReader {
         LeafReader[] leaves,
         IndexCommit commit,
         Dataset dataset,
-        DirectoryReader cacheLifetimeBridge
+        DirectoryReader cacheLifetimeBridge,
+        DataFileSizes dataFileSizes
     ) throws IOException {
         super(directory, leaves, null);
         this.commit = commit;
         this.dataset = dataset;
         this.cacheLifetimeBridge = cacheLifetimeBridge;
+        this.dataFileSizes = dataFileSizes;
+    }
+
+    /**
+     * Manifest-recorded data file byte total of the fragments this reader
+     * exposes. {@link DataFileSizes#NONE} for readers opened through
+     * {@link #openForFragments}.
+     */
+    public DataFileSizes dataFileSizes() {
+        return dataFileSizes;
     }
 
     @Override

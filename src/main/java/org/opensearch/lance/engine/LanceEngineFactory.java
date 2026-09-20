@@ -20,6 +20,8 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.FilterDirectoryReader;
 import org.apache.lucene.index.IndexCommit;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentInfos;
@@ -56,9 +58,10 @@ import org.opensearch.lance.StorageOptions;
  *       engine whose {@link Engine#get(Engine.Get, java.util.function.BiFunction)}
  *       resolves the primary key through a Lance scalar-index-backed
  *       point lookup.</li>
- *   <li>Shard-level stats: {@link Engine#docStats()} and
- *       {@link Engine#segmentsStats(boolean, boolean)} report Lance-provided
- *       row counts instead of Lucene segment stats.</li>
+ *   <li>Shard-level stats: {@link Engine#docStats()} reports the Lance row
+ *       count, deletion count, and manifest-recorded data file total;
+ *       {@link Engine#segmentsStats(boolean, boolean)} stays empty because
+ *       there are no Lucene segments to describe.</li>
  *   <li>Refresh lifecycle: {@link Engine#refresh(String)} advances the
  *       shared reader when the Lance manifest version advances, so the
  *       fragment executors that open per-fragment leaves see the latest
@@ -299,9 +302,20 @@ public final class LanceEngineFactory implements EngineFactory {
         // leaves are neither SegmentReaders nor Lucene segments, so those
         // helpers throw on every stats API call and take out _stats /
         // _cat/indices docs.count / _nodes/stats/indices / _cluster/stats
-        // across the whole node. Recompute the fields Lance can provide
-        // (numDocs / maxDoc from each leaf), leave the ones tied to Lucene
-        // segment files empty, and never delegate to Lucene.segmentReader.
+        // across the whole node. Recompute the fields Lance can provide,
+        // leave the ones tied to Lucene segment files empty, and never
+        // delegate to Lucene.segmentReader.
+        //
+        // count / deleted come from the leaves: each LanceFragmentLeafReader
+        // reports maxDoc = physical rows and numDocs = rows outside the
+        // fragment's deletion file, so the sums equal Dataset.countRows()
+        // and the manifest's deletion total for the served version.
+        // totalSizeInBytes is the manifest-recorded data file total the
+        // reader captured at open (LanceDirectoryReader.dataFileSizes()).
+        // It is not what _cat/indices shows as store.size: that column is
+        // IndexShard.storeStats() -> Store.stats(), which sums the files in
+        // the shard's Lucene Directory (only the bootstrap commit here) and
+        // has no engine-level override in OpenSearch 3.8.
         @Override
         public org.opensearch.index.shard.DocsStats docStats() {
             try (Searcher searcher = acquireSearcher("docStats", SearcherScope.INTERNAL)) {
@@ -311,11 +325,14 @@ public final class LanceEngineFactory implements EngineFactory {
                     numDocs += ctx.reader().numDocs();
                     numDeletedDocs += ctx.reader().numDeletedDocs();
                 }
-                // sizeInBytes is unknown for Lance leaves; leave it at zero.
-                // Callers already expect this to be an estimate.
+                long sizeInBytes = 0L;
+                if (searcher.getIndexReader() instanceof DirectoryReader directoryReader
+                    && FilterDirectoryReader.unwrap(directoryReader) instanceof LanceDirectoryReader lanceReader) {
+                    sizeInBytes = lanceReader.dataFileSizes().knownBytes();
+                }
                 return new org.opensearch.index.shard.DocsStats.Builder().count(numDocs)
                     .deleted(numDeletedDocs)
-                    .totalSizeInBytes(0L)
+                    .totalSizeInBytes(sizeInBytes)
                     .build();
             }
         }
