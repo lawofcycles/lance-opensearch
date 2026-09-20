@@ -941,11 +941,12 @@ public final class LanceTableFactory {
      * fragments * rowsPerFragment}):
      * <ul>
      *   <li>{@code id}: int32, {@code i}</li>
-     *   <li>{@code body}: Utf8 with an INVERTED index, {@code "hello"}
-     *       followed by the token {@code lance} repeated {@code i + 1}
-     *       times. Distinct term frequencies give every row a distinct
-     *       BM25 score for a {@code lance_match} on {@code lance}, so
-     *       score order is total and does not depend on how ties are
+     *   <li>{@code body}: Utf8 with an INVERTED index, {@code "hello
+     *       tok<i>"} followed by the token {@code lance} repeated
+     *       {@code i + 1} times. {@code tok<i>} matches exactly one row.
+     *       Distinct term frequencies give every row a distinct BM25
+     *       score for a {@code lance_match} on {@code lance}, so score
+     *       order is total and does not depend on how ties are
      *       broken.</li>
      *   <li>{@code category}: Utf8 without an index (derives to
      *       {@code keyword}), {@code "c" + (i % 3)}</li>
@@ -953,11 +954,13 @@ public final class LanceTableFactory {
      *       {@code i} days, so ts order equals id order</li>
      * </ul>
      * The first fragment is written with {@code CREATE}, the rest with
-     * {@code APPEND}, one manifest version per fragment.
+     * {@code APPEND}, one manifest version per fragment. Public because
+     * the query and dispatch packages' unit tests need a multi-fragment
+     * table with a total score order.
      *
      * @return absolute URI of the table.
      */
-    static String writeInterleavedTable(Path parent, String name, int fragments, int rowsPerFragment) throws Exception {
+    public static String writeInterleavedTable(Path parent, String name, int fragments, int rowsPerFragment) throws Exception {
         return withLocaleRoot(() -> writeInterleavedTableOnce(parent, name, fragments, rowsPerFragment));
     }
 
@@ -994,7 +997,7 @@ public final class LanceTableFactory {
                     for (int slot = 0; slot < rowsPerFragment; slot++) {
                         int i = fragment + slot * fragments;
                         idVector.set(slot, i);
-                        String body = "hello" + " lance".repeat(i + 1);
+                        String body = "hello tok" + i + " lance".repeat(i + 1);
                         bodyVector.setSafe(slot, body.getBytes(StandardCharsets.UTF_8));
                         categoryVector.setSafe(slot, ("c" + (i % 3)).getBytes(StandardCharsets.UTF_8));
                         tsVector.set(slot, epochMicros + i * dayMicros);

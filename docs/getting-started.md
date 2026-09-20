@@ -470,6 +470,16 @@ lance.native_memory.circuit_breaker.poll_interval: 5s   # default; how fast the 
 
 Both are dynamic, so changes take effect without a restart. The byte limit itself is not directly configurable through the breaker; it always follows `lance.native_memory.limit` so operators reason about one number.
 
+### Full-text lookups on several data nodes
+
+With more than one data node each node executes a share of the table's fragments, but a full-text query still looks the whole table up from the inverted index and keeps its own rows, because passing Lance a fragment list makes it read `_rowid` over those fragments first. Shapes that need every match (aggregations, sort by a field, post_filter, `size 0`, `track_total_hits: true`) run that lookup as a probe capped by one dynamic cluster setting:
+
+```
+lance.fts.subset_probe_limit: 1000000   # default; rows a subset node accepts from the whole-table lookup before it repeats the scan restricted to its fragments
+```
+
+Lower it when the per-node heap for the probe rows matters more than latency on queries that match millions of rows; raise it when such queries should stay on the index-only lookup.
+
 ## 7. Cleanup and restart
 
 The namespace registry is held in process memory. Restarting OpenSearch clears the registrations, and any Lance-backed indices survive as regular OpenSearch indices without a live sync loop. To resume auto-surface after a restart:
