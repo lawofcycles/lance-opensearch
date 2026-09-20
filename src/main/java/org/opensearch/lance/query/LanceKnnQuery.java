@@ -164,6 +164,10 @@ public final class LanceKnnQuery extends Query {
                 docIds[i] = (int) (packed[i] >>> 32);
                 hitScores[i] = Float.intBitsToFloat((int) (packed[i] & 0xFFFFFFFFL));
             }
+            // Same hint protocol as LanceFtsQuery: the leaf learns the
+            // k nearest rows of this fragment so sort and aggregation
+            // columns are fetched for those rows only.
+            leaf.hintMatchedOffsets(docIds, false);
             LanceSparseHitIterator iterator = new LanceSparseHitIterator(docIds, hitScores, hitCount);
             Scorer scorer = new Scorer() {
                 @Override
@@ -186,7 +190,11 @@ public final class LanceKnnQuery extends Query {
                     return iterator.docID();
                 }
             };
-            return new Weight.DefaultScorerSupplier(scorer);
+            // Under a reader wrapper the plugin does not know (the security
+            // plugin's document and field level security reader) the
+            // hint is delivered but never marked exclusive, so keyword
+            // dictionaries keep the full column path there.
+            return new LanceHintingScorerSupplier(scorer, leaf, docIds, LanceFragmentLeafReader.wrappedOnlyByOwnReaders(context.reader()));
         }
 
         private Map<Integer, FragmentHits> ensureShardScan(LanceFragmentLeafReader leaf) throws IOException {

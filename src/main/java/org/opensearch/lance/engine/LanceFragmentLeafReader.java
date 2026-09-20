@@ -77,6 +77,7 @@ import org.lance.Dataset;
 import org.lance.index.IndexCriteria;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.opensearch.common.lucene.index.OpenSearchLeafReader;
 
 /**
  * LeafReader over one Lance fragment.
@@ -285,6 +286,70 @@ public final class LanceFragmentLeafReader extends LeafReader {
     // and keywordArrayTerms back a multi-valued SortedSetDocValues.
     private final Map<String, int[][]> keywordArrayOrds = new ConcurrentHashMap<>();
     private final Map<String, BytesRef[]> keywordArrayTerms = new ConcurrentHashMap<>();
+
+    /**
+     * Largest fraction of {@link #maxDoc} a hinted hit set may cover
+     * before the doc value accessors stop taking the hit rows by
+     * address and load the whole column instead. A
+     * {@code _rowaddr IN (...)} take costs one Lance scan per
+     * {@link #TAKE_CHUNK} rows plus a per-row random read, while the
+     * full column load is one sequential scan of the fragment; at
+     * around one row in twenty the two are of the same order on the
+     * fixtures measured, so above that the sequential scan is used.
+     * Kept as a single constant so the threshold can be tuned in one
+     * place.
+     */
+    static final double SPARSE_RATIO = 0.05;
+
+    /**
+     * Request-scoped hit set for this leaf, or {@code null} when no
+     * Lance-side scorer has reported one. Sorted ascending doc ids
+     * (physical row offsets) that the last {@link #hintMatchedOffsets}
+     * call passed in. The doc value accessors use it to fetch only the
+     * hit rows of a sort or aggregation column instead of scanning the
+     * whole column; see {@link #hintMatchedOffsets} for the contract.
+     *
+     * <p>This state belongs to the request that is running against the
+     * reader, not to the fragment. A reader that is later kept across
+     * requests (a warm reader cache) must clear it, or receive a fresh
+     * hint, before the next request reads doc values; today every
+     * fragment path request opens its own reader, so the field lives
+     * exactly as long as the request.
+     */
+    private volatile int[] hintedOffsets;
+    /**
+     * Whether the Lance-side scorer that delivered {@link #hintedOffsets}
+     * has shown that every doc the current search collects on this
+     * leaf is one of the hinted docs (its own {@code BulkScorer} drives
+     * collection). Ordinal-based doc values ({@link #getSortedDocValues},
+     * {@link #getSortedSetDocValues}) build their sparse term
+     * dictionary only under this flag, because an ordinal space cannot
+     * be widened after a consumer has observed it. Numeric doc values
+     * use the hint without the flag and fall back to the full column
+     * on the first doc outside the hint.
+     */
+    private volatile boolean hintExclusive;
+    /**
+     * Sparse numeric and boolean values taken for {@link #hintedOffsets},
+     * keyed by column name. Cleared whenever the hint is replaced.
+     */
+    private final Map<String, SparseNumeric> sparseNumeric = new ConcurrentHashMap<>();
+    /** Sparse keyword dictionaries taken for {@link #hintedOffsets}, keyed by base column name. */
+    private final Map<String, SparseKeyword> sparseKeyword = new ConcurrentHashMap<>();
+    /** Sparse multi-valued keyword dictionaries taken for {@link #hintedOffsets}, keyed by column name. */
+    private final Map<String, SparseKeywordArray> sparseKeywordArray = new ConcurrentHashMap<>();
+    /**
+     * Per ordinal-based column, whether the first doc values instance
+     * this leaf served under the current hint used the sparse
+     * dictionary ({@code TRUE}) or the full one ({@code FALSE}). Every
+     * later instance of the same column follows the first, so a global
+     * ordinal map built from one instance and the instance a leaf
+     * collector obtains afterwards agree on the ordinal space. A
+     * {@code FALSE} entry survives hint replacement (the full
+     * dictionary is loaded and stays valid); {@code TRUE} entries are
+     * dropped together with the sparse dictionaries.
+     */
+    private final Map<String, Boolean> keywordServedSparse = new ConcurrentHashMap<>();
 
     /**
      * Shard-level column materialisation coordinator. Non-null when the
@@ -677,11 +742,23 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * then see the populated maps via ConcurrentHashMap's happens-before.
      */
     private void ensureNumericLoaded(String name) throws IOException {
+        ensureNumericLoaded(name, true);
+    }
+
+    /**
+     * Same as {@link #ensureNumericLoaded(String)}; {@code useShardCache}
+     * false forces the per-fragment scan even when a
+     * {@link LanceShardColumnCache} is installed. A doc values instance
+     * that leaves the sparse path for one doc outside its hint uses this
+     * so the fallback costs one fragment, not one scan of every fragment
+     * in the reader; the other leaves keep serving their hinted rows.
+     */
+    private void ensureNumericLoaded(String name, boolean useShardCache) throws IOException {
         if (numericColumns.containsKey(name)) {
             return;
         }
         LanceShardColumnCache cache = shardColumnCache;
-        if (cache != null) {
+        if (cache != null && useShardCache) {
             // Delegate to the shard-level coordinator: one scan for
             // the whole reader instead of one per leaf. After the
             // cache returns, publishNumericColumn below has put the
@@ -752,11 +829,15 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     private void ensureBooleanLoaded(String name) throws IOException {
+        ensureBooleanLoaded(name, true);
+    }
+
+    private void ensureBooleanLoaded(String name, boolean useShardCache) throws IOException {
         if (booleanColumns.containsKey(name)) {
             return;
         }
         LanceShardColumnCache cache = shardColumnCache;
-        if (cache != null) {
+        if (cache != null && useShardCache) {
             cache.loadBooleanColumn(name);
             return;
         }
@@ -811,11 +892,15 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * is installed so the scan runs once per shard.
      */
     private void ensureTextLoaded(String name) throws IOException {
+        ensureTextLoaded(name, true);
+    }
+
+    private void ensureTextLoaded(String name, boolean useShardCache) throws IOException {
         if (keywordOrds.containsKey(name)) {
             return;
         }
         LanceShardColumnCache cache = shardColumnCache;
-        if (cache != null) {
+        if (cache != null && useShardCache) {
             cache.loadTextColumn(name);
             return;
         }
@@ -869,11 +954,15 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * {@link #getSortedSetDocValues}.
      */
     private void ensureKeywordArrayLoaded(String name) throws IOException {
+        ensureKeywordArrayLoaded(name, true);
+    }
+
+    private void ensureKeywordArrayLoaded(String name, boolean useShardCache) throws IOException {
         if (keywordArrayOrds.containsKey(name)) {
             return;
         }
         LanceShardColumnCache cache = shardColumnCache;
-        if (cache != null) {
+        if (cache != null && useShardCache) {
             cache.loadKeywordArrayColumn(name);
             return;
         }
@@ -940,87 +1029,502 @@ public final class LanceFragmentLeafReader extends LeafReader {
         keywordArrayOrds.put(name, rowOrds);
     }
 
+    /**
+     * Report the doc ids a Lance-side scorer ({@code LanceFtsQuery},
+     * {@code LanceKnnQuery}) matched on this leaf, so the doc value
+     * accessors can fetch a sort or aggregation column for those rows
+     * only instead of scanning the whole column. Lucene's sort
+     * comparators and aggregators read doc values for the collected
+     * docs alone, so when the collected docs are the scorer's hits a
+     * {@code _rowaddr IN (...)} take of the hit rows is all the column
+     * data the request needs.
+     *
+     * <p>{@code sortedOffsets} must be sorted ascending and free of
+     * duplicates; the array is kept by reference and must not be
+     * modified afterwards. A second call replaces the previous hint
+     * (no union): each Lucene {@code Weight} reports its own hit set,
+     * and a later Weight of the same request (the count phase, or a
+     * second Lance clause of a bool query) describes the docs the
+     * collector is about to see better than the union would. When the
+     * new array equals the current one the sparse structures already
+     * taken are kept; otherwise they are dropped.
+     *
+     * <p>{@code exclusive} states that the caller has established that
+     * every doc the current search collects on this leaf is one of
+     * {@code sortedOffsets}. The Lance scorers pass {@code false} when
+     * they build their per-leaf scorer and {@code true} once Lucene
+     * asks their {@code ScorerSupplier} for a {@code BulkScorer}, which
+     * only the collection driver of a leaf (the searcher itself, or a
+     * boolean parent whose other clauses can only narrow the doc set)
+     * does. Only ordinal-based doc values depend on the flag; numeric
+     * doc values verify the hint per doc and fall back to the full
+     * column when a doc outside it is requested.
+     *
+     * <p>The hint is request-scoped state on a reader that today lives
+     * for one request. A reader kept across requests must not carry a
+     * hint from one request into the next.
+     */
+    public void hintMatchedOffsets(int[] sortedOffsets, boolean exclusive) {
+        int[] current = hintedOffsets;
+        if (current != null && (current == sortedOffsets || Arrays.equals(current, sortedOffsets))) {
+            if (exclusive) {
+                hintExclusive = true;
+            }
+            return;
+        }
+        hintedOffsets = sortedOffsets;
+        hintExclusive = exclusive;
+        sparseNumeric.clear();
+        sparseKeyword.clear();
+        sparseKeywordArray.clear();
+        keywordServedSparse.values().removeIf(Boolean::booleanValue);
+    }
+
+    /** Current hint, for tests. */
+    int[] hintedOffsets() {
+        return hintedOffsets;
+    }
+
+    /** Whether the current hint is marked exclusive, for tests. */
+    boolean hintExclusive() {
+        return hintExclusive;
+    }
+
+    /**
+     * Whether doc values of column {@code name} are currently served
+     * from the rows taken for the hint, for tests. Numeric columns: a
+     * take exists for the current hint and no instance has left it for
+     * the full column. Keyword columns: the first instance under the
+     * current hint chose the sparse dictionary.
+     */
+    boolean isServingSparse(String name) {
+        SparseNumeric taken = sparseNumeric.get(name);
+        if (taken != null) {
+            return taken.offsets == hintedOffsets && !taken.fellBack;
+        }
+        return Boolean.TRUE.equals(keywordServedSparse.get(name));
+    }
+
+    /**
+     * Whether the whole column {@code name} has been materialised on
+     * this leaf (through {@code ensureXxxLoaded} or a
+     * {@link LanceShardColumnCache} publish), for tests that check
+     * which path a doc values accessor took.
+     */
+    boolean isColumnFullyLoaded(String name) {
+        return numericColumns.containsKey(name)
+            || booleanColumns.containsKey(name)
+            || keywordOrds.containsKey(name)
+            || keywordArrayOrds.containsKey(name);
+    }
+
+    /**
+     * Whether {@code hint} is small enough, relative to this leaf's
+     * row count, for the per-row take to be cheaper than the full
+     * column scan (see {@link #SPARSE_RATIO}).
+     */
+    private boolean isSparseHint(int[] hint) {
+        return hint != null && hint.length <= maxDoc * SPARSE_RATIO;
+    }
+
+    /**
+     * Values of one numeric or boolean column for the hinted rows.
+     * {@code offsets} is the hint array itself; {@code values[i]} and
+     * {@code presence.get(i)} describe the row at {@code offsets[i]}.
+     * Rows the take did not return (deleted after the hit was
+     * produced) keep their presence bit clear, which is also what the
+     * full column load reports for them.
+     */
+    private static final class SparseNumeric {
+        final int[] offsets;
+        final long[] values;
+        final FixedBitSet presence;
+        /**
+         * Set once a doc outside {@code offsets} was requested and the
+         * accessor switched to the full column. Later instances for
+         * the same column start on the full column directly instead
+         * of repeating the miss.
+         */
+        volatile boolean fellBack;
+
+        SparseNumeric(int[] offsets) {
+            this.offsets = offsets;
+            this.values = new long[offsets.length];
+            this.presence = new FixedBitSet(offsets.length);
+        }
+    }
+
+    /**
+     * Keyword dictionary built from the hinted rows only: {@code terms}
+     * sorted in unsigned byte order over the distinct values of those
+     * rows, {@code ords[i]} the ordinal of the row at {@code offsets[i]}
+     * or -1 for Arrow null. The ordinal space is that of the hinted
+     * rows, which is complete for a consumer that only reads hinted
+     * docs.
+     */
+    private static final class SparseKeyword {
+        final int[] offsets;
+        final int[] ords;
+        final BytesRef[] terms;
+
+        SparseKeyword(int[] offsets, int[] ords, BytesRef[] terms) {
+            this.offsets = offsets;
+            this.ords = ords;
+            this.terms = terms;
+        }
+    }
+
+    /** Multi-valued counterpart of {@link SparseKeyword}; {@code rowOrds[i]} is null for an Arrow-null list. */
+    private static final class SparseKeywordArray {
+        final int[] offsets;
+        final int[][] rowOrds;
+        final BytesRef[] terms;
+
+        SparseKeywordArray(int[] offsets, int[][] rowOrds, BytesRef[] terms) {
+            this.offsets = offsets;
+            this.rowOrds = rowOrds;
+            this.terms = terms;
+        }
+    }
+
+    /** Receives one taken cell: the index into the hint array, the column vector and the row inside it. */
+    @FunctionalInterface
+    private interface TakenCellConsumer {
+        void accept(int hintIndex, FieldVector vector, int row);
+    }
+
+    /**
+     * Take the rows at {@code sortedOffsets} for the single column
+     * {@code column} and hand every returned cell to {@code consumer}.
+     * Same {@code _rowaddr IN (...)} shape and {@link #TAKE_CHUNK}
+     * chunking as {@link #prefetchRows}: Lance turns the predicate into
+     * a take by address, so the cost is proportional to the number of
+     * offsets, not to the fragment's row count. {@link #filterSql} is
+     * not layered in for the same reason as in {@code prefetchRows}:
+     * the offsets come from a scan that already applied whatever
+     * predicate the query carries.
+     */
+    private void takeHintedRows(String column, int[] sortedOffsets, TakenCellConsumer consumer) throws IOException {
+        for (int from = 0; from < sortedOffsets.length; from += TAKE_CHUNK) {
+            int to = Math.min(from + TAKE_CHUNK, sortedOffsets.length);
+            StringBuilder sql = new StringBuilder((to - from) * 12 + 16).append("_rowaddr IN (");
+            for (int i = from; i < to; i++) {
+                if (i > from) {
+                    sql.append(',');
+                }
+                sql.append(((long) fragmentId << 32) | (sortedOffsets[i] & 0xFFFFFFFFL));
+            }
+            sql.append(')');
+            ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
+                .columns(Collections.singletonList(column))
+                .filter(sql.toString())
+                .withRowAddress(true)
+                .build();
+            try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+                while (reader.loadNextBatch()) {
+                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                    FieldVector vector = root.getVector(column);
+                    for (int i = 0; i < root.getRowCount(); i++) {
+                        int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
+                        int hintIndex = Arrays.binarySearch(sortedOffsets, offset);
+                        if (hintIndex >= 0) {
+                            consumer.accept(hintIndex, vector, i);
+                        }
+                    }
+                }
+            } catch (IOException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new IOException(e);
+            }
+        }
+    }
+
+    /**
+     * Sparse values of the numeric or boolean column {@code name} for
+     * {@code hint}, taking them on first use. The same instance is
+     * returned for every accessor of the column while the hint stands.
+     */
+    private SparseNumeric sparseNumericFor(String name, boolean isBoolean, int[] hint) throws IOException {
+        SparseNumeric existing = sparseNumeric.get(name);
+        if (existing != null && existing.offsets == hint) {
+            return existing;
+        }
+        synchronized (columnLock(name)) {
+            existing = sparseNumeric.get(name);
+            if (existing != null && existing.offsets == hint) {
+                return existing;
+            }
+            SparseNumeric fresh = new SparseNumeric(hint);
+            if (isBoolean) {
+                takeHintedRows(name, hint, (hintIndex, vector, row) -> {
+                    if (!vector.isNull(row)) {
+                        fresh.values[hintIndex] = ((BitVector) vector).get(row);
+                        fresh.presence.set(hintIndex);
+                    }
+                });
+            } else {
+                takeHintedRows(name, hint, (hintIndex, vector, row) -> {
+                    if (!vector.isNull(row)) {
+                        fresh.values[hintIndex] = readAsLong(vector, row);
+                        fresh.presence.set(hintIndex);
+                    }
+                });
+            }
+            sparseNumeric.put(name, fresh);
+            return fresh;
+        }
+    }
+
+    /** Sparse keyword dictionary of the Utf8 column {@code name} for {@code hint}, built on first use. */
+    private SparseKeyword sparseKeywordFor(String name, int[] hint) throws IOException {
+        SparseKeyword existing = sparseKeyword.get(name);
+        if (existing != null && existing.offsets == hint) {
+            return existing;
+        }
+        synchronized (columnLock(name)) {
+            existing = sparseKeyword.get(name);
+            if (existing != null && existing.offsets == hint) {
+                return existing;
+            }
+            int[] ids = new int[hint.length];
+            Arrays.fill(ids, -1);
+            KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder();
+            takeHintedRows(name, hint, (hintIndex, vector, row) -> {
+                if (!vector.isNull(row)) {
+                    ids[hintIndex] = builder.intern((VarCharVector) vector, row);
+                }
+            });
+            KeywordDictionaryBuilder.Dictionary dictionary = builder.finish();
+            dictionary.remap(ids);
+            SparseKeyword fresh = new SparseKeyword(hint, ids, dictionary.terms());
+            sparseKeyword.put(name, fresh);
+            return fresh;
+        }
+    }
+
+    /** Sparse multi-valued keyword dictionary of the List&lt;Utf8&gt; column {@code name} for {@code hint}, built on first use. */
+    private SparseKeywordArray sparseKeywordArrayFor(String name, int[] hint) throws IOException {
+        SparseKeywordArray existing = sparseKeywordArray.get(name);
+        if (existing != null && existing.offsets == hint) {
+            return existing;
+        }
+        synchronized (columnLock(name)) {
+            existing = sparseKeywordArray.get(name);
+            if (existing != null && existing.offsets == hint) {
+                return existing;
+            }
+            int[][] rows = new int[hint.length][];
+            KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder();
+            takeHintedRows(name, hint, (hintIndex, vector, row) -> {
+                if (!vector.isNull(row)) {
+                    ListVector list = (ListVector) vector;
+                    rows[hintIndex] = internListElements(builder, list, (VarCharVector) list.getDataVector(), row);
+                }
+            });
+            KeywordDictionaryBuilder.Dictionary dictionary = builder.finish();
+            for (int r = 0; r < rows.length; r++) {
+                if (rows[r] != null) {
+                    rows[r] = dictionary.remapSortedUnique(rows[r]);
+                }
+            }
+            SparseKeywordArray fresh = new SparseKeywordArray(hint, rows, dictionary.terms());
+            sparseKeywordArray.put(name, fresh);
+            return fresh;
+        }
+    }
+
+    /**
+     * Decide, once per column and hint, whether the ordinal-based doc
+     * values of {@code name} are served from the sparse dictionary.
+     * The first decision sticks (see {@link #keywordServedSparse}).
+     * Sparse requires an exclusive hint below {@link #SPARSE_RATIO}
+     * and no full dictionary already present; a dictionary published
+     * by the shard cache on behalf of another leaf is free to use.
+     */
+    private boolean serveKeywordSparse(String name, int[] hint, boolean exclusive) {
+        Boolean served = keywordServedSparse.get(name);
+        if (served != null) {
+            return served;
+        }
+        boolean sparse = exclusive && isSparseHint(hint) && !keywordOrds.containsKey(name) && !keywordArrayOrds.containsKey(name);
+        Boolean previous = keywordServedSparse.putIfAbsent(name, sparse);
+        return previous != null ? previous : sparse;
+    }
+
     @Override
     public NumericDocValues getNumericDocValues(String field) {
-        final long[] column;
-        final FixedBitSet presence;
         ColumnKind kind = columnKind.get(field);
         if (kind != ColumnKind.NUMERIC && kind != ColumnKind.BOOLEAN) {
             return null;
         }
-        try {
-            if (kind == ColumnKind.NUMERIC) {
-                ensureNumericLoaded(field);
-                column = numericColumns.get(field);
-                presence = numericPresence.get(field);
-            } else {
-                ensureBooleanLoaded(field);
-                column = booleanColumns.get(field);
-                presence = booleanPresence.get(field);
-            }
-        } catch (IOException e) {
-            // LeafReader.getNumericDocValues declares throws IOException but the
-            // OpenSearch caller path (SortField.getComparator, doc-value queries)
-            // does not, so wrap into UncheckedIOException. In practice this is
-            // hit only if the Lance side fails a per-column scan after the
-            // constructor has already succeeded.
-            throw new UncheckedIOException(e);
+        return new HintedNumericDocValues(field, kind == ColumnKind.BOOLEAN);
+    }
+
+    /**
+     * Numeric doc values that pick their data source on first use
+     * rather than when the instance is created. Lucene's
+     * {@code IndexSearcher.searchLeaf} obtains the leaf collector, and
+     * with it the sort comparators' doc values, before it asks the
+     * Weight for a scorer, so a Lance scorer's hint for the leaf
+     * arrives after this instance exists but before the first
+     * {@link #advanceExact}. Deferring the choice to that call lets
+     * the hint be used.
+     *
+     * <p>On first use: if the full column is already loaded on this
+     * leaf, read it; else if a hint below {@link #SPARSE_RATIO} is
+     * present, take the hinted rows and read those; else load the
+     * full column. A sparse instance that is asked about a doc outside
+     * the hint loads the full column at that moment and answers from
+     * it for the rest of its life, so a Lucene clause that collects
+     * docs the Lance scorer did not produce still sees correct values.
+     * The switch is recorded on the sparse structure so later
+     * instances of the same column start on the full column.
+     *
+     * <p>{@link #advance} and {@link #nextDoc} walk every doc of the
+     * leaf, which a sparse structure cannot answer; they switch to the
+     * full column as well.
+     */
+    private final class HintedNumericDocValues extends NumericDocValues {
+        private final String name;
+        private final boolean isBoolean;
+        private boolean resolved;
+        private long[] column;
+        private FixedBitSet presence;
+        private SparseNumeric sparse;
+        private int sparseIndex = -1;
+        private int doc = -1;
+
+        HintedNumericDocValues(String name, boolean isBoolean) {
+            this.name = name;
+            this.isBoolean = isBoolean;
         }
-        return new NumericDocValues() {
-            private int doc = -1;
 
-            @Override
-            public long longValue() {
-                return column[doc];
+        private void resolve() throws IOException {
+            if (resolved) {
+                return;
             }
-
-            @Override
-            public boolean advanceExact(int target) {
-                doc = target;
-                if (liveDocs != null && !liveDocs.get(target)) {
-                    return false;
+            resolved = true;
+            int[] hint = hintedOffsets;
+            // Rows already taken for this hint serve as well as the full
+            // column would, so they win even when a shard cache load on
+            // behalf of another leaf has published the full column here.
+            SparseNumeric taken = sparseNumeric.get(name);
+            if (taken != null && taken.offsets == hint && !taken.fellBack) {
+                sparse = taken;
+                return;
+            }
+            Map<String, long[]> fullColumns = isBoolean ? booleanColumns : numericColumns;
+            if (fullColumns.containsKey(name)) {
+                useFullColumn();
+                return;
+            }
+            if (isSparseHint(hint)) {
+                SparseNumeric candidate = sparseNumericFor(name, isBoolean, hint);
+                if (!candidate.fellBack) {
+                    sparse = candidate;
+                    return;
                 }
-                // presence bit is clear for Arrow-null docs; exists / term /
-                // range / agg / sort all check advanceExact and stop reading
-                // the value here.
-                return presence.get(target);
             }
+            // No usable hint: the whole column is needed, and the shard
+            // cache loads it for every leaf of the reader in one scan.
+            loadFullColumn(true);
+        }
 
-            @Override
-            public int docID() {
-                return doc;
+        private void loadFullColumn(boolean useShardCache) throws IOException {
+            if (isBoolean) {
+                ensureBooleanLoaded(name, useShardCache);
+            } else {
+                ensureNumericLoaded(name, useShardCache);
             }
+            useFullColumn();
+        }
 
-            @Override
-            public int nextDoc() {
-                return advance(doc + 1);
+        private void useFullColumn() {
+            column = isBoolean ? booleanColumns.get(name) : numericColumns.get(name);
+            presence = isBoolean ? booleanPresence.get(name) : numericPresence.get(name);
+            if (sparse != null) {
+                sparse.fellBack = true;
+                sparse = null;
             }
+        }
 
-            @Override
-            public int advance(int target) {
-                // Skip liveDocs holes and Arrow-null slots. DocValuesFieldExistsQuery
-                // iterates through the doc values with advance/nextDoc alone and does
-                // not call advanceExact, so the null bitmap must also be honoured here
-                // - otherwise exists / _field_names checks count every row regardless
-                // of presence.
-                for (int candidate = target; candidate < column.length; candidate++) {
-                    if (liveDocs != null && !liveDocs.get(candidate)) {
-                        continue;
-                    }
-                    if (presence.get(candidate)) {
-                        doc = candidate;
-                        return doc;
-                    }
+        @Override
+        public long longValue() {
+            return sparse != null ? sparse.values[sparseIndex] : column[doc];
+        }
+
+        @Override
+        public boolean advanceExact(int target) throws IOException {
+            doc = target;
+            if (liveDocs != null && !liveDocs.get(target)) {
+                return false;
+            }
+            resolve();
+            if (sparse != null) {
+                int index = Arrays.binarySearch(sparse.offsets, target);
+                if (index >= 0) {
+                    sparseIndex = index;
+                    return sparse.presence.get(index);
                 }
-                doc = NO_MORE_DOCS;
-                return doc;
+                // A doc the Lance scorer did not produce: another
+                // clause of the query drives collection on this leaf,
+                // so the hint does not cover what will be asked. Read
+                // the whole column from here on, scanning this fragment
+                // only; the other leaves may still be served sparsely.
+                loadFullColumn(false);
             }
+            // presence bit is clear for Arrow-null docs; exists / term /
+            // range / agg / sort all check advanceExact and stop reading
+            // the value here.
+            return presence.get(target);
+        }
 
-            @Override
-            public long cost() {
-                return column.length;
+        @Override
+        public int docID() {
+            return doc;
+        }
+
+        @Override
+        public int nextDoc() throws IOException {
+            return advance(doc + 1);
+        }
+
+        @Override
+        public int advance(int target) throws IOException {
+            resolve();
+            if (sparse != null) {
+                loadFullColumn(false);
             }
-        };
+            // Skip liveDocs holes and Arrow-null slots. DocValuesFieldExistsQuery
+            // iterates through the doc values with advance/nextDoc alone and does
+            // not call advanceExact, so the null bitmap must also be honoured here
+            // - otherwise exists / _field_names checks count every row regardless
+            // of presence.
+            for (int candidate = target; candidate < column.length; candidate++) {
+                if (liveDocs != null && !liveDocs.get(candidate)) {
+                    continue;
+                }
+                if (presence.get(candidate)) {
+                    doc = candidate;
+                    return doc;
+                }
+            }
+            doc = NO_MORE_DOCS;
+            return doc;
+        }
+
+        @Override
+        public long cost() {
+            // An estimate only; do not resolve here, because a caller
+            // that asks for the cost while building the query tree
+            // would fix the data source before the hint has arrived.
+            if (!resolved) {
+                return maxDoc;
+            }
+            return sparse != null ? sparse.offsets.length : column.length;
+        }
     }
 
     @Override
@@ -1076,165 +1580,347 @@ public final class LanceFragmentLeafReader extends LeafReader {
         if (kind != ColumnKind.TEXT_KEYWORD && !basesWithKeywordSub.contains(source)) {
             return null;
         }
-        try {
-            ensureTextLoaded(source);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
-        int[] ords = keywordOrds.get(source);
-        BytesRef[] terms = keywordTerms.get(source);
-        if (ords == null || terms == null) {
-            return null;
-        }
-        return keywordSortedDocValues(ords, terms);
+        return new HintedSortedDocValues(source);
     }
 
     @Override
     public SortedSetDocValues getSortedSetDocValues(String field) {
         ColumnKind kind = columnKind.get(field);
         if (kind == ColumnKind.KEYWORD_ARRAY) {
-            try {
-                ensureKeywordArrayLoaded(field);
-            } catch (IOException e) {
-                throw new UncheckedIOException(e);
-            }
-            int[][] arrayOrds = keywordArrayOrds.get(field);
-            BytesRef[] arrayTerms = keywordArrayTerms.get(field);
-            if (arrayOrds != null && arrayTerms != null) {
-                return keywordArraySortedSetDocValues(arrayOrds, arrayTerms);
-            }
-            return null;
+            return new HintedSortedSetDocValues(field);
         }
         SortedDocValues single = getSortedDocValues(field);
         return single == null ? null : DocValues.singleton(single);
     }
 
-    private SortedSetDocValues keywordArraySortedSetDocValues(int[][] rowOrds, BytesRef[] terms) {
-        return new SortedSetDocValues() {
-            private int doc = -1;
-            private int[] currentRow;
-            private int cursor;
+    /**
+     * Keyword doc values over a Utf8 column that choose between the
+     * sparse dictionary of the hinted rows and the full dictionary on
+     * first use, for the same reason {@link HintedNumericDocValues}
+     * defers its choice.
+     *
+     * <p>Unlike numeric values, an ordinal space cannot change after a
+     * consumer has seen it: a sort comparator keeps the ordinal of its
+     * current bottom slot, and a global ordinal map records every
+     * segment ordinal it saw when it was built. The sparse dictionary
+     * is therefore used only when the hint is exclusive (every doc the
+     * search collects on this leaf is a hinted doc) and the decision
+     * for the column is recorded in {@link #keywordServedSparse} so
+     * every later instance under the same hint uses the same
+     * dictionary. Should a doc outside the hint still be requested,
+     * the full column is loaded and the doc's term is looked up in the
+     * sparse dictionary; a term that is not there has no ordinal in
+     * the space the consumer is using, and the instance fails rather
+     * than report the doc as missing or reorder the values.
+     */
+    private final class HintedSortedDocValues extends SortedDocValues {
+        private final String name;
+        private boolean resolved;
+        private int[] ords;
+        private BytesRef[] terms;
+        private SparseKeyword sparse;
+        private int currentOrd = -1;
+        private int doc = -1;
 
-            @Override
-            public long nextOrd() {
-                // Caller iterates docValueCount() times; no sentinel needed.
-                return currentRow[cursor++];
+        HintedSortedDocValues(String name) {
+            this.name = name;
+        }
+
+        private void resolve() {
+            if (resolved) {
+                return;
             }
-
-            @Override
-            public int docValueCount() {
-                return currentRow == null ? 0 : currentRow.length;
-            }
-
-            @Override
-            public BytesRef lookupOrd(long ord) {
-                return terms[(int) ord];
-            }
-
-            @Override
-            public long getValueCount() {
-                return terms.length;
-            }
-
-            @Override
-            public boolean advanceExact(int target) {
-                doc = target;
-                cursor = 0;
-                if (liveDocs != null && !liveDocs.get(target)) {
-                    currentRow = null;
-                    return false;
+            resolved = true;
+            try {
+                int[] hint = hintedOffsets;
+                if (serveKeywordSparse(name, hint, hintExclusive)) {
+                    sparse = sparseKeywordFor(name, hint);
+                    terms = sparse.terms;
+                } else {
+                    ensureTextLoaded(name);
+                    ords = keywordOrds.get(name);
+                    terms = keywordTerms.get(name);
                 }
+            } catch (IOException e) {
+                // SortedDocValues.getValueCount / lookupOrd do not declare
+                // IOException, so the scan failure surfaces unchecked.
+                throw new UncheckedIOException(e);
+            }
+        }
+
+        /**
+         * Ordinal, in the sparse dictionary, of a doc the hint does not
+         * cover. Loads the full column to learn the doc's term.
+         */
+        private int ordOutsideHint(int target) throws IOException {
+            ensureTextLoaded(name, false);
+            int fullOrd = keywordOrds.get(name)[target];
+            if (fullOrd < 0) {
+                return -1;
+            }
+            int sparseOrd = Arrays.binarySearch(sparse.terms, keywordTerms.get(name)[fullOrd]);
+            if (sparseOrd < 0) {
+                throw new IllegalStateException(
+                    "doc "
+                        + target
+                        + " of column "
+                        + name
+                        + " on fragment "
+                        + fragmentId
+                        + " was collected although the Lance scorer that hinted the leaf as exclusive did not match it, "
+                        + "and its value is not in the sparse dictionary"
+                );
+            }
+            return sparseOrd;
+        }
+
+        @Override
+        public int ordValue() {
+            return currentOrd;
+        }
+
+        @Override
+        public BytesRef lookupOrd(int ord) {
+            resolve();
+            return terms[ord];
+        }
+
+        @Override
+        public int getValueCount() {
+            resolve();
+            return terms.length;
+        }
+
+        @Override
+        public boolean advanceExact(int target) throws IOException {
+            doc = target;
+            if (liveDocs != null && !liveDocs.get(target)) {
+                currentOrd = -1;
+                return false;
+            }
+            resolve();
+            if (sparse != null) {
+                int index = Arrays.binarySearch(sparse.offsets, target);
+                currentOrd = index >= 0 ? sparse.ords[index] : ordOutsideHint(target);
+            } else {
+                currentOrd = ords[target];
+            }
+            return currentOrd >= 0;
+        }
+
+        @Override
+        public int docID() {
+            return doc;
+        }
+
+        @Override
+        public int nextDoc() throws IOException {
+            return advance(doc + 1);
+        }
+
+        @Override
+        public int advance(int target) throws IOException {
+            resolve();
+            if (sparse != null) {
+                // Only hinted docs can be collected under an exclusive
+                // hint, so iteration walks the hinted rows.
+                int index = Arrays.binarySearch(sparse.offsets, target);
+                if (index < 0) {
+                    index = -index - 1;
+                }
+                for (; index < sparse.offsets.length; index++) {
+                    int candidate = sparse.offsets[index];
+                    if ((liveDocs == null || liveDocs.get(candidate)) && sparse.ords[index] >= 0) {
+                        doc = candidate;
+                        currentOrd = sparse.ords[index];
+                        return doc;
+                    }
+                }
+            } else {
+                for (int i = target; i < ords.length; i++) {
+                    if ((liveDocs == null || liveDocs.get(i)) && ords[i] >= 0) {
+                        doc = i;
+                        currentOrd = ords[i];
+                        return i;
+                    }
+                }
+            }
+            doc = NO_MORE_DOCS;
+            currentOrd = -1;
+            return doc;
+        }
+
+        @Override
+        public long cost() {
+            if (!resolved) {
+                return maxDoc;
+            }
+            return sparse != null ? sparse.offsets.length : ords.length;
+        }
+    }
+
+    /**
+     * Multi-valued keyword doc values over a List&lt;Utf8&gt; column.
+     * Same source selection and ordinal-space rules as
+     * {@link HintedSortedDocValues}.
+     */
+    private final class HintedSortedSetDocValues extends SortedSetDocValues {
+        private final String name;
+        private boolean resolved;
+        private int[][] rowOrds;
+        private BytesRef[] terms;
+        private SparseKeywordArray sparse;
+        private int[] currentRow;
+        private int cursor;
+        private int doc = -1;
+
+        HintedSortedSetDocValues(String name) {
+            this.name = name;
+        }
+
+        private void resolve() {
+            if (resolved) {
+                return;
+            }
+            resolved = true;
+            try {
+                int[] hint = hintedOffsets;
+                if (serveKeywordSparse(name, hint, hintExclusive)) {
+                    sparse = sparseKeywordArrayFor(name, hint);
+                    terms = sparse.terms;
+                } else {
+                    ensureKeywordArrayLoaded(name);
+                    rowOrds = keywordArrayOrds.get(name);
+                    terms = keywordArrayTerms.get(name);
+                }
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+
+        /**
+         * Ordinals, in the sparse dictionary, of a doc the hint does not
+         * cover. Loads the full column to learn the doc's terms.
+         */
+        private int[] rowOutsideHint(int target) throws IOException {
+            ensureKeywordArrayLoaded(name, false);
+            int[] fullRow = keywordArrayOrds.get(name)[target];
+            if (fullRow == null) {
+                return null;
+            }
+            BytesRef[] fullTerms = keywordArrayTerms.get(name);
+            int[] row = new int[fullRow.length];
+            for (int i = 0; i < fullRow.length; i++) {
+                int sparseOrd = Arrays.binarySearch(sparse.terms, fullTerms[fullRow[i]]);
+                if (sparseOrd < 0) {
+                    throw new IllegalStateException(
+                        "doc "
+                            + target
+                            + " of column "
+                            + name
+                            + " on fragment "
+                            + fragmentId
+                            + " was collected although the Lance scorer that hinted the leaf as exclusive did not match it, "
+                            + "and one of its values is not in the sparse dictionary"
+                    );
+                }
+                row[i] = sparseOrd;
+            }
+            // Full-column ordinals are ascending and so are their sparse
+            // counterparts (both dictionaries sort the same way).
+            return row;
+        }
+
+        @Override
+        public long nextOrd() {
+            // Caller iterates docValueCount() times; no sentinel needed.
+            return currentRow[cursor++];
+        }
+
+        @Override
+        public int docValueCount() {
+            return currentRow == null ? 0 : currentRow.length;
+        }
+
+        @Override
+        public BytesRef lookupOrd(long ord) {
+            resolve();
+            return terms[(int) ord];
+        }
+
+        @Override
+        public long getValueCount() {
+            resolve();
+            return terms.length;
+        }
+
+        @Override
+        public boolean advanceExact(int target) throws IOException {
+            doc = target;
+            cursor = 0;
+            if (liveDocs != null && !liveDocs.get(target)) {
+                currentRow = null;
+                return false;
+            }
+            resolve();
+            if (sparse != null) {
+                int index = Arrays.binarySearch(sparse.offsets, target);
+                currentRow = index >= 0 ? sparse.rowOrds[index] : rowOutsideHint(target);
+            } else {
                 currentRow = rowOrds[target];
-                return currentRow != null && currentRow.length > 0;
             }
+            return currentRow != null && currentRow.length > 0;
+        }
 
-            @Override
-            public int docID() {
-                return doc;
-            }
+        @Override
+        public int docID() {
+            return doc;
+        }
 
-            @Override
-            public int nextDoc() {
-                return advance(doc + 1);
-            }
+        @Override
+        public int nextDoc() throws IOException {
+            return advance(doc + 1);
+        }
 
-            @Override
-            public int advance(int target) {
+        @Override
+        public int advance(int target) throws IOException {
+            resolve();
+            cursor = 0;
+            if (sparse != null) {
+                int index = Arrays.binarySearch(sparse.offsets, target);
+                if (index < 0) {
+                    index = -index - 1;
+                }
+                for (; index < sparse.offsets.length; index++) {
+                    int candidate = sparse.offsets[index];
+                    int[] row = sparse.rowOrds[index];
+                    if ((liveDocs == null || liveDocs.get(candidate)) && row != null && row.length > 0) {
+                        doc = candidate;
+                        currentRow = row;
+                        return doc;
+                    }
+                }
+            } else {
                 for (int i = target; i < rowOrds.length; i++) {
                     if ((liveDocs == null || liveDocs.get(i)) && rowOrds[i] != null && rowOrds[i].length > 0) {
                         doc = i;
                         currentRow = rowOrds[i];
-                        cursor = 0;
                         return i;
                     }
                 }
-                doc = NO_MORE_DOCS;
-                currentRow = null;
-                return doc;
             }
+            doc = NO_MORE_DOCS;
+            currentRow = null;
+            return doc;
+        }
 
-            @Override
-            public long cost() {
-                return rowOrds.length;
+        @Override
+        public long cost() {
+            if (!resolved) {
+                return maxDoc;
             }
-        };
-    }
-
-    private SortedDocValues keywordSortedDocValues(int[] ords, BytesRef[] terms) {
-        return new SortedDocValues() {
-            private int doc = -1;
-
-            @Override
-            public int ordValue() {
-                return ords[doc];
-            }
-
-            @Override
-            public BytesRef lookupOrd(int ord) {
-                return terms[ord];
-            }
-
-            @Override
-            public int getValueCount() {
-                return terms.length;
-            }
-
-            @Override
-            public boolean advanceExact(int target) {
-                doc = target;
-                if (liveDocs != null && !liveDocs.get(target)) {
-                    return false;
-                }
-                return ords[target] >= 0;
-            }
-
-            @Override
-            public int docID() {
-                return doc;
-            }
-
-            @Override
-            public int nextDoc() {
-                return advance(doc + 1);
-            }
-
-            @Override
-            public int advance(int target) {
-                for (int i = target; i < ords.length; i++) {
-                    if ((liveDocs == null || liveDocs.get(i)) && ords[i] >= 0) {
-                        doc = i;
-                        return i;
-                    }
-                }
-                doc = NO_MORE_DOCS;
-                return doc;
-            }
-
-            @Override
-            public long cost() {
-                return ords.length;
-            }
-        };
+            return sparse != null ? sparse.offsets.length : rowOrds.length;
+        }
     }
 
     @Override
@@ -1571,6 +2257,32 @@ public final class LanceFragmentLeafReader extends LeafReader {
             current = filter.getDelegate();
         }
         return current instanceof LanceFragmentLeafReader lance ? lance : null;
+    }
+
+    /**
+     * Whether every wrapper between {@code reader} and the underlying
+     * {@code LanceFragmentLeafReader} is one of the plugin's own
+     * ({@link LanceSequentialLeafReader}) or OpenSearch's
+     * ({@link OpenSearchLeafReader}). Any other {@link FilterLeafReader}
+     * in the chain is a reader wrapper installed by another plugin,
+     * such as the security plugin's document and field level security
+     * reader, which hides rows and fields the Lance scan still returns.
+     * A sparse keyword dictionary built from all the hit rows would then
+     * expose, through its value count and the global ordinal map, terms
+     * that live only in hidden rows, so the Lance scorers do not mark
+     * their hint exclusive on such a leaf and the keyword dictionaries
+     * stay on the full column path. Returns {@code false} when the
+     * chain does not end in a {@code LanceFragmentLeafReader}.
+     */
+    public static boolean wrappedOnlyByOwnReaders(LeafReader reader) {
+        LeafReader current = reader;
+        while (current instanceof FilterLeafReader filter) {
+            if (!(current instanceof LanceSequentialLeafReader) && !(current instanceof OpenSearchLeafReader)) {
+                return false;
+            }
+            current = filter.getDelegate();
+        }
+        return current instanceof LanceFragmentLeafReader;
     }
 
     private static FieldInfo storedOnly(String name, int number) {
