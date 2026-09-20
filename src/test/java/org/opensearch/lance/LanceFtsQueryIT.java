@@ -805,6 +805,65 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         }
     }
 
+    public void testUnboundedLanceMatchIsRejectedWithTooManyRequestsWhenTheRequestBreakerIsFull() throws Exception {
+        // A sort by a field needs every match, so the executor buffers
+        // the whole hit set on heap and reserves it with the request
+        // breaker. With the breaker limit below the first buffer the
+        // request must end in 429 circuit_breaking_exception naming the
+        // reservation, not in a 500 and not in a node failure; with the
+        // limit back at its default the same request answers 200 with
+        // the full page.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpMultiFragment(12, 4, "lmatchbreaker")) {
+            String indexName = fixture.indexName();
+            String sorted =
+                "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"sort\":[{\"id\":\"desc\"}]}";
+            String before = readAll(postJson("/" + indexName + "/_search", sorted));
+            assertEquals(6, extractIntPath(before, "hits", "total", "value"));
+            assertEquals(List.of("2-2", "2-0", "1-2", "1-0", "0-2", "0-0"), idsOf(hitsOf(before)));
+
+            updateClusterSetting("indices.breaker.request.limit", "16b");
+            try {
+                ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", sorted));
+                int status = failure.getResponse().getStatusLine().getStatusCode();
+                String body = readAll(failure.getResponse());
+                assertEquals("expected 429, saw " + status + ": " + body, 429, status);
+                assertTrue("expected circuit_breaking_exception: " + body, body.contains("circuit_breaking_exception"));
+                assertTrue("expected the hit buffer label: " + body, body.contains("lance_fts_hits"));
+            } finally {
+                updateClusterSetting("indices.breaker.request.limit", null);
+            }
+            String after = readAll(postJson("/" + indexName + "/_search", sorted));
+            assertEquals(idsOf(hitsOf(before)), idsOf(hitsOf(after)));
+
+            // The breaker holds nothing from the requests above: the
+            // reservations of the successful pages were returned when
+            // their requests finished, the refused one never counted.
+            String breakers = readAll(client().performRequest(new Request("GET", "/_nodes/stats/breaker")));
+            try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, breakers)) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> nodes = (Map<String, Object>) parser.map().get("nodes");
+                for (Object node : nodes.values()) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> request = (Map<String, Object>) ((Map<String, Object>) ((Map<String, Object>) node).get("breakers"))
+                        .get("request");
+                    assertEquals(
+                        "request breaker estimate after the requests: " + request,
+                        0,
+                        ((Number) request.get("estimated_size_in_bytes")).intValue()
+                    );
+                }
+            }
+        }
+    }
+
+    private static void updateClusterSetting(String key, String value) throws IOException {
+        Request request = new Request("PUT", "/_cluster/settings");
+        String encoded = value == null ? "null" : "\"" + value + "\"";
+        request.setJsonEntity("{\"transient\":{\"" + key + "\":" + encoded + "}}");
+        Response response = client().performRequest(request);
+        assertEquals(200, response.getStatusLine().getStatusCode());
+    }
+
     public void testLanceMatchRejectsUnknownField() throws Exception {
         try (LanceTestCluster fixture = LanceTestCluster.setUp(4, "lmatchnofield")) {
             String indexName = fixture.indexName();
