@@ -227,16 +227,62 @@ public final class LanceEngineFactory implements EngineFactory {
             this.pinnedVersion = pinnedVersion;
             this.storageOptions = storageOptions;
             this.multiFields = multiFields;
+            // The super constructor has already taken store.incRef(), the
+            // IndexWriter write lock, and a DirectoryReader on the empty
+            // commit. If the Lance side fails to open (table missing,
+            // storage unreachable), those must be given back before the
+            // exception leaves this constructor: otherwise the failed shard
+            // never releases its store, the node-level ShardLock stays
+            // held, and every allocation retry of the same shard fails on
+            // ShardLockObtainFailedException instead of surfacing the Lance
+            // error again.
+            OpenSearchDirectoryReader initial = null;
+            LanceReaderManager manager = null;
             try {
-                OpenSearchDirectoryReader initial = openLanceReader();
+                initial = openLanceReader();
                 long initialVersion;
                 try (Dataset probe = LanceRegistry.openDataset(tablePath, storageOptions, pinnedVersion)) {
                     initialVersion = probe.version();
                 }
-                this.lanceReaderManager = new LanceReaderManager(initial, this, initialVersion);
-            } catch (IOException e) {
-                throw new EngineException(config.getShardId(), "Failed to open initial Lance reader", e);
+                manager = new LanceReaderManager(initial, this, initialVersion);
+            } catch (Throwable t) {
+                // openLanceReader() cleans up after itself, so `initial` is
+                // only left unowned when the version probe failed after the
+                // reader was already open.
+                if (initial != null) {
+                    try {
+                        initial.close();
+                    } catch (Throwable suppressed) {
+                        t.addSuppressed(suppressed);
+                    }
+                }
+                // close() is the same path IndexShard uses when it tears an
+                // engine down: it marks the engine closed, runs
+                // closeNoLock(), and waits for the closed latch. closeNoLock()
+                // below skips the Lance manager (still null here) and then
+                // ReadOnlyEngine.closeNoLock() releases the reader manager,
+                // the IndexWriter lock, and the store reference in that
+                // order, which is exactly what the super constructor took.
+                // Calling closeNoLock() directly would release the same
+                // resources but leave the engine's public close state
+                // (write lock, latch) half handled.
+                try {
+                    close();
+                } catch (Throwable suppressed) {
+                    t.addSuppressed(suppressed);
+                }
+                if (t instanceof IOException io) {
+                    throw new EngineException(config.getShardId(), "Failed to open initial Lance reader", io);
+                }
+                if (t instanceof RuntimeException re) {
+                    throw re;
+                }
+                if (t instanceof Error err) {
+                    throw err;
+                }
+                throw new EngineException(config.getShardId(), "Failed to open initial Lance reader", t);
             }
+            this.lanceReaderManager = manager;
         }
 
         OpenSearchDirectoryReader openLanceReader() throws IOException {
@@ -362,10 +408,15 @@ public final class LanceEngineFactory implements EngineFactory {
 
         @Override
         protected void closeNoLock(String reason, CountDownLatch closedLatch) {
-            try {
-                lanceReaderManager.close();
-            } catch (IOException e) {
-                LOG.warn("Failed to close Lance reader manager", e);
+            // Null while the constructor is still opening the Lance side and
+            // rolls back through close(); there is no Lance reader to release
+            // yet, only what ReadOnlyEngine took.
+            if (lanceReaderManager != null) {
+                try {
+                    lanceReaderManager.close();
+                } catch (IOException e) {
+                    LOG.warn("Failed to close Lance reader manager", e);
+                }
             }
             super.closeNoLock(reason, closedLatch);
         }
