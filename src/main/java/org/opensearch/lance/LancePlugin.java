@@ -41,6 +41,7 @@ import org.opensearch.lance.namespace.LanceNamespaceService;
 import org.opensearch.lance.namespace.TransportLanceNamespaceListAction;
 import org.opensearch.lance.query.LanceFtsBoolQueryBuilder;
 import org.opensearch.lance.query.LanceFtsBoostQueryBuilder;
+import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.lance.query.LanceMatchPhraseQueryBuilder;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
@@ -331,6 +332,26 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.NodeScope
     );
 
+    /**
+     * Row cap of the probe scan a full-text query runs when the
+     * executing node holds a proper subset of the table's fragments
+     * (several data nodes) and the shape needs every match
+     * (aggregations, sort by a field, post_filter, {@code size 0},
+     * {@code track_total_hits: true}). The probe scans the whole table
+     * from the inverted index and keeps the node's rows; when it
+     * returns this many rows the node repeats the scan restricted to
+     * its fragments instead, which Lance answers through a
+     * {@code _rowid} prefilter read. Dynamic: the next scan picks up
+     * a new value. See {@link org.opensearch.lance.query.LanceFtsQuery}.
+     */
+    public static final Setting<Integer> FTS_SUBSET_PROBE_LIMIT_SETTING = Setting.intSetting(
+        "lance.fts.subset_probe_limit",
+        LanceFtsQuery.DEFAULT_SUBSET_PROBE_LIMIT,
+        1,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -352,7 +373,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING,
             CACHE_ENABLED_SETTING,
             CACHE_MAX_SNAPSHOTS_SETTING,
-            CACHE_COLUMN_SHARE_SETTING
+            CACHE_COLUMN_SHARE_SETTING,
+            FTS_SUBSET_PROBE_LIMIT_SETTING
         );
     }
 
@@ -533,6 +555,11 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         this.circuitBreakerPollTask = scheduleCircuitBreakerPoll(threadPool, circuitBreakerPollInterval);
         clusterService.getClusterSettings().addSettingsUpdateConsumer(NATIVE_MEMORY_CB_ENABLED_SETTING, LanceCircuitBreaker::setEnabled);
         clusterService.getClusterSettings().addSettingsUpdateConsumer(NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING, this::updatePollInterval);
+
+        // The FTS probe limit lives in a static holder read by every
+        // scan, so the consumer only has to store the new value.
+        LanceFtsQuery.setSubsetProbeLimit(FTS_SUBSET_PROBE_LIMIT_SETTING.get(environment.settings()));
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(FTS_SUBSET_PROBE_LIMIT_SETTING, LanceFtsQuery::setSubsetProbeLimit);
 
         // Register the shard-free dispatch ActionFilter. It
         // intercepts every _search request against Lance-backed
