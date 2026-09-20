@@ -8,6 +8,7 @@ package org.opensearch.lance;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Locale;
 import java.util.Map;
 
 import org.opensearch.client.Request;
@@ -105,7 +106,7 @@ public class LanceStatsIT extends LanceRestTestCase {
         // a Lance scan on the engine reader's dataset, which is the cached
         // snapshot's. _count then runs on the fragment path against the
         // same snapshot.
-        String suffix = "statsget-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "statsget-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeStringPkTable(scratchDir, tableName, 4);
