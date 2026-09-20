@@ -69,6 +69,7 @@ import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.BytesRefBuilder;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.Version;
 import org.lance.Dataset;
@@ -98,8 +99,10 @@ import org.opensearch.lance.engine.LanceFragmentSchema.NumericPrecision;
  * a light view that holds only request scoped state (the hint, the rows
  * taken for {@code _source}, sparse structures, columns loaded for this
  * request). A leaf built from a {@link LanceWarmCache} snapshot reads
- * numeric and boolean columns from the off-heap {@link ColumnStore}
- * through {@link CachedColumn}s another request may have loaded.
+ * numeric, boolean and keyword columns from the off-heap
+ * {@link ColumnStore} through entries another request may have loaded
+ * ({@link CachedColumn}, {@link CachedKeywordColumn},
+ * {@link CachedKeywordArrayColumn}).
  */
 public final class LanceFragmentLeafReader extends LeafReader {
 
@@ -253,6 +256,18 @@ public final class LanceFragmentLeafReader extends LeafReader {
     // and keywordArrayTerms back a multi-valued SortedSetDocValues.
     private final Map<String, int[][]> keywordArrayOrds = new ConcurrentHashMap<>();
     private final Map<String, BytesRef[]> keywordArrayTerms = new ConcurrentHashMap<>();
+    /**
+     * Keyword columns of this fragment served from the off-heap
+     * {@link ColumnStore} (dictionary plus per-row ordinals), published
+     * by {@link LanceShardColumnCache} through
+     * {@link #publishOffHeapKeywordColumn}. Same exclusivity with the
+     * heap maps above as {@link #offHeapColumns}: the shard cache tries
+     * the store first and loads into heap only when the store has no
+     * room or the reader carries a top-level filter.
+     */
+    private final Map<String, CachedKeywordColumn> offHeapKeywordColumns = new ConcurrentHashMap<>();
+    /** Multi-valued counterpart of {@link #offHeapKeywordColumns}. */
+    private final Map<String, CachedKeywordArrayColumn> offHeapKeywordArrayColumns = new ConcurrentHashMap<>();
 
     /**
      * Largest fraction of {@link #maxDoc} a hinted hit set may cover
@@ -683,14 +698,15 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * reads Utf8 values through the reader any more ({@code _source}
      * comes from the per-hit take), so no per-row {@link String} copy
      * is retained. Delegates to {@link LanceShardColumnCache} when one
-     * is installed so the scan runs once per shard.
+     * is installed so the scan runs once per shard, and so the column is
+     * served from the off-heap store when the reader has one.
      */
     private void ensureTextLoaded(String name) throws IOException {
         ensureTextLoaded(name, true);
     }
 
     private void ensureTextLoaded(String name, boolean useShardCache) throws IOException {
-        if (keywordOrds.containsKey(name)) {
+        if (keywordOrds.containsKey(name) || offHeapKeywordColumns.containsKey(name)) {
             return;
         }
         LanceShardColumnCache cache = shardColumnCache;
@@ -699,7 +715,10 @@ public final class LanceFragmentLeafReader extends LeafReader {
             return;
         }
         synchronized (columnLock(name)) {
-            if (keywordOrds.containsKey(name)) {
+            if (keywordOrds.containsKey(name) || offHeapKeywordColumns.containsKey(name)) {
+                return;
+            }
+            if (cache != null && cache.publishKeywordFromStoreForLeaf(this, name)) {
                 return;
             }
             int[] ids = new int[maxDoc];
@@ -742,6 +761,31 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     /**
+     * Called by {@link LanceShardColumnCache} when the off-heap
+     * {@link ColumnStore} holds (or has just loaded) the dictionary and
+     * ordinals of the Utf8 column {@code name} for this fragment. Pinned
+     * by the shard cache for the life of the request.
+     */
+    void publishOffHeapKeywordColumn(String name, CachedKeywordColumn column) {
+        offHeapKeywordColumns.put(name, column);
+    }
+
+    /** Multi-valued counterpart of {@link #publishOffHeapKeywordColumn}. */
+    void publishOffHeapKeywordArrayColumn(String name, CachedKeywordArrayColumn column) {
+        offHeapKeywordArrayColumns.put(name, column);
+    }
+
+    /** Off-heap keyword column of {@code name} published for this leaf, or {@code null}. */
+    CachedKeywordColumn offHeapKeywordColumn(String name) {
+        return offHeapKeywordColumns.get(name);
+    }
+
+    /** Off-heap keyword array column of {@code name} published for this leaf, or {@code null}. */
+    CachedKeywordArrayColumn offHeapKeywordArrayColumn(String name) {
+        return offHeapKeywordArrayColumns.get(name);
+    }
+
+    /**
      * Build the multi-valued keyword dictionary for a List&lt;Utf8&gt;
      * column: sorted terms plus, per doc, a strictly ascending
      * duplicate-free ordinal array (null for an Arrow-null list), for
@@ -752,7 +796,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     private void ensureKeywordArrayLoaded(String name, boolean useShardCache) throws IOException {
-        if (keywordArrayOrds.containsKey(name)) {
+        if (keywordArrayOrds.containsKey(name) || offHeapKeywordArrayColumns.containsKey(name)) {
             return;
         }
         LanceShardColumnCache cache = shardColumnCache;
@@ -761,7 +805,10 @@ public final class LanceFragmentLeafReader extends LeafReader {
             return;
         }
         synchronized (columnLock(name)) {
-            if (keywordArrayOrds.containsKey(name)) {
+            if (keywordArrayOrds.containsKey(name) || offHeapKeywordArrayColumns.containsKey(name)) {
+                return;
+            }
+            if (cache != null && cache.publishKeywordArrayFromStoreForLeaf(this, name)) {
                 return;
             }
             int[][] rows = new int[maxDoc][];
@@ -929,12 +976,14 @@ public final class LanceFragmentLeafReader extends LeafReader {
             || booleanColumns.containsKey(name)
             || offHeapColumns.containsKey(name)
             || keywordOrds.containsKey(name)
-            || keywordArrayOrds.containsKey(name);
+            || keywordArrayOrds.containsKey(name)
+            || offHeapKeywordColumns.containsKey(name)
+            || offHeapKeywordArrayColumns.containsKey(name);
     }
 
     /** Whether column {@code name} is served from the off-heap column store on this leaf, for tests. */
     boolean isServingOffHeap(String name) {
-        return offHeapColumns.containsKey(name);
+        return offHeapColumns.containsKey(name) || offHeapKeywordColumns.containsKey(name) || offHeapKeywordArrayColumns.containsKey(name);
     }
 
     /**
@@ -1167,7 +1216,12 @@ public final class LanceFragmentLeafReader extends LeafReader {
         if (served != null) {
             return served;
         }
-        boolean sparse = exclusive && isSparseHint(hint) && !keywordOrds.containsKey(name) && !keywordArrayOrds.containsKey(name);
+        boolean sparse = exclusive
+            && isSparseHint(hint)
+            && !keywordOrds.containsKey(name)
+            && !keywordArrayOrds.containsKey(name)
+            && !offHeapKeywordColumns.containsKey(name)
+            && !offHeapKeywordArrayColumns.containsKey(name);
         Boolean previous = keywordServedSparse.putIfAbsent(name, sparse);
         return previous != null ? previous : sparse;
     }
@@ -1443,12 +1497,23 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * sparse dictionary; a term that is not there has no ordinal in
      * the space the consumer is using, and the instance fails rather
      * than report the doc as missing or reorder the values.
+     *
+     * <p>The full dictionary is either the heap {@code BytesRef[]} plus
+     * {@code int[]} built for this request or a {@link CachedKeywordColumn}
+     * of the off-heap store. Over the store, {@link #ordValue} is one
+     * read of the ordinal buffer, {@link #lookupOrd} copies the term
+     * into a scratch owned by this instance (the returned
+     * {@link BytesRef} is valid until the next call, as with Lucene's
+     * own codecs), and {@link #lookupTerm} compares the off-heap bytes
+     * in place.
      */
     private final class HintedSortedDocValues extends SortedDocValues {
         private final String name;
         private boolean resolved;
         private int[] ords;
         private BytesRef[] terms;
+        private CachedKeywordColumn offHeap;
+        private BytesRefBuilder scratch;
         private SparseKeyword sparse;
         private int currentOrd = -1;
         private int doc = -1;
@@ -1469,8 +1534,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     terms = sparse.terms;
                 } else {
                     ensureTextLoaded(name);
-                    ords = keywordOrds.get(name);
-                    terms = keywordTerms.get(name);
+                    useFullColumn();
                 }
             } catch (IOException e) {
                 // SortedDocValues.getValueCount / lookupOrd do not declare
@@ -1479,17 +1543,43 @@ public final class LanceFragmentLeafReader extends LeafReader {
             }
         }
 
+        /** Point this instance at whichever full dictionary {@link #ensureTextLoaded} published for the leaf. */
+        private void useFullColumn() {
+            offHeap = offHeapKeywordColumns.get(name);
+            if (offHeap != null) {
+                scratch = new BytesRefBuilder();
+            } else {
+                ords = keywordOrds.get(name);
+                terms = keywordTerms.get(name);
+            }
+        }
+
         /**
          * Ordinal, in the sparse dictionary, of a doc the hint does not
-         * cover. Loads the full column to learn the doc's term.
+         * cover. Loads the full column (store or heap, this fragment
+         * only) to learn the doc's term.
          */
         private int ordOutsideHint(int target) throws IOException {
             ensureTextLoaded(name, false);
-            int fullOrd = keywordOrds.get(name)[target];
-            if (fullOrd < 0) {
-                return -1;
+            BytesRef term;
+            CachedKeywordColumn full = offHeapKeywordColumns.get(name);
+            if (full != null) {
+                int fullOrd = full.ord(target);
+                if (fullOrd < 0) {
+                    return -1;
+                }
+                if (scratch == null) {
+                    scratch = new BytesRefBuilder();
+                }
+                term = full.term(fullOrd, scratch);
+            } else {
+                int fullOrd = keywordOrds.get(name)[target];
+                if (fullOrd < 0) {
+                    return -1;
+                }
+                term = keywordTerms.get(name)[fullOrd];
             }
-            int sparseOrd = Arrays.binarySearch(sparse.terms, keywordTerms.get(name)[fullOrd]);
+            int sparseOrd = Arrays.binarySearch(sparse.terms, term);
             if (sparseOrd < 0) {
                 throw new IllegalStateException(
                     "doc "
@@ -1513,13 +1603,19 @@ public final class LanceFragmentLeafReader extends LeafReader {
         @Override
         public BytesRef lookupOrd(int ord) {
             resolve();
-            return terms[ord];
+            return offHeap != null ? offHeap.term(ord, scratch) : terms[ord];
+        }
+
+        @Override
+        public int lookupTerm(BytesRef key) throws IOException {
+            resolve();
+            return offHeap != null ? offHeap.lookupTerm(key) : super.lookupTerm(key);
         }
 
         @Override
         public int getValueCount() {
             resolve();
-            return terms.length;
+            return offHeap != null ? offHeap.valueCount() : terms.length;
         }
 
         @Override
@@ -1533,6 +1629,8 @@ public final class LanceFragmentLeafReader extends LeafReader {
             if (sparse != null) {
                 int index = Arrays.binarySearch(sparse.offsets, target);
                 currentOrd = index >= 0 ? sparse.ords[index] : ordOutsideHint(target);
+            } else if (offHeap != null) {
+                currentOrd = offHeap.ord(target);
             } else {
                 currentOrd = ords[target];
             }
@@ -1568,10 +1666,14 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     }
                 }
             } else {
-                for (int i = target; i < ords.length; i++) {
-                    if ((liveDocs == null || liveDocs.get(i)) && ords[i] >= 0) {
+                for (int i = target; i < maxDoc; i++) {
+                    if (liveDocs != null && !liveDocs.get(i)) {
+                        continue;
+                    }
+                    int ord = offHeap != null ? offHeap.ord(i) : ords[i];
+                    if (ord >= 0) {
                         doc = i;
-                        currentOrd = ords[i];
+                        currentOrd = ord;
                         return i;
                     }
                 }
@@ -1586,22 +1688,30 @@ public final class LanceFragmentLeafReader extends LeafReader {
             if (!resolved) {
                 return maxDoc;
             }
-            return sparse != null ? sparse.offsets.length : ords.length;
+            return sparse != null ? sparse.offsets.length : maxDoc;
         }
     }
 
     /**
      * Multi-valued keyword doc values over a List&lt;Utf8&gt; column.
      * Same source selection and ordinal-space rules as
-     * {@link HintedSortedDocValues}.
+     * {@link HintedSortedDocValues}. Over the off-heap store the current
+     * doc's ordinals are the flat range
+     * {@code [rowStart, rowStart + rowCount)} of the
+     * {@link CachedKeywordArrayColumn}; over heap they are the doc's
+     * {@code int[]}.
      */
     private final class HintedSortedSetDocValues extends SortedSetDocValues {
         private final String name;
         private boolean resolved;
         private int[][] rowOrds;
         private BytesRef[] terms;
+        private CachedKeywordArrayColumn offHeap;
+        private BytesRefBuilder scratch;
         private SparseKeywordArray sparse;
         private int[] currentRow;
+        private int rowStart;
+        private int rowCount;
         private int cursor;
         private int doc = -1;
 
@@ -1621,68 +1731,116 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     terms = sparse.terms;
                 } else {
                     ensureKeywordArrayLoaded(name);
-                    rowOrds = keywordArrayOrds.get(name);
-                    terms = keywordArrayTerms.get(name);
+                    useFullColumn();
                 }
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
         }
 
+        private void useFullColumn() {
+            offHeap = offHeapKeywordArrayColumns.get(name);
+            if (offHeap != null) {
+                scratch = new BytesRefBuilder();
+            } else {
+                rowOrds = keywordArrayOrds.get(name);
+                terms = keywordArrayTerms.get(name);
+            }
+        }
+
         /**
          * Ordinals, in the sparse dictionary, of a doc the hint does not
-         * cover. Loads the full column to learn the doc's terms.
+         * cover. Loads the full column (store or heap, this fragment
+         * only) to learn the doc's terms.
          */
         private int[] rowOutsideHint(int target) throws IOException {
             ensureKeywordArrayLoaded(name, false);
-            int[] fullRow = keywordArrayOrds.get(name)[target];
-            if (fullRow == null) {
-                return null;
-            }
-            BytesRef[] fullTerms = keywordArrayTerms.get(name);
-            int[] row = new int[fullRow.length];
-            for (int i = 0; i < fullRow.length; i++) {
-                int sparseOrd = Arrays.binarySearch(sparse.terms, fullTerms[fullRow[i]]);
-                if (sparseOrd < 0) {
-                    throw new IllegalStateException(
-                        "doc "
-                            + target
-                            + " of column "
-                            + name
-                            + " on fragment "
-                            + fragmentId
-                            + " was collected although the Lance scorer that hinted the leaf as exclusive did not match it, "
-                            + "and one of its values is not in the sparse dictionary"
-                    );
+            CachedKeywordArrayColumn full = offHeapKeywordArrayColumns.get(name);
+            int[] row;
+            if (full != null) {
+                int start = full.rowStart(target);
+                int count = full.rowEnd(target) - start;
+                if (count == 0) {
+                    return null;
                 }
-                row[i] = sparseOrd;
+                if (scratch == null) {
+                    scratch = new BytesRefBuilder();
+                }
+                row = new int[count];
+                for (int i = 0; i < count; i++) {
+                    row[i] = sparseOrdOf(target, full.term(full.ordinal(start + i), scratch));
+                }
+            } else {
+                int[] fullRow = keywordArrayOrds.get(name)[target];
+                if (fullRow == null) {
+                    return null;
+                }
+                BytesRef[] fullTerms = keywordArrayTerms.get(name);
+                row = new int[fullRow.length];
+                for (int i = 0; i < fullRow.length; i++) {
+                    row[i] = sparseOrdOf(target, fullTerms[fullRow[i]]);
+                }
             }
             // Full-column ordinals are ascending and so are their sparse
             // counterparts (both dictionaries sort the same way).
             return row;
         }
 
+        private int sparseOrdOf(int target, BytesRef term) {
+            int sparseOrd = Arrays.binarySearch(sparse.terms, term);
+            if (sparseOrd < 0) {
+                throw new IllegalStateException(
+                    "doc "
+                        + target
+                        + " of column "
+                        + name
+                        + " on fragment "
+                        + fragmentId
+                        + " was collected although the Lance scorer that hinted the leaf as exclusive did not match it, "
+                        + "and one of its values is not in the sparse dictionary"
+                );
+            }
+            return sparseOrd;
+        }
+
         @Override
         public long nextOrd() {
             // Caller iterates docValueCount() times; no sentinel needed.
-            return currentRow[cursor++];
+            if (currentRow != null) {
+                return currentRow[cursor++];
+            }
+            return offHeap.ordinal(rowStart + cursor++);
         }
 
         @Override
         public int docValueCount() {
-            return currentRow == null ? 0 : currentRow.length;
+            return currentRow != null ? currentRow.length : rowCount;
         }
 
         @Override
         public BytesRef lookupOrd(long ord) {
             resolve();
-            return terms[(int) ord];
+            return offHeap != null ? offHeap.term((int) ord, scratch) : terms[(int) ord];
+        }
+
+        @Override
+        public long lookupTerm(BytesRef key) throws IOException {
+            resolve();
+            return offHeap != null ? offHeap.lookupTerm(key) : super.lookupTerm(key);
         }
 
         @Override
         public long getValueCount() {
             resolve();
-            return terms.length;
+            return offHeap != null ? offHeap.valueCount() : terms.length;
+        }
+
+        /** Point the current doc at the off-heap range of {@code target}; returns whether it has values. */
+        private boolean setStoreRow(int target) {
+            currentRow = null;
+            rowStart = offHeap.rowStart(target);
+            rowCount = offHeap.rowEnd(target) - rowStart;
+            return rowCount > 0;
         }
 
         @Override
@@ -1691,16 +1849,20 @@ public final class LanceFragmentLeafReader extends LeafReader {
             cursor = 0;
             if (liveDocs != null && !liveDocs.get(target)) {
                 currentRow = null;
+                rowCount = 0;
                 return false;
             }
             resolve();
             if (sparse != null) {
                 int index = Arrays.binarySearch(sparse.offsets, target);
                 currentRow = index >= 0 ? sparse.rowOrds[index] : rowOutsideHint(target);
+            } else if (offHeap != null) {
+                return setStoreRow(target);
             } else {
                 currentRow = rowOrds[target];
             }
-            return currentRow != null && currentRow.length > 0;
+            rowCount = currentRow == null ? 0 : currentRow.length;
+            return rowCount > 0;
         }
 
         @Override
@@ -1728,7 +1890,15 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     if ((liveDocs == null || liveDocs.get(candidate)) && row != null && row.length > 0) {
                         doc = candidate;
                         currentRow = row;
+                        rowCount = row.length;
                         return doc;
+                    }
+                }
+            } else if (offHeap != null) {
+                for (int i = target; i < maxDoc; i++) {
+                    if ((liveDocs == null || liveDocs.get(i)) && setStoreRow(i)) {
+                        doc = i;
+                        return i;
                     }
                 }
             } else {
@@ -1736,12 +1906,14 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     if ((liveDocs == null || liveDocs.get(i)) && rowOrds[i] != null && rowOrds[i].length > 0) {
                         doc = i;
                         currentRow = rowOrds[i];
+                        rowCount = currentRow.length;
                         return i;
                     }
                 }
             }
             doc = NO_MORE_DOCS;
             currentRow = null;
+            rowCount = 0;
             return doc;
         }
 
@@ -1750,7 +1922,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             if (!resolved) {
                 return maxDoc;
             }
-            return sparse != null ? sparse.offsets.length : rowOrds.length;
+            return sparse != null ? sparse.offsets.length : maxDoc;
         }
     }
 
