@@ -49,6 +49,7 @@ import org.opensearch.lance.rest.RestBuildIndexesAction;
 import org.opensearch.lance.rest.RestNamespaceAction;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.plugins.ActionPlugin;
+import org.opensearch.plugins.ActionPlugin.ActionHandler;
 import org.opensearch.plugins.CircuitBreakerPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.MapperPlugin;
@@ -578,15 +579,9 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
                 org.opensearch.lance.namespace.LanceNamespaceUpdateAction.INSTANCE,
                 org.opensearch.lance.namespace.TransportLanceNamespaceUpdateAction.class
             ),
-            new org.opensearch.plugins.ActionPlugin.ActionHandler<>(
-                LanceNamespaceListAction.INSTANCE,
-                TransportLanceNamespaceListAction.class
-            ),
-            new org.opensearch.plugins.ActionPlugin.ActionHandler<>(LanceAttachAction.INSTANCE, TransportLanceAttachAction.class),
-            new org.opensearch.plugins.ActionPlugin.ActionHandler<>(
-                LanceBuildIndexesAction.INSTANCE,
-                TransportLanceBuildIndexesAction.class
-            )
+            new ActionHandler<>(LanceNamespaceListAction.INSTANCE, TransportLanceNamespaceListAction.class),
+            new ActionHandler<>(LanceAttachAction.INSTANCE, TransportLanceAttachAction.class),
+            new ActionHandler<>(LanceBuildIndexesAction.INSTANCE, TransportLanceBuildIndexesAction.class)
         );
     }
 
