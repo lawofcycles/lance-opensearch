@@ -184,6 +184,194 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         }
     }
 
+    public void testLanceMatchSortAndAggregationsMatchScalarReference() throws Exception {
+        // Three fragments of 200 rows. grp3 matches 8 rows per fragment
+        // (4 percent, below the reader's sparse ratio), so the sort and
+        // aggregation columns are fetched for those rows only. The
+        // reference is a terms filter on id selecting the same rows,
+        // which runs on the scalar path and never sees a hint; the
+        // constant_score wrapping of the same FTS clause is compared as
+        // well. Ids, sort values and buckets must agree on every path.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "lmatchhintsort")) {
+            String indexName = fixture.indexName();
+            String fts = "{\"lance_match\":{\"field\":\"body\",\"query\":\"grp3\"}}";
+            String constantScore = "{\"constant_score\":{\"filter\":" + fts + "}}";
+            StringBuilder ids = new StringBuilder();
+            for (int i = 3; i < 600; i += 25) {
+                if (ids.length() > 0) {
+                    ids.append(',');
+                }
+                ids.append(i);
+            }
+            String reference = "{\"terms\":{\"id\":[" + ids + "]}}";
+
+            // Numeric sort: rating is distinct per row and never null on
+            // grp3 rows; id breaks no ties but keeps the order total.
+            String ratingSort = "\"sort\":[{\"rating\":\"desc\"},{\"id\":\"asc\"}]";
+            String ftsByRating = readAll(postJson("/" + indexName + "/_search", "{\"size\":30,\"query\":" + fts + "," + ratingSort + "}"));
+            String refByRating = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":30,\"query\":" + reference + "," + ratingSort + "}")
+            );
+            String csByRating = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":30,\"query\":" + constantScore + "," + ratingSort + "}")
+            );
+            assertEquals(24, extractIntPath(ftsByRating, "hits", "total", "value"));
+            assertEquals(24, hitsOf(ftsByRating).size());
+            assertEquals(idsAndSortValuesOf(refByRating), idsAndSortValuesOf(ftsByRating));
+            assertEquals(idsAndSortValuesOf(refByRating), idsAndSortValuesOf(csByRating));
+            // Row 378 has the highest rating among grp3 rows: 378 * 37 mod 1000 = 986.
+            assertEquals("1-178 [986, 378]", idsAndSortValuesOf(ftsByRating).get(0));
+
+            // Keyword sort: category is null on rows with id % 4 == 3, so
+            // missing docs and ties are part of the comparison.
+            String categorySort = "\"sort\":[{\"category\":\"asc\"},{\"id\":\"asc\"}]";
+            String ftsByCategory = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":30,\"query\":" + fts + "," + categorySort + "}")
+            );
+            String refByCategory = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":30,\"query\":" + reference + "," + categorySort + "}")
+            );
+            String csByCategory = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":30,\"query\":" + constantScore + "," + categorySort + "}")
+            );
+            assertEquals(idsAndSortValuesOf(refByCategory), idsAndSortValuesOf(ftsByCategory));
+            assertEquals(idsAndSortValuesOf(refByCategory), idsAndSortValuesOf(csByCategory));
+
+            // A page smaller than the hits of one fragment makes Lucene
+            // look the bottom term up on later fragments before scoring
+            // starts; those fragments read the full dictionary and the
+            // page must still agree.
+            String smallPage = readAll(postJson("/" + indexName + "/_search", "{\"size\":5,\"query\":" + fts + "," + categorySort + "}"));
+            assertEquals(idsAndSortValuesOf(refByCategory).subList(0, 5), idsAndSortValuesOf(smallPage));
+
+            // Aggregations over keyword, multi-valued keyword, numeric and
+            // boolean columns, with size 0 (no hits phase before the
+            // aggregator is built) and with a hits page in front.
+            String aggs = "\"aggs\":{"
+                + "\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}},"
+                + "\"by_tag\":{\"terms\":{\"field\":\"tags\",\"size\":10}},"
+                + "\"by_rating\":{\"terms\":{\"field\":\"rating\",\"size\":50}},"
+                + "\"by_flag\":{\"terms\":{\"field\":\"flag\",\"size\":10}},"
+                + "\"avg_rating\":{\"avg\":{\"field\":\"rating\"}}}";
+            for (String size : List.of("0", "5")) {
+                String ftsAggs = readAll(
+                    postJson("/" + indexName + "/_search", "{\"size\":" + size + ",\"query\":" + fts + "," + aggs + "}")
+                );
+                String refAggs = readAll(
+                    postJson("/" + indexName + "/_search", "{\"size\":" + size + ",\"query\":" + reference + "," + aggs + "}")
+                );
+                for (String name : List.of("by_category", "by_tag", "by_rating", "by_flag")) {
+                    assertEquals("size " + size + ", " + name, bucketsOf(refAggs, name), bucketsOf(ftsAggs, name));
+                }
+                assertEquals(
+                    extractDoublePath(refAggs, "aggregations", "avg_rating", "value"),
+                    extractDoublePath(ftsAggs, "aggregations", "avg_rating", "value"),
+                    1e-9
+                );
+                assertEquals(24, extractIntPath(ftsAggs, "hits", "total", "value"));
+            }
+            // grp3 rows: id % 3 cycles, id % 4 == 3 is null. 24 rows, 6 null.
+            String ftsCategory = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":" + fts + ",\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}}}}"
+                )
+            );
+            assertEquals(List.of("c0=6", "c1=6", "c2=6"), bucketsOf(ftsCategory, "by_category"));
+            // The map execution mode builds no global ordinals, so every
+            // fragment reads the hinted rows only; the buckets must agree.
+            String mapMode = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":"
+                        + fts
+                        + ",\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10,\"execution_hint\":\"map\"}}}}"
+                )
+            );
+            assertEquals(List.of("c0=6", "c1=6", "c2=6"), bucketsOf(mapMode, "by_category"));
+
+            // One hit: row 250 is fragment 1, offset 50.
+            String single = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"tok250\"}}," + ratingSort + "}"
+                )
+            );
+            assertEquals(List.of("1-50 [250, 250]"), idsAndSortValuesOf(single));
+
+            // Every row matches hello (above the sparse ratio): the full
+            // column path answers and agrees with match_all.
+            String dense = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}," + ratingSort + "}"
+                )
+            );
+            String matchAll = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"match_all\":{}}," + ratingSort + "}")
+            );
+            assertEquals(600, extractIntPath(dense, "hits", "total", "value"));
+            assertEquals(idsAndSortValuesOf(matchAll), idsAndSortValuesOf(dense));
+        }
+    }
+
+    public void testLanceMatchInsideDisjunctionsSortsLikeTheScalarReference() throws Exception {
+        // Shapes where Lucene collects docs the FTS scorer did not
+        // produce: a should with a second clause, and a should beside a
+        // filter (minimum_should_match 0, so the filter alone decides).
+        // The reader must answer those docs from the full column and
+        // agree with the scalar reference for the same rows.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "lmatchhintunion")) {
+            String indexName = fixture.indexName();
+            String fts = "{\"lance_match\":{\"field\":\"body\",\"query\":\"grp3\"}}";
+            String categorySort = "\"sort\":[{\"category\":\"asc\"},{\"id\":\"asc\"}]";
+            String ratingSort = "\"sort\":[{\"rating\":\"desc\"},{\"id\":\"asc\"}]";
+
+            StringBuilder unionIds = new StringBuilder("1");
+            for (int i = 3; i < 600; i += 25) {
+                unionIds.append(',').append(i);
+            }
+            String union = "{\"bool\":{\"should\":[" + fts + ",{\"term\":{\"id\":1}}]}}";
+            String unionReference = "{\"terms\":{\"id\":[" + unionIds + "]}}";
+            for (String sort : List.of(categorySort, ratingSort)) {
+                String actual = readAll(postJson("/" + indexName + "/_search", "{\"size\":30,\"query\":" + union + "," + sort + "}"));
+                String expected = readAll(
+                    postJson("/" + indexName + "/_search", "{\"size\":30,\"query\":" + unionReference + "," + sort + "}")
+                );
+                assertEquals(25, extractIntPath(actual, "hits", "total", "value"));
+                assertEquals(sort, idsAndSortValuesOf(expected), idsAndSortValuesOf(actual));
+            }
+
+            String shouldWithFilter = "{\"bool\":{\"should\":[" + fts + "],\"filter\":[{\"range\":{\"id\":{\"lt\":60}}}]}}";
+            String filterReference = "{\"range\":{\"id\":{\"lt\":60}}}";
+            for (String sort : List.of(categorySort, ratingSort)) {
+                String actual = readAll(
+                    postJson("/" + indexName + "/_search", "{\"size\":60,\"query\":" + shouldWithFilter + "," + sort + "}")
+                );
+                String expected = readAll(
+                    postJson("/" + indexName + "/_search", "{\"size\":60,\"query\":" + filterReference + "," + sort + "}")
+                );
+                assertEquals(60, extractIntPath(actual, "hits", "total", "value"));
+                assertEquals(sort, idsAndSortValuesOf(expected), idsAndSortValuesOf(actual));
+            }
+            String unionAggs = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":" + union + ",\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}}}}"
+                )
+            );
+            String unionAggsReference = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":"
+                        + unionReference
+                        + ",\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}}}}"
+                )
+            );
+            assertEquals(bucketsOf(unionAggsReference, "by_category"), bucketsOf(unionAggs, "by_category"));
+        }
+    }
+
     /**
      * Runs {@code bool { must: [fts], filter: [filter], must_not: [mustNot] }}
      * twice: once as written (collapsed into a prefiltered Lance FTS
