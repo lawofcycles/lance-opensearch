@@ -167,12 +167,10 @@ public class LanceSnapshotIT extends LanceRestTestCase {
             assertEquals("1", extractPath(settings, indexName, "settings", "index", "lance", "version"));
             assertEquals("us-east-1", extractPath(settings, indexName, "settings", "index", "lance", "storage_options", "aws_region"));
 
-            // Version 1 predates the row deletion. The shard engine
-            // honours the pin, so _count and _stats report six rows once
-            // the engine has opened; the fragment path behind _search
-            // opens the latest manifest without reading
-            // index.lance.version and reports the three rows that
-            // survived the delete.
+            // Version 1 predates the row deletion. Both the shard engine
+            // (_count, _stats) and the fragment path behind _search open
+            // the pinned manifest, so every surface reports six rows once
+            // the engine has opened.
             assertBusy(() -> {
                 int count = extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count");
                 int statsCount = engineDocCount(indexName);
@@ -181,7 +179,7 @@ public class LanceSnapshotIT extends LanceRestTestCase {
                 assertEquals(observed, 6, statsCount);
             }, 30, TimeUnit.SECONDS);
             String search = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
-            assertEquals(3, extractIntPath(search, "hits", "total", "value"));
+            assertEquals("pinned _search must read version 1: " + search, 6, extractIntPath(search, "hits", "total", "value"));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));

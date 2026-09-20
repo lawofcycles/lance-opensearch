@@ -7,6 +7,7 @@ package org.opensearch.lance.dispatch;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
@@ -78,7 +79,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         assertEquals(original.fragmentIds(), restored.fragmentIds());
         assertEquals(original.storageOptions().asMap(), restored.storageOptions().asMap());
         assertEquals(7L, restored.pinnedVersion());
-        assertEquals(java.util.Optional.of(7L), restored.pinnedVersionOrEmpty());
+        assertEquals(Optional.of(7L), restored.pinnedVersionOrEmpty());
         assertEquals(original.trackScores(), restored.trackScores());
     }
 

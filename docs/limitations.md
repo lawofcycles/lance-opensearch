@@ -86,7 +86,6 @@ OpenSearch's stock `match` and `match_phrase` queries against a `lance_text` fie
 ## Version pinning
 
 - `"version": N` on `POST /_lance/attach` pins a Lance-backed index to a specific manifest version for readonly snapshots. Tag and branch checkout are not exposed by the Lance Java SDK (v11 today), so they cannot be pinned from OpenSearch.
-- The pin is honoured by the shard engine only (`_count`, `_stats`, GET). The fragment path behind `_search` opens the latest manifest version and does not read `index.lance.version`, so `_search` on a pinned index returns rows from the current table state.
 
 ## Snapshot and restore
 
