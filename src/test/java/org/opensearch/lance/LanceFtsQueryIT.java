@@ -8,12 +8,20 @@ package org.opensearch.lance;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.XContentParser;
 
 /**
  * Full-text query types backed by the Lance inverted index: {@code
@@ -35,6 +43,74 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             // Even rows say "hello lance i", odd rows "quick brown fox i".
             int totalHits = extractIntPath(body, "hits", "total", "value");
             assertEquals("expected 8 hits (even rows), saw response: " + body, 8, totalHits);
+        }
+    }
+
+    public void testLanceMatchAcrossSeveralFragmentsOnOneNode() throws Exception {
+        // 12 rows written 4 per file give fragments 0, 1 and 2. On the
+        // single-node cluster the executor holds all three, so both the
+        // hits scan and the count scan run without a fragmentIds
+        // restriction; the assertions pin the row set, the per-fragment
+        // _id layout and the score order that path must reproduce.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpMultiFragment(12, 4, "lmatchmultifrag")) {
+            String indexName = fixture.indexName();
+
+            String helloBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}}")
+            );
+            assertEquals("even rows across three fragments: " + helloBody, 6, extractIntPath(helloBody, "hits", "total", "value"));
+            List<Map<String, Object>> hits = hitsOf(helloBody);
+            assertEquals(
+                "row i lives at fragment i / 4, offset i % 4",
+                Set.of("0-0", "0-2", "1-0", "1-2", "2-0", "2-2"),
+                new HashSet<>(idsOf(hits))
+            );
+            List<Double> scores = scoresOf(helloBody);
+            for (int i = 1; i < scores.size(); i++) {
+                assertTrue("_score must be non-increasing, saw " + scores, scores.get(i - 1) >= scores.get(i));
+            }
+            assertTrue("BM25 scores must be positive, saw " + scores, scores.get(scores.size() - 1) > 0d);
+
+            // A token unique to row 4 (body "hello lance 4") pins the
+            // hit to fragment 1, offset 0.
+            String singleBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"4\"}}}")
+            );
+            assertEquals("token 4 appears in one row only: " + singleBody, 1, extractIntPath(singleBody, "hits", "total", "value"));
+            assertEquals(List.of("1-0"), idsOf(hitsOf(singleBody)));
+
+            // A bounded size still reports the full total.
+            String pagedBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":2,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}}")
+            );
+            assertEquals(6, extractIntPath(pagedBody, "hits", "total", "value"));
+            assertEquals(2, hitsOf(pagedBody).size());
+
+            // _count is answered by the shard engine's reader over the
+            // same three fragments and must agree with hits.total.value.
+            String countBody = readAll(
+                postJson("/" + indexName + "/_count", "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}}")
+            );
+            assertEquals("_count for hello: " + countBody, 6, extractIntPath(countBody, "count"));
+            String singleCountBody = readAll(
+                postJson("/" + indexName + "/_count", "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"4\"}}}")
+            );
+            assertEquals("_count for token 4: " + singleCountBody, 1, extractIntPath(singleCountBody, "count"));
+        }
+    }
+
+    private static List<Double> scoresOf(String searchBody) throws IOException {
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, searchBody)) {
+            Map<String, Object> map = parser.map();
+            @SuppressWarnings("unchecked")
+            List<Object> hits = (List<Object>) ((Map<String, Object>) map.get("hits")).get("hits");
+            List<Double> scores = new ArrayList<>(hits.size());
+            for (Object hit : hits) {
+                Object score = ((Map<?, ?>) hit).get("_score");
+                assertTrue("_score must be numeric, saw " + score, score instanceof Number);
+                scores.add(((Number) score).doubleValue());
+            }
+            return scores;
         }
     }
 

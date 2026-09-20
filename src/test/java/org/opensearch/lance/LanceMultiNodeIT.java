@@ -11,7 +11,12 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -83,6 +88,58 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testFtsAcrossFragmentsOnThreeNodeCluster() throws Exception {
+        // 12 rows written 4 per file give fragments 0, 1 and 2. The
+        // coordinator pins the fan-out to the node hosting the primary
+        // shard (see TransportLanceCoordinatorAction.nodeListForTarget),
+        // so on the three-node cluster one executor still receives all
+        // three fragments and its FTS scan runs without a fragmentIds
+        // restriction, while the other two nodes forward the request.
+        // The hits, their per-fragment _id layout and _count must match
+        // what the single-node LanceFtsQueryIT asserts for the same
+        // table.
+        String suffix = "mn-fts-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 12, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(3, extractIntPath(readAll(attach), "fragments"));
+
+            String helloBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}}")
+            );
+            assertEquals("even rows across three fragments: " + helloBody, 6, extractIntPath(helloBody, "hits", "total", "value"));
+            assertEquals(
+                "row i lives at fragment i / 4, offset i % 4",
+                Set.of("0-0", "0-2", "1-0", "1-2", "2-0", "2-2"),
+                new HashSet<>(hitIds(helloBody))
+            );
+
+            String singleBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"4\"}}}")
+            );
+            assertEquals("token 4 appears in one row only: " + singleBody, 1, extractIntPath(singleBody, "hits", "total", "value"));
+            assertEquals(List.of("1-0"), hitIds(singleBody));
+
+            String countBody = readAll(
+                postJson("/" + indexName + "/_count", "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}}")
+            );
+            assertEquals("_count for hello: " + countBody, 6, extractIntPath(countBody, "count"));
+            String singleCountBody = readAll(
+                postJson("/" + indexName + "/_count", "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"4\"}}}")
+            );
+            assertEquals("_count for token 4: " + singleCountBody, 1, extractIntPath(singleCountBody, "count"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testNamespaceRegisterPropagatesToAllNodes() throws Exception {
         // GET reads cluster state on the responding node, so the entry
         // only appears if the registration propagated.
@@ -135,6 +192,19 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     private static String readAll(Response response) throws IOException {
         try (var stream = response.getEntity().getContent()) {
             return new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<String> hitIds(String searchBody) throws IOException {
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, searchBody)) {
+            Map<String, Object> map = parser.map();
+            List<Object> hits = (List<Object>) ((Map<String, Object>) map.get("hits")).get("hits");
+            List<String> ids = new ArrayList<>(hits.size());
+            for (Object hit : hits) {
+                ids.add((String) ((Map<String, Object>) hit).get("_id"));
+            }
+            return ids;
         }
     }
 

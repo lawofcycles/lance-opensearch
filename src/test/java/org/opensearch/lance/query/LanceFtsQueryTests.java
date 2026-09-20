@@ -10,15 +10,21 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.lucene.search.QueryVisitor;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ipc.FullTextQuery;
+import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
@@ -205,6 +211,46 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
             assertEquals(all.size(), sameSizeButMissingOne.size());
             assertFalse(LanceFtsQuery.coversAllFragments(sameSizeButMissingOne, dataset));
         }
+    }
+
+    public void testFtsScanReturnsOnlySubsetRowsWithRestrictionAndAllRowsWithout() throws Exception {
+        // Drive Lance with the same ScanOptions shape ensureShardScan
+        // builds (fullTextQuery + row address + limit) through both
+        // branches of restrictToFragmentsUnlessAll. "hello" sits in
+        // the even rows, two per fragment of four rows.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeMultiFragmentTable(scratchDir, "coverage-scan", 12, 4);
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            List<Integer> all = fragmentIdsOf(dataset);
+            assertEquals(3, all.size());
+
+            Map<Integer, Integer> unrestricted = hitsByFragment(dataset, all);
+            assertEquals("two hello rows per fragment", Map.of(all.get(0), 2, all.get(1), 2, all.get(2), 2), unrestricted);
+
+            List<Integer> subset = List.of(all.get(0), all.get(2));
+            Map<Integer, Integer> restricted = hitsByFragment(dataset, subset);
+            assertEquals("restricted scan must not return rows of the excluded fragment", Map.of(all.get(0), 2, all.get(2), 2), restricted);
+        }
+    }
+
+    private static Map<Integer, Integer> hitsByFragment(Dataset dataset, List<Integer> executorFragmentIds) throws Exception {
+        ScanOptions options = LanceFtsQuery.restrictToFragmentsUnlessAll(new ScanOptions.Builder(), executorFragmentIds, dataset)
+            .fullTextQuery(FullTextQuery.match("hello", "body"))
+            .withRowAddress(true)
+            .limit(100L)
+            .build();
+        Map<Integer, Integer> counts = new HashMap<>();
+        try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                for (int i = 0; i < root.getRowCount(); i++) {
+                    int fragmentId = (int) (rowAddr.get(i) >>> 32);
+                    counts.merge(fragmentId, 1, Integer::sum);
+                }
+            }
+        }
+        return counts;
     }
 
     private static List<Integer> fragmentIdsOf(Dataset dataset) {
