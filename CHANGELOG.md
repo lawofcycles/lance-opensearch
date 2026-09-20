@@ -27,6 +27,11 @@ Inspired by [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Aggregation pushdown runs each executor's fragments in up to `lance.aggregation.pushdown_parallelism` scans at once (dynamic, default half the CPUs, 1 to 32) and merges the group rows before building buckets; `date_histogram` with a `calendar_interval` (`second` to `year`, UTC, no offset) on a timestamp column joins the pushdown through DataFusion's `date_trunc`.
 - Heap column loads (a column the off-heap column store has no room for, or every column when the cache is off) are charged to the request circuit breaker before allocation and given back when the reader closes. A load the breaker refuses ends the request with HTTP 429 `circuit_breaking_exception` naming the column and the bytes it asked for instead of taking the node down with `OutOfMemoryError`. `GET /_lance/stats` reports `column_store.heap_fallback_bytes` and `column_store.heap_fallback_rejections`.
 
+### Fixed
+
+- The Lance scan behind a full-text or knn query returns `_rowaddr` and `_score` (`_distance` for knn) only. Without a projection Lance materialised every column of every matching row into the Arrow batches, so an unbounded full-text shape (sort by a field, aggregation, `size 0`) over a large match set held native memory proportional to matches times row width and the kernel killed the node, and past 2 GiB of text in one take the Utf8 offsets overflowed into a 500.
+- The hit buffers a full-text or knn query keeps on heap are reserved with the `request` circuit breaker (label `lance_fts_hits`) before they are allocated and returned when the request ends, so a hit set the heap cannot hold answers 429 `circuit_breaking_exception` instead of `OutOfMemoryError`.
+
 ### Infrastructure
 
 - Bundle Lance's runtime dependencies (Arrow, Netty, questdb JAR JNI loader, Lance native library for macOS/aarch64, linux/x86_64, and linux/aarch64).
