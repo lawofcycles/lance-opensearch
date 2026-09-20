@@ -48,6 +48,16 @@ public class LancePluginTests extends OpenSearchTestCase {
         assertTrue("expected lance_fts_bool in registered queries: " + names, names.contains(LanceFtsBoolQueryBuilder.NAME));
     }
 
+    public void testExposesLanceActionNames() {
+        // The action names are the privileges operators grant to roles, so
+        // a rename is a breaking change and has to show up in review.
+        Set<String> names = plugin.getActions().stream().map(h -> h.getAction().name()).collect(java.util.stream.Collectors.toSet());
+        assertTrue(names.toString(), names.contains("cluster:admin/lance/attach"));
+        assertTrue(names.toString(), names.contains("indices:admin/lance/build_indexes"));
+        assertTrue(names.toString(), names.contains("cluster:monitor/lance/namespace"));
+        assertTrue(names.toString(), names.contains("cluster:admin/lance/namespace/update"));
+    }
+
     public void testRegistersLanceTextMapper() {
         assertTrue("lance_text must be registered as a mapper", plugin.getMappers().containsKey(LanceTextFieldMapper.CONTENT_TYPE));
     }

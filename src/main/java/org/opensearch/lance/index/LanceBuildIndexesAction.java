@@ -6,13 +6,14 @@
 package org.opensearch.lance.index;
 
 import org.opensearch.action.ActionType;
+import org.opensearch.action.IndicesRequest;
 
 /**
  * Action behind {@code POST /_lance/build_indexes/{index}}. Building
  * writes Lance indexes into the table behind an OpenSearch index and
  * can hold a CPU for a long time, so the name sits under
  * {@code indices:admin/} and the request implements
- * {@link org.opensearch.action.IndicesRequest}: a security plugin
+ * {@link IndicesRequest}: a security plugin
  * evaluates the privilege per target index before the build starts.
  */
 public final class LanceBuildIndexesAction extends ActionType<LanceBuildIndexesResponse> {
