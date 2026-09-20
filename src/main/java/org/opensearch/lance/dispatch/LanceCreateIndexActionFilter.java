@@ -32,6 +32,16 @@ import org.opensearch.threadpool.ThreadPool;
  * LanceInternalHeaders#LANCE_INTERNAL_CREATE_INDEX} on their
  * ThreadContext before calling {@code client.admin().indices().create(...)}
  * so this filter can tell them apart from user-facing requests.
+ *
+ * <p>The header check assumes the create request is executed on the
+ * node that stamped the header. That holds because both internal
+ * callers already run on the elected cluster manager: attach is a
+ * cluster-manager routed transport action, and the namespace poll only
+ * runs on the manager. The create therefore never crosses transport
+ * before it reaches this filter. A security plugin stashes the
+ * ThreadContext on every outbound transport request and copies only
+ * the headers it knows, so a create that had to be forwarded to the
+ * manager would arrive here without the header and be rejected.
  */
 public final class LanceCreateIndexActionFilter implements ActionFilter {
 
