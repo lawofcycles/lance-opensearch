@@ -8,6 +8,7 @@ package org.opensearch.lance.query;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
@@ -28,6 +29,7 @@ import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.Weight;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.lance.LanceCircuitBreaker;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 
@@ -83,20 +85,37 @@ public final class LanceKnnQuery extends Query {
 
     @Override
     public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) {
-        return new LanceKnnWeight(this, boost);
+        return new LanceKnnWeight(this, boost, LanceHitsAccounting.of(searcher));
     }
+
+    /**
+     * Projection of the nearest scan: the distance only. The row address
+     * comes through {@code withRowAddress(true)}; no data column is
+     * read. Named explicitly for the same reason as
+     * {@link LanceFtsQuery#HITS_SCAN_COLUMNS}: Lance still adds
+     * {@code _distance} to an empty projection by default but logs a
+     * deprecation warning per scan for it.
+     */
+    static final List<String> HITS_SCAN_COLUMNS = List.of("_distance");
 
     private final class LanceKnnWeight extends Weight implements LanceHintingWeight {
 
         private final float boost;
+        // Hit buffers are reserved with the request's accounting before
+        // they are allocated and released with the search context; a
+        // knn scan holds at most k rows, so the reservation is small,
+        // but the path is the one the FTS Weight takes and a refusal
+        // surfaces the same way (CircuitBreakingException, HTTP 429).
+        private final LanceHitsAccounting accounting;
         // Cache is populated on the first Lance-backed leaf we visit and then
         // reused for every other leaf in the same shard. The volatile field is
         // set once via CAS so concurrent readers see a fully constructed map.
         private final AtomicReference<Map<Integer, LanceFragmentHits>> shardHits = new AtomicReference<>();
 
-        LanceKnnWeight(LanceKnnQuery query, float boost) {
+        LanceKnnWeight(LanceKnnQuery query, float boost, LanceHitsAccounting accounting) {
             super(query);
             this.boost = boost;
+            this.accounting = Objects.requireNonNull(accounting, "accounting must not be null");
         }
 
         @Override
@@ -206,7 +225,10 @@ public final class LanceKnnQuery extends Query {
             if (useIndex != null) {
                 qb.setUseIndex(useIndex);
             }
-            ScanOptions.Builder options = new ScanOptions.Builder().nearest(qb.build()).withRowAddress(true);
+            // Only the distance and the row address come back; the
+            // vector column itself and every other data column stay in
+            // Lance, the Weight reads none of them.
+            ScanOptions.Builder options = new ScanOptions.Builder().nearest(qb.build()).columns(HITS_SCAN_COLUMNS).withRowAddress(true);
             if (filter != null && !filter.isEmpty()) {
                 // Push the filter down as a pre-filter so Lance evaluates
                 // it BEFORE applying the k-nearest cutoff. Without this
@@ -227,18 +249,20 @@ public final class LanceKnnQuery extends Query {
                         int offset = (int) (addr & 0xFFFFFFFFL);
                         // Score = boost / (1 + distance), so a smaller
                         // distance is a higher score.
-                        fresh.computeIfAbsent(fragId, id -> new LanceFragmentHits()).add(offset, boost / (1f + distance.get(i)));
+                        fresh.computeIfAbsent(fragId, id -> new LanceFragmentHits(accounting)).add(offset, boost / (1f + distance.get(i)));
                     }
                 }
-            } catch (IOException e) {
+            } catch (IOException | CircuitBreakingException e) {
                 throw e;
             } catch (Exception e) {
                 throw new IOException(e);
             }
-            // Whichever thread wins the CAS installs the map; losers reuse it.
+            // Whichever thread wins the CAS installs the map; losers
+            // reuse it and drop the buffers of their own scan.
             if (shardHits.compareAndSet(null, fresh)) {
                 return fresh;
             }
+            accounting.release(LanceFtsQuery.heapBytesOf(fresh));
             return shardHits.get();
         }
 

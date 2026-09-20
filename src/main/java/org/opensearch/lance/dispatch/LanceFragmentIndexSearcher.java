@@ -15,8 +15,10 @@ import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryCachingPolicy;
 import org.apache.lucene.search.Weight;
+import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.cache.query.DisabledQueryCache;
+import org.opensearch.lance.query.LanceHitsAccounting;
 import org.opensearch.search.internal.ContextIndexSearcher;
 
 /**
@@ -51,8 +53,17 @@ import org.opensearch.search.internal.ContextIndexSearcher;
  * <p>The query cache is disabled: the Lance-backed reader has its own
  * freshness tracking and Lucene's per-query cache would only add
  * bookkeeping.
+ *
+ * <p>The searcher owns the request's {@link LanceHitsAccounting}: every
+ * Lance Weight created against it, whether by the executor directly or
+ * by Lucene inside a {@code BooleanQuery} or under a reader wrapper,
+ * reserves its hit buffers with the {@code request} breaker through
+ * that one instance. The accounting is registered with the search
+ * context as a releasable, so the bytes go back to the breaker when
+ * the executor closes the context at the end of the request, after
+ * the hits, aggregation and count phases that used the Weights.
  */
-final class LanceFragmentIndexSearcher extends ContextIndexSearcher {
+final class LanceFragmentIndexSearcher extends ContextIndexSearcher implements LanceHitsAccounting.Provider {
 
     private static final QueryCachingPolicy NEVER_CACHE = new QueryCachingPolicy() {
         @Override
@@ -65,9 +76,14 @@ final class LanceFragmentIndexSearcher extends ContextIndexSearcher {
     };
 
     private final LanceFragmentSearchContext fragmentContext;
+    private final LanceHitsAccounting hitsAccounting;
 
-    LanceFragmentIndexSearcher(DirectoryReader reader, IndexSettings indexSettings, LanceFragmentSearchContext searchContext)
-        throws IOException {
+    LanceFragmentIndexSearcher(
+        DirectoryReader reader,
+        IndexSettings indexSettings,
+        LanceFragmentSearchContext searchContext,
+        CircuitBreaker requestBreaker
+    ) throws IOException {
         super(
             reader,
             IndexSearcher.getDefaultSimilarity(),
@@ -78,6 +94,13 @@ final class LanceFragmentIndexSearcher extends ContextIndexSearcher {
             searchContext
         );
         this.fragmentContext = searchContext;
+        this.hitsAccounting = new LanceHitsAccounting(requestBreaker);
+        searchContext.addReleasable(hitsAccounting);
+    }
+
+    @Override
+    public LanceHitsAccounting hitsAccounting() {
+        return hitsAccounting;
     }
 
     @Override
