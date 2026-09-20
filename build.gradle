@@ -347,6 +347,11 @@ File sharedTablesDir = new File(project.buildDir, "shared-tables")
 // sibling of the shared tables directory; LanceRestTestCase.repoRoot()
 // derives the same path from tests.lance.shared_tables_dir.
 File sharedRepoDir = new File(project.buildDir, "shared-repo")
+// The testclusters plugin writes each node's log under
+// build/testclusters/<task>-<n>/logs. LanceMultiNodeIT reads the
+// coordinator's fan-out lines and the executor's temporary IndexService
+// lines from there to assert which nodes ran fragments.
+File testClustersDir = new File(project.buildDir, "testclusters")
 
 // Lance resolves `lindera/<name>` and `jieba/<name>` FTS tokenizers to
 // dictionaries under $LANCE_LANGUAGE_MODEL_HOME (see docs/features.md).
@@ -419,6 +424,7 @@ task multiNodeIntegTest(type: org.opensearch.gradle.test.RestIntegTestTask) {
         sharedRepoDir.mkdirs()
     }
     systemProperty 'tests.lance.shared_tables_dir', sharedTablesDir.absolutePath
+    systemProperty 'tests.lance.cluster_logs_dir', testClustersDir.absolutePath
     filter {
         includeTestsMatching 'org.opensearch.lance.LanceMultiNodeIT'
     }
