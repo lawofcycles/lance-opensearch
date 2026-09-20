@@ -47,13 +47,15 @@ import org.opensearch.test.OpenSearchTestCase;
  * dictionary, ordinal and term lookup equals the heap {@code BytesRef[]}
  * path, one scan per (snapshot, column), pins block eviction, the budget
  * fallback loads into heap, deleted rows are masked, and the breaker sees
- * the footprint.
+ * the footprint. The fixture has three fragments of 10,000 rows, so a
+ * hint of at most 25 rows ({@link LanceFragmentLeafReader#SPARSE_RATIO})
+ * is sparse and a hint of 100 rows (1 percent) is not.
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
 
     private static final int FRAGMENTS = 3;
-    private static final int ROWS = 200;
+    private static final int ROWS = 10_000;
     private static final String UUID = "column-store-uuid";
 
     private RootAllocator allocator;
@@ -297,8 +299,8 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
 
     public void testDeletedRowsAreMaskedInBothPaths() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
-            // Rows 205 and 210 sit in fragment 1; 205 has a rating, 210 too.
-            dataset.delete("id = 205 OR id = 210");
+            // Rows 10,005 and 10,010 sit in fragment 1; both have a rating.
+            dataset.delete("id = " + (ROWS + 5) + " OR id = " + (ROWS + 10));
         }
         try (Lease lease = acquire()) {
             Snapshot snapshot = lease.snapshot();
@@ -318,7 +320,7 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
                 Long[] ratings = readByAdvanceExact(offHeapLeaf, "rating");
                 assertNull("deleted row reports no value", ratings[5]);
                 assertNull(ratings[10]);
-                assertEquals(rating(206), ratings[6]);
+                assertEquals(rating(ROWS + 6), ratings[6]);
                 // The store's validity bit is clear for the deleted rows as well.
                 CachedColumn column = offHeapLeaf.offHeapColumn("rating");
                 assertFalse(column.isSet(5));
@@ -328,6 +330,8 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
     }
 
     public void testSparseHintStillTakesRowsAndLeavesTheStoreAlone() throws Exception {
+        // Hint below the ratio, store empty: the leaf takes the hinted
+        // rows and starts no store load.
         ColumnStore store = cache.columnStore();
         try (Lease lease = acquire()) {
             try (LanceDirectoryReader reader = openCached(lease.snapshot(), allFragments)) {
@@ -353,6 +357,126 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
                 assertTrue(store.contains(lease.snapshot().key(), "rating", 1));
                 assertFalse(leavesOf(reader).get(0).isServingOffHeap("rating"));
                 assertFalse(leavesOf(reader).get(0).isColumnFullyLoaded("rating"));
+            }
+        }
+    }
+
+    /** Twenty ascending offsets, below the sparse ratio on a 10,000 row fragment. */
+    private static int[] twentyOffsets() {
+        int[] hint = new int[20];
+        for (int i = 0; i < hint.length; i++) {
+            hint[i] = 3 + i * 7;
+        }
+        return hint;
+    }
+
+    public void testStoreHeldColumnsAreReadInsteadOfTheHintedTake() throws Exception {
+        // A first reader loads rating, flag, category and tags into the
+        // store for every fragment. A second reader with a 20 row
+        // exclusive hint (0.2 percent, sparse) then reads the store
+        // instead of taking the rows: no take, no scan, and the keyword
+        // dictionaries are the full ones. Only the hinted leaf is
+        // published; the leaves the request did not touch stay untouched.
+        ColumnStore store = cache.columnStore();
+        try (Lease lease = acquire()) {
+            try (LanceDirectoryReader first = openCached(lease.snapshot(), allFragments)) {
+                LanceFragmentLeafReader leaf = leavesOf(first).get(0);
+                readByAdvanceExact(leaf, "rating");
+                readByAdvanceExact(leaf, "flag");
+                ordsByDoc(leaf.getSortedDocValues("category"), leaf.maxDoc());
+                rowsByDoc(leaf.getSortedSetDocValues("tags"), leaf.maxDoc());
+            }
+        }
+        assertEquals(4L, store.loadCount());
+        assertEquals(4 * FRAGMENTS, store.entryCount());
+        long hitsBefore = store.hitCount();
+        try (Lease lease = acquire()) {
+            Snapshot snapshot = lease.snapshot();
+            try (LanceDirectoryReader reader = openCached(snapshot, allFragments)) {
+                List<LanceFragmentLeafReader> leaves = leavesOf(reader);
+                LanceFragmentLeafReader leaf = leaves.get(1);
+                int[] hint = twentyOffsets();
+                leaf.hintMatchedOffsets(hint, true);
+
+                NumericDocValues rating = leaf.getNumericDocValues("rating");
+                for (int offset : hint) {
+                    Long expected = rating(ROWS + offset);
+                    assertEquals(expected != null, rating.advanceExact(offset));
+                    if (expected != null) {
+                        assertEquals(expected.longValue(), rating.longValue());
+                    }
+                }
+                assertTrue("the store holds the fragment, so it is read", leaf.isServingOffHeap("rating"));
+                assertFalse("no take for a column the store holds", leaf.isServingSparse("rating"));
+                assertEquals("a doc outside the hint costs nothing extra", ROWS, rating.cost());
+                assertTrue(rating.advanceExact(0));
+                assertEquals(rating(ROWS).longValue(), rating.longValue());
+
+                NumericDocValues flag = leaf.getNumericDocValues("flag");
+                assertTrue(flag.advanceExact(hint[0]));
+                assertTrue(leaf.isServingOffHeap("flag"));
+                assertFalse(leaf.isServingSparse("flag"));
+
+                SortedDocValues category = leaf.getSortedDocValues("category");
+                assertEquals("the full dictionary, not the one of the hinted rows", 3, category.getValueCount());
+                assertTrue(leaf.isServingOffHeap("category"));
+                assertFalse(leaf.isServingSparse("category"));
+                for (int offset : hint) {
+                    String expected = category(ROWS + offset);
+                    assertEquals(expected != null, category.advanceExact(offset));
+                    if (expected != null) {
+                        assertEquals(expected, category.lookupOrd(category.ordValue()).utf8ToString());
+                    }
+                }
+                SortedSetDocValues tags = leaf.getSortedSetDocValues("tags");
+                assertEquals(5L, tags.getValueCount());
+                assertTrue(leaf.isServingOffHeap("tags"));
+                assertFalse(leaf.isServingSparse("tags"));
+
+                assertEquals("nothing was scanned", 4L, store.loadCount());
+                assertEquals(4 * FRAGMENTS, store.entryCount());
+                assertEquals("one store hit per column", hitsBefore + 4, store.hitCount());
+                for (int f : new int[] { 0, 2 }) {
+                    assertFalse("fragment " + f + " was not touched", leaves.get(f).isColumnFullyLoaded("rating"));
+                    assertFalse(leaves.get(f).isColumnFullyLoaded("category"));
+                }
+            }
+        }
+    }
+
+    public void testHintAboveTheRatioLoadsTheColumnIntoTheStore() throws Exception {
+        // 100 of 10,000 rows (1 percent) is above the ratio: the leaf
+        // loads the column through the shard cache, which puts every
+        // fragment of the reader into the store in one scan.
+        ColumnStore store = cache.columnStore();
+        try (Lease lease = acquire()) {
+            Snapshot snapshot = lease.snapshot();
+            try (LanceDirectoryReader reader = openCached(snapshot, allFragments)) {
+                List<LanceFragmentLeafReader> leaves = leavesOf(reader);
+                LanceFragmentLeafReader leaf = leaves.get(1);
+                int[] hint = new int[100];
+                for (int i = 0; i < hint.length; i++) {
+                    hint[i] = i * 3;
+                }
+                leaf.hintMatchedOffsets(hint, true);
+                NumericDocValues rating = leaf.getNumericDocValues("rating");
+                assertTrue(rating.advanceExact(3));
+                assertEquals(rating(ROWS + 3).longValue(), rating.longValue());
+                assertFalse(leaf.isServingSparse("rating"));
+                assertTrue(leaf.isServingOffHeap("rating"));
+                assertEquals(1L, store.loadCount());
+                assertEquals(FRAGMENTS, store.entryCount());
+                for (LanceFragmentLeafReader other : leaves) {
+                    assertTrue(store.contains(snapshot.key(), "rating", other.fragmentId()));
+                    assertTrue(other.isServingOffHeap("rating"));
+                }
+
+                SortedDocValues category = leaf.getSortedDocValues("category");
+                assertEquals(3, category.getValueCount());
+                assertFalse(leaf.isServingSparse("category"));
+                assertTrue(leaf.isServingOffHeap("category"));
+                assertEquals(2L, store.loadCount());
+                assertEquals(2 * FRAGMENTS, store.entryCount());
             }
         }
     }
@@ -655,7 +779,8 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
                         }
                     }
                     SortedSetDocValues tags = leaf.getSortedSetDocValues("tags");
-                    // Rows 2, 202 and 402 carry t0 and t2; row 0 of each fragment carries t0 twice.
+                    // Offset 2 of every fragment (rows 2, 10,002, 20,002)
+                    // carries t0 and t2; offset 0 carries t0 twice.
                     assertTrue(tags.advanceExact(2));
                     assertEquals(2, tags.docValueCount());
                     assertTrue(tags.advanceExact(0));
@@ -760,8 +885,11 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
 
     public void testDeletedRowsHaveNoKeywordValueInBothPaths() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
-            // Rows 205 and 210 sit in fragment 1; 205 (c1, tags t1/t0) and 210 (c0, tags t0) both carry values.
-            dataset.delete("id = 205 OR id = 210");
+            // Rows 10,005 (c0, tags t0/t1) and 10,010 (c2, tags t0) sit in
+            // fragment 1 and both carry values.
+            assertEquals("c0", category(ROWS + 5));
+            assertEquals("c2", category(ROWS + 10));
+            dataset.delete("id = " + (ROWS + 5) + " OR id = " + (ROWS + 10));
         }
         try (Lease lease = acquire()) {
             Snapshot snapshot = lease.snapshot();
@@ -778,7 +906,7 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
                 assertFalse("deleted row reports no value", category.advanceExact(5));
                 assertFalse(category.advanceExact(10));
                 assertTrue(category.advanceExact(6));
-                assertEquals(category(206), category.lookupOrd(category.ordValue()).utf8ToString());
+                assertEquals(category(ROWS + 6), category.lookupOrd(category.ordValue()).utf8ToString());
                 assertEquals(-1, offHeapLeaf.offHeapKeywordColumn("category").ord(5));
                 CachedKeywordArrayColumn tags = offHeapLeaf.offHeapKeywordArrayColumn("tags");
                 assertEquals("deleted row has an empty ordinal range", tags.rowStart(5), tags.rowEnd(5));
@@ -795,38 +923,43 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
             Snapshot snapshot = lease.snapshot();
             try (LanceDirectoryReader reader = openCached(snapshot, allFragments)) {
                 LanceFragmentLeafReader leaf = leavesOf(reader).get(1);
-                // Rows 201 (c0), 202 (c1), 203 (null), 208 (c1), 210 (c0), 212 (c2)
+                // Rows 10,001 (c2), 10,002 (c0), 10,003 (null), 10,008 (c0),
+                // 10,010 (c2), 10,012 (c1)
                 int[] hint = { 1, 2, 3, 8, 10, 12 };
                 leaf.hintMatchedOffsets(hint, true);
                 SortedDocValues category = leaf.getSortedDocValues("category");
                 assertEquals(3, category.getValueCount());
+                assertEquals("c0", category(ROWS + 2));
                 assertTrue(category.advanceExact(2));
-                assertEquals("c1", category.lookupOrd(category.ordValue()).utf8ToString());
-                assertTrue("an exclusive sparse hint wins over the store", leaf.isServingSparse("category"));
+                assertEquals("c0", category.lookupOrd(category.ordValue()).utf8ToString());
+                assertTrue("an exclusive sparse hint takes the rows while the store is empty", leaf.isServingSparse("category"));
                 assertFalse(leaf.isServingOffHeap("category"));
                 assertFalse(leaf.isColumnFullyLoaded("category"));
                 assertEquals(0L, store.loadCount());
                 assertEquals(0, store.entryCount());
 
-                // Row 204 (c0) is outside the hint: the instance learns its
-                // term from the full column, which the store serves for
+                // Row 10,004 (c2) is outside the hint: the instance learns
+                // its term from the full column, which the store serves for
                 // this fragment alone, and answers with the sparse ordinal.
+                assertEquals("c2", category(ROWS + 4));
                 assertTrue(category.advanceExact(4));
-                assertEquals(0, category.ordValue());
-                assertEquals("c0", category.lookupOrd(category.ordValue()).utf8ToString());
+                assertEquals(2, category.ordValue());
+                assertEquals("c2", category.lookupOrd(category.ordValue()).utf8ToString());
                 assertTrue(leaf.isServingOffHeap("category"));
                 assertEquals(1L, store.loadCount());
                 assertEquals(1, store.entryCount());
                 assertTrue(store.contains(snapshot.key(), "category", 1));
                 assertFalse(leavesOf(reader).get(0).isColumnFullyLoaded("category"));
-                // Row 207 is outside the hint and null.
+                // Row 10,007 is outside the hint and null.
+                assertNull(category(ROWS + 7));
                 assertFalse(category.advanceExact(7));
                 // The decision sticks: later instances stay sparse.
                 assertTrue(leaf.isServingSparse("category"));
                 assertEquals(3, leaf.getSortedDocValues("category").getValueCount());
 
                 // Same for the multi-valued column: hinted rows carry
-                // t0..t3; row 206 (t0, t1) is outside the hint.
+                // t0..t3; row 10,006 (t0, t1) is outside the hint.
+                assertEquals(List.of("t0", "t1"), tags(ROWS + 6));
                 SortedSetDocValues tags = leaf.getSortedSetDocValues("tags");
                 assertEquals(4L, tags.getValueCount());
                 assertTrue(leaf.isServingSparse("tags"));
