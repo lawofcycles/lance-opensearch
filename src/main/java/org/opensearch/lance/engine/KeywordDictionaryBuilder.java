@@ -5,18 +5,23 @@
 
 package org.opensearch.lance.engine;
 
+import java.util.Arrays;
+
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.BytesRefHash;
 
 /**
- * Builds the per-fragment keyword dictionary
- * ({@code BytesRef[] terms} sorted in unsigned byte order plus a
- * per-doc ordinal array) that backs
+ * Builds the per-fragment keyword dictionary (distinct terms sorted in
+ * unsigned byte order plus a per-doc ordinal mapping) that backs
  * {@link LanceFragmentLeafReader#getSortedDocValues} and
  * {@link LanceFragmentLeafReader#getSortedSetDocValues}, straight from
- * Arrow {@link VarCharVector} bytes.
+ * Arrow {@link VarCharVector} bytes. The heap path takes the terms as a
+ * {@code BytesRef[]} through {@link #finish}; the off-heap
+ * {@link ColumnStore} sizes its vectors from {@link #size} and
+ * {@link #termBytes}, then has the sorted terms written into a
+ * {@link VarCharVector} through {@link #sort} and {@link #writeTerms}.
  *
  * <p>Values are interned into a {@link BytesRefHash} as they stream out
  * of the Lance scan. Each cell is copied once into a reusable scratch
@@ -43,6 +48,9 @@ final class KeywordDictionaryBuilder {
     private final BytesRefHash hash = new BytesRefHash();
     private final BytesRef scratch = new BytesRef();
     private byte[] buffer = new byte[64];
+    private long termBytes;
+    /** Interned ids in sorted order, set by {@link #sort}. */
+    private int[] sortedIds;
 
     /**
      * Intern the value at {@code index} of {@code vector} and return
@@ -59,7 +67,11 @@ final class KeywordDictionaryBuilder {
         scratch.offset = 0;
         scratch.length = length;
         int id = hash.add(scratch);
-        return id < 0 ? -id - 1 : id;
+        if (id >= 0) {
+            termBytes += length;
+            return id;
+        }
+        return -id - 1;
     }
 
     /** Number of distinct terms interned so far. */
@@ -67,62 +79,111 @@ final class KeywordDictionaryBuilder {
         return hash.size();
     }
 
+    /** Total UTF-8 bytes of the distinct terms interned so far (the data buffer size a {@link VarCharVector} of them needs). */
+    long termBytes() {
+        return termBytes;
+    }
+
     /**
-     * Sort the interned terms and return them with an id-to-ordinal
-     * remap. Destroys the builder for further {@link #intern} calls.
+     * Sort the interned terms. Destroys the builder for further
+     * {@link #intern} calls; {@link #writeTerms} and {@link #finish}
+     * remain available.
+     *
+     * @return {@code idToOrd} such that {@code idToOrd[id]} is the
+     *         ordinal of the term {@link #intern} returned {@code id} for
+     */
+    int[] sort() {
+        if (sortedIds == null) {
+            sortedIds = hash.sort();
+        }
+        int size = hash.size();
+        int[] idToOrd = new int[size];
+        for (int ord = 0; ord < size; ord++) {
+            idToOrd[sortedIds[ord]] = ord;
+        }
+        return idToOrd;
+    }
+
+    /**
+     * Write the sorted terms into {@code target}, one per ordinal, and
+     * set its value count. {@code target} must have been allocated for
+     * {@link #termBytes} bytes and {@link #size} values; the bytes go
+     * straight from the hash's pool into the vector.
+     */
+    void writeTerms(VarCharVector target) {
+        sort();
+        int size = hash.size();
+        BytesRef view = new BytesRef();
+        for (int ord = 0; ord < size; ord++) {
+            hash.get(sortedIds[ord], view);
+            target.set(ord, view.bytes, view.offset, view.length);
+        }
+        target.setValueCount(size);
+    }
+
+    /**
+     * Sort the interned terms and return them as heap {@link BytesRef}s
+     * with the id-to-ordinal remap.
      *
      * @return {@code terms} in unsigned byte order and {@code idToOrd}
      *         such that {@code idToOrd[id]} is the ordinal of the term
      *         {@link #intern} returned {@code id} for
      */
     Dictionary finish() {
+        int[] idToOrd = sort();
         int size = hash.size();
-        int[] sortedIds = hash.sort();
         BytesRef[] terms = new BytesRef[size];
-        int[] idToOrd = new int[size];
         BytesRef view = new BytesRef();
         for (int ord = 0; ord < size; ord++) {
-            int id = sortedIds[ord];
-            hash.get(id, view);
+            hash.get(sortedIds[ord], view);
             terms[ord] = BytesRef.deepCopyOf(view);
-            idToOrd[id] = ord;
         }
         return new Dictionary(terms, idToOrd);
+    }
+
+    /** Remap a per-doc id array in place through {@code idToOrd}; {@code -1} (null) stays {@code -1}. */
+    static void remap(int[] idToOrd, int[] ids) {
+        for (int i = 0; i < ids.length; i++) {
+            if (ids[i] >= 0) {
+                ids[i] = idToOrd[ids[i]];
+            }
+        }
+    }
+
+    /**
+     * Remap a multi-valued doc's element ids into the strictly
+     * ascending, duplicate-free ordinal array
+     * {@link org.apache.lucene.index.SortedSetDocValues#nextOrd}
+     * requires. {@code ids} holds only non-null elements.
+     */
+    static int[] remapSortedUnique(int[] idToOrd, int[] ids) {
+        if (ids.length == 0) {
+            return ids;
+        }
+        int[] ords = new int[ids.length];
+        for (int i = 0; i < ids.length; i++) {
+            ords[i] = idToOrd[ids[i]];
+        }
+        Arrays.sort(ords);
+        int unique = 1;
+        for (int i = 1; i < ords.length; i++) {
+            if (ords[i] != ords[unique - 1]) {
+                ords[unique++] = ords[i];
+            }
+        }
+        return unique == ords.length ? ords : Arrays.copyOf(ords, unique);
     }
 
     /** Sorted terms plus the remap from interned id to sorted ordinal. */
     record Dictionary(BytesRef[] terms, int[] idToOrd) {
         /** Remap a per-doc id array in place; {@code -1} (null) stays {@code -1}. */
         void remap(int[] ids) {
-            for (int i = 0; i < ids.length; i++) {
-                if (ids[i] >= 0) {
-                    ids[i] = idToOrd[ids[i]];
-                }
-            }
+            KeywordDictionaryBuilder.remap(idToOrd, ids);
         }
 
-        /**
-         * Remap a multi-valued doc's element ids into the strictly
-         * ascending, duplicate-free ordinal array
-         * {@link org.apache.lucene.index.SortedSetDocValues#nextOrd}
-         * requires. {@code ids} holds only non-null elements.
-         */
+        /** See {@link KeywordDictionaryBuilder#remapSortedUnique}. */
         int[] remapSortedUnique(int[] ids) {
-            if (ids.length == 0) {
-                return ids;
-            }
-            int[] ords = new int[ids.length];
-            for (int i = 0; i < ids.length; i++) {
-                ords[i] = idToOrd[ids[i]];
-            }
-            java.util.Arrays.sort(ords);
-            int unique = 1;
-            for (int i = 1; i < ords.length; i++) {
-                if (ords[i] != ords[unique - 1]) {
-                    ords[unique++] = ords[i];
-                }
-            }
-            return unique == ords.length ? ords : java.util.Arrays.copyOf(ords, unique);
+            return KeywordDictionaryBuilder.remapSortedUnique(idToOrd, ids);
         }
     }
 }

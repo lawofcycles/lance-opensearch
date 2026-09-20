@@ -5,8 +5,6 @@
 
 package org.opensearch.lance.engine;
 
-import java.util.concurrent.atomic.AtomicInteger;
-
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.BitVectorHelper;
@@ -25,12 +23,8 @@ import org.apache.arrow.vector.FieldVector;
  * row (a {@code BitVector} for boolean columns) and the validity buffer
  * holds one bit per row, set for rows that carry a value. Deleted rows
  * and Arrow nulls leave their validity bit clear.
- *
- * <p>A column stays in the store until it is evicted; a leaf that reads
- * it {@link #pin pins} it for the life of its request so the store does
- * not release the buffers underneath a running doc values iterator.
  */
-public final class CachedColumn {
+public final class CachedColumn extends StoreEntry {
 
     private final FieldVector vector;
     private final ArrowBuf validity;
@@ -38,7 +32,6 @@ public final class CachedColumn {
     private final boolean bit;
     private final int rows;
     private final long bytes;
-    private final AtomicInteger pins = new AtomicInteger();
 
     CachedColumn(FieldVector vector, int rows) {
         this.vector = vector;
@@ -64,25 +57,12 @@ public final class CachedColumn {
         return rows;
     }
 
-    /** Off-heap bytes the two buffers occupy, as the allocator accounts them. */
+    @Override
     public long bytes() {
         return bytes;
     }
 
-    /** Keep the buffers alive while a request reads them. Balanced by {@link #unpin}. */
-    void pin() {
-        pins.incrementAndGet();
-    }
-
-    void unpin() {
-        pins.decrementAndGet();
-    }
-
-    boolean isPinned() {
-        return pins.get() > 0;
-    }
-
-    /** Release the buffers back to the allocator. Only the store calls this, and only when nothing pins the column. */
+    @Override
     void close() {
         vector.close();
     }
