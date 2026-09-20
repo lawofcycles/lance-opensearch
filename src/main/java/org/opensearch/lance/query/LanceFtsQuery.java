@@ -82,6 +82,22 @@ public final class LanceFtsQuery extends Query {
      * this at {@link #SCAN_LIMIT_UNBOUNDED} for those shapes.
      */
     private final int scanLimit;
+    /**
+     * Optional Lance SQL predicate the FTS scan evaluates before the
+     * inverted-index lookup, or {@code null} for an unfiltered scan.
+     *
+     * <p>When set, {@code ensureShardScan} passes it as
+     * {@code ScanOptions.Builder.filter(sql).prefilter(true)}, which
+     * makes Lance restrict the posting-list lookup to the rows the
+     * predicate selects (through the column's scalar index when one
+     * exists, otherwise through a filtered read of {@code _rowid}).
+     * The fragment path resolver fills this in for
+     * {@code bool { must: [one FTS clause], filter: [...], must_not:
+     * [...] }} so the scalar clauses never have to be evaluated on the
+     * Lucene side against every FTS hit, and {@code scanLimit} then
+     * bounds the already filtered result.
+     */
+    private final String prefilterSql;
 
     /**
      * Primary constructor. {@code columns} is the set of Lance columns
@@ -94,9 +110,17 @@ public final class LanceFtsQuery extends Query {
     }
 
     /**
-     * Full constructor including the top-k pushdown hint.
+     * Constructor including the top-k pushdown hint and no prefilter.
      */
     public LanceFtsQuery(FullTextQuery fullTextQuery, Set<String> columns, int scanLimit) {
+        this(fullTextQuery, columns, scanLimit, null);
+    }
+
+    /**
+     * Full constructor including the top-k pushdown hint and the
+     * optional Lance SQL prefilter ({@code null} for none).
+     */
+    public LanceFtsQuery(FullTextQuery fullTextQuery, Set<String> columns, int scanLimit, String prefilterSql) {
         this.fullTextQuery = Objects.requireNonNull(fullTextQuery, "fullTextQuery must not be null");
         this.columns = Set.copyOf(Objects.requireNonNull(columns, "columns must not be null"));
         if (this.columns.isEmpty()) {
@@ -106,6 +130,7 @@ public final class LanceFtsQuery extends Query {
             throw new IllegalArgumentException("scanLimit must not be negative, was " + scanLimit);
         }
         this.scanLimit = scanLimit;
+        this.prefilterSql = prefilterSql;
         this.canonical = canonicalString(fullTextQuery);
     }
 
@@ -118,11 +143,30 @@ public final class LanceFtsQuery extends Query {
         if (newScanLimit == scanLimit) {
             return this;
         }
-        return new LanceFtsQuery(fullTextQuery, columns, newScanLimit);
+        return new LanceFtsQuery(fullTextQuery, columns, newScanLimit, prefilterSql);
+    }
+
+    /**
+     * Return a copy of this query whose Lance scan is prefiltered by
+     * {@code newPrefilterSql} ({@code null} removes the prefilter).
+     */
+    public LanceFtsQuery withPrefilterSql(String newPrefilterSql) {
+        if (Objects.equals(newPrefilterSql, prefilterSql)) {
+            return this;
+        }
+        return new LanceFtsQuery(fullTextQuery, columns, scanLimit, newPrefilterSql);
     }
 
     public int scanLimit() {
         return scanLimit;
+    }
+
+    /**
+     * The Lance SQL prefilter applied to the FTS scan, or {@code null}
+     * when the scan is unfiltered.
+     */
+    public String prefilterSql() {
+        return prefilterSql;
     }
 
     /**
@@ -384,6 +428,15 @@ public final class LanceFtsQuery extends Query {
             ScanOptions.Builder builder = restrictToFragmentsUnlessAll(new ScanOptions.Builder(), fragmentIds, leaf.dataset())
                 .fullTextQuery(query().fullTextQuery())
                 .withRowAddress(true);
+            // A scalar predicate pushed down from a bool query runs
+            // as a Lance prefilter: the planner evaluates it first
+            // (scalar index or filtered _rowid read) and hands the
+            // resulting row set to the inverted-index lookup, so the
+            // limit below clips the already filtered hits.
+            String prefilterSql = query().prefilterSql();
+            if (prefilterSql != null) {
+                builder = builder.filter(prefilterSql).prefilter(true);
+            }
             if (effectiveLimit > 0) {
                 builder = builder.limit(effectiveLimit);
             }
@@ -422,7 +475,10 @@ public final class LanceFtsQuery extends Query {
 
     @Override
     public String toString(String field) {
-        return "LanceFtsQuery(" + canonical + ")";
+        if (prefilterSql == null) {
+            return "LanceFtsQuery(" + canonical + ")";
+        }
+        return "LanceFtsQuery(" + canonical + ",prefilter=" + prefilterSql + ")";
     }
 
     @Override
@@ -432,12 +488,16 @@ public final class LanceFtsQuery extends Query {
 
     @Override
     public boolean equals(Object other) {
-        return other instanceof LanceFtsQuery q && columns.equals(q.columns) && canonical.equals(q.canonical) && scanLimit == q.scanLimit;
+        return other instanceof LanceFtsQuery q
+            && columns.equals(q.columns)
+            && canonical.equals(q.canonical)
+            && scanLimit == q.scanLimit
+            && Objects.equals(prefilterSql, q.prefilterSql);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(columns, canonical, scanLimit);
+        return Objects.hash(columns, canonical, scanLimit, prefilterSql);
     }
 
     /**
