@@ -547,10 +547,11 @@ public class LanceAggregationIT extends LanceRestTestCase {
 
     public void testSubstraitPushdownAnswersDateHistogramLikeTheAggregators() throws Exception {
         // The dated fixture has six rows with a timestamp[us] column and
-        // an even / odd keyword category: fixed_interval date histograms
-        // and date metrics take the pushdown, calendar_interval and
-        // time_zone stay on the aggregators. The attach adds a keyword
-        // sub-field so a terms on category.raw resolves to the base column.
+        // an even / odd keyword category: fixed_interval and
+        // calendar_interval date histograms and date metrics take the
+        // pushdown, time_zone, offset and bounds stay on the aggregators.
+        // The attach adds a keyword sub-field so a terms on category.raw
+        // resolves to the base column.
         String suffix = "pushdown-date-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -573,9 +574,22 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"order\":{\"_key\":\"desc\"}}}}}",
                 "{\"size\":0,\"aggs\":{\"first\":{\"min\":{\"field\":\"ts\"}},\"last\":{\"max\":{\"field\":\"ts\"}},\"n\":{\"value_count\":{\"field\":\"ts\"}}}}",
                 "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"ts\",\"size\":10}}}}",
-                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"first\":{\"min\":{\"field\":\"ts\"}}}}}}" };
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"first\":{\"min\":{\"field\":\"ts\"}}}}}}",
+                // calendar intervals: month with a metric child (the March
+                // bucket holds two rows), day, week, quarter, year, the 1M
+                // spelling, a filter and min_doc_count 0 for the reduce's
+                // empty bucket filling on calendar rounding
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"day\"}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"week\",\"min_doc_count\":1}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"quarter\",\"keyed\":true}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"year\"}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"1M\",\"order\":{\"_key\":\"desc\"}}}}}",
+                "{\"size\":0,\"query\":{\"term\":{\"category\":\"odd\"}},\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"week\",\"min_doc_count\":0}}}}" };
             String[] aggregatorShapes = new String[] {
-                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\",\"time_zone\":\"+09:00\"}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"day\",\"offset\":\"6h\"}}}}",
                 "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"time_zone\":\"+09:00\"}}}}",
                 "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"offset\":\"1d\"}}}}",
                 "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\","
@@ -585,6 +599,38 @@ public class LanceAggregationIT extends LanceRestTestCase {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
+        }
+    }
+
+    public void testSubstraitPushdownWithParallelScansAnswersLikeTheAggregators() throws Exception {
+        // Six fragments of 100 rows scanned in three groups per request:
+        // the bodies have to equal the aggregators' exactly, terms error
+        // and other counts included, and the executor's log line has to
+        // say the answer came from three scans.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(6, 100, "pushdown-parallel")) {
+            String index = fixture.indexName();
+            String[] shapes = new String[] {
+                "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}},\"a\":{\"avg\":{\"field\":\"rating\"}},"
+                    + "\"m\":{\"min\":{\"field\":\"rating\"}},\"M\":{\"max\":{\"field\":\"rating\"}},\"c\":{\"value_count\":{\"field\":\"rating\"}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
+                "{\"size\":0,\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":3,\"show_term_doc_count_error\":true}}}}",
+                "{\"size\":0,\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":5,\"order\":{\"_key\":\"desc\"}}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"size\":2},\"aggs\":{\"a\":{\"avg\":{\"field\":\"rating\"}},"
+                    + "\"m\":{\"min\":{\"field\":\"rating\"}},\"M\":{\"max\":{\"field\":\"rating\"}},\"n\":{\"value_count\":{\"field\":\"flag\"}}}}}}",
+                "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":500}}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
+                "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":100},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}}" };
+            Request parallelism = new Request("PUT", "/_cluster/settings");
+            parallelism.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown_parallelism\":3}}");
+            client().performRequest(parallelism);
+            try {
+                long before = pushdownLogLines(index, "in 3 scans");
+                assertPushdownAgreesWithAggregators(index, shapes, new String[0]);
+                assertEquals("every pushdown answer came from three scans", before + shapes.length, pushdownLogLines(index, "in 3 scans"));
+            } finally {
+                Request reset = new Request("PUT", "/_cluster/settings");
+                reset.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown_parallelism\":null}}");
+                client().performRequest(reset);
+            }
         }
     }
 
@@ -678,6 +724,14 @@ public class LanceAggregationIT extends LanceRestTestCase {
      * captured stdout repeats every line.
      */
     private static long pushdownLogLines(String indexName) throws IOException {
+        return pushdownLogLines(indexName, "");
+    }
+
+    /**
+     * As {@link #pushdownLogLines(String)}, counting only the lines that
+     * also contain {@code detail} (for example {@code "in 3 scans"}).
+     */
+    private static long pushdownLogLines(String indexName, String detail) throws IOException {
         Path clustersDir = sharedRoot().resolveSibling("testclusters");
         assertTrue("testclusters directory not found at " + clustersDir, Files.isDirectory(clustersDir));
         String marker = "lance.dispatch: aggregation pushdown for [" + indexName + "]";
@@ -689,7 +743,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                     continue;
                 }
                 for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
-                    if (line.contains(marker)) {
+                    if (line.contains(marker) && line.contains(detail)) {
                         count++;
                     }
                 }

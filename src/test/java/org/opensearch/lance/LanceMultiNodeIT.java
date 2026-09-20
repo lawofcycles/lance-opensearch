@@ -685,6 +685,107 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    /**
+     * The pushdown with parallel group scans on three executors: twelve
+     * fragments of 25 rows, so every node holds several fragments and
+     * cuts them into up to four scans per request. The responses have
+     * to equal the shard path and the aggregators, {@code terms} error
+     * and other counts included, and the cluster log has to show
+     * answers assembled from more than one scan.
+     */
+    public void testAggregationPushdownWithParallelScansAcrossThreeNodes() throws Exception {
+        String suffix = "mn-agg-parallel-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 12;
+        int rowsPerFragment = 25;
+        LanceTableFactory.writeInterleavedTable(scratchDir, tableName, fragments, rowsPerFragment);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        List<String> shapes = List.of(
+            "\"size\":0,\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}}}",
+            "\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":2,\"show_term_doc_count_error\":true}}}",
+            "\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":5,\"order\":{\"_key\":\"desc\"}}}}",
+            "\"size\":0,\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}},\"m\":{\"max\":{\"field\":\"ts\"}}}}}",
+            "\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":150}}},\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\"}}}",
+            "\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}},\"a\":{\"avg\":{\"field\":\"id\"}},\"c\":{\"value_count\":{\"field\":\"category\"}}}",
+            "\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"id\",\"interval\":50}}}",
+            "\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\"},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}",
+            "\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}"
+        );
+        try {
+            updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
+            updateClusterSetting("lance.aggregation.pushdown_parallelism", "4");
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+
+            List<Map<String, Object>> pushed = new ArrayList<>();
+            for (int i = 0; i < shapes.size(); i++) {
+                String shape = shapes.get(i);
+                Map<String, Object> response = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
+                pushed.add(response);
+                assertFragmentPathMatchesShardPath(indexName, shape);
+                // The size 2 terms loses groups across three partials
+                // that a single shard keeps; every other block is equal.
+                if (i != 1) {
+                    Map<String, Object> shardPath = parse(
+                        readAll(postJson("/" + indexName + "/_search", "{\"explain\":true," + shape + "}"))
+                    );
+                    assertEquals(shape, shardPath.get("aggregations"), response.get("aggregations"));
+                }
+            }
+            // 300 one row groups: each node keeps shard_size 13 of its
+            // 100 with an error of 1, whatever the number of scans it
+            // merged them from.
+            Map<String, Object> sizeTwo = pushed.get(1);
+            assertEquals(300, extractIntPath(sizeTwo, "hits", "total", "value"));
+            assertEquals(2, buckets(sizeTwo).size());
+            assertEquals(298, extractIntPath(sizeTwo, "aggregations", "by_id", "sum_other_doc_count"));
+            assertEquals(3, extractIntPath(sizeTwo, "aggregations", "by_id", "doc_count_error_upper_bound"));
+
+            updateClusterSetting("lance.aggregation.pushdown", "false");
+            try {
+                for (int i = 0; i < shapes.size(); i++) {
+                    Map<String, Object> viaAggregators = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(i) + "}")));
+                    assertEquals(shapes.get(i), viaAggregators.get("aggregations"), pushed.get(i).get("aggregations"));
+                    assertEquals(shapes.get(i), viaAggregators.get("hits"), pushed.get(i).get("hits"));
+                }
+            } finally {
+                updateClusterSetting("lance.aggregation.pushdown", null);
+            }
+            // Every executor announced its answers, and with twelve
+            // fragments over three nodes at least one of them merged
+            // more than one scan.
+            assertBusy(() -> {
+                Set<String> nodes = new HashSet<>();
+                boolean severalScans = false;
+                for (String line : clusterLogLines()) {
+                    if (!line.contains("lance.dispatch: aggregation pushdown for [" + indexName + "]")) {
+                        continue;
+                    }
+                    nodes.add(loggingNodeName(line));
+                    if (!line.contains(" in 1 scans ")) {
+                        severalScans = true;
+                    }
+                }
+                assertEquals("pushdown answers logged on " + nodes, dataNodeCount(), nodes.size());
+                assertTrue("no executor merged more than one scan", severalScans);
+            });
+        } finally {
+            try {
+                updateClusterSetting("lance.aggregation.pushdown_parallelism", null);
+            } catch (Exception ignored) {}
+            try {
+                updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", null);
+            } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     /** Name of the elected cluster manager, from {@code GET /_cat/cluster_manager}. */
     private static String clusterManagerNodeName() throws IOException {
         String name = readAll(client().performRequest(new Request("GET", "/_cat/cluster_manager?h=node"))).trim();
