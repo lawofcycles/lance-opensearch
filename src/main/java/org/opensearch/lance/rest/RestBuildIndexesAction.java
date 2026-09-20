@@ -20,15 +20,17 @@ import org.opensearch.rest.action.RestToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
- * POST /_lance/build_indexes/{index} [{"columns": [...], "fragment_ids": [...], "optimize": bool, "retrain": bool, "tokenizer": "..."}]
+ * POST /_lance/build_indexes/{index} [{"columns": [...], "fts_columns": [...], "fragment_ids": [...], "optimize": bool, "retrain": bool, "tokenizer": "..."}]
  *
  * Manual index build endpoint. The handler parses the body and hands a
  * {@link LanceBuildIndexesRequest} to {@link LanceBuildIndexesAction};
  * resolving the table, running the Lance builders, and refreshing the
  * index happen in the transport action so a security plugin evaluates
  * the caller's index-level privilege before the plugin opens the table.
- * {@code tokenizer} is forwarded to Lance as the FTS {@code base_tokenizer}
- * without an allowlist; validation of the name is Lance's.
+ * {@code fts_columns} names Utf8 columns that receive a new FTS index;
+ * {@code tokenizer} is forwarded to Lance as that index's
+ * {@code base_tokenizer} without an allowlist, so validation of the name
+ * is Lance's.
  */
 public class RestBuildIndexesAction extends BaseRestHandler {
 
@@ -54,6 +56,7 @@ public class RestBuildIndexesAction extends BaseRestHandler {
         List<Number> fragmentIdsRaw = (List<Number>) body.get("fragment_ids");
         boolean optimize = Boolean.TRUE.equals(body.get("optimize"));
         boolean retrain = Boolean.TRUE.equals(body.get("retrain"));
+        Object ftsColumnsRaw = body.get("fts_columns");
         Object tokenizerRaw = body.get("tokenizer");
 
         if (optimize && fragmentIdsRaw != null) {
@@ -67,6 +70,11 @@ public class RestBuildIndexesAction extends BaseRestHandler {
         if (retrain && !optimize) {
             return channel -> channel.sendResponse(
                 new BytesRestResponse(RestStatus.BAD_REQUEST, "retrain is only valid with optimize=true")
+            );
+        }
+        if (ftsColumnsRaw != null && !isStringList(ftsColumnsRaw)) {
+            return channel -> channel.sendResponse(
+                new BytesRestResponse(RestStatus.BAD_REQUEST, "fts_columns must be an array of Utf8 column names, saw " + ftsColumnsRaw)
             );
         }
         if (tokenizerRaw != null && !(tokenizerRaw instanceof String)) {
@@ -85,14 +93,29 @@ public class RestBuildIndexesAction extends BaseRestHandler {
                 fragmentIds.add(n.intValue());
             }
         }
+        @SuppressWarnings("unchecked")
+        List<String> ftsColumns = (List<String>) ftsColumnsRaw;
         LanceBuildIndexesRequest build = new LanceBuildIndexesRequest(
             indexName,
             columnsFilterRaw,
+            ftsColumns,
             fragmentIds,
             optimize,
             retrain,
             (String) tokenizerRaw
         );
         return channel -> client.execute(LanceBuildIndexesAction.INSTANCE, build, new RestToXContentListener<>(channel));
+    }
+
+    private static boolean isStringList(Object value) {
+        if (!(value instanceof List<?> list)) {
+            return false;
+        }
+        for (Object element : list) {
+            if (!(element instanceof String)) {
+                return false;
+            }
+        }
+        return true;
     }
 }

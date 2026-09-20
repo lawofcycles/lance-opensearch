@@ -26,6 +26,7 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
 
     private final String index;
     private final List<String> columns;
+    private final List<String> ftsColumns;
     private final List<Integer> fragmentIds;
     private final boolean optimize;
     private final boolean retrain;
@@ -35,6 +36,13 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
      * @param index       OpenSearch index whose Lance table gets the indexes.
      * @param columns     restrict the build to these columns, or {@code null}
      *                    for every indexable column.
+     * @param ftsColumns  Utf8 columns that receive an FTS (inverted) index in
+     *                    this build even though they carry none yet, or
+     *                    {@code null}. Without this list a Utf8 column
+     *                    without an FTS index is a keyword column and gets a
+     *                    BTree index instead. Columns named here are left out
+     *                    of the scalar build. Not accepted together with
+     *                    {@code optimize}.
      * @param fragmentIds build only over these fragments, or {@code null} for
      *                    the whole table. Not accepted together with
      *                    {@code optimize}.
@@ -43,13 +51,14 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
      * @param retrain     with {@code optimize}, rebuild instead of merging.
      * @param tokenizer   Lance {@code base_tokenizer} for the FTS indexes this
      *                    request creates, or {@code null} for Lance's
-     *                    {@code simple}. Passed to Lance verbatim. Only valid
-     *                    without {@code optimize}: an existing index keeps the
-     *                    tokenizer it was built with.
+     *                    {@code simple}. Passed to Lance verbatim. Requires
+     *                    {@code ftsColumns}, because an existing index keeps
+     *                    the tokenizer it was built with.
      */
     public LanceBuildIndexesRequest(
         String index,
         List<String> columns,
+        List<String> ftsColumns,
         List<Integer> fragmentIds,
         boolean optimize,
         boolean retrain,
@@ -57,6 +66,7 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
     ) {
         this.index = index;
         this.columns = columns == null ? null : List.copyOf(columns);
+        this.ftsColumns = ftsColumns == null ? null : List.copyOf(ftsColumns);
         this.fragmentIds = fragmentIds == null ? null : List.copyOf(fragmentIds);
         this.optimize = optimize;
         this.retrain = retrain;
@@ -70,6 +80,7 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
         this.fragmentIds = in.readBoolean() ? in.readList(StreamInput::readVInt) : null;
         this.optimize = in.readBoolean();
         this.retrain = in.readBoolean();
+        this.ftsColumns = in.readOptionalStringList();
         this.tokenizer = in.readOptionalString();
     }
 
@@ -86,6 +97,7 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
         }
         out.writeBoolean(optimize);
         out.writeBoolean(retrain);
+        out.writeOptionalStringCollection(ftsColumns);
         out.writeOptionalString(tokenizer);
     }
 
@@ -104,11 +116,21 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
         if (retrain && !optimize) {
             ex = add(ex, "retrain is only valid with optimize=true");
         }
+        if (ftsColumns != null && ftsColumns.isEmpty()) {
+            ex = add(ex, "fts_columns must name at least one Utf8 column; omit it to build no new FTS index");
+        }
+        if (ftsColumns != null && optimize) {
+            ex = add(ex, "fts_columns is only valid with optimize=false (optimize extends existing indexes and creates none)");
+        }
         if (tokenizer != null && tokenizer.isEmpty()) {
             ex = add(ex, "tokenizer must not be empty; omit it to use Lance's default (simple)");
         }
-        if (tokenizer != null && optimize) {
-            ex = add(ex, "tokenizer is only valid with optimize=false (an existing FTS index keeps the tokenizer it was built with)");
+        if (tokenizer != null && ftsColumns == null) {
+            ex = add(
+                ex,
+                "tokenizer applies to the FTS indexes this request creates; name them in fts_columns "
+                    + "(an existing FTS index keeps the tokenizer it was built with)"
+            );
         }
         return ex;
     }
@@ -138,6 +160,14 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
     /** Column filter, or {@code null} when every indexable column is a target. */
     public List<String> columns() {
         return columns;
+    }
+
+    /**
+     * Utf8 columns that get a new FTS index in this build, or {@code null}
+     * when the request creates no FTS index.
+     */
+    public List<String> ftsColumns() {
+        return ftsColumns;
     }
 
     /** Fragment filter, or {@code null} for the whole table. */

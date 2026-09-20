@@ -10,6 +10,8 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.lance.Dataset;
 import org.opensearch.action.ActionRunnable;
 import org.opensearch.action.admin.indices.refresh.RefreshRequest;
@@ -47,9 +49,11 @@ import org.opensearch.transport.client.Client;
  *       columns discovered by {@link RestAttachAction#derive}. Columns
  *       already carrying an index are skipped. {@code fragment_ids}
  *       produces a partial initial index over the requested fragments
- *       only. {@code tokenizer} names the Lance {@code base_tokenizer}
- *       for the FTS indexes this call creates (default {@code simple});
- *       Lance's rejection of the name comes back as 400.</li>
+ *       only. {@code fts_columns} names Utf8 columns that get an FTS
+ *       index instead of the BTree a keyword column would otherwise
+ *       receive; {@code tokenizer} names the Lance {@code base_tokenizer}
+ *       for those indexes (default {@code simple}), and Lance's rejection
+ *       of the name comes back as 400.</li>
  *   <li>{@code optimize=true} runs {@link Dataset#optimizeIndices} for the
  *       filtered indexes. Lance incrementally merges fragments not yet
  *       covered. {@code retrain=true} rebuilds the index (vector codebook
@@ -133,9 +137,28 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
                     }
                 }
             }
-            Set<String> ftsTarget = filter(derivation.ftsColumns(), columnsFilter);
-            Set<String> scalarTarget = filter(derivation.scalarColumns(), columnsFilter);
+            Set<String> ftsTarget = new LinkedHashSet<>(filter(derivation.ftsColumns(), columnsFilter));
+            Set<String> scalarTarget = new LinkedHashSet<>(filter(derivation.scalarColumns(), columnsFilter));
             Set<String> vectorTarget = filter(derivation.vectorColumns(), columnsFilter);
+            if (request.ftsColumns() != null) {
+                // derive() classifies a Utf8 column by the indexes it
+                // already carries: with an FTS index it is lance_text and
+                // sits in ftsColumns, without one it is keyword and sits in
+                // scalarColumns. A first FTS build therefore needs the
+                // caller to name the column; move it from the scalar
+                // target to the FTS target so it gets an inverted index
+                // rather than a BTree.
+                Set<String> utf8 = utf8Columns(dataset);
+                for (String c : request.ftsColumns()) {
+                    if (!utf8.contains(c)) {
+                        throw new IllegalArgumentException(
+                            "fts_columns entry [" + c + "] is not a Utf8 column of the table; Utf8 columns are " + utf8
+                        );
+                    }
+                    ftsTarget.add(c);
+                    scalarTarget.remove(c);
+                }
+            }
             if (request.optimize()) {
                 // Optimize path: hand the actual Lance index names (via
                 // describeIndices) to OptimizeIndices instead of assuming the
@@ -168,6 +191,16 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
                 new RefreshRequest(indexName),
                 ActionListener.wrap((RefreshResponse r) -> listener.onResponse(response), listener::onFailure)
             );
+    }
+
+    private static Set<String> utf8Columns(Dataset dataset) {
+        Set<String> utf8 = new LinkedHashSet<>();
+        for (Field field : dataset.getSchema().getFields()) {
+            if (field.getType() instanceof ArrowType.Utf8) {
+                utf8.add(field.getName());
+            }
+        }
+        return utf8;
     }
 
     private static Set<String> filter(Set<String> derivedColumns, Set<String> columnsFilter) {
