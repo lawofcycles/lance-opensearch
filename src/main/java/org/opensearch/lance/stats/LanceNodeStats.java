@@ -17,7 +17,8 @@ import org.opensearch.core.xcontent.XContentBuilder;
 /**
  * One node's view of the plugin's caches at the moment
  * {@link LanceStatsCollector#collect()} ran: the snapshot cache, the
- * off-heap column store, the native memory the {@code lance_native}
+ * off-heap column store and the heap columns its misses put on the
+ * request breaker, the native memory the {@code lance_native}
  * breaker accounts for, the index cache's capacity and shard layout and
  * the full-text probe limit in force. Read only; every number is a plain
  * counter or gauge read from the owning component.
@@ -42,6 +43,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     private final long columnStoreLoads;
     private final long columnStoreEvictions;
     private final long columnStoreBudgetMisses;
+    private final long heapFallbackBytes;
+    private final long heapFallbackRejections;
 
     private final long nativeEstimatedBytes;
     private final long sessionBytes;
@@ -65,6 +68,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         long columnStoreLoads,
         long columnStoreEvictions,
         long columnStoreBudgetMisses,
+        long heapFallbackBytes,
+        long heapFallbackRejections,
         long nativeEstimatedBytes,
         long sessionBytes,
         long indexCacheCapacityBytes,
@@ -85,6 +90,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.columnStoreLoads = columnStoreLoads;
         this.columnStoreEvictions = columnStoreEvictions;
         this.columnStoreBudgetMisses = columnStoreBudgetMisses;
+        this.heapFallbackBytes = heapFallbackBytes;
+        this.heapFallbackRejections = heapFallbackRejections;
         this.nativeEstimatedBytes = nativeEstimatedBytes;
         this.sessionBytes = sessionBytes;
         this.indexCacheCapacityBytes = indexCacheCapacityBytes;
@@ -107,6 +114,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.columnStoreLoads = in.readVLong();
         this.columnStoreEvictions = in.readVLong();
         this.columnStoreBudgetMisses = in.readVLong();
+        this.heapFallbackBytes = in.readVLong();
+        this.heapFallbackRejections = in.readVLong();
         this.nativeEstimatedBytes = in.readLong();
         this.sessionBytes = in.readLong();
         this.indexCacheCapacityBytes = in.readVLong();
@@ -130,6 +139,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         out.writeVLong(columnStoreLoads);
         out.writeVLong(columnStoreEvictions);
         out.writeVLong(columnStoreBudgetMisses);
+        out.writeVLong(heapFallbackBytes);
+        out.writeVLong(heapFallbackRejections);
         out.writeLong(nativeEstimatedBytes);
         out.writeLong(sessionBytes);
         out.writeVLong(indexCacheCapacityBytes);
@@ -157,6 +168,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.field("loads", columnStoreLoads);
         builder.field("evictions", columnStoreEvictions);
         builder.field("budget_misses", columnStoreBudgetMisses);
+        builder.field("heap_fallback_bytes", heapFallbackBytes);
+        builder.field("heap_fallback_rejections", heapFallbackRejections);
         builder.endObject();
 
         builder.startObject("native_memory");
@@ -226,6 +239,16 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         return columnStoreBudgetMisses;
     }
 
+    /** Heap bytes open readers on the node currently have charged to the request breaker for columns the store could not hold. */
+    public long heapFallbackBytes() {
+        return heapFallbackBytes;
+    }
+
+    /** Heap column loads the request breaker refused (each one ended a request with HTTP 429). */
+    public long heapFallbackRejections() {
+        return heapFallbackRejections;
+    }
+
     public long nativeEstimatedBytes() {
         return nativeEstimatedBytes;
     }
@@ -271,6 +294,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && columnStoreLoads == other.columnStoreLoads
             && columnStoreEvictions == other.columnStoreEvictions
             && columnStoreBudgetMisses == other.columnStoreBudgetMisses
+            && heapFallbackBytes == other.heapFallbackBytes
+            && heapFallbackRejections == other.heapFallbackRejections
             && nativeEstimatedBytes == other.nativeEstimatedBytes
             && sessionBytes == other.sessionBytes
             && indexCacheCapacityBytes == other.indexCacheCapacityBytes
@@ -295,6 +320,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             columnStoreLoads,
             columnStoreEvictions,
             columnStoreBudgetMisses,
+            heapFallbackBytes,
+            heapFallbackRejections,
             nativeEstimatedBytes,
             sessionBytes,
             indexCacheCapacityBytes,

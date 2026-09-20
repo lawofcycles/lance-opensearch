@@ -12,6 +12,7 @@ import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.lance.LanceCircuitBreaker;
 import org.opensearch.lance.NativeMemoryLimit.IndexCacheSizing;
 import org.opensearch.lance.engine.ColumnStore;
+import org.opensearch.lance.engine.HeapFallbackStats;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.query.LanceFtsQuery;
 
@@ -26,7 +27,10 @@ import org.opensearch.lance.query.LanceFtsQuery;
  * most), while {@code session_bytes} and {@code column_store_bytes} are
  * read live, so the sum of the two can differ from the estimate by up to
  * one sampling interval of growth. The index cache capacity, shard count
- * and shard share are fixed at startup.
+ * and shard share are fixed at startup. {@code column_store.heap_fallback_bytes}
+ * and {@code heap_fallback_rejections} come from {@link HeapFallbackStats}
+ * and are reported whether or not the node has a snapshot cache, since a
+ * reader opened without one loads every column into heap.
  */
 public final class LanceStatsCollector {
 
@@ -61,6 +65,8 @@ public final class LanceStatsCollector {
         int indexCacheShards = sizing == null ? 0 : sizing.shards();
         long indexCacheShardShare = sizing == null ? 0L : sizing.shardShareBytes();
         int probeLimit = LanceFtsQuery.subsetProbeLimit();
+        long heapFallbackBytes = HeapFallbackStats.bytes();
+        long heapFallbackRejections = HeapFallbackStats.rejections();
         if (warmCache == null) {
             return new LanceNodeStats(
                 false,
@@ -76,6 +82,8 @@ public final class LanceStatsCollector {
                 0L,
                 0L,
                 0L,
+                heapFallbackBytes,
+                heapFallbackRejections,
                 estimatedBytes,
                 session,
                 indexCacheCapacity,
@@ -99,6 +107,8 @@ public final class LanceStatsCollector {
             store.loadCount(),
             store.evictionCount(),
             store.budgetMissCount(),
+            heapFallbackBytes,
+            heapFallbackRejections,
             estimatedBytes,
             session,
             indexCacheCapacity,

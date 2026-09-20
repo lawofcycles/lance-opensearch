@@ -53,6 +53,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             5L,
             2L,
             1L,
+            2048L,
+            3L,
             5000L,
             900L,
             17_179_869_183L,
@@ -84,7 +86,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 "{\"snapshots\":{\"enabled\":true,\"count\":3,\"retired\":1,\"dataset_open_count\":7,\"snapshot_build_count\":4,"
                     + "\"snapshot_hit_count\":12},"
                     + "\"column_store\":{\"bytes\":4096,\"limit_bytes\":65536,\"entries\":9,\"hits\":30,\"loads\":5,\"evictions\":2,"
-                    + "\"budget_misses\":1},"
+                    + "\"budget_misses\":1,\"heap_fallback_bytes\":2048,\"heap_fallback_rejections\":3},"
                     + "\"native_memory\":{\"estimated_bytes\":5000,\"session_bytes\":900,\"column_store_bytes\":4096,"
                     + "\"index_cache_capacity\":17179869183,\"index_cache_shards\":2,\"index_cache_shard_share\":8589934591},"
                     + "\"fts\":{\"subset_probe_limit\":1000000}}",
