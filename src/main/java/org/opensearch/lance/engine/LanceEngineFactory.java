@@ -34,6 +34,9 @@ import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.common.lucene.uid.VersionsAndSeqNoResolver.DocIdAndVersion;
+import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.common.breaker.NoopCircuitBreaker;
+import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineException;
@@ -390,7 +393,9 @@ public final class LanceEngineFactory implements EngineFactory {
          * reader is a view over the node's snapshot of that version, the
          * one the fragment path reads too, and owns a lease on it that
          * {@link LanceDirectoryReader#doClose} releases; without one the
-         * reader opens and owns its own dataset.
+         * reader opens and owns its own dataset. Either way the reader
+         * charges the columns it materialises in heap to the node's
+         * request breaker ({@link #requestBreaker()}).
          */
         OpenSearchDirectoryReader openLanceReader(Optional<Long> version) throws IOException {
             Directory directory = engineConfig.getStore().directory();
@@ -408,7 +413,7 @@ public final class LanceEngineFactory implements EngineFactory {
             OpenSearchDirectoryReader wrapped = null;
             LanceDirectoryReader reader = null;
             try {
-                reader = LanceDirectoryReader.open(directory, commit, dataset, field, pkType, multiFields);
+                reader = LanceDirectoryReader.open(directory, commit, dataset, field, pkType, multiFields, requestBreaker());
                 wrapped = OpenSearchDirectoryReader.wrap(reader, config().getShardId());
                 return wrapped;
             } catch (Throwable t) {
@@ -448,7 +453,8 @@ public final class LanceEngineFactory implements EngineFactory {
                 directory,
                 commit,
                 lease,
-                lease.snapshot().isCached() ? warmCache.columnStore() : null
+                lease.snapshot().isCached() ? warmCache.columnStore() : null,
+                requestBreaker()
             );
             try {
                 return OpenSearchDirectoryReader.wrap(reader, config().getShardId());
@@ -460,6 +466,17 @@ public final class LanceEngineFactory implements EngineFactory {
                 }
                 throw t;
             }
+        }
+
+        /**
+         * The node's request circuit breaker, which the shard reader charges
+         * for every column it materialises in heap. The engine test
+         * harness builds its {@link EngineConfig} without a breaker
+         * service; that case gets a {@link NoopCircuitBreaker}.
+         */
+        private CircuitBreaker requestBreaker() {
+            CircuitBreakerService breakers = engineConfig.getCircuitBreakerService();
+            return breakers == null ? new NoopCircuitBreaker(CircuitBreaker.REQUEST) : breakers.getBreaker(CircuitBreaker.REQUEST);
         }
 
         @Override
