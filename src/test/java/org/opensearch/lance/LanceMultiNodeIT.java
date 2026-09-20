@@ -356,7 +356,11 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * hit ids and order, scores, sort values, {@code hits.total},
      * and terms buckets. The interleaved fixture gives every row a
      * distinct score for {@code lance} and a unique token
-     * {@code tok<i>}, so a top 10 has no tie at its boundary.
+     * {@code tok<i>}, so a top 10 has no tie at its boundary. The
+     * shapes with {@code track_total_hits: 50} sit below the 300
+     * matches of {@code lance}, so the bounded count on a subset
+     * executor fills its scan and the merged total must be the bound
+     * with {@code gte}.
      */
     public void testFtsOnSubsetExecutorsMatchesWholeTableAnswer() throws Exception {
         String suffix = "mn-fts-subset-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
@@ -371,6 +375,10 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String manyHits = "{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}}";
         String terms = "\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}}}";
         String filtered = "{\"bool\":{\"must\":[" + manyHits + "],\"filter\":[{\"term\":{\"category\":\"c1\"}}]}}";
+        // Below the 300 matches of manyHits, so the bounded count on
+        // every subset executor fills its scan and hits.total is a
+        // lower bound.
+        String bound = "\"track_total_hits\":50";
         List<String> shapes = List.of(
             "\"size\":10,\"query\":" + oneHit,
             "\"size\":10,\"query\":" + manyHits,
@@ -379,7 +387,11 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "\"size\":10,\"query\":" + filtered,
             "\"size\":10,\"track_total_hits\":true,\"query\":" + manyHits,
             "\"size\":0,\"query\":" + oneHit + "," + terms,
-            "\"size\":0,\"query\":" + manyHits + "," + terms
+            "\"size\":0,\"query\":" + manyHits + "," + terms,
+            "\"size\":10," + bound + ",\"query\":" + manyHits,
+            "\"size\":0," + bound + ",\"query\":" + manyHits,
+            "\"size\":10," + bound + ",\"query\":" + manyHits + ",\"sort\":[{\"ts\":\"desc\"}]",
+            "\"size\":10," + bound + ",\"query\":" + oneHit
         );
         try {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
@@ -399,6 +411,23 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             Map<String, Object> single = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(0) + "}")));
             assertEquals(List.of(137), sourceIds(single));
             assertEquals(1, extractIntPath(single, "hits", "total", "value"));
+
+            // Analytic check of the bounded total, independent of the
+            // oracle. 300 rows match and the bound is 50, so every
+            // executor's count scan (limit 51 over the whole table)
+            // fills up while its own share of those 51 rows is about
+            // a third; the executor must report the bound from the
+            // filled scan, not from its share, or the coordinator
+            // would sum the shares and answer eq with a value that is
+            // neither the total nor the bound.
+            for (String shape : shapes.subList(8, 11)) {
+                Map<String, Object> bounded = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
+                assertEquals(shape, 50, extractIntPath(bounded, "hits", "total", "value"));
+                assertEquals(shape, "gte", relation(bounded));
+            }
+            Map<String, Object> boundedSingle = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(11) + "}")));
+            assertEquals(1, extractIntPath(boundedSingle, "hits", "total", "value"));
+            assertEquals("eq", relation(boundedSingle));
 
             // With the probe limit below the match count, the shapes
             // that need every match repeat their scan restricted to the
