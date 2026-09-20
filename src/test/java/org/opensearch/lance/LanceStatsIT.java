@@ -26,7 +26,14 @@ public class LanceStatsIT extends LanceRestTestCase {
 
     public void testStatsReportSnapshotSharingAndColumnStoreTraffic() throws Exception {
         // The hint fixture has 2 fragments of 100 rows with a nullable
-        // int rating.
+        // int rating. The column store traffic below comes from the
+        // Lucene aggregator reading rating through the fragment leaf
+        // reader; with the aggregation pushdown on, a size 0 sum runs
+        // inside the Lance scan and never touches the store, so the
+        // pushdown is turned off for this test.
+        Request disablePushdown = new Request("PUT", "/_cluster/settings");
+        disablePushdown.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":false}}");
+        client().performRequest(disablePushdown);
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(2, 100, "stats")) {
             String index = fixture.indexName();
 
@@ -107,6 +114,10 @@ public class LanceStatsIT extends LanceRestTestCase {
                 assertEquals(0, columnStore(afterDelete).get("entries"));
                 assertEquals(0L, ((Number) columnStore(afterDelete).get("bytes")).longValue());
             });
+        } finally {
+            Request enablePushdown = new Request("PUT", "/_cluster/settings");
+            enablePushdown.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":null}}");
+            client().performRequest(enablePushdown);
         }
     }
 
