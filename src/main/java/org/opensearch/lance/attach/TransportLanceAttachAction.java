@@ -31,6 +31,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.lance.LanceInternalHeaders;
 import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -185,7 +186,47 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions(), openVersion)) {
             derivation = RestAttachAction.derive(dataset, request.multiFields());
         }
+        warnIfInvertedIndexExceedsShardShare(indexName, derivation);
         createIndex(indexName, table, derivation, request.storageOptions(), request.pinnedVersion(), request.tag(), listener);
+    }
+
+    private static void warnIfInvertedIndexExceedsShardShare(String indexName, RestAttachAction.Derivation derivation) {
+        String warning = invertedIndexShardShareWarning(indexName, derivation, LanceRegistry.indexCacheSizing());
+        if (warning != null) {
+            LOG.warn(warning);
+        }
+    }
+
+    /**
+     * Lance keeps the whole document set of an inverted index as one
+     * index cache entry and refuses an entry heavier than one cache
+     * shard's share, so a table whose inverted index does not fit is
+     * reloaded from storage on every full-text query. Returns the
+     * warning to log when the table has a full-text column and its
+     * estimated entry is heavier than the share, {@code null} when it
+     * fits, has no full-text column, or no Session is installed. The
+     * estimate is per full-text column, so it is compared once per
+     * table.
+     */
+    static String invertedIndexShardShareWarning(
+        String indexName,
+        RestAttachAction.Derivation derivation,
+        NativeMemoryLimit.IndexCacheSizing sizing
+    ) {
+        if (derivation.ftsColumns().isEmpty() || sizing == null) {
+            return null;
+        }
+        long estimate = NativeMemoryLimit.invertedIndexEntryEstimateBytes(derivation.rows());
+        if (estimate <= sizing.shardShareBytes()) {
+            return null;
+        }
+        return "inverted index of ["
+            + indexName
+            + "] (~"
+            + NativeMemoryLimit.humanReadable(estimate)
+            + ") may not fit one index cache shard ("
+            + NativeMemoryLimit.humanReadable(sizing.shardShareBytes())
+            + "); raise lance.native_memory.limit or lower lance.cache.column_share";
     }
 
     private void createIndex(
