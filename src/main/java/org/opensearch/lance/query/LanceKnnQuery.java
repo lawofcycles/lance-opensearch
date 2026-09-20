@@ -86,34 +86,13 @@ public final class LanceKnnQuery extends Query {
         return new LanceKnnWeight(this, boost);
     }
 
-    /**
-     * Per-fragment result buckets for a single shard-wide Lance scan.
-     * Sizes are typically at most {@code k} per fragment, so the arrays
-     * grow geometrically from a small initial capacity.
-     */
-    static final class FragmentHits {
-        int[] offsets = new int[Math.max(1, 8)];
-        float[] distances = new float[offsets.length];
-        int size = 0;
-
-        void add(int offset, float distance) {
-            if (size == offsets.length) {
-                offsets = Arrays.copyOf(offsets, offsets.length * 2);
-                distances = Arrays.copyOf(distances, distances.length * 2);
-            }
-            offsets[size] = offset;
-            distances[size] = distance;
-            size++;
-        }
-    }
-
-    private final class LanceKnnWeight extends Weight {
+    private final class LanceKnnWeight extends Weight implements LanceHintingWeight {
 
         private final float boost;
         // Cache is populated on the first Lance-backed leaf we visit and then
         // reused for every other leaf in the same shard. The volatile field is
         // set once via CAS so concurrent readers see a fully constructed map.
-        private final AtomicReference<Map<Integer, FragmentHits>> shardHits = new AtomicReference<>();
+        private final AtomicReference<Map<Integer, LanceFragmentHits>> shardHits = new AtomicReference<>();
 
         LanceKnnWeight(LanceKnnQuery query, float boost) {
             super(query);
@@ -125,51 +104,53 @@ public final class LanceKnnQuery extends Query {
             return Explanation.match(0f, "lance knn");
         }
 
+        /**
+         * The k nearest rows of the shard that fall into {@code leaf}'s
+         * fragment, running the scan on first use. Same as
+         * LanceFtsQuery: a leaf outside the k nearest rows gets an
+         * empty hit set rather than null, so Lucene's BulkScorer
+         * request reaches it and the leaf learns that nothing will be
+         * collected there.
+         */
+        private LanceFragmentHits leafHits(LanceFragmentLeafReader leaf) throws IOException {
+            LanceFragmentHits hits = ensureShardScan(leaf).get(leaf.fragmentId());
+            return hits == null ? LanceFragmentHits.EMPTY : hits;
+        }
+
+        @Override
+        public void hintExclusive(LeafReaderContext context) throws IOException {
+            LanceFragmentLeafReader leaf = LanceFragmentLeafReader.unwrap(context.reader());
+            if (leaf == null) {
+                return;
+            }
+            leaf.hintMatchedOffsets(leafHits(leaf).sortedDocIds(), LanceFragmentLeafReader.wrappedOnlyByOwnReaders(context.reader()));
+        }
+
         @Override
         public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
             LanceFragmentLeafReader leaf = LanceFragmentLeafReader.unwrap(context.reader());
             if (leaf == null) {
                 return null;
             }
-            Map<Integer, FragmentHits> hitsByFragment = ensureShardScan(leaf);
-            FragmentHits hits = hitsByFragment.get(leaf.fragmentId());
-            // Same as LanceFtsQuery: a leaf outside the k nearest rows
-            // gets a supplier over an empty hit set rather than null, so
-            // Lucene's BulkScorer request reaches it and the leaf learns
-            // that nothing will be collected there.
-            int hitCount = hits == null ? 0 : hits.size;
-
-            // FragmentHits.offsets / distances is already the sparse
-            // list Lance's nearest scan returned for this fragment,
-            // so materialise the hit set directly rather than
-            // allocating float[maxDoc] and FixedBitSet(maxDoc). On
-            // a 250k-row fragment this drops per-fragment heap from
-            // 1 MB + 31 KB to 8 bytes * hits.size (typically <= k),
-            // which is what keeps 64 concurrent queries over 80
-            // fragments under the parent breaker.
-            //
-            // Lance's nearest scan returns rows in score order; the
-            // Lucene DocIdSetIterator contract asks for ascending
-            // docIds, so pack (offset, score) into longs, sort, and
-            // hand a LanceSparseHitIterator to the Scorer.
-            long[] packed = new long[hitCount];
-            for (int i = 0; i < hitCount; i++) {
-                int offset = hits.offsets[i];
-                float score = boost / (1f + hits.distances[i]);
-                packed[i] = ((long) offset << 32) | (Float.floatToIntBits(score) & 0xFFFFFFFFL);
-            }
-            Arrays.sort(packed);
-            int[] docIds = new int[hitCount];
-            float[] hitScores = new float[hitCount];
-            for (int i = 0; i < hitCount; i++) {
-                docIds[i] = (int) (packed[i] >>> 32);
-                hitScores[i] = Float.intBitsToFloat((int) (packed[i] & 0xFFFFFFFFL));
-            }
+            LanceFragmentHits hits = leafHits(leaf);
+            // The hit set is the sparse list Lance's nearest scan
+            // returned for this fragment, materialised directly rather
+            // than through float[maxDoc] and FixedBitSet(maxDoc). On a
+            // 250k-row fragment this keeps per-fragment heap at 8 bytes
+            // per hit (typically <= k) instead of 1 MB + 31 KB, which is
+            // what keeps 64 concurrent queries over 80 fragments under
+            // the parent breaker. Lance returns rows in score order and
+            // the Lucene DocIdSetIterator contract asks for ascending
+            // docIds, so the sorted view is used; it is the same array
+            // every other supplier and hint of this Weight sees for the
+            // fragment.
+            int[] docIds = hits.sortedDocIds();
+            float[] hitScores = hits.sortedScores();
             // Same hint protocol as LanceFtsQuery: the leaf learns the
             // k nearest rows of this fragment so sort and aggregation
             // columns are fetched for those rows only.
             leaf.hintMatchedOffsets(docIds, false);
-            LanceSparseHitIterator iterator = new LanceSparseHitIterator(docIds, hitScores, hitCount);
+            LanceSparseHitIterator iterator = new LanceSparseHitIterator(docIds, hitScores, docIds.length);
             Scorer scorer = new Scorer() {
                 @Override
                 public DocIdSetIterator iterator() {
@@ -198,8 +179,8 @@ public final class LanceKnnQuery extends Query {
             return new LanceHintingScorerSupplier(scorer, leaf, docIds, LanceFragmentLeafReader.wrappedOnlyByOwnReaders(context.reader()));
         }
 
-        private Map<Integer, FragmentHits> ensureShardScan(LanceFragmentLeafReader leaf) throws IOException {
-            Map<Integer, FragmentHits> cached = shardHits.get();
+        private Map<Integer, LanceFragmentHits> ensureShardScan(LanceFragmentLeafReader leaf) throws IOException {
+            Map<Integer, LanceFragmentHits> cached = shardHits.get();
             if (cached != null) {
                 return cached;
             }
@@ -208,7 +189,7 @@ public final class LanceKnnQuery extends Query {
             // breaker has already tripped so we do not push the cache
             // past its budget mid-query.
             LanceCircuitBreaker.checkAndTrip("lance_knn_query");
-            Map<Integer, FragmentHits> fresh = new HashMap<>();
+            Map<Integer, LanceFragmentHits> fresh = new HashMap<>();
             org.lance.ipc.Query.Builder qb = new org.lance.ipc.Query.Builder().setColumn(column).setKey(vector).setK(k);
             if (nprobes != null) {
                 qb.setNprobes(nprobes);
@@ -244,7 +225,9 @@ public final class LanceKnnQuery extends Query {
                         long addr = rowAddr.get(i);
                         int fragId = (int) (addr >>> 32);
                         int offset = (int) (addr & 0xFFFFFFFFL);
-                        fresh.computeIfAbsent(fragId, id -> new FragmentHits()).add(offset, distance.get(i));
+                        // Score = boost / (1 + distance), so a smaller
+                        // distance is a higher score.
+                        fresh.computeIfAbsent(fragId, id -> new LanceFragmentHits()).add(offset, boost / (1f + distance.get(i)));
                     }
                 }
             } catch (IOException e) {
@@ -279,7 +262,7 @@ public final class LanceKnnQuery extends Query {
     public boolean equals(Object other) {
         return other instanceof LanceKnnQuery q
             && column.equals(q.column)
-            && java.util.Arrays.equals(vector, q.vector)
+            && Arrays.equals(vector, q.vector)
             && k == q.k
             && Objects.equals(nprobes, q.nprobes)
             && Objects.equals(refineFactor, q.refineFactor)
@@ -291,6 +274,6 @@ public final class LanceKnnQuery extends Query {
 
     @Override
     public int hashCode() {
-        return Objects.hash(column, java.util.Arrays.hashCode(vector), k, nprobes, refineFactor, ef, distanceType, useIndex, filter);
+        return Objects.hash(column, Arrays.hashCode(vector), k, nprobes, refineFactor, ef, distanceType, useIndex, filter);
     }
 }

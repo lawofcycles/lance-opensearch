@@ -7,7 +7,6 @@ package org.opensearch.lance.query;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -222,34 +221,6 @@ public final class LanceFtsQuery extends Query {
     }
 
     /**
-     * Per-fragment result buckets for a single shard-wide Lance FTS
-     * scan. Sizes are typically at most the caller's scan limit for
-     * the fragments that carry hits (many fragments carry none), so
-     * the arrays grow geometrically from a small initial capacity.
-     *
-     * <p>Modelled on {@link LanceKnnQuery.FragmentHits} but stores
-     * BM25 scores (higher = better) rather than distances (lower =
-     * better). Kept as a separate class instead of shared because
-     * the field names {@code offsets}/{@code scores} read better in
-     * the FTS context than {@code offsets}/{@code distances}.
-     */
-    static final class FtsFragmentHits {
-        int[] offsets = new int[8];
-        float[] scores = new float[offsets.length];
-        int size = 0;
-
-        void add(int offset, float score) {
-            if (size == offsets.length) {
-                offsets = Arrays.copyOf(offsets, offsets.length * 2);
-                scores = Arrays.copyOf(scores, scores.length * 2);
-            }
-            offsets[size] = offset;
-            scores[size] = score;
-            size++;
-        }
-    }
-
-    /**
      * Weight for a Lance FTS query. Runs a single Lance scan across
      * every Lance-backed leaf in the shard (the "shard-level scan"
      * pattern that {@code LanceKnnQuery.LanceKnnWeight} already uses
@@ -273,15 +244,17 @@ public final class LanceFtsQuery extends Query {
      * <p>The class is public so the fragment executor, which creates
      * the Weight itself and drives hits and aggregations through it,
      * can read {@link #hitCount()} afterwards instead of running a
-     * second Lance scan to count the matches.
+     * second Lance scan to count the matches, and can deliver the hit
+     * sets to the fragment readers through {@link #hintExclusive}
+     * before it builds aggregators and sort comparators.
      */
-    public final class LanceFtsWeight extends Weight {
+    public final class LanceFtsWeight extends Weight implements LanceHintingWeight {
 
         private final float boost;
         // Cache populated by the first Lance-backed leaf we visit and
         // reused for every other leaf in the same Weight. Set once
         // via CAS so concurrent readers see a fully constructed map.
-        private final AtomicReference<Map<Integer, FtsFragmentHits>> shardHits = new AtomicReference<>();
+        private final AtomicReference<Map<Integer, LanceFragmentHits>> shardHits = new AtomicReference<>();
 
         LanceFtsWeight(LanceFtsQuery query, float boost) {
             super(query);
@@ -293,57 +266,73 @@ public final class LanceFtsQuery extends Query {
             return Explanation.match(0f, "lance fts");
         }
 
-        @Override
-        public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
-            if (!(org.apache.lucene.index.FilterLeafReader.unwrap(context.reader()) instanceof LanceFragmentLeafReader leaf)) {
-                return null;
-            }
-            // Security plugin FLS hides a field by dropping it from
-            // the wrapper reader's FieldInfos. If any referenced
-            // column is missing on this leaf's wrapper reader,
-            // contribute no hits so the caller cannot use the FTS
-            // query as a probe against the hidden data. The check
-            // stays per-leaf (rather than moving into ensureShardScan)
-            // so an FLS decision that hides the column on one leaf
-            // still leaves other leaves working.
+        /**
+         * Whether every column the query references is present on the
+         * leaf's reader. Security plugin FLS hides a field by dropping
+         * it from the wrapper reader's FieldInfos; if any referenced
+         * column is missing on this leaf's wrapper reader, the query
+         * contributes no hits so the caller cannot use it as a probe
+         * against the hidden data. The check stays per-leaf (rather
+         * than moving into ensureShardScan) so an FLS decision that
+         * hides the column on one leaf still leaves other leaves
+         * working.
+         */
+        private boolean columnsVisible(LeafReaderContext context) {
             for (String col : query().columns()) {
                 if (context.reader().getFieldInfos().fieldInfo(col) == null) {
-                    return null;
+                    return false;
                 }
             }
-            Map<Integer, FtsFragmentHits> hitsByFragment = ensureShardScan(context, leaf);
-            FtsFragmentHits hits = hitsByFragment.get(leaf.fragmentId());
-            // A leaf without hits still gets a supplier (over an empty
-            // hit set) rather than null. Lucene then asks it for a
-            // BulkScorer exactly when it would have for a leaf with
-            // hits, and the leaf learns that nothing will be collected
-            // on it; a keyword terms aggregation built after the hits
-            // phase can then skip the leaf's dictionary instead of
-            // loading it for the global ordinal map.
-            int hitCount = hits == null ? 0 : hits.size;
-            // Pack (offset, score) into longs sorted by offset so
-            // the Lucene DocIdSetIterator contract (ascending docIds)
-            // is satisfied. Offsets are non-negative ints so signed
-            // long ordering is docId-ascending.
-            long[] packed = new long[hitCount];
-            for (int i = 0; i < hitCount; i++) {
-                int offset = hits.offsets[i];
-                float s = hits.scores[i];
-                packed[i] = ((long) offset << 32) | (Float.floatToIntBits(s) & 0xFFFFFFFFL);
+            return true;
+        }
+
+        /**
+         * Hits of the shard-level scan that fall into {@code leaf}'s
+         * fragment, running the scan on first use. A leaf without hits
+         * gets {@link LanceFragmentHits#EMPTY} rather than null: it
+         * still receives a supplier over an empty hit set, so Lucene
+         * asks it for a BulkScorer exactly when it would have for a
+         * leaf with hits, and the leaf learns that nothing will be
+         * collected on it; a keyword terms aggregation built after the
+         * hits phase can then skip the leaf's dictionary instead of
+         * loading it for the global ordinal map.
+         */
+        private LanceFragmentHits leafHits(LeafReaderContext context, LanceFragmentLeafReader leaf) throws IOException {
+            LanceFragmentHits hits = ensureShardScan(context, leaf).get(leaf.fragmentId());
+            return hits == null ? LanceFragmentHits.EMPTY : hits;
+        }
+
+        @Override
+        public void hintExclusive(LeafReaderContext context) throws IOException {
+            LanceFragmentLeafReader leaf = LanceFragmentLeafReader.unwrap(context.reader());
+            if (leaf == null || !columnsVisible(context)) {
+                return;
             }
-            Arrays.sort(packed);
-            int[] docIds = new int[hitCount];
-            float[] hitScores = new float[hitCount];
-            for (int i = 0; i < hitCount; i++) {
-                docIds[i] = (int) (packed[i] >>> 32);
-                hitScores[i] = Float.intBitsToFloat((int) (packed[i] & 0xFFFFFFFFL));
+            leaf.hintMatchedOffsets(
+                leafHits(context, leaf).sortedDocIds(),
+                LanceFragmentLeafReader.wrappedOnlyByOwnReaders(context.reader())
+            );
+        }
+
+        @Override
+        public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
+            LanceFragmentLeafReader leaf = LanceFragmentLeafReader.unwrap(context.reader());
+            if (leaf == null || !columnsVisible(context)) {
+                return null;
             }
+            LanceFragmentHits hits = leafHits(context, leaf);
+            // Sorted by offset so the Lucene DocIdSetIterator contract
+            // (ascending docIds) is satisfied; the arrays are the ones
+            // every other supplier and hint of this Weight sees for
+            // the fragment.
+            int[] docIds = hits.sortedDocIds();
+            float[] hitScores = hits.sortedScores();
             // Tell the leaf which rows this Weight matched so a sort or
             // aggregation column can be fetched for those rows alone;
             // the supplier below upgrades the hint to exclusive when
             // Lucene lets this Weight drive collection on the leaf.
             leaf.hintMatchedOffsets(docIds, false);
-            LanceSparseHitIterator iterator = new LanceSparseHitIterator(docIds, hitScores, hitCount);
+            LanceSparseHitIterator iterator = new LanceSparseHitIterator(docIds, hitScores, docIds.length);
             Scorer scorer = new Scorer() {
                 @Override
                 public DocIdSetIterator iterator() {
@@ -390,19 +379,20 @@ public final class LanceFtsQuery extends Query {
          * installed.
          */
         public long hitCount() {
-            Map<Integer, FtsFragmentHits> hits = shardHits.get();
+            Map<Integer, LanceFragmentHits> hits = shardHits.get();
             if (hits == null) {
                 return -1L;
             }
             long total = 0L;
-            for (FtsFragmentHits fragmentHits : hits.values()) {
-                total += fragmentHits.size;
+            for (LanceFragmentHits fragmentHits : hits.values()) {
+                total += fragmentHits.size();
             }
             return total;
         }
 
-        private Map<Integer, FtsFragmentHits> ensureShardScan(LeafReaderContext context, LanceFragmentLeafReader leaf) throws IOException {
-            Map<Integer, FtsFragmentHits> cached = shardHits.get();
+        private Map<Integer, LanceFragmentHits> ensureShardScan(LeafReaderContext context, LanceFragmentLeafReader leaf)
+            throws IOException {
+            Map<Integer, LanceFragmentHits> cached = shardHits.get();
             if (cached != null) {
                 return cached;
             }
@@ -441,7 +431,7 @@ public final class LanceFtsQuery extends Query {
                 // No Lance-backed leaves at all: nothing to scan.
                 // Install an empty map so subsequent scorer calls
                 // short-circuit through the cache.
-                Map<Integer, FtsFragmentHits> empty = new HashMap<>();
+                Map<Integer, LanceFragmentHits> empty = new HashMap<>();
                 shardHits.compareAndSet(null, empty);
                 return shardHits.get();
             }
@@ -484,7 +474,7 @@ public final class LanceFtsQuery extends Query {
                 builder = builder.limit(effectiveLimit);
             }
 
-            Map<Integer, FtsFragmentHits> fresh = new HashMap<>();
+            Map<Integer, LanceFragmentHits> fresh = new HashMap<>();
             try (LanceScanner scanner = leaf.dataset().newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -495,7 +485,7 @@ public final class LanceFtsQuery extends Query {
                         int fragId = (int) (addr >>> 32);
                         int offset = (int) (addr & 0xFFFFFFFFL);
                         float s = score.get(i) * boost;
-                        fresh.computeIfAbsent(fragId, id -> new FtsFragmentHits()).add(offset, s);
+                        fresh.computeIfAbsent(fragId, id -> new LanceFragmentHits()).add(offset, s);
                     }
                 }
             } catch (IOException e) {
