@@ -41,7 +41,9 @@ public class LanceSnapshotIT extends LanceRestTestCase {
         // the index, restore. The restored index follows the manifest, so
         // it reads the rows as they are at restore time, not as they were
         // when the snapshot was taken. The namespace poll must leave the
-        // restored index alone rather than surface it a second time.
+        // restored index in place rather than surface it a second time,
+        // and must take it back into its tracking so later manifest
+        // advances reach the shard engine without a manual _refresh.
         String repo = "repo-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
         String snap = "snap-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
         try (LanceTestCluster f = LanceTestCluster.setUp(6, "snapns")) {
@@ -108,20 +110,29 @@ public class LanceSnapshotIT extends LanceRestTestCase {
                 );
                 assertEquals(3, extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count"));
 
-                // The poll skips the restored index because the delete
-                // dropped it from the tracked set, so a later manifest
-                // advance reaches _search (fragment path opens the latest
-                // version per query) but not the shard engine behind
-                // _count, _stats and GET until an explicit _refresh.
+                // The delete dropped the index from the poll's tracking and
+                // the restore put it back into cluster state, so the poll
+                // adopts it again from index.lance.table. A later manifest
+                // advance therefore reaches the shard engine behind _count
+                // and _stats on the next poll cycle, not only _search
+                // (whose fragment path opens the latest version per query).
                 LanceTableFactory.deleteRows(f.tableUri(), "id >= 2");
                 Thread.sleep(3_500);
                 String searchAfter = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
                 assertEquals(2, extractIntPath(searchAfter, "hits", "total", "value"));
-                assertEquals("engine reader of an untracked restored index must not advance", 3, engineDocCount(indexName));
-                assertEquals(3, extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count"));
-                client().performRequest(new Request("POST", "/" + indexName + "/_refresh"));
-                assertEquals(2, engineDocCount(indexName));
-                assertEquals(2, extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count"));
+                assertBusy(() -> {
+                    int count = extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count");
+                    int statsCount = engineDocCount(indexName);
+                    String observed = "_count=" + count + " _stats=" + statsCount;
+                    assertEquals("engine reader of a restored index must follow the table: " + observed, 2, statsCount);
+                    assertEquals(observed, 2, count);
+                }, 10, TimeUnit.SECONDS);
+                String settingsFollowed = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
+                assertEquals(
+                    "adoption must refresh the restored index in place: " + settingsFollowed,
+                    uuid,
+                    extractPath(settingsFollowed, indexName, "settings", "index", "uuid")
+                );
             } finally {
                 try {
                     client().performRequest(new Request("DELETE", "/" + indexName));
@@ -131,6 +142,82 @@ public class LanceSnapshotIT extends LanceRestTestCase {
                 } catch (Exception ignored) {}
                 dropFsRepository(repo);
             }
+        }
+    }
+
+    public void testRestoreOfAttachedIndexFollowsTable() throws Exception {
+        // An index created through attach (no pin, no storage_options) is
+        // deleted and restored from a snapshot. The delete dropped it from
+        // the attach bookkeeping and nothing calls attach again, so the
+        // only way the poll can pick it up is from index.lance.table in
+        // cluster state. After restore, an append and a delete on the
+        // table must reach _count and _stats on the poll cadence without
+        // a manual _refresh.
+        String suffix = "snapattach-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String repo = "repo-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
+        String snap = "snap-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            ensureGreen(indexName);
+
+            putFsRepository(repo);
+            String created = snapshotIndex(repo, snap, indexName);
+            assertEquals("snapshot state: " + created, "SUCCESS", extractPath(created, "snapshot", "state"));
+
+            client().performRequest(new Request("DELETE", "/" + indexName));
+
+            String restored = restoreIndex(repo, snap, indexName, true);
+            assertEquals("restore failed shards: " + restored, 0, extractIntPath(restored, "snapshot", "shards", "failed"));
+            ensureGreen(indexName);
+
+            String settings = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
+            assertEquals(tableUri, extractPath(settings, indexName, "settings", "index", "lance", "table"));
+            String uuid = (String) extractPath(settings, indexName, "settings", "index", "uuid");
+            assertEquals(6, extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count"));
+            assertEquals(6, engineDocCount(indexName));
+
+            // Append four rows: the engine reader must move to the new
+            // manifest on the poll cadence.
+            LanceTableFactory.appendRows(tableUri, 6, 4);
+            assertBusy(() -> {
+                int count = extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count");
+                int statsCount = engineDocCount(indexName);
+                String observed = "_count=" + count + " _stats=" + statsCount;
+                assertEquals("engine reader of a restored attached index must follow an append: " + observed, 10, statsCount);
+                assertEquals(observed, 10, count);
+            }, 10, TimeUnit.SECONDS);
+
+            // And a delete, to show the following continues past the first
+            // adopted cycle.
+            LanceTableFactory.deleteRows(tableUri, "id >= 8");
+            assertBusy(() -> {
+                int count = extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count");
+                int statsCount = engineDocCount(indexName);
+                String observed = "_count=" + count + " _stats=" + statsCount;
+                assertEquals("engine reader of a restored attached index must follow a delete: " + observed, 8, statsCount);
+                assertEquals(observed, 8, count);
+            }, 10, TimeUnit.SECONDS);
+            String search = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
+            assertEquals(8, extractIntPath(search, "hits", "total", "value"));
+
+            // The poll refreshed the restored index in place; it did not
+            // recreate it.
+            String settingsAfter = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
+            assertEquals(uuid, extractPath(settingsAfter, indexName, "settings", "index", "uuid"));
+            String cat = readAll(client().performRequest(new Request("GET", "/_cat/indices?format=json")));
+            assertEquals("restored index must appear exactly once: " + cat, 1, countOccurrences(cat, "\"" + indexName + "\""));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+            dropFsRepository(repo);
+            deleteRecursively(scratchDir);
         }
     }
 
