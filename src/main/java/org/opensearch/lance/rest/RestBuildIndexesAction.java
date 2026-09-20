@@ -174,8 +174,8 @@ public class RestBuildIndexesAction extends BaseRestHandler {
             Set<String> columnsFilter = columnsFilterRaw != null ? new LinkedHashSet<>(columnsFilterRaw) : null;
             if (columnsFilter != null) {
                 // Reject unknown columns up front so callers don't get a 200
-                // response with `built: []` and no explanation for a typo
-                // (see issue #33). "Known" here means the column is
+                // response with `built: []` and no explanation for a typo.
+                // "Known" here means the column is
                 // FTS-eligible, scalar-eligible, or vector-eligible per
                 // derive; other columns are stored-only and cannot carry an
                 // index.
@@ -201,9 +201,8 @@ public class RestBuildIndexesAction extends BaseRestHandler {
                 // Optimize path: hand the ACTUAL Lance index names (via
                 // describeIndices) to OptimizeIndices instead of assuming the
                 // `<col>_fts` / `<col>_btree` / `<col>_vec` convention. Lance
-                // silently ignores unknown names, so the old convention path
-                // returned 200 with `built: [...]` even when nothing was
-                // touched (see issue #33).
+                // silently ignores unknown names, so guessing would return
+                // 200 with `built: [...]` even when nothing was touched.
                 ftsBuilt = LanceIndexBuilder.optimizeExistingFtsIndexes(dataset, ftsTarget, retrain);
                 scalarBuilt = LanceIndexBuilder.optimizeExistingScalarIndexes(dataset, scalarTarget, retrain);
                 vectorBuilt = LanceIndexBuilder.optimizeExistingVectorIndexes(dataset, vectorTarget, retrain);

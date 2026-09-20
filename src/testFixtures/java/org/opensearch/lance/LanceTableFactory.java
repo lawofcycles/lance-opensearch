@@ -46,7 +46,7 @@ import org.lance.index.scalar.ScalarIndexParams;
 
 /**
  * Test-only helper that writes a small Lance table onto the local
- * filesystem for use by {@link LancePluginIT}. Mirrors the shape a
+ * filesystem for the REST integration tests. Mirrors the shape a
  * production table would have (int PK + Utf8 body + fixed-size vector
  * embedding) so the IT drives the same code paths a real deployment
  * would.
@@ -104,14 +104,10 @@ final class LanceTableFactory {
         String uri = tablePath.toString();
         Schema schema = new Schema(
             Arrays.asList(
-                // Note: the Lance schema does not declare
-                // `lance-schema:unenforced-primary-key`. Adding that metadata
-                // via `new FieldType(true, ArrowType.Int, null, meta)` breaks
-                // the C Data serialisation of the FixedSizeList column that
-                // follows (see the corresponding failure signature in the
-                // review notes). Without a declared PK the derived
-                // `primary_key_field` is empty and GET /_doc returns 404,
-                // which B10 verifies through testAttachOfPkLessTableDisablesGet.
+                // No `lance-schema:unenforced-primary-key` metadata: adding it
+                // to this field breaks the C Data serialisation of the
+                // FixedSizeList column below. The table therefore has no
+                // declared primary key and GET /_doc answers 404.
                 new Field(PRIMARY_KEY, FieldType.nullable(new ArrowType.Int(32, true)), null),
                 new Field(BODY_COLUMN, FieldType.nullable(new ArrowType.Utf8()), null),
                 new Field(TITLE_COLUMN, FieldType.nullable(new ArrowType.Utf8()), null),
@@ -211,10 +207,8 @@ final class LanceTableFactory {
     }
 
     /**
-     * Writes a Lance table exercising nullable numeric columns. Used by
-     * B4 regression tests to confirm the reader stops crashing on Arrow
-     * nulls, int8 / int16 / int64 all surface with the correct OpenSearch
-     * mapping type, and boolean nulls no longer collapse to false.
+     * Writes a Lance table with nullable int8 / int16 / int64 and boolean
+     * columns, for tests of Arrow null handling and integer width mapping.
      *
      * <p>Row layout ({@code rowCount = 12}):
      * <ul>
@@ -346,17 +340,9 @@ final class LanceTableFactory {
     }
 
     /**
-     * Writes a Lance table with a Utf8 column that has no FTS index, so
-     * {@code RestAttachAction.derive} maps the column to
-     * {@code keyword} rather than {@code lance_text}. The leaf reader
-     * used to build a duplicate {@code FieldInfo} for that column
-     * (once through the keyword doc values path and once through the
-     * text-column-for-FLS loop), which tripped
-     * {@code IllegalArgumentException: duplicate field names} and
-     * left every FTS-less string-column table red. The regression
-     * fixture is a two-column table so no other loader touches the
-     * problem column: {@code id} int32 primary key and {@code label}
-     * Utf8 without an inverted index.
+     * Writes a two-column Lance table ({@code id} int32, {@code label}
+     * Utf8) whose Utf8 column has no FTS index, so the derived mapping is
+     * {@code keyword} rather than {@code lance_text}.
      *
      * @return absolute URI of the table, usable as-is for
      *         {@code /_lance/attach} or namespace register.
@@ -377,9 +363,6 @@ final class LanceTableFactory {
      *   <li>{@code label = "row-i"} for even {@code i}, {@code "col-i"}
      *       for odd {@code i}</li>
      * </ul>
-     * Used by the {@code _id} string PK integration tests to verify that
-     * {@code _search} echoes the Utf8 PK values as {@code _id} and
-     * {@code GET /{index}/_doc/{key}} resolves via a quoted Lance filter.
      */
     static String writeStringPkTable(Path parent, String name, int rowCount) throws Exception {
         return withLocaleRoot(() -> writeStringPkTableOnce(parent, name, rowCount));
@@ -587,18 +570,10 @@ final class LanceTableFactory {
     }
 
     /**
-     * Writes a Lance table exercising a Timestamp column. Used by the
-     * date-range regression tests: a {@code range} query with an
-     * ISO-8601 string literal on a Timestamp column used to return 400
-     * because {@link org.opensearch.lance.query.LanceKnnFilterTranslator}
-     * emitted a plain Utf8 SQL literal that DataFusion could not
-     * compare against a Timestamp. This fixture is the smallest schema
-     * that reproduces the bug: an int primary key so hits assertions
-     * can pin down individual rows, a Utf8 category column so bool
-     * filter tests can combine a keyword term with a date range, and a
-     * {@code Timestamp(Microsecond, None)} column so the fragment
-     * reader normalises the values to epoch millis for OpenSearch's
-     * date field type.
+     * Writes a Lance table with a {@code Timestamp(Microsecond, None)}
+     * column for date range tests, plus an int primary key so assertions
+     * can pin individual rows and a Utf8 category column so bool filters
+     * can combine a keyword term with a date range.
      *
      * <p>Row layout (fixed six-row table so the caller does not have
      * to pick between date coverage and row count):
@@ -790,76 +765,22 @@ final class LanceTableFactory {
     }
 
     /**
-     * Pins the JVM's default {@link Locale} to {@link Locale#ROOT}
-     * for the duration of a Lance write, saving and restoring the
-     * previous default in a {@code finally} block.
+     * Pins the JVM's default {@link Locale} to {@link Locale#ROOT} for the
+     * duration of a Lance write, restoring the previous default afterwards.
      *
-     * <h2>Why this is necessary</h2>
-     *
-     * <p>Apache Arrow Java 18.1.0 formats the C Data interface schema
-     * string in {@code org.apache.arrow.c.Format#asString} using
-     * {@code String.format("+w:%d", listSize)} without an explicit
-     * locale. {@code String.format(String, Object...)} routes through
-     * {@code Locale.getDefault(Locale.Category.FORMAT)} and Java's
-     * {@code Formatter} Number Localization Algorithm rewrites each
-     * digit using the current locale's
-     * {@code DecimalFormatSymbols.getZeroDigit()}. Roughly 9.2% of the
-     * locales available on JDK 21.0.6 (98 of 1069) use a non-ASCII zero
-     * digit: Arabic-Indic ({@code ar-*}, {@code fa-*}, {@code ur-IN}),
-     * Bengali ({@code as}, {@code bn-*}), Devanagari ({@code mr},
-     * {@code ne}), Myanmar ({@code my}), Tibetan ({@code dz}) and
-     * others. When the default locale is one of those, the schema
-     * string becomes {@code "+w:٨"} (or similar), and the arrow-rs 58
-     * side (which is what Lance 11 embeds) tries to parse the digits
-     * with {@code num_elems.parse::<i32>()}. The {@code i32::from_str}
-     * parser only accepts ASCII digits, so the call fails with
-     * {@code "The FixedSizeList type requires an integer parameter
-     * representing number of elements per list"}.
-     *
-     * <p>The same {@code %d} pattern is used in the Format helper for
-     * {@code FixedSizeBinary} and {@code Decimal}, so any of those
-     * three types passed through the Arrow C Data bridge from Java is
-     * affected. Every fixture in this factory is wrapped for
-     * uniformity even when the current schema does not contain one of
-     * the three, so future edits that add {@code FixedSizeList} to a
-     * fixture inherit the fix automatically.
-     *
-     * <h2>Why the JVM default is randomised inside integTest</h2>
-     *
-     * <p>Lucene's test framework rule
-     * {@code TestRuleSetupAndRestoreClassEnv#before} picks a locale
-     * from {@code LuceneTestCase.randomLocale(Random)} on every test
-     * class and installs it with {@code Locale.setDefault(...)}
-     * before the class runs. {@code OpenSearchTestCase.ensureSupportedLocale}
-     * only overrides that to English on a FIPS JVM, so under a normal
-     * integTest the seed of the run drives a decision that lands on
-     * an "Arabic-Indic digits" locale about 9 out of 100 seeds. The
-     * result is a decisive, seed-deterministic failure that looked
-     * like a "flake" only because the reproducer had never been run
-     * with the same seed twice.
-     *
-     * <h2>Why we scope the pin to the write region</h2>
-     *
-     * <p>{@code Locale.setDefault(...)} mutates a JVM-global piece of
-     * state, so pinning it for the entire test run would erase the
-     * Locale-randomization coverage that OpenSearch and Lucene rely
-     * on to catch locale-sensitive bugs in the code under test. Only
-     * the Lance write path needs ASCII digits, so scoping the pin to
-     * that region keeps the coverage for everything else. The tests
-     * run single-threaded so there is no window where another thread
-     * observes the temporary {@code Locale.ROOT}.
-     *
-     * <h2>Follow-up: fix in Apache Arrow Java</h2>
-     *
-     * <p>The upstream fix is to add {@code Locale.ROOT} to the four
-     * {@code String.format} calls in
-     * {@code org.apache.arrow.c.Format#asString} (or replace them with
-     * plain string concatenation, since {@code Integer.toString} is
-     * locale-independent). Tracked as a separate follow-up in
-     * {@code research/opensearch/lance-integration/lance-11-ffi-flake.md};
-     * once a fixed arrow-java is released and the {@code arrow-c-data}
-     * dependency in {@code build.gradle} is bumped, this workaround
-     * can be deleted.
+     * <p>Arrow Java's C Data bridge ({@code org.apache.arrow.c.Format#asString})
+     * renders the {@code FixedSizeList} width with {@code String.format("%d")}
+     * and no explicit locale, so under a default locale whose zero digit is
+     * not ASCII (Arabic-Indic, Bengali, Devanagari and others) the schema
+     * string carries localised digits that arrow-rs cannot parse, and
+     * {@code Dataset.create} fails with "The FixedSizeList type requires an
+     * integer parameter". The Lucene test framework randomises the default
+     * locale per test class, so the failure is seed-dependent. The pin is
+     * scoped to the write so the rest of the test keeps the randomised
+     * locale. Every fixture is wrapped so a schema that later gains a
+     * {@code FixedSizeList}, {@code FixedSizeBinary} or {@code Decimal}
+     * column inherits the fix. Can be removed once arrow-java formats those
+     * widths locale-independently.
      */
     @FunctionalInterface
     private interface ThrowingSupplier {

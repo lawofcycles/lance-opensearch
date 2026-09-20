@@ -55,9 +55,9 @@ public class LanceEngineFactoryTests extends OpenSearchTestCase {
     }
 
     public void testPrimaryKeyTypeFromSettingFallsBackToLong() {
-        // Empty and unknown strings must return LONG so pre-#24 indices
-        // without the setting continue to open with the integer lookup
-        // path. Known values map to their enum. NONE is only ever set at
+        // Empty and unknown strings must return LONG so indices created
+        // before the setting existed continue to open with the integer
+        // lookup path. Known values map to their enum. NONE is only ever set at
         // runtime when the field name is empty, but the enum still round
         // trips through fromSetting so callers that persist "none"
         // (e.g. a future migration tool) see the same value on read.

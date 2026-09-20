@@ -9,17 +9,12 @@ import org.apache.lucene.search.DocIdSetIterator;
 /**
  * DocIdSetIterator over a sparse hit set.
  *
- * <p>{@link LanceFtsQuery} and {@link LanceKnnQuery} both used to
- * materialise hits by writing scores into a {@code float[maxDoc]}
- * and setting bits in a {@code FixedBitSet(maxDoc)}. On a table with
- * fragment {@code maxDoc} of 250,000 that is 1 MB of scores plus
- * 31 KB of bitset per fragment per query, and the sparse Lance FTS
- * scorer or nearest scan actually populates a handful of entries.
- * QA measured this as the main driver behind
- * {@code lance.fragment_dispatch.max_concurrent} not scaling
- * (issue #47): 64 concurrent sort queries filled the parent breaker
- * with per-query {@code float[maxDoc]} allocations that G1 refused
- * to reclaim until an explicit {@code System.gc}.
+ * <p>{@link LanceFtsQuery} and {@link LanceKnnQuery} materialise
+ * hits through this iterator instead of a {@code float[maxDoc]} plus
+ * {@code FixedBitSet(maxDoc)}. A fragment with {@code maxDoc} of
+ * 250,000 would cost 1 MB of scores plus 31 KB of bitset per fragment
+ * per query for a handful of populated entries, and 64 concurrent
+ * queries of that shape fill the parent breaker.
  *
  * <p>This iterator stores hits in two parallel arrays sized to the
  * actual hit count, sorted by ascending docId to satisfy the

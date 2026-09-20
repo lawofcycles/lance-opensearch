@@ -91,7 +91,7 @@ public final class LanceKnnFilterTranslator {
      * {@link org.apache.lucene.search.IndexSearcher#count} against
      * the rewritten Lucene {@link org.apache.lucene.search.Query}
      * (which resolves the unmapped range to {@code MatchNoDocsQuery}
-     * via {@code RangeQueryBuilder.doRewrite}). See issue #50.
+     * via {@code RangeQueryBuilder.doRewrite}).
      *
      * <p>Only the {@link QueryBuilder} shapes this translator
      * already supports at
@@ -175,11 +175,10 @@ public final class LanceKnnFilterTranslator {
      * Convert {@code builder} to a Lance SQL expression. Never returns null.
      *
      * <p>Equivalent to {@link #toLanceSql(QueryBuilder, Function)}
-     * with {@link #NO_MAPPING}. Kept for callers that do not have a
+     * with {@link #NO_MAPPING}. For callers that do not have a
      * field-type resolver at hand; the numeric-epoch-millis branch on
      * date columns and the ISO-8601 shape branch on non-date columns
-     * both need a lookup to be handled cleanly and will fall back to
-     * pre-mapping-aware behaviour here.
+     * both need a lookup and fall back to shape heuristics here.
      *
      * @throws IllegalArgumentException when the builder or one of its
      *     sub-builders is not supported.
@@ -201,9 +200,8 @@ public final class LanceKnnFilterTranslator {
      * (wrapped in {@code to_timestamp_millis(...)}) or an ISO-8601
      * string (wrapped in {@code timestamp '...'}). Without the lookup
      * the translator falls back to shape heuristics on strings only,
-     * so a numeric epoch-millis on a date column still reaches
-     * DataFusion as a bare Int64 and is rejected — that is the pre-#48
-     * behaviour.
+     * so a numeric epoch-millis on a date column would reach
+     * DataFusion as a bare Int64 and be rejected.
      *
      * @throws IllegalArgumentException when the builder or one of its
      *     sub-builders is not supported.
@@ -260,9 +258,8 @@ public final class LanceKnnFilterTranslator {
      * {@code filterSql} is null.
      *
      * <p>Nested Lance columns (Struct / List&lt;Struct&gt;) are not
-     * surfaced yet (issues #4 / #5), so a dot in the mapping today
-     * means multi-field unambiguously. Revisit this guard when those
-     * shapes land.
+     * surfaced yet, so a dot in the mapping today means multi-field
+     * unambiguously. Revisit this guard when those shapes land.
      */
     private static void rejectMultiFieldPath(String fieldName) {
         if (fieldName != null && fieldName.indexOf('.') >= 0) {
@@ -406,8 +403,7 @@ public final class LanceKnnFilterTranslator {
                     return "timestamp '" + s + "'";
                 }
                 // Field type is known and it is not `date`: emit
-                // the literal as a plain SQL string. This is the
-                // fix for the pre-#48 false positive.
+                // the literal as a plain SQL string.
             }
             // Escape single quotes by doubling them, which is the standard
             // SQL literal escape that DataFusion accepts.

@@ -21,14 +21,9 @@ import org.opensearch.core.rest.RestStatus;
 public class LanceSearchDispatchIT extends LanceRestTestCase {
 
     public void testFragmentDispatchModeAnswersFilterQueries() throws Exception {
-        // Fragment-path baseline: match_all + filter queries
-        // (term / terms / exists / range / bool) on Lance-backed
-        // indices flow through the plugin's own executor. The count
-        // and hits both come from Lance via LanceKnnFilterTranslator
-        // (metadata-only Dataset.countRows for the count, and
-        // ScanOptions.filter for the hits' Lance scan), so
-        // hits.total.value stays in sync with the number of matching
-        // hits regardless of shard state.
+        // match_all and scalar filters (term / range / bool / match)
+        // through the fragment dispatch path: hits.total.value and the
+        // hits themselves are derived from the same Lance filter.
         String suffix = "dispatch-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -42,13 +37,9 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             String matchAllBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
             int matchAllHits = extractIntPath(matchAllBody, "hits", "total", "value");
             assertEquals("fragment path match_all must return the true row count", 6, matchAllHits);
-            // Default size is 10 so a 6-row table returns all six
-            // hits. Each hit carries a synthesised _id in the form
-            // "<fragmentId>-<offset>" and a _source rendered from
-            // the Arrow batch. The LanceTableFactory fixture puts
-            // "hello lance " at even offsets and "quick brown fox"
-            // at odd offsets in the body column; both must show
-            // up in the response.
+            // Six rows, default size 10. The table has no primary key, so
+            // _id is the synthesised "<fragmentId>-<offset>". The fixture
+            // alternates "hello lance" and "quick brown fox" in body.
             assertTrue("fragment path match_all must populate the hits array: " + matchAllBody, matchAllBody.contains("\"_id\":\"0-0\""));
             assertTrue(
                 "fragment path match_all must render _source with the body column: " + matchAllBody,
@@ -59,32 +50,23 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
                 matchAllBody.contains("\"id\":0")
             );
 
-            // A size=2 request returns only two hits but keeps the
-            // total row count at six.
             String sizeBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}},\"size\":2}"));
             assertEquals("size clause must not affect total", 6, extractIntPath(sizeBody, "hits", "total", "value"));
             int returnedHits = countOccurrences(sizeBody, "\"_id\":");
             assertEquals("size=2 must return exactly two hits: " + sizeBody, 2, returnedHits);
 
-            // Term queries on numeric columns are answered by the
-            // fragment executor. The count and hit metadata both come
-            // from the plugin's own path via
-            // LanceKnnFilterTranslator -> Dataset.countRows(sql) +
-            // ScanOptions.filter(sql).
             String termBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"term\":{\"id\":3}}}"));
             assertEquals("fragment path term must match exactly one row", 1, extractIntPath(termBody, "hits", "total", "value"));
             assertTrue("fragment path term must return the id=3 hit: " + termBody, termBody.contains("\"_id\":\"0-3\""));
             assertTrue("fragment path term must render the matching row: " + termBody, termBody.contains("\"id\":3"));
 
-            // A numeric range covers three rows (id in {2, 3, 4}).
+            // id in {2, 3, 4}
             String rangeBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"id\":{\"gte\":2,\"lt\":5}}}}"));
             assertEquals("fragment path range must count matching rows", 3, extractIntPath(rangeBody, "hits", "total", "value"));
             assertTrue("fragment path range must include id=2: " + rangeBody, rangeBody.contains("\"id\":2"));
             assertTrue("fragment path range must include id=4: " + rangeBody, rangeBody.contains("\"id\":4"));
 
-            // Bool AND of two filters proves nested translation works
-            // end-to-end. id >= 2 intersects id = 3, so the response
-            // must count and return exactly the id=3 row.
+            // Nested translation: id >= 2 AND id = 3 leaves one row.
             String boolBody = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -94,12 +76,8 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals("fragment path bool must count the intersection", 1, extractIntPath(boolBody, "hits", "total", "value"));
             assertTrue("fragment path bool must return the id=3 hit: " + boolBody, boolBody.contains("\"_id\":\"0-3\""));
 
-            // Full-text match queries also flow through the fragment
-            // executor since Stage 3 widened the dispatch filter. The
-            // per-node handler translates the QueryBuilder via
-            // QueryShardContext.toQuery, gets a LanceFtsQuery from the
-            // lance_text field mapper, and drives IndexSearcher.search
-            // against the per-fragment reader.
+            // A stock match query on a lance_text field resolves to the
+            // Lance FTS scorer through the field mapper.
             int matchHits = extractIntPath(
                 readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}}}")),
                 "hits",
@@ -115,22 +93,9 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testFragmentDispatchModeAnswersDateRangeQuery() throws Exception {
-        // Issue #43: a `range` query with an ISO-8601 string literal
-        // ({"gte":"2024-03-01","lt":"2024-04-01"}) on a Lance
-        // Timestamp column used to return 400. LanceKnnFilterTranslator
-        // emitted a bare Utf8 SQL literal ('2024-03-01') and
-        // DataFusion rejected the comparison against a Timestamp
-        // column with "could not convert to literal of type
-        // 'Timestamp(...)'". The translator now recognises ISO-8601
-        // shapes and lifts them into `timestamp '...'` so the same
-        // range DSL that works on shard-path date fields also works
-        // when the request lands on the fragment executor.
-        //
-        // Four shapes exercise the fix:
-        // (a) date-only literal
-        // (b) datetime literal (with T and seconds)
-        // (c) bool filter combining a keyword term with a date range
-        // (d) date_histogram bucket aggregation consuming the date column
+        // ISO-8601 string literals in a range on a Lance Timestamp
+        // column translate to `timestamp '...'` SQL, so the same range
+        // DSL that works on a shard-path date field works here.
         String suffix = "date-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -141,9 +106,8 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // (a) Date-only literal: id 2 (2024-03-10) and id 3
-            // (2024-03-25) are the two March rows in the fixture, so
-            // [2024-03-01, 2024-04-01) picks exactly those two.
+            // Date-only literals: ids 2 (2024-03-10) and 3 (2024-03-25)
+            // are the March rows.
             String dateOnly = readAll(
                 postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"ts\":{\"gte\":\"2024-03-01\",\"lt\":\"2024-04-01\"}}}}")
             );
@@ -155,12 +119,9 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertTrue("date-only range must include the id=2 hit: " + dateOnly, dateOnly.contains("\"id\":2"));
             assertTrue("date-only range must include the id=3 hit: " + dateOnly, dateOnly.contains("\"id\":3"));
 
-            // (b) Datetime literal: id 1 (2024-02-20) and id 2
-            // (2024-03-10) fall inside
-            // [2024-02-01T00:00:00Z, 2024-03-15T12:00:00Z). id 3
-            // (2024-03-25) sits above the upper bound and must be
-            // excluded, proving the timestamp comparison respects
-            // sub-day precision.
+            // Datetime literals: ids 1 and 2 fall inside
+            // [2024-02-01T00:00:00Z, 2024-03-15T12:00:00Z); id 3 is above
+            // the upper bound.
             String dateTime = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -175,12 +136,8 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertTrue("datetime range must include the id=1 hit: " + dateTime, dateTime.contains("\"id\":1"));
             assertTrue("datetime range must include the id=2 hit: " + dateTime, dateTime.contains("\"id\":2"));
 
-            // (c) bool filter [term category=odd, range ts]: the odd
-            // subset is {1, 3, 5}, the date range keeps rows in
-            // [2024-01-01, 2024-05-01), and id 5 (2024-05-30) falls
-            // outside the upper bound. The intersection is exactly
-            // {1, 3}. This proves nested translation still routes the
-            // date literal through the timestamp path.
+            // term category=odd ({1, 3, 5}) AND ts in
+            // [2024-01-01, 2024-05-01) excludes id 5 (2024-05-30).
             String boolBody = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -198,10 +155,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertTrue("bool filter must include id=1: " + boolBody, boolBody.contains("\"id\":1"));
             assertTrue("bool filter must include id=3: " + boolBody, boolBody.contains("\"id\":3"));
 
-            // (d) date_histogram on the same column, monthly interval.
-            // All six rows contribute: {Jan:1, Feb:1, March:2, April:1,
-            // May:1}, so five buckets are opened and the March bucket
-            // carries two docs. min_doc_count 1 keeps empty months out.
+            // Monthly date_histogram: {Jan:1, Feb:1, Mar:2, Apr:1, May:1}.
             String hist = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -221,35 +175,10 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testFragmentDispatchModeAnswersDateRangeQueryWithEpochMillisLiterals() throws Exception {
-        // Issue #48 (follow-up to #43): a `range` on a Lance
-        // Timestamp column with a numeric epoch-millis literal —
-        // {"gte": 1709251200000} — used to return 400 with
-        // `Received literal Int64(...) and could not convert to
-        // literal of type 'Timestamp(...)'` because the translator
-        // emitted the number as a bare Int64. The #43 fix only
-        // handled ISO-8601 strings because the translator had no
-        // mapping context to know whether a numeric literal was
-        // meant to be a date or a plain integer.
-        //
-        // The follow-up plumbs a field-type lookup through
-        // {@link org.opensearch.lance.query.LanceKnnFilterTranslator#toLanceSql(QueryBuilder, Function)}
-        // so both the coordinator (via
-        // {@code TransportLanceCoordinatorAction.resolveTargets} +
-        // {@code IndexMetadata.mapping()}) and the knn inner filter
-        // ({@code LanceKnnQueryBuilder.doToQuery} via
-        // {@code QueryShardContext.fieldMapper}) can tell the
-        // translator that a given field is mapped as `date`. When
-        // the field is a date, a numeric literal gets wrapped in
-        // {@code to_timestamp_millis(...)} so DataFusion coerces
-        // to whatever Timestamp unit the Lance column carries.
-        //
-        // Shapes exercised:
-        // (a) range ts with epoch-millis literals only
-        // (b) bool filter combining a keyword term with an
-        // epoch-millis date range (same intersection as the
-        // ISO-8601 variant in #43's IT)
-        // (c) regression fence: ISO-8601 string literals still
-        // resolve on the mapping-aware path
+        // Numeric epoch-millis literals in a range on a date-mapped
+        // column translate to to_timestamp_millis(...) SQL; the
+        // translator decides from the field mapping, not the literal
+        // shape.
         String suffix = "dateml-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -260,17 +189,11 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // Epoch-millis anchor points (UTC midnight, matching what
-            // OpenSearch's date field emits from a numeric literal
-            // input by default):
             // 2024-03-01T00:00:00Z = 1709251200000
             // 2024-04-01T00:00:00Z = 1711929600000
             // 2024-05-01T00:00:00Z = 1714521600000
 
-            // (a) numeric range: id 2 (2024-03-10) and id 3
-            // (2024-03-25) sit inside [1709251200000, 1711929600000),
-            // matching the ISO-8601 variant of the same interval in
-            // testFragmentDispatchModeAnswersDateRangeQuery.
+            // ids 2 and 3 fall inside [1709251200000, 1711929600000).
             String numeric = readAll(
                 postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"ts\":{\"gte\":1709251200000,\"lt\":1711929600000}}}}")
             );
@@ -282,10 +205,8 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertTrue("numeric range must include id=2: " + numeric, numeric.contains("\"id\":2"));
             assertTrue("numeric range must include id=3: " + numeric, numeric.contains("\"id\":3"));
 
-            // (b) bool + term + numeric range: category=odd narrows
-            // to {1, 3, 5}, the date range keeps rows in
-            // [2024-01-01, 2024-05-01), and id 5 (2024-05-30) falls
-            // outside the upper bound. Intersection: {1, 3}.
+            // term category=odd ({1, 3, 5}) AND ts in
+            // [2024-01-01, 2024-05-01) excludes id 5.
             String bool = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -299,11 +220,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertTrue("bool + numeric range must include id=1: " + bool, bool.contains("\"id\":1"));
             assertTrue("bool + numeric range must include id=3: " + bool, bool.contains("\"id\":3"));
 
-            // (c) regression fence: ISO-8601 string variant of (a)
-            // must resolve to the same two rows through the
-            // mapping-aware translator (the shape heuristic and the
-            // mapping-driven branch converge on the same output for
-            // this shape).
+            // The ISO-8601 form of the same interval resolves identically.
             String iso = readAll(
                 postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"ts\":{\"gte\":\"2024-03-01\",\"lt\":\"2024-04-01\"}}}}")
             );
@@ -318,40 +235,10 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testFragmentDispatchModeAnswersQueriesAgainstUnmappedFieldsWithoutError() throws Exception {
-        // Issue #50: a range / bool query against a field that
-        // derive() left unmapped used to return 500 with
-        // `illegal_state_exception: Rewrite first`. The exception
-        // comes from RangeQueryBuilder.doToQuery reaching for a
-        // MappedFieldType that is null; the shard path never hits
-        // it because SearchService.parseSource calls
-        // Rewriteable.rewrite before toQuery, which folds an
-        // unmapped range into MatchNoneQueryBuilder via
-        // RangeQueryBuilder.doRewrite. The fragment executor
-        // skipped that rewrite step.
-        //
-        // After the fix (a) TransportLanceFragmentQueryAction
-        // rewrites request.query() and request.postFilter() before
-        // handing them to toQuery, and (b) the coordinator's
-        // resolveFilterSql refuses to emit Lance SQL when any leaf
-        // names an unmapped field so Dataset.countRows(sql) does
-        // not surface a second 500 from the count path. Behaviour
-        // now matches the shard path: 200 with 0 hits, no error.
-        //
-        // Shapes exercised:
-        // (a) `range unmapped_int {gte:1}` — pure unmapped range,
-        // which is the exact repro from the issue.
-        // (b) `range unmapped_str {gte:"aa"}` — string-shaped
-        // range against an unmapped field (regression fence
-        // for the ISO-8601 shape-heuristic branch in the
-        // translator's literal encoder).
-        // (c) `bool must [term body="alpha", range unmapped_int]`
-        // — nested case where the coordinator's
-        // hasUnmappedField walker has to recurse into the
-        // bool tree, and Rewriteable.rewrite on the per-node
-        // side has to fold the range clause inside the bool.
-        // (d) Regression fence: a range against the mapped `id`
-        // column still returns the correct hit set on the
-        // same index (no over-broad match-none rewrite).
+        // A range against an unmapped field behaves as on the shard
+        // path: RangeQueryBuilder.doRewrite folds it to match_none and
+        // the response is 200 with zero hits, also when the clause is
+        // nested inside a bool.
         String suffix = "unmapped-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -362,15 +249,9 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // (a) numeric range on unmapped field
             String numeric = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"unmapped_int\":{\"gte\":1}}}}"));
             assertEquals("unmapped range must return 0 hits: " + numeric, 0, extractIntPath(numeric, "hits", "total", "value"));
 
-            // (b) string range on unmapped field. Also exercises
-            // the branch in LanceKnnFilterTranslator.literal where
-            // a shape-heuristic ISO-8601 detection would fire on a
-            // string literal; the coordinator's hasUnmappedField
-            // walker skips translation before we get there.
             String stringRange = readAll(
                 postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"unmapped_str\":{\"gte\":\"aa\"}}}}")
             );
@@ -380,14 +261,9 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
                 extractIntPath(stringRange, "hits", "total", "value")
             );
 
-            // (c) bool must with one mapped and one unmapped
-            // clause. RangeQueryBuilder.doRewrite folds the
-            // unmapped range to MatchNone, then
-            // BoolQueryBuilder.doRewrite collapses the whole
-            // bool to a query that matches nothing. Both the
-            // per-node hits path and the count path have to see
-            // this or hits.total.value would collapse to only
-            // the term-clause matches.
+            // The unmapped clause inside a bool must collapses the whole
+            // bool to match_none; hits.total must not report the
+            // term-clause matches.
             String bool = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -399,10 +275,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             );
             assertEquals("bool must with unmapped clause must return 0 hits: " + bool, 0, extractIntPath(bool, "hits", "total", "value"));
 
-            // (d) regression fence: range on the mapped `id`
-            // column still resolves normally on the same index.
-            // Ensures the rewrite step does not accidentally
-            // treat mapped fields as MatchNone.
+            // A range on a mapped column on the same index still resolves.
             String mapped = readAll(
                 postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"id\":{\"gte\":1,\"lt\":3}}},\"size\":10}")
             );
@@ -415,25 +288,14 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testFragmentDispatchModeCountsFtsHitsWithoutWeightMaterialisation() throws Exception {
-        // triggered LanceFtsQuery's Weight to fully materialise every
-        // hit's row address and score into the sparse buffer. On a 20M
-        // row table with 500k matching hits QA measured 4.6 s for a
-        // count-only query that pylance answered in <2 ms because
-        // Lance's inverted-index scan can stream row counts when we
-        // ask for zero columns. This test fences that count path:
-        //
-        // - lance_match size:0 must return the exact match count
-        // (no clip, no over-count) for match / phrase / bool
-        // - post_filter present + size:0 must fall through to the
-        // Weight path (post_filter narrowing needs Lucene)
-        // - non-FTS scoring shapes (knn) continue on the Weight
-        // path since Lance has no countRows(NearestQuery)
+        // size:0 on a pure FTS query is counted by a Lance scan that
+        // projects no columns; the count must be exact for match and
+        // phrase, and a post_filter must route the count through Lucene
+        // because it narrows below what Lance would report.
         String suffix = "ftscount-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
-        // 20 rows: 10 with "hello lance N" (even ids), 10 with "quick
-        // brown fox N" (odd ids). "lance" hits 10 rows, "hello lance"
-        // as a phrase hits the same 10 rows.
+        // Even ids carry "hello lance N", odd ids "quick brown fox N".
         LanceTableFactory.writeTable(scratchDir, tableName, 20);
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
@@ -441,14 +303,10 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // Simple lance_match count-only: total = 10, hits empty.
             String matchBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}},\"size\":0}"));
             assertEquals("match size:0 total must be 10", 10, extractIntPath(matchBody, "hits", "total", "value"));
             assertEquals("size:0 must return no hits", 0, countOccurrences(matchBody, "\"_id\":"));
 
-            // lance_match_phrase count-only: same 10 rows contain
-            // "hello lance N" so the phrase count matches the
-            // simple match count.
             String phraseBody = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -457,21 +315,13 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             );
             assertEquals("phrase size:0 total must be 10", 10, extractIntPath(phraseBody, "hits", "total", "value"));
 
-            // Zero-match count: query never touches the fixture so
-            // the count path must still return 0 (regression fence
-            // against the Weight path failing when the FTS scan
-            // yields empty batches).
+            // No match: the count path must return 0 from empty batches.
             String zeroBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"nonexistent\"}},\"size\":0}")
             );
             assertEquals("no-match size:0 total must be 0", 0, extractIntPath(zeroBody, "hits", "total", "value"));
 
-            // Post-filter forces the Weight fallback because the
-            // post_filter narrows below what Dataset.countRows
-            // would report. The fixture pins ids 0..19 sequential,
-            // so id >= 10 keeps five "hello lance" rows (10, 12, 14,
-            // 16, 18) and drops the rest. When Weight-fallback works
-            // correctly total = 5, hits empty (size:0).
+            // post_filter id >= 10 keeps five of the ten "hello lance" rows.
             String postFilterBody = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -491,25 +341,14 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testFragmentDispatchModeAppliesTopKPushdownForFtsHits() throws Exception {
-        // Issue #42 Phase B: pure FTS (lance_match / lance_match_phrase
-        // as the top-level query) with no sort, no aggregation, and no
-        // post_filter must push size into the per-fragment Lance scan
-        // as `limit(size)`. Lance's inverted-index scorer holds a
-        // bounded score-sorted heap, so a size:5 request against a
-        // large hit set never has to transfer or rank 4+ orders of
-        // magnitude of rows the client will not look at.
-        //
-        // Regression fence covers: hits stay correct up to the
-        // requested size, hits.total.value keeps returning the true
-        // count from LanceFtsQuery's Weight (because that Weight runs
-        // once per size:0 count call and the scan limit is disabled
-        // there), and shapes that must NOT enable the pushdown (sort
-        // by non-score field / agg) keep serving the full matched set.
+        // A pure FTS query with no sort, aggregation or post_filter
+        // pushes size into the Lance scan as limit. The clip must not
+        // leak into hits.total, and shapes that need the full match set
+        // (sort by a field, aggregations) must not be clipped.
         String suffix = "ftstop-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
-        // 20 rows: 10 with "hello lance N" (even ids), 10 with "quick
-        // brown fox N" (odd ids). The "lance" match yields 10 hits.
+        // Even ids carry "hello lance N", odd ids "quick brown fox N".
         LanceTableFactory.writeTable(scratchDir, tableName, 20);
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
@@ -517,16 +356,11 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // Match "lance" hits 10 rows; size:3 must clip hits to 3
-            // while hits.total.value stays at 10. If the clip leaked
-            // into the total, the count would drop to 3.
             String matchBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}},\"size\":3}"));
             assertEquals("match size:3 total must be 10", 10, extractIntPath(matchBody, "hits", "total", "value"));
             int matchReturnedHits = countOccurrences(matchBody, "\"_id\":");
             assertEquals("match size:3 must return three hits: " + matchBody, 3, matchReturnedHits);
 
-            // Match with a size larger than the matched set must
-            // return every match (no clip, no padding).
             String allMatchBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}},\"size\":50}")
             );
@@ -534,19 +368,12 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             int allMatchReturnedHits = countOccurrences(allMatchBody, "\"_id\":");
             assertEquals("match size:50 must return ten hits: " + allMatchBody, 10, allMatchReturnedHits);
 
-            // size:0 count-only: hits stays empty, total reflects the
-            // full match (served by IndexSearcher.count on the FTS
-            // Weight without the top-k enabled).
             String countBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}},\"size\":0}"));
             assertEquals("match size:0 total must be 10", 10, extractIntPath(countBody, "hits", "total", "value"));
             int countReturnedHits = countOccurrences(countBody, "\"_id\":");
             assertEquals("size:0 must return no hits", 0, countReturnedHits);
 
-            // Sort by a non-score field must disable the top-k
-            // pushdown: even at size:3, we need every match so sort
-            // by id desc can pick the largest id (the row with "hello
-            // lance 18" at id=18 must come first for the "lance"
-            // match on even ids).
+            // Sort by a field needs every match: id 18 must come first.
             String sortBody = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -558,9 +385,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals("match sort size:3 must return three hits: " + sortBody, 3, sortReturnedHits);
             assertTrue("match sort desc must put id=18 first: " + sortBody, sortBody.contains("\"id\":18"));
 
-            // Aggregation must disable the top-k pushdown: the sum of
-            // even ids 0..18 is 0+2+4+6+8+10+12+14+16+18 = 90. If the
-            // scan were clipped to 3, the sum would be < 90.
+            // Aggregations need every match: sum of even ids 0..18 is 90.
             String aggBody = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -570,8 +395,6 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals("match agg size:3 total must be 10", 10, extractIntPath(aggBody, "hits", "total", "value"));
             assertEquals("sum(id) over match must be 90", 90.0d, extractDoublePath(aggBody, "aggregations", "s", "value"), 0.0d);
 
-            // lance_match_phrase should follow the same pushdown path.
-            // "hello lance" matches all 10 even-id rows exactly.
             String phraseBody = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -589,20 +412,13 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testFragmentDispatchModeAppliesTopKPushdownForScalarFilterHits() throws Exception {
-        // Issue #42 Phase A: pure scalar filter (term / range / bool
-        // built from LanceKnnFilterTranslator-translatable clauses)
-        // with no sort, no aggregation, and no post_filter must
-        // push size into the per-fragment Lance scan as `limit(size)`.
-        // The regression fence covers: hits stay correct up to the
-        // requested size, hits.total.value keeps returning the true
-        // count from Dataset.countRows(sql), and shapes that must
-        // NOT enable the pushdown (sort / agg) keep serving the full
-        // matched set.
+        // A pure scalar filter with no sort, aggregation or post_filter
+        // pushes size into the Lance scan as limit. The clip must not
+        // leak into hits.total, and shapes that need the full match set
+        // must not be clipped.
         String suffix = "topk-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
-        // 20 rows so a size:5 request exercises the top-k clip while
-        // still leaving enough distinct rows for the count assertion.
         LanceTableFactory.writeTable(scratchDir, tableName, 20);
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
@@ -610,9 +426,6 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // Range covers 20 rows; size:5 must clip hits to 5 while
-            // hits.total.value stays at 20. If the clip leaks into
-            // Dataset.countRows the total would drop to 5.
             String rangeBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"id\":{\"gte\":0,\"lt\":20}}},\"size\":5}")
             );
@@ -620,14 +433,10 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             int rangeReturnedHits = countOccurrences(rangeBody, "\"_id\":");
             assertEquals("range size:5 must return five hits: " + rangeBody, 5, rangeReturnedHits);
 
-            // Term narrowing to a single row must still return that
-            // row even when size:5 is more than the matched count.
             String termBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"term\":{\"id\":3}},\"size\":5}"));
             assertEquals("term id=3 total must be 1", 1, extractIntPath(termBody, "hits", "total", "value"));
             assertTrue("term id=3 must return the id=3 hit: " + termBody, termBody.contains("\"_id\":\"0-3\""));
 
-            // size:0 count-only: hits stays empty, total reflects the
-            // full match (served by Dataset.countRows(sql) directly).
             String countBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"id\":{\"gte\":0,\"lt\":20}}},\"size\":0}")
             );
@@ -635,9 +444,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             int countReturnedHits = countOccurrences(countBody, "\"_id\":");
             assertEquals("size:0 must return no hits", 0, countReturnedHits);
 
-            // Sort must disable the top-k pushdown: even at size:5 we
-            // need the full matched set to sort by id desc, and the
-            // first hit must be id=19 (max id in the range).
+            // Sort by a field needs every match: id 19 must come first.
             String sortBody = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -650,9 +457,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertTrue("sort desc must put id=19 first: " + sortBody, sortBody.contains("\"id\":19"));
             assertTrue("sort desc must put id=15 last: " + sortBody, sortBody.contains("\"id\":15"));
 
-            // Aggregation must disable the top-k pushdown: sum over
-            // the full range is 0 + 1 + ... + 19 = 190. If the scan
-            // were clipped to 5, the sum would be < 190.
+            // Aggregations need every match: sum of 0..19 is 190.
             String aggBody = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -669,17 +474,9 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testStoredFieldsDocValueFieldsExplainFallThroughToShardPath() throws Exception {
-        // stored_fields, docvalue_fields, and explain used to slip
-        // past isDispatchable and produce silently wrong hit
-        // envelopes (issue #37 case 4 remainder). Fragment
-        // executor drops all three: stored_fields projection is
-        // ignored so _source stays in hits (including when
-        // "_none_" asks to hide it entirely), docvalue_fields is
-        // never populated into hits.fields, and explain never
-        // adds the _explanation field. Reject list now sends
-        // each of these shapes to the shard path where the
-        // built-in fetch phase applies the projection and
-        // synthesises the explanation.
+        // stored_fields, docvalue_fields and explain are not implemented
+        // by the fragment dispatch path; the dispatch filter sends those
+        // requests to the shard path, whose fetch phase handles them.
         String suffix = "s3-storedfields-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -690,16 +487,11 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // stored_fields: "_none_" hides _source entirely on
-            // the shard path. Fragment path used to always
-            // materialise _source from the Lance row scan.
             String noneBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"stored_fields\":\"_none_\"}")
             );
             assertFalse("stored_fields:_none_ should suppress _source: " + noneBody, noneBody.contains("\"_source\""));
 
-            // docvalue_fields projects doc values into hits.fields.
-            // Fragment path used to omit hits.fields entirely.
             String docvalueBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"docvalue_fields\":[\"id\"]}")
             );
@@ -708,10 +500,6 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
                 docvalueBody.contains("\"fields\":{\"id\"")
             );
 
-            // explain: true adds a per-hit _explanation with a
-            // scoring breakdown on the shard path. Fragment path
-            // used to never call searcher.explain, so the field
-            // was missing.
             String explainBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"explain\":true}")
             );
@@ -724,18 +512,10 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testMinScoreTerminateAfterTrackTotalHitsFallThroughToShardPath() throws Exception {
-        // min_score, terminate_after, and track_total_hits used to
-        // slip past isDispatchable and produce silently wrong
-        // response envelopes (issue #37 cases 1 and 3). Fragment
-        // path counts matches from Lance metadata (or Lucene
-        // count()) without threading these knobs through, so the
-        // request would come back with hits.total.value from the
-        // full match set and terminated_early=false, even when
-        // the caller asked for a tighter answer. Reject list now
-        // sends each of these shapes to the shard path where the
-        // built-in MinScoreCollector /
-        // EarlyTerminatingCollector / total-hits-up-to gate
-        // actually clip.
+        // min_score, terminate_after and track_total_hits are not
+        // implemented by the fragment dispatch path (it counts matches
+        // from Lance without those knobs); the dispatch filter sends
+        // those requests to the shard path.
         String suffix = "s3-reject-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -746,22 +526,16 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // min_score above 1.0 excludes every hit from a
-            // match_all query (all hits carry score 1.0). Fragment
-            // path used to return total=6; shard path clips to
-            // total=0.
+            // Every match_all hit scores 1.0, so min_score above that
+            // excludes everything.
             String minScoreBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"min_score\":2.0}")
             );
             assertEquals(0, extractIntPath(minScoreBody, "hits", "total", "value"));
 
-            // terminate_after=2 tells the collector to stop after
-            // two docs per segment. Shard path signals early
-            // termination through terminated_early=true; fragment
-            // path omits the flag entirely because it never wired
-            // the count through its scan. Shard path leaves
-            // hits.total.value as the pre-terminate count, so we
-            // only look at the flag rather than total.
+            // The shard path signals terminate_after through
+            // terminated_early; hits.total keeps the pre-terminate count,
+            // so only the flag is asserted.
             String terminateBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"terminate_after\":2}")
             );
@@ -770,20 +544,12 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
                 terminateBody.contains("\"terminated_early\":true")
             );
 
-            // track_total_hits=3 on a 6-row table produces
-            // relation=gte with a value at the shard path
-            // early-terminated counter. Fragment path used to
-            // return relation="eq" with the Lance metadata count.
             String trackBoundBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":3}")
             );
             assertTrue("track_total_hits:3 should return relation=gte: " + trackBoundBody, trackBoundBody.contains("\"relation\":\"gte\""));
 
-            // track_total_hits=false omits hits.total entirely on
-            // the shard path. Fragment path used to always return
-            // the exact Lance total, ignoring the flag. Assert on
-            // the response envelope shape rather than the counter
-            // value because the two paths disagree on the shape.
+            // track_total_hits=false omits hits.total entirely.
             String trackFalseBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":false}")
             );
@@ -796,14 +562,10 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testFragmentDispatchModeStampsIndexAndVersionEnvelope() throws Exception {
-        // The response envelope should carry _index on every hit
-        // regardless of what the request asked for, and _version /
-        // _seq_no / _primary_term when the request opted in via
-        // `version` / `seq_no_primary_term`. Fragment path used to
-        // omit all four because it built SearchHit objects on the
-        // per-node executor without a SearchShardTarget and without
-        // per-doc version accounting; the coordinator now stamps
-        // them on absorbTargetResponses.
+        // Every hit carries _index; _version and _seq_no /
+        // _primary_term appear only when the request opts in. The
+        // fragment path has no per-doc versions, so the constants match
+        // what the shard path reports for a freshly indexed doc.
         String suffix = "s3-env-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -814,18 +576,12 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // Plain _search: _index must be present on every hit,
-            // version / seq_no / primary_term must NOT (defaults are
-            // off).
             String plain = readAll(postJson("/" + indexName + "/_search", "{\"size\":2,\"query\":{\"match_all\":{}}}"));
             assertTrue("expected _index=[" + indexName + "] on each hit: " + plain, plain.contains("\"_index\":\"" + indexName + "\""));
             assertFalse("_version must be omitted by default: " + plain, plain.contains("\"_version\""));
             assertFalse("_seq_no must be omitted by default: " + plain, plain.contains("\"_seq_no\""));
             assertFalse("_primary_term must be omitted by default: " + plain, plain.contains("\"_primary_term\""));
 
-            // version: true opts _version in, but not seq_no /
-            // primary_term. Fragment path has no per-doc version so
-            // the constant value 1 is reported.
             String versioned = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"version\":true}")
             );
@@ -833,10 +589,6 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertTrue("expected _version=1 when version:true: " + versioned, versioned.contains("\"_version\":1"));
             assertFalse("_seq_no still off: " + versioned, versioned.contains("\"_seq_no\""));
 
-            // seq_no_primary_term: true opts _seq_no and
-            // _primary_term in but leaves _version off. Constants
-            // seqNo=0 / primaryTerm=1 match the shard path defaults
-            // for a freshly-indexed doc.
             String seqno = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"seq_no_primary_term\":true}")
             );
@@ -851,12 +603,8 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testFragmentDispatchModeAnswersFromPagination() throws Exception {
-        // from > 0 used to fall through to the shard path because the
-        // coordinator merge did not know how to skip. Now the
-        // coordinator asks each per-node executor for `from + size`
-        // hits and drops the leading `from` from the merged response,
-        // so pagination beyond the first page runs through the
-        // fragment executor end-to-end.
+        // The coordinator asks each node for from + size hits and drops
+        // the leading from after the merge.
         String suffix = "s3-from-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -867,10 +615,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // Sort by id descending, request the third page window
-            // (from=2, size=2). Full descending order is [5, 4, 3,
-            // 2, 1, 0]; skipping two leaves [3, 2, 1, 0] and size=2
-            // clips to [3, 2].
+            // id desc is [5, 4, 3, 2, 1, 0]; from=2, size=2 keeps [3, 2].
             String body = readAll(
                 postJson("/" + indexName + "/_search", "{\"from\":2,\"size\":2,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}]}")
             );
@@ -888,10 +633,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testFragmentDispatchModeAnswersPostFilter() throws Exception {
-        // post_filter narrows hits (and hits.total.value) but leaves
-        // aggregations unaffected. Fragment path runs aggregations
-        // against the top-level query and applies the post_filter
-        // to the hits scan on the per-node executor.
+        // post_filter narrows hits and hits.total but not aggregations.
         String suffix = "s3-pf-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -902,9 +644,6 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // Query matches all 6 rows, post_filter narrows to id
-            // >= 4 (rows 4 and 5). The aggregation counts the full
-            // 6 rows because post_filter must not influence it.
             String body = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -923,11 +662,6 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testFragmentDispatchModeAnswersSearchAfter() throws Exception {
-        // search_after pagination flows through the fragment path
-        // when the request also carries a sort. The per-node
-        // executor calls IndexSearcher.searchAfter(FieldDoc, size,
-        // sort) with the coordinator-forwarded cursor; the merged
-        // response contains only the hits after the cursor value.
         String suffix = "s3-sa-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -938,17 +672,13 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // First page: sort id desc, size=2. Full descending
-            // order is [5, 4, 3, 2, 1, 0]; the first page keeps 5
-            // and 4.
+            // id desc is [5, 4, 3, 2, 1, 0].
             String first = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":2,\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"desc\"}]}")
             );
             assertTrue("expected first page to include sort value [5]: " + first, first.contains("\"sort\":[5]"));
             assertTrue("expected first page to include sort value [4]: " + first, first.contains("\"sort\":[4]"));
 
-            // Second page via search_after: the cursor is the last
-            // sort value from the first page. Expect ids 3 and 2.
             String second = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -967,18 +697,9 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testFragmentDispatchModeAnswersScriptQueryAndScriptSort() throws Exception {
-        // Two shapes flow through the fragment path without any
-        // explicit plumbing because the per-fragment reader already
-        // exposes doc values that scripts consume through the
-        // standard DocValues API. If this test starts failing, the
-        // shape has to move onto the isDispatchable reject list (or
-        // the fragment executor has to grow the missing piece).
-        //
-        // collapse and rescore used to live in this test as well
-        // but they are silent no-ops on the fragment path (collapse
-        // returns ungrouped hits, rescore leaves first-pass scores
-        // untouched), so they now sit on the isDispatchable reject
-        // list and go through the standard shard path instead.
+        // Script queries and script sorts read doc values through the
+        // standard DocValues API, so they work on the fragment path
+        // without dedicated plumbing.
         String suffix = "s3-scq-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -989,7 +710,6 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // id > 2 -> rows 3, 4, 5.
             String body = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -998,8 +718,6 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             );
             assertEquals(3, extractIntPath(body, "hits", "total", "value"));
 
-            // Same doc value path also drives script sort. Rows
-            // 5..0 in id desc order.
             String sortBody = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -1018,13 +736,9 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testDefaultSearchReturnsAtLeastTenHits() throws Exception {
-        // Regression for the FetchPhase sequential-stored-fields path: with
-        // >= 10 adjacent doc ids and no deletions the fetch phase calls
-        // getSequentialStoredFieldsReader on the leaf reader. Before the
-        // LanceSequentialLeafReader wrapper this threw "requires a
-        // CodecReader or a SequentialStoredFieldsLeafReader", so GET
-        // /demo/_search with the default size=10 returned 500. Sixteen rows
-        // exercises the >= 10 hits case; every hit must materialise cleanly.
+        // With ten or more adjacent doc ids and no deletions, FetchPhase
+        // asks the leaf for a sequential stored-fields reader; the Lance
+        // leaf must provide one.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "defaultsearch")) {
             String indexName = fixture.indexName();
 
@@ -1032,8 +746,6 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             String body = readAll(search);
             int totalHits = extractIntPath(body, "hits", "total", "value");
             assertEquals("expected 16 total hits, saw response: " + body, 16, totalHits);
-            // Default size is 10; hits array must be full and each entry
-            // must carry the Lance-backed _source.
             assertTrue("expected hits[0]._source in response, saw: " + body, body.contains("\"_source\""));
         }
     }

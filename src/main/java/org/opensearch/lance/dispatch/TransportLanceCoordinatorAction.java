@@ -66,8 +66,7 @@ import org.opensearch.transport.TransportService;
  * <p>Single-node clusters take this same path with a data-node list
  * of length one, so the transport hop reduces to a local
  * {@code sendRequest} against the loopback pool. Multi-node
- * behaviour is verified separately in Milestone 5-C4's integration
- * cluster.
+ * behaviour is covered by {@code LanceMultiNodeIT}.
  */
 public final class TransportLanceCoordinatorAction extends HandledTransportAction<SearchRequest, SearchResponse> {
 
@@ -153,15 +152,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         nodeList.sort(Comparator.comparing(DiscoveryNode::getId));
 
         // Per-index fan-out results, collected sequentially.
-        // Sequential loop keeps the merge trivial; parallel per-index
-        // fan-out is future work if it becomes a hot spot.
-        // filterSql lives on the spec but is recomputed per target
-        // inside runIndexLoop so each target uses its own mapping to
-        // encode date literals (see issue #48). The placeholder value
-        // here is only used when a target's per-mapping recomputation
-        // returns the same value, i.e. when the target's mapping does
-        // not affect the emitted SQL (all-integer filter, match_all
-        // etc.). Any other case is overwritten inside the loop.
+        // filterSql is recomputed per target inside runIndexLoop so
+        // each target encodes literals against its own mapping; the
+        // value set here only survives when the mapping does not
+        // affect the emitted SQL.
         FragmentQuerySpec spec = new FragmentQuerySpec(
             null,
             query,
@@ -199,12 +193,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         }
         IndexTarget target = targets.get(index);
         // filterSql is re-derived per target because Lance SQL literal
-        // encoding depends on the target's mapping. Two targets in the
-        // same request could have different types for the same field
-        // name (say `ts` mapped to `date` on one index and to `long`
-        // on another); a shared filterSql would silently misencode
-        // one of them. Fixing this at the target level is the
-        // resolution to issue #48.
+        // encoding depends on the target's mapping: two indices in the
+        // same request may map the same field name to different types
+        // (say `ts` as `date` on one and `long` on the other).
         FragmentQuerySpec perTargetSpec = new FragmentQuerySpec(
             resolveFilterSql(source, target.fieldTypeLookup()),
             spec.query(),
@@ -311,8 +302,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 nodeTarget.getId(),
                 fragmentsForNode
             );
-            // Milestone 5-C4: dispatch through TransportService so
-            // remote data nodes actually receive the request. For
+            // Dispatch through TransportService so remote data nodes
+            // receive the request. For
             // the local node this still executes in-process because
             // TransportService's request handler dispatch is loopback
             // aware, but any other node in the cluster picks up its
@@ -515,8 +506,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // lets the per-node executor use the rewritten Lucene
         // query (RangeQueryBuilder.doRewrite folds an unmapped
         // range to MatchNone) and count through the same
-        // IndexSearcher.count path shard search uses. See issue
-        // #50.
+        // IndexSearcher.count path shard search uses.
         if (LanceKnnFilterTranslator.hasUnmappedField(qb, fieldTypeLookup)) {
             return null;
         }
@@ -579,8 +569,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * into a {@code Map<String, Object>} tree. The top-level
      * {@code properties} entry holds one entry per column, keyed by
      * the OpenSearch field name; the {@code type} field on each
-     * entry is what we need. Nested objects are not surfaced yet
-     * (issues #4 / #5) so this shallow walk covers today's mappings.
+     * entry is what we need. Nested objects are not surfaced yet,
+     * so this shallow walk covers today's mappings.
      */
     @SuppressWarnings("unchecked")
     private static java.util.function.Function<String, String> buildFieldTypeLookup(IndexMetadata indexMetadata) {
@@ -760,9 +750,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 // Feed every per-node InternalAggregations tree into the
                 // stock reduce path so cross-node reduction lives in
                 // OpenSearch's aggregator code rather than in the Lance
-                // plugin. Direction 1 Stage 2 wire format: nodes ship
-                // InternalAggregations, coordinator calls topLevelReduce,
-                // no plugin-specific merge logic in the middle.
+                // plugin: nodes ship InternalAggregations, the
+                // coordinator calls topLevelReduce.
                 InternalAggregation.ReduceContext ctx = InternalAggregation.ReduceContext.forFinalReduction(
                     bigArrays,
                     scriptService,

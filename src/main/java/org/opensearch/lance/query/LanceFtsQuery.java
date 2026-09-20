@@ -211,27 +211,16 @@ public final class LanceFtsQuery extends Query {
      * map.
      *
      * <p>The reason for the shard-level scan is fragment fixed cost.
-     * Before, {@code scorerSupplier} called {@code dataset.newScan}
-     * per leaf, one call per fragment; QA measurements on a 20M-row
-     * table with 80 fragments per shard put the per-leaf overhead at
-     * 15-19 ms, so an unscoped {@code lance_match} paid 1.2-1.5 s
-     * just to spin up the scanner 80 times before any actual work
-     * happened. The consolidated scan collapses that to a single
-     * newScan call per Weight instance, so the fragment fixed cost
-     * shrinks from {@code N_fragments * per_scan_overhead} to a
-     * single {@code per_scan_overhead}. See {@code issue-42-design.md}
-     * Phase D / Direction 4 for the design rationale.
+     * Each {@code dataset.newScan} costs 15-19 ms on a 20M-row table
+     * regardless of how much it returns, so one scan per fragment
+     * over 80 fragments spends 1.2-1.5 s before any matching work.
+     * One newScan per Weight instance makes the fixed cost
+     * independent of fragment count.
      *
-     * <p>{@code scanLimit} used to bound the scan at
-     * {@code min(scanLimit, per_fragment_maxDoc)}, and the top-k
-     * pushdown pass ({@code #42} Phase B / Step B-1) added the field
-     * so the FTS scorer could stop after {@code size} score-sorted
-     * rows per fragment. With the shard-level scan the limit still
-     * caps the total transfer at {@code scanLimit} but is now applied
-     * once across the fragment subset instead of per fragment; a
-     * request of {@code size=20} over 20 fragments per node now
-     * transfers 20 hits, not 400, matching the shape the coordinator
-     * ultimately merges anyway.
+     * <p>{@code scanLimit} caps the total transfer across the fragment
+     * subset, so a request of {@code size=20} over 20 fragments per
+     * node transfers 20 hits, not 400, matching the shape the
+     * coordinator merges anyway.
      */
     final class LanceFtsWeight extends Weight {
 
@@ -263,11 +252,7 @@ public final class LanceFtsQuery extends Query {
             // query as a probe against the hidden data. The check
             // stays per-leaf (rather than moving into ensureShardScan)
             // so an FLS decision that hides the column on one leaf
-            // still leaves other leaves working. In practice FLS is
-            // per-shard consistent, so this is equivalent to a
-            // one-shot check, but keeping the loop preserves the
-            // pre-Phase D behaviour for any callers that reason
-            // about it.
+            // still leaves other leaves working.
             for (String col : query().columns()) {
                 if (context.reader().getFieldInfos().fieldInfo(col) == null) {
                     return null;

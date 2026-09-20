@@ -84,9 +84,9 @@ public final class LanceNamespaceService {
     // Index names created via /_lance/attach along with the absolute Lance
     // table path and storage_options they point at. Tracked here so poll()
     // can extend append coverage to attach-only indexes and not just
-    // namespace-registered tables (see C6: the previous behaviour was that
-    // appending to a table whose index came from attach never surfaced
-    // through _search until the operator hit refresh manually).
+    // namespace-registered tables; otherwise an append to a table whose
+    // index came from attach would not surface through _search until
+    // the operator refreshed manually.
     private final Map<String, AttachedIndex> attachedIndexes = new ConcurrentHashMap<>();
     // Index names we've already flagged as unowned, so the poll doesn't shout
     // the same warning every ten seconds. Cleared if the collision resolves.
@@ -101,7 +101,7 @@ public final class LanceNamespaceService {
     // seconds would otherwise flood the log.
     private final Set<String> warnedWaitPolicy = ConcurrentHashMap.newKeySet();
     /**
-     * Deleted-index tombstones for the re-surface guard (#34). Maps a
+     * Deleted-index tombstones for the re-surface guard. Maps a
      * Lance-backed index name to the millisecond timestamp at which
      * the {@code DELETE /{index}} was observed on the cluster state.
      * The poll cycle consults this map before creating a new index
@@ -155,8 +155,7 @@ public final class LanceNamespaceService {
     /**
      * Reactive setter for the dynamic
      * {@code lance.namespace.resurface_guard_grace} node setting. Zero
-     * or negative disables the guard (poll re-surfaces immediately),
-     * matching the pre-#34 behaviour.
+     * or negative disables the guard (poll re-surfaces immediately).
      */
     public void setResurfaceGrace(TimeValue newGrace) {
         resurfaceGrace.set(newGrace);
@@ -168,9 +167,7 @@ public final class LanceNamespaceService {
      * cluster state applier on every state that touches metadata, so
      * new registrations propagated from another node reach the
      * cache in time for the next poll cycle. Failures to initialise
-     * a DirectoryNamespace surface as warnings, matching the
-     * behaviour {@link #register} used to have for local
-     * initialisation errors.
+     * a DirectoryNamespace surface as warnings.
      */
     private void onClusterStateChanged(ClusterChangedEvent event) {
         if (!event.metadataChanged()) {
@@ -428,12 +425,11 @@ public final class LanceNamespaceService {
         try {
             boolean exists = client.admin().indices().exists(new IndicesExistsRequest(indexName)).actionGet().isExists();
             if (!exists) {
-                // Re-surface guard (#34): if this index was recently
-                // deleted through OpenSearch, honour the operator's
-                // intent and skip the surface until the grace period
-                // expires. Grace <= 0 disables the guard and matches
-                // the pre-#34 behaviour where every poll would
-                // recreate the index unconditionally.
+                // Re-surface guard: if this index was recently deleted
+                // through OpenSearch, honour the operator's intent and
+                // skip the surface until the grace period expires.
+                // Grace <= 0 disables the guard and every poll recreates
+                // the index unconditionally.
                 Long tombstonedAt = tombstones.get(indexName);
                 if (tombstonedAt != null) {
                     long graceMs = resurfaceGrace.get().millis();
@@ -479,7 +475,7 @@ public final class LanceNamespaceService {
                     // every checkout. We derive first so the builder only touches
                     // columns that derived to lance_text; keyword columns stay untouched.
                     // Re-apply any attach-body overrides captured on shard creation
-                    // (issue #2) so the re-derived mapping preserves multi-field
+                    // so the re-derived mapping preserves multi-field
                     // declarations across manifest version advance; without this the
                     // mapping would drop back to the default derivation and a caller
                     // querying body.raw would suddenly see 400 no-such-field errors.
@@ -493,38 +489,22 @@ public final class LanceNamespaceService {
                     rederivedMappingJson = derivation.mappingJson();
                     warnOnLanceFieldRename(indexName, dataset.getLanceSchema());
                     if ("wait".equals(policy)) {
-                        // The wait policy used to run Lance's incremental
-                        // optimize here so appended fragments were folded
-                        // into every existing index before the new version
-                        // became visible. That behaviour committed extra
-                        // versions to the user's Lance table (violating
-                        // the "plugin never writes to a user table without
-                        // permission" principle established by cf74c21) and
-                        // pushed append visibility above nineteen minutes
-                        // on 100M-row / 200-shard tables. The plugin now
-                        // treats indexes as an external concern: they are
-                        // expected to be built by the same writer that
-                        // produced the table (Python, Ray, Spark, or the
-                        // Lance Java SDK), and the plugin only helps out
-                        // through the explicit
-                        // `POST /_lance/build_indexes/{index}` endpoint.
-                        // The wait value is still accepted so the setting
-                        // shape can host a future async-optimize
-                        // implementation; today it converges with the
-                        // immediate branch. Log the observation once per
-                        // index so an operator who set `wait` on purpose
-                        // sees why nothing is happening.
+                        // `wait` is accepted but converges with the
+                        // immediate branch: the plugin never writes to a
+                        // user table, so folding appended fragments into
+                        // the existing indexes is left to the table's
+                        // writer or to POST /_lance/build_indexes/{index}.
+                        // Log once per index so an operator who set `wait`
+                        // on purpose sees why nothing is happening.
                         warnDeprecatedWaitPolicyOnce(indexName);
                     }
-                    // Either branch now exposes the new version at once
-                    // and lets Lance fall back to scan evaluation on any
-                    // fragment that the existing indexes have not yet
-                    // caught up to. Lance's own scanner produces a mixed
-                    // execution plan for FTS and knn (index for covered
-                    // fragments, flat scan for uncovered fragments,
-                    // unioned) so an incremental append never slows down
-                    // the queries hitting the previously-covered
-                    // fragments.
+                    // Either branch exposes the new version at once and
+                    // lets Lance fall back to scan evaluation on any
+                    // fragment the existing indexes have not caught up
+                    // to. Lance's scanner produces a mixed plan for FTS
+                    // and knn (index for covered fragments, flat scan for
+                    // uncovered, unioned) so an incremental append does
+                    // not slow down queries on covered fragments.
                 }
             }
             if (latest > served) {
@@ -585,14 +565,14 @@ public final class LanceNamespaceService {
         try (Dataset dataset = LanceRegistry.openDataset(table, storageOptions)) {
             // Derive first so the CreateIndex settings and mapping reflect
             // the current Lance schema. Automatic index creation is off by
-            // default (see C3 / C9); operators build indexes explicitly
-            // through POST /_lance/build_indexes.
+            // default; operators build indexes explicitly through
+            // POST /_lance/build_indexes.
             derivation = RestAttachAction.derive(dataset);
         }
         // Fire the CreateIndex asynchronously so a red shard on this table
         // does not block the poll thread for 30 seconds waiting for ack.
-        // Every other table in the same namespace was previously stuck
-        // behind that block. See issue #29.
+        // Every other table in the same namespace would otherwise wait
+        // behind that block.
         final long version = derivation.version();
         Settings.Builder settings = Settings.builder()
             .put("index.number_of_shards", 1)

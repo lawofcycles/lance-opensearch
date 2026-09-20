@@ -21,19 +21,16 @@ import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
 
 /**
- * Unit tests for {@link LanceNamespaceService}. Milestone 5-D1
- * migrated the service's registration state from a per-node
- * {@code CopyOnWriteArrayList} to cluster-state metadata routed
- * through a {@code TransportClusterManagerNodeAction}, so calls to
- * {@link LanceNamespaceService#register} in isolation no longer
- * mutate state without a live transport stack. The tests here
- * cover the surface that stands on its own: cadence exposure and
- * the metadata-backed {@link LanceNamespaceService#namespaces}
- * reader.
+ * Unit tests for {@link LanceNamespaceService}. Registration state
+ * lives in cluster-state metadata routed through a
+ * {@code TransportClusterManagerNodeAction}, so
+ * {@link LanceNamespaceService#register} cannot be exercised without a
+ * live transport stack; the tests here cover the surface that stands
+ * on its own: cadence exposure and the metadata-backed
+ * {@link LanceNamespaceService#namespaces} reader.
  *
  * <p>End-to-end register / unregister behaviour is exercised in
- * {@code LancePluginIT} where the plugin ships with a real
- * transport stack and REST endpoints.
+ * {@code LanceNamespaceIT}.
  *
  * <p>Thread leak checking is disabled at the suite level because
  * {@code DirectoryNamespace.initialize} spins up Lance's native runtime,

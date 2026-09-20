@@ -18,21 +18,15 @@ import org.opensearch.core.rest.RestStatus;
 public class LancePluginIT extends LanceRestTestCase {
 
     public void testPluginIsInstalled() throws IOException {
-        // Ask the cluster for its plugin list and confirm the entry exists.
-        // This catches classpath / metadata regressions before any Lance code
-        // ever gets touched.
         Response response = client().performRequest(new Request("GET", "/_cat/plugins?format=json"));
         String body = readAll(response);
         assertTrue("expected opensearch-lance in _cat/plugins, saw: " + body, body.contains("opensearch-lance"));
     }
 
     public void testCircuitBreakerIsRegistered() throws IOException {
-        // The plugin registers a lance_native breaker via
-        // CircuitBreakerPlugin.getCircuitBreaker so operators can see
-        // the native memory footprint through the standard
-        // _nodes/stats/breaker API without a plugin-specific stats
-        // endpoint. Assert that the breaker name and non-zero limit
-        // show up on every node in a fresh cluster.
+        // The lance_native breaker is registered through
+        // CircuitBreakerPlugin so it shows up in the standard
+        // _nodes/stats/breaker output.
         Response response = client().performRequest(new Request("GET", "/_nodes/stats/breaker"));
         assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
         String body = readAll(response);
@@ -40,9 +34,6 @@ public class LancePluginIT extends LanceRestTestCase {
     }
 
     public void testNamespaceEndpointIsRegistered() throws IOException {
-        // GET /_lance/namespace lists registered namespaces. On a fresh
-        // cluster it returns an empty list, but the important assertion is
-        // that the route is wired up and returns a 200 instead of 404.
         Response response = client().performRequest(new Request("GET", "/_lance/namespace"));
         assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
         String body = readAll(response);
@@ -50,12 +41,10 @@ public class LancePluginIT extends LanceRestTestCase {
     }
 
     public void testStatsAPIsSucceedForLanceIndex() throws Exception {
-        // Regression for LanceReadOnlyEngine.docStats() / segmentsStats():
-        // OpenSearch's default implementations traverse leaves via
-        // Lucene.segmentReader(reader), which throws for Lance leaves and
-        // takes out _stats / _cat/indices docs.count / _nodes/stats /
-        // _cluster/stats node-wide. Confirm the plugin overrides succeed
-        // and the node-level stats aggregation runs without shard failures.
+        // The default docStats / segmentsStats implementations walk
+        // leaves through Lucene.segmentReader, which rejects Lance
+        // leaves; the engine overrides must keep the stats APIs free of
+        // shard failures.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "statsapi")) {
             String indexName = fixture.indexName();
 

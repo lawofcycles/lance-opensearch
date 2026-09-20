@@ -29,8 +29,7 @@ import org.opensearch.search.sort.SortBuilder;
  * "all"), and honours the filter and aggregations alongside the
  * hits {@code size} allowance.
  *
- * <p>Since Direction 1 Stage 3 the request carries native OpenSearch
- * shapes on the wire:
+ * <p>The request carries native OpenSearch shapes on the wire:
  * <ul>
  *   <li>{@link #query()} — top-level query builder (nullable).
  *       Translated to a Lucene {@link org.apache.lucene.search.Query}

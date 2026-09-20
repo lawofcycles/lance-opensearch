@@ -113,12 +113,9 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         hit.score(1.0f);
         hit.sourceRef(new BytesArray("{\"id\":3}"));
 
-        // Wire format now carries InternalAggregations (Direction 1
-        // Stage 2). Build a real InternalSum so the round-trip
-        // exercises the aggregator's own StreamInput/StreamOutput
-        // code path rather than an empty container: an empty
-        // InternalAggregations would not catch bugs in
-        // per-aggregation serialisation.
+        // A real InternalSum so the round-trip exercises the aggregator's
+        // own StreamInput / StreamOutput path rather than an empty
+        // container.
         org.opensearch.search.aggregations.InternalAggregations aggregations = org.opensearch.search.aggregations.InternalAggregations.from(
             List.<org.opensearch.search.aggregations.InternalAggregation>of(
                 new org.opensearch.search.aggregations.metrics.InternalSum(

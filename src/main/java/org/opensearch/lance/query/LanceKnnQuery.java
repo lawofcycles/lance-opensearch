@@ -142,10 +142,9 @@ public final class LanceKnnQuery extends Query {
             // so materialise the hit set directly rather than
             // allocating float[maxDoc] and FixedBitSet(maxDoc). On
             // a 250k-row fragment this drops per-fragment heap from
-            // 1 MB + 31 KB to 8 bytes * hits.size (typically <= k).
-            // Multiplied by 80 fragments and 64 concurrent queries
-            // this was the main driver behind #47 (parent breaker
-            // latching under raised max_concurrent).
+            // 1 MB + 31 KB to 8 bytes * hits.size (typically <= k),
+            // which is what keeps 64 concurrent queries over 80
+            // fragments under the parent breaker.
             //
             // Lance's nearest scan returns rows in score order; the
             // Lucene DocIdSetIterator contract asks for ascending

@@ -105,7 +105,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * {@link LanceEngineFactory} to pick the right lookup strategy. Only
      * {@code "long"} (signed integer PK, default) and {@code "keyword"}
      * (Utf8 PK) are recognised; unknown values fall back to {@code "long"}
-     * to keep pre-#24 indices readable. The setting has no meaning when
+     * so indices created before this setting existed stay readable. The
+     * setting has no meaning when
      * {@link #PRIMARY_KEY_FIELD_SETTING} is empty (the table has no PK).
      */
     public static final Setting<String> PRIMARY_KEY_TYPE_SETTING = Setting.simpleString(
@@ -125,7 +126,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     /**
      * JSON stringified multi-fields spec, persisted by attach so the
      * engine can rehydrate keyword sub-fields on shard open. Empty
-     * means no sub-fields declared. See design note 36.
+     * means no sub-fields declared.
      */
     public static final Setting<String> MULTI_FIELDS_SETTING = Setting.simpleString(
         LanceEngineFactory.MULTI_FIELDS_SETTING,
@@ -151,7 +152,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * (through {@code DELETE /{index}}) is held in the namespace poll's
      * tombstone list so a subsequent poll cycle does not immediately
      * recreate it. Zero disables the guard (poll re-surfaces
-     * immediately, matching the pre-#34 behaviour). Applies only to
+     * immediately). Applies only to
      * indexes that were surfaced or attached by this plugin; ordinary
      * OpenSearch indexes are never in the tombstone list.
      */
@@ -210,7 +211,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * itself gets in the way of an investigation. The breaker's byte
      * limit is not configurable through this setting; it always mirrors
      * the Session cache limit so operators have one number to reason
-     * about. Independent headroom is deferred to a follow-up.
+     * about.
      */
     public static final Setting<Boolean> NATIVE_MEMORY_CB_ENABLED_SETTING = Setting.boolSetting(
         "lance.native_memory.circuit_breaker.enabled",
@@ -328,31 +329,17 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     }
 
     /**
-     * Historically wired an {@link org.opensearch.index.shard.IndexEventListener}
-     * onto every {@link org.opensearch.index.IndexModule} so Lance-backed
-     * indexes triggered a shared-session cache invalidation on DELETE
-     * (see issue #46). Lance 11's index-metadata cache was keyed by
-     * dataset URI plus dataset version but not the manifest ETag, so a
-     * table recreated at the same path could still return cached
-     * {@code _indices/<uuid>/} pages from its previous incarnation.
-     *
-     * <p>Lance 12 keys the index-metadata cache on the manifest ETag
-     * (upstream fix in <a href="https://github.com/lancedb/lance/pull/8904">
-     * lance#8904</a>), so a recreated table gets a fresh cache slot on
-     * the first access without any plugin intervention. The listener
-     * and its {@code LanceRegistry.reinstallSession} call have been
-     * removed as a result; the workaround was safe (one leaked
-     * Session per DELETE, bounded) but no longer needed. The IT
-     * {@code testAttachRecreateAtSamePathServesNewContent} still
-     * runs as a regression fence.
+     * No plugin-level index events are wired. Lance 12 keys its
+     * index-metadata cache on the manifest ETag
+     * (<a href="https://github.com/lancedb/lance/pull/8904">lance#8904</a>),
+     * so a table recreated at the same path gets a fresh cache slot on
+     * first access without a DELETE-time invalidation from the plugin;
+     * {@code LanceAttachIT#testAttachRecreateAtSamePathServesNewContent}
+     * covers that. The override is kept as the wiring point for any
+     * future per-index hook (warm cache, per-index breaker).
      */
     @Override
-    public void onIndexModule(org.opensearch.index.IndexModule indexModule) {
-        // No plugin-level index events to wire since the shared-session
-        // invalidation moved upstream into Lance 12's metadata cache.
-        // The override is kept so any future per-index hook (per-index
-        // warm cache, per-index breaker) has an obvious wiring point.
-    }
+    public void onIndexModule(org.opensearch.index.IndexModule indexModule) {}
 
     private LanceNamespaceService namespaceService;
     private org.opensearch.threadpool.ThreadPool threadPool;

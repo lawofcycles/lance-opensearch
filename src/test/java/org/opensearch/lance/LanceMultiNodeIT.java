@@ -29,16 +29,13 @@ import org.opensearch.test.rest.OpenSearchRestTestCase;
  *   <li>Coordinator fan-out over multiple data nodes for
  *       fragment-mode search.</li>
  *   <li>Namespace metadata propagation through cluster state.</li>
- *   <li>Manager-routed register / unregister via the transport
- *       action registered in Milestone 5-D1.</li>
+ *   <li>Manager-routed register / unregister through the transport
+ *       action.</li>
  * </ul>
  *
  * <p>The rest of the integTest suite runs against a single-node
- * cluster in the default integTest task because 99 % of its cases
- * do not care about node topology and duplicating them on a 3-node
- * cluster would inflate the dev cycle by roughly an order of
- * magnitude. Only tests that meaningfully depend on multiple nodes
- * live here.
+ * cluster; only tests that depend on node topology live here, so the
+ * three-node cluster does not slow down every run.
  *
  * <p>Filtered in and out through Gradle {@code filter} blocks: the
  * default {@code integTest} task excludes this class, and
@@ -57,13 +54,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     public void testFragmentDispatchAcrossThreeNodes() throws Exception {
-        // Attach a 6-row Lance table, flip to fragment dispatch, and
-        // confirm the coordinator's fan-out returns the expected
-        // count + hits when the target cluster has three data
-        // nodes. Prior to the transport layer landing in Milestone
-        // 5-C4 this would have quietly executed on the coordinator
-        // node only; now every data node participates and the
-        // response merges partials.
+        // The coordinator's fan-out must return the full count and hits
+        // when the cluster has three data nodes.
         String suffix = "mn-dispatch-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -92,10 +84,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     public void testNamespaceRegisterPropagatesToAllNodes() throws Exception {
-        // Register on whichever node the test client picks and
-        // verify GET returns the path. The list read reads cluster
-        // state locally on the responding node, so if propagation
-        // stalled the entry would not appear here.
+        // GET reads cluster state on the responding node, so the entry
+        // only appears if the registration propagated.
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-mn-register-" + randomAlphaOfLength(8)));
         String path = scratchDir.toString();
         try {

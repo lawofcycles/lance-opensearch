@@ -106,13 +106,11 @@ public class RestAttachAction extends BaseRestHandler {
             }
             explicitName = readOptionalString(body, "name");
             if (body.containsKey("number_of_shards")) {
-                // Attach used to derive a shard count from the row count, but
-                // the fragment path is now the only search implementation and
-                // shards no longer influence fan-out. Rejecting the option is
-                // cleaner than silently ignoring it — an operator setting
-                // `number_of_shards: 5` would otherwise still get a
-                // single-shard index and be confused about why fan-out did
-                // not widen.
+                // Lance-backed indices are single-shard and fan-out happens
+                // per fragment, so a shard count has nothing to control.
+                // Reject rather than silently ignore so an operator setting
+                // `number_of_shards: 5` is not left wondering why fan-out
+                // did not widen.
                 return channel -> channel.sendResponse(
                     new BytesRestResponse(
                         RestStatus.BAD_REQUEST,
@@ -429,9 +427,8 @@ public class RestAttachAction extends BaseRestHandler {
         // Track the Arrow type family of the declared primary key so the
         // engine can pick the right lookup strategy (signed integer via
         // Long.parseLong / Utf8 via SQL-quoted string). The setting is
-        // ignored by the engine when keyField is empty, so leaving the
-        // default "long" here matches the pre-#24 behaviour for tables
-        // that never declared a PK.
+        // ignored by the engine when keyField is empty, so the default
+        // "long" is harmless for tables that never declared a PK.
         String keyFieldType = "long";
         java.util.List<String> notes = new java.util.ArrayList<>();
         java.util.Set<String> ftsColumns = new java.util.LinkedHashSet<>();
@@ -502,10 +499,9 @@ public class RestAttachAction extends BaseRestHandler {
                 // recorded as a note and left off keyField so the
                 // engine treats the table as PK-less rather than
                 // trying to serve GET on an unsupported column.
-                // Unsigned int8 / int16 / int32 PKs are out of
-                // scope for #24 too (no OpenSearch mapping type
-                // covers unsigned <64 bit); they fall through to
-                // the note branch.
+                // Unsigned int8 / int16 / int32 PKs also fall through
+                // to the note branch: no OpenSearch mapping type
+                // covers unsigned <64 bit.
                 if (type instanceof ArrowType.Int intType && intType.getIsSigned() && intType.getBitWidth() <= 64) {
                     keyField = name;
                     keyFieldType = "long";
@@ -578,9 +574,7 @@ public class RestAttachAction extends BaseRestHandler {
                 // Scalar float columns. FixedSizeList<float32> vectors go
                 // through the branch below and pick up the lance_vector
                 // mapping; this branch handles bare Float32 / Float64
-                // columns that were previously left in the "stored only"
-                // notes and consequently unreachable through range /
-                // sort / metric aggregation / _source. Both surface with
+                // columns. Both surface with
                 // doc values enabled: OpenSearch's `float` / `double`
                 // mappers pair with the NumericDocValues path the reader
                 // already serves through the shared long[] storage
@@ -696,7 +690,7 @@ public class RestAttachAction extends BaseRestHandler {
         // base column must exist and must be Utf8, because keyword-flavoured
         // sub-fields only make sense on a string column (they share the
         // underlying data with the base field). Sub-field type must be
-        // "keyword" today; other types will land alongside issue #7 /#6.
+        // "keyword" today.
         // Also refuse a sub-field name that collides with an existing
         // field id so the mapping stays unambiguous.
         java.util.Set<String> allColumnNames = new java.util.HashSet<>();
@@ -792,9 +786,8 @@ public class RestAttachAction extends BaseRestHandler {
      * <p>The clause is versioned by shape rather than by a flag:
      * {@code type} on the base column (for {@code ip}, {@code wildcard},
      * an analyzer mode, or a preferred index type) is not accepted yet
-     * and returns 400. That reservation lets subsequent tickets
-     * (#6 / #7 / #11) grow the receiver without another wire-format
-     * change.
+     * and returns 400. That reservation lets those features land
+     * without another wire-format change.
      *
      * <p>Returns the same normalised shape as
      * {@link #parseMultiFields} so callers can persist it through the
@@ -821,7 +814,7 @@ public class RestAttachAction extends BaseRestHandler {
                 // scalar / vector index type) is reserved but not
                 // implemented yet. Explicitly refuse rather than
                 // silently ignore so an operator experimenting today
-                // knows to wait for #6 / #7 / #11.
+                // knows the override had no effect.
                 Object t = spec.get("type");
                 throw new IllegalArgumentException(
                     "[overrides."

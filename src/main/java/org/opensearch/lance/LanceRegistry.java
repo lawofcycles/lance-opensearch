@@ -16,26 +16,19 @@ import org.lance.Session;
  * Process-wide Arrow allocator and Lance {@link Session} shared by every
  * plugin-owned code path that needs to open a Lance dataset, plus the
  * single-source helper for constructing that {@link Dataset} instance.
- * Every call site that used to build the {@link OpenDatasetBuilder}
- * inline now goes through {@link #openDataset(String, StorageOptions)} so
- * the storage-options plumbing and the Session sharing both live in one
- * place.
+ * Every call site goes through {@link #openDataset(String, StorageOptions)}
+ * so the storage-options plumbing and the Session sharing both live in
+ * one place.
  *
  * <p>Sharing one {@link Session} across every {@code Dataset} on the node
  * keeps Lance's inverted-index and metadata caches native-side and node
- * scoped: with a per-shard {@code Dataset} each shard used to allocate its
- * own 6 GiB / 1 GiB caches (the Lance defaults) on demand, so 200 shards
- * of the same table could drive the resident set above 100 GiB even
- * though JVM heap stayed at its configured maximum. The shared Session
- * caps the two caches to the node-level limits configured by
+ * scoped: a per-shard {@code Dataset} would allocate its own 6 GiB /
+ * 1 GiB caches (the Lance defaults) on demand, so 200 shards of the
+ * same table could drive the resident set above 100 GiB even though
+ * JVM heap stayed at its configured maximum. The shared Session caps
+ * the two caches to the node-level limits configured by
  * {@code lance.native_memory.limit}, and {@link Session#sizeBytes()}
- * exposes the current usage so a follow-up circuit-breaker layer can
- * feed it back into OpenSearch's memory accounting.
- *
- * <p>Historically this class also cached a per-index {@code Dataset} for
- * two REST endpoints ({@code _scan} / {@code _query}); the endpoints were
- * undocumented PoC leftovers and both they and the caching layer have
- * been removed.
+ * exposes the current usage to the {@code lance_native} circuit breaker.
  */
 public final class LanceRegistry {
 

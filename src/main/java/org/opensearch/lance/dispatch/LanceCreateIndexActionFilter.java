@@ -22,15 +22,11 @@ import org.opensearch.threadpool.ThreadPool;
  * ActionFilter that rejects {@code indices:admin/create} requests
  * carrying {@code index.lance.table} in their settings unless the
  * request originates inside the plugin (attach or namespace
- * surface). Users who tried to bypass {@code POST /_lance/attach}
- * by sending {@code PUT /{index} {settings:{index.lance.table:...}}}
- * used to end up with a half-broken index: the engine wired up
- * without the derive step running, so mapping stayed empty and
- * every typed query failed with "No mapping found" while {@code
- * _count} returned the Lance metadata count. Rejecting up front
- * points the caller at the correct entry point instead of leaving
- * behind an inconsistent index that only surfaces the mistake on
- * the next {@code _search}.
+ * surface). A bare {@code PUT /{index} {settings:{index.lance.table:...}}}
+ * would wire up the engine without the derive step, leaving the mapping
+ * empty so every typed query fails with "No mapping found" while
+ * {@code _count} returns the Lance metadata count. Rejecting up front
+ * points the caller at {@code POST /_lance/attach} instead.
  *
  * <p>Plugin-internal callers stamp {@link
  * LanceInternalHeaders#LANCE_INTERNAL_CREATE_INDEX} on their

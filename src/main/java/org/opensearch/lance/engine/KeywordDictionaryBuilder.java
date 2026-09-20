@@ -24,9 +24,9 @@ import org.apache.lucene.util.BytesRefHash;
  * copied into the hash's byte pool. Nothing per row survives except one
  * {@code int} in the caller's ordinal array, so a 20M-row keyword
  * column with a few thousand distinct values costs about 80 MB of
- * ordinals plus the distinct terms, instead of the 20M {@link String}
- * objects (roughly 1.5 GB plus the garbage of allocating them) the
- * previous {@code String[maxDoc]} intermediate needed. See issue #52.
+ * ordinals plus the distinct terms; a {@code String[maxDoc]}
+ * intermediate would cost 20M {@link String} objects, roughly 1.5 GB
+ * plus the garbage of allocating them.
  *
  * <p>Ordering follows {@link BytesRefHash#sort()}, which compares
  * UTF-8 bytes unsigned. That is the order Lucene's

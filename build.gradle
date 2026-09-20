@@ -351,8 +351,8 @@ integTest {
         sharedTablesDir.mkdirs()
     }
     systemProperty 'tests.lance.shared_tables_dir', sharedTablesDir.absolutePath
-    // Milestone 5-D2 keeps the default integTest single-node so the
-    // dev cycle stays around a minute. A separate multiNodeIntegTest
+    // The default integTest stays single-node so the dev cycle is
+    // around a minute. A separate multiNodeIntegTest
     // task below runs a focused set of tests against a 3-node
     // cluster to verify multi-node fan-out without paying the
     // ~10x latency penalty on every commit.

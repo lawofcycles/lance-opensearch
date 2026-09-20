@@ -100,7 +100,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * (see {@link #resolveFtsColumns}).
      * The constructor does not materialise column data; each column moves
      * from "declared in schema" to "loaded" the first time a Lucene accessor
-     * asks for it. This is the mitigation for issue #21 (heap footprint).
+     * asks for it, so heap scales with the columns a query touches.
      */
     private enum ColumnKind {
         NUMERIC,       // signed Int / Date / Timestamp / Float32 / Float64 — served as NumericDocValues
@@ -172,16 +172,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * handled so a miss does not trigger a second scan for the same
      * doc).
      *
-     * <p>This replaces the previous constructor-time
-     * {@code _rowaddr + PK} scan of the whole fragment (which populated
-     * a {@code long[maxDoc]} / {@code String[maxDoc]} pair for
-     * {@code _id}) and the whole-column {@code ensureXxxLoaded} path
-     * {@code _source} rendering used to depend on. Fetching only the
-     * hit rows keeps the per-request cost proportional to
-     * {@code size} rather than to the number of rows in the fragment;
-     * see issue #42 (QA r8 section 10.8: the 1-hit floor scaled with
-     * total rows, not fragment count, because of the constructor
-     * scan).
+     * <p>Fetching only the hit rows keeps the per-request cost of
+     * {@code _id} / {@code _source} proportional to {@code size} rather
+     * than to the number of rows in the fragment; a constructor-time
+     * {@code _rowaddr + PK} scan would make even a 1-hit query scale
+     * with total row count.
      */
     private final Map<Integer, Object[]> takenRows = new ConcurrentHashMap<>();
     private static final Object[] MISSING_ROW = new Object[0];
@@ -215,8 +210,8 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * entry is a keyword sub-field on a Utf8 base column; the reader
      * routes {@link #getSortedDocValues} / {@link #getSortedSetDocValues}
      * on the sub-field name through the base column's ord data
-     * structure. See design note 36 for why the sub-field shares the
-     * base column's ord map rather than getting its own.
+     * structure; a keyword sub-field of a Utf8 column holds the same
+     * values as the column, so a second ord map would be a copy.
      */
     private final java.util.Map<String, String> keywordSubFields;
     /**
@@ -237,15 +232,12 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * <p>Fragment path queries whose top-level shape is a scalar
      * filter that {@code LanceKnnFilterTranslator} can translate to
      * Lance SQL ship the translated predicate as
-     * {@code LanceFragmentQueryRequest.filterSql()}. The fragment
-     * dispatch handler now forwards that predicate all the way to
-     * the leaf reader so the lazy column loads inside
-     * {@link #ensureNumericLoaded} et al. only materialise the rows
-     * that match. Without the predicate, {@code filter + terms} or
-     * {@code filter + sum} on a 20M row fragment reads every value
-     * in the aggregated column, throwing the fragment path back to
-     * the pre-Phase-A pattern despite the Weight side already
-     * filtering.
+     * {@code LanceFragmentQueryRequest.filterSql()}, and the fragment
+     * dispatch handler forwards it here so the lazy column loads
+     * inside {@link #ensureNumericLoaded} et al. only materialise the
+     * rows that match. Without the predicate, {@code filter + terms}
+     * or {@code filter + sum} reads every value in the aggregated
+     * column even though the Weight already filters.
      *
      * <p>Kept {@code null} when the query cannot be expressed in
      * Lance SQL (FTS, knn, unsupported shapes) so the reader falls
@@ -409,7 +401,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
         // Flatten the multi-fields spec into "<sub>" → "<base>" lookup so
         // getSortedDocValues("body.raw") can route to the base column's
         // ord data structure without re-parsing the spec. Only keyword
-        // sub-fields are supported today (see design note 36), so any
+        // sub-fields are supported today, so any
         // sub-field type that is not "keyword" is skipped defensively
         // rather than errored out — the attach-time validation is where
         // the error surfaces.
@@ -733,8 +725,8 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * writes into the per-leaf storage the accessors already read
      * from ({@link #numericColumns}, {@link #numericPresence}), so
      * downstream {@link #getSortedNumericDocValues} calls see the
-     * populated arrays through the same {@code ConcurrentHashMap}
-     * happens-before as the pre-cache per-leaf path.
+     * populated arrays through the {@code ConcurrentHashMap}
+     * happens-before.
      *
      * <p>Package-private because only the cache should call it — the
      * cache lives alongside this class in

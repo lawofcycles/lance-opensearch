@@ -67,7 +67,7 @@ import org.opensearch.transport.TransportService;
  * its subset, keeping the total work proportional to the fragments
  * a node owns instead of the entire dataset.
  *
- * <p>Since Direction 1 Stage 3 both hits and aggregations flow through
+ * <p>Both hits and aggregations flow through
  * OpenSearch's stock query / aggregator machinery driven against a
  * per-fragment {@link org.opensearch.lance.engine.LanceFragmentLeafReader}
  * bundle:
@@ -309,13 +309,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     // and every per-column Lance scan the leaf reader
                     // issues inside ensureXxxLoaded is layered with
                     // that filter, so `filter + terms agg` and
-                    // `filter + sum` no longer materialise every row
-                    // of the aggregated column when only a fraction
-                    // matches. FTS and knn queries do not have a
-                    // SQL representation so filterSql is null there
-                    // and the leaf reader falls back to unfiltered
-                    // full-column scans, matching the pre-Phase-C
-                    // behaviour for those shapes.
+                    // `filter + sum` materialise only the matching
+                    // rows of the aggregated column. FTS and knn
+                    // queries have no SQL representation so filterSql
+                    // is null there and the leaf reader runs
+                    // unfiltered full-column scans.
                     request.filterSql(),
                     readerWrapper
                 )
@@ -462,7 +460,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *       {@link org.opensearch.index.query.QueryBuilder} the
      *       coordinator forwarded, for shapes the translator refused
      *       (match / knn / anything scoring, or a tree touching an
-     *       unmapped field, see issue #50). Runs through the local
+     *       unmapped field). Runs through the local
      *       {@link QueryShardContext#toQuery} so per-node mapping
      *       decisions (Lance FTS field types, knn field types, etc.)
      *       apply.</li>
@@ -486,11 +484,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // are resolved before Lucene translation. Without this
             // step RangeQueryBuilder.doToQuery throws
             // IllegalStateException("Rewrite first"), which the
-            // OpenSearch error handler surfaces as a 500. See
-            // issue #50 and the shard-path counterpart in
-            // QueryShardContext.toQuery (which does the same
-            // Rewriteable.rewrite call before invoking
-            // doToQuery).
+            // OpenSearch error handler surfaces as a 500. The shard
+            // path does the same Rewriteable.rewrite call in
+            // QueryShardContext.toQuery before invoking doToQuery.
             org.opensearch.index.query.QueryBuilder rewritten = org.opensearch.index.query.Rewriteable.rewrite(request.query(), qsc, true);
             Query base = rewritten.toQuery(qsc);
             // If the request shape allows top-k pushdown and the
@@ -500,9 +496,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // stop after k score-sorted rows. Callers wrapping the
             // FTS clause in a bool / boost / dis_max keep the
             // sentinel: mixing the top-k with other scorers would
-            // clip the wrong side. Phase B follow-ups can extend the
-            // rewrite deeper once we teach the scorer to negotiate
-            // with siblings.
+            // clip the wrong side.
             int scanLimit = resolveScanFilterTopK(request);
             if (scanLimit != LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED && base instanceof LanceFtsQuery fts) {
                 return fts.withScanLimit(scanLimit);
@@ -612,10 +606,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * The reader is built by the caller so hits and aggregations
      * share one Lucene scan of the fragment subset.
      *
-     * <p>Since Stage 3 the score is the real Lucene score
-     * (BM25 for Lance FTS, cosine for Lance knn, 1.0 for
-     * {@link MatchAllDocsQuery}) instead of the hard-coded 1.0 the
-     * previous Lance-native scan wrote. Sort clauses go through the
+     * <p>The score is the real Lucene score (BM25 for Lance FTS,
+     * cosine for Lance knn, 1.0 for {@link MatchAllDocsQuery}).
+     * Sort clauses go through the
      * standard {@link org.apache.lucene.search.IndexSearcher#search(Query, int, org.apache.lucene.search.Sort)}
      * call and per-hit sort values are captured for the coordinator's
      * merge phase.
@@ -757,7 +750,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *
      * <p>The caller additionally refuses the pushdown when a reader
      * wrapper is installed, because the Lance-side hits would bypass
-     * DLS / FLS the same way a Lance-side count would (see issue #51).
+     * DLS / FLS the same way a Lance-side count would.
      */
     private static List<org.lance.ipc.ColumnOrdering> resolvePushdownOrderings(
         LanceFragmentQueryRequest request,
@@ -1107,7 +1100,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
-     * Direction 1 aggregator path. Runs the request's
+     * Aggregator path. Runs the request's
      * {@link org.opensearch.search.aggregations.AggregatorFactories.Builder}
      * against the shared per-fragment reader and returns the
      * per-node {@link InternalAggregations} for the coordinator to
@@ -1151,7 +1144,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         // time here would drive DeferableBucketAggregator (breadth_first
         // terms with metric sub-aggregations such as avg / sum / max /
         // terms) through BestBucketsDeferringCollector#prepareSelectedBuckets
-        // twice; the second call throws "Already been replayed" (issue #40).
+        // twice; the second call throws "Already been replayed".
         List<InternalAggregation> results = new ArrayList<>(aggregators.length);
         for (Aggregator agg : aggregators) {
             results.add(agg.getPostCollectionAggregation());
@@ -1366,9 +1359,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // without materialising every match. Lance's FTS scan
             // walks the posting list once and can stream row counts
             // when we do not ask it for row addresses or scores;
-            // pylance measures this at 1.5-1.9 ms independent of hit
-            // count, versus 4.6 s for the Weight-based path on a
-            // 20M-row table with 500k hits (issue #42 perf report).
+            // pylance measures this at low milliseconds independent of
+            // hit count, versus seconds for the Weight-based path on a
+            // 20M-row table with 500k hits.
             return countFtsHitsDirectly(dataset, fts, fragmentIds);
         }
         if (hasScoringQuery || hasPostFilter) {
@@ -1404,11 +1397,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         // row id: the batches only need to carry a row count that
         // the loop below accumulates via getRowCount(). Without
         // columns(emptyList()) Lance materialises every column of
-        // every matching row (including large text / vector fields
-        // for size:0 requests), which QA measured at 5.2 s for a
-        // scalar term filter on a 20M-row table where the actual
-        // count is trivial (issue #42 QA r8 recommendation 5,
-        // immediate step). This mirrors what countFtsHitsDirectly
+        // every matching row (including large text / vector fields)
+        // just to count them. This mirrors what countFtsHitsDirectly
         // does for the FTS shape.
         org.lance.ipc.ScanOptions options = new org.lance.ipc.ScanOptions.Builder().filter(filterSql)
             .fragmentIds(fragmentIds)
@@ -1436,9 +1426,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * no row address / row id. This is the count-only counterpart
      * of {@code Dataset.countRows(sqlFilter)} for scalar filters,
      * and pylance measures it at low milliseconds independent of
-     * the hit count. See issue #42 phase A / Step A-1 for the
-     * background: without this path, an FTS count went through
-     * {@code IndexSearcher.count(luceneQuery)}, which triggered
+     * the hit count. Without this path an FTS count goes through
+     * {@code IndexSearcher.count(luceneQuery)}, which triggers
      * {@link LanceFtsQuery}'s Weight to materialise every match's
      * row address and score into a sparse array (see
      * {@code LanceFtsQuery.scorerSupplier}). The Weight is

@@ -27,16 +27,14 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         Response post = postJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
         assertEquals(RestStatus.OK.getStatus(), post.getStatusLine().getStatusCode());
 
-        // The register call should surface the path back through GET.
         Response listing = client().performRequest(new Request("GET", "/_lance/namespace"));
         String body = readAll(listing);
         assertTrue("expected namespace " + path + " in listing, saw: " + body, body.contains(path));
     }
 
     public void testRegisterNamespaceIsIdempotent() throws IOException {
-        // Registering the same path twice must not duplicate the entry, so a
-        // second POST is a no-op. If the polling loop scanned the same
-        // catalog twice per cycle every table would surface twice as well.
+        // A second POST for the same path is a no-op; a duplicate entry
+        // would make the poll loop scan the catalog twice per cycle.
         String path = scratchPathString("idempotent");
         java.nio.file.Files.createDirectories(java.nio.file.Path.of(path));
         postJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
@@ -49,8 +47,6 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     }
 
     public void testRegisterNamespaceRejectsMissingPath() throws IOException {
-        // The `path` field is required. Without validation, the code cast the
-        // body value to String and threw a 500. It must now be 400.
         ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/namespace", "{}"));
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for missing path, saw " + status, 400, status);
@@ -59,8 +55,6 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     }
 
     public void testRegisterNamespaceRejectsNonStringPath() throws IOException {
-        // A numeric or boolean `path` used to trip a ClassCastException. The
-        // handler must catch the type mismatch and return 400.
         ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/namespace", "{\"path\":42}"));
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for non-string path, saw " + status, 400, status);
@@ -69,8 +63,6 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     }
 
     public void testRegisterNamespaceRejectsNonExistentPath() throws IOException {
-        // Registering a non-existent directory used to succeed silently and
-        // then the poll cycle would list nothing forever. Validate up front.
         String phantom = sharedRoot().resolve("does-not-exist-" + randomAlphaOfLength(8)).toString();
         ResponseException failure = expectThrows(
             ResponseException.class,
@@ -83,7 +75,6 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     }
 
     public void testRegisterNamespaceRejectsFilePath() throws IOException {
-        // A file path (not a directory) must also be rejected.
         java.nio.file.Path base = sharedRoot();
         java.nio.file.Path file = java.nio.file.Files.createFile(
             base.resolve("not-a-dir-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT) + ".lance")
@@ -103,7 +94,6 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     }
 
     public void testUnregisterNamespace() throws IOException {
-        // Register, then unregister, then verify it disappears from GET.
         String path = scratchPathString("unregister");
         java.nio.file.Files.createDirectories(java.nio.file.Path.of(path));
         Response register = postJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
@@ -131,10 +121,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
 
     public void testListTablesReturnsSurfacedNames() throws Exception {
         // POST /_lance/namespace/tables previews what the poll would
-        // surface, without waiting for the poll cycle to run. Useful for
-        // debugging a fresh registration on a large directory (operator
-        // can see immediately whether the plugin reads the same table
-        // set they expect).
+        // surface without waiting for a poll cycle.
         String suffix = "listtables-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         LanceTableFactory.writeTable(scratchDir, "alpha", 4);
@@ -157,10 +144,8 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     }
 
     public void testListTablesReturns404ForUnregisteredPath() throws IOException {
-        // Preview against a path that never went through
-        // POST /_lance/namespace must be 404, not 200 with an empty list.
-        // Empty list would let a caller confuse "not registered" with
-        // "registered but empty".
+        // 404 rather than an empty list, so "not registered" and
+        // "registered but empty" stay distinguishable.
         String phantom = scratchPathString("phantom-list") + "-nope";
         ResponseException failure = expectThrows(
             ResponseException.class,
@@ -180,10 +165,9 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     }
 
     public void testResurfaceGuardHoldsDeletedIndexDuringGrace() throws Exception {
-        // A Lance-backed index that the operator deleted via
-        // DELETE /{index} must stay deleted for the resurface grace
-        // period. Small grace so the post-grace resurface assertion
-        // can fire within the test wall-clock budget.
+        // An index deleted through DELETE /{index} must stay deleted for
+        // the resurface grace period. A short grace keeps the post-grace
+        // assertion inside the test's wall-clock budget.
         String suffix = "resurface-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -197,8 +181,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
 
             client().performRequest(new Request("DELETE", "/" + indexName));
 
-            // Wait longer than the poll cadence (1s in test config)
-            // but shorter than the 3s grace. The index must stay gone.
+            // Longer than the 1s poll cadence, shorter than the 3s grace.
             Thread.sleep(1_500);
             ResponseException stillGone = expectThrows(
                 ResponseException.class,
@@ -210,8 +193,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
                 stillGone.getResponse().getStatusLine().getStatusCode()
             );
 
-            // After the grace expires the next poll must recreate it.
-            // Give the poll a couple of cadences of slack.
+            // After the grace expires the next poll recreates the index.
             Thread.sleep(4_000);
             Response recovered = client().performRequest(
                 new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s")
@@ -233,8 +215,8 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     }
 
     public void testResurfaceGuardDisabledByZeroGrace() throws Exception {
-        // Grace = 0 short-circuits the tombstone check so the poll
-        // cycle recreates the index on the very next tick.
+        // Grace 0 disables the tombstone check: the next poll recreates
+        // the index immediately.
         String suffix = "resurface0-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -266,10 +248,9 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     }
 
     public void testNamespaceRegisterPropagatesStorageOptionsToAutoSurfacedIndex() throws Exception {
-        // Namespace-level storage_options must ride into every auto-
-        // surfaced index's settings — that is how a namespace pointing at
-        // an S3 root gives every table under it the same credentials
-        // without repeating them per table.
+        // Namespace-level storage_options apply to every auto-surfaced
+        // index under it, so a namespace pointing at an S3 root carries
+        // the credentials once for all of its tables.
         String suffix = "nsso-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;

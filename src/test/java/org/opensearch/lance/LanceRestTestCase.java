@@ -38,8 +38,9 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
      * Fixture that writes a Lance table into a scratch directory, registers
      * that directory as a Lance namespace, waits for the polling loop to
      * surface the table, and cleans everything up on close. The scratch
-     * directory sits under {@code java.io.tmpdir} so the child test-cluster
-     * process (which lives in a separate work directory) can still open it.
+     * directory sits under the path {@code build.gradle} passes in as
+     * {@code tests.lance.shared_tables_dir} so the test JVM and the cluster
+     * JVM see the same location.
      */
     static final class LanceTestCluster implements AutoCloseable {
         private final Path scratchDir;
@@ -64,13 +65,9 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
         }
 
         static LanceTestCluster setUp(int rowCount, String testHint) throws Exception {
-            // Anchor the shared directory at the path build.gradle passes in
-            // via tests.lance.shared_tables_dir. Test JVM and cluster JVM see
-            // the same location without relying on a system-wide tmpdir.
             Path base = sharedRoot();
-            // Lowercase everything. OpenSearch rejects index names that
-            // contain any uppercase character, and the surfaced index name
-            // is derived from the table directory name.
+            // Index names are derived from the directory name and must be
+            // lowercase.
             String suffix = testHint.toLowerCase(java.util.Locale.ROOT) + "-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
             Path scratchDir = Files.createDirectories(base.resolve("lance-it-" + suffix));
             String tableName = "demo-" + suffix;

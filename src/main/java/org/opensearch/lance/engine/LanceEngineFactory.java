@@ -80,8 +80,8 @@ public final class LanceEngineFactory implements EngineFactory {
     public static final String PRIMARY_KEY_FIELD_SETTING = "index.lance.primary_key_field";
     /**
      * Arrow type of the declared primary key column. {@code "long"} covers
-     * signed integer PKs (default, preserves the pre-#24 behaviour when the
-     * setting is missing); {@code "keyword"} covers Utf8 PKs, which take a
+     * signed integer PKs (default when the setting is missing);
+     * {@code "keyword"} covers Utf8 PKs, which take a
      * separate lookup path that quotes the {@code _id} inside the Lance
      * filter and holds {@code BytesRef} values in the reader instead of
      * numeric ones. Ignored when {@link #PRIMARY_KEY_FIELD_SETTING} is empty
@@ -114,9 +114,8 @@ public final class LanceEngineFactory implements EngineFactory {
      * 64), {@link #KEYWORD} covers Utf8 PKs, and {@link #NONE} is the
      * sentinel used at runtime when the primary key column name is empty
      * (either because the table did not declare a PK, or because derivation
-     * refused to surface a PK of an unsupported type). Unsigned or wider
-     * than 64 bit integer PKs are out of scope for this ticket; see issue
-     * #24 for the follow-up.
+     * refused to surface a PK of an unsupported type). Integer PKs wider
+     * than 64 bits are not supported.
      */
     public enum LancePrimaryKeyType {
         NONE("none"),
@@ -136,9 +135,8 @@ public final class LanceEngineFactory implements EngineFactory {
 
         /**
          * Resolve the setting-string form back into an enum. Unknown or
-         * empty values map to {@link #LONG} for backwards compatibility
-         * with pre-#24 indices where the setting did not exist and the
-         * only supported kind was signed integer.
+         * empty values map to {@link #LONG} so indices created before the
+         * setting existed (signed integer was the only kind) stay readable.
          */
         public static LancePrimaryKeyType fromSetting(String value) {
             if (value == null || value.isEmpty()) {

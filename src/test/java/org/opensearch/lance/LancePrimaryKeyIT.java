@@ -24,12 +24,9 @@ import org.opensearch.core.xcontent.XContentParser;
 public class LancePrimaryKeyIT extends LanceRestTestCase {
 
     public void testAttachAndGetById() throws Exception {
-        // Without a declared primary key on the Lance side (see LanceTableFactory
-        // — adding the metadata breaks the C Data serialisation of the
-        // FixedSizeList vector column), attach must publish an empty
-        // primary_key_field. B10 guarantees that engine.get returns
-        // NOT_EXISTS immediately in that case rather than 500-ing on an
-        // empty filter column, so GET /_doc must return 404.
+        // The default fixture declares no primary key, so attach records
+        // an empty primary_key_field and GET /_doc answers 404 instead
+        // of running a filter on an empty column.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(8, "attachAndGet")) {
             String indexName = fixture.indexName();
 
@@ -50,9 +47,6 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
     }
 
     public void testAttachOfPkLessTableDisablesGet() throws Exception {
-        // Same intent as testAttachAndGetById but uses a second, independent
-        // fixture so the assertion still covers the derivation branch when
-        // the primary integer column is not the first field.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(4, "nopkget")) {
             String indexName = fixture.indexName();
 
@@ -66,12 +60,8 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
     }
 
     public void testPkLessTableSynthesisesUniqueIdsInSearchResults() throws Exception {
-        // Regression for #24: a table with no declared primary key used to
-        // emit _id: "0" for every hit because the reader's values[] array
-        // stayed at its default long[] zeros. Every hit collapsed to the
-        // same id and any client that dedup'd by _id (Dashboards result
-        // grids, _mget by hits, etc.) silently lost rows. Synthesised ids
-        // must at least be unique within the shard.
+        // Without a primary key every hit still needs a distinct _id;
+        // clients that dedupe by _id would otherwise drop rows.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(6, "nopksearch")) {
             String indexName = fixture.indexName();
 
@@ -95,14 +85,8 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
     }
 
     public void testStringPrimaryKeyEchoesInHitsAndResolvesInGet() throws Exception {
-        // Regression for #24: a Utf8 primary key column used to be read
-        // through readAsLong (returning 0 for every row) and looked up
-        // through Long.parseLong (which either 500'd Lance with "Received
-        // literal Int64(0) and could not convert to literal of type 'Utf8'"
-        // or short-circuited to 404 for non-numeric ids). Now the reader
-        // holds string PK values in a parallel array, _search emits them
-        // as _id verbatim, and GET builds a SQL-quoted filter so the
-        // Lance scan finds the row.
+        // A Utf8 primary key is echoed verbatim as _id and GET looks it
+        // up through a quoted SQL literal.
         String suffix = "strpk-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -117,10 +101,6 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
                 attach.getStatusLine().getStatusCode()
             );
 
-            // Derivation must surface the Utf8 PK column as the
-            // declared primary_key_field, and the new type setting must
-            // carry the string form so the engine picks the KEYWORD
-            // lookup path on reopen.
             Response settings = client().performRequest(new Request("GET", "/" + indexName + "/_settings"));
             String settingsBody = readAll(settings);
             assertTrue("expected primary_key_field: key, saw: " + settingsBody, settingsBody.contains("\"primary_key_field\":\"key\""));
@@ -129,8 +109,6 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
                 settingsBody.contains("\"primary_key_type\":\"keyword\"")
             );
 
-            // _search must return the Utf8 PK values as _id verbatim.
-            // Old behaviour returned _id: "0" for every row.
             String searchBody = readAll(postJson("/" + indexName + "/_search", "{\"size\":4}"));
             assertEquals(4, extractIntPath(searchBody, "hits", "total", "value"));
             java.util.Set<String> ids = new java.util.HashSet<>();
@@ -150,8 +128,6 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
                 ids
             );
 
-            // GET by a known key resolves through the quoted Lance
-            // filter. Previously this either 500'd or 404'd.
             Response getResponse = client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-2"));
             assertEquals(
                 "expected 200 for GET on Utf8 PK, saw " + getResponse.getStatusLine().getStatusCode(),
@@ -164,8 +140,6 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
             assertTrue("expected key:alpha-2 in _source, saw: " + getBody, getBody.contains("\"key\":\"alpha-2\""));
             assertTrue("expected label:row-2 in _source, saw: " + getBody, getBody.contains("\"label\":\"row-2\""));
 
-            // Unknown key must return 404 (not 500). This exercises the
-            // negative branch of the SQL-quoted filter.
             ResponseException notFound = expectThrows(
                 ResponseException.class,
                 () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-999"))
@@ -176,11 +150,8 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
                 notFound.getResponse().getStatusLine().getStatusCode()
             );
 
-            // Single quote in the id must not break the filter or open
-            // an injection path. `''` is the SQL escape for a literal
-            // quote inside a quoted string; the escape puts an
-            // unmatched-in-the-data id past the filter, so Lance
-            // returns no rows and the engine reports 404.
+            // A single quote in the id must be escaped in the SQL literal,
+            // not break the filter.
             ResponseException quoted = expectThrows(
                 ResponseException.class,
                 () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/al'pha"))
@@ -198,12 +169,9 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
     }
 
     public void testUnsignedLongPrimaryKeyRoundTripsThroughIdAndGet() throws Exception {
-        // Issue #24 remainder: a UInt64 PK column must survive the round
-        // trip through _search / _id / GET even when the values sit
-        // above Long.MAX_VALUE. The reader holds them as raw long bit
-        // patterns; _id decodes with Long.toUnsignedString and GET
-        // parses through BigInteger before handing a wide decimal
-        // literal to Lance's SQL filter.
+        // A UInt64 primary key round-trips through _id and GET for values
+        // above Long.MAX_VALUE: the reader keeps the raw bit pattern,
+        // _id renders it unsigned, and GET parses through BigInteger.
         String suffix = "ulongpk-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -218,10 +186,6 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
                 attach.getStatusLine().getStatusCode()
             );
 
-            // Settings must carry primary_key_type: unsigned_long, and
-            // mapping must expose the PK column as unsigned_long so
-            // OpenSearch's built-in field type handles the doc value
-            // interpretation.
             String settingsBody = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
             assertTrue(
                 "expected primary_key_type: unsigned_long, saw: " + settingsBody,
@@ -230,10 +194,7 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
             String mappingBody = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
             assertTrue("expected mapping type unsigned_long: " + mappingBody, mappingBody.contains("\"type\":\"unsigned_long\""));
 
-            // _search must return four distinct _id strings: 0, 42,
-            // Long.MAX_VALUE (9223372036854775807), and 2^64 - 6
-            // (18446744073709551610). Previously the top-half value
-            // would have shown as -6 or 0.
+            // 0, 42, Long.MAX_VALUE and 2^64 - 6.
             String searchBody = readAll(postJson("/" + indexName + "/_search", "{\"size\":4}"));
             assertEquals(4, extractIntPath(searchBody, "hits", "total", "value"));
             java.util.Set<String> ids = new java.util.HashSet<>();
@@ -253,25 +214,18 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
                 ids
             );
 
-            // GET by a low-half key resolves through Long.parseLong /
-            // BigInteger and hits the Lance filter with a literal
-            // Lance understands.
             Response getLow = client().performRequest(new Request("GET", "/" + indexName + "/_doc/42"));
             assertEquals(200, getLow.getStatusLine().getStatusCode());
             String getLowBody = readAll(getLow);
             assertTrue("expected _id:42, saw: " + getLowBody, getLowBody.contains("\"_id\":\"42\""));
 
-            // GET by the top-half key exercises the BigInteger path.
-            // Previously Long.parseLong would have thrown
-            // NumberFormatException and the engine short-circuited to
-            // 404.
+            // Above Long.MAX_VALUE.
             Response getHigh = client().performRequest(new Request("GET", "/" + indexName + "/_doc/18446744073709551610"));
             assertEquals(200, getHigh.getStatusLine().getStatusCode());
             String getHighBody = readAll(getHigh);
             assertTrue("expected _id:18446744073709551610, saw: " + getHighBody, getHighBody.contains("\"_id\":\"18446744073709551610\""));
 
-            // Negative / oversized ids never match a UInt64 row and
-            // must be rejected as 404 before Lance sees them.
+            // Negative and oversized ids cannot match a UInt64 row.
             ResponseException notFound = expectThrows(
                 ResponseException.class,
                 () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/-1"))
@@ -290,41 +244,28 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
     }
 
     public void testDeletedRowsStayOutOfHitsTotalsAndSource() throws Exception {
-        // The leaf reader used to learn which physical rows are live by
-        // scanning `_rowaddr` (plus the primary key) for every fragment
-        // at open time. That scan was also what fed `_id`. Both now
-        // come from different places: liveDocs from the fragment's
-        // deletion file (a `_rowaddr`-only scan runs only when the
-        // fragment metadata reports one), `_id` and `_source` from a
-        // per-hit `_rowaddr IN (...)` take. This test creates a table
-        // with a deletion file and checks that the two paths agree
-        // with each other and with Lance: deleted rows are not counted,
-        // not returned, and the survivors' `_id` / `_source` still
-        // round-trip the primary key.
+        // A fragment with a deletion file: the reader's liveDocs (built
+        // from the deletion file) and the per-hit fetch of _id / _source
+        // must agree with Lance on which rows exist.
         String suffix = "deleted-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeStringPkTable(scratchDir, tableName, 6);
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
-        // Delete two rows out of six. The fragment keeps six physical
-        // rows (maxDoc stays 6) and gains a deletion file, so docids 1
-        // and 4 become liveDocs holes.
+        // Six physical rows remain; offsets 1 and 4 become liveDocs holes.
         LanceTableFactory.deleteRows(tableUri, "key IN ('alpha-1', 'alpha-4')");
         String indexName = tableName;
         try {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // _count goes through the engine's reader; hits.total goes
-            // through the fragment path's Lance-side count. Both must
-            // exclude the two deleted rows.
+            // _count (engine path) and hits.total (fragment path) must
+            // both exclude the deleted rows.
             String countBody = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count")));
             assertEquals("_count body=" + countBody, 4, extractIntPath(countBody, "count"));
 
-            // match_all with size covering the whole table: Lucene
-            // iterates 0..maxDoc here (no Lance scan produces the doc
-            // ids), so this is the shape that depends on liveDocs
-            // being built from the deletion file.
+            // match_all iterates every doc id in Lucene, so this shape
+            // depends on liveDocs.
             String searchBody = readAll(postJson("/" + indexName + "/_search", "{\"size\":10,\"sort\":[{\"key\":\"asc\"}]}"));
             assertEquals("hits.total body=" + searchBody, 4, extractIntPath(searchBody, "hits", "total", "value"));
             java.util.List<String> ids = new java.util.ArrayList<>();
@@ -342,33 +283,24 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
                     labels.add((String) source.get("label"));
                 }
             }
-            // _id comes from the per-hit take of the PK column; the
-            // deleted keys must not appear and the survivors must be
-            // the operator's original strings, not synthesised ids.
             assertEquals(
                 "expected the four surviving keys in sort order, saw " + ids + " (body=" + searchBody + ")",
                 java.util.List.of("alpha-0", "alpha-2", "alpha-3", "alpha-5"),
                 ids
             );
-            // _source comes from the same take; labels are "row-N" for
-            // even N and "col-N" for odd N in the fixture.
+            // Labels are "row-N" for even N and "col-N" for odd N.
             assertEquals(
                 "expected surviving labels aligned with ids, saw " + labels,
                 java.util.List.of("row-0", "row-2", "col-3", "col-5"),
                 labels
             );
 
-            // A term query on a deleted key resolves through the Lance
-            // scalar filter, which skips deleted rows on its own; the
-            // count path must agree (0), not report the pre-deletion
-            // presence.
+            // The Lance filter scan skips deleted rows on its own.
             String deletedTerm = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"term\":{\"key\":\"alpha-1\"}}}")
             );
             assertEquals("deleted key must not match, body=" + deletedTerm, 0, extractIntPath(deletedTerm, "hits", "total", "value"));
 
-            // GET by primary key: the engine path (SQL filter on the PK)
-            // must also honour the deletion.
             ResponseException notFound = expectThrows(
                 ResponseException.class,
                 () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-4"))

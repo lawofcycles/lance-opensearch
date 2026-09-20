@@ -17,29 +17,21 @@ import org.opensearch.client.ResponseException;
 public class LanceFtsQueryIT extends LanceRestTestCase {
 
     public void testAttachAndMatch() throws Exception {
-        // End-to-end: build a real Lance table, wait for the polling loop to
-        // surface it as an OpenSearch index, then confirm a match query
-        // routes into the plugin engine and returns the rows whose body
-        // matches the search term.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "attachAndMatch")) {
             String indexName = fixture.indexName();
 
             Response search = postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"hello\"}}}");
             String body = readAll(search);
-            // 16 rows total, even rows say "hello lance i", odd rows say
-            // "quick brown fox i". Half the rows should match.
+            // Even rows say "hello lance i", odd rows "quick brown fox i".
             int totalHits = extractIntPath(body, "hits", "total", "value");
             assertEquals("expected 8 hits (even rows), saw response: " + body, 8, totalHits);
         }
     }
 
     public void testLanceMatchPhraseHonoursPhraseOrder() throws Exception {
-        // The custom lance_match_phrase DSL routes into Lance's
-        // FullTextQuery.phrase, which honours phrase order using the
-        // positions written into the FTS index (LanceTableFactory builds
-        // the body_fts index with with_position=true). Even rows say
-        // "hello lance i", so "hello lance" hits 8 rows and the reversed
-        // "lance hello" hits 0.
+        // The fixture's FTS index is built with positions, so phrase
+        // order matters: "hello lance" hits the eight even rows and
+        // "lance hello" hits none.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lmphraseorder")) {
             String indexName = fixture.indexName();
 
@@ -60,9 +52,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceMatchPhraseSlopBridgesGap() throws Exception {
-        // Odd rows say "quick brown fox i". "quick fox" with slop=0 must
-        // fail (brown between them), slop>=1 must succeed. Confirms the
-        // slop parameter reaches Lance.
+        // "quick fox" needs slop 1 to bridge "brown".
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lmphraseslop")) {
             String indexName = fixture.indexName();
 
@@ -83,11 +73,8 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceMatchAndOperatorRestrictsToDocumentsMatchingAllTokens() throws Exception {
-        // Even rows say "hello lance i", odd rows say "quick brown fox i".
-        // OR "hello quick" would return 16 (every row has one). AND
-        // "hello quick" returns 0 because no row has both. lance_match
-        // must honour the operator via FullTextQuery.match's Operator
-        // parameter.
+        // "hello quick": every row has one of the tokens (OR hits 16),
+        // no row has both (AND hits 0).
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lmatchand")) {
             String indexName = fixture.indexName();
 
@@ -105,7 +92,6 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             int andHits = extractIntPath(readAll(andQuery), "hits", "total", "value");
             assertEquals("expected 0 hits for AND 'hello quick'", 0, andHits);
 
-            // Same 'hello lance' AND both tokens present in even rows.
             Response andSameRow = postJson(
                 "/" + indexName + "/_search",
                 "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello lance\",\"operator\":\"and\"}}}"
@@ -116,10 +102,8 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceMatchFuzzinessAllowsSingleEdit() throws Exception {
-        // Even rows say "hello lance i". "helo" is edit distance 1 from
-        // "hello"; without fuzziness the FTS analyzer matches zero rows,
-        // with fuzziness=1 it must match all 8 even rows. Confirms
-        // fuzziness reaches Lance rather than being silently dropped.
+        // "helo" is one edit from "hello": zero hits without fuzziness,
+        // the eight even rows with fuzziness 1.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lmatchfuzz")) {
             String indexName = fixture.indexName();
 
@@ -171,12 +155,9 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceMultiMatchHitsEitherField() throws Exception {
-        // Even rows say body="hello lance i", title="sunny morning i".
-        // Odd rows say body="quick brown fox i", title="cloudy morning i".
-        // multi_match "hello cloudy" on [body, title] with OR must hit
-        // every row: even rows via body:hello, odd rows via title:cloudy.
-        // Confirms Lance's multi_match reads both columns and unions the
-        // per-field matches.
+        // Even rows: body "hello lance i", title "sunny morning i". Odd
+        // rows: body "quick brown fox i", title "cloudy morning i".
+        // "hello cloudy" over both fields hits every row.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lmmboth")) {
             String indexName = fixture.indexName();
 
@@ -190,9 +171,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceMultiMatchLimitsToListedFields() throws Exception {
-        // "morning" only appears in title. Restricting the search to
-        // [body] must return 0, while listing [body, title] must return
-        // every row.
+        // "morning" only appears in title.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lmmscope")) {
             String indexName = fixture.indexName();
 
@@ -213,13 +192,8 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceMultiMatchAndOperator() throws Exception {
-        // multi_match "hello sunny" on [body, title] with AND: only rows
-        // whose combined fields contain both tokens should match. Even
-        // rows have body:hello + title:sunny; odd rows have neither. So
-        // OR returns 8 (even rows) and AND also returns 8. To distinguish
-        // OR vs AND semantics, "hello cloudy" AND must return 0 (no row
-        // has both hello and cloudy anywhere in body|title), while OR
-        // returns 16.
+        // "hello cloudy" over both fields: OR hits 16, AND hits 0 because
+        // no row has both tokens.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lmmand")) {
             String indexName = fixture.indexName();
 
@@ -240,10 +214,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceMultiMatchWithBoostsSmoke() throws Exception {
-        // Smoke test that per-field boosts parse and reach Lance without
-        // erroring out. Even rows match both terms; asserting 8 hits
-        // proves the query executed, and using distinct boosts exercises
-        // the boosts list path in Lance's MultiMatchQuery.
+        // Per-field boosts parse and execute.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lmmboosts")) {
             String indexName = fixture.indexName();
 
@@ -291,12 +262,8 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceFtsBoostReturnsPositiveMatches() throws Exception {
-        // The lance_fts_boost DSL composes two Lance FTS clauses so the
-        // positive set defines the hits and the negative clause only
-        // affects scoring. With positive "hello" (even rows) and a
-        // negative "fox" (odd rows, disjoint), the hit set must equal
-        // the positive set (8 even rows). Confirms Lance's BoostQuery
-        // wiring and that non-overlapping negatives do not drop hits.
+        // The positive clause defines the hit set; a disjoint negative
+        // clause must not remove any.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lfbboost")) {
             String indexName = fixture.indexName();
 
@@ -313,12 +280,8 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceFtsBoostPenalisesOverlappingNegative() throws Exception {
-        // Even rows say body="hello lance i", so positive "hello" and
-        // negative "lance" match the same 8 rows. Under Lance's
-        // BoostQuery, matching rows score positive*negative_boost, so
-        // the top _score with negative_boost=0.1 must be strictly less
-        // than the top _score of the same positive without any negative
-        // wrapper.
+        // Positive and negative clauses match the same rows; the top
+        // score with negative_boost 0.1 must be below the unboosted one.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lfbpenalise")) {
             String indexName = fixture.indexName();
 
@@ -347,11 +310,8 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceFtsBoostRejectsNonLanceFtsClause() throws Exception {
-        // The positive clause below is a stock OpenSearch `match`, not a
-        // Lance FTS DSL. Lance's boost engine only takes FullTextQuery
-        // subclauses, so the plugin must reject with 400 rather than
-        // silently falling back to a Lucene bool that would break score
-        // composition.
+        // Sub-clauses must be Lance FTS queries; a stock match is
+        // rejected rather than mixed into Lance's score composition.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(4, "lfbwrongclause")) {
             String indexName = fixture.indexName();
 
@@ -372,10 +332,6 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceFtsBoolMustClauseFiltersToMatchingRows() throws Exception {
-        // With a single must clause the bool query is equivalent to
-        // running the inner Lance FTS DSL directly: must=body:hello →
-        // 8 even rows. Confirms Lance's booleanQuery accepts a lone
-        // MUST clause and hands hits back through the plugin.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lbmust")) {
             String indexName = fixture.indexName();
 
@@ -389,10 +345,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceFtsBoolMustNotExcludesOverlappingClause() throws Exception {
-        // Even rows say body="hello lance i", so must=body:hello and
-        // must_not=body:lance target the same 8 rows and must_not knocks
-        // all of them out. Confirms MUST_NOT reaches Lance rather than
-        // being silently ignored.
+        // must and must_not target the same rows, leaving none.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lbmustnot")) {
             String indexName = fixture.indexName();
 
@@ -408,9 +361,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceFtsBoolShouldUnionsAcrossClauses() throws Exception {
-        // Two should clauses on disjoint sets (body:hello even, title:cloudy
-        // odd) with no must should return the union — 16 rows. This also
-        // exercises the multi-field bool composition.
+        // Disjoint should clauses on two fields union to every row.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lbshould")) {
             String indexName = fixture.indexName();
 
@@ -427,9 +378,6 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceFtsBoolMustAcrossFieldsIntersects() throws Exception {
-        // must=body:hello (even) AND must=title:sunny (even) intersect
-        // on the 8 even rows. Confirms MUST clauses on different columns
-        // compose as an intersection on Lance's side.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lbmustintersect")) {
             String indexName = fixture.indexName();
 
@@ -446,10 +394,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceFtsBoolRejectsNonLanceFtsClause() throws Exception {
-        // Stock OpenSearch `match` is not a Lance FTS DSL. Rejecting at
-        // 400 rather than falling back to a Lucene bool keeps score
-        // composition on Lance's side and avoids silently mixing two
-        // scoring systems on the same query.
+        // Sub-clauses must be Lance FTS queries.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(4, "lbwrongclause")) {
             String indexName = fixture.indexName();
 
@@ -468,9 +413,6 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     public void testLanceFtsBoolEmptyClausesRejected() throws Exception {
-        // Lance's booleanQuery constructor rejects an empty clauses list.
-        // The plugin catches this at parse time and returns 400 with a
-        // message pointing the caller at the three lists they can fill.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(4, "lbempty")) {
             String indexName = fixture.indexName();
 

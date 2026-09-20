@@ -146,7 +146,7 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
      * the map through a CAS so the remaining leaves only look up their
      * own bitset. One scan per shard instead of one per fragment keeps
      * the fixed cost of the filter (plan, index lookup, JNI round
-     * trip) from scaling with fragment count; see issue #42 Phase D.
+     * trip) from scaling with fragment count.
      *
      * <p>{@code scanLimit} is applied to the shard-level scan, so a
      * bounded request transfers at most {@code scanLimit} row

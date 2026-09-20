@@ -143,10 +143,10 @@ public class LanceDispatchActionFilter implements ActionFilter {
         }
 
         if (LanceAggregationSupport.hasAggregations(searchRequest.source()) && concrete.length > 1) {
-            // Cross-index aggregation needs a partial-reduce path
-            // (Milestone 5-D) that merges partials across independent
-            // Lance datasets. Until then multi-index aggregation
-            // requests route through the shard path.
+            // Cross-index aggregation needs a partial-reduce path that
+            // merges partials across independent Lance datasets. Until
+            // then multi-index aggregation requests route through the
+            // shard path.
             chain.proceed(task, action, request, listener);
             return;
         }

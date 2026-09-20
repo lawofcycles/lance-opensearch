@@ -33,16 +33,11 @@ import org.lance.ipc.ScanOptions;
  * {@link LanceDirectoryReader#open} path also installs a cache so both
  * lifecycles benefit uniformly.
  *
- * <p>Before this cache existed, each leaf's {@code ensureXxxLoaded}
- * opened its own {@code dataset.newScan} restricted to one fragment.
- * On a per-node subset of ~20 fragments loading three columns for an
- * aggregation, that meant 60 native scan startups (15-19 ms of FFI
- * overhead each on the QA perf table, 20M rows), so an aggregation
- * paid 0.9-1.1 s of fixed cost before Lance did any real per-doc
- * work. Consolidating into one scan per (column, cache) shrinks the
- * fixed cost to a single {@code newScan} call per column materialised.
- * See {@code issue-42-design.md} Phase D / Direction 4 (column
- * materialisation side).
+ * <p>One scan per (column, cache) rather than one per (column, leaf):
+ * each {@code dataset.newScan} costs 15-19 ms of FFI overhead on a
+ * 20M-row table regardless of how many rows it returns, so a
+ * three-column aggregation over ~20 fragments per node would spend
+ * 0.9-1.1 s on scan startup alone.
  *
  * <p>The cache does not own the loaded arrays. {@link #loadNumericColumn}
  * scans, buckets the rows by the fragment id embedded in {@code _rowaddr},
@@ -244,9 +239,9 @@ public final class LanceShardColumnCache {
      * after the scan each builder is sorted and the ids are remapped to
      * ordinals before the leaf receives them through
      * {@link LanceFragmentLeafReader#publishTextColumn}. No per-row
-     * {@link String} is created (issue #52: the previous
-     * {@code String[maxDoc]} intermediate cost about 2 GB per 20M-row
-     * query). Keyword dictionaries stay per-fragment because that is
+     * {@link String} is created; a {@code String[maxDoc]} intermediate
+     * would cost about 2 GB per 20M-row query. Keyword dictionaries
+     * stay per-fragment because that is
      * what {@link org.apache.lucene.index.SortedDocValues} expects for
      * ord-comparison semantics.
      */

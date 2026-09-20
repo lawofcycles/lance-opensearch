@@ -24,9 +24,9 @@ import org.opensearch.search.builder.SearchSourceBuilder;
  * whether to send a search through the fragment coordinator or fall
  * through to shard fan-out.
  *
- * <p>Direction 1 Stage 2 adds bucket support (terms / histogram /
- * date_histogram) alongside the metric family shipped in Stage 1.
- * Anything outside the whitelist still returns {@code false} so the
+ * <p>The whitelist covers the metric family plus terms / histogram /
+ * date_histogram buckets.
+ * Anything outside the whitelist returns {@code false} so the
  * request continues on the shard path — an unknown aggregation type
  * is a compatibility miss, not a request error.
  *

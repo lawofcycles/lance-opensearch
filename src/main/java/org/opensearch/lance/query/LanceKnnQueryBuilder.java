@@ -395,7 +395,7 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
             // there). This is what makes numeric-epoch-millis on
             // date columns and ISO-8601 strings on non-date
             // columns route through the correct SQL literal form
-            // for the pre-filter path — see issue #48.
+            // for the pre-filter path.
             org.opensearch.index.mapper.MappedFieldType mft = context.fieldMapper(name);
             return mft == null ? null : mft.typeName();
         });

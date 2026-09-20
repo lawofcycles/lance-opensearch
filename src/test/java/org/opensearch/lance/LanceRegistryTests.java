@@ -27,7 +27,7 @@ import org.opensearch.test.OpenSearchTestCase;
  * <p>Lance keeps a native thread pool alive across Session creations
  * (Tokio runtime shared per JVM), which trips the default
  * randomizedtesting thread-leak scanner. The same suppression is applied
- * in {@code LancePluginIT} and {@code LanceNamespaceServiceTests}, both
+ * in {@code LanceRestTestCase} and {@code LanceNamespaceServiceTests}, both
  * of which touch Lance from tests.
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
