@@ -12,11 +12,15 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.stream.Stream;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.XContentParser;
 
 /**
  * Aggregations on the fragment dispatch path: metric aggregations, terms
@@ -405,6 +409,75 @@ public class LanceAggregationIT extends LanceRestTestCase {
     /** Response body with the {@code took} field removed so two runs compare on content. */
     private static String withoutTook(String body) {
         return body.replaceFirst("\"took\":\\d+,", "");
+    }
+
+    public void testKeywordTermsLoadsTheDictionaryOnceAndAgreesWithTheDisabledCache() throws Exception {
+        // terms(category) size 0 through the Lucene aggregator: the first
+        // request scans the keyword column once and its dictionary enters
+        // the store (loads + 1, no budget miss), the second reads the
+        // store (no load), and the per request path with
+        // lance.cache.enabled false returns the same buckets. The
+        // aggregation pushdown is turned off because a size 0 terms over
+        // match_all otherwise runs inside the Lance scan and never
+        // touches the store. The hint fixture has 3 fragments of 200 rows
+        // with category c0, c1, c2 on three rows out of four.
+        Request disablePushdown = new Request("PUT", "/_cluster/settings");
+        disablePushdown.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":false}}");
+        client().performRequest(disablePushdown);
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "kw-once")) {
+            String index = fixture.indexName();
+            String terms = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"size\":10}}}}";
+            Map<String, Object> before = columnStoreStats();
+
+            String first = withoutTook(readAll(postJson("/" + index + "/_search", terms)));
+            assertEquals(600, extractIntPath(first, "hits", "total", "value"));
+            assertEquals(List.of("c0=150", "c1=150", "c2=150"), bucketsOf(first, "c"));
+            Map<String, Object> afterFirst = columnStoreStats();
+            assertEquals("one scan filled the store", number(before.get("loads")) + 1, number(afterFirst.get("loads")));
+            assertEquals("the dictionary fit the budget", before.get("budget_misses"), afterFirst.get("budget_misses"));
+
+            String second = withoutTook(readAll(postJson("/" + index + "/_search", terms)));
+            assertEquals("second request differs", first, second);
+            Map<String, Object> afterSecond = columnStoreStats();
+            assertEquals("no load on the second request", afterFirst.get("loads"), afterSecond.get("loads"));
+            assertEquals(afterFirst.get("budget_misses"), afterSecond.get("budget_misses"));
+            assertTrue("the second request read the store", number(afterSecond.get("hits")) > number(afterFirst.get("hits")));
+
+            Request disable = new Request("PUT", "/_cluster/settings");
+            disable.setJsonEntity("{\"transient\":{\"lance.cache.enabled\":false}}");
+            client().performRequest(disable);
+            try {
+                String uncached = withoutTook(readAll(postJson("/" + index + "/_search", terms)));
+                assertEquals("uncached request differs", first, uncached);
+                Map<String, Object> afterUncached = columnStoreStats();
+                assertEquals("the per request path never touches the store", afterSecond.get("loads"), afterUncached.get("loads"));
+                assertEquals(afterSecond.get("budget_misses"), afterUncached.get("budget_misses"));
+            } finally {
+                Request enable = new Request("PUT", "/_cluster/settings");
+                enable.setJsonEntity("{\"transient\":{\"lance.cache.enabled\":null}}");
+                client().performRequest(enable);
+            }
+        } finally {
+            Request enablePushdown = new Request("PUT", "/_cluster/settings");
+            enablePushdown.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":null}}");
+            client().performRequest(enablePushdown);
+        }
+    }
+
+    /** The {@code column_store} object of the single test node from {@code GET /_lance/stats}. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> columnStoreStats() throws IOException {
+        String json = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
+            Map<String, Object> nodes = (Map<String, Object>) parser.map().get("nodes");
+            assertEquals("single node cluster", 1, nodes.size());
+            Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();
+            return (Map<String, Object>) node.get("column_store");
+        }
+    }
+
+    private static int number(Object value) {
+        return ((Number) value).intValue();
     }
 
     public void testSubstraitPushdownAnswersLikeTheAggregators() throws Exception {
