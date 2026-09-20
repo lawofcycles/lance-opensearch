@@ -73,13 +73,6 @@ public final class LanceNamespaceService {
      * in the cluster's {@link LanceNamespaceMetadata}.
      */
     private final Map<String, DirectoryNamespace> directoryCache = new ConcurrentHashMap<>();
-    /**
-     * Ack timeout for cluster state updates. Sized so the register /
-     * unregister await loop tolerates the manager being queued
-     * behind a batch of namespace-poll CreateIndex updates in a
-     * loaded multi-node cluster.
-     */
-    private static final TimeValue STATE_UPDATE_TIMEOUT = TimeValue.timeValueSeconds(90);
     private final Map<String, Long> servedVersions = new ConcurrentHashMap<>();
     // Index names created via /_lance/attach along with the absolute Lance
     // table path and storage_options they point at. Tracked here so poll()
@@ -238,14 +231,23 @@ public final class LanceNamespaceService {
         return cadence;
     }
 
-    public void register(String rootUri) {
-        register(rootUri, StorageOptions.empty());
-    }
-
-    public void register(String rootUri, StorageOptions storageOptions) {
+    /**
+     * Registers a namespace root through the cluster manager. Completes
+     * {@code listener} once the cluster state update is acknowledged, or
+     * immediately with {@code changed == false} when the local cluster
+     * state already carries the root.
+     *
+     * <p>Asynchronous on purpose: REST handlers call this from a netty
+     * {@code transport_worker} thread, and that thread may also be the
+     * one the cluster manager's state publication for this very update
+     * arrives on. Blocking it would stall the publication until
+     * {@code cluster.follower_lag.timeout} removes the node.
+     */
+    public void register(String rootUri, StorageOptions storageOptions, ActionListener<LanceNamespaceUpdateResponse> listener) {
         LanceNamespaceMetadata current = currentMetadata(clusterService.state());
         for (LanceNamespaceMetadata.Entry entry : current.entries()) {
             if (entry.rootUri().equals(rootUri)) {
+                listener.onResponse(new LanceNamespaceUpdateResponse(true, false));
                 return;
             }
         }
@@ -253,17 +255,7 @@ public final class LanceNamespaceService {
         // that tries to submitStateUpdateTask directly gets
         // NotClusterManagerException. TransportClusterManagerNodeAction
         // handles the forwarding, retries, and acknowledgement.
-        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.atomic.AtomicReference<Exception> failure = new java.util.concurrent.atomic.AtomicReference<>();
-        client.execute(
-            LanceNamespaceUpdateAction.INSTANCE,
-            LanceNamespaceUpdateRequest.register(rootUri, storageOptions),
-            ActionListener.wrap(response -> latch.countDown(), e -> {
-                failure.set(e);
-                latch.countDown();
-            })
-        );
-        awaitAckOrLog(latch, failure, "register", rootUri);
+        client.execute(LanceNamespaceUpdateAction.INSTANCE, LanceNamespaceUpdateRequest.register(rootUri, storageOptions), listener);
     }
 
     public List<String> namespaces() {
@@ -303,55 +295,20 @@ public final class LanceNamespaceService {
     /**
      * Stops polling a previously-registered namespace. Surfaced indexes are
      * left in place — the operator can delete them separately if they want
-     * the tables to disappear. Returns true if a registration matched, false
-     * if the URI was not registered.
+     * the tables to disappear. The response's {@code changed} flag is true
+     * if a registration matched, false if the URI was not registered.
+     *
+     * <p>Asynchronous for the same reason as
+     * {@link #register(String, StorageOptions, ActionListener)}.
      */
-    public boolean unregister(String rootUri) {
+    public void unregister(String rootUri, ActionListener<LanceNamespaceUpdateResponse> listener) {
         // Do not skip the manager round-trip based on the local
         // node's cluster state: the local view can lag behind
         // recent registrations from another node or from this node
         // if the applier has not yet run. The manager returns a
         // response with a "changed" flag so we can 404 a REST
         // caller trying to unregister a path the cluster never had.
-        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.atomic.AtomicReference<LanceNamespaceUpdateResponse> responseRef =
-            new java.util.concurrent.atomic.AtomicReference<>();
-        java.util.concurrent.atomic.AtomicReference<Exception> failure = new java.util.concurrent.atomic.AtomicReference<>();
-        client.execute(
-            LanceNamespaceUpdateAction.INSTANCE,
-            LanceNamespaceUpdateRequest.unregister(rootUri),
-            ActionListener.wrap(response -> {
-                responseRef.set(response);
-                latch.countDown();
-            }, e -> {
-                failure.set(e);
-                latch.countDown();
-            })
-        );
-        awaitAckOrLog(latch, failure, "unregister", rootUri);
-        if (failure.get() != null) {
-            return false;
-        }
-        LanceNamespaceUpdateResponse response = responseRef.get();
-        return response != null && response.changed();
-    }
-
-    private static void awaitAckOrLog(
-        java.util.concurrent.CountDownLatch latch,
-        java.util.concurrent.atomic.AtomicReference<Exception> failure,
-        String opName,
-        String rootUri
-    ) {
-        try {
-            if (!latch.await(STATE_UPDATE_TIMEOUT.getSeconds() + 5, java.util.concurrent.TimeUnit.SECONDS)) {
-                LOG.warn("{} {} timed out waiting for cluster state ack", opName, rootUri);
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        if (failure.get() != null) {
-            LOG.warn("{} {} failed", opName, rootUri, failure.get());
-        }
+        client.execute(LanceNamespaceUpdateAction.INSTANCE, LanceNamespaceUpdateRequest.unregister(rootUri), listener);
     }
 
     private void poll() {

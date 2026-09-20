@@ -14,9 +14,12 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.namespace.AllowedTableRoots;
 import org.opensearch.lance.namespace.LanceNamespaceService;
+import org.opensearch.lance.namespace.LanceNamespaceUpdateResponse;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.rest.RestResponse;
+import org.opensearch.rest.action.RestBuilderListener;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
@@ -118,13 +121,14 @@ public class RestNamespaceAction extends BaseRestHandler {
             // DELETE /{index} if they want the tables to disappear. This
             // matches the "the namespace registration is separate from the
             // OpenSearch index lifecycle" contract in the RFC.
-            return channel -> {
-                boolean removed = service.unregister(path);
-                try (XContentBuilder b = channel.newBuilder()) {
+            return channel -> service.unregister(path, new RestBuilderListener<>(channel) {
+                @Override
+                public RestResponse buildResponse(LanceNamespaceUpdateResponse response, XContentBuilder b) throws Exception {
+                    boolean removed = response.changed();
                     b.startObject().field("unregistered", removed).field("path", path).endObject();
-                    channel.sendResponse(new BytesRestResponse(removed ? RestStatus.OK : RestStatus.NOT_FOUND, b));
+                    return new BytesRestResponse(removed ? RestStatus.OK : RestStatus.NOT_FOUND, b);
                 }
-            };
+            });
         }
         // POST: register (with allowlist check).
         if (!allowedRoots.allows(path)) {
@@ -169,12 +173,12 @@ public class RestNamespaceAction extends BaseRestHandler {
             }
         }
         final StorageOptions storageOptionsFinal = storageOptions;
-        return channel -> {
-            service.register(path, storageOptionsFinal);
-            try (XContentBuilder b = channel.newBuilder()) {
+        return channel -> service.register(path, storageOptionsFinal, new RestBuilderListener<>(channel) {
+            @Override
+            public RestResponse buildResponse(LanceNamespaceUpdateResponse response, XContentBuilder b) throws Exception {
                 b.startObject().field("registered", path).field("note", "tables surface as indexes within the poll cadence").endObject();
-                channel.sendResponse(new BytesRestResponse(RestStatus.OK, b));
+                return new BytesRestResponse(RestStatus.OK, b);
             }
-        };
+        });
     }
 }

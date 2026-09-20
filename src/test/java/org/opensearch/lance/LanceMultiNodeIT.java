@@ -98,7 +98,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
             Response unregister = deleteJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
             assertEquals(RestStatus.OK.getStatus(), unregister.getStatusLine().getStatusCode());
-            assertTrue("expected unregistered:true, saw: " + readAll(unregister), true);
+            String unregisterBody = readAll(unregister);
+            assertTrue("expected unregistered:true, saw: " + unregisterBody, unregisterBody.contains("\"unregistered\":true"));
 
             Response after = client().performRequest(new Request("GET", "/_lance/namespace"));
             String afterBody = readAll(after);
