@@ -557,6 +557,18 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // shipping it to the per-node executor keeps _search on the
             // manifest _count / _stats / GET already serve.
             long pinnedVersion = indexMetadata.getSettings().getAsLong(LanceEngineFactory.VERSION_SETTING, -1L);
+            String tag = indexMetadata.getSettings().get(LanceEngineFactory.TAG_SETTING, "");
+            if (pinnedVersion < 0 && !tag.isEmpty()) {
+                // A tag-following index pins to whatever version the tag
+                // points at right now, so resolve it here and ship the
+                // version exactly like an explicit pin. This costs one
+                // extra Dataset.open of the latest manifest per request
+                // per tag-following index (the tag lives in the table's
+                // refs, not in any manifest); the shared Lance Session
+                // keeps the metadata cached so it is a small, fixed cost
+                // rather than a table scan.
+                pinnedVersion = LanceRegistry.resolveTagVersion(tableUri, storageOptions, tag);
+            }
             targets.add(new IndexTarget(index.getName(), tableUri, storageOptions, pinnedVersion, buildFieldTypeLookup(indexMetadata)));
         }
         return targets;
