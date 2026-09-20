@@ -150,4 +150,24 @@ public final class LanceRegistry {
         }
         return builder.build();
     }
+
+    /**
+     * Resolve a Lance tag to the manifest version it currently points at.
+     * Tags live in the table's {@code _refs} directory rather than in any
+     * one manifest, so the table is opened at its latest version first and
+     * {@code Dataset.tags().getVersion(tag)} is read from there. Callers
+     * then pass the returned version through
+     * {@link #openDataset(String, StorageOptions, java.util.Optional)} to
+     * read the tagged snapshot; this keeps tag following a two step
+     * "resolve, then open at version" so the version-pinned open path is
+     * the only place that checks out a specific manifest.
+     *
+     * <p>Propagates whatever Lance throws for an unknown tag so the caller
+     * can surface the Lance message to the operator.
+     */
+    public static long resolveTagVersion(String uri, StorageOptions storageOptions, String tag) {
+        try (Dataset latest = openDataset(uri, storageOptions)) {
+            return latest.tags().getVersion(tag);
+        }
+    }
 }
