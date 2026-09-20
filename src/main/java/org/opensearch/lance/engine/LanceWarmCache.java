@@ -45,7 +45,10 @@ import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
  * {@code (index uuid, Lance version)}; the leaves of a request are light
  * views over it (see {@link LanceDirectoryReader#openForSnapshot}), so a
  * second request against the same version opens no dataset, asks Lance for
- * no index description and runs no schema pass.
+ * no index description and runs no schema pass. The shard engine
+ * ({@link LanceEngineFactory.LanceReadOnlyEngine}) takes its whole-table
+ * reader from the same snapshot, so GET, {@code _stats} and the fragment
+ * path share one dataset and one column store per version on a node.
  *
  * <p>Numeric and boolean column data lives next to the snapshots in a
  * {@link ColumnStore}, off-heap, keyed by the same snapshot key, so it
@@ -179,6 +182,7 @@ public final class LanceWarmCache implements Closeable {
         private final Map<Integer, FragmentMeta> fragmentsById;
         private final Set<String> ftsColumns;
         private final LanceFragmentSchema schema;
+        private final LanceDirectoryReader.DataFileSizes dataFileSizes;
         private final boolean cached;
         private final AtomicInteger refCount = new AtomicInteger();
         private final AtomicBoolean retired = new AtomicBoolean();
@@ -191,6 +195,7 @@ public final class LanceWarmCache implements Closeable {
             List<FragmentMeta> fragments,
             Set<String> ftsColumns,
             LanceFragmentSchema schema,
+            LanceDirectoryReader.DataFileSizes dataFileSizes,
             boolean cached
         ) {
             this.key = key;
@@ -203,6 +208,7 @@ public final class LanceWarmCache implements Closeable {
             this.fragmentsById = Collections.unmodifiableMap(byId);
             this.ftsColumns = Collections.unmodifiableSet(ftsColumns);
             this.schema = schema;
+            this.dataFileSizes = dataFileSizes;
             this.cached = cached;
             this.lastAccessNanos = System.nanoTime();
         }
@@ -238,6 +244,16 @@ public final class LanceWarmCache implements Closeable {
 
         public LanceFragmentSchema schema() {
             return schema;
+        }
+
+        /**
+         * Manifest-recorded byte total of the data files behind
+         * {@link #fragments()}, read from the manifest when the snapshot
+         * was built. The shard engine reports it as
+         * {@code _stats} {@code docs.total_size_in_bytes}.
+         */
+        public LanceDirectoryReader.DataFileSizes dataFileSizes() {
+            return dataFileSizes;
         }
 
         /** Whether the cache keeps this snapshot after the lease ends (false when the cache is disabled). */
@@ -448,7 +464,7 @@ public final class LanceWarmCache implements Closeable {
             );
         }
         LOGGER.debug("built snapshot {} with {} fragments", key, fragments.size());
-        return new Snapshot(key, dataset, fragments, ftsColumns, schema, cached);
+        return new Snapshot(key, dataset, fragments, ftsColumns, schema, LanceDirectoryReader.sumDataFileSizes(lanceFragments), cached);
     }
 
     /** Take a reference on the cached snapshot for {@code key}, or return {@code null} when there is none usable. */
@@ -529,12 +545,26 @@ public final class LanceWarmCache implements Closeable {
         if (snapshot.isClosed()) {
             return;
         }
-        if (snapshot.cached) {
+        if (snapshot.cached && !keyServedByAnother(snapshot)) {
             columnStore.dropSnapshot(snapshot.key);
         }
         snapshot.closeNow();
         snapshotCloses.incrementAndGet();
         LOGGER.debug("closed snapshot {}", snapshot.key);
+    }
+
+    /**
+     * Whether a different, open snapshot is filed under {@code snapshot}'s
+     * key. That happens when a retired snapshot is still leased (the
+     * shard engine's reader after {@code lance.cache.enabled} went off and
+     * on again) while a later acquire built a replacement for the same
+     * version. The store keys columns by {@code (index uuid, version)},
+     * which names the same rows for both, so the columns stay with the
+     * replacement instead of being dropped from under its readers.
+     */
+    private synchronized boolean keyServedByAnother(Snapshot snapshot) {
+        Snapshot current = snapshots.get(snapshot.key);
+        return current != null && current != snapshot && !current.isClosed();
     }
 
     /**
@@ -604,6 +634,22 @@ public final class LanceWarmCache implements Closeable {
     /** Snapshots currently held (referenced or idle). */
     public synchronized int snapshotCount() {
         return snapshots.size();
+    }
+
+    /**
+     * Held snapshots that were retired (the table moved on, the index was
+     * deleted, the cache was disabled) but are still referenced by a
+     * reader, most often the shard engine's previous reader waiting for
+     * its last searcher. They close when that reference is released.
+     */
+    public synchronized int retiredSnapshotCount() {
+        int retired = 0;
+        for (Snapshot snapshot : snapshots.values()) {
+            if (snapshot.isRetired()) {
+                retired++;
+            }
+        }
+        return retired;
     }
 
     /** Snapshot of {@code key} if held, for tests. */

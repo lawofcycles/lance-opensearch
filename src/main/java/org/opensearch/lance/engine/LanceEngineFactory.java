@@ -78,8 +78,31 @@ import org.opensearch.lance.StorageOptions;
  * whose reference is a {@link LanceDirectoryReader}. The manager swaps in
  * a new reader when the Lance manifest advances so refresh does not close
  * the previous reader until in-flight readers release.
+ *
+ * <p>The reader is built over the node's {@link LanceWarmCache} snapshot of
+ * {@code (index uuid, version)}, the same snapshot the fragment path reads,
+ * so one node holds one open dataset, one fragment list and one set of
+ * store columns per table version. Each reader owns a lease on its
+ * snapshot for as long as it is open. Without a cache (the plugin has not
+ * created one, or a test builds the factory directly) the engine opens its
+ * own dataset per reader as it always did.
  */
 public final class LanceEngineFactory implements EngineFactory {
+
+    private final LanceWarmCache warmCache;
+
+    /** Factory whose engines open their own dataset per reader. */
+    public LanceEngineFactory() {
+        this(null);
+    }
+
+    /**
+     * @param warmCache snapshot cache the engines take their readers
+     *                  from, or {@code null} to open a dataset per reader
+     */
+    public LanceEngineFactory(LanceWarmCache warmCache) {
+        this.warmCache = warmCache;
+    }
 
     public static final String TABLE_SETTING = "index.lance.table";
     public static final String PRIMARY_KEY_FIELD_SETTING = "index.lance.primary_key_field";
@@ -196,7 +219,20 @@ public final class LanceEngineFactory implements EngineFactory {
         String multiFieldsJson = config.getIndexSettings().getSettings().get(MULTI_FIELDS_SETTING, "");
         java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields = org.opensearch.lance.rest.RestAttachAction
             .deserialiseMultiFields(multiFieldsJson);
-        return new LanceReadOnlyEngine(config, table, field, pkType, shardId, pinnedVersion, tag, storageOptions, multiFields);
+        String indexUuid = config.getIndexSettings().getIndex().getUUID();
+        return new LanceReadOnlyEngine(
+            config,
+            table,
+            field,
+            pkType,
+            shardId,
+            pinnedVersion,
+            tag,
+            storageOptions,
+            multiFields,
+            warmCache,
+            indexUuid
+        );
     }
 
     static final class LanceReadOnlyEngine extends ReadOnlyEngine {
@@ -228,6 +264,13 @@ public final class LanceEngineFactory implements EngineFactory {
          * so keyword sub-fields become queryable through doc values.
          */
         final java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields;
+        /**
+         * Snapshot cache the readers are built over, or {@code null} to open
+         * a dataset per reader.
+         */
+        final LanceWarmCache warmCache;
+        /** Key the snapshots of this index are filed under, with the version. */
+        final String indexUuid;
         private final LanceReaderManager lanceReaderManager;
 
         LanceReadOnlyEngine(
@@ -239,7 +282,9 @@ public final class LanceEngineFactory implements EngineFactory {
             Optional<Long> pinnedVersion,
             String tag,
             StorageOptions storageOptions,
-            java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
+            java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+            LanceWarmCache warmCache,
+            String indexUuid
         ) {
             super(config, null, null, true, Function.identity(), true);
             this.tablePath = table;
@@ -250,6 +295,8 @@ public final class LanceEngineFactory implements EngineFactory {
             this.tag = tag;
             this.storageOptions = storageOptions;
             this.multiFields = multiFields;
+            this.warmCache = warmCache;
+            this.indexUuid = indexUuid;
             // The super constructor has already taken store.incRef(), the
             // IndexWriter write lock, and a DirectoryReader on the empty
             // commit. If the Lance side fails to open (table missing,
@@ -269,6 +316,10 @@ public final class LanceEngineFactory implements EngineFactory {
                     // Pinned or tag-resolved: the version is known, no
                     // probe open needed.
                     initialVersion = target.get();
+                } else if (LanceDirectoryReader.snapshotVersionOf(initial) >= 0) {
+                    // The cache resolved the latest version when it built
+                    // or found the snapshot; the reader serves exactly that.
+                    initialVersion = LanceDirectoryReader.snapshotVersionOf(initial);
                 } else {
                     try (Dataset probe = LanceRegistry.openDataset(tablePath, storageOptions)) {
                         initialVersion = probe.version();
@@ -333,10 +384,21 @@ public final class LanceEngineFactory implements EngineFactory {
             return Optional.empty();
         }
 
+        /**
+         * Open the shard's whole-table reader at {@code version} (empty
+         * for the latest manifest). With a {@link LanceWarmCache} the
+         * reader is a view over the node's snapshot of that version, the
+         * one the fragment path reads too, and owns a lease on it that
+         * {@link LanceDirectoryReader#doClose} releases; without one the
+         * reader opens and owns its own dataset.
+         */
         OpenSearchDirectoryReader openLanceReader(Optional<Long> version) throws IOException {
             Directory directory = engineConfig.getStore().directory();
             SegmentInfos infos = getLastCommittedSegmentInfos();
             IndexCommit commit = Lucene.getIndexCommit(infos, directory);
+            if (warmCache != null) {
+                return openSnapshotReader(directory, commit, version);
+            }
             Dataset dataset = LanceRegistry.openDataset(tablePath, storageOptions, version);
             // If wrapping the dataset in a directory reader fails, close it
             // here — otherwise the JNI-owned Dataset handle leaks and
@@ -373,6 +435,30 @@ public final class LanceEngineFactory implements EngineFactory {
                     throw err;
                 }
                 throw new IOException(t);
+            }
+        }
+
+        private OpenSearchDirectoryReader openSnapshotReader(Directory directory, IndexCommit commit, Optional<Long> version)
+            throws IOException {
+            LanceWarmCache.Lease lease = warmCache.acquire(indexUuid, tablePath, storageOptions, version, field, pkType, multiFields);
+            // openForSnapshot releases the lease itself when it fails; from
+            // its return on the reader owns the lease and releases it in
+            // doClose, so only the wrap step needs the reader closed here.
+            LanceDirectoryReader reader = LanceDirectoryReader.openForSnapshot(
+                directory,
+                commit,
+                lease,
+                lease.snapshot().isCached() ? warmCache.columnStore() : null
+            );
+            try {
+                return OpenSearchDirectoryReader.wrap(reader, config().getShardId());
+            } catch (Throwable t) {
+                try {
+                    reader.close();
+                } catch (Throwable suppressed) {
+                    t.addSuppressed(suppressed);
+                }
+                throw t;
             }
         }
 
@@ -662,9 +748,13 @@ public final class LanceEngineFactory implements EngineFactory {
             if (target == servedVersion) {
                 return null;
             }
-            // A tag-following shard opens the resolved version explicitly;
-            // a latest-following shard opens latest again, as before.
-            Optional<Long> openAt = engine.tag != null ? Optional.of(target) : Optional.empty();
+            // A tag-following shard opens the resolved version explicitly.
+            // With a warm cache every shard does, so the snapshot the new
+            // reader leases is keyed on the version recorded as served (a
+            // latest-following table that advanced again between the probe
+            // above and the acquire is caught by the next poll). Without a
+            // cache a latest-following shard opens latest again, as before.
+            Optional<Long> openAt = engine.tag != null || engine.warmCache != null ? Optional.of(target) : Optional.empty();
             OpenSearchDirectoryReader newReader = engine.openLanceReader(openAt);
             servedVersion = target;
             return newReader;
