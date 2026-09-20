@@ -140,6 +140,82 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    /**
+     * With a shard copy on every data node the coordinator hands each
+     * fragment to a different node and has to merge three sorted (or
+     * scored) lists. The same requests are run first against the
+     * single-copy index (one node answers, no merge) and then after
+     * {@code auto_expand_replicas: 0-all} put a copy on all three
+     * nodes; ids, sort values, totals and buckets must not change.
+     * The fixture interleaves ids across fragments so a merge that
+     * only concatenated per-node lists would reorder every page.
+     */
+    public void testFanOutAcrossReplicaHostsMatchesSingleHost() throws Exception {
+        String suffix = "mn-merge-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 3;
+        int rowsPerFragment = 4;
+        LanceTableFactory.writeInterleavedTable(scratchDir, tableName, fragments, rowsPerFragment);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String[] requests = new String[] {
+            "{\"query\":{\"match_all\":{}},\"sort\":[{\"id\":\"asc\"}],\"size\":10}",
+            "{\"sort\":[{\"ts\":\"desc\"}],\"size\":5}",
+            "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}},\"size\":12}",
+            "{\"from\":2,\"size\":3,\"sort\":[{\"id\":\"asc\"}]}",
+            "{\"size\":0,\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}}}}" };
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+            assertEquals(1, activeShards(indexName));
+
+            List<Map<String, Object>> single = new ArrayList<>();
+            for (String request : requests) {
+                single.add(parse(readAll(postJson("/" + indexName + "/_search", request))));
+            }
+            // Sanity on the single-host baseline before comparing.
+            assertEquals(List.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9), sourceIds(single.get(0)));
+            assertEquals(List.of(11, 10, 9, 8, 7), sourceIds(single.get(1)));
+            assertEquals(12, sourceIds(single.get(2)).size());
+            assertEquals(List.of(2, 3, 4), sourceIds(single.get(3)));
+            assertEquals(3, buckets(single.get(4)).size());
+            for (Map<String, Object> response : single) {
+                assertEquals(fragments * rowsPerFragment, extractIntPath(response, "hits", "total", "value"));
+            }
+
+            Request expand = new Request("PUT", "/" + indexName + "/_settings");
+            expand.setJsonEntity("{\"index.auto_expand_replicas\":\"0-all\"}");
+            assertEquals(RestStatus.OK.getStatus(), client().performRequest(expand).getStatusLine().getStatusCode());
+            client().performRequest(
+                new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&wait_for_active_shards=3&timeout=60s")
+            );
+            assertEquals(3, activeShards(indexName));
+
+            for (int i = 0; i < requests.length; i++) {
+                Map<String, Object> multi = parse(readAll(postJson("/" + indexName + "/_search", requests[i])));
+                Map<String, Object> expected = single.get(i);
+                String label = "request " + requests[i];
+                assertEquals(label, sourceIds(expected), sourceIds(multi));
+                assertEquals(label, sortValues(expected), sortValues(multi));
+                assertEquals(label, extractIntPath(expected, "hits", "total", "value"), extractIntPath(multi, "hits", "total", "value"));
+                assertEquals(label, expected.get("aggregations"), multi.get("aggregations"));
+            }
+            // The scored request must come back in strictly descending
+            // score order after the merge; every row has a distinct
+            // term frequency so no two scores tie.
+            List<Double> scores = scores(parse(readAll(postJson("/" + indexName + "/_search", requests[2]))));
+            for (int i = 1; i < scores.size(); i++) {
+                assertTrue("scores not descending: " + scores, scores.get(i - 1) > scores.get(i));
+            }
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testNamespaceRegisterPropagatesToAllNodes() throws Exception {
         // GET reads cluster state on the responding node, so the entry
         // only appears if the registration propagated.
@@ -206,6 +282,78 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             }
             return ids;
         }
+    }
+
+    private static Map<String, Object> parse(String json) {
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
+            return parser.map();
+        } catch (IOException e) {
+            throw new AssertionError("could not parse JSON: " + json, e);
+        }
+    }
+
+    private static int activeShards(String indexName) throws IOException {
+        String body = readAll(client().performRequest(new Request("GET", "/_cluster/health/" + indexName)));
+        return extractIntPath(body, "active_shards");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> hitList(Map<String, Object> response) {
+        Map<String, Object> hits = (Map<String, Object>) response.get("hits");
+        return (List<Map<String, Object>>) hits.get("hits");
+    }
+
+    /** {@code _source.id} of every hit, in response order. */
+    @SuppressWarnings("unchecked")
+    private static List<Integer> sourceIds(Map<String, Object> response) {
+        List<Integer> ids = new ArrayList<>();
+        for (Map<String, Object> hit : hitList(response)) {
+            Map<String, Object> source = (Map<String, Object>) hit.get("_source");
+            ids.add(((Number) source.get("id")).intValue());
+        }
+        return ids;
+    }
+
+    /** The {@code sort} array of every hit, in response order; null entries for unsorted requests. */
+    private static List<Object> sortValues(Map<String, Object> response) {
+        List<Object> values = new ArrayList<>();
+        for (Map<String, Object> hit : hitList(response)) {
+            values.add(hit.get("sort"));
+        }
+        return values;
+    }
+
+    private static List<Double> scores(Map<String, Object> response) {
+        List<Double> scores = new ArrayList<>();
+        for (Map<String, Object> hit : hitList(response)) {
+            scores.add(((Number) hit.get("_score")).doubleValue());
+        }
+        return scores;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> buckets(Map<String, Object> response) {
+        Map<String, Object> aggregations = (Map<String, Object>) response.get("aggregations");
+        Map<String, Object> byCategory = (Map<String, Object>) aggregations.get("by_category");
+        return (List<Map<String, Object>>) byCategory.get("buckets");
+    }
+
+    private static int extractIntPath(Map<String, Object> parsed, String... path) {
+        Object value = parsed;
+        for (String step : path) {
+            if (value instanceof Map<?, ?> map) {
+                value = map.get(step);
+            } else {
+                throw new AssertionError("cannot descend into " + value + " with step " + step);
+            }
+            if (value == null) {
+                throw new AssertionError("missing key " + step + " in path " + String.join(".", path) + ", json=" + parsed);
+            }
+        }
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        throw new AssertionError("expected number at " + String.join(".", path) + ", saw " + value);
     }
 
     private static int extractIntPath(String json, String... path) {

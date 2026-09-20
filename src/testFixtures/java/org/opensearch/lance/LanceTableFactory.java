@@ -928,6 +928,118 @@ public final class LanceTableFactory {
     }
 
     /**
+     * Writes a Lance table made of {@code fragments} fragments whose rows
+     * interleave by id, for tests of the coordinator's cross-node hit
+     * merge. Fragment {@code f} holds the rows with
+     * {@code id % fragments == f}, so once the coordinator hands each
+     * fragment to a different node, any id- or ts-ordered page has to
+     * take hits from every node in turn; a merge that merely
+     * concatenates per-node lists produces a visibly wrong order.
+     *
+     * <p>Columns, for a row with global id {@code i} ({@code 0 <= i <
+     * fragments * rowsPerFragment}):
+     * <ul>
+     *   <li>{@code id}: int32, {@code i}</li>
+     *   <li>{@code body}: Utf8 with an INVERTED index, {@code "hello"}
+     *       followed by the token {@code lance} repeated {@code i + 1}
+     *       times. Distinct term frequencies give every row a distinct
+     *       BM25 score for a {@code lance_match} on {@code lance}, so
+     *       score order is total and does not depend on how ties are
+     *       broken.</li>
+     *   <li>{@code category}: Utf8 without an index (derives to
+     *       {@code keyword}), {@code "c" + (i % 3)}</li>
+     *   <li>{@code ts}: timestamp[us], {@code 2024-01-01T00:00:00Z} plus
+     *       {@code i} days, so ts order equals id order</li>
+     * </ul>
+     * The first fragment is written with {@code CREATE}, the rest with
+     * {@code APPEND}, one manifest version per fragment.
+     *
+     * @return absolute URI of the table.
+     */
+    static String writeInterleavedTable(Path parent, String name, int fragments, int rowsPerFragment) throws Exception {
+        return withLocaleRoot(() -> writeInterleavedTableOnce(parent, name, fragments, rowsPerFragment));
+    }
+
+    private static String writeInterleavedTableOnce(Path parent, String name, int fragments, int rowsPerFragment) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        Schema schema = new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field(BODY_COLUMN, FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("category", FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("ts", FieldType.nullable(new ArrowType.Timestamp(TimeUnit.MICROSECOND, null)), null)
+            ),
+            Map.of()
+        );
+        long epochMicros = Instant.parse("2024-01-01T00:00:00Z").toEpochMilli() * 1000L;
+        long dayMicros = 24L * 60L * 60L * 1_000_000L;
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            for (int fragment = 0; fragment < fragments; fragment++) {
+                byte[] ipcBytes;
+                try (
+                    VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                    ByteArrayOutputStream out = new ByteArrayOutputStream()
+                ) {
+                    IntVector idVector = (IntVector) root.getVector("id");
+                    VarCharVector bodyVector = (VarCharVector) root.getVector(BODY_COLUMN);
+                    VarCharVector categoryVector = (VarCharVector) root.getVector("category");
+                    TimeStampMicroVector tsVector = (TimeStampMicroVector) root.getVector("ts");
+                    idVector.allocateNew(rowsPerFragment);
+                    bodyVector.allocateNew();
+                    categoryVector.allocateNew();
+                    tsVector.allocateNew(rowsPerFragment);
+                    for (int slot = 0; slot < rowsPerFragment; slot++) {
+                        int i = fragment + slot * fragments;
+                        idVector.set(slot, i);
+                        String body = "hello" + " lance".repeat(i + 1);
+                        bodyVector.setSafe(slot, body.getBytes(StandardCharsets.UTF_8));
+                        categoryVector.setSafe(slot, ("c" + (i % 3)).getBytes(StandardCharsets.UTF_8));
+                        tsVector.set(slot, epochMicros + i * dayMicros);
+                    }
+                    idVector.setValueCount(rowsPerFragment);
+                    bodyVector.setValueCount(rowsPerFragment);
+                    categoryVector.setValueCount(rowsPerFragment);
+                    tsVector.setValueCount(rowsPerFragment);
+                    root.setRowCount(rowsPerFragment);
+                    try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                        writer.start();
+                        writer.writeBatch();
+                        writer.end();
+                    }
+                    ipcBytes = out.toByteArray();
+                }
+                try (
+                    ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                    ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                    ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+                ) {
+                    Data.exportArrayStream(allocator, reader, stream);
+                    WriteParams.WriteMode mode = fragment == 0 ? WriteParams.WriteMode.CREATE : WriteParams.WriteMode.APPEND;
+                    WriteParams writeParams = new WriteParams.Builder().withMode(mode).build();
+                    Dataset.create(allocator, stream, uri, writeParams).close();
+                }
+            }
+            // The FTS index goes on last so it covers every fragment;
+            // same parameters as writeTable.
+            try (Dataset dataset = Dataset.open().allocator(allocator).uri(uri).build()) {
+                ScalarIndexParams scalarParams = ScalarIndexParams.create(
+                    "inverted",
+                    "{\"base_tokenizer\":\"simple\",\"language\":\"English\",\"with_position\":true}"
+                );
+                IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+                dataset.createIndex(
+                    IndexOptions.builder(Collections.singletonList(BODY_COLUMN), IndexType.INVERTED, indexParams)
+                        .withIndexName(BODY_COLUMN + "_fts")
+                        .build()
+                );
+            }
+        }
+        return uri;
+    }
+
+    /**
      * Pins the JVM's default {@link Locale} to {@link Locale#ROOT} for the
      * duration of a Lance write, restoring the previous default afterwards.
      *
