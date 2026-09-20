@@ -17,6 +17,8 @@ import org.apache.lucene.store.ByteBuffersDirectory;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
+import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -72,7 +74,8 @@ public class LanceDataFileSizeTests extends OpenSearchTestCase {
                 dataset,
                 "",
                 LanceEngineFactory.LancePrimaryKeyType.NONE,
-                Collections.emptyMap()
+                Collections.emptyMap(),
+                new NoopCircuitBreaker(CircuitBreaker.REQUEST)
             )
         ) {
             OpenSearchDirectoryReader wrapped = OpenSearchDirectoryReader.wrap(reader, shardId);

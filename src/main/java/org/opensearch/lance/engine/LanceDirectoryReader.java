@@ -23,6 +23,8 @@ import org.apache.lucene.store.Directory;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.fragment.DataFile;
+import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 
 /** DirectoryReader whose leaves are Lance fragments. */
 public final class LanceDirectoryReader extends DirectoryReader {
@@ -109,7 +111,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
      * ({@link LanceEngineFactory.LanceReadOnlyEngine}) uses this only when
      * it has no {@link LanceWarmCache} to take a snapshot from; with one it
      * goes through {@link #openForSnapshot(Directory, IndexCommit,
-     * LanceWarmCache.Lease, ColumnStore)} instead. The RFC's
+     * LanceWarmCache.Lease, ColumnStore, CircuitBreaker)} instead. The RFC's
      * shard-partitioning scheme (fragment id modulo shard count) was
      * retired when {@code number_of_shards} was dropped from attach;
      * {@link #openForFragments} is the fan-out variant used by the fragment
@@ -132,6 +134,10 @@ public final class LanceDirectoryReader extends DirectoryReader {
      *                  {@link org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType#NONE})
      *                  the reader falls back to the integer / synthesised
      *                  paths.
+     * @param requestBreaker breaker every column the leaves materialise
+     *                  in heap is charged to before allocation and given
+     *                  back on {@link #close()}; the node's request
+     *                  breaker, or a {@link NoopCircuitBreaker}
      */
     public static LanceDirectoryReader open(
         Directory directory,
@@ -139,7 +145,8 @@ public final class LanceDirectoryReader extends DirectoryReader {
         Dataset dataset,
         String intField,
         org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+        CircuitBreaker requestBreaker
     ) throws IOException {
         List<LeafReader> leaves = new ArrayList<>();
         List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>();
@@ -167,7 +174,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         // so every leaf's ensureXxxLoaded delegates through one
         // dataset.newScan per column. See LanceShardColumnCache
         // javadoc for the rationale.
-        LanceShardColumnCache cache = new LanceShardColumnCache(dataset, null, rawLeaves);
+        LanceShardColumnCache cache = new LanceShardColumnCache(dataset, null, rawLeaves, null, null, requestBreaker);
         for (LanceFragmentLeafReader raw : rawLeaves) {
             raw.setShardColumnCache(cache);
         }
@@ -231,6 +238,10 @@ public final class LanceDirectoryReader extends DirectoryReader {
      * absent by default so existing callers (whole-table {@code open}
      * used by the shard engine, tests that build a reader without
      * a top-level filter) continue to run unfiltered column scans.
+     * Heap column loads of the resulting reader are not charged to a
+     * request breaker: this open has no production caller (the fragment
+     * executor opens through {@link #openForSnapshot}), so it hands the
+     * cache a {@link NoopCircuitBreaker}.
      */
     public static LanceDirectoryReader openForFragments(
         Directory directory,
@@ -292,22 +303,27 @@ public final class LanceDirectoryReader extends DirectoryReader {
      * <p>Fragment ids the snapshot does not list are skipped, as in
      * {@link #openForFragments}.
      *
-     * @param directory   Lucene directory the reader reports to Lucene's
-     *                    bookkeeping; never written
-     * @param snapshot    snapshot the caller holds a lease on
-     * @param columnStore off-heap store to serve numeric and boolean
-     *                    columns from, or {@code null} to load into heap
-     *                    for this request (cache disabled)
-     * @param fragmentIds Lance fragment ids to expose as leaves
-     * @param filterSql   predicate for request scoped heap column loads,
-     *                    or {@code null}; never applied to store loads
+     * @param directory      Lucene directory the reader reports to Lucene's
+     *                       bookkeeping; never written
+     * @param snapshot       snapshot the caller holds a lease on
+     * @param columnStore    off-heap store to serve numeric and boolean
+     *                       columns from, or {@code null} to load into heap
+     *                       for this request (cache disabled)
+     * @param fragmentIds    Lance fragment ids to expose as leaves
+     * @param filterSql      predicate for request scoped heap column loads,
+     *                       or {@code null}; never applied to store loads
+     * @param requestBreaker breaker every column the leaves materialise in
+     *                       heap (no store, or no room in it) is charged to
+     *                       before allocation and given back when the
+     *                       reader closes; the node's request breaker
      */
     public static LanceDirectoryReader openForSnapshot(
         Directory directory,
         LanceWarmCache.Snapshot snapshot,
         ColumnStore columnStore,
         List<Integer> fragmentIds,
-        String filterSql
+        String filterSql,
+        CircuitBreaker requestBreaker
     ) throws IOException {
         java.util.Set<Integer> wanted = new java.util.HashSet<>(fragmentIds);
         List<LeafReader> leaves = new ArrayList<>(wanted.size());
@@ -322,7 +338,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
             rawLeaves.add(raw);
             leaves.add(LanceSequentialLeafReader.wrap(raw));
         }
-        LanceShardColumnCache cache = new LanceShardColumnCache(dataset, filterSql, rawLeaves, columnStore, snapshot.key());
+        LanceShardColumnCache cache = new LanceShardColumnCache(dataset, filterSql, rawLeaves, columnStore, snapshot.key(), requestBreaker);
         for (LanceFragmentLeafReader raw : rawLeaves) {
             raw.setShardColumnCache(cache);
         }
@@ -333,31 +349,37 @@ public final class LanceDirectoryReader extends DirectoryReader {
      * Open the shard engine's whole-table reader over a cached
      * {@link LanceWarmCache.Snapshot}: every fragment the snapshot lists
      * becomes a leaf, the same views {@link #openForSnapshot(Directory,
-     * LanceWarmCache.Snapshot, ColumnStore, List, String)} builds for the
-     * fragment path, so GET, {@code _stats} and the fragment path read one
-     * dataset and one column store per table version on a node. The
-     * returned reader owns {@code lease} and releases it when it closes,
-     * which for the engine is when Lucene's {@code ReferenceManager} has
-     * released the last searcher of a swapped out reader; the caller must
-     * not release the lease itself. The data file total the engine reports
-     * through {@code _stats} comes from the snapshot.
+     * LanceWarmCache.Snapshot, ColumnStore, List, String, CircuitBreaker)}
+     * builds for the fragment path, so GET, {@code _stats} and the
+     * fragment path read one dataset and one column store per table
+     * version on a node. The returned reader owns {@code lease} and
+     * releases it when it closes, which for the engine is when Lucene's
+     * {@code ReferenceManager} has released the last searcher of a
+     * swapped out reader; the caller must not release the lease itself.
+     * The data file total the engine reports through {@code _stats}
+     * comes from the snapshot.
      *
-     * @param directory   Lucene directory of the shard's store, reported to
-     *                    Lucene's bookkeeping and never written
-     * @param commit      the shard's bootstrap commit, returned by
-     *                    {@link #getIndexCommit()}
-     * @param lease       lease on the snapshot to read; owned by the
-     *                    returned reader on success, released here on
-     *                    failure
-     * @param columnStore off-heap store to serve columns from, or
-     *                    {@code null} to load into heap (cache disabled,
-     *                    the snapshot is then transient)
+     * @param directory      Lucene directory of the shard's store, reported
+     *                       to Lucene's bookkeeping and never written
+     * @param commit         the shard's bootstrap commit, returned by
+     *                       {@link #getIndexCommit()}
+     * @param lease          lease on the snapshot to read; owned by the
+     *                       returned reader on success, released here on
+     *                       failure
+     * @param columnStore    off-heap store to serve columns from, or
+     *                       {@code null} to load into heap (cache disabled,
+     *                       the snapshot is then transient)
+     * @param requestBreaker breaker the heap column loads of this reader
+     *                       are charged to; a heap column of the engine's
+     *                       reader stays charged until the next refresh
+     *                       swaps the reader out and it closes
      */
     public static LanceDirectoryReader openForSnapshot(
         Directory directory,
         IndexCommit commit,
         LanceWarmCache.Lease lease,
-        ColumnStore columnStore
+        ColumnStore columnStore,
+        CircuitBreaker requestBreaker
     ) throws IOException {
         LanceWarmCache.Snapshot snapshot = lease.snapshot();
         Dataset dataset = snapshot.dataset();
@@ -370,7 +392,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
                 rawLeaves.add(raw);
                 leaves.add(LanceSequentialLeafReader.wrap(raw));
             }
-            LanceShardColumnCache cache = new LanceShardColumnCache(dataset, null, rawLeaves, columnStore, snapshot.key());
+            LanceShardColumnCache cache = new LanceShardColumnCache(dataset, null, rawLeaves, columnStore, snapshot.key(), requestBreaker);
             for (LanceFragmentLeafReader raw : rawLeaves) {
                 raw.setShardColumnCache(cache);
             }
@@ -462,7 +484,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
     /**
      * The {@link LanceWarmCache.Snapshot} this reader was opened over
      * through {@link #openForSnapshot(Directory, IndexCommit,
-     * LanceWarmCache.Lease, ColumnStore)}, or {@code null} for a reader
+     * LanceWarmCache.Lease, ColumnStore, CircuitBreaker)}, or {@code null} for a reader
      * that opened its own dataset or does not own its lease.
      */
     public LanceWarmCache.Snapshot snapshot() {
@@ -558,7 +580,9 @@ public final class LanceDirectoryReader extends DirectoryReader {
             first = e;
         }
         if (columnCache != null) {
-            columnCache.releasePins();
+            // Unpins the store entries and gives the request breaker back
+            // every heap column charge of this reader's loads.
+            columnCache.release();
         }
         if (ownsDataset) {
             try {

@@ -31,6 +31,7 @@ import org.apache.lucene.util.BytesRefBuilder;
 import org.lance.Dataset;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
+import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.lance.LanceCircuitBreaker;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
@@ -95,12 +96,26 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
     }
 
     private LanceDirectoryReader openCached(Snapshot snapshot, List<Integer> fragmentIds) throws IOException {
-        return LanceDirectoryReader.openForSnapshot(new ByteBuffersDirectory(), snapshot, cache.columnStore(), fragmentIds, null);
+        return LanceDirectoryReader.openForSnapshot(
+            new ByteBuffersDirectory(),
+            snapshot,
+            cache.columnStore(),
+            fragmentIds,
+            null,
+            new NoopCircuitBreaker(CircuitBreaker.REQUEST)
+        );
     }
 
     /** Heap reference: the same snapshot without a store, so every column loads into {@code long[]}. */
     private LanceDirectoryReader openHeap(Snapshot snapshot, List<Integer> fragmentIds) throws IOException {
-        return LanceDirectoryReader.openForSnapshot(new ByteBuffersDirectory(), snapshot, null, fragmentIds, null);
+        return LanceDirectoryReader.openForSnapshot(
+            new ByteBuffersDirectory(),
+            snapshot,
+            null,
+            fragmentIds,
+            null,
+            new NoopCircuitBreaker(CircuitBreaker.REQUEST)
+        );
     }
 
     private static List<LanceFragmentLeafReader> leavesOf(LanceDirectoryReader reader) {
@@ -916,7 +931,8 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
                         snapshot,
                         full,
                         List.of(0),
-                        null
+                        null,
+                        new NoopCircuitBreaker(CircuitBreaker.REQUEST)
                     )
                 ) {
                     LanceFragmentLeafReader leaf = leavesOf(pinning).get(0);
@@ -929,7 +945,8 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
                             snapshot,
                             full,
                             allFragments,
-                            null
+                            null,
+                            new NoopCircuitBreaker(CircuitBreaker.REQUEST)
                         );
                         LanceDirectoryReader heap = openHeap(snapshot, allFragments)
                     ) {

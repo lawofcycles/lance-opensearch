@@ -1986,7 +1986,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             snapshot,
             columnStore,
             effectiveFragmentIds,
-            filterSql
+            filterSql,
+            circuitBreakerService.getBreaker(CircuitBreaker.REQUEST)
         );
         OpenSearchDirectoryReader wrapped = null;
         try {

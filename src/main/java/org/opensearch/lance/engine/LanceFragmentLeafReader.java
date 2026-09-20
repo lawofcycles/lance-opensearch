@@ -76,6 +76,8 @@ import org.lance.Dataset;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.opensearch.common.lucene.index.OpenSearchLeafReader;
+import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.lance.engine.LanceFragmentSchema.ColumnKind;
 import org.opensearch.lance.engine.LanceFragmentSchema.NumericPrecision;
 
@@ -361,7 +363,9 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * across the reader instead of once per (column, leaf). When
      * unset the leaf falls back to its own per-fragment scan for
      * backwards compatibility (unit tests that construct leaves
-     * directly, callers that skip {@link LanceDirectoryReader}).
+     * directly, callers that skip {@link LanceDirectoryReader}). The
+     * single fragment heap loads route their request breaker charges
+     * through the cache too, so one place gives them back on close.
      */
     private volatile LanceShardColumnCache shardColumnCache;
 
@@ -580,28 +584,68 @@ public final class LanceFragmentLeafReader extends LeafReader {
             if (cache != null && cache.publishFromStoreForLeaf(this, name, false)) {
                 return;
             }
-            long[] col = new long[maxDoc];
-            FixedBitSet presence = new FixedBitSet(maxDoc);
-            ScanOptions colOptions = singleColumnScan(name);
-            try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
-                while (reader.loadNextBatch()) {
-                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                    FieldVector vector = root.getVector(name);
-                    for (int i = 0; i < root.getRowCount(); i++) {
-                        int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
-                        if (!vector.isNull(i)) {
-                            col[offset] = readAsLong(vector, i);
-                            presence.set(offset);
+            long heapBytes = LanceShardColumnCache.numericHeapBytes(maxDoc);
+            chargeHeap(cache, heapBytes, name);
+            boolean published = false;
+            try {
+                long[] col = new long[maxDoc];
+                FixedBitSet presence = new FixedBitSet(maxDoc);
+                ScanOptions colOptions = singleColumnScan(name);
+                try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
+                    while (reader.loadNextBatch()) {
+                        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                        UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                        FieldVector vector = root.getVector(name);
+                        for (int i = 0; i < root.getRowCount(); i++) {
+                            int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
+                            if (!vector.isNull(i)) {
+                                col[offset] = readAsLong(vector, i);
+                                presence.set(offset);
+                            }
                         }
                     }
+                } catch (Exception e) {
+                    throw new IOException(e);
                 }
-            } catch (Exception e) {
-                throw new IOException(e);
+                numericPresence.put(name, presence);
+                numericColumns.put(name, col);
+                published = true;
+            } finally {
+                if (!published) {
+                    releaseHeap(cache, heapBytes);
+                }
             }
-            numericPresence.put(name, presence);
-            numericColumns.put(name, col);
         }
+    }
+
+    /**
+     * Charge {@code bytes} of heap this leaf is about to allocate for a
+     * single fragment load of {@code name} to the request breaker, through
+     * the shard cache so the charge is given back when the reader closes.
+     * A leaf without a cache (tests that build leaves directly) has no
+     * breaker and allocates unchecked.
+     */
+    private static void chargeHeap(LanceShardColumnCache cache, long bytes, String name) {
+        if (cache != null) {
+            cache.chargeHeap(bytes, name);
+        }
+    }
+
+    /** Give back a charge of {@link #chargeHeap} whose load did not complete. */
+    private static void releaseHeap(LanceShardColumnCache cache, long bytes) {
+        if (cache != null) {
+            cache.releaseHeap(bytes);
+        }
+    }
+
+    /**
+     * The request breaker heap column loads of this leaf are charged to:
+     * the shard cache's when one is attached, a {@link NoopCircuitBreaker}
+     * otherwise.
+     */
+    CircuitBreaker requestBreaker() {
+        LanceShardColumnCache cache = shardColumnCache;
+        return cache == null ? new NoopCircuitBreaker(CircuitBreaker.REQUEST) : cache.requestBreaker();
     }
 
     /**
@@ -677,27 +721,37 @@ public final class LanceFragmentLeafReader extends LeafReader {
             if (cache != null && cache.publishFromStoreForLeaf(this, name, true)) {
                 return;
             }
-            long[] col = new long[maxDoc];
-            FixedBitSet presence = new FixedBitSet(maxDoc);
-            ScanOptions colOptions = singleColumnScan(name);
-            try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
-                while (reader.loadNextBatch()) {
-                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                    BitVector vector = (BitVector) root.getVector(name);
-                    for (int i = 0; i < root.getRowCount(); i++) {
-                        int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
-                        if (!vector.isNull(i)) {
-                            col[offset] = vector.get(i);
-                            presence.set(offset);
+            long heapBytes = LanceShardColumnCache.numericHeapBytes(maxDoc);
+            chargeHeap(cache, heapBytes, name);
+            boolean published = false;
+            try {
+                long[] col = new long[maxDoc];
+                FixedBitSet presence = new FixedBitSet(maxDoc);
+                ScanOptions colOptions = singleColumnScan(name);
+                try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
+                    while (reader.loadNextBatch()) {
+                        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                        UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                        BitVector vector = (BitVector) root.getVector(name);
+                        for (int i = 0; i < root.getRowCount(); i++) {
+                            int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
+                            if (!vector.isNull(i)) {
+                                col[offset] = vector.get(i);
+                                presence.set(offset);
+                            }
                         }
                     }
+                } catch (Exception e) {
+                    throw new IOException(e);
                 }
-            } catch (Exception e) {
-                throw new IOException(e);
+                booleanPresence.put(name, presence);
+                booleanColumns.put(name, col);
+                published = true;
+            } finally {
+                if (!published) {
+                    releaseHeap(cache, heapBytes);
+                }
             }
-            booleanPresence.put(name, presence);
-            booleanColumns.put(name, col);
         }
     }
 
@@ -744,29 +798,42 @@ public final class LanceFragmentLeafReader extends LeafReader {
             if (cache != null && cache.publishKeywordFromStoreForLeaf(this, name)) {
                 return;
             }
-            int[] ids = new int[maxDoc];
-            Arrays.fill(ids, -1);
-            KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder();
-            ScanOptions colOptions = singleColumnScan(name);
-            try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
-                while (reader.loadNextBatch()) {
-                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                    VarCharVector vector = (VarCharVector) root.getVector(name);
-                    for (int i = 0; i < root.getRowCount(); i++) {
-                        if (vector.isNull(i)) {
-                            continue;
+            long charged = LanceShardColumnCache.intArrayBytes(maxDoc);
+            chargeHeap(cache, charged, name);
+            boolean published = false;
+            try {
+                int[] ids = new int[maxDoc];
+                Arrays.fill(ids, -1);
+                KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder();
+                ScanOptions colOptions = singleColumnScan(name);
+                try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
+                    while (reader.loadNextBatch()) {
+                        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                        UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                        VarCharVector vector = (VarCharVector) root.getVector(name);
+                        for (int i = 0; i < root.getRowCount(); i++) {
+                            if (vector.isNull(i)) {
+                                continue;
+                            }
+                            int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
+                            ids[offset] = builder.intern(vector, i);
                         }
-                        int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
-                        ids[offset] = builder.intern(vector, i);
                     }
+                } catch (Exception e) {
+                    throw new IOException(e);
                 }
-            } catch (Exception e) {
-                throw new IOException(e);
+                long termBytes = LanceShardColumnCache.termsHeapBytes(builder.size(), builder.termBytes());
+                chargeHeap(cache, termBytes, name);
+                charged += termBytes;
+                KeywordDictionaryBuilder.Dictionary dictionary = builder.finish();
+                dictionary.remap(ids);
+                publishTextColumn(name, dictionary.terms(), ids);
+                published = true;
+            } finally {
+                if (!published) {
+                    releaseHeap(cache, charged);
+                }
             }
-            KeywordDictionaryBuilder.Dictionary dictionary = builder.finish();
-            dictionary.remap(ids);
-            publishTextColumn(name, dictionary.terms(), ids);
         }
     }
 
@@ -834,33 +901,49 @@ public final class LanceFragmentLeafReader extends LeafReader {
             if (cache != null && cache.publishKeywordArrayFromStoreForLeaf(this, name)) {
                 return;
             }
-            int[][] rows = new int[maxDoc][];
-            KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder();
-            ScanOptions colOptions = singleColumnScan(name);
-            try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
-                while (reader.loadNextBatch()) {
-                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                    ListVector vector = (ListVector) root.getVector(name);
-                    VarCharVector elements = (VarCharVector) vector.getDataVector();
-                    for (int i = 0; i < root.getRowCount(); i++) {
-                        if (vector.isNull(i)) {
-                            continue;
+            long charged = LanceShardColumnCache.objectArrayBytes(maxDoc);
+            chargeHeap(cache, charged, name);
+            boolean published = false;
+            try {
+                int[][] rows = new int[maxDoc][];
+                KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder();
+                ScanOptions colOptions = singleColumnScan(name);
+                try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
+                    while (reader.loadNextBatch()) {
+                        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                        UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                        ListVector vector = (ListVector) root.getVector(name);
+                        VarCharVector elements = (VarCharVector) vector.getDataVector();
+                        for (int i = 0; i < root.getRowCount(); i++) {
+                            if (vector.isNull(i)) {
+                                continue;
+                            }
+                            int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
+                            rows[offset] = internListElements(builder, vector, elements, i);
                         }
-                        int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
-                        rows[offset] = internListElements(builder, vector, elements, i);
+                    }
+                } catch (Exception e) {
+                    throw new IOException(e);
+                }
+                int[] idToOrd = builder.sort();
+                for (int r = 0; r < rows.length; r++) {
+                    if (rows[r] != null) {
+                        rows[r] = KeywordDictionaryBuilder.remapSortedUnique(idToOrd, rows[r]);
                     }
                 }
-            } catch (Exception e) {
-                throw new IOException(e);
-            }
-            KeywordDictionaryBuilder.Dictionary dictionary = builder.finish();
-            for (int r = 0; r < rows.length; r++) {
-                if (rows[r] != null) {
-                    rows[r] = dictionary.remapSortedUnique(rows[r]);
+                long rowAndTermBytes = LanceShardColumnCache.rowOrdinalBytes(rows) + LanceShardColumnCache.termsHeapBytes(
+                    builder.size(),
+                    builder.termBytes()
+                );
+                chargeHeap(cache, rowAndTermBytes, name);
+                charged += rowAndTermBytes;
+                publishKeywordArrayColumn(name, builder.finish().terms(), rows);
+                published = true;
+            } finally {
+                if (!published) {
+                    releaseHeap(cache, charged);
                 }
             }
-            publishKeywordArrayColumn(name, dictionary.terms(), rows);
         }
     }
 
