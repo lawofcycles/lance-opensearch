@@ -5,6 +5,7 @@
 
 package org.opensearch.lance.rest;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -13,30 +14,18 @@ import org.lance.Dataset;
 import org.lance.index.IndexCriteria;
 import org.lance.schema.LanceField;
 import org.lance.schema.LanceSchema;
-import org.opensearch.ResourceAlreadyExistsException;
-import org.opensearch.action.admin.cluster.state.ClusterStateRequest;
-import org.opensearch.action.admin.cluster.state.ClusterStateResponse;
-import org.opensearch.action.admin.indices.create.CreateIndexRequest;
-import org.opensearch.action.admin.indices.create.CreateIndexResponse;
-import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.common.settings.Settings;
-import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
-import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
-import org.opensearch.lance.LanceInternalHeaders;
-import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
-import org.opensearch.lance.engine.LanceEngineFactory;
-import org.opensearch.lance.namespace.AllowedTableRoots;
+import org.opensearch.lance.attach.LanceAttachAction;
+import org.opensearch.lance.attach.LanceAttachRequest;
 import org.opensearch.lance.namespace.LanceNamespaceService;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
-import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestRequest;
-import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.rest.action.RestToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
@@ -54,29 +43,16 @@ import org.opensearch.transport.client.node.NodeClient;
  * left, and it fans out to fragments regardless of shard count. Requests
  * carrying {@code number_of_shards} are rejected with 400.
  *
- * <p>Threading: the JNI work ({@link Dataset#open}, schema and row counts)
- * runs on {@link ThreadPool.Names#GENERIC}. The transport thread only
- * validates the request body so a bad payload returns 400 immediately.
- *
- * <p>Existing-index handling: when the target index already exists we look
- * up its settings and only report {@code already_attached: true} if the
- * existing index is a Lance index pointing to the same table. Any other
- * clash (plain index reusing the name, Lance index for a different table)
- * returns 409 so the operator picks a different name explicitly.
+ * <p>The handler parses the body and hands a {@link LanceAttachRequest} to
+ * {@link LanceAttachAction}; opening the table, deriving the mapping, and
+ * creating the index happen in the transport action so a security plugin
+ * evaluates the caller before any of that starts. The static
+ * {@link #derive} helpers stay here because the namespace poller reuses
+ * them for tables it surfaces on its own.
  */
 public class RestAttachAction extends BaseRestHandler {
 
     private static final String PK_METADATA_KEY = "lance-schema:unenforced-primary-key";
-
-    private final ThreadPool threadPool;
-    private final AllowedTableRoots allowedRoots;
-    private final LanceNamespaceService namespaceService;
-
-    public RestAttachAction(ThreadPool threadPool, AllowedTableRoots allowedRoots, LanceNamespaceService namespaceService) {
-        this.threadPool = threadPool;
-        this.allowedRoots = allowedRoots;
-        this.namespaceService = namespaceService;
-    }
 
     @Override
     public String getName() {
@@ -98,7 +74,7 @@ public class RestAttachAction extends BaseRestHandler {
         String explicitName;
         Long pinnedVersion;
         StorageOptions storageOptions;
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields;
+        Map<String, LinkedHashMap<String, String>> multiFields;
         try {
             table = readOptionalString(body, "table");
             if (table == null || table.isEmpty()) {
@@ -127,7 +103,7 @@ public class RestAttachAction extends BaseRestHandler {
             }
             storageOptions = StorageOptions.parseFromRequestField(body.get("storage_options"), "[lance_attach]");
             multiFields = parseMultiFields(body.get("multi_fields"));
-            java.util.Map<String, java.util.LinkedHashMap<String, String>> overrides = parseOverrides(body.get("overrides"));
+            Map<String, LinkedHashMap<String, String>> overrides = parseOverrides(body.get("overrides"));
             if (!overrides.isEmpty()) {
                 if (!multiFields.isEmpty()) {
                     // Same conceptual data (sub-field spec) coming in twice
@@ -147,7 +123,7 @@ public class RestAttachAction extends BaseRestHandler {
                     // No column conflict; merge into one map. `overrides`
                     // wins on any later augmentation because it is the
                     // canonical shape.
-                    java.util.LinkedHashMap<String, java.util.LinkedHashMap<String, String>> merged = new java.util.LinkedHashMap<>();
+                    LinkedHashMap<String, LinkedHashMap<String, String>> merged = new LinkedHashMap<>();
                     merged.putAll(multiFields);
                     merged.putAll(overrides);
                     multiFields = merged;
@@ -160,202 +136,8 @@ public class RestAttachAction extends BaseRestHandler {
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
         }
 
-        if (!allowedRoots.allows(table)) {
-            String rejected = table;
-            return channel -> channel.sendResponse(
-                new BytesRestResponse(
-                    RestStatus.FORBIDDEN,
-                    "table [" + rejected + "] is not under any of the configured lance.allowed_table_roots"
-                )
-            );
-        }
-
-        final String tableFinal = table;
-        final String indexName = explicitName != null ? explicitName : tableName(table);
-        final StorageOptions storageOptionsFinal = storageOptions;
-        final java.util.Optional<Long> pinnedVersionFinal = java.util.Optional.ofNullable(pinnedVersion);
-        final java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFieldsFinal = multiFields;
-
-        // Dispatch the JNI work to the generic pool. Dataset.open blocks on
-        // native I/O and would trip the transport-thread assertion otherwise.
-        return channel -> threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
-            Derivation derivation;
-            try (Dataset dataset = LanceRegistry.openDataset(tableFinal, storageOptionsFinal, pinnedVersionFinal)) {
-                derivation = derive(dataset, multiFieldsFinal);
-            } catch (IllegalArgumentException e) {
-                channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, e.getMessage()));
-                return;
-            } catch (Exception e) {
-                sendError(channel, e);
-                return;
-            }
-            createIndex(client, channel, indexName, tableFinal, derivation, namespaceService, storageOptionsFinal, pinnedVersionFinal);
-        });
-    }
-
-    private static void createIndex(
-        NodeClient client,
-        RestChannel channel,
-        String indexName,
-        String table,
-        Derivation derivation,
-        LanceNamespaceService namespaceService,
-        StorageOptions storageOptions,
-        java.util.Optional<Long> pinnedVersion
-    ) {
-        Settings.Builder settings = Settings.builder()
-            .put("index.number_of_shards", 1)
-            .put("index.number_of_replicas", 0)
-            .put(LanceEngineFactory.TABLE_SETTING, table)
-            .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField)
-            .put(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, derivation.keyFieldType);
-        if (!derivation.multiFieldsJson.isEmpty()) {
-            settings.put(LanceEngineFactory.MULTI_FIELDS_SETTING, derivation.multiFieldsJson);
-        }
-        pinnedVersion.ifPresent(v -> settings.put(LanceEngineFactory.VERSION_SETTING, v));
-        storageOptions.writeToSettings(settings);
-        CreateIndexRequest create = new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson);
-
-        // LanceCreateIndexActionFilter blocks user PUT /{index} that
-        // tries to set index.lance.table. Stamp the internal header
-        // so this plugin-issued call is recognised as legitimate.
-        // stashContext preserves the caller's headers for the outer
-        // REST handler.
-        ThreadContext threadContext = client.threadPool().getThreadContext();
-        try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
-            threadContext.putHeader(LanceInternalHeaders.LANCE_INTERNAL_CREATE_INDEX, "true");
-            client.admin().indices().create(create, new ActionListener<CreateIndexResponse>() {
-                @Override
-                public void onResponse(CreateIndexResponse response) {
-                    // Register the attach-created index with the namespace poller
-                    // only when the operator is following the latest version.
-                    // Pinned indices stay on their manifest version by design
-                    // (readonly snapshot for reproducibility), so the poll cycle
-                    // does not need to touch them and would otherwise burn cycles
-                    // probing for a manifest advance that must not change the
-                    // reader.
-                    if (pinnedVersion.isEmpty()) {
-                        namespaceService.registerAttachedIndex(indexName, table, derivation.version, storageOptions);
-                    }
-                    writeAttachResponse(channel, indexName, table, derivation, false);
-                }
-
-                @Override
-                public void onFailure(Exception e) {
-                    if (!isAlreadyExists(e)) {
-                        sendError(channel, e);
-                        return;
-                    }
-                    // The index already exists. Verify it is a Lance index for the
-                    // same table before claiming success; otherwise attach would
-                    // silently take credit for an unrelated index.
-                    verifyExistingLanceIndex(
-                        client,
-                        channel,
-                        indexName,
-                        table,
-                        derivation,
-                        namespaceService,
-                        storageOptions,
-                        pinnedVersion
-                    );
-                }
-            });
-        }
-    }
-
-    private static void verifyExistingLanceIndex(
-        NodeClient client,
-        RestChannel channel,
-        String indexName,
-        String table,
-        Derivation derivation,
-        LanceNamespaceService namespaceService,
-        StorageOptions storageOptions,
-        java.util.Optional<Long> pinnedVersion
-    ) {
-        ClusterStateRequest stateRequest = new ClusterStateRequest();
-        stateRequest.clear().metadata(true).indices(indexName);
-        client.admin().cluster().state(stateRequest, new ActionListener<ClusterStateResponse>() {
-            @Override
-            public void onResponse(ClusterStateResponse response) {
-                IndexMetadata md = response.getState().metadata().index(indexName);
-                if (md == null) {
-                    // Race: the index disappeared between create and state.
-                    // Treat as conflict rather than pretend attach succeeded.
-                    sendError(channel, RestStatus.CONFLICT, "index " + indexName + " conflicts with a concurrent request");
-                    return;
-                }
-                String existing = md.getSettings().get(LanceEngineFactory.TABLE_SETTING);
-                if (existing == null) {
-                    sendError(
-                        channel,
-                        RestStatus.CONFLICT,
-                        "index " + indexName + " already exists and is not a Lance index; choose a different `name`"
-                    );
-                    return;
-                }
-                if (!existing.equals(table)) {
-                    sendError(channel, RestStatus.CONFLICT, "index " + indexName + " already attached to a different table: " + existing);
-                    return;
-                }
-                // Same table, so record the (index, table) pair with the
-                // namespace poller in case this node has forgotten it
-                // (cluster restart after attach, for example). Pinned
-                // indices are readonly snapshots and stay outside the
-                // poll cycle so a manifest advance does not race with
-                // the intended version.
-                if (pinnedVersion.isEmpty()) {
-                    namespaceService.registerAttachedIndex(indexName, table, derivation.version, storageOptions);
-                }
-                writeAttachResponse(channel, indexName, table, derivation, true);
-            }
-
-            @Override
-            public void onFailure(Exception e) {
-                sendError(channel, e);
-            }
-        });
-    }
-
-    private static boolean isAlreadyExists(Throwable e) {
-        Throwable cursor = e;
-        while (cursor != null) {
-            if (cursor instanceof ResourceAlreadyExistsException) {
-                return true;
-            }
-            cursor = cursor.getCause();
-        }
-        return false;
-    }
-
-    private static void writeAttachResponse(
-        RestChannel channel,
-        String indexName,
-        String table,
-        Derivation derivation,
-        boolean alreadyAttached
-    ) {
-        try (XContentBuilder b = channel.newBuilder()) {
-            b.startObject();
-            b.field("index", indexName);
-            b.field("table", table);
-            b.field("version", derivation.version);
-            b.field("rows", derivation.rows);
-            b.field("fragments", derivation.fragments);
-            b.field("derived_key_field", derivation.keyField);
-            b.rawField(
-                "derived_mapping",
-                new java.io.ByteArrayInputStream(derivation.mappingJson.getBytes(java.nio.charset.StandardCharsets.UTF_8)),
-                org.opensearch.core.xcontent.MediaTypeRegistry.JSON
-            );
-            b.field("notes", derivation.notes);
-            b.field("already_attached", alreadyAttached);
-            b.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, b));
-        } catch (Exception e) {
-            sendError(channel, e);
-        }
+        LanceAttachRequest attach = new LanceAttachRequest(table, explicitName, pinnedVersion, storageOptions, multiFields);
+        return channel -> client.execute(LanceAttachAction.INSTANCE, attach, new RestToXContentListener<>(channel));
     }
 
     private static String readOptionalString(Map<String, Object> body, String key) {
@@ -378,22 +160,6 @@ public class RestAttachAction extends BaseRestHandler {
             throw new IllegalArgumentException("[" + key + "] must be a number, got " + v.getClass().getSimpleName());
         }
         return ((Number) v).longValue();
-    }
-
-    private static void sendError(RestChannel channel, Exception e) {
-        try {
-            channel.sendResponse(new BytesRestResponse(channel, e));
-        } catch (Exception inner) {
-            // channel already closed
-        }
-    }
-
-    private static void sendError(RestChannel channel, RestStatus status, String message) {
-        try {
-            channel.sendResponse(new BytesRestResponse(status, message));
-        } catch (Exception inner) {
-            // channel already closed
-        }
     }
 
     public record Derivation(String mappingJson, String keyField, String keyFieldType, String multiFieldsJson, long version, long rows,

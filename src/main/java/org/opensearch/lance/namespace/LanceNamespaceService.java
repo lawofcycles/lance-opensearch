@@ -231,33 +231,6 @@ public final class LanceNamespaceService {
         return cadence;
     }
 
-    /**
-     * Registers a namespace root through the cluster manager. Completes
-     * {@code listener} once the cluster state update is acknowledged, or
-     * immediately with {@code changed == false} when the local cluster
-     * state already carries the root.
-     *
-     * <p>Asynchronous on purpose: REST handlers call this from a netty
-     * {@code transport_worker} thread, and that thread may also be the
-     * one the cluster manager's state publication for this very update
-     * arrives on. Blocking it would stall the publication until
-     * {@code cluster.follower_lag.timeout} removes the node.
-     */
-    public void register(String rootUri, StorageOptions storageOptions, ActionListener<LanceNamespaceUpdateResponse> listener) {
-        LanceNamespaceMetadata current = currentMetadata(clusterService.state());
-        for (LanceNamespaceMetadata.Entry entry : current.entries()) {
-            if (entry.rootUri().equals(rootUri)) {
-                listener.onResponse(new LanceNamespaceUpdateResponse(true, false));
-                return;
-            }
-        }
-        // Route through the cluster manager: any non-manager node
-        // that tries to submitStateUpdateTask directly gets
-        // NotClusterManagerException. TransportClusterManagerNodeAction
-        // handles the forwarding, retries, and acknowledgement.
-        client.execute(LanceNamespaceUpdateAction.INSTANCE, LanceNamespaceUpdateRequest.register(rootUri, storageOptions), listener);
-    }
-
     public List<String> namespaces() {
         LanceNamespaceMetadata metadata = currentMetadata(clusterService.state());
         List<String> uris = new ArrayList<>(metadata.entries().size());
@@ -290,25 +263,6 @@ public final class LanceNamespaceService {
         ListTablesResponse response = directory.listTables(new ListTablesRequest());
         java.util.Set<String> tables = response.getTables();
         return java.util.Optional.of(tables == null ? java.util.Collections.emptySet() : tables);
-    }
-
-    /**
-     * Stops polling a previously-registered namespace. Surfaced indexes are
-     * left in place — the operator can delete them separately if they want
-     * the tables to disappear. The response's {@code changed} flag is true
-     * if a registration matched, false if the URI was not registered.
-     *
-     * <p>Asynchronous for the same reason as
-     * {@link #register(String, StorageOptions, ActionListener)}.
-     */
-    public void unregister(String rootUri, ActionListener<LanceNamespaceUpdateResponse> listener) {
-        // Do not skip the manager round-trip based on the local
-        // node's cluster state: the local view can lag behind
-        // recent registrations from another node or from this node
-        // if the applier has not yet run. The manager returns a
-        // response with a "changed" flag so we can 404 a REST
-        // caller trying to unregister a path the cluster never had.
-        client.execute(LanceNamespaceUpdateAction.INSTANCE, LanceNamespaceUpdateRequest.unregister(rootUri), listener);
     }
 
     private void poll() {

@@ -25,13 +25,19 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.mapper.Mapper;
 import org.opensearch.indices.breaker.BreakerSettings;
+import org.opensearch.lance.attach.LanceAttachAction;
+import org.opensearch.lance.attach.TransportLanceAttachAction;
 import org.opensearch.lance.dispatch.LanceDispatchActionFilter;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.engine.LanceEngineFactory;
+import org.opensearch.lance.index.LanceBuildIndexesAction;
+import org.opensearch.lance.index.TransportLanceBuildIndexesAction;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
 import org.opensearch.lance.mapper.LanceVectorFieldMapper;
 import org.opensearch.lance.namespace.AllowedTableRoots;
+import org.opensearch.lance.namespace.LanceNamespaceListAction;
 import org.opensearch.lance.namespace.LanceNamespaceService;
+import org.opensearch.lance.namespace.TransportLanceNamespaceListAction;
 import org.opensearch.lance.query.LanceFtsBoolQueryBuilder;
 import org.opensearch.lance.query.LanceFtsBoostQueryBuilder;
 import org.opensearch.lance.query.LanceKnnQueryBuilder;
@@ -468,7 +474,9 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // period at runtime without a rolling restart.
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(NAMESPACE_RESURFACE_GRACE_SETTING, namespaceService::setResurfaceGrace);
-        return List.of(namespaceService);
+        // Both components are injected into the plugin's transport
+        // actions (attach, build_indexes, namespace list / update).
+        return List.of(namespaceService, allowedTableRoots);
     }
 
     /**
@@ -569,6 +577,15 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             new org.opensearch.plugins.ActionPlugin.ActionHandler<>(
                 org.opensearch.lance.namespace.LanceNamespaceUpdateAction.INSTANCE,
                 org.opensearch.lance.namespace.TransportLanceNamespaceUpdateAction.class
+            ),
+            new org.opensearch.plugins.ActionPlugin.ActionHandler<>(
+                LanceNamespaceListAction.INSTANCE,
+                TransportLanceNamespaceListAction.class
+            ),
+            new org.opensearch.plugins.ActionPlugin.ActionHandler<>(LanceAttachAction.INSTANCE, TransportLanceAttachAction.class),
+            new org.opensearch.plugins.ActionPlugin.ActionHandler<>(
+                LanceBuildIndexesAction.INSTANCE,
+                TransportLanceBuildIndexesAction.class
             )
         );
     }
@@ -610,10 +627,6 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<DiscoveryNodes> nodesInCluster
     ) {
-        return List.of(
-            new RestAttachAction(threadPool, allowedTableRoots, namespaceService),
-            new RestNamespaceAction(namespaceService, allowedTableRoots),
-            new RestBuildIndexesAction(threadPool)
-        );
+        return List.of(new RestAttachAction(), new RestNamespaceAction(), new RestBuildIndexesAction());
     }
 }
