@@ -13,7 +13,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.Function;
 
@@ -32,9 +31,6 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
-import org.opensearch.cluster.routing.IndexRoutingTable;
-import org.opensearch.cluster.routing.IndexShardRoutingTable;
-import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.util.BigArrays;
@@ -66,9 +62,13 @@ import org.opensearch.transport.TransportService;
  * {@link SearchRequest} the {@link LanceDispatchActionFilter}
  * already decided is fragment-dispatchable, resolves the target
  * indexes and query metadata, enumerates fragments through the
- * shared {@link LanceRegistry}, groups them round-robin across the
- * data nodes that hold a started copy of the index's shard, and fans
- * requests out via {@link LanceFragmentQueryAction}. Once every
+ * shared {@link LanceRegistry}, groups them round-robin across every
+ * data node in cluster state (sorted by node id), and fans
+ * requests out via {@link LanceFragmentQueryAction}. The executor
+ * builds its query context from cluster state alone, so a node needs
+ * no shard copy of the index to take a share; the plugin has to be
+ * installed on every data node, which OpenSearch expects of plugins
+ * anyway. Once every
  * per-node response arrives, it merges the per-node hit lists by the
  * request's sort (or by score) and the per-node
  * {@link InternalAggregations} through the stock reduce into a
@@ -262,7 +262,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // Empty table + aggregations requested: the coordinator
             // still needs an aggregations block in the response
             // (matching shard path behaviour for an empty index).
-            // Send a single fan-out to the first shard host with an
+            // Send a single fan-out to the first data node with an
             // empty fragment set. The per-node executor opens a
             // LanceDirectoryReader with zero leaves, runs the
             // aggregators over zero docs, and returns an empty
@@ -270,16 +270,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // via topLevelReduce. Same wire format as any other
             // fan-out; the only novel case is the reader being
             // shaped to maxDoc=0.
-            List<DiscoveryNode> hosts = nodeListForTarget(target, nodeList);
-            if (hosts.isEmpty()) {
-                done.onResponse(null);
-                return;
-            }
-            dispatchEmptyAggregationRun(target, hosts.get(0), spec, merged, done);
+            dispatchEmptyAggregationRun(target, nodeList.get(0), spec, merged, done);
             return;
         }
 
-        Map<DiscoveryNode, List<Integer>> perNode = groupFragmentsByNode(allFragmentIds, nodeListForTarget(target, nodeList));
+        Map<DiscoveryNode, List<Integer>> perNode = groupFragmentsByNode(allFragmentIds, nodeList);
         int fanOutSize = perNode.size();
 
         // Responses land in the slot of the node they came from, so
@@ -452,71 +447,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             result.computeIfAbsent(node, k -> new ArrayList<>()).add(fragmentIds.get(i));
         }
         return result;
-    }
-
-    /**
-     * Return the data nodes that hold a started copy (primary or
-     * replica) of the target index's shard, sorted by node id.
-     *
-     * <p>The fragment path drives OpenSearch's aggregator machinery
-     * through {@link org.opensearch.index.shard.IndexShard} so the
-     * receiving node must have the index initialised in its
-     * {@link org.opensearch.indices.IndicesService}. A node without a
-     * started shard has no IndexService yet
-     * ({@code IndicesService.indexServiceSafe} throws
-     * {@code IndexNotFoundException}), so the fragment query would
-     * fail there.
-     *
-     * <p>Lance-backed indices are single-shard and are created with
-     * {@code auto_expand_replicas: 0-all}, so once the copies have
-     * recovered every data node hosts one and takes a round-robin
-     * share of the fragments; on a single data node the fan-out
-     * collapses to that node. A replica copy is not a copy of the
-     * data: Lance fragments live in external storage and any node can
-     * open any fragment through
-     * {@link org.opensearch.lance.LanceRegistry#openDataset}; the
-     * copy only gives the node a reader and a
-     * {@code QueryShardContext} for the index. Copies still
-     * initialising are skipped, so the spread grows as recovery
-     * completes.
-     *
-     * <p>If cluster state has no {@link IndexRoutingTable} for the
-     * index yet (very early in create-index handling) or no copy is
-     * {@link ShardRouting#started()}, fall back to the caller's full
-     * node list. The receiving node then surfaces a clear
-     * {@code IndexNotFoundException} in that rare case.
-     */
-    private List<DiscoveryNode> nodeListForTarget(IndexTarget target, List<DiscoveryNode> fullList) {
-        IndexMetadata indexMetadata = clusterService.state().metadata().index(target.indexName());
-        if (indexMetadata == null) {
-            return fullList;
-        }
-        IndexRoutingTable routingTable = clusterService.state().routingTable().index(indexMetadata.getIndex());
-        if (routingTable == null) {
-            return fullList;
-        }
-        TreeSet<String> startedNodeIds = new TreeSet<>();
-        for (IndexShardRoutingTable shardTable : routingTable) {
-            for (ShardRouting copy : shardTable) {
-                if (copy.started() && copy.currentNodeId() != null) {
-                    startedNodeIds.add(copy.currentNodeId());
-                }
-            }
-        }
-        if (startedNodeIds.isEmpty()) {
-            return fullList;
-        }
-        List<DiscoveryNode> hosts = new ArrayList<>(startedNodeIds.size());
-        for (DiscoveryNode node : fullList) {
-            if (startedNodeIds.contains(node.getId())) {
-                hosts.add(node);
-            }
-        }
-        if (hosts.isEmpty()) {
-            return fullList;
-        }
-        hosts.sort(Comparator.comparing(DiscoveryNode::getId));
-        return hosts;
     }
 
     /**
