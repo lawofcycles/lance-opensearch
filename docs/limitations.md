@@ -69,6 +69,14 @@ OpenSearch's stock `match` and `match_phrase` queries against a `lance_text` fie
 - Automatic index builds happen only for tables at or under `lance.builder.max_rows` (default 1,000,000). Larger tables need `POST /_lance/build_indexes/{index}` explicitly, or a Lance-side build (Python `dataset.create_index`, Ray, Spark, Java SDK). Indexes built by the plugin still block subsequent `alter_columns` on the indexed column, so drop the index before altering the type.
 - If an OpenSearch index already exists under the same name as a surfaced Lance table, the plugin logs one warning and leaves the table alone on every subsequent poll. Rename, delete, or attach explicitly to resolve.
 
+## Stats and monitoring APIs
+
+`_cat/indices`, `_cat/shards`, `{index}/_stats`, `_nodes/stats/indices`, and `_cluster/stats` report a Lance-backed index as follows.
+
+- `docs.count` and `docs.deleted` are the Lance row count and deletion count of the manifest version the shard currently serves (they advance on refresh, so a Lance write shows up after the next poll or an explicit `_refresh`). `_cluster/health` reports green for the single primary shard; it turns red only when the shard fails to open the table (unreachable path, missing credentials, dropped table), because there is no replica to fall back to.
+- `store.size`, `pri.store.size`, and `store.size_in_bytes` are the size of the shard's Lucene directory, which holds only the bootstrap commit (a few hundred bytes), not the Lance data. OpenSearch computes the store size from the shard directory and offers no engine-level override. The manifest-recorded data file total is available internally as `DocsStats.totalSizeInBytes` (used by `_rollover` size conditions); data files written without a `file_size_bytes` manifest entry contribute zero to that total, and Lance index files (`Index.getSizeBytes()`) are not included anywhere.
+- Segment fields (`segments.count`, `segments.memory`, the per-shard list in `_segments`) and the write-side groups `indexing`, `merges`, `flush`, `translog.operations`, `warmer`, and `recovery` are always 0 or empty. There are no Lucene segments and no OpenSearch-side writes; the values are not synthesised from Lance metadata. `refresh.total` also stays 0: Lance version advances swap the reader without going through the shard's refresh listeners, and `search.*` stays 0 because `_search` is answered by the fragment path, not the shard.
+
 ## Reader memory profile
 
 - Each Lance fragment leaf loads columns lazily. The reader constructor only performs a schema pass; a fragment that carries a deletion file additionally runs a `_rowaddr`-only scan to learn which physical rows are live. Every scalar column moves from "declared" to "loaded" the first time a Lucene accessor (doc values, sort, aggregation) asks for it, then stays in heap for the fragment's lifetime.
