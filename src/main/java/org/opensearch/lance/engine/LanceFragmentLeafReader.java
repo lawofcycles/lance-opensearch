@@ -851,9 +851,14 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * asks their {@code ScorerSupplier} for a {@code BulkScorer}, which
      * only the collection driver of a leaf (the searcher itself, or a
      * boolean parent whose other clauses can only narrow the doc set)
-     * does. Only ordinal-based doc values depend on the flag; numeric
-     * doc values verify the hint per doc and fall back to the full
-     * column when a doc outside it is requested.
+     * does. The fragment executor passes {@code true} ahead of
+     * collection, through {@code LanceHintingWeight.hintExclusive},
+     * when it knows from the request shape that the Lance clause is the
+     * top-level query, so that aggregators and sort comparators built
+     * afterwards already see the hint. Only ordinal-based doc values
+     * depend on the flag; numeric doc values verify the hint per doc
+     * and fall back to the full column when a doc outside it is
+     * requested.
      *
      * <p>The hint is request-scoped state on a reader that today lives
      * for one request. A reader kept across requests must not carry a

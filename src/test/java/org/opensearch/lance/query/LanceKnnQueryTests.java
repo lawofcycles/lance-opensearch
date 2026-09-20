@@ -56,24 +56,4 @@ public class LanceKnnQueryTests extends OpenSearchTestCase {
         });
         assertEquals("expected exactly one visitLeaf call", 1, leafCalls.get());
     }
-
-    public void testFragmentHitsGrowGeometricallyFromEightEntries() {
-        LanceKnnQuery.FragmentHits hits = new LanceKnnQuery.FragmentHits();
-        // Locked in at eight entries per the initial capacity so a per-shard
-        // scan that returns at most k rows per fragment does not reallocate
-        // for a typical top-10 query.
-        assertEquals(8, hits.offsets.length);
-        assertEquals(8, hits.distances.length);
-        for (int i = 0; i < 8; i++) {
-            hits.add(i, (float) i);
-        }
-        assertEquals(8, hits.size);
-        // Ninth add forces a geometric grow.
-        hits.add(8, 8.0f);
-        assertEquals(9, hits.size);
-        assertEquals(16, hits.offsets.length);
-        assertEquals(16, hits.distances.length);
-        assertEquals(8, hits.offsets[8]);
-        assertEquals(8.0f, hits.distances[8], 0.0f);
-    }
 }

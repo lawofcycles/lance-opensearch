@@ -76,7 +76,9 @@ import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceFtsQueryBuilder;
+import org.opensearch.lance.query.LanceHintingWeight;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
+import org.opensearch.lance.query.LanceKnnQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.search.SearchHit;
@@ -552,26 +554,31 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // count and hits.total.value would collapse to
                 // `size`.
                 Query countQuery = withoutScanLimit(hitsQuery);
-                SortAndFormats sortAndFormats = resolveSort(request, qsc);
 
-                // A bare LanceFtsQuery (pure FTS shape, or a bool
-                // collapsed into one with a SQL prefilter, and no
-                // post_filter so hitsQuery is the same instance as
-                // query) gets one Weight for the whole request. Its
-                // shard-level Lance scan then runs once and serves the
-                // hits phase, the aggregators and, through
-                // LanceFtsWeight.hitCount, the match count. Letting
-                // each phase build its own Weight through the Query
-                // API would repeat the scan per phase. Skipped under a
-                // reader wrapper: the count has to go through the
-                // searcher there so DLS liveDocs apply.
+                // A bare Lance clause at the top level (LanceFtsQuery,
+                // possibly a bool collapsed into one with a SQL
+                // prefilter, or LanceKnnQuery) gets one Weight for the
+                // whole request, created before the sort comparators
+                // and aggregators exist. Its shard-level Lance scan then
+                // runs once and serves the hits phase, the aggregators
+                // and, for FTS through LanceFtsWeight.hitCount, the
+                // match count. Letting each phase build its own Weight
+                // through the Query API would repeat the scan per phase.
+                // Skipped under a reader wrapper: the count has to go
+                // through the searcher there so DLS liveDocs apply, and
+                // the hint below must not be marked exclusive.
+                Weight lanceWeight = null;
                 LanceFtsQuery.LanceFtsWeight ftsWeight = null;
-                if (!hasSecurityWrapper && hitsQuery instanceof LanceFtsQuery fts) {
-                    Weight weight = searcher.createWeight(searcher.rewrite(fts), ScoreMode.COMPLETE, 1f);
-                    if (weight instanceof LanceFtsQuery.LanceFtsWeight lanceFtsWeight) {
+                if (!hasSecurityWrapper && (query instanceof LanceFtsQuery || query instanceof LanceKnnQuery)) {
+                    lanceWeight = searcher.createWeight(searcher.rewrite(query), ScoreMode.COMPLETE, 1f);
+                    if (lanceWeight instanceof LanceFtsQuery.LanceFtsWeight lanceFtsWeight) {
                         ftsWeight = lanceFtsWeight;
                     }
+                    if (lanceWeight instanceof LanceHintingWeight hinting && hintsHelpBeforeScoring(request)) {
+                        hintLeavesExclusive(hinting, searcher.getIndexReader().leaves());
+                    }
                 }
+                SortAndFormats sortAndFormats = resolveSort(request, qsc);
 
                 // Aggregations run over the top-level query only —
                 // OpenSearch semantics for post_filter say the
@@ -600,17 +607,21 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         effectiveFragmentIds
                     );
                 } else {
+                    // The shared Weight drives the hits phase only when
+                    // hitsQuery is the very query it was created for;
+                    // with a post_filter the hits query is a conjunction
+                    // Lucene has to build its own Weight for.
                     hits = scanHitsViaIndexSearcher(
                         searcher,
                         hitsQuery,
-                        ftsWeight,
+                        hitsQuery == query ? lanceWeight : null,
                         sortAndFormats,
                         request.searchAfter(),
                         request.size(),
                         request.trackScores()
                     );
                 }
-                InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query, ftsWeight);
+                InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query, lanceWeight);
                 MatchedCount matched = computeMatched(dataset, request, searcher, countQuery, hasSecurityWrapper, ftsWeight);
                 return new LanceFragmentQueryResponse(matched.value(), matched.lowerBound(), fragmentCount, hits, aggregations);
             }
@@ -918,6 +929,59 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
+     * Whether the request reads doc values before Lucene has scored a
+     * single doc, so that a hit set delivered to the fragment readers
+     * ahead of collection changes what those reads load.
+     *
+     * <p>Two consumers read keyword ordinals that early: OpenSearch's
+     * {@code TermsAggregatorFactory} builds the global ordinal map
+     * from every leaf's {@code SortedSetDocValues} while the
+     * aggregators are created, and {@code BytesRefFieldComparatorSource}
+     * reads the value count while the leaf comparator is created.
+     * Without a hint at that point both load the full dictionary of
+     * every fragment; with an exclusive hint they build it from the
+     * hit rows. So the early hint pays off when the request carries
+     * aggregations, or a sort that a hits page will actually use.
+     *
+     * <p>Every other shape is left alone on purpose. A page clipped to
+     * {@code size} ({@link #resolveScanFilterTopK} returned a bound)
+     * carries the top {@code size} rows of the scan, which is a
+     * different set from the rows a sort or aggregation would visit,
+     * and nothing reads doc values before scoring there anyway. A
+     * count-only request ({@code size: 0} without aggregations, with
+     * or without post_filter) reads no doc values at all, and running
+     * the materialising scan for it would replace the cheaper bounded
+     * count scan {@link #computeMatched} uses.
+     */
+    private boolean hintsHelpBeforeScoring(LanceFragmentQueryRequest request) {
+        if (resolveScanFilterTopK(request) != LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED) {
+            return false;
+        }
+        boolean hasAggregations = request.aggregations() != null && !request.aggregations().getAggregatorFactories().isEmpty();
+        boolean sortsAPage = request.size() > 0 && !request.sorts().isEmpty();
+        return hasAggregations || sortsAPage;
+    }
+
+    /**
+     * Deliver the Weight's per-leaf hit set to every fragment reader as
+     * an exclusive hint (see {@link LanceHintingWeight#hintExclusive}).
+     * Called only when the top-level query is the bare Lance clause the
+     * Weight belongs to and no reader wrapper is installed, which is
+     * the executor's proof that nothing but this Weight's hits will be
+     * collected on any leaf: the aggregators run over that query alone,
+     * and the hits phase runs it either alone or as the required clause
+     * of a conjunction with {@code post_filter}, which can only drop
+     * docs from the hit set. The first call runs the Lance scan; the
+     * hits and aggregation phases then reuse it through the same
+     * Weight.
+     */
+    private static void hintLeavesExclusive(LanceHintingWeight weight, List<LeafReaderContext> leaves) throws IOException {
+        for (LeafReaderContext ctx : leaves) {
+            weight.hintExclusive(ctx);
+        }
+    }
+
+    /**
      * Translate the request's sort clauses (native
      * {@link org.opensearch.search.sort.SortBuilder} shape) into an
      * OpenSearch {@link SortAndFormats}
@@ -991,9 +1055,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * {@code numHits} cap and the total-hits threshold are the ones
      * the stock {@code search} / {@code searchAfter} overloads build
      * internally, so the returned page is the same either way. The
-     * caller passes a Weight only for a bare {@link LanceFtsQuery}
-     * so that its Lance scan is shared with the aggregators and the
-     * match count.
+     * caller passes a Weight only for a bare {@link LanceFtsQuery} or
+     * {@link LanceKnnQuery} so that its Lance scan is shared with the
+     * aggregators and, for FTS, the match count.
      */
     private List<SearchHit> scanHitsViaIndexSearcher(
         LanceFragmentIndexSearcher searcher,

@@ -26,6 +26,8 @@ import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.Collector;
+import org.apache.lucene.search.CollectorManager;
 import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
@@ -34,6 +36,7 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
+import org.apache.lucene.search.TopFieldCollectorManager;
 import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.ByteBuffersDirectory;
@@ -46,6 +49,7 @@ import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.query.LanceFtsQuery;
+import org.opensearch.lance.query.LanceHintingWeight;
 import org.opensearch.lance.query.LanceKnnQuery;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -593,6 +597,145 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
                 assertTrue(leaf.hintExclusive());
                 assertTrue(leaf.isServingSparse("category"));
             }
+        }
+    }
+
+    public void testEarlyExclusiveHintServesKeywordOrdinalsBeforeCollection() throws Exception {
+        // The fragment executor creates the Weight of a bare Lance
+        // clause first and hints every leaf exclusively through it,
+        // then builds aggregators and comparators. A keyword terms
+        // aggregation reads every leaf's value count while it is
+        // created (TermsAggregatorFactory.getMaxOrd) and a keyword sort
+        // reads the bottom term on every later leaf while the leaf
+        // comparator is created; both happen before any scorer exists.
+        // Under the early hint those reads see the sparse dictionary.
+        WeightSearcher searcher = new WeightSearcher(reader);
+        Weight weight = searcher.createWeight(new LanceFtsQuery("body", "grp7"), ScoreMode.COMPLETE, 1f);
+        assertTrue(weight instanceof LanceHintingWeight);
+        for (LeafReaderContext ctx : reader.leaves()) {
+            ((LanceHintingWeight) weight).hintExclusive(ctx);
+        }
+        List<int[]> hinted = new ArrayList<>();
+        for (int f = 0; f < FRAGMENTS; f++) {
+            LanceFragmentLeafReader leaf = leaves.get(f);
+            assertTrue(leaf.hintExclusive());
+            assertEquals(8, leaf.hintedOffsets().length);
+            hinted.add(leaf.hintedOffsets());
+            // What getMaxOrd does before collection: read the value count.
+            SortedSetDocValues values = leaf.getSortedSetDocValues("category");
+            // grp7 rows are i % 25 == 7 (8 per fragment); category is
+            // null for i % 4 == 3, else "c" + (i % 3).
+            TreeSet<String> distinct = new TreeSet<>();
+            for (int offset : leaf.hintedOffsets()) {
+                String category = category(rowId(f, offset));
+                if (category != null) {
+                    distinct.add(category);
+                }
+            }
+            assertEquals("fragment " + f, distinct.size(), values.getValueCount());
+            assertTrue("fragment " + f, leaf.isServingSparse("category"));
+            assertFalse("fragment " + f, leaf.isColumnFullyLoaded("category"));
+        }
+
+        // A keyword sort with a page smaller than one fragment's hits,
+        // driven through the same Weight: the later leaves' comparators
+        // look the bottom term up in the sparse dictionary now (without
+        // the early hint they would have loaded the full one, see
+        // testKeywordSortLoadsTheFullDictionaryOnLeavesVisitedWithAFullQueue).
+        List<Integer> expected = new ArrayList<>();
+        for (int i = 0; i < FRAGMENTS * ROWS_PER_FRAGMENT; i++) {
+            if (i % 25 == 7) {
+                expected.add(i);
+            }
+        }
+        expected.sort(Comparator.comparing((Integer i) -> category(i) == null ? "" : category(i)).thenComparing(i -> i));
+        Sort byCategory = new Sort(new SortField("category", SortField.Type.STRING));
+        TopFieldDocs docs = searcher.search(weight, new TopFieldCollectorManager(byCategory, 5, null, 1000));
+        assertEquals(expected.subList(0, 5), globalIds(docs.scoreDocs));
+        for (int f = 0; f < FRAGMENTS; f++) {
+            LanceFragmentLeafReader leaf = leaves.get(f);
+            assertSame("the scorer handed the reader the array it was hinted with", hinted.get(f), leaf.hintedOffsets());
+            assertTrue(leaf.hintExclusive());
+            assertTrue("fragment " + f, leaf.isServingSparse("category"));
+            assertFalse("fragment " + f, leaf.isColumnFullyLoaded("category"));
+        }
+        // The same Weight serves a second collection (the executor's
+        // aggregation phase after the hits phase) without touching the
+        // dictionaries again.
+        TopFieldDocs again = searcher.search(weight, new TopFieldCollectorManager(byCategory, 30, null, 1000));
+        assertEquals(expected, globalIds(again.scoreDocs));
+        for (LanceFragmentLeafReader leaf : leaves) {
+            assertFalse(leaf.isColumnFullyLoaded("category"));
+        }
+    }
+
+    public void testEarlyExclusiveHintFromTheKnnWeight() throws Exception {
+        WeightSearcher searcher = new WeightSearcher(reader);
+        float[] vector = new float[8];
+        vector[0] = 250.4f;
+        Weight weight = searcher.createWeight(new LanceKnnQuery("embedding", vector, 3), ScoreMode.COMPLETE, 1f);
+        for (LeafReaderContext ctx : reader.leaves()) {
+            ((LanceHintingWeight) weight).hintExclusive(ctx);
+        }
+        // Rows 249, 250, 251 are the three nearest, all in fragment 1.
+        assertArrayEquals(new int[] { 49, 50, 51 }, leaves.get(1).hintedOffsets());
+        assertTrue(leaves.get(1).hintExclusive());
+        assertEquals(0, leaves.get(0).hintedOffsets().length);
+        assertTrue(leaves.get(0).hintExclusive());
+        assertEquals(0, leaves.get(2).hintedOffsets().length);
+        assertTrue(leaves.get(2).hintExclusive());
+        // 249 -> c0, 250 -> c1, 251 -> null.
+        assertEquals(2L, leaves.get(1).getSortedSetDocValues("category").getValueCount());
+        assertEquals(0L, leaves.get(0).getSortedSetDocValues("category").getValueCount());
+        assertEquals(0L, leaves.get(2).getSortedSetDocValues("category").getValueCount());
+        for (LanceFragmentLeafReader leaf : leaves) {
+            assertTrue(leaf.isServingSparse("category"));
+            assertFalse(leaf.isColumnFullyLoaded("category"));
+        }
+        TopFieldDocs docs = searcher.search(
+            weight,
+            new TopFieldCollectorManager(new Sort(new SortField("category", SortField.Type.STRING)), 10, null, 1000)
+        );
+        // Missing terms sort first: 251 (null), then 249 (c0), 250 (c1).
+        assertEquals(List.of(251, 249, 250), globalIds(docs.scoreDocs));
+        for (LanceFragmentLeafReader leaf : leaves) {
+            assertFalse(leaf.isColumnFullyLoaded("category"));
+        }
+    }
+
+    public void testEarlyHintUnderAForeignWrapperIsDeliveredButNotExclusive() throws Exception {
+        try (DirectoryReader wrapped = new ForeignWrapper(reader)) {
+            IndexSearcher searcher = new IndexSearcher(wrapped);
+            Weight weight = searcher.createWeight(new LanceFtsQuery("body", "grp7"), ScoreMode.COMPLETE, 1f);
+            for (LeafReaderContext ctx : wrapped.leaves()) {
+                ((LanceHintingWeight) weight).hintExclusive(ctx);
+            }
+            for (LanceFragmentLeafReader leaf : leaves) {
+                assertEquals(8, leaf.hintedOffsets().length);
+                assertFalse(leaf.hintExclusive());
+                assertEquals("full dictionary of the fragment", 3L, leaf.getSortedSetDocValues("category").getValueCount());
+                assertFalse(leaf.isServingSparse("category"));
+            }
+        }
+    }
+
+    /**
+     * {@link IndexSearcher} that runs a caller-built {@link Weight}
+     * through a {@link CollectorManager}, the way the fragment executor
+     * drives its phases off the one Weight it created up front.
+     */
+    private static final class WeightSearcher extends IndexSearcher {
+        WeightSearcher(DirectoryReader reader) {
+            super(reader);
+        }
+
+        <C extends Collector, T> T search(Weight weight, CollectorManager<C, T> manager) throws IOException {
+            C collector = manager.newCollector();
+            LeafReaderContextPartition[] partitions = getLeafContexts().stream()
+                .map(LeafReaderContextPartition::createForEntireSegment)
+                .toArray(LeafReaderContextPartition[]::new);
+            search(partitions, weight, collector);
+            return manager.reduce(Collections.singletonList(collector));
         }
     }
 
