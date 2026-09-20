@@ -502,7 +502,9 @@ curl -sS localhost:9200/_lance/stats?pretty
         "hits" : 120,
         "loads" : 12,
         "evictions" : 0,
-        "budget_misses" : 0
+        "budget_misses" : 0,
+        "heap_fallback_bytes" : 0,
+        "heap_fallback_rejections" : 0
       },
       "native_memory" : {
         "estimated_bytes" : 1258291200,
@@ -524,7 +526,7 @@ How to read it:
 
 - `snapshots.count` is normally the number of Lance-backed shards on the node (each shard reader holds its version's snapshot) plus any version a request is still reading. It grows by one when a table advances and the poll has not refreshed the shard yet, and comes back down when the poll retires the old version. A `retired` value that stays above zero means a reader of an old version has not closed.
 - `snapshot_build_count` and `dataset_open_count` should stop growing once every table version in use has been seen; `snapshot_hit_count` grows with every `_search`. Builds that keep growing on a table that is not changing mean requests are not finding the cached version.
-- `column_store.bytes` against `limit_bytes` tells you how much of `lance.cache.column_share` is in use. `loads` grows on the first request that reads a column of a fragment, `hits` on every later one. `budget_misses` above zero means requests fell back to heap loads because the store was full; raise `lance.cache.column_share` or `lance.native_memory.limit`, or reduce the number of columns aggregated or sorted on.
+- `column_store.bytes` against `limit_bytes` tells you how much of `lance.cache.column_share` is in use. `loads` grows on the first request that reads a column of a fragment, `hits` on every later one. `budget_misses` above zero means requests fell back to heap loads because the store was full; raise `lance.cache.column_share` or `lance.native_memory.limit`, or reduce the number of columns aggregated or sorted on. `heap_fallback_bytes` is the heap those loads currently hold on the request circuit breaker, and `heap_fallback_rejections` counts the loads the breaker refused (HTTP 429 to the client); a rising rejection count means the columns that miss the store are too large for `indices.breaker.request.limit` on this node.
 - `native_memory.estimated_bytes` is what the breaker enforces against `lance.native_memory.limit`; it lags `session_bytes + column_store_bytes` by at most one `lance.native_memory.circuit_breaker.poll_interval`. Compare it with the process RSS to see how much of the native footprint the plugin accounts for.
 - `native_memory.index_cache_capacity`, `index_cache_shards` and `index_cache_shard_share` are the index cache the plugin handed Lance at startup and the shard layout Lance derives from it (see "Cap Lance's native memory footprint"). `index_cache_shard_share` is the heaviest entry the cache admits; a table whose inverted index is heavier than it (about 52 bytes per row per full-text column) is reloaded on every full-text query.
 
