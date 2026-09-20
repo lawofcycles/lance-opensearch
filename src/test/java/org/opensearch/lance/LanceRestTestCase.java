@@ -138,6 +138,16 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
         return sharedRoot().resolve("lance-it-" + label + "-" + randomAlphaOfLength(8)).toString();
     }
 
+    /**
+     * Directory the test clusters accept as an {@code fs} snapshot
+     * repository location. {@code build.gradle} sets {@code path.repo} to
+     * the sibling of the shared tables directory, so the same path is
+     * derived here from {@code tests.lance.shared_tables_dir}.
+     */
+    static Path repoRoot() {
+        return sharedRoot().resolveSibling("shared-repo");
+    }
+
     static int countOccurrences(String haystack, String needle) {
         int count = 0;
         int i = 0;
