@@ -5,9 +5,14 @@
 
 package org.opensearch.lance;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.stream.Stream;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -24,7 +29,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         // Metric aggregations (value_count, sum, avg, min, max) and a
         // terms bucket aggregation on the fragment dispatch path, alone
         // and combined with a filter query or with hits.
-        String suffix = "aggs-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "aggs-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -99,7 +104,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         // aggregations through Aggregator#getPostCollectionAggregation,
         // as the shard path does, rather than replaying post-collection
         // itself. depth_first is included so both modes stay covered.
-        String suffix = "tds-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "tds-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -169,7 +174,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         // still equal the unfiltered aggregation restricted to the
         // matching rows, for numeric doc values and for the keyword
         // ordinal dictionary alike.
-        String suffix = "fcpc-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "fcpc-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         // id 0..5; body alternates "hello lance i" and "quick brown fox i".
@@ -259,7 +264,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         // An empty table still returns an aggregations block: the
         // coordinator dispatches to the primary even with no fragments
         // so the aggregator produces an empty tree to reduce.
-        String suffix = "s3-empty-agg-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "s3-empty-agg-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 0);
@@ -349,7 +354,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                     + "\"sort\":[{\"rating\":\"desc\"},{\"id\":\"asc\"}]}" };
 
             // Warm: every shape twice against the cache.
-            java.util.List<String> first = new java.util.ArrayList<>();
+            List<String> first = new ArrayList<>();
             for (String shape : shapes) {
                 first.add(withoutTook(readAll(postJson("/" + index + "/_search", shape))));
             }
@@ -400,5 +405,223 @@ public class LanceAggregationIT extends LanceRestTestCase {
     /** Response body with the {@code took} field removed so two runs compare on content. */
     private static String withoutTook(String body) {
         return body.replaceFirst("\"took\":\\d+,", "");
+    }
+
+    public void testSubstraitPushdownAnswersLikeTheAggregators() throws Exception {
+        // Every size 0 shape the Substrait pushdown accepts, answered
+        // once with lance.aggregation.pushdown on (the default) and once
+        // with it off (Lucene aggregators over the fragment readers);
+        // the two response bodies have to be identical, hits.total and
+        // the terms error / other counts included. The hint fixture has
+        // 3 fragments of 200 rows with nullable rating (int), flag (bool),
+        // category (keyword), tags (keyword list) and an FTS body.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "pushdown-agree")) {
+            String index = fixture.indexName();
+            String[] shapes = new String[] {
+                // metrics only, with and without a filter
+                "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}},\"a\":{\"avg\":{\"field\":\"rating\"}},"
+                    + "\"m\":{\"min\":{\"field\":\"rating\"}},\"M\":{\"max\":{\"field\":\"rating\"}},\"c\":{\"value_count\":{\"field\":\"rating\"}}}}",
+                "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}",
+                "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":500}}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}},\"c\":{\"value_count\":{\"field\":\"id\"}}}}",
+                "{\"size\":0,\"query\":{\"term\":{\"flag\":true}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}},\"f\":{\"sum\":{\"field\":\"flag\"}}}}",
+                "{\"size\":0,\"aggs\":{\"k\":{\"value_count\":{\"field\":\"category\"}}}}",
+                "{\"size\":0,\"aggs\":{\"fm\":{\"max\":{\"field\":\"flag\"}},\"fa\":{\"avg\":{\"field\":\"flag\"}}}}",
+                // terms: keyword, integer, boolean, small size (shard_size
+                // cuts the groups, so sum_other_doc_count and the error
+                // bound matter), _key orders, sub-metrics
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"size\":2}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"order\":{\"_key\":\"desc\"}}}}}",
+                "{\"size\":0,\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":20}}}}",
+                "{\"size\":0,\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":3,\"shard_size\":5}}}}",
+                "{\"size\":0,\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":5,\"order\":{\"_key\":\"asc\"}}}}}",
+                "{\"size\":0,\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":5,\"show_term_doc_count_error\":true}}}}",
+                "{\"size\":0,\"aggs\":{\"f\":{\"terms\":{\"field\":\"flag\"}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"a\":{\"avg\":{\"field\":\"rating\"}},"
+                    + "\"s\":{\"sum\":{\"field\":\"rating\"}},\"m\":{\"min\":{\"field\":\"rating\"}},\"M\":{\"max\":{\"field\":\"rating\"}},\"n\":{\"value_count\":{\"field\":\"rating\"}}}}}}",
+                "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":500}}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
+                "{\"size\":0,\"query\":{\"term\":{\"category\":\"c1\"}},\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":4}}}}",
+                "{\"size\":0,\"query\":{\"bool\":{\"filter\":[{\"term\":{\"flag\":false}},{\"range\":{\"rating\":{\"lt\":300}}}]}},"
+                    + "\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"a\":{\"avg\":{\"field\":\"rating\"}}}}}}",
+                // histogram on the integer column
+                "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":100}}}}",
+                "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":250,\"min_doc_count\":1},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}}",
+                "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":100,\"lt\":700}}},\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":150,\"keyed\":true}}}}",
+                // track_total_hits variants
+                "{\"size\":0,\"track_total_hits\":true,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
+                "{\"size\":0,\"track_total_hits\":false,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
+                "{\"size\":0,\"track_total_hits\":100,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}" };
+            String[] aggregatorShapes = new String[] {
+                // shapes outside the allow list stay on the aggregators
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"t\":{\"terms\":{\"field\":\"tags\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"tags\",\"size\":10}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"missing\":\"none\"}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"include\":\"c[01]\"}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"min_doc_count\":0}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"order\":{\"a\":\"desc\"}},\"aggs\":{\"a\":{\"avg\":{\"field\":\"rating\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":100,\"offset\":10}}}}",
+                "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":100,\"extended_bounds\":{\"min\":-200,\"max\":1200}}}}}",
+                "{\"size\":0,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}",
+                "{\"size\":0,\"query\":{\"match_all\":{}},\"post_filter\":{\"term\":{\"flag\":true}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
+                "{\"size\":2,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
+                "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\",\"missing\":0}}}}",
+                "{\"size\":0,\"aggs\":{\"u\":{\"sum\":{\"field\":\"unmapped\"}}}}",
+                // the namespace registered this fixture without multi_fields, so body.raw is unmapped
+                "{\"size\":0,\"aggs\":{\"b\":{\"terms\":{\"field\":\"body.raw\",\"size\":5}}}}" };
+            assertPushdownAgreesWithAggregators(index, shapes, aggregatorShapes);
+        }
+    }
+
+    public void testSubstraitPushdownAnswersDateHistogramLikeTheAggregators() throws Exception {
+        // The dated fixture has six rows with a timestamp[us] column and
+        // an even / odd keyword category: fixed_interval date histograms
+        // and date metrics take the pushdown, calendar_interval and
+        // time_zone stay on the aggregators. The attach adds a keyword
+        // sub-field so a terms on category.raw resolves to the base column.
+        String suffix = "pushdown-date-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeDatedTable(scratchDir, tableName);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson(
+                "/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"multi_fields\":{\"category\":{\"raw\":{\"type\":\"keyword\"}}}}"
+            );
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            String[] shapes = new String[] {
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\"}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category.raw\"},\"aggs\":{\"n\":{\"value_count\":{\"field\":\"category.raw\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"min_doc_count\":1,\"keyed\":true}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"7d\"},"
+                    + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}},\"last\":{\"max\":{\"field\":\"ts\"}}}}}}",
+                "{\"size\":0,\"query\":{\"term\":{\"category\":\"even\"}},\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\"}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"order\":{\"_key\":\"desc\"}}}}}",
+                "{\"size\":0,\"aggs\":{\"first\":{\"min\":{\"field\":\"ts\"}},\"last\":{\"max\":{\"field\":\"ts\"}},\"n\":{\"value_count\":{\"field\":\"ts\"}}}}",
+                "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"ts\",\"size\":10}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"first\":{\"min\":{\"field\":\"ts\"}}}}}}" };
+            String[] aggregatorShapes = new String[] {
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"time_zone\":\"+09:00\"}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"offset\":\"1d\"}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\","
+                    + "\"extended_bounds\":{\"min\":\"2023-12-01\",\"max\":\"2024-07-01\"}}}}}" };
+            assertPushdownAgreesWithAggregators(indexName, shapes, aggregatorShapes);
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testSubstraitPushdownOnEmptyTable() throws Exception {
+        String suffix = "pushdown-empty-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 0);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            String[] shapes = new String[] {
+                "{\"size\":0,\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}},\"s\":{\"sum\":{\"field\":\"id\"}},\"a\":{\"avg\":{\"field\":\"id\"}},\"c\":{\"value_count\":{\"field\":\"id\"}}}}",
+                "{\"size\":0,\"aggs\":{\"g\":{\"terms\":{\"field\":\"id\"}}}}",
+                "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"id\",\"interval\":2}}}}" };
+            assertPushdownAgreesWithAggregators(indexName, shapes, new String[0]);
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Runs every shape with {@code lance.aggregation.pushdown} on and
+     * off and asserts the two response bodies are identical apart from
+     * {@code took}. The executor logs each request the pushdown answers
+     * at DEBUG, so the node log has to gain one line per shape in
+     * {@code pushdownShapes} and none for {@code aggregatorShapes} or
+     * for the run with the setting off. Restores the settings afterwards.
+     */
+    static void assertPushdownAgreesWithAggregators(String index, String[] pushdownShapes, String[] aggregatorShapes) throws Exception {
+        Request debug = new Request("PUT", "/_cluster/settings");
+        debug.setJsonEntity("{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":\"DEBUG\"}}");
+        client().performRequest(debug);
+        try {
+            long before = pushdownLogLines(index);
+            List<String> pushed = new ArrayList<>();
+            for (String shape : pushdownShapes) {
+                pushed.add(withoutTook(readAll(postJson("/" + index + "/_search", shape))));
+            }
+            assertBusy(
+                () -> assertEquals("pushdown log lines after the pushdown shapes", before + pushdownShapes.length, pushdownLogLines(index))
+            );
+            List<String> viaAggregatorsOnly = new ArrayList<>();
+            for (String shape : aggregatorShapes) {
+                viaAggregatorsOnly.add(withoutTook(readAll(postJson("/" + index + "/_search", shape))));
+            }
+            assertEquals(
+                "shapes outside the allow list must not take the pushdown",
+                before + pushdownShapes.length,
+                pushdownLogLines(index)
+            );
+
+            Request disable = new Request("PUT", "/_cluster/settings");
+            disable.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":false}}");
+            client().performRequest(disable);
+            try {
+                for (int i = 0; i < pushdownShapes.length; i++) {
+                    String viaAggregators = withoutTook(readAll(postJson("/" + index + "/_search", pushdownShapes[i])));
+                    assertEquals("pushdown differs from the aggregators for " + pushdownShapes[i], viaAggregators, pushed.get(i));
+                }
+                for (int i = 0; i < aggregatorShapes.length; i++) {
+                    String again = withoutTook(readAll(postJson("/" + index + "/_search", aggregatorShapes[i])));
+                    assertEquals(
+                        "aggregator shape differs with the setting off for " + aggregatorShapes[i],
+                        viaAggregatorsOnly.get(i),
+                        again
+                    );
+                }
+                assertEquals("the setting off must not take the pushdown", before + pushdownShapes.length, pushdownLogLines(index));
+            } finally {
+                Request enable = new Request("PUT", "/_cluster/settings");
+                enable.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":null}}");
+                client().performRequest(enable);
+            }
+        } finally {
+            Request reset = new Request("PUT", "/_cluster/settings");
+            reset.setJsonEntity("{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":null}}");
+            client().performRequest(reset);
+        }
+    }
+
+    /**
+     * Number of executor log lines announcing a pushdown answer for
+     * {@code indexName} across the node logs under
+     * {@code build/testclusters/<task>-<n>/logs/<task>.log}, the sibling
+     * of the shared tables directory. Only the log4j file is read; the
+     * captured stdout repeats every line.
+     */
+    private static long pushdownLogLines(String indexName) throws IOException {
+        Path clustersDir = sharedRoot().resolveSibling("testclusters");
+        assertTrue("testclusters directory not found at " + clustersDir, Files.isDirectory(clustersDir));
+        String marker = "lance.dispatch: aggregation pushdown for [" + indexName + "]";
+        long count = 0;
+        try (Stream<Path> files = Files.walk(clustersDir)) {
+            for (Path file : files.filter(Files::isRegularFile).toList()) {
+                String name = file.getFileName().toString();
+                if (!name.endsWith(".log") || name.startsWith("opensearch.") || !file.getParent().getFileName().toString().equals("logs")) {
+                    continue;
+                }
+                for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+                    if (line.contains(marker)) {
+                        count++;
+                    }
+                }
+            }
+        }
+        return count;
     }
 }

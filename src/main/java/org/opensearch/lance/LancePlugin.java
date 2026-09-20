@@ -357,6 +357,24 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.Dynamic
     );
 
+    /**
+     * Whether a {@code size: 0} aggregation request whose shape the
+     * scan can compute (metrics, or one {@code terms} / {@code histogram}
+     * / fixed interval {@code date_histogram} with metric children, over
+     * a {@code match_all} or scalar filter query; see
+     * {@link org.opensearch.lance.dispatch.LanceAggregatePushdown}) runs
+     * as a Substrait group by inside the Lance scan. Off, every
+     * aggregation goes through the Lucene aggregators over the fragment
+     * leaf readers. Dynamic so the two paths can be compared without a
+     * restart.
+     */
+    public static final Setting<Boolean> AGGREGATION_PUSHDOWN_SETTING = Setting.boolSetting(
+        "lance.aggregation.pushdown",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -379,7 +397,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             CACHE_ENABLED_SETTING,
             CACHE_MAX_SNAPSHOTS_SETTING,
             CACHE_COLUMN_SHARE_SETTING,
-            FTS_SUBSET_PROBE_LIMIT_SETTING
+            FTS_SUBSET_PROBE_LIMIT_SETTING,
+            AGGREGATION_PUSHDOWN_SETTING
         );
     }
 
