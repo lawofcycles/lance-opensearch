@@ -526,24 +526,38 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // every shard on the node will share its index and metadata
         // caches instead of each shard allocating its own 6 GiB / 1 GiB
         // budget out of native memory. The column cache takes its share
-        // of the same limit first; the Session gets the rest.
+        // of the same limit first; the Session gets the rest. The index
+        // cache is not handed its whole budget: Lance shards it and
+        // refuses any entry heavier than one shard's share, so the
+        // capacity within the budget with the largest share is chosen and
+        // the difference stays unused. It is not added to the column
+        // cache, whose share is what shrank the index cache in the first
+        // place.
         String rawLimit = NATIVE_MEMORY_LIMIT_SETTING.get(environment.settings());
         long totalBytes = NativeMemoryLimit.parse(rawLimit, NATIVE_MEMORY_LIMIT_SETTING.getKey());
         double columnShare = CACHE_COLUMN_SHARE_SETTING.get(environment.settings());
         long columnCacheBytes = NativeMemoryLimit.columnCacheBytes(totalBytes, columnShare);
         long sessionBytes = NativeMemoryLimit.sessionCacheBytes(totalBytes, columnShare);
-        long indexCacheBytes = NativeMemoryLimit.indexCacheBytes(sessionBytes);
         long metadataCacheBytes = NativeMemoryLimit.metadataCacheBytes(sessionBytes);
-        LanceRegistry.initSession(indexCacheBytes, metadataCacheBytes);
+        int cpus = NativeMemoryLimit.availableCpus();
+        NativeMemoryLimit.IndexCacheSizing indexCache = NativeMemoryLimit.sizeIndexCache(
+            NativeMemoryLimit.indexCacheBudgetBytes(sessionBytes),
+            cpus
+        );
+        LanceRegistry.initSession(indexCache, metadataCacheBytes);
         LOGGER.info(
-            "installed shared Lance Session: limit [{}] -> index cache [{}], metadata cache [{}], column cache [{}] "
-                + "(from lance.native_memory.limit [{}], lance.cache.column_share [{}])",
+            "installed shared Lance Session: limit [{}] -> index cache [{}] (shards {}, share {} per shard), metadata cache [{}], "
+                + "column cache [{}], unused [{}] (from lance.native_memory.limit [{}], lance.cache.column_share [{}], {} cpus)",
             NativeMemoryLimit.humanReadable(totalBytes),
-            NativeMemoryLimit.humanReadable(indexCacheBytes),
+            NativeMemoryLimit.humanReadable(indexCache.capacityBytes()),
+            indexCache.shards(),
+            NativeMemoryLimit.humanReadable(indexCache.shardShareBytes()),
             NativeMemoryLimit.humanReadable(metadataCacheBytes),
             NativeMemoryLimit.humanReadable(columnCacheBytes),
+            NativeMemoryLimit.humanReadable(indexCache.unusedBytes()),
             rawLimit,
-            columnShare
+            columnShare,
+            cpus
         );
 
         // Node scoped snapshot and column cache for the fragment path.
@@ -562,7 +576,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LanceStatsCollector statsCollector = new LanceStatsCollector(warmCache, () -> {
             Session session = LanceRegistry.currentSession();
             return session == null || session.isClosed() ? 0L : session.sizeBytes();
-        });
+        }, LanceRegistry::indexCacheSizing);
 
         // Prime the circuit-breaker helper with the current cluster
         // settings and start the polling loop that keeps its accounting
