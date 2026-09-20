@@ -73,10 +73,12 @@ import org.opensearch.index.IndexService;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.Rewriteable;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.engine.ColumnStore;
 import org.opensearch.lance.engine.LanceDirectoryReader;
@@ -252,7 +254,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         this.bigArrays = bigArrays;
         this.circuitBreakerService = circuitBreakerService;
         this.warmCache = warmCache;
-        int permits = org.opensearch.lance.LancePlugin.FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING.get(clusterService.getSettings());
+        int permits = LancePlugin.FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING.get(clusterService.getSettings());
         this.concurrencyLimit = new java.util.concurrent.Semaphore(permits, /*fair*/ false);
     }
 
@@ -675,8 +677,38 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         request.trackScores()
                     );
                 }
-                InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query, lanceWeight);
-                MatchedCount matched = computeMatched(dataset, request, searcher, countQuery, hasSecurityWrapper, ftsWeight);
+                InternalAggregations aggregations;
+                MatchedCount matched;
+                LanceAggregatePushdown.Plan pushdown = resolveAggregatePushdown(request, hasSecurityWrapper, dataset, multiFields, qsc);
+                if (pushdown != null) {
+                    // The scan groups and aggregates on the Lance side and
+                    // also yields the row total, so neither the Lucene
+                    // aggregators nor computeMatched run for this request.
+                    long pushdownStart = System.nanoTime();
+                    LanceAggregatePushdown.Result result = pushdown.execute(
+                        dataset,
+                        request.fragmentIdsOrNull(),
+                        request.filterSql(),
+                        name -> emptyTopLevelAggregation(request, searchContext, qsc, name)
+                    );
+                    LOGGER.debug(
+                        "lance.dispatch: aggregation pushdown for [{}] over {} rows took {} us",
+                        request.indexName(),
+                        result.totalRows(),
+                        (System.nanoTime() - pushdownStart) / 1_000L
+                    );
+                    aggregations = result.aggregations();
+                    matched = request.trackTotalHitsUpTo() == SearchContext.TRACK_TOTAL_HITS_DISABLED
+                        ? MatchedCount.NOT_TRACKED
+                        : MatchedCount.exact(result.totalRows());
+                } else {
+                    aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query, lanceWeight);
+                    matched = computeMatched(dataset, request, searcher, countQuery, hasSecurityWrapper, ftsWeight);
+                }
+                // A size 0 request (the only shape the pushdown takes)
+                // has an empty page, so its row address array is empty
+                // as well; every other shape ships the addresses of the
+                // hits above for the coordinator's tie break.
                 return new LanceFragmentQueryResponse(
                     matched.value(),
                     matched.lowerBound(),
@@ -714,6 +746,72 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             throw new IllegalStateException("leaf " + leaf.ord + " of the fragment reader is not backed by a Lance fragment");
         }
         return ((long) lance.fragmentId() << 32) | ((doc - leaf.docBase) & 0xFFFFFFFFL);
+    }
+
+    /**
+     * Decide whether this request's aggregations run as a Substrait
+     * group by inside the Lance scan ({@link LanceAggregatePushdown})
+     * and, when they do, encode the plan. The request qualifies when
+     * {@code lance.aggregation.pushdown} is on, it asks for no hits
+     * ({@code size} 0) and has no {@code post_filter}, its query is
+     * {@code match_all} or a scalar filter the coordinator translated to
+     * Lance SQL ({@link LanceFragmentQueryRequest#filterSql()}; FTS and
+     * knn queries have no SQL form and stay on the aggregator path), no
+     * reader wrapper is installed (DLS / FLS filter documents in the
+     * Lucene reader, which the scan never sees), and the aggregation tree
+     * and its fields pass {@link LanceAggregatePushdown#plan}. Returns
+     * {@code null} otherwise.
+     */
+    private LanceAggregatePushdown.Plan resolveAggregatePushdown(
+        LanceFragmentQueryRequest request,
+        boolean hasSecurityWrapper,
+        Dataset dataset,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        QueryShardContext qsc
+    ) {
+        if (!clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_SETTING)) {
+            return null;
+        }
+        if (request.size() != 0 || hasSecurityWrapper || request.postFilter() != null || request.aggregations() == null) {
+            return null;
+        }
+        boolean scalarQuery = request.query() == null || request.query() instanceof MatchAllQueryBuilder || request.filterSql() != null;
+        if (!scalarQuery) {
+            return null;
+        }
+        return LanceAggregatePushdown.plan(request.aggregations(), dataset.getSchema(), multiFields, qsc);
+    }
+
+    /**
+     * The {@link InternalAggregation} the top level aggregator named
+     * {@code name} builds over zero documents. The pushdown uses it as
+     * the prototype for {@code date_histogram}, whose result class has
+     * no public constructor but a public {@code create(buckets)}: the
+     * aggregators are built exactly as {@link #aggregateViaIndexSearcher}
+     * builds them and asked for their empty result without collecting
+     * anything. They are not released here: {@code createTopLevelAggregators}
+     * registers them with the search context, which releases them when it
+     * closes, and a second release would drive the request breaker
+     * negative.
+     */
+    private static InternalAggregation emptyTopLevelAggregation(
+        LanceFragmentQueryRequest request,
+        LanceFragmentSearchContext searchContext,
+        QueryShardContext qsc,
+        String name
+    ) {
+        try {
+            AggregatorFactories factories = request.aggregations().build(qsc, null);
+            List<Aggregator> aggregators = factories.createTopLevelAggregators(searchContext);
+            for (Aggregator aggregator : aggregators) {
+                if (aggregator.name().equals(name)) {
+                    return aggregator.buildEmptyAggregation();
+                }
+            }
+            throw new IllegalStateException("no top level aggregation named [" + name + "]");
+        } catch (IOException e) {
+            throw new IllegalStateException("cannot build the empty aggregation for [" + name + "]", e);
+        }
     }
 
     /**
