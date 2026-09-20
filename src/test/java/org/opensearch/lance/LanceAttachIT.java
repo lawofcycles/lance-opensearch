@@ -225,6 +225,80 @@ public class LanceAttachIT extends LanceRestTestCase {
         }
     }
 
+    public void testTableAdvanceIsServedFromANewSnapshotWithFreshColumns() throws Exception {
+        // A request loads the aggregated column into the node's off-heap
+        // column store for the table version it read. After the table
+        // moves on (a delete here, which also gives the fragment a
+        // deletion file) the next request keys on the new version: it
+        // must not serve the previous version's rows or column values,
+        // before and after the namespace poll has refreshed the shard.
+        String suffix = "advance-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        // 3 fragments of 100 rows; rating = (i * 37) % 1000, null when i % 5 == 4.
+        LanceTableFactory.writeHintFixtureTable(scratchDir, tableName, 3, 100);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String aggregation = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{"
+            + "\"c\":{\"value_count\":{\"field\":\"rating\"}},\"s\":{\"sum\":{\"field\":\"rating\"}},"
+            + "\"top\":{\"terms\":{\"field\":\"rating\",\"size\":3,\"order\":{\"_key\":\"desc\"}}}}}";
+        String countBody = "{\"query\":{\"match_all\":{}},\"track_total_hits\":true,\"size\":0}";
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            long sumAll = 0L;
+            int countAll = 0;
+            for (int i = 0; i < 300; i++) {
+                if (i % 5 != 4) {
+                    sumAll += (i * 37) % 1000;
+                    countAll++;
+                }
+            }
+            String before = readAll(postJson("/" + indexName + "/_search", aggregation));
+            assertEquals(300, extractIntPath(before, "hits", "total", "value"));
+            assertEquals(countAll, extractIntPath(before, "aggregations", "c", "value"));
+            assertEquals((double) sumAll, extractDoublePath(before, "aggregations", "s", "value"), 0.0d);
+            // Second request against the same version reads the cached column.
+            assertEquals(
+                before.replaceFirst("\"took\":\\d+,", ""),
+                readAll(postJson("/" + indexName + "/_search", aggregation)).replaceFirst("\"took\":\\d+,", "")
+            );
+
+            // Ratings are (i * 37) % 1000: id 27 carries 999 and id 81
+            // carries 997 (998 would be id 54, whose rating is null).
+            // Deleting them removes the two largest keys.
+            LanceTableFactory.deleteRows(tableUri, "id IN (27, 81)");
+            long sumAfter = sumAll - 999L - 997L;
+            String after = readAll(postJson("/" + indexName + "/_search", aggregation));
+            assertEquals("the delete is visible on the next _search", 298, extractIntPath(after, "hits", "total", "value"));
+            assertEquals(countAll - 2, extractIntPath(after, "aggregations", "c", "value"));
+            assertEquals(
+                "column values of the deleted rows are gone",
+                (double) sumAfter,
+                extractDoublePath(after, "aggregations", "s", "value"),
+                0.0d
+            );
+            assertTrue("rating 999 was the top key before: " + before, before.contains("\"key\":999"));
+            assertFalse("rating 999 was deleted: " + after, after.contains("\"key\":999"));
+            assertFalse("rating 997 was deleted: " + after, after.contains("\"key\":997"));
+            assertTrue("rating 996 (id 108) is still there: " + after, after.contains("\"key\":996"));
+
+            // The shard engine follows on the poll; the fragment path keeps
+            // answering from the new version's snapshot throughout.
+            assertBusy(() -> {
+                String shard = readAll(postJson("/" + indexName + "/_search", countBody));
+                assertEquals("shard path should follow the delete: " + shard, 298, extractIntPath(shard, "hits", "total", "value"));
+            }, 60, java.util.concurrent.TimeUnit.SECONDS);
+            String afterPoll = readAll(postJson("/" + indexName + "/_search", aggregation));
+            assertEquals(after.replaceFirst("\"took\":\\d+,", ""), afterPoll.replaceFirst("\"took\":\\d+,", ""));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testAttachRejectsNegativeVersion() throws IOException {
         String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"version\":-1}";
         ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
