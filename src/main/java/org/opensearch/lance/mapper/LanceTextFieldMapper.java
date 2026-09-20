@@ -89,7 +89,7 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
         @Override
         public Query existsQuery(QueryShardContext context) {
             rejectIfDropped();
-            return new MatchAllDocsQuery();
+            return MatchAllDocsQuery.INSTANCE;
         }
 
         @Override

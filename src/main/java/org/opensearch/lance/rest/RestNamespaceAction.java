@@ -20,6 +20,7 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.RestResponse;
 import org.opensearch.rest.action.RestBuilderListener;
+import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
@@ -88,7 +89,10 @@ public class RestNamespaceAction extends BaseRestHandler {
         // path segments fragile. Body-with-path matches the shape of the
         // register / unregister calls right above.
         if (request.path().endsWith("/tables")) {
-            return channel -> {
+            // listTables goes to the namespace's storage (a directory
+            // listing, or an object-store call for s3:// roots), so run
+            // it off the transport thread.
+            return channel -> client.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
                 try {
                     java.util.Optional<java.util.Set<String>> tables = service.listTables(path);
                     try (XContentBuilder b = channel.newBuilder()) {
@@ -113,7 +117,7 @@ public class RestNamespaceAction extends BaseRestHandler {
                         new BytesRestResponse(RestStatus.INTERNAL_SERVER_ERROR, "list tables for [" + path + "] failed: " + e.getMessage())
                     );
                 }
-            };
+            });
         }
         if (request.method() == RestRequest.Method.DELETE) {
             // DELETE only stops the polling of that path. Already-surfaced

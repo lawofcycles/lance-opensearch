@@ -333,7 +333,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
 
                 // Placeholder query for the LanceFragmentSearchContext ctor;
                 // resolveLuceneQuery() runs after we have the QueryShardContext.
-                Query placeholderQuery = new MatchAllDocsQuery();
+                Query placeholderQuery = MatchAllDocsQuery.INSTANCE;
 
                 try (
                     LanceFragmentSearchContext searchContext = new LanceFragmentSearchContext(
@@ -507,7 +507,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             }
             return base;
         }
-        return new MatchAllDocsQuery();
+        return MatchAllDocsQuery.INSTANCE;
     }
 
     /**
