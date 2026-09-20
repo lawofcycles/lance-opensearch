@@ -83,6 +83,8 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 - `post_filter` narrows hits without affecting aggregations.
 - `sort` by scalar field, and Painless `script` query / `script` sort.
 - `track_scores: true` alongside `sort` keeps per-hit `_score` populated (Lucene's 4-argument `search(query, size, sort, doDocScores)` overload). `max_score` is the largest per-hit score in the paged window; NaN scores fall through so a sort-only query without `track_scores` reports `max_score: null` matching the shard path.
+- `track_total_hits` follows the OpenSearch contract: omitted counts up to 10,000 and reports `{"value": 10000, "relation": "gte"}` beyond that, an integer sets that bound, `true` counts exactly, `false` omits `hits.total`. The coordinator ships the bound to every executor and composes the relation from the per-node counts. Scalar filters and `match_all` are counted from Lance metadata and are always exact on the executor; a Lance FTS query (`match`, `lance_*`, or a `bool` collapsed into a prefiltered FTS scan) is counted from the same scan that served the hits or aggregations when that scan saw every match, and otherwise by a count-only scan stopped at `bound + 1` rows, so a query with many hits costs the same as one with few until `track_total_hits: true` asks for the exact number.
+- `_count` runs on the fragment path (it is a `_search` with `size: 0` and `track_total_hits: true`), so it reads the same manifest version and takes the same count paths as `_search`; for an FTS query that is one count-only Lance scan over the inverted index.
 
 ### Multi-fields
 

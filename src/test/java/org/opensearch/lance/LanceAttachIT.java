@@ -189,10 +189,11 @@ public class LanceAttachIT extends LanceRestTestCase {
             assertEquals(6, extractIntPath(pinnedBody, "hits", "total", "value"));
 
             // Advance the table past the pinned version. The pinned index
-            // must keep serving version 1 through both the shard engine
-            // (_count) and the fragment path (_search); the unpinned
-            // index follows the latest manifest on _search right away
-            // because the fragment path opens the table per request.
+            // must keep serving version 1 through both the fragment path
+            // (_search, _count) and the shard engine (_stats docs.count);
+            // the unpinned index follows the latest manifest on _search
+            // right away because the fragment path opens the table per
+            // request.
             LanceTableFactory.deleteRows(tableUri, "id IN (1, 4)");
             String pinnedAfterDelete = readAll(postJson("/" + pinnedIndex + "/_search", "{\"query\":{\"match_all\":{}}}"));
             assertEquals(
@@ -202,6 +203,8 @@ public class LanceAttachIT extends LanceRestTestCase {
             );
             String pinnedCount = readAll(client().performRequest(new Request("GET", "/" + pinnedIndex + "/_count")));
             assertEquals("pinned _count must read version 1: " + pinnedCount, 6, extractIntPath(pinnedCount, "count"));
+            ensureGreen(pinnedIndex);
+            assertEquals("pinned engine reader must read version 1", 6, engineDocCount(pinnedIndex));
             String latestAfterDelete = readAll(postJson("/" + latestIndex + "/_search", "{\"query\":{\"match_all\":{}}}"));
             assertEquals(
                 "unpinned _search follows the delete: " + latestAfterDelete,
@@ -284,10 +287,10 @@ public class LanceAttachIT extends LanceRestTestCase {
 
         String tagIndex = tableName + "-tag";
         String pinnedIndex = tableName + "-pinned";
-        // track_total_hits routes the search to the shard path (engine
-        // reader); the plain body goes through the fragment path, where the
-        // coordinator resolves the tag itself. Both must agree.
-        String countBody = "{\"query\":{\"match_all\":{}},\"track_total_hits\":true,\"size\":0}";
+        // _search goes through the fragment path, where the coordinator
+        // resolves the tag itself; _stats docs.count reads the shard
+        // engine's reader, which follows the tag through the namespace
+        // poll. Both must agree.
         String fragmentBody = "{\"query\":{\"match_all\":{}},\"size\":0}";
         try {
             Response attachTag = postJson(
@@ -306,30 +309,34 @@ public class LanceAttachIT extends LanceRestTestCase {
             String settingsBody = readAll(client().performRequest(new Request("GET", "/" + tagIndex + "/_settings")));
             assertTrue("expected index.lance.tag=v1 to persist: " + settingsBody, settingsBody.contains("\"tag\":\"v1\""));
 
-            assertEquals(6, extractIntPath(readAll(postJson("/" + tagIndex + "/_search", countBody)), "hits", "total", "value"));
+            ensureGreen(tagIndex);
+            ensureGreen(pinnedIndex);
+            assertEquals(6, engineDocCount(tagIndex));
             assertEquals(6, extractIntPath(readAll(postJson("/" + tagIndex + "/_search", fragmentBody)), "hits", "total", "value"));
-            assertEquals(6, extractIntPath(readAll(postJson("/" + pinnedIndex + "/_search", countBody)), "hits", "total", "value"));
+            assertEquals(6, engineDocCount(pinnedIndex));
             assertEquals(6, extractIntPath(readAll(postJson("/" + pinnedIndex + "/_search", fragmentBody)), "hits", "total", "value"));
 
             LanceTableFactory.updateTag(tableUri, "v1", versionB);
             // The fragment path resolves the tag per request, so it sees
             // the move at once; the engine reader follows on the next poll.
             assertEquals(10, extractIntPath(readAll(postJson("/" + tagIndex + "/_search", fragmentBody)), "hits", "total", "value"));
-            assertBusy(() -> {
-                String body = readAll(postJson("/" + tagIndex + "/_search", countBody));
-                assertEquals("tag index should follow v1 to version B: " + body, 10, extractIntPath(body, "hits", "total", "value"));
-            }, 60, java.util.concurrent.TimeUnit.SECONDS);
-            assertEquals(6, extractIntPath(readAll(postJson("/" + pinnedIndex + "/_search", countBody)), "hits", "total", "value"));
+            assertBusy(
+                () -> { assertEquals("tag index should follow v1 to version B", 10, engineDocCount(tagIndex)); },
+                60,
+                java.util.concurrent.TimeUnit.SECONDS
+            );
+            assertEquals(6, engineDocCount(pinnedIndex));
             assertEquals(6, extractIntPath(readAll(postJson("/" + pinnedIndex + "/_search", fragmentBody)), "hits", "total", "value"));
 
             // Moving the tag back is a move too: the poll compares for
             // inequality, not for a forward advance.
             LanceTableFactory.updateTag(tableUri, "v1", versionA);
             assertEquals(6, extractIntPath(readAll(postJson("/" + tagIndex + "/_search", fragmentBody)), "hits", "total", "value"));
-            assertBusy(() -> {
-                String body = readAll(postJson("/" + tagIndex + "/_search", countBody));
-                assertEquals("tag index should follow v1 back to version A: " + body, 6, extractIntPath(body, "hits", "total", "value"));
-            }, 60, java.util.concurrent.TimeUnit.SECONDS);
+            assertBusy(
+                () -> { assertEquals("tag index should follow v1 back to version A", 6, engineDocCount(tagIndex)); },
+                60,
+                java.util.concurrent.TimeUnit.SECONDS
+            );
         } finally {
             for (String idx : new String[] { tagIndex, pinnedIndex }) {
                 try {
@@ -729,5 +736,17 @@ public class LanceAttachIT extends LanceRestTestCase {
             String body = readAll(failure.getResponse());
             assertTrue("expected 'no longer exists' message, saw: " + body, body.contains("no longer exists"));
         }
+    }
+
+    /**
+     * Row count as the shard engine's reader sees it ({@code _stats}
+     * docs.count comes from {@code Engine#docStats}). {@code _search} and
+     * {@code _count} run on the fragment path and open the table per
+     * request, so this is the REST view of the engine reader that the
+     * namespace poll refreshes.
+     */
+    private static int engineDocCount(String indexName) throws IOException {
+        String stats = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_stats/docs")));
+        return extractIntPath(stats, "indices", indexName, "primaries", "docs", "count");
     }
 }
