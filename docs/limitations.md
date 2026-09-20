@@ -47,7 +47,7 @@ OpenSearch's stock `match` and `match_phrase` queries against a `lance_text` fie
 
 ## Freshness
 
-- `_search` (fragment path) and `GET /_doc/{id}` (engine path) do not share a freshness view. After a Lance append advances the manifest, `_search` reflects the new rows on its next call because the fragment executor opens the latest version per query. Engine path (GET, stats) follows the shard's poll cadence (default 10s, configurable via `lance.namespace.poll_cadence`), so the same row can be visible to `_search` seconds before `GET` sees it. Read-your-writes depends on which API the caller used; prefer `_search` when the write side matters.
+- `_search` (fragment path) and `GET /_doc/{id}` (engine path) do not share a freshness view. After a Lance append advances the manifest, `_search` reflects the new rows on its next call because the coordinator reads the latest manifest version per query and the executors build a snapshot for it. Engine path (GET, stats) follows the shard's poll cadence (default 10s, configurable via `lance.namespace.poll_cadence`), so the same row can be visible to `_search` seconds before `GET` sees it. Read-your-writes depends on which API the caller used; prefer `_search` when the write side matters.
 - `index.lance.uncovered_fragment_policy` (`wait` / `immediate`, default `immediate`) still exists in settings but both values expose the new version at once today. `wait` is reserved for a future async-optimize implementation.
 
 ## Storage and credentials
@@ -81,8 +81,11 @@ OpenSearch's stock `match` and `match_phrase` queries against a `lance_text` fie
 
 ## Reader memory profile
 
-- Each Lance fragment leaf loads columns lazily. The reader constructor only performs a schema pass; a fragment that carries a deletion file additionally runs a `_rowaddr`-only scan to learn which physical rows are live. Every scalar column moves from "declared" to "loaded" the first time a Lucene accessor (doc values, sort, aggregation) asks for it, then stays in heap for the fragment's lifetime.
-- `_id` and `_source` are not served from those whole-column loads. The fragment path fetches the rows behind the hits with a `_rowaddr IN (...)` take per leaf, so a `size:10` fetch reads ten rows of the projected columns regardless of table size. Queries that never render hits (aggregations, `size=0` hit counts) only heap-allocate the columns they consult.
+- Each Lance fragment leaf loads columns lazily. On the fragment path the leaf is a view over a cached table snapshot (see features.md, "Fragment path snapshot and column cache"): numeric, boolean, date and float columns it reads for the whole fragment live off-heap in the node's column store and are shared across requests; keyword and keyword array columns are built per request in heap (sorted terms plus per-doc ordinals) and dropped when the request ends. Their off-heap form is not implemented yet.
+- The shard path reader (`GET /_doc/{id}`, `_count`, stats, and the shapes listed under "Query shapes routed to the shard path") does not use the snapshot cache or the column store; its leaves load every column into heap and keep it for the reader's lifetime (one reader per manifest version).
+- `_id` and `_source` are not served from whole-column loads on either path. The fragment path fetches the rows behind the hits with a `_rowaddr IN (...)` take per leaf, so a `size:10` fetch reads ten rows of the projected columns regardless of table size. Queries that never render hits (aggregations, `size=0` hit counts) only touch the columns they consult.
+- When the column store is full and nothing can be evicted (every held column is being read by a running request), the request loads the column into heap for itself, with the query's filter applied as before the store existed. The store's budget is `lance.cache.column_share` of `lance.native_memory.limit`; on a multi-node cluster every data node holds the columns of the fragments it executes, so a node that executes a subset of the fragments holds that subset only.
+- Snapshots retired by the namespace poll (table advanced, tag moved) are closed only on the elected cluster manager, where the poll runs. Other nodes keep the previous version's snapshot until `lance.cache.max_snapshots` evicts it or the index is deleted; requests on those nodes already key on the new version, so the leftover costs one open dataset and its columns, not stale results.
 
 ## Version pinning
 
