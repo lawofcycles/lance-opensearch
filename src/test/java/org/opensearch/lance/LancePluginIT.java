@@ -56,6 +56,12 @@ public class LancePluginIT extends LanceRestTestCase {
 
             Response segments = client().performRequest(new Request("GET", "/" + indexName + "/_segments"));
             assertEquals(RestStatus.OK.getStatus(), segments.getStatusLine().getStatusCode());
+            String segmentsBody = readAll(segments);
+            assertEquals(
+                "expected zero shard failures on _segments, saw: " + segmentsBody,
+                0,
+                extractIntPath(segmentsBody, "_shards", "failed")
+            );
 
             Response nodesStats = client().performRequest(new Request("GET", "/_nodes/stats/indices/docs"));
             assertEquals(RestStatus.OK.getStatus(), nodesStats.getStatusLine().getStatusCode());
