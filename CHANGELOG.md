@@ -23,6 +23,7 @@ Inspired by [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `_source` and `_id` come from stored fields synthesised on the fly from the Lance row. Tables without a declared primary key still emit unique `_id` values through a `<fragment>-<offset>` fallback so sort-by-`_id` and `_mget` dedup stay correct.
 - Auto-build of missing FTS / scalar / vector indexes for tables at or under `lance.builder.max_rows` rows (default 1,000,000). `POST /_lance/build_indexes/{index}` triggers manual builds with optional `columns` and `fragment_ids` for larger tables or incremental builds.
 - Fragment path is the single search implementation. Coordinator response envelope tracks per-hit scores (Lucene's 4 / 5 argument `search` / `searchAfter` overloads) so `sort` combined with `track_scores: true` preserves `_score`, and `max_score` reports the largest per-hit score in the paged window. Attach and namespace surface persist all metadata the fragment path and engine path need on shard open.
+- Aggregation pushdown: a `size: 0` request over `match_all` or a scalar filter whose aggregations are metrics only, or one `terms` / `histogram` / fixed interval `date_histogram` with metric children, runs as a Substrait `AggregateRel` inside the Lance scan (one row per group per executor; the coordinator reduce is unchanged; `hits.total` from the same scan). `lance.aggregation.pushdown` (dynamic, default `true`) turns it off.
 
 ### Infrastructure
 
