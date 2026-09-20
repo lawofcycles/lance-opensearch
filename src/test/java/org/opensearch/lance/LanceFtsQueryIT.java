@@ -380,6 +380,48 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             );
             assertEquals(List.of("c0=6", "c1=6", "c2=6"), bucketsOf(mapMode, "by_category"));
 
+            // One hit with size 0: no hits phase runs before the
+            // aggregator is built, so the hit set the executor delivers
+            // ahead of the aggregators is the only hint the keyword
+            // dictionary can use. The constant_score wrapping is not a
+            // bare Lance clause and gets no early hint, so it is the
+            // hint-free reference. Row 250 is c1.
+            String singleTerms = ",\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}}}}";
+            String singleFts = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"tok250\"}}" + singleTerms
+                )
+            );
+            String singleCs = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"constant_score\":{\"filter\":{\"lance_match\":{\"field\":\"body\",\"query\":\"tok250\"}}}}"
+                        + singleTerms
+                )
+            );
+            assertEquals(List.of("c1=1"), bucketsOf(singleFts, "by_category"));
+            assertEquals(bucketsOf(singleCs, "by_category"), bucketsOf(singleFts, "by_category"));
+            assertEquals(1, extractIntPath(singleFts, "hits", "total", "value"));
+
+            // post_filter narrows the page to the c0 rows but leaves the
+            // aggregation over every grp3 row; the early hint covers both
+            // because the page can only lose rows from the hit set.
+            String postFilter = ",\"post_filter\":{\"term\":{\"category\":\"c0\"}}";
+            String postFilteredFts = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":30,\"query\":" + fts + postFilter + "," + categorySort + singleTerms)
+            );
+            String postFilteredRef = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":30,\"query\":" + reference + postFilter + "," + categorySort + singleTerms
+                )
+            );
+            assertEquals(6, extractIntPath(postFilteredFts, "hits", "total", "value"));
+            assertEquals(6, hitsOf(postFilteredFts).size());
+            assertEquals(idsAndSortValuesOf(postFilteredRef), idsAndSortValuesOf(postFilteredFts));
+            assertEquals(List.of("c0=6", "c1=6", "c2=6"), bucketsOf(postFilteredFts, "by_category"));
+
             // One hit: row 250 is fragment 1, offset 50.
             String single = readAll(
                 postJson(

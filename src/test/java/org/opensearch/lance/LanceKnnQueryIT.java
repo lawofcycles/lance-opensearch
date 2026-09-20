@@ -199,6 +199,22 @@ public class LanceKnnQueryIT extends LanceRestTestCase {
                 assertEquals(bucketsOf(expected, "by_tag"), bucketsOf(actual, "by_tag"));
                 assertEquals(324d, extractDoublePath(actual, "aggregations", "max_rating", "value"), 0d);
             }
+            // constant_score wrapping is not a bare Lance clause and gets
+            // no hint before the aggregator is built; with size 0 it is
+            // the hint-free reference for the keyword terms buckets.
+            String categoryTerms = "\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}}}";
+            String knnCategory = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":" + knn + "," + categoryTerms + "}")
+            );
+            String csCategory = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"constant_score\":{\"filter\":" + knn + "}}," + categoryTerms + "}"
+                )
+            );
+            // 248 -> c2, 249 -> c0, 250 -> c1, 251 -> null, 252 -> c0.
+            assertEquals(List.of("c0=2", "c1=1", "c2=1"), bucketsOf(knnCategory, "by_category"));
+            assertEquals(bucketsOf(csCategory, "by_category"), bucketsOf(knnCategory, "by_category"));
         }
     }
 
