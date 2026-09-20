@@ -7,10 +7,19 @@ package org.opensearch.lance;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.stream.Stream;
 
+import org.apache.lucene.index.FilterDirectoryReader;
+import org.apache.lucene.store.ByteBuffersDirectory;
 import org.lance.Dataset;
+import org.lance.Fragment;
+import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.lance.engine.LanceDirectoryReader;
+import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.test.OpenSearchTestCase;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
@@ -42,6 +51,57 @@ public class LanceDataFileSizeTests extends OpenSearchTestCase {
             LanceDirectoryReader.DataFileSizes sizes = LanceDirectoryReader.sumDataFileSizes(dataset.getFragments());
             assertEquals(onDisk, sizes.knownBytes());
             assertEquals(10L, dataset.countRows());
+        }
+    }
+
+    public void testEngineReaderChainResolvesDataFileSizes() throws Exception {
+        // docStats() sees the shard reader through OpenSearchDirectoryReader,
+        // so the unwrap in dataFileSizesOf must reach the LanceDirectoryReader
+        // underneath; if that chain stops matching the reported total
+        // silently falls back to 0.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeTable(scratchDir, "chain", 12);
+        long onDisk = bytesUnderDataDir(Path.of(uri));
+        ShardId shardId = new ShardId("chain", "uuid", 0);
+
+        Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty());
+        try (
+            LanceDirectoryReader reader = LanceDirectoryReader.open(
+                new ByteBuffersDirectory(),
+                null,
+                dataset,
+                "",
+                LanceEngineFactory.LancePrimaryKeyType.NONE,
+                Collections.emptyMap()
+            )
+        ) {
+            OpenSearchDirectoryReader wrapped = OpenSearchDirectoryReader.wrap(reader, shardId);
+            assertSame(reader, FilterDirectoryReader.unwrap(wrapped));
+            assertEquals(onDisk, LanceDirectoryReader.dataFileSizesOf(wrapped).knownBytes());
+            assertEquals(0, LanceDirectoryReader.dataFileSizesOf(wrapped).filesWithoutSize());
+            assertEquals(12, wrapped.numDocs());
+        }
+
+        // Per-request fragment readers never serve shard stats and skip the
+        // manifest walk.
+        Dataset fragmentDataset = LanceRegistry.openDataset(uri, StorageOptions.empty());
+        List<Integer> fragmentIds = new ArrayList<>();
+        for (Fragment fragment : fragmentDataset.getFragments()) {
+            fragmentIds.add(fragment.getId());
+        }
+        try (
+            LanceDirectoryReader reader = LanceDirectoryReader.openForFragments(
+                new ByteBuffersDirectory(),
+                null,
+                fragmentDataset,
+                "",
+                LanceEngineFactory.LancePrimaryKeyType.NONE,
+                Collections.emptyMap(),
+                fragmentIds
+            )
+        ) {
+            assertEquals(LanceDirectoryReader.DataFileSizes.NONE, reader.dataFileSizes());
+            assertEquals(LanceDirectoryReader.DataFileSizes.NONE, LanceDirectoryReader.dataFileSizesOf(reader));
         }
     }
 

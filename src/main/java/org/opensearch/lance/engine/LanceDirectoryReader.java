@@ -12,7 +12,9 @@ import java.util.concurrent.ExecutorService;
 
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.FilterDirectoryReader;
 import org.apache.lucene.index.IndexCommit;
+import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReader;
@@ -301,6 +303,23 @@ public final class LanceDirectoryReader extends DirectoryReader {
      */
     public DataFileSizes dataFileSizes() {
         return dataFileSizes;
+    }
+
+    /**
+     * Resolve the {@link DataFileSizes} behind an arbitrary reader handed
+     * out by the engine. The shard searcher's reader is an
+     * {@code OpenSearchDirectoryReader} (and, with the security plugin, a
+     * further DLS / FLS wrapper) around the {@link LanceDirectoryReader}, so
+     * unwrap the {@link FilterDirectoryReader} chain first. Returns
+     * {@link DataFileSizes#NONE} when the innermost reader is not a
+     * {@link LanceDirectoryReader}.
+     */
+    public static DataFileSizes dataFileSizesOf(IndexReader reader) {
+        if (reader instanceof DirectoryReader directoryReader
+            && FilterDirectoryReader.unwrap(directoryReader) instanceof LanceDirectoryReader lanceReader) {
+            return lanceReader.dataFileSizes();
+        }
+        return DataFileSizes.NONE;
     }
 
     @Override
