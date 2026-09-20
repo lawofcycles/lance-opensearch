@@ -141,6 +141,49 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testUnboundedFtsOnThreeNodesIsRejectedWithTooManyRequestsWhenTheRequestBreakerIsFull() throws Exception {
+        // Each of the three executors buffers the hits of its fragment
+        // for a sort by a field and reserves them with its node's
+        // request breaker. A refusal on any executor travels back to
+        // the coordinator as the executor's CircuitBreakingException
+        // and the client sees 429 with the reservation's label; the
+        // same request answers 200 again once the limit is restored.
+        String suffix = "mn-fts-breaker-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 12, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String sorted = "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"sort\":[{\"id\":\"desc\"}]}";
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(3, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+
+            String before = readAll(postJson("/" + indexName + "/_search", sorted));
+            assertEquals(List.of("2-2", "2-0", "1-2", "1-0", "0-2", "0-0"), hitIds(before));
+
+            updateClusterSetting("indices.breaker.request.limit", "16b");
+            try {
+                ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", sorted));
+                int status = failure.getResponse().getStatusLine().getStatusCode();
+                String body = readAll(failure.getResponse());
+                assertEquals("expected 429, saw " + status + ": " + body, RestStatus.TOO_MANY_REQUESTS.getStatus(), status);
+                assertTrue("expected circuit_breaking_exception: " + body, body.contains("circuit_breaking_exception"));
+                assertTrue("expected the hit buffer label: " + body, body.contains("lance_fts_hits"));
+            } finally {
+                updateClusterSetting("indices.breaker.request.limit", null);
+            }
+            String after = readAll(postJson("/" + indexName + "/_search", sorted));
+            assertEquals(hitIds(before), hitIds(after));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     /**
      * The coordinator hands each fragment to a different data node
      * whether or not that node holds a shard copy, and merges three
