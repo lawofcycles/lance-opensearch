@@ -12,6 +12,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.FieldVector;
@@ -59,9 +60,12 @@ import org.lance.ipc.ScanOptions;
  * {@link LanceFragmentLeafReader#publishOffHeapColumn},
  * {@link LanceFragmentLeafReader#publishOffHeapKeywordColumn} and
  * {@link LanceFragmentLeafReader#publishOffHeapKeywordArrayColumn} and
- * pinned until the reader closes, and the heap scan above runs only when
- * the store has no room. Keyword loads under a top-level filter stay on
- * the heap path (see {@link #loadTextColumn}).
+ * pinned until the reader closes. The heap scan above runs when the store
+ * has no room for a numeric or boolean column; a keyword column the
+ * store cannot hold is still scanned by the store once and its
+ * dictionaries arrive here as heap results, so the heap keyword scan runs
+ * only when the store is not usable for keywords at all (no store, a
+ * zero budget, or a top-level filter; see {@link #keywordStoreUsable}).
  *
  * <p>Concurrency: a per-column {@code Object} lock serialises
  * concurrent loads of the same column. Different columns load in
@@ -93,6 +97,8 @@ public final class LanceShardColumnCache {
     private final Map<String, Boolean> loadedBooleanColumns = new ConcurrentHashMap<>();
     private final Map<String, Boolean> loadedTextColumns = new ConcurrentHashMap<>();
     private final Map<String, Boolean> loadedKeywordArrayColumns = new ConcurrentHashMap<>();
+    /** Lance scans this cache ran itself for heap loads (not the store's), for tests that count scans per path. */
+    private final AtomicLong heapScans = new AtomicLong();
 
     /**
      * Build a cache scoped to {@code leaves} against {@code dataset}
@@ -211,10 +217,13 @@ public final class LanceShardColumnCache {
      * applies {@link #filterSql} to its scan and produces ordinals for
      * the matching rows only, and the store cannot hold both shapes under
      * one key. Readers opened with a top-level filter therefore keep the
-     * request scoped heap dictionary for keyword columns.
+     * request scoped heap dictionary for keyword columns. A store with a
+     * zero budget can never hold a dictionary, and its keyword loaders
+     * only learn that after their scan, so it is skipped up front and the
+     * heap load below scans the column once.
      */
     private boolean keywordStoreUsable() {
-        return columnStore != null && filterSql == null;
+        return columnStore != null && columnStore.limitBytes() > 0L && filterSql == null;
     }
 
     /**
@@ -252,26 +261,27 @@ public final class LanceShardColumnCache {
     /**
      * Keyword counterpart of {@link #publishFromStore}: serve the Utf8
      * column {@code name} to every leaf from the store's dictionaries and
-     * ordinals, loading the missing fragments in one scan.
+     * ordinals, loading the missing fragments in one scan. Fragments the
+     * store could not hold arrive as heap dictionaries built from that
+     * same scan and are published through
+     * {@link LanceFragmentLeafReader#publishTextColumn}, so this returns
+     * {@code true} in both cases and the caller never scans again.
      */
     private boolean publishKeywordFromStore(String name) throws IOException {
         if (!keywordStoreUsable()) {
             return false;
         }
-        Map<Integer, CachedKeywordColumn> columns = columnStore.acquireKeyword(snapshotKey, dataset, name, allFragmentRows());
-        if (columns == null) {
+        ColumnStore.KeywordLoad load = columnStore.acquireKeyword(snapshotKey, dataset, name, allFragmentRows());
+        if (load == null) {
             LOGGER.debug(
-                "column cache budget exhausted; building the dictionary of [{}] of {} in heap for this request ({} fragments)",
+                "column cache could not scan [{}] of {}; building the dictionary in heap for this request ({} fragments)",
                 name,
                 snapshotKey,
                 leavesByFragmentId.size()
             );
             return false;
         }
-        pinned.addAll(columns.values());
-        for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
-            leaf.publishOffHeapKeywordColumn(name, columns.get(leaf.fragmentId()));
-        }
+        publishKeywordLoad(name, load, leavesByFragmentId.values());
         return true;
     }
 
@@ -280,49 +290,47 @@ public final class LanceShardColumnCache {
         if (!keywordStoreUsable()) {
             return false;
         }
-        Map<Integer, CachedKeywordArrayColumn> columns = columnStore.acquireKeywordArray(snapshotKey, dataset, name, allFragmentRows());
-        if (columns == null) {
+        ColumnStore.KeywordArrayLoad load = columnStore.acquireKeywordArray(snapshotKey, dataset, name, allFragmentRows());
+        if (load == null) {
             LOGGER.debug(
-                "column cache budget exhausted; building the dictionary of [{}] of {} in heap for this request ({} fragments)",
+                "column cache could not scan [{}] of {}; building the dictionary in heap for this request ({} fragments)",
                 name,
                 snapshotKey,
                 leavesByFragmentId.size()
             );
             return false;
         }
-        pinned.addAll(columns.values());
-        for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
-            leaf.publishOffHeapKeywordArrayColumn(name, columns.get(leaf.fragmentId()));
-        }
+        publishKeywordArrayLoad(name, load, leavesByFragmentId.values());
         return true;
     }
 
     /**
      * Keyword counterpart of {@link #publishFromStoreForLeaf}: serve the
      * Utf8 column {@code name} to {@code leaf} alone from the store,
-     * scanning that one fragment when the store does not hold it.
+     * scanning that one fragment when the store does not hold it. As in
+     * {@link #publishKeywordFromStore}, a dictionary the store has no
+     * room for is published to the leaf as a heap column.
      */
     boolean publishKeywordFromStoreForLeaf(LanceFragmentLeafReader leaf, String name) throws IOException {
         if (!keywordStoreUsable()) {
             return false;
         }
-        Map<Integer, CachedKeywordColumn> columns = columnStore.acquireKeyword(
+        ColumnStore.KeywordLoad load = columnStore.acquireKeyword(
             snapshotKey,
             dataset,
             name,
             Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc())
         );
-        if (columns == null) {
+        if (load == null) {
             LOGGER.debug(
-                "column cache budget exhausted; building the dictionary of [{}] of {} fragment {} in heap for this request",
+                "column cache could not scan [{}] of {} fragment {}; building the dictionary in heap for this request",
                 name,
                 snapshotKey,
                 leaf.fragmentId()
             );
             return false;
         }
-        pinned.addAll(columns.values());
-        leaf.publishOffHeapKeywordColumn(name, columns.get(leaf.fragmentId()));
+        publishKeywordLoad(name, load, Collections.singletonList(leaf));
         return true;
     }
 
@@ -331,24 +339,81 @@ public final class LanceShardColumnCache {
         if (!keywordStoreUsable()) {
             return false;
         }
-        Map<Integer, CachedKeywordArrayColumn> columns = columnStore.acquireKeywordArray(
+        ColumnStore.KeywordArrayLoad load = columnStore.acquireKeywordArray(
             snapshotKey,
             dataset,
             name,
             Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc())
         );
-        if (columns == null) {
+        if (load == null) {
             LOGGER.debug(
-                "column cache budget exhausted; building the dictionary of [{}] of {} fragment {} in heap for this request",
+                "column cache could not scan [{}] of {} fragment {}; building the dictionary in heap for this request",
                 name,
                 snapshotKey,
                 leaf.fragmentId()
             );
             return false;
         }
-        pinned.addAll(columns.values());
-        leaf.publishOffHeapKeywordArrayColumn(name, columns.get(leaf.fragmentId()));
+        publishKeywordArrayLoad(name, load, Collections.singletonList(leaf));
         return true;
+    }
+
+    /**
+     * Hand each leaf in {@code leaves} its fragment's part of
+     * {@code load}: the store entry, pinned until {@link #releasePins},
+     * or the heap dictionary the store scanned but could not keep.
+     */
+    private void publishKeywordLoad(String name, ColumnStore.KeywordLoad load, Iterable<LanceFragmentLeafReader> leaves) {
+        pinned.addAll(load.stored().values());
+        if (!load.heap().isEmpty()) {
+            LOGGER.debug(
+                "column cache budget exhausted; serving the scanned dictionary of [{}] of {} from heap for this request ({} fragments)",
+                name,
+                snapshotKey,
+                load.heap().size()
+            );
+        }
+        for (LanceFragmentLeafReader leaf : leaves) {
+            CachedKeywordColumn stored = load.stored().get(leaf.fragmentId());
+            if (stored != null) {
+                leaf.publishOffHeapKeywordColumn(name, stored);
+                continue;
+            }
+            ColumnStore.HeapKeyword heap = load.heap().get(leaf.fragmentId());
+            if (heap == null) {
+                throw new IllegalStateException(
+                    "column store returned neither a stored nor a heap dictionary of [" + name + "] for fragment " + leaf.fragmentId()
+                );
+            }
+            leaf.publishTextColumn(name, heap.terms(), heap.ords());
+        }
+    }
+
+    /** {@link #publishKeywordLoad} for a {@code List<Utf8>} column. */
+    private void publishKeywordArrayLoad(String name, ColumnStore.KeywordArrayLoad load, Iterable<LanceFragmentLeafReader> leaves) {
+        pinned.addAll(load.stored().values());
+        if (!load.heap().isEmpty()) {
+            LOGGER.debug(
+                "column cache budget exhausted; serving the scanned dictionary of [{}] of {} from heap for this request ({} fragments)",
+                name,
+                snapshotKey,
+                load.heap().size()
+            );
+        }
+        for (LanceFragmentLeafReader leaf : leaves) {
+            CachedKeywordArrayColumn stored = load.stored().get(leaf.fragmentId());
+            if (stored != null) {
+                leaf.publishOffHeapKeywordArrayColumn(name, stored);
+                continue;
+            }
+            ColumnStore.HeapKeywordArray heap = load.heap().get(leaf.fragmentId());
+            if (heap == null) {
+                throw new IllegalStateException(
+                    "column store returned neither a stored nor a heap dictionary of [" + name + "] for fragment " + leaf.fragmentId()
+                );
+            }
+            leaf.publishKeywordArrayColumn(name, heap.terms(), heap.rowOrds());
+        }
     }
 
     /**
@@ -366,6 +431,11 @@ public final class LanceShardColumnCache {
             pinned.clear();
         }
         columnStore.unpin(toRelease);
+    }
+
+    /** Number of Lance scans the heap loaders below have run for this reader, for tests. */
+    long heapScanCount() {
+        return heapScans.get();
     }
 
     /**
@@ -414,6 +484,7 @@ public final class LanceShardColumnCache {
             if (filterSql != null) {
                 builder = builder.filter(filterSql);
             }
+            heapScans.incrementAndGet();
             try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -482,6 +553,7 @@ public final class LanceShardColumnCache {
             if (filterSql != null) {
                 builder = builder.filter(filterSql);
             }
+            heapScans.incrementAndGet();
             try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -531,8 +603,11 @@ public final class LanceShardColumnCache {
      * <p>With a store and no top-level filter the dictionary and
      * ordinals come from (or go into) the store's off-heap vectors
      * instead, so later requests over the snapshot skip the scan and the
-     * heap build; see {@link #keywordStoreUsable} for why a filtered
-     * load stays here.
+     * heap build; when the store scans the column but has no room for
+     * the result, the leaves receive that scan's dictionaries as heap
+     * columns and the loop below does not run. See
+     * {@link #keywordStoreUsable} for why a filtered load or a zero
+     * budget stays here.
      */
     public void loadTextColumn(String name) throws IOException {
         if (loadedTextColumns.containsKey(name)) {
@@ -561,6 +636,7 @@ public final class LanceShardColumnCache {
             if (filterSql != null) {
                 builder = builder.filter(filterSql);
             }
+            heapScans.incrementAndGet();
             try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -629,6 +705,7 @@ public final class LanceShardColumnCache {
             if (filterSql != null) {
                 builder = builder.filter(filterSql);
             }
+            heapScans.incrementAndGet();
             try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();

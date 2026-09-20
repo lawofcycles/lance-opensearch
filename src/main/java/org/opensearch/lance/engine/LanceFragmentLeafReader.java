@@ -652,6 +652,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
         this.shardColumnCache = cache;
     }
 
+    /** The {@link LanceShardColumnCache} attached to this leaf, or {@code null}; for tests that read its counters. */
+    LanceShardColumnCache shardColumnCache() {
+        return shardColumnCache;
+    }
+
     private void ensureBooleanLoaded(String name) throws IOException {
         ensureBooleanLoaded(name, true);
     }
