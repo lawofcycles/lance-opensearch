@@ -81,6 +81,7 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 - `_source` and `_id` synthesised on the fly from Lance rows.
 - `from` + `size` pagination.
 - `search_after` cursor pagination when the request carries a `sort` clause.
+- Hits with equal scores or equal sort values are ordered by their Lance row address (`fragment id`, then offset) ascending, which is the doc id order of one Lucene reader over the whole table, so the order does not depend on how many nodes served the fragments; `_doc` sort means the same order. Each executor ships the row address of every hit to the coordinator over the transport layer only; it is not part of the response. Which tied rows a bare full-text page (no `sort`) contains at its cut is decided by Lance's bounded scan; see [limitations.md](limitations.md).
 - `post_filter` narrows hits without affecting aggregations.
 - `sort` by scalar field, and Painless `script` query / `script` sort.
 - `track_scores: true` alongside `sort` keeps per-hit `_score` populated (Lucene's 4-argument `search(query, size, sort, doDocScores)` overload). `max_score` is the largest per-hit score in the paged window; NaN scores fall through so a sort-only query without `track_scores` reports `max_score: null` matching the shard path.

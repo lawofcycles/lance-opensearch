@@ -26,6 +26,7 @@ import org.opensearch.client.Response;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.test.rest.OpenSearchRestTestCase;
 
@@ -434,6 +435,127 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    /**
+     * Hits with equal scores or equal sort values come back in the same
+     * order from three executors as from one reader over the whole
+     * table. The oracle is again the shard path ({@code "explain":
+     * true}), whose Lucene collectors break ties by doc id, which on the
+     * whole-table reader is fragment order then offset. The doc value
+     * fixture has ties everywhere: {@code lance} is repeated
+     * {@code (i % 5) + 1} times so sixty rows over the three fragments
+     * share the top score, {@code flag} and {@code category} take two
+     * and three distinct values. Every page below crosses a tie group,
+     * and the {@code from} and {@code search_after} pages start inside
+     * one; ids and, where the request has them, sort values must agree
+     * hit for hit.
+     *
+     * <p>The score-ordered shapes carry an explicit {@code _score} sort.
+     * Without one the executor clips the Lance FTS scan to the page
+     * size, and which of the tied rows survive that clip is decided
+     * inside Lance, not by row address, so the shard path is not the
+     * oracle for the bare shape; that shape is checked for the merge
+     * order alone at the end.
+     */
+    public void testTiedHitsOrderMatchesWholeTableAnswer() throws Exception {
+        String suffix = "mn-ties-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 3;
+        int rowsPerFragment = 100;
+        LanceTableFactory.writeHintFixtureTable(scratchDir, tableName, fragments, rowsPerFragment);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String tied = "{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}}";
+        String filtered = "{\"bool\":{\"must\":[" + tied + "],\"filter\":[{\"term\":{\"category\":\"c1\"}}]}}";
+        String byScore = ",\"sort\":[{\"_score\":\"desc\"}]";
+        List<String> shapes = List.of(
+            "\"size\":10,\"query\":" + tied + byScore,
+            "\"from\":5,\"size\":5,\"query\":" + tied + byScore,
+            "\"from\":55,\"size\":10,\"query\":" + tied + byScore,
+            "\"size\":10,\"query\":" + filtered + byScore,
+            "\"from\":3,\"size\":10,\"query\":" + filtered + byScore,
+            "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"flag\":\"desc\"}]",
+            "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"category\":\"asc\"},{\"_score\":\"desc\"}]",
+            "\"from\":7,\"size\":10,\"query\":" + tied + ",\"sort\":[{\"category\":\"asc\"},{\"_score\":\"desc\"}]",
+            "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"rating\":\"desc\"}]"
+        );
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+
+            for (String shape : shapes) {
+                assertFragmentPathMatchesShardPath(indexName, shape);
+            }
+            // The top ten of the score sort are the first ten rows with
+            // i % 5 == 4, all in fragment 0, and the page starting at
+            // 55 crosses from fragment 2 into the next score group.
+            Map<String, Object> top = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(0) + "}")));
+            assertEquals(List.of(4, 9, 14, 19, 24, 29, 34, 39, 44, 49), sourceIds(top));
+            Map<String, Object> crossing = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(2) + "}")));
+            assertEquals(List.of(279, 284, 289, 294, 299, 3, 8, 13, 18, 23), sourceIds(crossing));
+
+            // A _doc sort orders by fragment then offset on the whole
+            // table reader, and the fragment path has to agree on the
+            // ids; its per-node doc ids in the sort array differ from
+            // the shard path's, so only the ids are compared.
+            for (String order : List.of("asc", "desc")) {
+                String shape = "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"_score\":\"desc\"},{\"_doc\":\"" + order + "\"}]";
+                Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
+                Map<String, Object> shardPath = parse(readAll(postJson("/" + indexName + "/_search", "{\"explain\":true," + shape + "}")));
+                assertEquals(shape, hitIdsOf(shardPath), hitIdsOf(fragmentPath));
+            }
+
+            // search_after with a cursor on a tied (field value, score)
+            // pair skips the whole tie group on both paths, and the next
+            // group starts with the lowest row addresses again. A cursor
+            // needs a field clause: OpenSearch rejects search_after on a
+            // bare _score sort.
+            List<String> cursorShapes = List.of(
+                "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"_score\":\"desc\"},{\"flag\":\"desc\"}]",
+                "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"category\":\"asc\"},{\"_score\":\"desc\"}]"
+            );
+            for (String shape : cursorShapes) {
+                Map<String, Object> firstPage = parse(readAll(postJson("/" + indexName + "/_search", "{\"explain\":true," + shape + "}")));
+                List<Object> cursor = sortValues(firstPage);
+                String withCursor = shape + ",\"search_after\":" + toJson(cursor.get(cursor.size() - 1));
+                assertFragmentPathMatchesShardPath(indexName, withCursor);
+            }
+
+            // Bare shape: the page is ten of the sixty tied rows, and
+            // whichever ten the clipped scan kept, the merge lists them
+            // by fragment then offset, the same on every request.
+            String bare = "{\"size\":10,\"query\":" + tied + "}";
+            Map<String, Object> bareFirst = parse(readAll(postJson("/" + indexName + "/_search", bare)));
+            List<String> bareIds = hitIdsOf(bareFirst);
+            assertEquals(10, bareIds.size());
+            List<Double> bareScores = scores(bareFirst);
+            for (Double score : bareScores) {
+                assertEquals(bareScores.get(0), score, 1e-6d);
+            }
+            assertRowAddressAscending(bareIds);
+            for (int i = 0; i < 3; i++) {
+                assertEquals(bareIds, hitIdsOf(parse(readAll(postJson("/" + indexName + "/_search", bare)))));
+            }
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** Ids of the form {@code <fragment>-<offset>} ascend by fragment, then by offset. */
+    private static void assertRowAddressAscending(List<String> ids) {
+        long previous = -1L;
+        for (String id : ids) {
+            int dash = id.indexOf('-');
+            long rowAddr = (Long.parseLong(id.substring(0, dash)) << 32) | Long.parseLong(id.substring(dash + 1));
+            assertTrue("ids not in row address order: " + ids, rowAddr > previous);
+            previous = rowAddr;
+        }
+    }
+
     /** Name of the elected cluster manager, from {@code GET /_cat/cluster_manager}. */
     private static String clusterManagerNodeName() throws IOException {
         String name = readAll(client().performRequest(new Request("GET", "/_cat/cluster_manager?h=node"))).trim();
@@ -661,6 +783,14 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             return parser.map();
         } catch (IOException e) {
             throw new AssertionError("could not parse JSON: " + json, e);
+        }
+    }
+
+    /** JSON of a parsed value (a hit's {@code sort} array here), to feed back as {@code search_after}. */
+    private static String toJson(Object value) throws IOException {
+        try (XContentBuilder builder = MediaTypeRegistry.JSON.contentBuilder()) {
+            builder.value(value);
+            return builder.toString();
         }
     }
 
