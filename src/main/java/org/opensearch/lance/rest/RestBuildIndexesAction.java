@@ -16,7 +16,7 @@ import org.opensearch.lance.index.LanceBuildIndexesRequest;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
-import org.opensearch.rest.action.RestToXContentListener;
+import org.opensearch.rest.action.RestStatusToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
@@ -30,7 +30,9 @@ import org.opensearch.transport.client.node.NodeClient;
  * {@code fts_columns} names Utf8 columns that receive a new FTS index;
  * {@code tokenizer} is forwarded to Lance as that index's
  * {@code base_tokenizer} without an allowlist, so validation of the name
- * is Lance's.
+ * is Lance's. The response status (200 / 400 / 500) is the one the
+ * transport action put on the response; the body always lists
+ * {@code built}, {@code skipped} and {@code failed} per index kind.
  */
 public class RestBuildIndexesAction extends BaseRestHandler {
 
@@ -104,7 +106,7 @@ public class RestBuildIndexesAction extends BaseRestHandler {
             retrain,
             (String) tokenizerRaw
         );
-        return channel -> client.execute(LanceBuildIndexesAction.INSTANCE, build, new RestToXContentListener<>(channel));
+        return channel -> client.execute(LanceBuildIndexesAction.INSTANCE, build, new RestStatusToXContentListener<>(channel));
     }
 
     private static boolean isStringList(Object value) {
