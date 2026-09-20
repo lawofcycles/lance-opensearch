@@ -104,51 +104,71 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
         ActionListener<LanceNamespaceUpdateResponse> listener
     ) {
         if (request.operation() == LanceNamespaceUpdateRequest.Operation.REGISTER) {
-            LanceNamespaceMetadata current = state.metadata().custom(LanceNamespaceMetadata.TYPE);
-            if (current != null) {
-                for (LanceNamespaceMetadata.Entry entry : current.entries()) {
-                    if (entry.rootUri().equals(request.rootUri())) {
-                        // Already registered: acknowledge without a state
-                        // update so a repeated register stays a no-op even
-                        // if the directory has since gone away.
-                        listener.onResponse(new LanceNamespaceUpdateResponse(true, false));
-                        return;
-                    }
-                }
-            }
+            RegisterDecision decision;
             try {
-                validateRegisterPath(request.rootUri());
+                decision = decideRegister(allowedRoots, state.metadata().custom(LanceNamespaceMetadata.TYPE), request.rootUri());
             } catch (Exception e) {
                 listener.onFailure(e);
+                return;
+            }
+            if (decision == RegisterDecision.ALREADY_REGISTERED) {
+                // Acknowledge without a state update so a repeated
+                // register stays a no-op even if the directory has since
+                // gone away.
+                listener.onResponse(new LanceNamespaceUpdateResponse(true, false));
                 return;
             }
         }
         submitUpdate(request, listener);
     }
 
+    /** Outcome of {@link #decideRegister} when the request is not rejected. */
+    enum RegisterDecision {
+        /** Submit the cluster state update. */
+        PROCEED,
+        /** The root is already registered; acknowledge without an update. */
+        ALREADY_REGISTERED
+    }
+
     /**
-     * Rejects a register target that is outside the configured allowlist
-     * or, for filesystem paths, does not exist as a directory. Runs here
-     * rather than in the REST handler so the checks sit behind the
-     * {@link ActionFilters} chain: a caller without the privilege gets
-     * the security plugin's response regardless of whether the path
-     * exists, and a caller with it does not spin the poller against a
-     * typo'd path forever.
+     * Decides what a register request should do, in this order: the
+     * allowlist, then the duplicate lookup, then the filesystem existence
+     * check. Throws {@link OpenSearchStatusException} (403) for a root
+     * outside {@code lance.allowed_table_roots} and
+     * {@link IllegalArgumentException} (400) for a filesystem path that is
+     * not an existing directory.
      *
-     * <p>Object-store schemes ({@code s3://}, {@code gs://}, ...) route
-     * through Lance's own storage layer and cannot be probed from here,
-     * so only the allowlist applies to them; Lance surfaces a missing
-     * root on the first list-tables call.
+     * <p>The allowlist runs before the duplicate lookup so a root that is
+     * already registered but has since been removed from the allowlist is
+     * refused rather than acknowledged; it is a string comparison, so the
+     * ordering costs no I/O and reveals nothing about the path. The
+     * existence check runs last so a repeated register of a known root
+     * stays a no-op even if the directory has gone away.
+     *
+     * <p>These checks live here rather than in the REST handler so they
+     * sit behind the {@link ActionFilters} chain: a caller without the
+     * privilege gets the security plugin's response regardless of whether
+     * the path exists. Object-store schemes ({@code s3://}, {@code gs://},
+     * ...) route through Lance's own storage layer and cannot be probed
+     * from here; Lance surfaces a missing root on the first list-tables
+     * call.
      */
-    private void validateRegisterPath(String path) {
+    static RegisterDecision decideRegister(AllowedTableRoots allowedRoots, LanceNamespaceMetadata current, String path) {
         if (!allowedRoots.allows(path)) {
             throw new OpenSearchStatusException(
                 "path [" + path + "] is not under any of the configured lance.allowed_table_roots",
                 RestStatus.FORBIDDEN
             );
         }
+        if (current != null) {
+            for (LanceNamespaceMetadata.Entry entry : current.entries()) {
+                if (entry.rootUri().equals(path)) {
+                    return RegisterDecision.ALREADY_REGISTERED;
+                }
+            }
+        }
         if (path.contains("://")) {
-            return;
+            return RegisterDecision.PROCEED;
         }
         Path fsPath;
         try {
@@ -162,6 +182,7 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
         if (!Files.isDirectory(fsPath)) {
             throw new IllegalArgumentException("path [" + path + "] exists but is not a directory");
         }
+        return RegisterDecision.PROCEED;
     }
 
     private void submitUpdate(LanceNamespaceUpdateRequest request, ActionListener<LanceNamespaceUpdateResponse> listener) {
