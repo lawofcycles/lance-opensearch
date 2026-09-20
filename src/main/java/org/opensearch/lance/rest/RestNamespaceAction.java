@@ -12,34 +12,40 @@ import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.StorageOptions;
-import org.opensearch.lance.namespace.AllowedTableRoots;
-import org.opensearch.lance.namespace.LanceNamespaceService;
+import org.opensearch.lance.namespace.LanceNamespaceListAction;
+import org.opensearch.lance.namespace.LanceNamespaceListRequest;
+import org.opensearch.lance.namespace.LanceNamespaceUpdateAction;
+import org.opensearch.lance.namespace.LanceNamespaceUpdateRequest;
 import org.opensearch.lance.namespace.LanceNamespaceUpdateResponse;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.RestResponse;
 import org.opensearch.rest.action.RestBuilderListener;
-import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.rest.action.RestStatusToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
- * POST /_lance/namespace {"path": "/data"} registers a catalog directory.
+ * REST surface for namespace registration and listing.
  *
- * <p>The path is validated against the {@code lance.allowed_table_roots}
- * node setting the same way {@link RestAttachAction} does. This keeps a
- * single allowlist covering both entry points that can introduce a new
- * Lance table root to the plugin.
+ * <ul>
+ *   <li>{@code POST /_lance/namespace {"path": "/data"}} registers a
+ *       catalog directory through {@link LanceNamespaceUpdateAction}.</li>
+ *   <li>{@code DELETE /_lance/namespace {"path": "/data"}} unregisters it
+ *       through the same action.</li>
+ *   <li>{@code GET /_lance/namespace} lists the registered roots and
+ *       {@code POST /_lance/namespace/tables {"path": "/data"}} lists the
+ *       tables under one root, both through
+ *       {@link LanceNamespaceListAction}.</li>
+ * </ul>
+ *
+ * <p>The handler only parses the body and hands the request to the
+ * transport action. Allowlist and path existence checks live in the
+ * transport action so they run after a security plugin has evaluated
+ * the caller's privileges, and nothing about the path (whether it is
+ * registered, whether it exists) is revealed to a caller who lacks them.
  */
 public class RestNamespaceAction extends BaseRestHandler {
-
-    private final LanceNamespaceService service;
-    private final AllowedTableRoots allowedRoots;
-
-    public RestNamespaceAction(LanceNamespaceService service, AllowedTableRoots allowedRoots) {
-        this.service = service;
-        this.allowedRoots = allowedRoots;
-    }
 
     @Override
     public String getName() {
@@ -59,12 +65,11 @@ public class RestNamespaceAction extends BaseRestHandler {
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) {
         if (request.method() == RestRequest.Method.GET) {
-            return channel -> {
-                try (XContentBuilder b = channel.newBuilder()) {
-                    b.startObject().field("namespaces", service.namespaces()).endObject();
-                    channel.sendResponse(new BytesRestResponse(RestStatus.OK, b));
-                }
-            };
+            return channel -> client.execute(
+                LanceNamespaceListAction.INSTANCE,
+                LanceNamespaceListRequest.namespaces(),
+                new RestStatusToXContentListener<>(channel)
+            );
         }
         Map<String, Object> body = request.hasContent()
             ? XContentHelper.convertToMap(request.content(), false, request.getMediaType()).v2()
@@ -89,35 +94,11 @@ public class RestNamespaceAction extends BaseRestHandler {
         // path segments fragile. Body-with-path matches the shape of the
         // register / unregister calls right above.
         if (request.path().endsWith("/tables")) {
-            // listTables goes to the namespace's storage (a directory
-            // listing, or an object-store call for s3:// roots), so run
-            // it off the transport thread.
-            return channel -> client.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
-                try {
-                    java.util.Optional<java.util.Set<String>> tables = service.listTables(path);
-                    try (XContentBuilder b = channel.newBuilder()) {
-                        if (tables.isEmpty()) {
-                            // Namespace not registered on this node (or
-                            // applier has not yet built the runtime
-                            // handle). Return 404 so the operator learns
-                            // the path is unknown rather than seeing an
-                            // empty list they might misread as "no
-                            // tables".
-                            b.startObject().field("registered", false).field("path", path).endObject();
-                            channel.sendResponse(new BytesRestResponse(RestStatus.NOT_FOUND, b));
-                            return;
-                        }
-                        java.util.List<String> sorted = new java.util.ArrayList<>(tables.get());
-                        java.util.Collections.sort(sorted);
-                        b.startObject().field("path", path).field("tables", sorted).endObject();
-                        channel.sendResponse(new BytesRestResponse(RestStatus.OK, b));
-                    }
-                } catch (Exception e) {
-                    channel.sendResponse(
-                        new BytesRestResponse(RestStatus.INTERNAL_SERVER_ERROR, "list tables for [" + path + "] failed: " + e.getMessage())
-                    );
-                }
-            });
+            return channel -> client.execute(
+                LanceNamespaceListAction.INSTANCE,
+                LanceNamespaceListRequest.tables(path),
+                new RestStatusToXContentListener<>(channel)
+            );
         }
         if (request.method() == RestRequest.Method.DELETE) {
             // DELETE only stops the polling of that path. Already-surfaced
@@ -125,22 +106,17 @@ public class RestNamespaceAction extends BaseRestHandler {
             // DELETE /{index} if they want the tables to disappear. This
             // matches the "the namespace registration is separate from the
             // OpenSearch index lifecycle" contract in the RFC.
-            return channel -> service.unregister(path, new RestBuilderListener<>(channel) {
-                @Override
-                public RestResponse buildResponse(LanceNamespaceUpdateResponse response, XContentBuilder b) throws Exception {
-                    boolean removed = response.changed();
-                    b.startObject().field("unregistered", removed).field("path", path).endObject();
-                    return new BytesRestResponse(removed ? RestStatus.OK : RestStatus.NOT_FOUND, b);
+            return channel -> client.execute(
+                LanceNamespaceUpdateAction.INSTANCE,
+                LanceNamespaceUpdateRequest.unregister(path),
+                new RestBuilderListener<>(channel) {
+                    @Override
+                    public RestResponse buildResponse(LanceNamespaceUpdateResponse response, XContentBuilder b) throws Exception {
+                        boolean removed = response.changed();
+                        b.startObject().field("unregistered", removed).field("path", path).endObject();
+                        return new BytesRestResponse(removed ? RestStatus.OK : RestStatus.NOT_FOUND, b);
+                    }
                 }
-            });
-        }
-        // POST: register (with allowlist check).
-        if (!allowedRoots.allows(path)) {
-            return channel -> channel.sendResponse(
-                new BytesRestResponse(
-                    RestStatus.FORBIDDEN,
-                    "path [" + path + "] is not under any of the configured lance.allowed_table_roots"
-                )
             );
         }
         StorageOptions storageOptions;
@@ -150,39 +126,19 @@ public class RestNamespaceAction extends BaseRestHandler {
             String message = e.getMessage();
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
         }
-        // Path existence check for filesystem-scheme paths. Object-store
-        // schemes (s3://, gs://, azure://, ...) route through Lance's own
-        // storage layer and cannot be probed from here; skip the check for
-        // those and let Lance surface the error on the first list_tables
-        // call. Filesystem paths that do not exist as a directory are
-        // rejected up front so the poller does not spin against a
-        // typo'd path forever.
-        if (!path.contains("://")) {
-            try {
-                java.nio.file.Path fsPath = java.nio.file.Path.of(path);
-                if (!java.nio.file.Files.exists(fsPath)) {
-                    return channel -> channel.sendResponse(
-                        new BytesRestResponse(RestStatus.BAD_REQUEST, "path [" + path + "] does not exist")
-                    );
+        return channel -> client.execute(
+            LanceNamespaceUpdateAction.INSTANCE,
+            LanceNamespaceUpdateRequest.register(path, storageOptions),
+            new RestBuilderListener<>(channel) {
+                @Override
+                public RestResponse buildResponse(LanceNamespaceUpdateResponse response, XContentBuilder b) throws Exception {
+                    b.startObject()
+                        .field("registered", path)
+                        .field("note", "tables surface as indexes within the poll cadence")
+                        .endObject();
+                    return new BytesRestResponse(RestStatus.OK, b);
                 }
-                if (!java.nio.file.Files.isDirectory(fsPath)) {
-                    return channel -> channel.sendResponse(
-                        new BytesRestResponse(RestStatus.BAD_REQUEST, "path [" + path + "] exists but is not a directory")
-                    );
-                }
-            } catch (java.nio.file.InvalidPathException e) {
-                return channel -> channel.sendResponse(
-                    new BytesRestResponse(RestStatus.BAD_REQUEST, "path [" + path + "] is not a valid filesystem path: " + e.getReason())
-                );
             }
-        }
-        final StorageOptions storageOptionsFinal = storageOptions;
-        return channel -> service.register(path, storageOptionsFinal, new RestBuilderListener<>(channel) {
-            @Override
-            public RestResponse buildResponse(LanceNamespaceUpdateResponse response, XContentBuilder b) throws Exception {
-                b.startObject().field("registered", path).field("note", "tables surface as indexes within the poll cadence").endObject();
-                return new BytesRestResponse(RestStatus.OK, b);
-            }
-        });
+        );
     }
 }

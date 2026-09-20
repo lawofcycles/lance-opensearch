@@ -26,15 +26,15 @@ import org.opensearch.core.xcontent.XContentParser;
 public class LanceAttachIT extends LanceRestTestCase {
 
     public void testAttachRejectsMissingTable() throws IOException {
-        // A table path that does not exist must surface as a client
-        // error, not as an unhandled 500 from Dataset.open.
+        // A table path that does not exist must surface as a 400 from the
+        // transport action, not as an unhandled 500 from Dataset.open.
         String bogus = scratchPathString("missing") + ".lance";
         ResponseException failure = expectThrows(
             ResponseException.class,
             () -> postJson("/_lance/attach", "{\"table\":\"" + bogus + "\"}")
         );
         int status = failure.getResponse().getStatusLine().getStatusCode();
-        assertTrue("expected 4xx / 5xx for missing table, saw: " + status, status >= 400);
+        assertEquals("expected 400 for missing table, saw: " + status, 400, status);
     }
 
     public void testAttachRejectsMissingTableField() throws IOException {
@@ -233,7 +233,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         String unknown = "does-not-exist-" + randomAlphaOfLength(8);
         ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/build_indexes/" + unknown, "{}"));
         int status = failure.getResponse().getStatusLine().getStatusCode();
-        assertTrue("expected 4xx / 5xx for unknown index, saw: " + status, status >= 400);
+        assertEquals("expected 404 for unknown index, saw: " + status, 404, status);
     }
 
     public void testAttachRecreateAtSamePathServesNewContent() throws Exception {
