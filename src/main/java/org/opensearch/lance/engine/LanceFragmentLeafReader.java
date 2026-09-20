@@ -9,7 +9,6 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -37,7 +36,6 @@ import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
-import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.ByteVectorValues;
@@ -74,10 +72,11 @@ import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.Version;
 import org.lance.Dataset;
-import org.lance.index.IndexCriteria;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.opensearch.common.lucene.index.OpenSearchLeafReader;
+import org.opensearch.lance.engine.LanceFragmentSchema.ColumnKind;
+import org.opensearch.lance.engine.LanceFragmentSchema.NumericPrecision;
 
 /**
  * LeafReader over one Lance fragment.
@@ -92,60 +91,17 @@ import org.opensearch.common.lucene.index.OpenSearchLeafReader;
  * {@code _id} and {@code _source} are fetched per hit through
  * {@link #prefetchRows} / {@link #materialiseStoredFields}, so the cost of
  * opening a leaf does not grow with the number of rows in the fragment.
+ *
+ * <p>What the leaf knows about the table (column kinds, primary key,
+ * field infos, take projection) lives in a {@link LanceFragmentSchema}
+ * that is derived once per table version and shared; the leaf itself is
+ * a light view that holds only request scoped state (the hint, the rows
+ * taken for {@code _source}, sparse structures, columns loaded for this
+ * request). A leaf built from a {@link LanceWarmCache} snapshot reads
+ * numeric and boolean columns from the off-heap {@link ColumnStore}
+ * through {@link CachedColumn}s another request may have loaded.
  */
 public final class LanceFragmentLeafReader extends LeafReader {
-
-    /**
-     * Column kind resolved once during construction from the fragment schema
-     * plus the caller-resolved set of Utf8 columns that carry an FTS index
-     * (see {@link #resolveFtsColumns}).
-     * The constructor does not materialise column data; each column moves
-     * from "declared in schema" to "loaded" the first time a Lucene accessor
-     * asks for it, so heap scales with the columns a query touches.
-     */
-    private enum ColumnKind {
-        NUMERIC,       // signed Int / Date / Timestamp / Float32 / Float64 — served as NumericDocValues
-        BOOLEAN,       // Bool — served as NumericDocValues via ConcurrentHashMap
-        TEXT_FTS,      // Utf8 with a Lance FTS index — FieldInfo only, no doc values
-        TEXT_KEYWORD,  // Utf8 without an FTS index — SortedSetDocValues via ords
-        KEYWORD_ARRAY, // List<Utf8> — multi-valued SortedSetDocValues
-        BINARY         // Binary / LargeBinary — FieldInfo only, values fetched for _source
-    }
-
-    /**
-     * Encoding of a value stored inside {@code numericColumns}. Every
-     * numeric column shares the same {@code long[]} storage so that
-     * {@link org.apache.lucene.index.NumericDocValues} can hand back a
-     * {@code long} per doc regardless of the underlying Arrow type. The
-     * enum records how to render that {@code long} back to a JSON value
-     * inside {@link #materialiseStoredFields} and — where relevant — how
-     * downstream OpenSearch field mappers decode the value on read.
-     *
-     * <ul>
-     *   <li>{@link #INTEGER} — a plain integer (default). Emitted as a
-     *       {@code long} in {@code _source}. Signed integer columns and
-     *       date / timestamp columns fall in here; the epoch-millis
-     *       normalisation done inside {@link #readAsLong} means the
-     *       {@code DateFieldMapper} decodes them directly.</li>
-     *   <li>{@link #FLOAT} — a {@code float32} column whose values are
-     *       stored as {@code NumericUtils.floatToSortableInt} results
-     *       widened to {@code long}. OpenSearch's {@code float} field
-     *       type decodes the stored value via
-     *       {@code NumericUtils.sortableIntToFloat((int) longValue)}
-     *       inside {@code SortedNumericDoubleValues}, so range / sort /
-     *       aggregation work through the numeric doc value path
-     *       unchanged. {@code _source} rendering decodes the same way
-     *       so the JSON value matches the original {@code float}.</li>
-     *   <li>{@link #DOUBLE} — a {@code float64} column, mirrored to
-     *       {@code NumericUtils.doubleToSortableLong} on the write side
-     *       and {@code sortableLongToDouble} on the read side.</li>
-     * </ul>
-     */
-    private enum NumericPrecision {
-        INTEGER,
-        FLOAT,
-        DOUBLE
-    }
 
     private final String fieldName;
     /**
@@ -246,20 +202,21 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * every doc the Weight yields.
      */
     private final String filterSql;
-    // Column kind resolved eagerly during construction. Preserves schema order
-    // so materialiseStoredFields emits _source keys in schema order regardless
-    // of which columns have been loaded so far.
-    private final LinkedHashMap<String, ColumnKind> columnKind = new LinkedHashMap<>();
+    /** Shared, immutable description of the table's columns; see {@link LanceFragmentSchema}. */
+    private final LanceFragmentSchema schema;
+    // Column kind in schema order, from the shared schema. Preserves schema
+    // order so materialiseStoredFields emits _source keys in schema order
+    // regardless of which columns have been loaded so far.
+    private final Map<String, ColumnKind> columnKind;
     /**
      * Precision override for numeric columns whose {@link ColumnKind} is
      * {@link ColumnKind#NUMERIC} but whose underlying Arrow type is not
-     * a plain integer or a date/timestamp. Populated during the schema
-     * pass for {@code Float32} and {@code Float64} columns (see
-     * {@link NumericPrecision}); every other numeric column is absent
-     * from the map and defaults to {@link NumericPrecision#INTEGER}
-     * inside the {@code getOrDefault} lookups.
+     * a plain integer or a date/timestamp ({@code Float32} and
+     * {@code Float64}); every other numeric column is absent from the
+     * map and defaults to {@link NumericPrecision#INTEGER} inside the
+     * {@code getOrDefault} lookups.
      */
-    private final Map<String, NumericPrecision> numericPrecision = new ConcurrentHashMap<>();
+    private final Map<String, NumericPrecision> numericPrecision;
     // Per-column monitors so ensureXxxLoaded serialises the Lance scan for
     // that column without blocking other columns. The first accessor pays the
     // scan cost, subsequent readers see the populated map entry via the
@@ -274,6 +231,16 @@ public final class LanceFragmentLeafReader extends LeafReader {
     private final Map<String, FixedBitSet> numericPresence = new ConcurrentHashMap<>();
     private final Map<String, long[]> booleanColumns = new ConcurrentHashMap<>();
     private final Map<String, FixedBitSet> booleanPresence = new ConcurrentHashMap<>();
+    /**
+     * Numeric and boolean columns of this fragment served from the
+     * off-heap {@link ColumnStore}, published by
+     * {@link LanceShardColumnCache} through {@link #publishOffHeapColumn}.
+     * A column present here is complete for every physical row, so it
+     * takes the place of the heap arrays above; the two never hold the
+     * same column at once because the shard cache tries the store first
+     * and only loads into heap when the store has no room.
+     */
+    private final Map<String, CachedColumn> offHeapColumns = new ConcurrentHashMap<>();
     // Utf8 columns without an FTS index surface as keyword. Their sorted
     // term dictionary plus per-doc ordinals let getSortedDocValues serve
     // term, terms, aggregation and sort requests through the doc value
@@ -377,37 +344,15 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
     /**
      * Resolve which Utf8 columns of {@code dataset} carry an FTS
-     * (inverted) index. The result feeds every leaf's schema pass so
-     * the {@code describeIndices} round trip happens once per
-     * {@link LanceDirectoryReader} open instead of once per (leaf,
-     * Utf8 column) pair. On a table with 80 fragments and two text
-     * columns that is 160 JNI calls saved per request.
-     *
-     * @return set of column names that have an index supporting FTS;
-     *         never {@code null}, possibly empty
+     * (inverted) index; see {@link LanceFragmentSchema#resolveFtsColumns}.
      */
     static java.util.Set<String> resolveFtsColumns(Dataset dataset) throws IOException {
-        java.util.Set<String> fts = new java.util.HashSet<>();
-        try {
-            for (org.apache.arrow.vector.types.pojo.Field field : dataset.getSchema().getFields()) {
-                if (!(field.getType() instanceof ArrowType.Utf8)) {
-                    continue;
-                }
-                boolean hasFts = !dataset.describeIndices(
-                    new IndexCriteria.Builder().forColumn(field.getName()).mustSupportFts(true).build()
-                ).isEmpty();
-                if (hasFts) {
-                    fts.add(field.getName());
-                }
-            }
-        } catch (Exception e) {
-            throw new IOException(e);
-        }
-        return fts;
+        return LanceFragmentSchema.resolveFtsColumns(dataset);
     }
 
     /**
-     * Open a leaf over one Lance fragment.
+     * Open a leaf over one Lance fragment, deriving the schema and the
+     * live-row bitmap for this leaf alone.
      *
      * <p>Construction is metadata-only unless the fragment carries a
      * deletion file. The schema pass classifies columns from
@@ -422,6 +367,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * skip the scan entirely. Primary key values are not read here;
      * {@link #materialiseStoredFields} fetches them per hit through
      * {@link #prefetchRows}.
+     *
+     * <p>Callers that open many leaves over one table derive the schema
+     * once with {@link LanceFragmentSchema#derive} and use the
+     * package-private constructor instead; the fragment path does so
+     * through {@link LanceWarmCache}.
      *
      * @param dataset         the Lance dataset; the leaf does not take
      *                        ownership
@@ -451,206 +401,74 @@ public final class LanceFragmentLeafReader extends LeafReader {
         java.util.Set<String> ftsColumns,
         String filterSql
     ) throws IOException {
+        this(
+            dataset,
+            fragmentId,
+            physicalRows,
+            hasDeletionFile,
+            LanceFragmentSchema.derive(dataset, intField, pkType, multiFields, ftsColumns),
+            filterSql
+        );
+    }
+
+    /**
+     * Open a leaf over one Lance fragment with a schema the caller
+     * derived, resolving the live-row bitmap here (one {@code _rowaddr}
+     * scan when the fragment has a deletion file).
+     */
+    LanceFragmentLeafReader(
+        Dataset dataset,
+        int fragmentId,
+        long physicalRows,
+        boolean hasDeletionFile,
+        LanceFragmentSchema schema,
+        String filterSql
+    ) throws IOException {
+        this(dataset, fragmentId, resolveFragmentMeta(dataset, fragmentId, physicalRows, hasDeletionFile), schema, filterSql);
+    }
+
+    private static LanceWarmCache.FragmentMeta resolveFragmentMeta(
+        Dataset dataset,
+        int fragmentId,
+        long physicalRows,
+        boolean hasDeletionFile
+    ) throws IOException {
+        LanceWarmCache.FragmentMeta meta = new LanceWarmCache.FragmentMeta(fragmentId, physicalRows, hasDeletionFile);
+        meta.resolveLiveDocs(dataset);
+        return meta;
+    }
+
+    /**
+     * Open a leaf view over one fragment of a table whose schema and
+     * fragment metadata are already known. Allocates only Lucene-side
+     * objects: no Lance call happens here. {@code meta} must have its
+     * live-row bitmap resolved ({@link LanceWarmCache.FragmentMeta#resolveLiveDocs}).
+     *
+     * @param dataset   shared dataset the leaf scans; not owned
+     * @param fragmentId Lance fragment id this leaf exposes
+     * @param meta      row count and live-row bitmap of the fragment
+     * @param schema    column kinds, primary key and field infos
+     * @param filterSql predicate for request scoped heap column loads, or {@code null}
+     */
+    LanceFragmentLeafReader(Dataset dataset, int fragmentId, LanceWarmCache.FragmentMeta meta, LanceFragmentSchema schema, String filterSql)
+        throws IOException {
         this.dataset = dataset;
         this.fragmentId = fragmentId;
-        this.fieldName = intField;
-        // Empty field name overrides pkType regardless of what the caller
-        // passed in. The engine performs the same override at setting-read
-        // time, but the reader is also invoked from
-        // LanceDirectoryReader.openForFragments where the caller may pass
-        // a mismatched pair; canonicalising here keeps every accessor
-        // agreeing on "no PK" without needing the caller to zip them.
-        this.pkType = intField.isEmpty() ? org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.NONE : pkType;
-        this.maxDoc = (int) physicalRows;
+        this.schema = schema;
+        this.fieldName = schema.fieldName();
+        this.pkType = schema.pkType();
+        this.maxDoc = meta.physicalRows();
         this.filterSql = filterSql;
-        // Flatten the multi-fields spec into "<sub>" → "<base>" lookup so
-        // getSortedDocValues("body.raw") can route to the base column's
-        // ord data structure without re-parsing the spec. Only keyword
-        // sub-fields are supported today, so any
-        // sub-field type that is not "keyword" is skipped defensively
-        // rather than errored out — the attach-time validation is where
-        // the error surfaces.
-        java.util.LinkedHashMap<String, String> subToBase = new java.util.LinkedHashMap<>();
-        java.util.Set<String> basesWithKeywordSub = new java.util.HashSet<>();
-        if (multiFields != null && !multiFields.isEmpty()) {
-            for (java.util.Map.Entry<String, java.util.LinkedHashMap<String, String>> entry : multiFields.entrySet()) {
-                String baseName = entry.getKey();
-                for (java.util.Map.Entry<String, String> sub : entry.getValue().entrySet()) {
-                    if (!"keyword".equals(sub.getValue())) {
-                        continue;
-                    }
-                    subToBase.put(baseName + "." + sub.getKey(), baseName);
-                    basesWithKeywordSub.add(baseName);
-                }
-            }
-        }
-        this.keywordSubFields = java.util.Collections.unmodifiableMap(subToBase);
-        this.basesWithKeywordSub = java.util.Collections.unmodifiableSet(basesWithKeywordSub);
-
-        // Schema pass: classify every column we might surface. FTS
-        // presence for Utf8 columns comes from the caller-resolved
-        // ftsColumns set (one describeIndices sweep per reader, see
-        // resolveFtsColumns) rather than a per-leaf JNI call. This is
-        // metadata only — no data pages are read here.
-        try {
-            for (org.apache.arrow.vector.types.pojo.Field field : dataset.getSchema().getFields()) {
-                ColumnKind kind = classify(field);
-                if (kind == null) {
-                    continue;
-                }
-                if (kind == ColumnKind.TEXT_FTS) {
-                    kind = ftsColumns.contains(field.getName()) ? ColumnKind.TEXT_FTS : ColumnKind.TEXT_KEYWORD;
-                }
-                columnKind.put(field.getName(), kind);
-                // Remember the precision of Float32 / Float64 columns
-                // so materialiseStoredFields and readAsLong can round
-                // trip them through the shared long[] storage. All
-                // other numeric columns default to INTEGER via
-                // getOrDefault and no entry is written here.
-                if (field.getType() instanceof ArrowType.FloatingPoint fp) {
-                    if (fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE) {
-                        numericPrecision.put(field.getName(), NumericPrecision.FLOAT);
-                    } else if (fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE) {
-                        numericPrecision.put(field.getName(), NumericPrecision.DOUBLE);
-                    }
-                }
-            }
-        } catch (Exception e) {
-            throw new IOException(e);
-        }
-        // An UNSIGNED_LONG primary key sits on a Lance UInt64 column that
-        // classify() otherwise refuses (unsigned integers are not
-        // surfaced by default). Force it into NUMERIC here so the PK
-        // gets a NumericDocValues entry alongside signed integer
-        // columns; readAsLong already returns the unsigned bit pattern
-        // for UInt8Vector, so the doc value path is otherwise
-        // untouched. Only this one column is elevated; other UInt64
-        // columns stay unsurfaced.
-        if (this.pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.UNSIGNED_LONG && !intField.isEmpty()) {
-            columnKind.putIfAbsent(intField, ColumnKind.NUMERIC);
-        }
-
-        // Projection for the per-hit row take (see prefetchRows): every
-        // surfaced column in schema order so _source keys come out in a
-        // stable order, plus the PK column appended when its Arrow type
-        // is one classify() declines (the take still needs it for _id).
-        List<String> take = new java.util.ArrayList<>(columnKind.keySet());
-        this.sourceColumnCount = take.size();
-        int pkIndex = -1;
-        if (this.pkType != org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.NONE) {
-            pkIndex = take.indexOf(intField);
-            if (pkIndex < 0) {
-                take.add(intField);
-                pkIndex = take.size() - 1;
-            }
-        }
-        this.pkTakeIndex = pkIndex;
-        this.takeColumns = Collections.unmodifiableList(take);
-
-        // liveDocs: Lucene's MatchAllDocsQuery and the doc value
-        // iterators walk 0..maxDoc directly, so deleted physical rows
-        // must be masked here. Fragments without a deletion file have
-        // no deleted rows and skip the scan; fragments with one run a
-        // _rowaddr-only scan (8 bytes per row, no payload columns) to
-        // learn which offsets survive. Lance-driven scans (FTS, knn,
-        // scalar filter) already skip deleted rows on their own, so
-        // this bitmap only has to cover the Lucene-driven iteration.
-        if (hasDeletionFile) {
-            FixedBitSet live = new FixedBitSet(maxDoc);
-            int liveCount = 0;
-            ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
-                .columns(Collections.emptyList())
-                .withRowAddress(true)
-                .build();
-            try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
-                while (reader.loadNextBatch()) {
-                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                    for (int i = 0; i < root.getRowCount(); i++) {
-                        int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
-                        live.set(offset);
-                        liveCount++;
-                    }
-                }
-            } catch (Exception e) {
-                throw new IOException(e);
-            }
-            this.numDocs = liveCount;
-            this.liveDocs = liveCount == maxDoc ? null : live;
-        } else {
-            this.numDocs = maxDoc;
-            this.liveDocs = null;
-        }
-
-        // FieldInfos derived from columnKind. Order matches the schema pass
-        // above; field numbers start at 10 to leave 1 / 2 free for _id and
-        // _source (see storedOnly). One entry per column: NUMERIC / BOOLEAN
-        // → NumericDocValues, TEXT_KEYWORD / KEYWORD_ARRAY → SortedSet,
-        // TEXT_FTS / BINARY → no doc values but the FieldInfo exists so the
-        // security plugin's FLS wrapper can drop them by name (see LanceFtsQuery
-        // FLS-bypass check; see e21bf3c for the original bug).
-        //
-        // Multi-fields append a synthetic SORTED_SET entry per keyword
-        // sub-field so getSortedDocValues / getSortedSetDocValues on the
-        // sub-field name resolve, and so FLS field enumeration sees them.
-        // The underlying data lives on the base column; the sub-field
-        // entry only exists in the FieldInfos, not in columnKind.
-        List<FieldInfo> infos = new java.util.ArrayList<>();
-        int number = 10;
-        for (Map.Entry<String, ColumnKind> entry : columnKind.entrySet()) {
-            DocValuesType dvType = switch (entry.getValue()) {
-                case NUMERIC, BOOLEAN -> DocValuesType.NUMERIC;
-                case TEXT_KEYWORD, KEYWORD_ARRAY -> DocValuesType.SORTED_SET;
-                case TEXT_FTS, BINARY -> DocValuesType.NONE;
-            };
-            infos.add(
-                new FieldInfo(
-                    entry.getKey(),
-                    number++,
-                    false,
-                    true,
-                    false,
-                    IndexOptions.NONE,
-                    dvType,
-                    DocValuesSkipIndexType.NONE,
-                    -1,
-                    Collections.emptyMap(),
-                    0,
-                    0,
-                    0,
-                    0,
-                    VectorEncoding.FLOAT32,
-                    VectorSimilarityFunction.EUCLIDEAN,
-                    false,
-                    false
-                )
-            );
-        }
-        for (String subName : keywordSubFields.keySet()) {
-            infos.add(
-                new FieldInfo(
-                    subName,
-                    number++,
-                    false,
-                    true,
-                    false,
-                    IndexOptions.NONE,
-                    DocValuesType.SORTED_SET,
-                    DocValuesSkipIndexType.NONE,
-                    -1,
-                    Collections.emptyMap(),
-                    0,
-                    0,
-                    0,
-                    0,
-                    VectorEncoding.FLOAT32,
-                    VectorSimilarityFunction.EUCLIDEAN,
-                    false,
-                    false
-                )
-            );
-        }
-        this.fieldInfos = new FieldInfos(infos.toArray(new FieldInfo[0]));
+        this.keywordSubFields = schema.keywordSubFields();
+        this.basesWithKeywordSub = schema.basesWithKeywordSub();
+        this.columnKind = schema.columnKind();
+        this.numericPrecision = schema.numericPrecision();
+        this.sourceColumnCount = schema.sourceColumnCount();
+        this.pkTakeIndex = schema.pkTakeIndex();
+        this.takeColumns = schema.takeColumns();
+        this.numDocs = meta.numDocs();
+        this.liveDocs = meta.liveDocs();
+        this.fieldInfos = schema.fieldInfos();
 
         ByteBuffersDirectory bridgeDir = new ByteBuffersDirectory();
         try (IndexWriter writer = new IndexWriter(bridgeDir, new IndexWriterConfig())) {
@@ -658,54 +476,6 @@ public final class LanceFragmentLeafReader extends LeafReader {
             writer.commit();
         }
         this.cacheLifetimeBridge = DirectoryReader.open(bridgeDir);
-    }
-
-    /**
-     * Assign a column kind based on its Arrow field. Returns {@code null} for
-     * columns we do not surface (unsigned integers, vectors, structs, decimals
-     * etc.). {@code Utf8} columns are returned as {@link ColumnKind#TEXT_FTS}
-     * here and refined to {@link ColumnKind#TEXT_KEYWORD} by the caller after
-     * a {@code describeIndices} call — the caller can only issue the FTS check
-     * once it knows the column is a Utf8 column, so it does the refinement.
-     */
-    private static ColumnKind classify(org.apache.arrow.vector.types.pojo.Field field) {
-        ArrowType type = field.getType();
-        if (type instanceof ArrowType.Int intType && intType.getIsSigned()) {
-            return ColumnKind.NUMERIC;
-        }
-        if (type instanceof ArrowType.Bool) {
-            return ColumnKind.BOOLEAN;
-        }
-        if (type instanceof ArrowType.Utf8) {
-            return ColumnKind.TEXT_FTS; // caller may refine to TEXT_KEYWORD
-        }
-        if (type instanceof ArrowType.Date || type instanceof ArrowType.Timestamp) {
-            return ColumnKind.NUMERIC;
-        }
-        if (type instanceof ArrowType.FloatingPoint fp) {
-            // Float16 stays unsurfaced today: neither the OpenSearch
-            // `half_float` field type nor the Lance Java SDK's
-            // Float2Vector round-trip is wired through the reader.
-            // Float32 / Float64 both fold into the shared numeric doc
-            // value path; the precision is remembered separately in
-            // numericPrecision so _source and readAsLong can encode /
-            // decode via NumericUtils.floatToSortableInt or
-            // doubleToSortableLong.
-            if (fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE
-                || fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE) {
-                return ColumnKind.NUMERIC;
-            }
-            return null;
-        }
-        if (type instanceof ArrowType.List
-            && field.getChildren().size() == 1
-            && field.getChildren().get(0).getType() instanceof ArrowType.Utf8) {
-            return ColumnKind.KEYWORD_ARRAY;
-        }
-        if (type instanceof ArrowType.Binary || type instanceof ArrowType.LargeBinary) {
-            return ColumnKind.BINARY;
-        }
-        return null;
     }
 
     private Object columnLock(String name) {
@@ -747,29 +517,34 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
     /**
      * Same as {@link #ensureNumericLoaded(String)}; {@code useShardCache}
-     * false forces the per-fragment scan even when a
+     * false keeps the load to this fragment even when a
      * {@link LanceShardColumnCache} is installed. A doc values instance
      * that leaves the sparse path for one doc outside its hint uses this
      * so the fallback costs one fragment, not one scan of every fragment
-     * in the reader; the other leaves keep serving their hinted rows.
+     * in the reader; the other leaves keep serving their hinted rows. The
+     * fragment is still served from the off-heap store when the shard
+     * cache has one, and scanned into heap otherwise.
      */
     private void ensureNumericLoaded(String name, boolean useShardCache) throws IOException {
-        if (numericColumns.containsKey(name)) {
+        if (numericColumns.containsKey(name) || offHeapColumns.containsKey(name)) {
             return;
         }
         LanceShardColumnCache cache = shardColumnCache;
         if (cache != null && useShardCache) {
             // Delegate to the shard-level coordinator: one scan for
             // the whole reader instead of one per leaf. After the
-            // cache returns, publishNumericColumn below has put the
-            // fragment's slice into this leaf's numericColumns /
-            // numericPresence maps, so the containsKey short-circuit
-            // fires on subsequent calls.
+            // cache returns, publishNumericColumn or
+            // publishOffHeapColumn below has put the fragment's slice
+            // into this leaf's maps, so the short-circuit above fires
+            // on subsequent calls.
             cache.loadNumericColumn(name);
             return;
         }
         synchronized (columnLock(name)) {
-            if (numericColumns.containsKey(name)) {
+            if (numericColumns.containsKey(name) || offHeapColumns.containsKey(name)) {
+                return;
+            }
+            if (cache != null && cache.publishFromStoreForLeaf(this, name, false)) {
                 return;
             }
             long[] col = new long[maxDoc];
@@ -816,6 +591,22 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     /**
+     * Called by {@link LanceShardColumnCache} when the off-heap
+     * {@link ColumnStore} holds (or has just loaded) the numeric or
+     * boolean column {@code name} for this fragment. The column is
+     * pinned by the shard cache for the life of the request, so the
+     * doc values instances created afterwards read it directly.
+     */
+    void publishOffHeapColumn(String name, CachedColumn column) {
+        offHeapColumns.put(name, column);
+    }
+
+    /** Off-heap column of {@code name} published for this leaf, or {@code null}. */
+    CachedColumn offHeapColumn(String name) {
+        return offHeapColumns.get(name);
+    }
+
+    /**
      * Attach a {@link LanceShardColumnCache} to this leaf. Called
      * from {@link LanceDirectoryReader}'s open paths after the full
      * leaf list has been assembled so the cache has references to
@@ -833,7 +624,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     private void ensureBooleanLoaded(String name, boolean useShardCache) throws IOException {
-        if (booleanColumns.containsKey(name)) {
+        if (booleanColumns.containsKey(name) || offHeapColumns.containsKey(name)) {
             return;
         }
         LanceShardColumnCache cache = shardColumnCache;
@@ -842,7 +633,10 @@ public final class LanceFragmentLeafReader extends LeafReader {
             return;
         }
         synchronized (columnLock(name)) {
-            if (booleanColumns.containsKey(name)) {
+            if (booleanColumns.containsKey(name) || offHeapColumns.containsKey(name)) {
+                return;
+            }
+            if (cache != null && cache.publishFromStoreForLeaf(this, name, true)) {
                 return;
             }
             long[] col = new long[maxDoc];
@@ -1128,8 +922,14 @@ public final class LanceFragmentLeafReader extends LeafReader {
     boolean isColumnFullyLoaded(String name) {
         return numericColumns.containsKey(name)
             || booleanColumns.containsKey(name)
+            || offHeapColumns.containsKey(name)
             || keywordOrds.containsKey(name)
             || keywordArrayOrds.containsKey(name);
+    }
+
+    /** Whether column {@code name} is served from the off-heap column store on this leaf, for tests. */
+    boolean isServingOffHeap(String name) {
+        return offHeapColumns.containsKey(name);
     }
 
     /**
@@ -1406,6 +1206,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
         private boolean resolved;
         private long[] column;
         private FixedBitSet presence;
+        private CachedColumn offHeap;
         private SparseNumeric sparse;
         private int sparseIndex = -1;
         private int doc = -1;
@@ -1429,8 +1230,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 sparse = taken;
                 return;
             }
-            Map<String, long[]> fullColumns = isBoolean ? booleanColumns : numericColumns;
-            if (fullColumns.containsKey(name)) {
+            if (hasFullColumn()) {
                 useFullColumn();
                 return;
             }
@@ -1441,9 +1241,15 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     return;
                 }
             }
-            // No usable hint: the whole column is needed, and the shard
-            // cache loads it for every leaf of the reader in one scan.
+            // No usable hint: the whole column is needed. The shard cache
+            // serves it from the off-heap column store when it holds or
+            // can load the column, and loads it into heap for every leaf
+            // of the reader in one scan otherwise.
             loadFullColumn(true);
+        }
+
+        private boolean hasFullColumn() {
+            return offHeapColumns.containsKey(name) || (isBoolean ? booleanColumns : numericColumns).containsKey(name);
         }
 
         private void loadFullColumn(boolean useShardCache) throws IOException {
@@ -1456,8 +1262,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
         }
 
         private void useFullColumn() {
-            column = isBoolean ? booleanColumns.get(name) : numericColumns.get(name);
-            presence = isBoolean ? booleanPresence.get(name) : numericPresence.get(name);
+            offHeap = offHeapColumns.get(name);
+            if (offHeap == null) {
+                column = isBoolean ? booleanColumns.get(name) : numericColumns.get(name);
+                presence = isBoolean ? booleanPresence.get(name) : numericPresence.get(name);
+            }
             if (sparse != null) {
                 sparse.fellBack = true;
                 sparse = null;
@@ -1466,7 +1275,10 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
         @Override
         public long longValue() {
-            return sparse != null ? sparse.values[sparseIndex] : column[doc];
+            if (sparse != null) {
+                return sparse.values[sparseIndex];
+            }
+            return offHeap != null ? offHeap.get(doc) : column[doc];
         }
 
         @Override
@@ -1492,7 +1304,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             // presence bit is clear for Arrow-null docs; exists / term /
             // range / agg / sort all check advanceExact and stop reading
             // the value here.
-            return presence.get(target);
+            return offHeap != null ? offHeap.isSet(target) : presence.get(target);
         }
 
         @Override
@@ -1516,11 +1328,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
             // not call advanceExact, so the null bitmap must also be honoured here
             // - otherwise exists / _field_names checks count every row regardless
             // of presence.
-            for (int candidate = target; candidate < column.length; candidate++) {
+            for (int candidate = target; candidate < maxDoc; candidate++) {
                 if (liveDocs != null && !liveDocs.get(candidate)) {
                     continue;
                 }
-                if (presence.get(candidate)) {
+                if (offHeap != null ? offHeap.isSet(candidate) : presence.get(candidate)) {
                     doc = candidate;
                     return doc;
                 }
@@ -1537,7 +1349,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             if (!resolved) {
                 return maxDoc;
             }
-            return sparse != null ? sparse.offsets.length : column.length;
+            return sparse != null ? sparse.offsets.length : maxDoc;
         }
     }
 

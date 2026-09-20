@@ -80,8 +80,14 @@ public final class LanceDirectoryReader extends DirectoryReader {
     // so this reader takes ownership of it and closes it when the reader is
     // closed. Lucene's ReferenceManager releases the previous reader once the
     // last in-flight searcher completes, which is the point where we also want
-    // to release the Lance native handle it was reading from.
+    // to release the Lance native handle it was reading from. A reader built
+    // over a LanceWarmCache snapshot (openForSnapshot) borrows the snapshot's
+    // dataset instead and leaves it open for the next request.
     private final Dataset dataset;
+    private final boolean ownsDataset;
+    // Column coordinator of this reader's leaves; its store pins are
+    // released when the reader closes.
+    private final LanceShardColumnCache columnCache;
     // Bridge to Lucene's cache lifecycle at the composite reader level. See the
     // matching field on LanceFragmentLeafReader for the rationale: OpenSearch's
     // request cache keys entries by IndexReader.CacheKey, and only Lucene's own
@@ -157,7 +163,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         for (LanceFragmentLeafReader raw : rawLeaves) {
             raw.setShardColumnCache(cache);
         }
-        return openWithLeaves(directory, commit, dataset, leaves, sumDataFileSizes(fragments));
+        return openWithLeaves(directory, commit, dataset, true, cache, leaves, sumDataFileSizes(fragments));
     }
 
     /**
@@ -231,10 +237,11 @@ public final class LanceDirectoryReader extends DirectoryReader {
         java.util.Set<Integer> wanted = new java.util.HashSet<>(fragmentIds);
         List<LeafReader> leaves = new ArrayList<>(wanted.size());
         List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>(wanted.size());
-        // One describeIndices sweep for the whole reader; every leaf's
-        // schema pass reads the resulting set instead of calling into
+        // One describeIndices sweep and one schema pass for the whole
+        // reader; every leaf shares the result instead of calling into
         // Lance per (leaf, Utf8 column).
-        java.util.Set<String> ftsColumns = LanceFragmentLeafReader.resolveFtsColumns(dataset);
+        java.util.Set<String> ftsColumns = LanceFragmentSchema.resolveFtsColumns(dataset);
+        LanceFragmentSchema schema = LanceFragmentSchema.derive(dataset, intField, pkType, multiFields, ftsColumns);
         for (Fragment fragment : dataset.getFragments()) {
             if (!wanted.contains(fragment.getId())) {
                 continue;
@@ -244,10 +251,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
                 fragment.getId(),
                 fragment.metadata().getPhysicalRows(),
                 fragment.metadata().getDeletionFile() != null,
-                intField,
-                pkType,
-                multiFields,
-                ftsColumns,
+                schema,
                 filterSql
             );
             rawLeaves.add(raw);
@@ -262,13 +266,67 @@ public final class LanceDirectoryReader extends DirectoryReader {
         }
         // Per-request fragment readers do not report shard stats, so skip
         // the manifest walk here.
-        return openWithLeaves(directory, commit, dataset, leaves, DataFileSizes.NONE);
+        return openWithLeaves(directory, commit, dataset, true, cache, leaves, DataFileSizes.NONE);
+    }
+
+    /**
+     * Open a reader over {@code fragmentIds} of a cached
+     * {@link LanceWarmCache.Snapshot}. Every leaf is a view over the
+     * snapshot's shared dataset, fragment metadata and schema, so this
+     * call allocates Lucene-side objects only; the single Lance call it
+     * can make is the one {@code _rowaddr} scan that resolves the live-row
+     * bitmap of a fragment with a deletion file the first time any request
+     * opens it. The returned reader does not own the dataset (the snapshot
+     * does) and unpins the store columns its leaves were served when it
+     * closes; the caller releases its lease on the snapshot after closing
+     * the reader.
+     *
+     * <p>Fragment ids the snapshot does not list are skipped, as in
+     * {@link #openForFragments}.
+     *
+     * @param directory   Lucene directory the reader reports to Lucene's
+     *                    bookkeeping; never written
+     * @param snapshot    snapshot the caller holds a lease on
+     * @param columnStore off-heap store to serve numeric and boolean
+     *                    columns from, or {@code null} to load into heap
+     *                    for this request (cache disabled)
+     * @param fragmentIds Lance fragment ids to expose as leaves
+     * @param filterSql   predicate for request scoped heap column loads,
+     *                    or {@code null}; never applied to store loads
+     */
+    public static LanceDirectoryReader openForSnapshot(
+        Directory directory,
+        LanceWarmCache.Snapshot snapshot,
+        ColumnStore columnStore,
+        List<Integer> fragmentIds,
+        String filterSql
+    ) throws IOException {
+        java.util.Set<Integer> wanted = new java.util.HashSet<>(fragmentIds);
+        List<LeafReader> leaves = new ArrayList<>(wanted.size());
+        List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>(wanted.size());
+        Dataset dataset = snapshot.dataset();
+        for (LanceWarmCache.FragmentMeta meta : snapshot.fragments()) {
+            if (!wanted.contains(meta.id())) {
+                continue;
+            }
+            meta.resolveLiveDocs(dataset);
+            LanceFragmentLeafReader raw = new LanceFragmentLeafReader(dataset, meta.id(), meta, snapshot.schema(), filterSql);
+            rawLeaves.add(raw);
+            leaves.add(LanceSequentialLeafReader.wrap(raw));
+        }
+        LanceShardColumnCache cache = new LanceShardColumnCache(dataset, filterSql, rawLeaves, columnStore, snapshot.key());
+        for (LanceFragmentLeafReader raw : rawLeaves) {
+            raw.setShardColumnCache(cache);
+        }
+        return openWithLeaves(directory, null, dataset, false, cache, leaves, DataFileSizes.NONE);
     }
 
     private static LanceDirectoryReader openWithLeaves(
         Directory directory,
         IndexCommit commit,
         Dataset dataset,
+        boolean ownsDataset,
+        LanceShardColumnCache columnCache,
         List<LeafReader> leaves,
         DataFileSizes dataFileSizes
     ) throws IOException {
@@ -278,7 +336,16 @@ public final class LanceDirectoryReader extends DirectoryReader {
             writer.commit();
         }
         DirectoryReader bridge = DirectoryReader.open(bridgeDir);
-        return new LanceDirectoryReader(directory, leaves.toArray(new LeafReader[0]), commit, dataset, bridge, dataFileSizes);
+        return new LanceDirectoryReader(
+            directory,
+            leaves.toArray(new LeafReader[0]),
+            commit,
+            dataset,
+            ownsDataset,
+            columnCache,
+            bridge,
+            dataFileSizes
+        );
     }
 
     private LanceDirectoryReader(
@@ -286,12 +353,16 @@ public final class LanceDirectoryReader extends DirectoryReader {
         LeafReader[] leaves,
         IndexCommit commit,
         Dataset dataset,
+        boolean ownsDataset,
+        LanceShardColumnCache columnCache,
         DirectoryReader cacheLifetimeBridge,
         DataFileSizes dataFileSizes
     ) throws IOException {
         super(directory, leaves, null);
         this.commit = commit;
         this.dataset = dataset;
+        this.ownsDataset = ownsDataset;
+        this.columnCache = columnCache;
         this.cacheLifetimeBridge = cacheLifetimeBridge;
         this.dataFileSizes = dataFileSizes;
     }
@@ -395,11 +466,16 @@ public final class LanceDirectoryReader extends DirectoryReader {
         } catch (IOException e) {
             first = e;
         }
-        try {
-            dataset.close();
-        } catch (Exception e) {
-            if (first == null && e instanceof IOException) {
-                first = (IOException) e;
+        if (columnCache != null) {
+            columnCache.releasePins();
+        }
+        if (ownsDataset) {
+            try {
+                dataset.close();
+            } catch (Exception e) {
+                if (first == null && e instanceof IOException) {
+                    first = (IOException) e;
+                }
             }
         }
         if (first != null) {
