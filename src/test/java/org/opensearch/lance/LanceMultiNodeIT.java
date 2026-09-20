@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -346,6 +347,93 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    /**
+     * Every FTS shape answered by executors that hold a proper subset
+     * of the fragments must equal the answer over the whole table. The
+     * oracle is the shard path: {@code "explain": true} routes the same
+     * request to the one shard, whose reader holds every fragment, so
+     * its Lance scan runs unrestricted on one node. Compared per shape:
+     * hit ids and order, scores, sort values, {@code hits.total},
+     * and terms buckets. The interleaved fixture gives every row a
+     * distinct score for {@code lance} and a unique token
+     * {@code tok<i>}, so a top 10 has no tie at its boundary.
+     */
+    public void testFtsOnSubsetExecutorsMatchesWholeTableAnswer() throws Exception {
+        String suffix = "mn-fts-subset-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 3;
+        int rowsPerFragment = 100;
+        LanceTableFactory.writeInterleavedTable(scratchDir, tableName, fragments, rowsPerFragment);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String oneHit = "{\"lance_match\":{\"field\":\"body\",\"query\":\"tok137\"}}";
+        String manyHits = "{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}}";
+        String terms = "\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10}}}";
+        String filtered = "{\"bool\":{\"must\":[" + manyHits + "],\"filter\":[{\"term\":{\"category\":\"c1\"}}]}}";
+        List<String> shapes = List.of(
+            "\"size\":10,\"query\":" + oneHit,
+            "\"size\":10,\"query\":" + manyHits,
+            "\"size\":10,\"query\":" + oneHit + ",\"sort\":[{\"ts\":\"desc\"}]",
+            "\"size\":10,\"query\":" + manyHits + ",\"sort\":[{\"ts\":\"desc\"}]",
+            "\"size\":10,\"query\":" + filtered,
+            "\"size\":10,\"track_total_hits\":true,\"query\":" + manyHits,
+            "\"size\":0,\"query\":" + oneHit + "," + terms,
+            "\"size\":0,\"query\":" + manyHits + "," + terms
+        );
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+
+            for (String shape : shapes) {
+                assertFragmentPathMatchesShardPath(indexName, shape);
+            }
+            // Analytic check of the bare top 10, independent of the
+            // oracle: the score grows with the id, row i is
+            // (i % 3)-(i / 3).
+            Map<String, Object> top = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(1) + "}")));
+            assertEquals(List.of(299, 298, 297, 296, 295, 294, 293, 292, 291, 290), sourceIds(top));
+            assertEquals(fragments * rowsPerFragment, extractIntPath(top, "hits", "total", "value"));
+            Map<String, Object> single = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(0) + "}")));
+            assertEquals(List.of(137), sourceIds(single));
+            assertEquals(1, extractIntPath(single, "hits", "total", "value"));
+
+            // With the probe limit below the match count, the shapes
+            // that need every match repeat their scan restricted to the
+            // node's fragments and must still agree with the oracle.
+            updateClusterSetting("lance.fts.subset_probe_limit", "50");
+            for (String shape : shapes) {
+                assertFragmentPathMatchesShardPath(indexName, shape);
+            }
+
+            // The coordinator logs the fragments it hands to each node;
+            // every data node must have received a proper subset, or the
+            // requests above never exercised the subset path.
+            int dataNodes = dataNodeCount();
+            assertEquals("fixture assumes one fragment per data node", fragments, dataNodes);
+            assertBusy(() -> {
+                Map<String, String> assignments = fanOutAssignments(indexName);
+                assertEquals("fragments went to " + assignments, dataNodes, assignments.size());
+                for (Map.Entry<String, String> assignment : assignments.entrySet()) {
+                    assertEquals(
+                        "node " + assignment.getKey() + " got " + assignment.getValue(),
+                        1,
+                        assignment.getValue().split(",").length
+                    );
+                }
+            });
+        } finally {
+            try {
+                updateClusterSetting("lance.fts.subset_probe_limit", null);
+            } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     /** Name of the elected cluster manager, from {@code GET /_cat/cluster_manager}. */
     private static String clusterManagerNodeName() throws IOException {
         String name = readAll(client().performRequest(new Request("GET", "/_cat/cluster_manager?h=node"))).trim();
@@ -365,6 +453,97 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();
             return (String) node.get("name");
         }
+    }
+
+    /**
+     * Run {@code shape} (the body of a {@code _search} request without
+     * its outer braces) through the fragment path and, with
+     * {@code "explain": true} added, through the shard path, and
+     * compare the parts of the two responses that describe the result.
+     */
+    private static void assertFragmentPathMatchesShardPath(String indexName, String shape) throws IOException {
+        Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
+        Map<String, Object> shardPath = parse(readAll(postJson("/" + indexName + "/_search", "{\"explain\":true," + shape + "}")));
+        assertEquals(shape, hitIdsOf(shardPath), hitIdsOf(fragmentPath));
+        assertEquals(shape, sortValues(shardPath), sortValues(fragmentPath));
+        List<Double> expectedScores = scoresOrNull(shardPath);
+        List<Double> actualScores = scoresOrNull(fragmentPath);
+        assertEquals(shape, expectedScores.size(), actualScores.size());
+        for (int i = 0; i < expectedScores.size(); i++) {
+            Double expected = expectedScores.get(i);
+            Double actual = actualScores.get(i);
+            if (expected == null || actual == null) {
+                assertEquals(shape + " hit " + i, expected, actual);
+            } else {
+                assertEquals(shape + " hit " + i, expected, actual, 1e-6d);
+            }
+        }
+        assertEquals(shape, extractIntPath(shardPath, "hits", "total", "value"), extractIntPath(fragmentPath, "hits", "total", "value"));
+        assertEquals(shape, relation(shardPath), relation(fragmentPath));
+        assertEquals(shape, bucketSummary(shardPath), bucketSummary(fragmentPath));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String relation(Map<String, Object> response) {
+        Map<String, Object> hits = (Map<String, Object>) response.get("hits");
+        return (String) ((Map<String, Object>) hits.get("total")).get("relation");
+    }
+
+    private static List<String> hitIdsOf(Map<String, Object> response) {
+        List<String> ids = new ArrayList<>();
+        for (Map<String, Object> hit : hitList(response)) {
+            ids.add((String) hit.get("_id"));
+        }
+        return ids;
+    }
+
+    /** {@code _score} of every hit; null entries where the hit carries no score (sorted requests). */
+    private static List<Double> scoresOrNull(Map<String, Object> response) {
+        List<Double> scores = new ArrayList<>();
+        for (Map<String, Object> hit : hitList(response)) {
+            Object score = hit.get("_score");
+            scores.add(score == null ? null : ((Number) score).doubleValue());
+        }
+        return scores;
+    }
+
+    /** {@code key=doc_count} of every terms bucket, or an empty list without aggregations. */
+    private static List<String> bucketSummary(Map<String, Object> response) {
+        if (response.get("aggregations") == null) {
+            return List.of();
+        }
+        List<String> summary = new ArrayList<>();
+        for (Map<String, Object> bucket : buckets(response)) {
+            summary.add(bucket.get("key") + "=" + ((Number) bucket.get("doc_count")).longValue());
+        }
+        return summary;
+    }
+
+    /**
+     * The fragment lists the coordinator logged per node for
+     * {@code indexName}, keyed by node id, from the cluster logs. The
+     * same assignment is logged on every request, so the map holds one
+     * entry per node.
+     */
+    private static Map<String, String> fanOutAssignments(String indexName) throws IOException {
+        Map<String, String> assignments = new HashMap<>();
+        String nodeMarker = " to node [";
+        String fragmentsMarker = " with fragments [";
+        for (String line : clusterLogLines()) {
+            if (!line.contains("lance.dispatch: fan-out index [" + indexName + "]")) {
+                continue;
+            }
+            int at = line.indexOf(nodeMarker);
+            int fragmentsAt = line.indexOf(fragmentsMarker);
+            if (at < 0 || fragmentsAt < 0) {
+                continue;
+            }
+            String node = line.substring(at + nodeMarker.length(), line.indexOf(']', at + nodeMarker.length()));
+            int fragmentsStart = fragmentsAt + fragmentsMarker.length();
+            String fragments = line.substring(fragmentsStart, line.indexOf(']', fragmentsStart));
+            assignments.put(node, fragments);
+        }
+        return assignments;
     }
 
     public void testNamespaceRegisterPropagatesToAllNodes() throws Exception {
