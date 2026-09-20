@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -20,6 +21,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
@@ -32,6 +35,11 @@ import org.lance.Fragment;
 import org.lance.ipc.FullTextQuery;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.common.breaker.CircuitBreakingException;
+import org.opensearch.indices.breaker.HierarchyCircuitBreakerService;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -385,7 +393,8 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
 
     /**
      * Open a reader over {@code fragmentIds} of the table at
-     * {@code uri}; the reader takes ownership of the Dataset.
+     * {@code uri} (every fragment when {@code null}); the reader takes
+     * ownership of the Dataset.
      */
     private static LanceDirectoryReader openReader(String uri, List<Integer> fragmentIds) throws Exception {
         Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty());
@@ -396,7 +405,7 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
             "",
             LanceEngineFactory.LancePrimaryKeyType.NONE,
             Collections.emptyMap(),
-            fragmentIds
+            fragmentIds == null ? fragmentIdsOf(dataset) : fragmentIds
         );
     }
 
@@ -585,6 +594,170 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
             LanceFtsQuery.setSubsetProbeLimit(limitBefore);
             LanceFtsQuery.setSubsetProbeRatio(ratioBefore);
             LanceFtsQuery.setSubsetProbeMinRows(minRowsBefore);
+        }
+    }
+
+    public void testHitsScanReturnsRowAddressAndScoreOnly() throws Exception {
+        // The Weight's scan projects _score and asks for the row
+        // address; the batches Lance hands back must carry exactly
+        // those two columns (no body, title, embedding), and the
+        // Weight must still produce the same hits from them.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeMultiFragmentTable(scratchDir, "projection", 12, 4);
+        try (LanceDirectoryReader reader = openReader(uri, null)) {
+            IndexSearcher searcher = new IndexSearcher(reader);
+            LanceFtsQuery.LanceFtsWeight weight = weightOf(searcher, new LanceFtsQuery("body", "hello"));
+            assertEquals("hello sits in the even rows", List.of(0, 2), docIdsOn(weight, reader.leaves().get(0)));
+            assertEquals(6L, weight.hitCount());
+
+            ScanOptions issued = weight.issuedScans().get(0);
+            assertEquals(Optional.of(LanceFtsQuery.HITS_SCAN_COLUMNS), issued.getColumns());
+            assertTrue(issued.isWithRowAddress());
+            Dataset dataset = LanceFragmentLeafReader.unwrap(reader.leaves().get(0).reader()).dataset();
+            assertEquals(Set.of("_rowaddr", "_score"), columnsReturnedBy(dataset, issued));
+        }
+    }
+
+    public void testHitBuffersAreReservedWithTheRequestBreakerAndReleasedOnClose() throws Exception {
+        // Three fragments with two hello rows each. The first scored
+        // leaf runs the scan: each fragment's buffer starts at the
+        // initial capacity, and the leaf's sorted view is built on top.
+        // Every other leaf adds only its sorted view. Closing the
+        // accounting (what the executor does with its search context)
+        // returns every byte.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeMultiFragmentTable(scratchDir, "accounting", 12, 4);
+        CircuitBreaker breaker = requestBreaker("1mb");
+        try (LanceDirectoryReader reader = openReader(uri, null); AccountingSearcher searcher = new AccountingSearcher(reader, breaker)) {
+            assertEquals(3, reader.leaves().size());
+            LanceFtsQuery.LanceFtsWeight weight = weightOf(searcher, new LanceFtsQuery("body", "hello"));
+            assertEquals("nothing reserved before the scan", 0L, breaker.getUsed());
+
+            long bufferBytes = 3L * LanceFragmentHits.INITIAL_CAPACITY * LanceFragmentHits.BYTES_PER_HIT;
+            long sortedBytesPerLeaf = 2L * LanceFragmentHits.BYTES_PER_HIT;
+            assertEquals(List.of(0, 2), docIdsOn(weight, reader.leaves().get(0)));
+            assertEquals(bufferBytes + sortedBytesPerLeaf, breaker.getUsed());
+            assertEquals(breaker.getUsed(), searcher.accounting.reservedBytes());
+
+            assertEquals(List.of(0, 2), docIdsOn(weight, reader.leaves().get(1)));
+            assertEquals(List.of(0, 2), docIdsOn(weight, reader.leaves().get(2)));
+            assertEquals(bufferBytes + 3L * sortedBytesPerLeaf, breaker.getUsed());
+            // A second scorer on a leaf reuses the sorted arrays.
+            assertEquals(List.of(0, 2), docIdsOn(weight, reader.leaves().get(1)));
+            assertEquals(bufferBytes + 3L * sortedBytesPerLeaf, breaker.getUsed());
+
+            searcher.accounting.close();
+            assertEquals("close returns every reserved byte", 0L, breaker.getUsed());
+            assertEquals(0L, searcher.accounting.reservedBytes());
+        }
+    }
+
+    public void testBreakerRefusalSurfacesAsCircuitBreakingExceptionAndReleasesTheReservation() throws Exception {
+        // A limit below the buffers of two fragments: the first
+        // fragment's buffer fits, the second is refused. The exception
+        // must reach the caller as CircuitBreakingException, not
+        // wrapped in the IOException the scan uses for Lance failures,
+        // and the bytes reserved before the refusal must be released
+        // when the accounting closes.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeMultiFragmentTable(scratchDir, "refusal", 12, 4);
+        long oneBuffer = (long) LanceFragmentHits.INITIAL_CAPACITY * LanceFragmentHits.BYTES_PER_HIT;
+        CircuitBreaker breaker = requestBreaker((oneBuffer + oneBuffer / 2) + "b");
+        try (LanceDirectoryReader reader = openReader(uri, null); AccountingSearcher searcher = new AccountingSearcher(reader, breaker)) {
+            LanceFtsQuery.LanceFtsWeight weight = weightOf(searcher, new LanceFtsQuery("body", "hello"));
+            LeafReaderContext leaf = reader.leaves().get(0);
+            CircuitBreakingException refused = expectThrows(CircuitBreakingException.class, () -> weight.scorerSupplier(leaf));
+            assertTrue(refused.getMessage(), refused.getMessage().contains(LanceHitsAccounting.LABEL));
+            assertEquals("the refused reservation is not counted", oneBuffer, breaker.getUsed());
+            assertEquals(1L, breaker.getTrippedCount());
+            assertEquals("the Weight installed no scan", -1L, weight.hitCount());
+
+            searcher.accounting.close();
+            assertEquals(0L, breaker.getUsed());
+        }
+    }
+
+    public void testDiscardedProbeReturnsItsBytesBeforeTheRestrictedScan() throws Exception {
+        // Subset reader over fragments 0 and 2 of the interleaved
+        // fixture, probe limit 2: the probe returns two rows (at least
+        // one of them from a kept fragment, so it allocated a buffer),
+        // fills up, and is discarded. What stays reserved afterwards is
+        // the restricted scan's buffers alone, one per fragment of the
+        // reader, plus the sorted view of the scored leaf.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeInterleavedTable(scratchDir, "probe-release", 3, 4);
+        int before = LanceFtsQuery.subsetProbeLimit();
+        LanceFtsQuery.setSubsetProbeLimit(2);
+        CircuitBreaker breaker = requestBreaker("1mb");
+        try (
+            LanceDirectoryReader reader = openReader(uri, List.of(0, 2));
+            AccountingSearcher searcher = new AccountingSearcher(reader, breaker)
+        ) {
+            LanceFtsQuery.LanceFtsWeight weight = weightOf(searcher, new LanceFtsQuery("body", "lance"));
+            assertEquals(List.of(0, 1, 2, 3), docIdsOn(weight, leafOfFragment(reader, 0)));
+            assertEquals("probe then restricted scan", 2, weight.issuedScans().size());
+            long restrictedBuffers = 2L * LanceFragmentHits.INITIAL_CAPACITY * LanceFragmentHits.BYTES_PER_HIT;
+            long sortedLeaf = 4L * LanceFragmentHits.BYTES_PER_HIT;
+            assertEquals(restrictedBuffers + sortedLeaf, breaker.getUsed());
+            assertEquals(breaker.getUsed(), searcher.accounting.reservedBytes());
+
+            searcher.accounting.close();
+            assertEquals(0L, breaker.getUsed());
+        } finally {
+            LanceFtsQuery.setSubsetProbeLimit(before);
+        }
+    }
+
+    /**
+     * A {@code request} breaker with {@code limit} from the real
+     * hierarchy service, so the message and the tripped count are
+     * the ones a node produces. Real memory tracking is off: the
+     * parent then sums the children instead of reading the heap.
+     */
+    static CircuitBreaker requestBreaker(String limit) {
+        Settings settings = Settings.builder()
+            .put(HierarchyCircuitBreakerService.USE_REAL_MEMORY_USAGE_SETTING.getKey(), false)
+            .put(HierarchyCircuitBreakerService.REQUEST_CIRCUIT_BREAKER_LIMIT_SETTING.getKey(), limit)
+            .build();
+        ClusterSettings clusterSettings = new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
+        return new HierarchyCircuitBreakerService(settings, List.of(), clusterSettings).getBreaker(CircuitBreaker.REQUEST);
+    }
+
+    /** Names of the columns Lance returns for {@code options}, over every batch. */
+    static Set<String> columnsReturnedBy(Dataset dataset, ScanOptions options) throws Exception {
+        Set<String> names = new LinkedHashSet<>();
+        try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+                for (Field field : reader.getVectorSchemaRoot().getSchema().getFields()) {
+                    names.add(field.getName());
+                }
+            }
+        }
+        return names;
+    }
+
+    /**
+     * The searcher shape the fragment executor uses, reduced to what
+     * the Weights read from it: a plain {@link IndexSearcher} that
+     * carries the request's {@link LanceHitsAccounting}. Closing it
+     * closes the accounting the way the executor's search context does.
+     */
+    static final class AccountingSearcher extends IndexSearcher implements LanceHitsAccounting.Provider, AutoCloseable {
+        final LanceHitsAccounting accounting;
+
+        AccountingSearcher(IndexReader reader, CircuitBreaker breaker) {
+            super(reader);
+            this.accounting = new LanceHitsAccounting(breaker);
+        }
+
+        @Override
+        public LanceHitsAccounting hitsAccounting() {
+            return accounting;
+        }
+
+        @Override
+        public void close() {
+            accounting.close();
         }
     }
 

@@ -5,6 +5,8 @@
 
 package org.opensearch.lance.query;
 
+import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -56,5 +58,69 @@ public class LanceFragmentHitsTests extends OpenSearchTestCase {
             assertEquals(i, docIds[i]);
             assertEquals((float) (8 - i), scores[i], 0f);
         }
+    }
+
+    public void testEveryArrayIsReservedBeforeItIsAllocatedAndReportedByHeapBytes() {
+        // The (offset, score) buffers are reserved at each growth step
+        // (8, 16, 32 entries), the sorted view when it is first built;
+        // the packed array the sort uses is reserved for the build only.
+        // heapBytes is what the owner gives back, so it must equal the
+        // bytes still reserved at every point.
+        CircuitBreaker breaker = LanceFtsQueryTests.requestBreaker("1mb");
+        LanceHitsAccounting accounting = new LanceHitsAccounting(breaker);
+        LanceFragmentHits hits = new LanceFragmentHits(accounting);
+        assertEquals(0L, hits.heapBytes());
+        assertEquals(0L, breaker.getUsed());
+
+        hits.add(5, 1f);
+        assertEquals(8L * LanceFragmentHits.BYTES_PER_HIT, breaker.getUsed());
+        for (int i = 1; i < 8; i++) {
+            hits.add(i, 1f);
+        }
+        assertEquals("eight entries fit the initial capacity", 8L * LanceFragmentHits.BYTES_PER_HIT, breaker.getUsed());
+        hits.add(100, 1f);
+        assertEquals("the ninth entry doubles the buffers", 16L * LanceFragmentHits.BYTES_PER_HIT, breaker.getUsed());
+        for (int i = 9; i < 17; i++) {
+            hits.add(100 + i, 1f);
+        }
+        assertEquals(32L * LanceFragmentHits.BYTES_PER_HIT, breaker.getUsed());
+        assertEquals(17, hits.size());
+        assertEquals(breaker.getUsed(), hits.heapBytes());
+
+        hits.sortedDocIds();
+        assertEquals(
+            "sorted view adds size entries; the packed array is returned",
+            (32L + 17L) * LanceFragmentHits.BYTES_PER_HIT,
+            breaker.getUsed()
+        );
+        assertEquals(breaker.getUsed(), hits.heapBytes());
+        hits.sortedScores();
+        assertEquals("the sorted view is built once", (32L + 17L) * LanceFragmentHits.BYTES_PER_HIT, breaker.getUsed());
+        assertEquals(breaker.getUsed(), accounting.reservedBytes());
+
+        accounting.release(hits.heapBytes());
+        assertEquals(0L, breaker.getUsed());
+    }
+
+    public void testRefusedGrowthLeavesTheBufferIntact() {
+        // Limit for one buffer at the initial capacity: the ninth add
+        // is refused, the eight hits already added stay readable, and
+        // nothing beyond the first buffer is counted.
+        long oneBuffer = 8L * LanceFragmentHits.BYTES_PER_HIT;
+        CircuitBreaker breaker = LanceFtsQueryTests.requestBreaker(oneBuffer + "b");
+        LanceHitsAccounting accounting = new LanceHitsAccounting(breaker);
+        LanceFragmentHits hits = new LanceFragmentHits(accounting);
+        for (int i = 0; i < 8; i++) {
+            hits.add(i, (float) i);
+        }
+        expectThrows(CircuitBreakingException.class, () -> hits.add(8, 8f));
+        assertEquals(8, hits.size());
+        assertEquals(oneBuffer, breaker.getUsed());
+        assertEquals(oneBuffer, hits.heapBytes());
+        // The sorted view of eight entries needs more than the limit too.
+        expectThrows(CircuitBreakingException.class, hits::sortedDocIds);
+        assertEquals(oneBuffer, breaker.getUsed());
+        accounting.close();
+        assertEquals(0L, breaker.getUsed());
     }
 }
