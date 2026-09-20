@@ -36,6 +36,14 @@ import org.opensearch.search.aggregations.InternalAggregations;
  *   <li>{@link #hits()} — top-{@code size} hits from the node's
  *       fragment subset. Coordinator concatenates all node lists
  *       and truncates to the request's {@code size}.</li>
+ *   <li>{@link #rowAddrs()} — the Lance row address
+ *       ({@code fragmentId << 32 | offset}) of each hit, parallel to
+ *       {@link #hits()}. The coordinator breaks ties between hits
+ *       with equal sort values on it, ascending, which is the order
+ *       Lucene's collectors produce on a single reader over the whole
+ *       table (doc id order is fragment order then offset). The
+ *       address is internal to the fan-out and never rendered into
+ *       the response.</li>
  *   <li>{@link #aggregations()} — per-node
  *       {@link InternalAggregations} produced by driving OpenSearch's
  *       stock aggregator machinery against a per-fragment
@@ -63,6 +71,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
     private final boolean matchedIsLowerBound;
     private final int fragmentCount;
     private final List<SearchHit> hits;
+    private final long[] rowAddrs;
     private final InternalAggregations aggregations;
 
     public LanceFragmentQueryResponse(
@@ -70,12 +79,17 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         boolean matchedIsLowerBound,
         int fragmentCount,
         List<SearchHit> hits,
+        long[] rowAddrs,
         InternalAggregations aggregations
     ) {
+        if (rowAddrs.length != hits.size()) {
+            throw new IllegalArgumentException("rowAddrs has " + rowAddrs.length + " entries for " + hits.size() + " hits");
+        }
         this.matched = matched;
         this.matchedIsLowerBound = matchedIsLowerBound;
         this.fragmentCount = fragmentCount;
         this.hits = List.copyOf(hits);
+        this.rowAddrs = rowAddrs.clone();
         this.aggregations = aggregations;
     }
 
@@ -90,6 +104,10 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
             readHits.add(new SearchHit(in));
         }
         this.hits = List.copyOf(readHits);
+        this.rowAddrs = in.readLongArray();
+        if (rowAddrs.length != hitCount) {
+            throw new IOException("rowAddrs has " + rowAddrs.length + " entries for " + hitCount + " hits");
+        }
         this.aggregations = in.readBoolean() ? InternalAggregations.readFrom(in) : null;
     }
 
@@ -102,6 +120,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         for (SearchHit hit : hits) {
             hit.writeTo(out);
         }
+        out.writeLongArray(rowAddrs);
         if (aggregations == null) {
             out.writeBoolean(false);
         } else {
@@ -129,6 +148,16 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
 
     public List<SearchHit> hits() {
         return hits;
+    }
+
+    /**
+     * Lance row address of each hit, {@code fragmentId << 32 | offset},
+     * in the same order as {@link #hits()}. Ascending row address is
+     * the doc id order of a single reader over the whole table, so the
+     * coordinator uses it to break ties the way one executor would.
+     */
+    public long[] rowAddrs() {
+        return rowAddrs;
     }
 
     /**

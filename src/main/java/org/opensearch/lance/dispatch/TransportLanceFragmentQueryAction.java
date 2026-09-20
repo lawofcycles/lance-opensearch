@@ -25,6 +25,7 @@ import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.ReaderUtil;
@@ -649,7 +650,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 List<ColumnOrdering> pushdownOrderings = hasSecurityWrapper || sortAndFormats == null
                     ? null
                     : resolvePushdownOrderings(request, dataset.getSchema(), multiFields, sortAndFormats);
-                List<SearchHit> hits;
+                HitsPage hits;
                 if (pushdownOrderings != null) {
                     hits = scanSortedHitsViaLance(
                         dataset,
@@ -676,9 +677,43 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 }
                 InternalAggregations aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query, lanceWeight);
                 MatchedCount matched = computeMatched(dataset, request, searcher, countQuery, hasSecurityWrapper, ftsWeight);
-                return new LanceFragmentQueryResponse(matched.value(), matched.lowerBound(), fragmentCount, hits, aggregations);
+                return new LanceFragmentQueryResponse(
+                    matched.value(),
+                    matched.lowerBound(),
+                    fragmentCount,
+                    hits.hits(),
+                    hits.rowAddrs(),
+                    aggregations
+                );
             }
         }
+    }
+
+    /**
+     * The hits of one page together with the Lance row address
+     * ({@code fragmentId << 32 | offset}) of each, parallel arrays. The
+     * addresses travel to the coordinator, which breaks ties between
+     * hits with equal sort values on them.
+     */
+    private record HitsPage(List<SearchHit> hits, long[] rowAddrs) {
+        static final HitsPage EMPTY = new HitsPage(Collections.emptyList(), new long[0]);
+    }
+
+    /**
+     * Row address of a doc of {@code reader}: the fragment id of the
+     * Lance leaf the doc belongs to in the high 32 bits, the offset of
+     * the doc inside that leaf in the low 32 bits. Every leaf of a
+     * fragment dispatch reader is Lance-backed; any other leaf is a
+     * bug in the reader construction, not something to paper over.
+     */
+    private static long rowAddressOf(IndexReader reader, int doc) {
+        List<LeafReaderContext> leaves = reader.leaves();
+        LeafReaderContext leaf = leaves.get(ReaderUtil.subIndex(doc, leaves));
+        LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(leaf.reader());
+        if (lance == null) {
+            throw new IllegalStateException("leaf " + leaf.ord + " of the fragment reader is not backed by a Lance fragment");
+        }
+        return ((long) lance.fragmentId() << 32) | ((doc - leaf.docBase) & 0xFFFFFFFFL);
     }
 
     /**
@@ -1123,7 +1158,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * {@link LanceKnnQuery} so that its Lance scan is shared with the
      * aggregators and, for FTS, the match count.
      */
-    private List<SearchHit> scanHitsViaIndexSearcher(
+    private HitsPage scanHitsViaIndexSearcher(
         LanceFragmentIndexSearcher searcher,
         Query query,
         Weight sharedWeight,
@@ -1133,7 +1168,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         boolean trackScores
     ) throws java.io.IOException {
         if (size <= 0) {
-            return Collections.emptyList();
+            return HitsPage.EMPTY;
         }
         TopDocs topDocs;
         if (searchAfter != null && sortAndFormats != null) {
@@ -1161,6 +1196,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         }
         prefetchHitRows(searcher.getIndexReader(), topDocs.scoreDocs);
         List<SearchHit> out = new ArrayList<>(topDocs.scoreDocs.length);
+        long[] rowAddrs = new long[topDocs.scoreDocs.length];
         for (int i = 0; i < topDocs.scoreDocs.length; i++) {
             ScoreDoc scoreDoc = topDocs.scoreDocs[i];
             HitVisitor visitor = new HitVisitor();
@@ -1174,8 +1210,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 hit.sortValues(fieldDoc.fields, sortAndFormats.formats);
             }
             out.add(hit);
+            rowAddrs[i] = rowAddressOf(searcher.getIndexReader(), scoreDoc.doc);
         }
-        return out;
+        return new HitsPage(out, rowAddrs);
     }
 
     /**
@@ -1497,7 +1534,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * SortField for the request's {@code missing} / direction
      * combination.
      */
-    private List<SearchHit> scanSortedHitsViaLance(
+    private HitsPage scanSortedHitsViaLance(
         Dataset dataset,
         LanceFragmentQueryRequest request,
         List<ColumnOrdering> orderings,
@@ -1575,6 +1612,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             lance.prefetchRows(docIds);
         }
         List<SearchHit> out = new ArrayList<>(addresses.size());
+        long[] rowAddrs = new long[addresses.size()];
         float score = request.trackScores() ? 1.0f : Float.NaN;
         for (int i = 0; i < addresses.size(); i++) {
             long[] address = addresses.get(i);
@@ -1595,9 +1633,10 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 hit.sourceRef(new org.opensearch.core.common.bytes.BytesArray(visitor.source));
             }
             hit.sortValues(sortValues.get(i), sortAndFormats.formats);
+            rowAddrs[out.size()] = (address[0] << 32) | address[1];
             out.add(hit);
         }
-        return out;
+        return new HitsPage(out, out.size() == rowAddrs.length ? rowAddrs : Arrays.copyOf(rowAddrs, out.size()));
     }
 
     /**
