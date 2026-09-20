@@ -32,6 +32,7 @@ import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
+import org.apache.lucene.search.SimpleCollector;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopFieldCollector;
@@ -90,6 +91,7 @@ import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.MultiBucketCollector;
 import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer;
 import org.opensearch.search.aggregations.SearchContextAggregations;
+import org.opensearch.search.approximate.ApproximateScoreQuery;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.SortAndFormats;
@@ -1719,10 +1721,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * <p>Split out from {@link #openWrappedReader} so the caller in
      * {@link #execute} can inspect whether a wrapper is installed
      * without also opening the reader. This is what lets
-     * {@link #computeMatched} route counts through
-     * {@link org.apache.lucene.search.IndexSearcher#count(Query)}
-     * whenever a wrapper is present, so a DLS/FLS reader wrapper
-     * can restrict {@code hits.total.value} the same way it
+     * {@link #computeMatched} count from the wrapped reader's
+     * liveDocs whenever a wrapper is present, so a DLS/FLS reader
+     * wrapper can restrict {@code hits.total.value} the same way it
      * restricts the returned hits.
      */
     @SuppressWarnings("unchecked")
@@ -1843,6 +1844,46 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
+     * Number of documents {@code query} matches on {@code searcher},
+     * counted by collecting every doc its scorer yields. The searcher
+     * hands the scorer each leaf's {@link LeafReader#getLiveDocs()} as
+     * accepted docs, so a reader wrapper's filtered liveDocs apply.
+     *
+     * <p>{@link org.apache.lucene.search.IndexSearcher#count(Query)} is
+     * not used because its {@code TotalHitCountCollector} asks
+     * {@link Weight#count(LeafReaderContext)} first and takes that
+     * answer without scoring: {@link MatchAllDocsQuery} answers
+     * {@link LeafReader#numDocs()}, which the security plugin's DLS
+     * leaf reader leaves at the unfiltered value, and other Weights
+     * answer from index statistics that predate the wrapper as well.
+     * The collector below never consults {@code Weight.count}, so the
+     * only thing that decides the count is the scorer intersected with
+     * the liveDocs.
+     *
+     * <p>The counter is a plain {@code long[]}: {@link LanceFragmentIndexSearcher}
+     * is built with a null executor, so its slice loop visits every
+     * leaf on the calling thread and the collector is never shared
+     * across threads. Handing the searcher an executor would require
+     * an atomic counter (or a {@link org.apache.lucene.search.CollectorManager})
+     * here.
+     */
+    static long countThroughLiveDocs(LanceFragmentIndexSearcher searcher, Query query) throws IOException {
+        long[] total = new long[1];
+        searcher.search(query, new SimpleCollector() {
+            @Override
+            public void collect(int doc) {
+                total[0]++;
+            }
+
+            @Override
+            public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+            }
+        });
+        return total[0];
+    }
+
+    /**
      * Determine the number of rows in this node's fragment subset
      * that satisfy the query, counted as far as the request's
      * {@link LanceFragmentQueryRequest#trackTotalHitsUpTo()} asks.
@@ -1891,12 +1932,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * set; Lance's metadata-only counts and its native filter scan
      * see the raw Dataset, not the wrapper's view, so serving
      * {@code hits.total.value} from Lance would over-count and
-     * disagree with the hits the same request returns. Route every
-     * count path through
-     * {@link org.apache.lucene.search.IndexSearcher#count(Query)}
-     * whenever a wrapper is installed so the count matches the
-     * hits, and {@code _count} (which takes this same path) agrees
-     * with {@code _search}.
+     * disagree with the hits the same request returns. Whenever a
+     * wrapper is installed the count is taken from the wrapped
+     * leaves' {@link LeafReader#getLiveDocs()} instead, either
+     * directly ({@link #countLiveDocs}, for {@code match_all}) or by
+     * collecting the query's scorer under those liveDocs
+     * ({@link #countThroughLiveDocs}), so the count matches the hits,
+     * and {@code _count} (which takes this same path) agrees with
+     * {@code _search}.
      */
     private MatchedCount computeMatched(
         Dataset dataset,
@@ -1915,44 +1958,49 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (hasSecurityWrapper) {
             // A reader wrapper is installed on the IndexService,
             // most likely the security plugin's DLS/FLS wrapper.
-            // Any Lance-side count would bypass the wrapper and
-            // return the pre-wrapper row count, so route every
-            // count through the searcher instead. The searcher's
-            // BitSet iteration honours the wrapper's liveDocs the
-            // same way the hits phase does, keeping
-            // hits.total.value consistent with the returned hits
-            // for security-restricted users.
+            // Invariant of this branch: the count is derived from
+            // the wrapped leaves' getLiveDocs(), either read directly
+            // (countLiveDocs) or applied by the searcher while it
+            // drives a scorer (countThroughLiveDocs). Nothing here
+            // may read Lance metadata (Dataset.countRows,
+            // Fragment.countRows), run a Lance count scan, or use a
+            // Lucene shortcut that answers from LeafReader.numDocs():
+            // all of those see the rows before the wrapper and would
+            // report hidden rows in hits.total.value while the hits
+            // themselves are filtered.
             //
-            // The track_total_hits bound is not applied here.
-            // IndexSearcher.count has no early-termination knob (it
-            // always iterates every match), so the value it returns
-            // is exact, and exact is within the contract for any
-            // bound. count creates a fresh Weight from luceneQuery,
-            // so for an FTS query the Lance scan runs a second time
-            // here (the hits phase's LanceFtsWeight and its shardHits
-            // are not reused). That repeat is accepted: it is the
-            // only count path that sees the wrapper's view, and DLS
-            // correctness outranks the saving.
+            // The track_total_hits bound is not applied here. Both
+            // paths below count every match, so the value is exact,
+            // and exact is within the contract for any bound. For an
+            // FTS query the Lance scan runs a second time here (the
+            // hits phase's LanceFtsWeight and its shardHits are not
+            // reused). That repeat is accepted: it is the only count
+            // path that sees the wrapper's view, and DLS correctness
+            // outranks the saving.
             //
-            // MatchAllDocsQuery is the one shape IndexSearcher.count
-            // does not iterate: its Weight.count returns
-            // reader.numDocs(), and the security plugin's DLS leaf
-            // reader swaps in filtered liveDocs but leaves numDocs
-            // at the unfiltered value. Count that shape from the
-            // liveDocs directly so a DLS user's match_all total
-            // equals the rows the user can see. The normalisation mirrors
-            // the first two lines of IndexSearcher.count so a
-            // ConstantScoreQuery / BoostQuery / bool-filter wrapper
-            // around match_all is caught the same way count would
-            // unwrap it.
-            Query normalised = searcher.rewrite(new ConstantScoreQuery(luceneQuery));
+            // match_all is counted from the liveDocs bitset. The
+            // security plugin's DLS leaf reader swaps in filtered
+            // liveDocs but leaves numDocs() at the unfiltered value,
+            // and numDocs() is exactly what MatchAllDocsQuery's
+            // Weight.count answers, so IndexSearcher.count must not
+            // be used for it. MatchAllQueryBuilder produces an
+            // ApproximateScoreQuery around the MatchAllDocsQuery;
+            // once the hits phase has run, ContextIndexSearcher.rewrite
+            // has called setContext on that instance and its rewrite
+            // returns itself instead of the wrapped query, so unwrap
+            // it explicitly before the ConstantScoreQuery
+            // normalisation (which mirrors the first two lines of
+            // IndexSearcher.count and catches a constant_score /
+            // boost / bool-filter wrapper around match_all).
+            Query normalised = luceneQuery instanceof ApproximateScoreQuery approximate ? approximate.getOriginalQuery() : luceneQuery;
+            normalised = searcher.rewrite(new ConstantScoreQuery(normalised));
             if (normalised instanceof ConstantScoreQuery csq) {
                 normalised = csq.getQuery();
             }
             if (normalised instanceof MatchAllDocsQuery) {
                 return MatchedCount.exact(countLiveDocs(searcher.getIndexReader().leaves()));
             }
-            return MatchedCount.exact(searcher.count(luceneQuery));
+            return MatchedCount.exact(countThroughLiveDocs(searcher, luceneQuery));
         }
         List<Integer> fragmentIds = request.fragmentIdsOrNull();
         String filterSql = request.filterSql();
