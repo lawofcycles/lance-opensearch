@@ -108,6 +108,12 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 - All run through OpenSearch's standard aggregator machinery over Lance-backed doc values.
 - Pipeline aggregations (`avg_bucket`, `bucket_sort`, `cumulative_sum`, etc.) fall through to the shard path (see [limitations.md](limitations.md)).
 
+## Doc values for full-text and vector hits
+
+- When the top-level query is a Lance full-text or `lance_knn` clause (alone, with a pushed-down `filter` / `must_not`, or as the only clause Lucene collects from), the sort and aggregation columns are fetched for the matched rows only, with the same `_rowaddr IN (...)` take that already serves `_source`. The fragment reader receives the per-fragment hit set from the query's Weight and reads numeric, boolean and keyword doc values for those rows instead of scanning the column for the whole fragment.
+- The take is used while the hit set covers at most 5 percent of a fragment's rows (`LanceFragmentLeafReader.SPARSE_RATIO`); above that, or when no Lance clause drives the search, the fragment falls back to the full column load. Numeric columns also fall back per fragment the moment a doc outside the hit set is requested (a `should` with another clause, a `should` beside a `filter`), so results do not depend on the query shape. Keyword columns build their ordinal dictionary from the hit rows only when the Weight has shown that nothing else is collected on that fragment. Under a reader wrapper installed by another plugin (the security plugin's document and field level security reader) sparse keyword dictionaries are disabled and keyword columns load fully, because such a wrapper can hide rows the Lance scan returned and a dictionary built from every hit row would expose their terms through its value count; numeric and boolean columns keep the per-hit take, since they are read only for the documents the wrapper lets through.
+- Two shapes still load full columns: a keyword `terms` aggregation with `size: 0` (global ordinals are built before the query runs; `"execution_hint": "map"` avoids that), and keyword sorts on fragments Lucene visits once the result queue is already full (the comparator looks the current bottom term up before scoring starts).
+
 ## Follow-forward and version pinning
 
 - The plugin follows the Lance manifest forward automatically. When Lance advances to a new version, the poller notices, `LanceReaderManager` swaps in a fresh reader, and the next `_search` sees the new fragments. No index close, no shard reallocation, no request downtime.
