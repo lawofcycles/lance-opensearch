@@ -543,17 +543,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 searchContext.withQueryShardContext(qsc);
 
                 Query query = resolveLuceneQuery(request, qsc, hasSecurityWrapper, indexMetadata);
-                Query hitsQuery = applyPostFilter(query, request, qsc);
-                // Match count runs through the same Weight as the
-                // hits phase when the query is a scoring Lucene
-                // query (FTS, knn), so strip any scan-limit hint
-                // from the query before handing it to
-                // computeMatched. Without this, an FTS Weight
-                // that was clipped to `size` rows during
-                // scanHitsViaIndexSearcher would also clip the
-                // count and hits.total.value would collapse to
-                // `size`.
-                Query countQuery = withoutScanLimit(hitsQuery);
 
                 // A bare Lance clause at the top level (LanceFtsQuery,
                 // possibly a bool collapsed into one with a SQL
@@ -577,6 +566,37 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     if (lanceWeight instanceof LanceHintingWeight hinting && hintsHelpBeforeScoring(request)) {
                         hintLeavesExclusive(hinting, searcher.getIndexReader().leaves());
                     }
+                }
+
+                // With a post_filter the hits and count queries are a
+                // conjunction Lucene builds its own clause Weights for;
+                // PrebuiltWeightQuery puts the Weight above in the
+                // clause's place so the conjunction reuses its scan.
+                // Without a post_filter hitsQuery stays the query
+                // itself and the phases receive the Weight directly.
+                Query prebuilt = lanceWeight == null ? null : new PrebuiltWeightQuery(lanceWeight, ScoreMode.COMPLETE);
+                Query hitsQuery = query;
+                if (request.postFilter() != null) {
+                    hitsQuery = applyPostFilter(prebuilt == null ? query : prebuilt, request, qsc);
+                }
+                // Match count runs through the same Weight as the
+                // hits phase when the query is a scoring Lucene
+                // query (FTS, knn), so strip any scan-limit hint
+                // from the query before handing it to
+                // computeMatched. Without this, an FTS Weight
+                // that was clipped to `size` rows during
+                // scanHitsViaIndexSearcher would also clip the
+                // count and hits.total.value would collapse to
+                // `size`.
+                Query countQuery = withoutScanLimit(hitsQuery);
+                if (prebuilt != null && hitsQuery == query && query instanceof LanceKnnQuery) {
+                    // A bare knn query is counted through
+                    // searcher.count, which would create a second knn
+                    // Weight from the query; hand it the prebuilt one.
+                    // A bare FTS query keeps its own class here because
+                    // computeMatched reads its count from ftsWeight or
+                    // from a count-only scan of the LanceFtsQuery.
+                    countQuery = prebuilt;
                 }
                 SortAndFormats sortAndFormats = resolveSort(request, qsc);
 
