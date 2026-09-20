@@ -242,7 +242,6 @@ public class LanceAttachIT extends LanceRestTestCase {
         String aggregation = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{"
             + "\"c\":{\"value_count\":{\"field\":\"rating\"}},\"s\":{\"sum\":{\"field\":\"rating\"}},"
             + "\"top\":{\"terms\":{\"field\":\"rating\",\"size\":3,\"order\":{\"_key\":\"desc\"}}}}}";
-        String countBody = "{\"query\":{\"match_all\":{}},\"track_total_hits\":true,\"size\":0}";
         try {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
@@ -284,12 +283,14 @@ public class LanceAttachIT extends LanceRestTestCase {
             assertFalse("rating 997 was deleted: " + after, after.contains("\"key\":997"));
             assertTrue("rating 996 (id 108) is still there: " + after, after.contains("\"key\":996"));
 
-            // The shard engine follows on the poll; the fragment path keeps
+            // The shard engine follows on the poll (which also retires the
+            // previous version's snapshot); the fragment path keeps
             // answering from the new version's snapshot throughout.
-            assertBusy(() -> {
-                String shard = readAll(postJson("/" + indexName + "/_search", countBody));
-                assertEquals("shard path should follow the delete: " + shard, 298, extractIntPath(shard, "hits", "total", "value"));
-            }, 60, java.util.concurrent.TimeUnit.SECONDS);
+            assertBusy(
+                () -> { assertEquals("shard engine should follow the delete", 298, engineDocCount(indexName)); },
+                60,
+                java.util.concurrent.TimeUnit.SECONDS
+            );
             String afterPoll = readAll(postJson("/" + indexName + "/_search", aggregation));
             assertEquals(after.replaceFirst("\"took\":\\d+,", ""), afterPoll.replaceFirst("\"took\":\\d+,", ""));
         } finally {
