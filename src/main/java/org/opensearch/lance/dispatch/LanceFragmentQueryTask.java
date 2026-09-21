@@ -22,8 +22,8 @@ import org.opensearch.tasks.CancellableTask;
  * {@link #isCancelled()} between Lance batches and between Lucene
  * leaves and ends its scans with {@code TaskCancelledException}.
  *
- * <p>The executor itself sends no child requests, so there is nothing
- * to cancel below it.
+ * <p>The executor sends no child requests today; should one be added,
+ * cancelling this task cancels it too.
  */
 public final class LanceFragmentQueryTask extends CancellableTask {
 
@@ -40,6 +40,6 @@ public final class LanceFragmentQueryTask extends CancellableTask {
 
     @Override
     public boolean shouldCancelChildrenOnCancellation() {
-        return false;
+        return true;
     }
 }

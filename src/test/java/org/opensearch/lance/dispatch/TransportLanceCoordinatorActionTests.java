@@ -253,6 +253,7 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
             done,
             /* allowPartialResults */ true,
             /* task */ null,
+            coordinatorPool(),
             (node, request, cause) -> incomplete.add(node.getId() + ":" + cause.getClass().getSimpleName())
         );
         FragmentFanOut.Sender keep = (node, request, handler) -> {};
@@ -283,6 +284,7 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
             done,
             /* allowPartialResults */ false,
             /* task */ null,
+            coordinatorPool(),
             (node, request, cause) -> incomplete.add(node.getId())
         );
         FragmentFanOut.Sender keep = (node, request, handler) -> {};
@@ -349,6 +351,7 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
             done,
             true,
             task,
+            coordinatorPool(),
             (node, request, cause) -> {}
         );
 
@@ -364,6 +367,61 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
         assertEquals("a cancelled task must not merge", 0, merges.get());
     }
 
+    public void testCancellationAfterTheLastResponseStillEndsCancelled() throws Exception {
+        // The task is cancelled after every node has answered but before
+        // the queued merge runs: the merge is skipped and the request
+        // ends cancelled, because the task's state is read when the
+        // fan-out completes, not when the responses arrived.
+        CountingListener done = new CountingListener(coordinatorPool());
+        AtomicInteger merges = new AtomicInteger();
+        TestTask task = new TestTask();
+        FragmentFanOut fanOut = new FragmentFanOut(
+            1,
+            coordinatorPool(),
+            outcome -> merges.incrementAndGet(),
+            done,
+            true,
+            task,
+            coordinatorPool(),
+            (node, request, cause) -> {}
+        );
+        CountDownLatch release = new CountDownLatch(1);
+        coordinatorPool().execute(() -> awaitQuietly(release));
+
+        fanOut.handler(0).handleResponse(response(1L));
+        task.cancel("cancelled while the merge waited for the pool");
+        release.countDown();
+
+        done.await();
+        assertEquals(0, done.responses.get());
+        assertEquals(1, done.failures.get());
+        assertThat(done.failure.get(), instanceOf(TaskCancelledException.class));
+        assertEquals(0, merges.get());
+    }
+
+    public void testIncompleteListenerRunsOnTheNotifyPoolNotOnTheTransportThread() throws Exception {
+        CountingListener done = new CountingListener(coordinatorPool());
+        AtomicReference<Thread> listenerThread = new AtomicReference<>();
+        Thread caller = Thread.currentThread();
+        FragmentFanOut fanOut = new FragmentFanOut(
+            1,
+            coordinatorPool(),
+            outcome -> {},
+            done,
+            true,
+            null,
+            coordinatorPool(),
+            (node, request, cause) -> listenerThread.set(Thread.currentThread())
+        );
+
+        fanOut.handler(0).handleException(timeout(NODE_A));
+
+        done.await();
+        assertNotNull("the listener must have run", listenerThread.get());
+        assertNotSame("the listener must not run on the transport thread", caller, listenerThread.get());
+        assertThat(listenerThread.get().getName(), containsString(LancePlugin.LANCE_COORDINATOR_THREAD_POOL));
+    }
+
     public void testCancelledCoordinatorTaskReportsTaskCancelledInPlaceOfANodeFailure() throws Exception {
         // Once the coordinator task is cancelled its executors answer
         // TaskCancelledException too; whatever the last exception was,
@@ -371,7 +429,16 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
         // suppressed exception.
         CountingListener done = new CountingListener(coordinatorPool());
         TestTask task = new TestTask();
-        FragmentFanOut fanOut = new FragmentFanOut(2, coordinatorPool(), outcome -> {}, done, false, task, (node, request, cause) -> {});
+        FragmentFanOut fanOut = new FragmentFanOut(
+            2,
+            coordinatorPool(),
+            outcome -> {},
+            done,
+            false,
+            task,
+            coordinatorPool(),
+            (node, request, cause) -> {}
+        );
 
         task.cancel("cancelled through _tasks/_cancel");
         RemoteTransportException nodeGone = new RemoteTransportException("node b left", null);
@@ -392,7 +459,16 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
         CountingListener done = new CountingListener(coordinatorPool());
         TestTask task = new TestTask();
         task.cancel("cancelled before the fan-out");
-        FragmentFanOut fanOut = new FragmentFanOut(1, coordinatorPool(), outcome -> {}, done, true, task, (node, request, cause) -> {});
+        FragmentFanOut fanOut = new FragmentFanOut(
+            1,
+            coordinatorPool(),
+            outcome -> {},
+            done,
+            true,
+            task,
+            coordinatorPool(),
+            (node, request, cause) -> {}
+        );
         FragmentFanOut.Sender refusing = (node, request, handler) -> {
             throw new TaskCancelledException("The parent task was cancelled, shouldn't start any child tasks");
         };

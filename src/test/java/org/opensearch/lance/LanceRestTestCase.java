@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManagerBuilder;
 import org.apache.hc.core5.http.HttpHost;
@@ -499,21 +500,24 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
     }
 
     /**
-     * Poll {@code GET /_tasks?actions=<actions>} every few milliseconds
-     * until at least {@code count} tasks are listed, for at most thirty
-     * seconds. The poll is tight on purpose: a request that is being
-     * cancelled from the test runs for a second or two, and
-     * {@code assertBusy}'s backoff would miss that window.
+     * Wait until a fragment path request is running: at least one
+     * {@code internal:lance/coordinator_search} task and at least
+     * {@code executors} {@code internal:lance/fragment_query} tasks are
+     * listed at the same time. Returns the executor tasks. Uses
+     * {@code assertBusy} (backoff from a millisecond, ten seconds in
+     * all); the request the tests wait for runs for a second or more,
+     * and its tasks appear within the first few checks.
      */
-    static List<Map<String, Object>> awaitTasks(RestClient client, String actions, int count) throws Exception {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-        List<Map<String, Object>> tasks = tasksOf(client, actions);
-        while (tasks.size() < count && System.nanoTime() < deadline) {
-            Thread.sleep(5);
-            tasks = tasksOf(client, actions);
-        }
-        assertTrue("expected at least " + count + " task(s) for " + actions + ", saw " + tasks, tasks.size() >= count);
-        return tasks;
+    static List<Map<String, Object>> awaitFragmentQueryRunning(RestClient client, int executors) throws Exception {
+        AtomicReference<List<Map<String, Object>>> found = new AtomicReference<>();
+        assertBusy(() -> {
+            List<Map<String, Object>> coordinators = tasksOf(client, "*lance/coordinator*");
+            List<Map<String, Object>> tasks = tasksOf(client, "*lance/fragment_query*");
+            assertFalse("no coordinator task yet, executors: " + tasks, coordinators.isEmpty());
+            assertTrue("expected at least " + executors + " executor task(s), saw " + tasks, tasks.size() >= executors);
+            found.set(tasks);
+        });
+        return found.get();
     }
 
     /**
