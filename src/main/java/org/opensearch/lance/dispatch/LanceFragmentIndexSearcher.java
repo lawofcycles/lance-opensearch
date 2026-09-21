@@ -6,14 +6,20 @@
 package org.opensearch.lance.dispatch;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Executor;
 
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.search.Collector;
 import org.apache.lucene.search.CollectorManager;
+import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryCachingPolicy;
+import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Weight;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.index.IndexSettings;
@@ -47,9 +53,31 @@ import org.opensearch.search.internal.ContextIndexSearcher;
  * loop adds no check of its own between leaves, so this override does
  * not either.
  *
- * <p>Leaves are visited in reader order. {@link LanceFragmentSearchContext}
- * reports {@code shouldUseTimeSeriesDescSortOptimization() == false},
- * so the reversed traversal branch of the stock method is not needed.
+ * <p>Slices. The reader's leaves are the node's Lance fragments. When
+ * {@link LanceFragmentSearchContext#getTargetMaxSliceCount()} is above
+ * 1 the searcher is built with the executor's search pool and the
+ * inherited {@link ContextIndexSearcher#slices} bundles the leaves
+ * into at most that many slices by row count (whole leaves, no
+ * partition inside a fragment). Every {@link CollectorManager} search
+ * ({@link #search(Query, CollectorManager)}, {@link #search(Weight, CollectorManager)},
+ * and through them the top docs overloads of {@link IndexSearcher})
+ * then collects one slice per task with its own collector: all but one
+ * task are handed to the pool and the calling thread runs the rest,
+ * the way Lucene's {@code TaskExecutor} does it, so a pool with no free
+ * thread, or one that rejects the task, only reduces the parallelism to
+ * the calling thread. The calling thread never waits for a task the
+ * pool has not started, so a request whose search thread is itself a
+ * pool thread cannot deadlock the pool. With a target of 1 the searcher
+ * has no executor: Lucene then keeps one slice over every leaf in
+ * reader order and runs it on the calling thread, which is the
+ * behaviour the fragment path had before slicing and is what keeps a
+ * one slice request identical, down to the order in which an
+ * approximate aggregation sees its values, to the older one.
+ *
+ * <p>Leaves are visited in reader order within a slice.
+ * {@link LanceFragmentSearchContext} reports
+ * {@code shouldUseTimeSeriesDescSortOptimization() == false}, so the
+ * reversed traversal branch of the stock method is not needed.
  *
  * <p>The query cache is disabled: the Lance-backed reader has its own
  * freshness tracking and Lucene's per-query cache would only add
@@ -83,11 +111,20 @@ final class LanceFragmentIndexSearcher extends ContextIndexSearcher implements L
     private final LanceFragmentSearchContext fragmentContext;
     private final LanceHitsAccounting hitsAccounting;
 
+    /**
+     * @param executor pool the slices after the first run on when
+     *                 {@code searchContext.getTargetMaxSliceCount()} is
+     *                 above 1; ignored (the searcher gets none) when it
+     *                 is 1, see the class javadoc. May be null, which
+     *                 collects on the calling thread whatever the slice
+     *                 count says.
+     */
     LanceFragmentIndexSearcher(
         DirectoryReader reader,
         IndexSettings indexSettings,
         LanceFragmentSearchContext searchContext,
-        CircuitBreaker requestBreaker
+        CircuitBreaker requestBreaker,
+        Executor executor
     ) throws IOException {
         super(
             reader,
@@ -95,7 +132,7 @@ final class LanceFragmentIndexSearcher extends ContextIndexSearcher implements L
             new DisabledQueryCache(indexSettings),
             NEVER_CACHE,
             /* wrapWithExitableDirectoryReader */ false,
-            /* executor */ null,
+            searchContext.getTargetMaxSliceCount() > 1 ? executor : null,
             searchContext
         );
         this.fragmentContext = searchContext;
@@ -132,8 +169,12 @@ final class LanceFragmentIndexSearcher extends ContextIndexSearcher implements L
      * {@link ContextIndexSearcher#search(Query, Collector)} minus the
      * rewrite / createWeight steps; the caller is responsible for
      * having created the Weight against this searcher with the score
-     * mode the collector needs (a {@link org.apache.lucene.search.ScoreMode#COMPLETE}
-     * Weight satisfies any collector).
+     * mode the collector needs (a {@link ScoreMode#COMPLETE} Weight
+     * satisfies any collector).
+     *
+     * <p>A single collector cannot be shared between slices, so this
+     * runs on the calling thread over every leaf whatever the slice
+     * count, exactly like the inherited {@code search(Query, Collector)}.
      */
     void search(Weight weight, Collector collector) throws IOException {
         LeafReaderContextPartition[] partitions = (getLeafContexts() == null)
@@ -143,15 +184,93 @@ final class LanceFragmentIndexSearcher extends ContextIndexSearcher implements L
     }
 
     /**
-     * {@link CollectorManager} counterpart of {@link #search(Weight, Collector)}.
-     * The searcher has no executor, so a single collector covers every
-     * leaf and {@code manager.reduce} sees exactly one collector, the
-     * same shape {@link org.apache.lucene.search.IndexSearcher#search(Query, CollectorManager)}
-     * produces here.
+     * Same steps as {@link IndexSearcher#search(Query, CollectorManager)}
+     * (first collector, rewrite for its score mode, one Weight, then
+     * one collector per slice), routed through
+     * {@link #search(Weight, CollectorManager, Collector)} so the slice
+     * loop is the one place that decides how slices run. Overridden
+     * because the stock method's slice loop is private and the
+     * fragment path needs two things it does not do: run the bucket
+     * collector processor over a collector that saw no leaf at all (a
+     * reader over an empty table still has to build its empty
+     * aggregations), and start a Lance-backed Weight's shard scan once
+     * before the slices begin.
+     */
+    @Override
+    public <C extends Collector, T> T search(Query query, CollectorManager<C, T> manager) throws IOException {
+        C firstCollector = manager.newCollector();
+        Query rewritten = firstCollector.scoreMode().needsScores() ? rewrite(query) : rewrite(new ConstantScoreQuery(query));
+        Weight weight = createWeight(rewritten, firstCollector.scoreMode(), 1f);
+        return search(weight, manager, firstCollector);
+    }
+
+    /**
+     * {@link CollectorManager} counterpart of {@link #search(Weight, Collector)}:
+     * one collector per slice, the slices collected in parallel on the
+     * executor when the searcher has one, then {@code manager.reduce}
+     * over every collector. With no executor there is one slice and
+     * {@code reduce} sees exactly one collector, the same shape
+     * {@link IndexSearcher#search(Query, CollectorManager)} produces
+     * on a searcher without an executor.
      */
     <C extends Collector, T> T search(Weight weight, CollectorManager<C, T> manager) throws IOException {
-        C collector = manager.newCollector();
-        search(weight, collector);
-        return manager.reduce(Collections.singletonList(collector));
+        return search(weight, manager, manager.newCollector());
+    }
+
+    /**
+     * The slice loop. {@code firstCollector} is the collector the
+     * caller already obtained from {@code manager} (Lucene creates it
+     * before the Weight so the Weight can take the collector's score
+     * mode); it collects the first slice.
+     *
+     * <p>Without a leaf (an empty table, or every fragment filtered
+     * out) the collector is still run through
+     * {@link #search(LeafReaderContextPartition[], Weight, Collector)}
+     * with no partitions so that the bucket collector processor builds
+     * the empty aggregations; Lucene's own loop returns before that
+     * step and an aggregator tree would then have no result to read.
+     *
+     * <p>With several slices the Weight's scorer supplier is asked for
+     * the first leaf on the calling thread before the tasks start.
+     * A Lance-backed Weight ({@code LanceFtsQuery}, {@code LanceKnnQuery},
+     * {@code LanceScanFilterQuery}, alone or inside a Boolean Weight)
+     * runs its one shard level Lance scan on the first leaf it is asked
+     * about and installs the result with a compare and set that every
+     * later leaf reads; when the first ask came from each slice thread
+     * at once, each thread ran the whole scan and all but one threw
+     * theirs away. The early ask puts the scan on the calling thread,
+     * once, and the slices find it installed. For any other Weight the
+     * extra supplier is cheap and unused; Lucene allows asking for a
+     * leaf's supplier more than once.
+     */
+    private <C extends Collector, T> T search(Weight weight, CollectorManager<C, T> manager, C firstCollector) throws IOException {
+        LeafSlice[] slices = getSlices();
+        if (slices.length == 0) {
+            search(new LeafReaderContextPartition[0], weight, firstCollector);
+            return manager.reduce(Collections.singletonList(firstCollector));
+        }
+        List<C> collectors = new ArrayList<>(slices.length);
+        collectors.add(firstCollector);
+        ScoreMode scoreMode = firstCollector.scoreMode();
+        for (int i = 1; i < slices.length; i++) {
+            C collector = manager.newCollector();
+            if (collector.scoreMode() != scoreMode) {
+                throw new IllegalStateException("CollectorManager does not always produce collectors with the same score mode");
+            }
+            collectors.add(collector);
+        }
+        if (slices.length > 1) {
+            weight.scorerSupplier(slices[0].partitions[0].ctx);
+        }
+        List<Callable<C>> tasks = new ArrayList<>(slices.length);
+        for (int i = 0; i < slices.length; i++) {
+            LeafReaderContextPartition[] partitions = slices[i].partitions;
+            C collector = collectors.get(i);
+            tasks.add(() -> {
+                search(partitions, weight, collector);
+                return collector;
+            });
+        }
+        return manager.reduce(getTaskExecutor().invokeAll(tasks));
     }
 }

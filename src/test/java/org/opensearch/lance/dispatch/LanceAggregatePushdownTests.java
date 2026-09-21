@@ -74,7 +74,12 @@ import org.opensearch.threadpool.ThreadPool;
  * {@code rating = (i * 37) % 1000} (null when {@code i % 5 == 4}),
  * {@code category = "c" + (i % 3)} (null when {@code i % 4 == 3}),
  * {@code flag = i % 2 == 0} (null when {@code i % 7 == 6}), a keyword
- * list {@code tags} and an FTS {@code body}.
+ * list {@code tags} and an FTS {@code body}. The aggregators run in one
+ * slice here: a slice level reduce would mark every {@code terms} bucket
+ * of the reference with the "not computed" doc count error the reduce
+ * assigns when {@code show_term_doc_count_error} is off, a field the
+ * coordinator's reduce normalises on both sides but the field for field
+ * comparison would see.
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
@@ -82,6 +87,11 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
     @Override
     protected Collection<Class<? extends Plugin>> getPlugins() {
         return List.of(LancePlugin.class);
+    }
+
+    @Override
+    protected Settings nodeSettings() {
+        return Settings.builder().put(super.nodeSettings()).put(LancePlugin.FRAGMENT_PATH_SLICES_SETTING.getKey(), 1).build();
     }
 
     public void testStructuralAllowList() {

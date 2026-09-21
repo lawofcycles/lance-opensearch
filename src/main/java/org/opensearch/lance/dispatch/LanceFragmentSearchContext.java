@@ -29,11 +29,13 @@ import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.similarity.SimilarityService;
 import org.opensearch.lance.engine.LanceCancellation;
+import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchExtBuilder;
 import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.BucketCollectorProcessor;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.SearchContextAggregations;
+import org.opensearch.search.aggregations.pipeline.PipelineAggregator;
 import org.opensearch.search.collapse.CollapseContext;
 import org.opensearch.search.dfs.DfsSearchResult;
 import org.opensearch.search.fetch.FetchPhase;
@@ -86,6 +88,11 @@ import org.opensearch.common.unit.TimeValue;
  * {@link #bitsetFilterCache()} for nested doc collectors, and a couple of
  * bookkeeping getters ({@link #numberOfShards()}, {@link #query()},
  * {@link #from()}, {@link #size()}, {@link #bucketCollectorProcessor()}).
+ * {@link #getTargetMaxSliceCount()}, {@link #shouldUseConcurrentSearch()}
+ * and {@link #partialOnShard()} carry the executor's slice count into the
+ * searcher and the aggregators so a request collects its fragments on
+ * several threads and merges the slice results the way concurrent
+ * segment search does on the shard path.
  * Every other {@link SearchContext} method throws
  * {@link UnsupportedOperationException} on purpose: if a code path the
  * fragment handler drives ever needs one, its failure surfaces immediately
@@ -117,6 +124,8 @@ public final class LanceFragmentSearchContext extends SearchContext {
     private BucketCollectorProcessor bucketCollectorProcessor = new BucketCollectorProcessor();
     private final List<Releasable> releasables = new ArrayList<>();
     private LanceCancellation cancellation = LanceCancellation.NONE;
+    private int targetMaxSliceCount = 1;
+    private ScriptService scriptService;
 
     /**
      * Two-phase construction: {@link ContextIndexSearcher} keeps a
@@ -194,6 +203,29 @@ public final class LanceFragmentSearchContext extends SearchContext {
     /** The cancellation of the task the request runs under, never null. */
     public LanceCancellation cancellation() {
         return cancellation;
+    }
+
+    /**
+     * Number of slices the searcher built against this context cuts
+     * the reader's leaves into, see {@link #getTargetMaxSliceCount()}.
+     * Set before the {@link ContextIndexSearcher} is constructed, since
+     * the searcher decides on construction whether it has an executor
+     * to run slices on. Values below 1 are treated as 1.
+     */
+    public LanceFragmentSearchContext withTargetMaxSliceCount(int targetMaxSliceCount) {
+        this.targetMaxSliceCount = Math.max(1, targetMaxSliceCount);
+        return this;
+    }
+
+    /**
+     * {@link ScriptService} the slice level reduce of
+     * {@link #partialOnShard()} carries. None of the aggregations the
+     * fragment path accepts runs a script during a reduce, so a null
+     * service (unit tests) only matters if that list ever changes.
+     */
+    public LanceFragmentSearchContext withScriptService(ScriptService scriptService) {
+        this.scriptService = scriptService;
+        return this;
     }
 
     // ------------- Real implementations -------------
@@ -332,9 +364,33 @@ public final class LanceFragmentSearchContext extends SearchContext {
         return cancellation.isCancelled();
     }
 
+    /**
+     * Upper bound on the slices {@link ContextIndexSearcher#slices}
+     * cuts the reader's leaves into: {@code lance.fragment_path.slices}
+     * as the executor read it for this request. The leaves are Lance
+     * fragments, one per leaf, and the stock supplier bundles them into
+     * at most this many slices by row count; a reader with fewer leaves
+     * than slices gets one slice per leaf. 1 means the searcher has no
+     * executor and collects every leaf on the calling thread.
+     */
     @Override
     public int getTargetMaxSliceCount() {
-        return 1;
+        return targetMaxSliceCount;
+    }
+
+    /**
+     * True when the searcher may run more than one slice. Read by the
+     * aggregators through {@link #asLocalBucketCountThresholds}: under
+     * concurrent collection a {@code terms} aggregator keeps every
+     * bucket of its slice ({@code shard_min_doc_count} 0) and the slice
+     * level reduce of {@link #partialOnShard()} applies the shard
+     * thresholds once over the merged buckets, exactly as the shard
+     * path does when concurrent segment search is on. With one slice
+     * the aggregator applies them itself, as it did before slicing.
+     */
+    @Override
+    public boolean shouldUseConcurrentSearch() {
+        return targetMaxSliceCount > 1;
     }
 
     @Override
@@ -729,9 +785,26 @@ public final class LanceFragmentSearchContext extends SearchContext {
         throw uoe("readerContext");
     }
 
+    /**
+     * Reduce context for merging the aggregator trees of the slices on
+     * the executor, the same one {@code DefaultSearchContext} hands
+     * {@code NonGlobalAggCollectorManager}: a partial reduction (no
+     * pipelines, no {@code min_doc_count} pruning) marked slice level,
+     * so a {@code terms} reduce applies {@code shard_size} and
+     * {@code shard_min_doc_count} rather than the request level
+     * {@code size} and {@code min_doc_count} the coordinator applies
+     * later. The fragment path routes every request with a pipeline
+     * aggregation to the shard path, so the pipeline tree is empty.
+     */
     @Override
     public InternalAggregation.ReduceContext partialOnShard() {
-        throw uoe("partialOnShard");
+        InternalAggregation.ReduceContext reduceContext = InternalAggregation.ReduceContext.forPartialReduction(
+            bigArrays,
+            scriptService,
+            () -> PipelineAggregator.PipelineTree.EMPTY
+        );
+        reduceContext.setSliceLevel(shouldUseConcurrentSearch());
+        return reduceContext;
     }
 
     // ------------- helpers -------------

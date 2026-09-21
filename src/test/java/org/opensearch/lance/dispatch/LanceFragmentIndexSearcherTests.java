@@ -6,7 +6,16 @@ package org.opensearch.lance.dispatch;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
@@ -17,6 +26,7 @@ import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.Collector;
+import org.apache.lucene.search.CollectorManager;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
@@ -51,7 +61,12 @@ import org.opensearch.test.OpenSearchTestCase;
  * {@link ContextIndexSearcher} fetches the search operation listener
  * through {@code indexShard()} on every slice and fails there; the
  * subclass has to run the same slice loop without it and still hand
- * the collector tree to the bucket collector processor.
+ * the collector tree to the bucket collector processor. The slice
+ * tests check that a slice count above 1 cuts the leaves into several
+ * slices with one collector each, that the collectors' reduce yields
+ * what one collector over every leaf yields, and that a pool that
+ * refuses the slice tasks leaves the whole search to the calling
+ * thread.
  */
 public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
 
@@ -99,15 +114,15 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
         );
     }
 
+    private LanceFragmentIndexSearcher newSearcher(DirectoryReader reader, LanceFragmentSearchContext context, Executor executor)
+        throws IOException {
+        return new LanceFragmentIndexSearcher(reader, indexSettings, context, new NoopCircuitBreaker(CircuitBreaker.REQUEST), executor);
+    }
+
     public void testCountAndTopDocsWithoutIndexShard() throws IOException {
         try (DirectoryReader reader = DirectoryReader.open(dir); LanceFragmentSearchContext context = newContext()) {
             assertNull(context.indexShard());
-            LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(
-                reader,
-                indexSettings,
-                context,
-                new NoopCircuitBreaker(CircuitBreaker.REQUEST)
-            );
+            LanceFragmentIndexSearcher searcher = newSearcher(reader, context, null);
             assertTrue("fixture must span several leaves", reader.leaves().size() > 1);
             assertEquals(TOTAL, searcher.count(MatchAllDocsQuery.INSTANCE));
             TopDocs top = searcher.search(MatchAllDocsQuery.INSTANCE, 3, new Sort(new SortField("n", SortField.Type.LONG, true)));
@@ -154,15 +169,10 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
                     super.processPostCollection(collectorTree);
                 }
             });
-            LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(
-                reader,
-                indexSettings,
-                context,
-                new NoopCircuitBreaker(CircuitBreaker.REQUEST)
-            );
+            LanceFragmentIndexSearcher searcher = newSearcher(reader, context, null);
             CountingBucketCollector collector = new CountingBucketCollector();
             searcher.search(MatchAllDocsQuery.INSTANCE, collector);
-            assertEquals(TOTAL, collector.collected);
+            assertEquals(TOTAL, collector.collected.get());
             assertEquals(List.of(collector), processed);
         }
     }
@@ -182,12 +192,7 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
                     super.processPostCollection(collectorTree);
                 }
             });
-            LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(
-                reader,
-                indexSettings,
-                context,
-                new NoopCircuitBreaker(CircuitBreaker.REQUEST)
-            );
+            LanceFragmentIndexSearcher searcher = newSearcher(reader, context, null);
             Weight weight = searcher.createWeight(searcher.rewrite(MatchAllDocsQuery.INSTANCE), ScoreMode.COMPLETE, 1f);
 
             Sort sort = new Sort(new SortField("n", SortField.Type.LONG, true));
@@ -201,21 +206,194 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
 
             CountingBucketCollector collector = new CountingBucketCollector();
             searcher.search(weight, collector);
-            assertEquals(TOTAL, collector.collected);
+            assertEquals(TOTAL, collector.collected.get());
             assertTrue("collector tree must reach the bucket collector processor", processed.contains(collector));
+        }
+    }
+
+    public void testOneSliceKeepsOneCollectorOnTheCallingThread() throws Exception {
+        // Slice count 1 is the pre-slicing behaviour: no executor is
+        // used even when one is given, a single collector covers every
+        // leaf in reader order, and the calling thread does the work.
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try (DirectoryReader reader = DirectoryReader.open(dir); LanceFragmentSearchContext context = newContext()) {
+            context.withTargetMaxSliceCount(1);
+            assertFalse(context.shouldUseConcurrentSearch());
+            LanceFragmentIndexSearcher searcher = newSearcher(reader, context, pool);
+            assertEquals(1, searcher.getSlices().length);
+            assertEquals(reader.leaves().size(), searcher.getSlices()[0].partitions.length);
+            for (int i = 0; i < reader.leaves().size(); i++) {
+                assertSame("leaf order inside the single slice", reader.leaves().get(i), searcher.getSlices()[0].partitions[i].ctx);
+            }
+            CountingManager manager = new CountingManager();
+            assertEquals(TOTAL, searcher.search(MatchAllDocsQuery.INSTANCE, manager).intValue());
+            assertEquals(1, manager.created.get());
+            assertEquals(Set.of(Thread.currentThread().getName()), manager.threads);
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    public void testSeveralSlicesCollectWithOneCollectorEachAndReduceToTheSameAnswer() throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        try (DirectoryReader reader = DirectoryReader.open(dir)) {
+            assertTrue("fixture must span several leaves", reader.leaves().size() > 1);
+            Sort sort = new Sort(new SortField("n", SortField.Type.LONG, true));
+
+            TopFieldDocs oneSlice;
+            int oneSliceCount;
+            try (LanceFragmentSearchContext context = newContext()) {
+                LanceFragmentIndexSearcher searcher = newSearcher(reader, context.withTargetMaxSliceCount(1), pool);
+                oneSlice = searcher.search(MatchAllDocsQuery.INSTANCE, new TopFieldCollectorManager(sort, 3, null, Integer.MAX_VALUE));
+                oneSliceCount = searcher.search(MatchAllDocsQuery.INSTANCE, new CountingManager());
+            }
+
+            try (LanceFragmentSearchContext context = newContext()) {
+                context.withTargetMaxSliceCount(4);
+                assertTrue(context.shouldUseConcurrentSearch());
+                LanceFragmentIndexSearcher searcher = newSearcher(reader, context, pool);
+                // Three leaves, target four: one slice per leaf.
+                assertEquals(reader.leaves().size(), searcher.getSlices().length);
+
+                List<Collector> processed = new ArrayList<>();
+                context.setBucketCollectorProcessor(new BucketCollectorProcessor() {
+                    @Override
+                    public void processPostCollection(Collector collectorTree) throws IOException {
+                        synchronized (processed) {
+                            processed.add(collectorTree);
+                        }
+                        super.processPostCollection(collectorTree);
+                    }
+                });
+                CountingManager manager = new CountingManager();
+                assertEquals(oneSliceCount, searcher.search(MatchAllDocsQuery.INSTANCE, manager).intValue());
+                assertEquals("one collector per slice", searcher.getSlices().length, manager.created.get());
+                assertEquals("every slice's collector went through post collection", manager.created.get(), processed.size());
+
+                TopFieldDocs sliced = searcher.search(
+                    MatchAllDocsQuery.INSTANCE,
+                    new TopFieldCollectorManager(sort, 3, null, Integer.MAX_VALUE)
+                );
+                assertEquals(oneSlice.totalHits.value(), sliced.totalHits.value());
+                assertEquals(oneSlice.scoreDocs.length, sliced.scoreDocs.length);
+                for (int i = 0; i < oneSlice.scoreDocs.length; i++) {
+                    assertEquals("doc at rank " + i, oneSlice.scoreDocs[i].doc, sliced.scoreDocs[i].doc);
+                }
+
+                // The Weight entry point takes the same slice loop.
+                Weight weight = searcher.createWeight(searcher.rewrite(MatchAllDocsQuery.INSTANCE), ScoreMode.COMPLETE, 1f);
+                CountingManager viaWeight = new CountingManager();
+                assertEquals(TOTAL, searcher.search(weight, viaWeight).intValue());
+                assertEquals(searcher.getSlices().length, viaWeight.created.get());
+            }
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    public void testRejectingPoolLeavesEverySliceToTheCallingThread() throws IOException {
+        // The SEARCH pool refuses a task when its queue is full. The
+        // slice loop must then run the refused slices itself rather
+        // than fail the request or wait for a thread that never comes.
+        AtomicInteger rejected = new AtomicInteger();
+        Executor refusing = task -> {
+            rejected.incrementAndGet();
+            throw new RejectedExecutionException("pool full");
+        };
+        try (DirectoryReader reader = DirectoryReader.open(dir); LanceFragmentSearchContext context = newContext()) {
+            LanceFragmentIndexSearcher searcher = newSearcher(reader, context.withTargetMaxSliceCount(4), refusing);
+            assertEquals(reader.leaves().size(), searcher.getSlices().length);
+            CountingManager manager = new CountingManager();
+            assertEquals(TOTAL, searcher.search(MatchAllDocsQuery.INSTANCE, manager).intValue());
+            assertEquals(searcher.getSlices().length, manager.created.get());
+            assertEquals("all but one slice were offered to the pool", searcher.getSlices().length - 1, rejected.get());
+            assertEquals(Set.of(Thread.currentThread().getName()), manager.threads);
+        }
+    }
+
+    public void testEmptyReaderStillRunsPostCollection() throws IOException {
+        // An executor over a table with no rows opens a reader without
+        // leaves; the aggregation path still has to build its empty
+        // aggregations, which happens in processPostCollection.
+        try (Directory empty = new ByteBuffersDirectory()) {
+            try (IndexWriter writer = new IndexWriter(empty, new IndexWriterConfig())) {
+                writer.commit();
+            }
+            try (DirectoryReader reader = DirectoryReader.open(empty); LanceFragmentSearchContext context = newContext()) {
+                assertTrue(reader.leaves().isEmpty());
+                List<Collector> processed = new ArrayList<>();
+                context.setBucketCollectorProcessor(new BucketCollectorProcessor() {
+                    @Override
+                    public void processPostCollection(Collector collectorTree) throws IOException {
+                        processed.add(collectorTree);
+                        super.processPostCollection(collectorTree);
+                    }
+                });
+                LanceFragmentIndexSearcher searcher = newSearcher(reader, context.withTargetMaxSliceCount(4), null);
+                CountingManager manager = new CountingManager();
+                assertEquals(0, searcher.search(MatchAllDocsQuery.INSTANCE, manager).intValue());
+                assertEquals(1, manager.created.get());
+                assertEquals(1, processed.size());
+            }
+        }
+    }
+
+    public void testPartialOnShardIsSliceLevelOnlyWithSeveralSlices() {
+        try (LanceFragmentSearchContext context = newContext()) {
+            assertFalse(context.withTargetMaxSliceCount(1).partialOnShard().isSliceLevel());
+            assertFalse(context.partialOnShard().isFinalReduce());
+            assertTrue(context.withTargetMaxSliceCount(2).partialOnShard().isSliceLevel());
+            assertFalse(context.partialOnShard().isFinalReduce());
+        }
+    }
+
+    /**
+     * One {@link CountingBucketCollector} per {@code newCollector} call;
+     * {@code reduce} sums their counts. Records the threads that
+     * collected so a test can tell where the slices ran.
+     */
+    private static final class CountingManager implements CollectorManager<CountingBucketCollector, Integer> {
+        final AtomicInteger created = new AtomicInteger();
+        final Set<String> threads = ConcurrentHashMap.newKeySet();
+
+        @Override
+        public CountingBucketCollector newCollector() {
+            created.incrementAndGet();
+            return new CountingBucketCollector(threads);
+        }
+
+        @Override
+        public Integer reduce(Collection<CountingBucketCollector> collectors) {
+            int total = 0;
+            for (CountingBucketCollector collector : collectors) {
+                total += collector.collected.get();
+            }
+            return total;
         }
     }
 
     private static final class CountingBucketCollector extends BucketCollector {
 
-        int collected;
+        final AtomicInteger collected = new AtomicInteger();
+        private final Set<String> threads;
+
+        CountingBucketCollector() {
+            this(ConcurrentHashMap.newKeySet());
+        }
+
+        CountingBucketCollector(Set<String> threads) {
+            this.threads = threads;
+        }
 
         @Override
         public LeafBucketCollector getLeafCollector(LeafReaderContext ctx) {
+            threads.add(Thread.currentThread().getName());
             return new LeafBucketCollector() {
                 @Override
                 public void collect(int doc, long owningBucketOrd) {
-                    collected++;
+                    collected.incrementAndGet();
                 }
             };
         }
