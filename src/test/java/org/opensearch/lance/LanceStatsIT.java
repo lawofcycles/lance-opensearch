@@ -103,6 +103,12 @@ public class LanceStatsIT extends LanceRestTestCase {
             assertEquals(1, snapshots(afterSecond).get("count"));
             assertEquals(buildsAfterSurface, number(snapshots(afterSecond).get("snapshot_build_count")));
             assertEquals(0, columnStore(afterSecond).get("budget_misses"));
+            // The column came from the store, so nothing sits on the
+            // request breaker for it. The refusal counter is cumulative
+            // since node start and other tests in the same cluster may
+            // have driven it, so only its presence is checked here.
+            assertEquals(0, columnStore(afterSecond).get("heap_fallback_bytes"));
+            assertTrue(columnStore(afterSecond).containsKey("heap_fallback_rejections"));
 
             // Deleting the index releases the engine's lease and retires the
             // snapshot; the store gives its columns back.

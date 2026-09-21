@@ -17,6 +17,7 @@ import java.util.stream.Stream;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
+import org.opensearch.client.ResponseException;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
@@ -478,6 +479,93 @@ public class LanceAggregationIT extends LanceRestTestCase {
 
     private static int number(Object value) {
         return ((Number) value).intValue();
+    }
+
+    private static long longNumber(Object value) {
+        return ((Number) value).longValue();
+    }
+
+    private static void putTransientSetting(String key, String value) throws IOException {
+        Request request = new Request("PUT", "/_cluster/settings");
+        request.setJsonEntity("{\"transient\":{\"" + key + "\":" + (value == null ? "null" : "\"" + value + "\"") + "}}");
+        client().performRequest(request);
+    }
+
+    public void testHeapColumnLoadIsChargedToTheRequestBreakerAndRefusedAt429() throws Exception {
+        // With lance.cache.enabled false every column a request reads is
+        // materialised in heap for that request, the path a column store
+        // budget miss takes (lance.cache.column_share is a startup
+        // setting, so the store cannot be emptied at runtime). The hint
+        // fixture has 3 fragments of 200 rows: the rating column costs a
+        // little over 1.6 KB per fragment as long[200] plus its presence
+        // bits, about 5 KB for the request. The aggregator itself
+        // reserves 5 KB on the same breaker when it is built, so a limit
+        // of 8 KB lets the aggregator through and refuses the column. The
+        // pushdown is off because a size 0 sum over match_all would
+        // otherwise run inside the Lance scan and never touch the column.
+        putTransientSetting("lance.aggregation.pushdown", "false");
+        putTransientSetting("lance.cache.enabled", "false");
+        String sum = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}";
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "heap-breaker")) {
+            String index = fixture.indexName();
+            Map<String, Object> before = columnStoreStats();
+            long rejectionsBefore = longNumber(before.get("heap_fallback_rejections"));
+
+            String first = withoutTook(readAll(postJson("/" + index + "/_search", sum)));
+            assertEquals(600, extractIntPath(first, "hits", "total", "value"));
+            // 480 rows have a rating of (i * 37) % 1000.
+            double expectedSum = 0d;
+            for (int i = 0; i < 600; i++) {
+                if (i % 5 != 4) {
+                    expectedSum += (i * 37) % 1000;
+                }
+            }
+            assertEquals(expectedSum, extractDoublePath(first, "aggregations", "s", "value"), 0d);
+            Map<String, Object> afterFirst = columnStoreStats();
+            assertEquals(
+                "the reader closed with the request and gave the heap back",
+                0L,
+                longNumber(afterFirst.get("heap_fallback_bytes"))
+            );
+            assertEquals(rejectionsBefore, longNumber(afterFirst.get("heap_fallback_rejections")));
+
+            putTransientSetting("indices.breaker.request.limit", "8kb");
+            try {
+                ResponseException refused = expectThrows(ResponseException.class, () -> postJson("/" + index + "/_search", sum));
+                String body = readAll(refused.getResponse());
+                assertEquals(body, RestStatus.TOO_MANY_REQUESTS.getStatus(), refused.getResponse().getStatusLine().getStatusCode());
+                assertTrue(body, body.contains("circuit_breaking_exception"));
+                assertTrue("the label names the column: " + body, body.contains("lance_heap_column:rating"));
+                assertTrue("the message names the column: " + body, body.contains("column [rating]"));
+                assertTrue("the message carries the limit: " + body, body.contains("limit of [8192/8kb]"));
+                Map<String, Object> afterRefusal = columnStoreStats();
+                assertEquals(rejectionsBefore + 1, longNumber(afterRefusal.get("heap_fallback_rejections")));
+                assertEquals(0L, longNumber(afterRefusal.get("heap_fallback_bytes")));
+            } finally {
+                putTransientSetting("indices.breaker.request.limit", null);
+            }
+
+            // Back at the default limit the same request answers as before.
+            String again = withoutTook(readAll(postJson("/" + index + "/_search", sum)));
+            assertEquals(first, again);
+            assertEquals(rejectionsBefore + 1, longNumber(columnStoreStats().get("heap_fallback_rejections")));
+
+            // The shard path reader (explain routes there) stays open for
+            // the life of the shard, so its heap column stays charged and
+            // the gauge shows it until the index goes away.
+            String viaShard = readAll(postJson("/" + index + "/_search", "{\"explain\":true," + sum.substring(1)));
+            assertEquals(expectedSum, extractDoublePath(viaShard, "aggregations", "s", "value"), 0d);
+            long held = longNumber(columnStoreStats().get("heap_fallback_bytes"));
+            assertTrue(
+                "the engine reader holds rating in heap: " + held,
+                held >= 3 * 200 * Long.BYTES && held < 3 * 200 * Long.BYTES + 1024
+            );
+            client().performRequest(new Request("DELETE", "/" + index));
+            assertBusy(() -> assertEquals(0L, longNumber(columnStoreStats().get("heap_fallback_bytes"))));
+        } finally {
+            putTransientSetting("lance.cache.enabled", null);
+            putTransientSetting("lance.aggregation.pushdown", null);
+        }
     }
 
     public void testSubstraitPushdownAnswersLikeTheAggregators() throws Exception {
