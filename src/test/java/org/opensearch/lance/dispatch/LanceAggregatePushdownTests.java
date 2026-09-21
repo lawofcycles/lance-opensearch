@@ -728,6 +728,25 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
                         .field("rating")
                         .interval(100)
                         .subAggregation(AggregationBuilders.sum("s").field("id"))
+                ),
+            // multi key groups: the partials merge on the full key
+            // list, and the inner cut happens once per parent bucket
+            // over the merged groups
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .subAggregation(AggregationBuilders.avg("a").field("rating"))
+                        .subAggregation(
+                            AggregationBuilders.terms("r").field("rating").size(3).subAggregation(AggregationBuilders.max("m").field("id"))
+                        )
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    composite("cr", new TermsValuesSourceBuilder("c").field("category"), new TermsValuesSourceBuilder("r").field("rating"))
+                        .size(7)
+                        .aggregateAfter(Map.of("c", "c0", "r", 300))
+                        .subAggregation(AggregationBuilders.sum("s").field("id"))
                 )
         );
         List<QueryBuilder> queries = List.of(new MatchAllQueryBuilder(), new RangeQueryBuilder("rating").gte(500));
