@@ -183,11 +183,17 @@ public class LanceStatsIT extends LanceRestTestCase {
         LanceTableFactory.writeIndexedFixtureTable(scratchDir, tableName, 2, 150);
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         try {
+            long sessionBytesBefore = ((Number) nativeMemory(nodeStats()).get("session_bytes")).longValue();
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(readAll(attach), 200, attach.getStatusLine().getStatusCode());
             ensureGreen(tableName);
 
             Map<String, Object> warmUp = awaitWarmUp(tableName, "done");
+            // The indexes the warm-up opened sit in the Lance Session
+            // cache, so its live size has grown; a warm-up that reported
+            // done without scanning would leave it where it was.
+            long sessionBytesAfter = ((Number) nativeMemory(nodeStats()).get("session_bytes")).longValue();
+            assertTrue("session bytes " + sessionBytesBefore + " -> " + sessionBytesAfter, sessionBytesAfter > sessionBytesBefore);
             assertEquals("metadata", warmUp.get("mode"));
             assertEquals(tableUri, warmUp.get("table"));
             assertTrue(warmUp.toString(), ((Number) warmUp.get("version")).longValue() >= 1L);

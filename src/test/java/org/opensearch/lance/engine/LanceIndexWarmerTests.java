@@ -20,6 +20,7 @@ import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.lance.Dataset;
 import org.lance.index.IndexDescription;
+import org.lance.ipc.ScanOptions;
 import org.lance.schema.LanceField;
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -129,6 +130,21 @@ public class LanceIndexWarmerTests extends OpenSearchTestCase {
         warmer.close();
     }
 
+    public void testCloseWaitsForTheRunningWarmUp() throws Exception {
+        LanceIndexWarmer warmer = new LanceIndexWarmer(cache, executor, Mode.ALL);
+        warmer.schedule(indexMetadata("warm-close"));
+        // Close while the task may still be inside a scan: it returns
+        // only once no warm-up runs, so the cache can close safely.
+        warmer.close();
+        assertFalse(warmer.isWarmUpRunning());
+        // Whatever the task reached, nothing runs after close and a
+        // later schedule is recorded as cancelled without running.
+        warmer.schedule(indexMetadata("warm-after-close"));
+        TableStatus after = awaitFinished(warmer, "warm-after-close");
+        assertEquals(State.CANCELLED, after.state());
+        assertTrue(after.indexes().isEmpty());
+    }
+
     public void testNoneModeRecordsASkippedTableAndOpensNothing() throws Exception {
         LanceIndexWarmer warmer = new LanceIndexWarmer(cache, executor, Mode.NONE);
         warmer.schedule(indexMetadata("warm-none"));
@@ -176,6 +192,32 @@ public class LanceIndexWarmerTests extends OpenSearchTestCase {
                 assertNotNull(description.getIndexType(), LanceIndexWarmer.warmScan(field, description.getIndexType(), Mode.METADATA));
                 assertNotNull(description.getIndexType(), LanceIndexWarmer.warmScan(field, description.getIndexType(), Mode.ALL));
             }
+            // BTree and bitmap: metadata asks for the null pages only,
+            // all for every value from the type's lower bound.
+            ScanOptions btreeMetadata = LanceIndexWarmer.warmScan(byName.get("rating"), "BTree", Mode.METADATA);
+            assertEquals("`rating` IS NULL", btreeMetadata.getFilter().get());
+            assertEquals(Long.valueOf(1L), btreeMetadata.getLimit().get());
+            assertTrue(btreeMetadata.getColumns().get().isEmpty());
+            ScanOptions btreeAll = LanceIndexWarmer.warmScan(byName.get("rating"), "BTree", Mode.ALL);
+            assertEquals("`rating` >= -2147483648", btreeAll.getFilter().get());
+            assertEquals(
+                "`category` IS NULL",
+                LanceIndexWarmer.warmScan(byName.get("category"), "Bitmap", Mode.METADATA).getFilter().get()
+            );
+            assertEquals("`category` >= ''", LanceIndexWarmer.warmScan(byName.get("category"), "Bitmap", Mode.ALL).getFilter().get());
+            // Inverted: the same probe token under both modes, no filter.
+            for (Mode mode : List.of(Mode.METADATA, Mode.ALL)) {
+                ScanOptions fts = LanceIndexWarmer.warmScan(byName.get("body"), "Inverted", mode);
+                assertTrue(fts.getFullTextQuery().isPresent());
+                assertTrue(fts.getFilter().isEmpty());
+            }
+            // IVF: one probe under metadata, every partition under all.
+            ScanOptions ivfMetadata = LanceIndexWarmer.warmScan(byName.get("embedding"), "IVF_PQ", Mode.METADATA);
+            assertEquals(1, ivfMetadata.getNearest().get().getK());
+            assertEquals(1, ivfMetadata.getNearest().get().getMinimumNprobes());
+            assertEquals(8, ivfMetadata.getNearest().get().getKey().length);
+            ScanOptions ivfAll = LanceIndexWarmer.warmScan(byName.get("embedding"), "IVF_PQ", Mode.ALL);
+            assertEquals(LanceIndexWarmer.ALL_PARTITIONS_NPROBES, ivfAll.getNearest().get().getMinimumNprobes());
             // A type without a warm-up scan yields none.
             assertNull(LanceIndexWarmer.warmScan(byName.get("rating"), "ZoneMap", Mode.METADATA));
             // A vector index over a non float32 column has no probe vector.
