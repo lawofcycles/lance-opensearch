@@ -581,14 +581,17 @@ The effective probe limit is `min(subset_probe_limit, max(subset_probe_min_rows,
 
 ### Aggregations computed inside the scan
 
-A `size: 0` request over `match_all` or a scalar filter whose aggregations are metrics only, or one `terms` / `histogram` / `date_histogram` with metric children, is answered by a group by inside the Lance scan instead of the Lucene aggregators (the shapes are listed in [features.md](features.md#aggregation-pushdown)). Two dynamic cluster settings control it:
+A `size: 0` request over `match_all` or a scalar filter whose aggregations are metrics only (`stats`, `cardinality` and tdigest `percentiles` included), or a chain of `terms` / `histogram` / `date_histogram` / `range` / `date_range` / `filter` / `filters` / `missing` levels with metric children, is answered by a group by inside the Lance scan instead of the Lucene aggregators (the shapes are listed in [features.md](features.md#aggregation-pushdown)). Three dynamic cluster settings control it:
 
 ```
 lance.aggregation.pushdown: true              # default; false answers every aggregation through the aggregators
 lance.aggregation.pushdown_parallelism: 4     # default: half the CPUs the JVM sees (at least 1, at most 32)
+lance.aggregation.percentiles_bins: 4096      # default; bins of a pushed down tdigest percentiles histogram (16 to 1000000)
 ```
 
 Lance aggregates one scan on a single thread, so a node that holds many fragments cuts them into `pushdown_parallelism` contiguous groups, scans the groups at once on the `search` thread pool and merges the group rows before it builds its buckets. Set it to `1` to compare against a single scan; raise it up to the node's core count when a `terms` over many rows is slower than the same request with the setting off.
+
+A tdigest `percentiles` is sketched from a histogram of `percentiles_bins` equal width bins over the field's range instead of from every document, and a reported percentile is within one bin width of the value the aggregators would sketch. Raise the bin count when a percentile needs to be closer than `(max - min) / 4096`; every bin the data fills is one row the executor reads per bucket.
 
 ### Aggregations and hit pages collected on several threads
 
