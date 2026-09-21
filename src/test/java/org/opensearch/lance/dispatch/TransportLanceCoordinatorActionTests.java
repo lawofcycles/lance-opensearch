@@ -12,18 +12,26 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.opensearch.OpenSearchTimeoutException;
 import org.opensearch.Version;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
+import org.opensearch.core.rest.RestStatus;
+import org.opensearch.core.tasks.TaskCancelledException;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.FragmentFanOut;
+import org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.FragmentFanOut.Outcome;
+import org.opensearch.tasks.CancellableTask;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.ReceiveTimeoutTransportException;
 import org.opensearch.transport.RemoteTransportException;
+import org.opensearch.transport.TransportException;
 import org.opensearch.transport.TransportResponseHandler;
 
 import static org.hamcrest.Matchers.containsString;
@@ -35,7 +43,11 @@ import static org.hamcrest.Matchers.instanceOf;
  * {@code lance_coordinator} pool once every node has answered, and
  * every failure path (rejected merge submit, throwing merge, a node
  * failing, the send itself throwing) completes the coordinator's
- * listener exactly once with {@code onFailure}.
+ * listener exactly once with {@code onFailure}. A node whose request
+ * timed out or whose executor was cancelled leaves its slot empty and
+ * marks the outcome, or fails the fan-out with a 504 when partial
+ * results are not allowed; a cancelled coordinator task ends the
+ * fan-out with {@code TaskCancelledException} instead of a merge.
  */
 public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
 
@@ -98,9 +110,9 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
         CountingListener done = new CountingListener(coordinatorPool());
         AtomicReference<String> mergeThread = new AtomicReference<>();
         AtomicReference<List<LanceFragmentQueryResponse>> mergedResponses = new AtomicReference<>();
-        FragmentFanOut fanOut = new FragmentFanOut(2, coordinatorPool(), responses -> {
+        FragmentFanOut fanOut = new FragmentFanOut(2, coordinatorPool(), outcome -> {
             mergeThread.set(Thread.currentThread().getName());
-            mergedResponses.set(responses);
+            mergedResponses.set(outcome.responses());
         }, done);
         LanceFragmentQueryResponse first = response(1L);
         LanceFragmentQueryResponse second = response(2L);
@@ -226,6 +238,192 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
         done.await();
         assertEquals(0, done.responses.get());
         assertEquals(1, done.failures.get());
+    }
+
+    public void testTimedOutNodeLeavesItsSlotEmptyAndMarksTheOutcomeWhenPartialResultsAreAllowed() throws Exception {
+        CountingListener done = new CountingListener(coordinatorPool());
+        AtomicReference<Outcome> merged = new AtomicReference<>();
+        List<String> incomplete = new java.util.concurrent.CopyOnWriteArrayList<>();
+        FragmentFanOut fanOut = new FragmentFanOut(
+            2,
+            coordinatorPool(),
+            merged::set,
+            done,
+            /* allowPartialResults */ true,
+            /* task */ null,
+            (node, request, cause) -> incomplete.add(node.getId() + ":" + cause.getClass().getSimpleName())
+        );
+        FragmentFanOut.Sender keep = (node, request, handler) -> {};
+        fanOut.send(keep, 0, NODE_A, null);
+        fanOut.send(keep, 1, NODE_B, null);
+
+        fanOut.handler(1).handleException(timeout(NODE_B));
+        assertNull("the fan-out waits for the other node before merging", merged.get());
+        LanceFragmentQueryResponse fromA = response(3L);
+        fanOut.handler(0).handleResponse(fromA);
+
+        done.await();
+        assertEquals(1, done.responses.get());
+        assertEquals(0, done.failures.get());
+        assertEquals("only the response that arrived is merged", List.of(fromA), merged.get().responses());
+        assertEquals(1, merged.get().incompleteNodes());
+        assertEquals(List.of("b:ReceiveTimeoutTransportException"), incomplete);
+    }
+
+    public void testTimedOutNodeFailsTheFanOutWithGatewayTimeoutWhenPartialResultsAreNotAllowed() throws Exception {
+        CountingListener done = new CountingListener(coordinatorPool());
+        AtomicInteger merges = new AtomicInteger();
+        List<String> incomplete = new java.util.concurrent.CopyOnWriteArrayList<>();
+        FragmentFanOut fanOut = new FragmentFanOut(
+            2,
+            coordinatorPool(),
+            outcome -> merges.incrementAndGet(),
+            done,
+            /* allowPartialResults */ false,
+            /* task */ null,
+            (node, request, cause) -> incomplete.add(node.getId())
+        );
+        FragmentFanOut.Sender keep = (node, request, handler) -> {};
+        fanOut.send(keep, 0, NODE_A, null);
+        fanOut.send(keep, 1, NODE_B, null);
+
+        ReceiveTimeoutTransportException timeout = timeout(NODE_B);
+        fanOut.handler(1).handleException(timeout);
+        assertEquals("the fan-out waits for the other node before failing", 0, done.failures.get());
+        fanOut.handler(0).handleResponse(response(1L));
+
+        done.await();
+        assertEquals(0, done.responses.get());
+        assertEquals(1, done.failures.get());
+        assertThat(done.failure.get(), instanceOf(OpenSearchTimeoutException.class));
+        assertEquals(RestStatus.GATEWAY_TIMEOUT, ((OpenSearchTimeoutException) done.failure.get()).status());
+        assertSame(timeout, done.failure.get().getCause());
+        assertEquals("the node is reported even when the request fails", List.of("b"), incomplete);
+        assertEquals(0, merges.get());
+    }
+
+    public void testCancelledExecutorCountsAsIncompleteNode() throws Exception {
+        // A node whose executor task was cancelled answers a
+        // TaskCancelledException wrapped by the transport layer; it is
+        // treated like a node that timed out, not as a failure of the
+        // request.
+        CountingListener done = new CountingListener(coordinatorPool());
+        AtomicReference<Outcome> merged = new AtomicReference<>();
+        FragmentFanOut fanOut = new FragmentFanOut(2, coordinatorPool(), merged::set, done);
+
+        fanOut.handler(0)
+            .handleException(new RemoteTransportException("a", new TaskCancelledException("cancelled task with reason: test")));
+        LanceFragmentQueryResponse fromB = response(2L);
+        fanOut.handler(1).handleResponse(fromB);
+
+        done.await();
+        assertEquals(1, done.responses.get());
+        assertEquals(List.of(fromB), merged.get().responses());
+        assertEquals(1, merged.get().incompleteNodes());
+    }
+
+    public void testEveryNodeTimingOutMergesNothingAndMarksTheOutcome() throws Exception {
+        CountingListener done = new CountingListener(coordinatorPool());
+        AtomicReference<Outcome> merged = new AtomicReference<>();
+        FragmentFanOut fanOut = new FragmentFanOut(2, coordinatorPool(), merged::set, done);
+
+        fanOut.handler(0).handleException(timeout(NODE_A));
+        fanOut.handler(1).handleException(timeout(NODE_B));
+
+        done.await();
+        assertEquals(1, done.responses.get());
+        assertEquals(List.of(), merged.get().responses());
+        assertEquals(2, merged.get().incompleteNodes());
+    }
+
+    public void testCancelledCoordinatorTaskSkipsTheMergeAndFailsWithTaskCancelled() throws Exception {
+        CountingListener done = new CountingListener(coordinatorPool());
+        AtomicInteger merges = new AtomicInteger();
+        TestTask task = new TestTask();
+        FragmentFanOut fanOut = new FragmentFanOut(
+            2,
+            coordinatorPool(),
+            outcome -> merges.incrementAndGet(),
+            done,
+            true,
+            task,
+            (node, request, cause) -> {}
+        );
+
+        fanOut.handler(0).handleResponse(response(1L));
+        task.cancel("client closed the connection");
+        fanOut.handler(1).handleResponse(response(2L));
+
+        done.await();
+        assertEquals(0, done.responses.get());
+        assertEquals(1, done.failures.get());
+        assertThat(done.failure.get(), instanceOf(TaskCancelledException.class));
+        assertThat(done.failure.get().getMessage(), containsString("client closed the connection"));
+        assertEquals("a cancelled task must not merge", 0, merges.get());
+    }
+
+    public void testCancelledCoordinatorTaskReportsTaskCancelledInPlaceOfANodeFailure() throws Exception {
+        // Once the coordinator task is cancelled its executors answer
+        // TaskCancelledException too; whatever the last exception was,
+        // the request ends as cancelled and the original is kept as a
+        // suppressed exception.
+        CountingListener done = new CountingListener(coordinatorPool());
+        TestTask task = new TestTask();
+        FragmentFanOut fanOut = new FragmentFanOut(2, coordinatorPool(), outcome -> {}, done, false, task, (node, request, cause) -> {});
+
+        task.cancel("cancelled through _tasks/_cancel");
+        RemoteTransportException nodeGone = new RemoteTransportException("node b left", null);
+        fanOut.handler(1).handleException(nodeGone);
+        fanOut.handler(0).handleResponse(response(1L));
+
+        done.await();
+        assertEquals(1, done.failures.get());
+        assertThat(done.failure.get(), instanceOf(TaskCancelledException.class));
+        assertEquals(List.of(nodeGone), List.of(done.failure.get().getSuppressed()));
+    }
+
+    public void testSendThrowingAfterCancellationCountsAsThatNodeFailingAndEndsCancelled() throws Exception {
+        // TransportService.sendChildRequest refuses a child of a
+        // cancelled task by throwing from the send; the fan-out treats
+        // that like any other synchronous send failure and the request
+        // ends cancelled.
+        CountingListener done = new CountingListener(coordinatorPool());
+        TestTask task = new TestTask();
+        task.cancel("cancelled before the fan-out");
+        FragmentFanOut fanOut = new FragmentFanOut(1, coordinatorPool(), outcome -> {}, done, true, task, (node, request, cause) -> {});
+        FragmentFanOut.Sender refusing = (node, request, handler) -> {
+            throw new TaskCancelledException("The parent task was cancelled, shouldn't start any child tasks");
+        };
+
+        fanOut.send(refusing, 0, NODE_A, null);
+
+        done.await();
+        assertEquals(0, done.responses.get());
+        assertEquals(1, done.failures.get());
+        assertThat(done.failure.get(), instanceOf(TaskCancelledException.class));
+    }
+
+    public void testIsIncompleteRecognisesTimeoutsAndCancelledExecutors() {
+        assertTrue(FragmentFanOut.isIncomplete(timeout(NODE_A)));
+        assertTrue(FragmentFanOut.isIncomplete(new RemoteTransportException("a", new TaskCancelledException("cancelled"))));
+        assertFalse(FragmentFanOut.isIncomplete(new RemoteTransportException("a", new IllegalStateException("boom"))));
+        assertFalse(FragmentFanOut.isIncomplete(new TransportException("closed")));
+    }
+
+    private static ReceiveTimeoutTransportException timeout(DiscoveryNode node) {
+        return new ReceiveTimeoutTransportException(node, LanceFragmentQueryAction.NAME, "request_id [1] timed out after [10ms]");
+    }
+
+    /** A coordinator task that can be cancelled from the test. */
+    private static final class TestTask extends CancellableTask {
+        TestTask() {
+            super(1L, "transport", LanceCoordinatorAction.NAME, "test", TaskId.EMPTY_TASK_ID, java.util.Map.of());
+        }
+
+        @Override
+        public boolean shouldCancelChildrenOnCancellation() {
+            return true;
+        }
     }
 
     private ExecutorService coordinatorPool() {

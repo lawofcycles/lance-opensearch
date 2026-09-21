@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -23,7 +24,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.search.TotalHits;
 import org.lance.Dataset;
+import org.opensearch.OpenSearchTimeoutException;
 import org.opensearch.action.ActionRunnable;
+import org.opensearch.action.admin.cluster.node.tasks.cancel.CancelTasksRequest;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchResponseSections;
@@ -37,11 +40,15 @@ import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.BigArrays;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.tasks.TaskCancelledException;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
@@ -50,6 +57,7 @@ import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
+import org.opensearch.search.SearchService;
 import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.InternalAggregation;
@@ -60,11 +68,15 @@ import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.search.sort.ScoreSortBuilder;
 import org.opensearch.search.sort.SortBuilder;
 import org.opensearch.search.sort.SortOrder;
+import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.ReceiveTimeoutTransportException;
 import org.opensearch.transport.TransportException;
+import org.opensearch.transport.TransportRequestOptions;
 import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.TransportService;
+import org.opensearch.transport.client.node.NodeClient;
 
 /**
  * Coordinator handler for shard-free dispatch. Receives a
@@ -92,6 +104,19 @@ import org.opensearch.transport.TransportService;
  * run on the plugin's {@code lance_coordinator} pool; the per-node
  * responses are received on the transport thread that read them and
  * only stored and counted there (see {@link FragmentFanOut}).
+ *
+ * <p>Timeout and cancellation: the request's {@code timeout} (or the
+ * cluster's {@code search.default_search_timeout}) is the transport
+ * timeout of every per-node request. A node that has not answered by
+ * then is reported as incomplete, its executor task is cancelled, and
+ * the request either completes from the nodes that did answer with
+ * {@code timed_out: true} ({@code allow_partial_search_results},
+ * default true) or fails with HTTP 504. The per-node requests are child
+ * requests of the coordinator task, so cancelling that task (through
+ * {@code _tasks/_cancel}, or the client closing its connection, which
+ * cancels the search task the coordinator task is a child of) cancels
+ * the executors through the task manager and ends the request with
+ * {@code TaskCancelledException} instead of a merge.
  */
 public final class TransportLanceCoordinatorAction extends HandledTransportAction<SearchRequest, SearchResponse> {
 
@@ -103,6 +128,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     private final IndexNameExpressionResolver indexNameExpressionResolver;
     private final BigArrays bigArrays;
     private final ScriptService scriptService;
+    private final NodeClient client;
 
     /**
      * Requests that reach this action over the transport layer (a
@@ -119,7 +145,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         IndexNameExpressionResolver indexNameExpressionResolver,
         ActionFilters actionFilters,
         BigArrays bigArrays,
-        ScriptService scriptService
+        ScriptService scriptService,
+        NodeClient client
     ) {
         super(LanceCoordinatorAction.NAME, transportService, actionFilters, SearchRequest::new, LancePlugin.LANCE_COORDINATOR_THREAD_POOL);
         this.transportService = transportService;
@@ -128,20 +155,74 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         this.indexNameExpressionResolver = indexNameExpressionResolver;
         this.bigArrays = bigArrays;
         this.scriptService = scriptService;
+        this.client = client;
     }
 
-    private void sendFragmentRequest(
-        DiscoveryNode node,
-        LanceFragmentQueryRequest request,
-        TransportResponseHandler<LanceFragmentQueryResponse> handler
-    ) {
-        transportService.sendRequest(node, LanceFragmentQueryAction.NAME, request, handler);
+    /**
+     * How the per-node requests of one coordinator request leave the
+     * node: as child requests of {@code task} (so the task manager
+     * cancels the executors when the coordinator task is cancelled)
+     * with {@code timeout} as the transport timeout of each. A null
+     * {@code task} (no task registered for the request) sends plain
+     * requests; a null {@code timeout} means none.
+     */
+    private FragmentFanOut.Sender sender(CancellableTask task, TimeValue timeout) {
+        TransportRequestOptions options = timeout == null
+            ? TransportRequestOptions.EMPTY
+            : TransportRequestOptions.builder().withTimeout(timeout).build();
+        return (node, request, handler) -> {
+            if (task != null) {
+                transportService.sendChildRequest(node, LanceFragmentQueryAction.NAME, request, task, options, handler);
+            } else {
+                transportService.sendRequest(node, LanceFragmentQueryAction.NAME, request, options, handler);
+            }
+        };
+    }
+
+    /**
+     * Cancel the executor task of a per-node request whose answer will
+     * not come: the request timed out, so the transport layer has
+     * dropped its handler and unregistered the node as a child of the
+     * coordinator task, and a later cancellation of the coordinator task
+     * would not reach it. The cancel names the executor's action and the
+     * coordinator task as parent, so on that node it matches the one
+     * task this request started there. It runs under a stashed thread
+     * context so a caller without the tasks privilege can still stop
+     * its own executor, and its outcome only goes to the log: the
+     * request has already been answered or failed by then.
+     */
+    private void cancelExecutorTask(CancellableTask task, DiscoveryNode node, LanceFragmentQueryRequest request) {
+        if (task == null || node == null) {
+            return;
+        }
+        CancelTasksRequest cancel = new CancelTasksRequest().setNodes(node.getId())
+            .setActions(LanceFragmentQueryAction.NAME)
+            .setParentTaskId(new TaskId(clusterService.localNode().getId(), task.getId()))
+            .setReason("lance fragment request timed out at the coordinator");
+        try (ThreadContext.StoredContext ignored = threadPool.getThreadContext().stashContext()) {
+            client.admin().cluster().cancelTasks(cancel, ActionListener.wrap(response -> {
+                if (response.getTasks().isEmpty()) {
+                    LOGGER.debug(
+                        "lance.dispatch: no fragment query task left to cancel on node [{}] for index [{}]",
+                        node.getId(),
+                        request == null ? "?" : request.indexName()
+                    );
+                } else {
+                    LOGGER.debug(
+                        "lance.dispatch: cancelled {} fragment query task(s) on node [{}] for index [{}]",
+                        response.getTasks().size(),
+                        node.getId(),
+                        request == null ? "?" : request.indexName()
+                    );
+                }
+            }, e -> LOGGER.warn("lance.dispatch: could not cancel the fragment query task on node [{}]: {}", node.getId(), e.toString())));
+        }
     }
 
     @Override
     protected void doExecute(Task task, SearchRequest searchRequest, ActionListener<SearchResponse> listener) {
         try {
-            executeCoordinated(searchRequest, listener);
+            executeCoordinated(task instanceof CancellableTask cancellable ? cancellable : null, searchRequest, listener);
         } catch (Exception e) {
             listener.onFailure(e);
         }
@@ -156,9 +237,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * that carry metrics are filtered out earlier by the filter
      * because per-index metric merge is not yet implemented.
      */
-    private void executeCoordinated(SearchRequest searchRequest, ActionListener<SearchResponse> listener) throws Exception {
+    private void executeCoordinated(CancellableTask task, SearchRequest searchRequest, ActionListener<SearchResponse> listener)
+        throws Exception {
         long start = System.currentTimeMillis();
         SearchSourceBuilder source = searchRequest.source();
+        FanOutPolicy policy = new FanOutPolicy(task, resolveTimeout(source), resolveAllowPartialSearchResults(searchRequest));
 
         org.opensearch.index.query.QueryBuilder query = source == null ? null : source.query();
         org.opensearch.index.query.QueryBuilder postFilter = source == null ? null : source.postFilter();
@@ -220,7 +303,42 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             seqNoAndPrimaryTermRequested,
             trackTotalHitsUpTo
         );
-        runIndexLoop(targets, 0, nodeList, spec, source, merged, start, listener);
+        runIndexLoop(targets, 0, nodeList, spec, policy, source, merged, start, listener);
+    }
+
+    /**
+     * The timeout of the per-node requests: the request's
+     * {@code timeout}, else the cluster's
+     * {@code search.default_search_timeout}
+     * ({@link SearchService#DEFAULT_SEARCH_TIMEOUT_SETTING}), else none
+     * ({@code null}). The same resolution order the shard path applies
+     * to its query phase; the plugin adds no default of its own.
+     */
+    private TimeValue resolveTimeout(SearchSourceBuilder source) {
+        TimeValue timeout = source == null ? null : source.timeout();
+        if (timeout == null) {
+            timeout = clusterService.getClusterSettings().get(SearchService.DEFAULT_SEARCH_TIMEOUT_SETTING);
+        }
+        if (timeout == null || timeout.equals(SearchService.NO_TIMEOUT) || timeout.millis() <= 0) {
+            return null;
+        }
+        return timeout;
+    }
+
+    /**
+     * Whether a request answers from the nodes that did answer when
+     * one timed out: the request's {@code allow_partial_search_results},
+     * else the cluster's {@code search.default_allow_partial_results}
+     * (default true). The filter intercepts the search before
+     * {@code TransportSearchAction} fills the request's default in, so
+     * the cluster setting is read here.
+     */
+    private boolean resolveAllowPartialSearchResults(SearchRequest searchRequest) {
+        Boolean requested = searchRequest.allowPartialSearchResults();
+        if (requested != null) {
+            return requested;
+        }
+        return clusterService.getClusterSettings().get(SearchService.DEFAULT_ALLOW_PARTIAL_SEARCH_RESULTS);
     }
 
     /**
@@ -249,6 +367,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         int index,
         List<DiscoveryNode> nodeList,
         FragmentQuerySpec spec,
+        FanOutPolicy policy,
         SearchSourceBuilder source,
         MergeState merged,
         long startMillis,
@@ -279,9 +398,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 target,
                 nodeList,
                 perTargetSpec,
+                policy,
                 merged,
                 ActionListener.wrap(
-                    v -> runIndexLoop(targets, index + 1, nodeList, spec, source, merged, startMillis, listener),
+                    v -> runIndexLoop(targets, index + 1, nodeList, spec, policy, source, merged, startMillis, listener),
                     listener::onFailure
                 )
             );
@@ -301,6 +421,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         IndexTarget target,
         List<DiscoveryNode> nodeList,
         FragmentQuerySpec spec,
+        FanOutPolicy policy,
         MergeState merged,
         ActionListener<Void> done
     ) throws Exception {
@@ -337,7 +458,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // via topLevelReduce. Same wire format as any other
             // fan-out; the only novel case is the reader being
             // shaped to maxDoc=0.
-            dispatchEmptyAggregationRun(target, observedVersion, nodeList.get(0), spec, merged, done);
+            dispatchEmptyAggregationRun(target, observedVersion, nodeList.get(0), spec, policy, merged, done);
             return;
         }
 
@@ -349,18 +470,17 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // address and does not depend on this order; keeping it fixed
         // keeps the per-node lists, and with them the logs and the
         // aggregation partials, in the same order on every request.
-        // Any single per-node failure fails the whole request: the
-        // fan-out forwards the first failure to `done` once every node
-        // has answered and drops the remaining responses. There is no
-        // partial-result mode on the fragment path because a missing
-        // node means missing fragments, and a silently short result
-        // set is worse than an error.
-        FragmentFanOut fanOut = new FragmentFanOut(
-            perNode.size(),
-            threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL),
-            responses -> merged.absorbTargetResponses(target, responses),
-            done
-        );
+        // A per-node failure fails the whole request: the fan-out
+        // forwards the first failure to `done` once every node has
+        // answered and drops the remaining responses. A missing node
+        // means missing fragments, and a silently short result set is
+        // worse than an error. The one exception is a node that ran out
+        // of time (or whose executor was cancelled): under
+        // allow_partial_search_results the request answers from the
+        // other nodes and says so with timed_out: true, the contract
+        // of the shard path's timeout.
+        FragmentFanOut fanOut = newFanOut(perNode.size(), target, policy, merged, done);
+        FragmentFanOut.Sender sender = sender(policy.task(), policy.timeout());
 
         int slot = 0;
         for (Map.Entry<DiscoveryNode, List<Integer>> assignment : perNode.entrySet()) {
@@ -395,8 +515,53 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // executes in-process because TransportService's request
             // handler dispatch is loopback aware, but any other node
             // in the cluster picks up its slice through the network.
-            fanOut.send(this::sendFragmentRequest, slotIndex, nodeTarget, fragmentRequest);
+            fanOut.send(sender, slotIndex, nodeTarget, fragmentRequest);
         }
+    }
+
+    /**
+     * The fan-out of one target under {@code policy}: the merge absorbs
+     * the responses that arrived into {@code merged} and marks the
+     * response timed out when a node did not answer; a node that did
+     * not answer is logged and its executor task cancelled.
+     */
+    private FragmentFanOut newFanOut(int size, IndexTarget target, FanOutPolicy policy, MergeState merged, ActionListener<Void> done) {
+        return new FragmentFanOut(
+            size,
+            threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL),
+            outcome -> merged.absorbTargetResponses(target, outcome.responses(), outcome.incompleteNodes() > 0),
+            done,
+            policy.allowPartialSearchResults(),
+            policy.task(),
+            (node, request, cause) -> {
+                String nodeId = node == null ? "?" : node.getId();
+                String fragments = request == null
+                    ? "?"
+                    : (request.fragmentIds().isEmpty() ? "all" : String.valueOf(request.fragmentIds().size()));
+                if (cause instanceof ReceiveTimeoutTransportException) {
+                    LOGGER.warn(
+                        "lance.dispatch: node [{}] did not answer the fragment request for index [{}] ({} fragments) within [{}]; "
+                            + "cancelling its executor task",
+                        nodeId,
+                        target.indexName(),
+                        fragments,
+                        policy.timeout()
+                    );
+                    cancelExecutorTask(policy.task(), node, request);
+                } else {
+                    // The executor's task was cancelled on that node,
+                    // through _tasks/_cancel or because this request's
+                    // task was cancelled; nothing left to stop there.
+                    LOGGER.debug(
+                        "lance.dispatch: the fragment query task on node [{}] for index [{}] ({} fragments) was cancelled: {}",
+                        nodeId,
+                        target.indexName(),
+                        fragments,
+                        cause.getMessage()
+                    );
+                }
+            }
+        );
     }
 
     /**
@@ -414,6 +579,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         long observedVersion,
         DiscoveryNode host,
         FragmentQuerySpec spec,
+        FanOutPolicy policy,
         MergeState merged,
         ActionListener<Void> done
     ) {
@@ -439,13 +605,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             target.tableUri(),
             host.getId()
         );
-        FragmentFanOut fanOut = new FragmentFanOut(
-            1,
-            threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL),
-            responses -> merged.absorbTargetResponses(target, responses),
-            done
-        );
-        fanOut.send(this::sendFragmentRequest, 0, host, fragmentRequest);
+        FragmentFanOut fanOut = newFanOut(1, target, policy, merged, done);
+        fanOut.send(sender(policy.task(), policy.timeout()), 0, host, fragmentRequest);
     }
 
     /**
@@ -472,25 +633,92 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * {@link ActionListener#onResponse}. A pool rejection is passed
      * through as the pool's {@code OpenSearchRejectedExecutionException}
      * so the client sees HTTP 429.
+     *
+     * <p>A node whose answer will not come counts as answered with an
+     * empty slot: its request timed out
+     * ({@link ReceiveTimeoutTransportException}, the transport layer
+     * has dropped the handler and a late answer is discarded there), or
+     * its executor task was cancelled and it answered
+     * {@link TaskCancelledException}. The {@link IncompleteNodeListener}
+     * is told once per such node. With partial results allowed the
+     * merge then runs over the responses that did arrive and the
+     * {@link Outcome} carries the count of missing nodes; otherwise the
+     * fan-out fails with {@link OpenSearchTimeoutException} (HTTP 504)
+     * carrying the transport exception as its cause, once every node
+     * has answered or timed out.
+     *
+     * <p>A cancelled coordinator task ends the fan-out with
+     * {@link TaskCancelledException} in place of the merge (and in
+     * place of any other failure), whatever the nodes answered.
      */
     static final class FragmentFanOut {
 
-        /** How a per-node request leaves the coordinator; {@code TransportService::sendRequest} outside tests. */
+        /** How a per-node request leaves the coordinator; {@code TransportService::sendChildRequest} outside tests. */
         interface Sender {
             void send(DiscoveryNode node, LanceFragmentQueryRequest request, TransportResponseHandler<LanceFragmentQueryResponse> handler);
         }
 
+        /**
+         * Told about a node whose answer will not come, with the
+         * exception that said so. {@code node} and {@code request} are
+         * those {@link #send} was called with for the slot, null when
+         * the slot was never sent.
+         */
+        interface IncompleteNodeListener {
+            void onIncomplete(DiscoveryNode node, LanceFragmentQueryRequest request, TransportException cause);
+        }
+
+        /**
+         * What the merge receives: the responses that arrived, in slot
+         * order, and how many nodes did not answer (0 when every node
+         * did).
+         */
+        record Outcome(List<LanceFragmentQueryResponse> responses, int incompleteNodes) {
+        }
+
+        private final int size;
         private final AtomicReferenceArray<LanceFragmentQueryResponse> slots;
+        private final AtomicReferenceArray<DiscoveryNode> nodes;
+        private final AtomicReferenceArray<LanceFragmentQueryRequest> requests;
+        private final AtomicInteger incompleteNodes = new AtomicInteger();
+        private final boolean allowPartialResults;
+        private final CancellableTask task;
+        private final IncompleteNodeListener incompleteListener;
         private final GroupedActionListener<LanceFragmentQueryResponse> gathered;
 
         /**
-         * @param size          number of per-node requests
-         * @param mergeExecutor pool the merge runs on once every response is in
-         * @param merge         consumes the responses in slot order
-         * @param done          completed once, after the merge or on the first failure
+         * A fan-out that allows partial results, runs under no task and
+         * tells nobody about a node that did not answer.
          */
-        FragmentFanOut(int size, Executor mergeExecutor, Consumer<List<LanceFragmentQueryResponse>> merge, ActionListener<Void> done) {
+        FragmentFanOut(int size, Executor mergeExecutor, Consumer<Outcome> merge, ActionListener<Void> done) {
+            this(size, mergeExecutor, merge, done, true, null, (node, request, cause) -> {});
+        }
+
+        /**
+         * @param size                number of per-node requests
+         * @param mergeExecutor       pool the merge runs on once every response is in
+         * @param merge               consumes the responses in slot order
+         * @param done                completed once, after the merge or on the first failure
+         * @param allowPartialResults whether a node that did not answer leaves its slot empty (true) or fails the fan-out (false)
+         * @param task                the coordinator task, or null; a cancelled task ends the fan-out with TaskCancelledException
+         * @param incompleteListener  told once about every node that did not answer
+         */
+        FragmentFanOut(
+            int size,
+            Executor mergeExecutor,
+            Consumer<Outcome> merge,
+            ActionListener<Void> done,
+            boolean allowPartialResults,
+            CancellableTask task,
+            IncompleteNodeListener incompleteListener
+        ) {
+            this.size = size;
             this.slots = new AtomicReferenceArray<>(size);
+            this.nodes = new AtomicReferenceArray<>(size);
+            this.requests = new AtomicReferenceArray<>(size);
+            this.allowPartialResults = allowPartialResults;
+            this.task = task;
+            this.incompleteListener = incompleteListener;
             ActionListener<Void> once = ActionListener.notifyOnce(done);
             this.gathered = new GroupedActionListener<>(ActionListener.wrap(responses -> {
                 // ActionRunnable routes a throwing merge and a
@@ -498,22 +726,29 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 // defaults to onFailure) to once.onFailure, and a
                 // completed merge to once.onResponse.
                 mergeExecutor.execute(ActionRunnable.run(once, () -> {
+                    ensureNotCancelled();
                     List<LanceFragmentQueryResponse> ordered = new ArrayList<>(size);
                     for (int i = 0; i < size; i++) {
-                        ordered.add(slots.get(i));
+                        LanceFragmentQueryResponse response = slots.get(i);
+                        if (response != null) {
+                            ordered.add(response);
+                        }
                     }
-                    merge.accept(ordered);
+                    merge.accept(new Outcome(ordered, incompleteNodes.get()));
                 }));
-            }, once::onFailure), size);
+            }, e -> once.onFailure(cancelledOr(e))), size);
         }
 
         /**
          * Send the request for {@code slot}. A synchronous failure of
-         * the sender (the node is gone, the request does not serialise)
-         * counts as that node's failure so the fan-out still completes
-         * once the other nodes have answered.
+         * the sender (the node is gone, the request does not serialise,
+         * the coordinator task has been cancelled and refuses new
+         * children) counts as that node's failure so the fan-out still
+         * completes once the other nodes have answered.
          */
         void send(Sender sender, int slot, DiscoveryNode node, LanceFragmentQueryRequest request) {
+            nodes.set(slot, node);
+            requests.set(slot, request);
             try {
                 sender.send(node, request, handler(slot));
             } catch (Exception e) {
@@ -537,7 +772,21 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
                 @Override
                 public void handleException(TransportException exp) {
-                    gathered.onFailure(exp);
+                    if (!isIncomplete(exp)) {
+                        gathered.onFailure(exp);
+                        return;
+                    }
+                    incompleteNodes.incrementAndGet();
+                    try {
+                        incompleteListener.onIncomplete(nodes.get(slot), requests.get(slot), exp);
+                    } catch (Exception e) {
+                        exp.addSuppressed(e);
+                    }
+                    if (allowPartialResults) {
+                        gathered.onResponse(null);
+                    } else {
+                        gathered.onFailure(timedOut(nodes.get(slot), exp));
+                    }
                 }
 
                 @Override
@@ -545,6 +794,39 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                     return ThreadPool.Names.SAME;
                 }
             };
+        }
+
+        /**
+         * Whether {@code exp} says the node's answer will not come: the
+         * request timed out, or the executor's task was cancelled (the
+         * exception then arrives wrapped in the transport layer's
+         * {@code RemoteTransportException}).
+         */
+        static boolean isIncomplete(TransportException exp) {
+            return exp instanceof ReceiveTimeoutTransportException || TransportLanceFragmentQueryAction.findCancelled(exp) != null;
+        }
+
+        private static OpenSearchTimeoutException timedOut(DiscoveryNode node, TransportException cause) {
+            return new OpenSearchTimeoutException(
+                "lance fragment request to node [" + (node == null ? "?" : node.getId()) + "] did not complete in time",
+                cause
+            );
+        }
+
+        private void ensureNotCancelled() {
+            if (task != null && task.isCancelled()) {
+                throw new TaskCancelledException("cancelled task with reason: " + task.getReasonCancelled());
+            }
+        }
+
+        /** {@code e}, or a {@link TaskCancelledException} carrying it when the coordinator task has been cancelled. */
+        private Exception cancelledOr(Exception e) {
+            if (task != null && task.isCancelled()) {
+                TaskCancelledException cancelled = new TaskCancelledException("cancelled task with reason: " + task.getReasonCancelled());
+                cancelled.addSuppressed(e);
+                return cancelled;
+            }
+            return e;
         }
     }
 
@@ -900,6 +1182,16 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     }
 
     /**
+     * How the per-node requests of one coordinator request are sent and
+     * how a node that does not answer is treated: the coordinator task
+     * they are children of (null when the request runs under none), the
+     * transport timeout of each (null for none), and whether a node that
+     * did not answer leaves the request with partial results or fails it.
+     */
+    private record FanOutPolicy(CancellableTask task, TimeValue timeout, boolean allowPartialSearchResults) {
+    }
+
+    /**
      * Immutable bundle of the query-time settings the coordinator
      * resolves once and threads through the per-index fan-out. Keeps
      * the recursive {@link #runIndexLoop} / {@link #fanOutForTarget}
@@ -944,6 +1236,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // summed total is a lower bound even if it did not exceed
         // trackTotalHitsUpTo itself.
         private boolean matchedIsLowerBound = false;
+        // Set when a node of any target did not answer in time: the
+        // response is built from the nodes that did, says timed_out,
+        // and reports hits.total as a lower bound.
+        private boolean timedOut = false;
         // One entry per per-node response, in fan-out order (target
         // order, then node id order within a target). Each inner list
         // is already sorted by the executor and cut to from + size,
@@ -975,7 +1271,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             this.trackTotalHitsUpTo = trackTotalHitsUpTo;
         }
 
-        void absorbTargetResponses(IndexTarget target, List<LanceFragmentQueryResponse> responses) {
+        void absorbTargetResponses(IndexTarget target, List<LanceFragmentQueryResponse> responses, boolean incomplete) {
+            timedOut |= incomplete;
             // Every hit needs a SearchShardTarget so the response
             // envelope carries the {@code _index} key that clients
             // expect. Fragment path has no shard concept, so we
@@ -1036,9 +1333,17 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         /**
          * {@code hits.total} of the merged response; see
          * {@link TransportLanceCoordinatorAction#totalHits(long, boolean, int)}.
+         * When a node did not answer, the count of the nodes that did is
+         * a lower bound of the true count whatever the tracking mode, so
+         * the relation is {@code gte}; the value stays as composed (the
+         * sum, or the bound when the sum passed it).
          */
         private TotalHits totalHits() {
-            return TransportLanceCoordinatorAction.totalHits(totalMatched, matchedIsLowerBound, trackTotalHitsUpTo);
+            TotalHits total = TransportLanceCoordinatorAction.totalHits(totalMatched, matchedIsLowerBound, trackTotalHitsUpTo);
+            if (total == null || !timedOut) {
+                return total;
+            }
+            return new TotalHits(total.value(), TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
         }
 
         SearchResponse buildResponse(long startMillis) {
@@ -1089,7 +1394,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 );
                 aggregations = InternalAggregations.topLevelReduce(perNodeAggregations, ctx);
             }
-            SearchResponseSections sections = new SearchResponseSections(searchHits, aggregations, null, false, false, null, 1);
+            // timed_out is the only trace of a node that did not answer:
+            // the fragment path reports one logical unit under _shards,
+            // so there is no failed shard to count; the coordinator's
+            // WARN log names the node, the fragment count and the
+            // timeout. Aggregations are the reduce of the nodes that
+            // answered, as on the shard path.
+            SearchResponseSections sections = new SearchResponseSections(searchHits, aggregations, null, timedOut, false, null, 1);
             // Hide the Lance fragment fan-out from the response
             // shape. The user's mental model is one logical dataset,
             // not N shards; reporting fragmentCount here would leak
