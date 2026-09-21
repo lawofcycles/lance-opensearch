@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 
 import org.apache.arrow.vector.UInt8Vector;
@@ -2335,18 +2336,37 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * case: Lance applies its {@code count(*)} before the limit node,
      * so the limit would be ignored and the count would be exact at
      * full cost, which is what the bound exists to avoid.
+     *
+     * <p>{@link #NATIVE_SCALAR_COUNTS} and {@link #BOUNDED_SCALAR_COUNT_SCANS}
+     * record which of the two paths ran, so a test can tell a native
+     * count from a batch loop that happens to return the same number.
      */
     static MatchedCount countScalarFilter(Dataset dataset, String filterSql, List<Integer> fragmentIds, int upTo) throws Exception {
         ScanOptions.Builder builder = countOnlyScan(filterSql, fragmentIds);
         if (upTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
             try (LanceScanner scanner = dataset.newScan(builder.build())) {
-                return MatchedCount.exact(scanner.countRows());
+                long counted = scanner.countRows();
+                NATIVE_SCALAR_COUNTS.incrementAndGet();
+                return MatchedCount.exact(counted);
             }
         }
         long limit = (long) upTo + 1L;
         long counted = countRows(dataset, builder.limit(limit).build());
+        BOUNDED_SCALAR_COUNT_SCANS.incrementAndGet();
         return new MatchedCount(counted, counted >= limit);
     }
+
+    /**
+     * Number of scalar filter counts {@link #countScalarFilter} answered
+     * through {@link LanceScanner#countRows()} since the class loaded.
+     */
+    static final AtomicLong NATIVE_SCALAR_COUNTS = new AtomicLong();
+
+    /**
+     * Number of scalar filter counts {@link #countScalarFilter} answered
+     * by a scan limited to {@code upTo + 1} rows since the class loaded.
+     */
+    static final AtomicLong BOUNDED_SCALAR_COUNT_SCANS = new AtomicLong();
 
     /**
      * Scan options for a count-only scalar filter scan over
