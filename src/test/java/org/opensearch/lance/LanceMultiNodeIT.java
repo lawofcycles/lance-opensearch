@@ -23,6 +23,7 @@ import java.util.stream.Stream;
 import org.apache.hc.core5.http.HttpHost;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
+import org.opensearch.client.ResponseException;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
@@ -791,6 +792,98 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String name = readAll(client().performRequest(new Request("GET", "/_cat/cluster_manager?h=node"))).trim();
         assertFalse("_cat/cluster_manager returned no node name", name.isEmpty());
         return name;
+    }
+
+    /**
+     * A heap column load the request breaker refuses on one executor
+     * reaches the client as HTTP 429. Four fragments of 400 rows over
+     * three data nodes put fragments 0 and 3 on the first node and one
+     * fragment on each of the other two; with {@code lance.cache.enabled}
+     * off every executor materialises {@code rating} in heap, about
+     * 3.3 KB per fragment, on top of the 5 KB every aggregator reserves
+     * on the same breaker when it is built. A request breaker limit of
+     * 10 KB therefore refuses the two fragment node (about 11.7 KB) and
+     * lets the others (about 8.4 KB) through. The coordinator forwards
+     * the executor's {@code CircuitBreakingException} with its status,
+     * and {@code _lance/stats} shows the refusal on exactly one node.
+     */
+    public void testHeapColumnRefusedOnOneExecutorIs429AtTheCoordinator() throws Exception {
+        String suffix = "mn-heap-breaker-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 4;
+        int rowsPerFragment = 400;
+        LanceTableFactory.writeHintFixtureTable(scratchDir, tableName, fragments, rowsPerFragment);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String sum = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}";
+        updateClusterSetting("lance.aggregation.pushdown", "false");
+        updateClusterSetting("lance.cache.enabled", "false");
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+            assertEquals("fixture assumes three data nodes", 3, dataNodeCount());
+
+            Map<String, Long> rejectionsBefore = heapFallbackRejectionsByNode();
+            String first = readAll(postJson("/" + indexName + "/_search", sum));
+            assertEquals(1600, extractIntPath(first, "hits", "total", "value"));
+            double expectedSum = 0d;
+            for (int i = 0; i < fragments * rowsPerFragment; i++) {
+                if (i % 5 != 4) {
+                    expectedSum += (i * 37) % 1000;
+                }
+            }
+            assertEquals(expectedSum, extractDoublePath(first, "aggregations", "s", "value"), 0d);
+            assertEquals(rejectionsBefore, heapFallbackRejectionsByNode());
+
+            updateClusterSetting("indices.breaker.request.limit", "10kb");
+            try {
+                ResponseException refused = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", sum));
+                String body = readAll(refused.getResponse());
+                assertEquals(body, RestStatus.TOO_MANY_REQUESTS.getStatus(), refused.getResponse().getStatusLine().getStatusCode());
+                assertTrue(body, body.contains("circuit_breaking_exception"));
+                assertTrue(body, body.contains("lance_heap_column:rating"));
+                assertTrue(body, body.contains("limit of [10240/10kb]"));
+                Map<String, Long> rejectionsAfter = heapFallbackRejectionsByNode();
+                int nodesThatRefused = 0;
+                for (Map.Entry<String, Long> entry : rejectionsAfter.entrySet()) {
+                    long delta = entry.getValue() - rejectionsBefore.get(entry.getKey());
+                    assertTrue("node " + entry.getKey() + " refused " + delta + " loads", delta == 0L || delta == 1L);
+                    nodesThatRefused += (int) delta;
+                }
+                assertEquals("the two fragment executor alone refused: " + rejectionsAfter, 1, nodesThatRefused);
+            } finally {
+                updateClusterSetting("indices.breaker.request.limit", null);
+            }
+
+            String again = readAll(postJson("/" + indexName + "/_search", sum));
+            assertEquals(expectedSum, extractDoublePath(again, "aggregations", "s", "value"), 0d);
+            assertBusy(() -> {
+                Map<String, String> assignments = fanOutAssignments(indexName);
+                assertEquals("fragments went to " + assignments, 3, assignments.size());
+            });
+        } finally {
+            updateClusterSetting("lance.cache.enabled", null);
+            updateClusterSetting("lance.aggregation.pushdown", null);
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** {@code column_store.heap_fallback_rejections} of every node, keyed by node id. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Long> heapFallbackRejectionsByNode() throws IOException {
+        Map<String, Object> stats = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
+        Map<String, Long> rejections = new HashMap<>();
+        for (Map.Entry<String, Object> node : nodes.entrySet()) {
+            Map<String, Object> columnStore = (Map<String, Object>) ((Map<String, Object>) node.getValue()).get("column_store");
+            rejections.put(node.getKey(), ((Number) columnStore.get("heap_fallback_rejections")).longValue());
+        }
+        return rejections;
     }
 
     /** Name of the node listening on {@code host}, read through a client pinned to that host alone. */
