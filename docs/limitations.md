@@ -16,6 +16,8 @@ Everything documented here is a shape that either falls through to the shard pat
 
 Cross-index metrics also hit the shard path today.
 
+Against a table above the Lucene document bound (more than 2,147,483,519 physical rows, see [features.md](features.md#tables-above-the-lucene-document-bound)) these shapes are not routed to the shard path: its reader holds the leading fragments that fit, so the request would answer from part of the table. They are refused with 400 `illegal_argument_exception` (`table of index [...] has N rows, above the Lucene bound of B rows per reader; this request shape is served by the shard path and would see only M rows`). The dispatch filter reads the table's manifest to decide that, on the `lance_coordinator` pool, for every Lance-backed request it hands to the shard path.
+
 A request Lance refuses as invalid input (for example `lance_match_phrase` on an FTS index built without `with_position: true`) answers 400 `illegal_argument_exception` with Lance's message on the fragment path. On the shard path the same request answers 500: Lucene's query phase wraps the failure in `QueryPhaseExecutionException`, which OpenSearch reports as a server error, and the plugin does not intercept that phase. Lance's message is still in the response body.
 
 ## Aggregation shapes the scan does not compute
@@ -60,6 +62,14 @@ The coordinator orders hits with equal scores or equal sort values by their Lanc
 - Nearest-neighbour queries scan once per Lance fragment. Many small fragments issue many native scans; compact with the Lance writer's compaction step to reduce the overhead.
 - Filter clauses other than `match_all` / `term` / `terms` / `exists` / `range` / `bool` inside `lance_knn.filter` are rejected with 400 (no push-down to Lance).
 - `lance_knn` combined with an outer `bool.filter` runs the outer clause as a post-filter (Lucene layer). Wrap it inside `lance_knn.filter` to push it into Lance.
+
+## Tables above the Lucene document bound
+
+- Each group of a node's fragments is one fragment request, so a request over such a table costs one executor run per group instead of one per node: the `lance.fragment_dispatch.max_concurrent` semaphore admits the node's groups four at a time (default) and queues the rest, the timeout applies to every group's request, and the coordinator holds one response per group until the merge.
+- A full-text query runs its whole table scan once per group (the same scan the subset executor case already repeats per node), and Lance's document set cannot represent a table of that size in one inverted index either; full-text search over such a table is not expected to work.
+- `{index}/_stats` `docs.count` and `docs.deleted` count the fragments the shard reader holds. `GET /_lance/stats` reports the table's rows (`indices.<index>.rows`) next to the reader's (`shard_reader_rows`) and `lucene_bound_exceeded`.
+- `GET /_doc/{id}` of a row outside the shard reader opens a reader over that row's fragment; when the index's reader wrapper applied itself to the caller (the security plugin's DLS / FLS) that reader cannot carry the filter and the GET fails with an `illegal_state_exception` instead of answering outside it. Rows inside the shard reader are filtered as before.
+- A table with a single fragment above the bound cannot be read by any reader and is refused at attach (400).
 
 ## Shard model and concurrency
 
@@ -106,7 +116,7 @@ The coordinator orders hits with equal scores or equal sort values by their Lanc
 
 `_cat/indices`, `_cat/shards`, `{index}/_stats`, `_nodes/stats/indices`, and `_cluster/stats` report a Lance-backed index as follows.
 
-- `docs.count` and `docs.deleted` are the Lance row count and deletion count of the manifest version the shard currently serves (they advance on refresh, so a Lance write shows up after the next poll or an explicit `_refresh`). `_cluster/health` reports green for the single primary shard; it turns red only when the shard fails to open the table (unreachable path, missing credentials, dropped table), because there is no replica to fall back to.
+- `docs.count` and `docs.deleted` are the Lance row count and deletion count of the manifest version the shard currently serves (they advance on refresh, so a Lance write shows up after the next poll or an explicit `_refresh`). For a table above the Lucene document bound they count the fragments the shard reader holds, not the table: `GET /_lance/stats` reports the table's rows as `indices.<index>.rows` next to `shard_reader_rows`. `_cluster/health` reports green for the single primary shard; it turns red only when the shard fails to open the table (unreachable path, missing credentials, dropped table), because there is no replica to fall back to.
 - `store.size`, `pri.store.size`, and `store.size_in_bytes` are the size of the shard's Lucene directory, which holds only the bootstrap commit (a few hundred bytes), not the Lance data. OpenSearch computes the store size from the shard directory and offers no engine-level override. The manifest-recorded data file total is available internally as `DocsStats.totalSizeInBytes` (used by `_rollover` size conditions); data files written without a `file_size_bytes` manifest entry contribute zero to that total, and Lance index files (`Index.getSizeBytes()`) are not included anywhere.
 - Segment fields (`segments.count`, `segments.memory`, the per-shard list in `_segments`) and the write-side groups `indexing`, `merges`, `flush`, `translog.operations`, `warmer`, and `recovery` are always 0 or empty. There are no Lucene segments and no OpenSearch-side writes; the values are not synthesised from Lance metadata. `refresh.total` also stays 0: Lance version advances swap the reader without going through the shard's refresh listeners, and `search.*` stays 0 because `_search` is answered by the fragment path, not the shard.
 - `suggest.*`, `completion.*`, `fielddata.*`, `query_cache.*`, `request_cache.*`, `memory.total`, and the matching `_stats` cache groups stay 0 as well: the fragment path never reaches the shard-level caches or suggesters. `get.*` is the one request counter that does move: `get.total` counts `GET /_doc/{id}` on a table with a declared primary key (the only request shape the shard engine serves itself).
