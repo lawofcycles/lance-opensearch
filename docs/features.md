@@ -108,10 +108,11 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 
 ## Aggregations
 
-- Metric: `sum`, `avg`, `min`, `max`, `value_count`.
-- Bucket: `terms`, `histogram`, `date_histogram`, `composite` over `terms` and `date_histogram` sources.
-- All run through OpenSearch's standard aggregator machinery over Lance-backed doc values, except the shapes below, which the scan computes.
-- Pipeline aggregations (`avg_bucket`, `bucket_sort`, `cumulative_sum`, etc.) fall through to the shard path (see [limitations.md](limitations.md)).
+- Metric: `sum`, `avg`, `min`, `max`, `value_count`, `stats`, `extended_stats`, `percentiles` (tdigest and hdr), `percentile_ranks`, `cardinality`.
+- Bucket: `terms`, `histogram`, `date_histogram`, `range`, `date_range`, `missing`, `composite` (sources `terms` / `histogram` / `date_histogram` over a field, with `after` paging), `filter` and `filters` whose queries are `match_all`, `term`, `terms`, `range`, `exists` or a `bool` of those.
+- Every builder names a field; a script anywhere in the tree, a `filter` / `filters` query of another type (a Lance full-text or `lance_knn` clause included), a pipeline aggregation, and the types not listed (`top_hits`, `sampler`, `significant_terms`, `nested`, `geo*`, `scripted_metric`, ...) send the request to the shard path (see [limitations.md](limitations.md)).
+- All run through OpenSearch's standard aggregator machinery over Lance-backed doc values, except the shapes below, which the scan computes. The coordinator reduces the per node results with the stock reduce, so the sketches of `percentiles` (tdigest) and `cardinality` are merged the way they are merged across shards: their values can differ from a single shard's within the algorithm's error, and `hdr` percentiles and every other listed aggregation are exact.
+- A column an aggregation reads for the whole fragment (numeric, boolean, date, float, keyword) is loaded by each executor in up to `lance.fragment_path.parallelism` contiguous fragment groups scanned side by side on the `search` pool (dynamic, 1 to 32, default half the CPUs the JVM sees, at least 1; `1` is one scan per column). The scan's Lance side decodes on Lance's own threads; the Java side that reads the batches into the column arrays is one thread per scan, which on a node with many fragments was the whole request's core budget. Each fragment's arrays are written by exactly one group, so nothing is merged; when the pool has no free thread the request's own thread scans the remaining groups.
 
 ### Aggregation pushdown
 
