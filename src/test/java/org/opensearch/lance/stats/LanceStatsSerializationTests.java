@@ -76,6 +76,10 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                         new LanceWarmUpStatus.IndexEntry("body_idx", "Inverted", "body", "failed", 1.25d, "boom")
                     )
                 )
+            ),
+            List.of(
+                new LanceNodeStats.IndexReaderStats("big", 3_000_000_000L, 2_000_000_000L, true),
+                new LanceNodeStats.IndexReaderStats("small", 120L, 120L, false)
             )
         );
     }
@@ -110,7 +114,9 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"version\":8,\"mode\":\"metadata\",\"state\":\"done\",\"started_at\":\"2023-11-14T22:13:20Z\",\"seconds\":3.46,"
                     + "\"indexes\":[{\"name\":\"rating_idx\",\"type\":\"BTree\",\"column\":\"rating\",\"state\":\"done\",\"seconds\":0.4},"
                     + "{\"name\":\"body_idx\",\"type\":\"Inverted\",\"column\":\"body\",\"state\":\"failed\",\"seconds\":1.25,"
-                    + "\"detail\":\"boom\"}]}]}}",
+                    + "\"detail\":\"boom\"}]}]},"
+                    + "\"indices\":{\"big\":{\"rows\":3000000000,\"shard_reader_rows\":2000000000,\"lucene_bound_exceeded\":true},"
+                    + "\"small\":{\"rows\":120,\"shard_reader_rows\":120,\"lucene_bound_exceeded\":false}}}",
                 builder.toString()
             );
         }
@@ -150,6 +156,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             String json = builder.toString();
             assertTrue(json, json.startsWith("{\"nodes\":{\"node-1\":{\"name\":\"node-1\",\"snapshots\":{"));
             assertTrue(json, json.contains("\"fts\":{\"subset_probe_limit\":1000000},\"warm_up\":{\"mode\":\"metadata\""));
+            assertTrue(json, json.endsWith("\"lucene_bound_exceeded\":false}}}}}"));
         }
     }
 
