@@ -2113,15 +2113,19 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *   <li>No filter: sum {@link org.lance.Fragment#countRows()}
      *       across the assigned fragments (Lance metadata, no
      *       scan).</li>
-     *   <li>Filter set, all fragments assigned: use
+     *   <li>Filter set, no fragment list: use
      *       {@link Dataset#countRows(String)}.</li>
-     *   <li>Filter set, subset of fragments: run a bounded scan
-     *       over the subset and count matching rows.</li>
+     *   <li>Filter set, fragment list: {@link #countScalarFilter},
+     *       which asks Lance to count the matches of the listed
+     *       fragments natively when the request wants an accurate
+     *       total and otherwise scans at most
+     *       {@code trackTotalHitsUpTo + 1} rows to decide between an
+     *       exact count and a lower bound.</li>
      * </ul>
-     * These counts come from Lance metadata or a scan that reads no
-     * payload columns, so they are cheap regardless of the match
-     * count and are always reported exact; the {@code track_total_hits}
-     * bound only affects how the coordinator presents them.
+     * The first two read Lance metadata or run one native count, so
+     * they are cheap regardless of the match count and are reported
+     * exact; the {@code track_total_hits} bound then only affects how
+     * the coordinator presents them.
      *
      * <p>A bare {@link LanceFtsQuery} is counted from the Weight the
      * caller built for the request when that Weight's scan has run
@@ -2282,33 +2286,78 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (fragmentIds == null) {
             return MatchedCount.exact(dataset.countRows(filterSql));
         }
-        // Filter + fragment subset: scan and count. Cheap for
-        // typical query workloads because the filter narrows the
-        // row set before the scan even starts.
-        //
-        // Ask Lance for zero payload columns and no row address /
-        // row id: the batches only need to carry a row count that
-        // the loop below accumulates via getRowCount(). Without
-        // columns(emptyList()) Lance materialises every column of
-        // every matching row (including large text / vector fields)
-        // just to count them. This mirrors what countFtsHitsDirectly
-        // does for the FTS shape.
-        org.lance.ipc.ScanOptions options = new org.lance.ipc.ScanOptions.Builder().filter(filterSql)
+        return countScalarFilter(dataset, filterSql, fragmentIds, upTo);
+    }
+
+    /**
+     * Count the rows of {@code fragmentIds} that match the scalar
+     * filter {@code filterSql}, honouring the {@code track_total_hits}
+     * bound {@code upTo}.
+     *
+     * <p>The coordinator always hands an executor its fragment list,
+     * so every scalar-filter count of the fragment path arrives here.
+     * The scan asks Lance for zero payload columns and no row address
+     * or row id, so nothing but a row count crosses from Lance to
+     * Java. The fragment list is passed to Lance: for a scalar filter
+     * it only narrows the fragments the filtered read opens (unlike
+     * an FTS scan, where a fragment list turns into a prefilter over
+     * {@code _rowid}), so there is no reason to scan the whole table
+     * and sort the rows by fragment here.
+     *
+     * <ul>
+     *   <li>{@code upTo == TRACK_TOTAL_HITS_ACCURATE}
+     *       ({@code track_total_hits: true}, which is also what
+     *       {@code _count} sends): {@link LanceScanner#countRows()}.
+     *       Lance puts a {@code count(*)} on top of the filtered read
+     *       and runs it across its own thread pool; the result comes
+     *       back as one number. Pulling the same rows through
+     *       {@code scanBatches()} instead would hand every match to
+     *       this search thread one batch at a time, which for a
+     *       filter that matches most of a large table costs seconds
+     *       of a single core.</li>
+     *   <li>Otherwise: one scan with {@code limit(upTo + 1)}, whose
+     *       returned rows are counted. Lance plans the limit as a
+     *       node above the filtered read, so the read stops once
+     *       {@code upTo + 1} rows are through; at most that many rows
+     *       reach Java. Reaching the limit proves the executor holds
+     *       more than {@code upTo} matches, which is all the
+     *       coordinator needs for {@code gte}, so the result is then
+     *       a lower bound; coming back short means every match was
+     *       seen and the count is exact. Because the scan is already
+     *       restricted to the executor's fragments, every returned
+     *       row is the executor's own and the returned count itself
+     *       is compared with the limit. (The FTS counterpart judges
+     *       on the rows before its fragment filter because that scan
+     *       runs over the whole table.)</li>
+     * </ul>
+     *
+     * <p>{@link LanceScanner#countRows()} is not used for the bounded
+     * case: Lance applies its {@code count(*)} before the limit node,
+     * so the limit would be ignored and the count would be exact at
+     * full cost, which is what the bound exists to avoid.
+     */
+    static MatchedCount countScalarFilter(Dataset dataset, String filterSql, List<Integer> fragmentIds, int upTo) throws Exception {
+        ScanOptions.Builder builder = countOnlyScan(filterSql, fragmentIds);
+        if (upTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
+            try (LanceScanner scanner = dataset.newScan(builder.build())) {
+                return MatchedCount.exact(scanner.countRows());
+            }
+        }
+        long limit = (long) upTo + 1L;
+        long counted = countRows(dataset, builder.limit(limit).build());
+        return new MatchedCount(counted, counted >= limit);
+    }
+
+    /**
+     * Scan options for a count-only scalar filter scan over
+     * {@code fragmentIds}: no columns, no row address, no row id.
+     */
+    private static ScanOptions.Builder countOnlyScan(String filterSql, List<Integer> fragmentIds) {
+        return new ScanOptions.Builder().filter(filterSql)
             .fragmentIds(fragmentIds)
             .columns(Collections.emptyList())
             .withRowAddress(false)
-            .withRowId(false)
-            .build();
-        long total = 0L;
-        try (
-            org.lance.ipc.LanceScanner scanner = dataset.newScan(options);
-            org.apache.arrow.vector.ipc.ArrowReader reader = scanner.scanBatches()
-        ) {
-            while (reader.loadNextBatch()) {
-                total += reader.getVectorSchemaRoot().getRowCount();
-            }
-        }
-        return MatchedCount.exact(total);
+            .withRowId(false);
     }
 
     /**
