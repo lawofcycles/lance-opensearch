@@ -103,6 +103,13 @@ public final class LanceShardColumnCache {
     private final String filterSql;
     private final Map<Integer, LanceFragmentLeafReader> leavesByFragmentId;
     /**
+     * How the column scans of this reader are cut into fragment groups
+     * that run side by side, for the heap loads here and for the store's
+     * loads. {@link FragmentGroupScan#SEQUENTIAL} (one scan on the
+     * calling thread) for readers opened without one.
+     */
+    private final FragmentGroupScan groupScan;
+    /**
      * Request breaker every heap column of this reader is charged to
      * before allocation. A {@link NoopCircuitBreaker} when the reader was
      * opened without one (tests, the fragment path helpers that predate
@@ -138,7 +145,7 @@ public final class LanceShardColumnCache {
      * the fragment open paths that have no breaker to hand over.
      */
     LanceShardColumnCache(Dataset dataset, String filterSql, List<LanceFragmentLeafReader> leaves) {
-        this(dataset, filterSql, leaves, null, null, new NoopCircuitBreaker(CircuitBreaker.REQUEST));
+        this(dataset, filterSql, leaves, null, null, new NoopCircuitBreaker(CircuitBreaker.REQUEST), FragmentGroupScan.SEQUENTIAL);
     }
 
     /**
@@ -166,6 +173,11 @@ public final class LanceShardColumnCache {
      *                       the node's {@code CircuitBreakerService}, or a
      *                       {@link NoopCircuitBreaker} where none is at
      *                       hand
+     * @param groupScan      how every column scan of this reader (heap
+     *                       loads here, store loads) is cut into fragment
+     *                       groups that run side by side;
+     *                       {@link FragmentGroupScan#SEQUENTIAL} for one
+     *                       scan on the calling thread
      */
     LanceShardColumnCache(
         Dataset dataset,
@@ -173,13 +185,15 @@ public final class LanceShardColumnCache {
         List<LanceFragmentLeafReader> leaves,
         ColumnStore columnStore,
         LanceWarmCache.SnapshotKey snapshotKey,
-        CircuitBreaker requestBreaker
+        CircuitBreaker requestBreaker,
+        FragmentGroupScan groupScan
     ) {
         this.dataset = dataset;
         this.filterSql = filterSql;
         this.columnStore = columnStore;
         this.snapshotKey = snapshotKey;
         this.requestBreaker = requestBreaker;
+        this.groupScan = groupScan;
         Map<Integer, LanceFragmentLeafReader> byId = new HashMap<>(leaves.size() * 2);
         for (LanceFragmentLeafReader leaf : leaves) {
             byId.put(leaf.fragmentId(), leaf);
@@ -316,7 +330,7 @@ public final class LanceShardColumnCache {
             return false;
         }
         Map<Integer, Integer> fragmentRows = allFragmentRows();
-        Map<Integer, CachedColumn> columns = columnStore.acquire(snapshotKey, dataset, name, isBoolean, fragmentRows);
+        Map<Integer, CachedColumn> columns = columnStore.acquire(snapshotKey, dataset, name, isBoolean, fragmentRows, groupScan);
         if (columns == null) {
             LOGGER.debug(
                 "column cache budget exhausted; loading [{}] of {} into heap for this request ({} fragments)",
@@ -351,7 +365,8 @@ public final class LanceShardColumnCache {
             dataset,
             name,
             isBoolean,
-            Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc())
+            Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc()),
+            FragmentGroupScan.SEQUENTIAL
         );
         if (columns == null) {
             LOGGER.debug(
@@ -428,7 +443,7 @@ public final class LanceShardColumnCache {
         if (!keywordStoreUsable()) {
             return false;
         }
-        ColumnStore.KeywordLoad load = columnStore.acquireKeyword(snapshotKey, dataset, name, allFragmentRows());
+        ColumnStore.KeywordLoad load = columnStore.acquireKeyword(snapshotKey, dataset, name, allFragmentRows(), groupScan);
         if (load == null) {
             LOGGER.debug(
                 "column cache could not scan [{}] of {}; building the dictionary in heap for this request ({} fragments)",
@@ -447,7 +462,7 @@ public final class LanceShardColumnCache {
         if (!keywordStoreUsable()) {
             return false;
         }
-        ColumnStore.KeywordArrayLoad load = columnStore.acquireKeywordArray(snapshotKey, dataset, name, allFragmentRows());
+        ColumnStore.KeywordArrayLoad load = columnStore.acquireKeywordArray(snapshotKey, dataset, name, allFragmentRows(), groupScan);
         if (load == null) {
             LOGGER.debug(
                 "column cache could not scan [{}] of {}; building the dictionary in heap for this request ({} fragments)",
@@ -476,7 +491,8 @@ public final class LanceShardColumnCache {
             snapshotKey,
             dataset,
             name,
-            Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc())
+            Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc()),
+            FragmentGroupScan.SEQUENTIAL
         );
         if (load == null) {
             LOGGER.debug(
@@ -500,7 +516,8 @@ public final class LanceShardColumnCache {
             snapshotKey,
             dataset,
             name,
-            Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc())
+            Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc()),
+            FragmentGroupScan.SEQUENTIAL
         );
         if (load == null) {
             LOGGER.debug(
@@ -611,9 +628,77 @@ public final class LanceShardColumnCache {
         columnStore.unpin(toRelease);
     }
 
-    /** Number of Lance scans the heap loaders below have run for this reader, for tests. */
+    /** Number of Lance scans (one per fragment group) the heap loaders below have run for this reader, for tests. */
     long heapScanCount() {
         return heapScans.get();
+    }
+
+    /** Receives one non-null cell of a heap column scan: the fragment id and row offset from {@code _rowaddr}, the column vector and the row inside it. */
+    @FunctionalInterface
+    private interface HeapCellConsumer {
+        void accept(int fragmentId, int offset, FieldVector vector, int row);
+    }
+
+    /**
+     * Scan {@code name} over every fragment of this reader, the cache's
+     * top-level filter included, and hand every non-null cell to
+     * {@code consumer}. The fragments are cut into contiguous groups by
+     * {@link #groupScan} and the groups run side by side, so
+     * {@code consumer} is called from several threads at once; the
+     * loaders below write each cell into the array or dictionary builder
+     * of its own fragment and a fragment is in exactly one group, so no
+     * two threads write the same structure. A cell of a fragment outside
+     * the reader is dropped before it reaches {@code consumer}: it should
+     * not occur because the scan is scoped by fragment ids, but the guard
+     * keeps an unexpected batch from throwing.
+     */
+    private void scanHeap(String name, HeapCellConsumer consumer) throws IOException {
+        List<Integer> fragmentIds = new ArrayList<>(leavesByFragmentId.keySet());
+        Collections.sort(fragmentIds);
+        try {
+            groupScan.run(fragmentIds, group -> {
+                scanHeapGroup(name, group, consumer);
+                return null;
+            });
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e);
+        }
+    }
+
+    /** One Lance scan of {@link #scanHeap}: {@code name} over {@code fragmentIds} with {@code _rowaddr} and the top-level filter. */
+    private void scanHeapGroup(String name, List<Integer> fragmentIds, HeapCellConsumer consumer) throws IOException {
+        ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(fragmentIds)
+            .columns(Collections.singletonList(name))
+            .withRowAddress(true);
+        if (filterSql != null) {
+            builder = builder.filter(filterSql);
+        }
+        heapScans.incrementAndGet();
+        try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                FieldVector vector = root.getVector(name);
+                int rowCount = root.getRowCount();
+                for (int i = 0; i < rowCount; i++) {
+                    if (vector.isNull(i)) {
+                        continue;
+                    }
+                    long addr = rowAddr.get(i);
+                    int fragmentId = (int) (addr >>> 32);
+                    if (!leavesByFragmentId.containsKey(fragmentId)) {
+                        continue;
+                    }
+                    consumer.accept(fragmentId, (int) (addr & 0xFFFFFFFFL), vector, i);
+                }
+            }
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e);
+        }
     }
 
     /**
@@ -629,14 +714,11 @@ public final class LanceShardColumnCache {
      * fragment metadata read time and does not change. A refused
      * charge leaves nothing allocated.
      *
-     * <p>The scan is {@code newScan(fragmentIds = allLeafFragments,
-     * columns = [name], withRowAddress = true)} plus the cache's
-     * top-level filter if present. Each row's {@code _rowaddr}
-     * splits into (fragmentId, offset); the row's value goes into
-     * the fragment's leaf. Rows for fragments outside the cache's
-     * subset are dropped defensively — they should not occur because
-     * we scope the scan by {@code fragmentIds}, but the guard keeps
-     * an unexpected batch from throwing an NPE.
+     * <p>The scan is {@code newScan(fragmentIds = group, columns =
+     * [name], withRowAddress = true)} per fragment group of
+     * {@link #scanHeap}, plus the cache's top-level filter if present.
+     * Each row's {@code _rowaddr} splits into (fragmentId, offset); the
+     * row's value goes into the fragment's leaf.
      */
     public void loadNumericColumn(String name) throws IOException {
         if (loadedNumericColumns.containsKey(name)) {
@@ -662,42 +744,10 @@ public final class LanceShardColumnCache {
                     valuesByFragment.put(leaf.fragmentId(), new long[maxDoc]);
                     presenceByFragment.put(leaf.fragmentId(), new FixedBitSet(maxDoc));
                 }
-                ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(new java.util.ArrayList<>(leavesByFragmentId.keySet()))
-                    .columns(Collections.singletonList(name))
-                    .withRowAddress(true);
-                if (filterSql != null) {
-                    builder = builder.filter(filterSql);
-                }
-                heapScans.incrementAndGet();
-                try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
-                    while (reader.loadNextBatch()) {
-                        VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                        UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                        FieldVector vector = root.getVector(name);
-                        for (int i = 0; i < root.getRowCount(); i++) {
-                            long addr = rowAddr.get(i);
-                            int fragId = (int) (addr >>> 32);
-                            int offset = (int) (addr & 0xFFFFFFFFL);
-                            long[] values = valuesByFragment.get(fragId);
-                            FixedBitSet presence = presenceByFragment.get(fragId);
-                            if (values == null || presence == null) {
-                                // Scan returned a row for a fragment not
-                                // in the cache subset. Skip defensively;
-                                // the fragmentIds filter above should
-                                // have prevented this.
-                                continue;
-                            }
-                            if (!vector.isNull(i)) {
-                                values[offset] = LanceFragmentLeafReader.readAsLong(vector, i);
-                                presence.set(offset);
-                            }
-                        }
-                    }
-                } catch (IOException e) {
-                    throw e;
-                } catch (Exception e) {
-                    throw new IOException(e);
-                }
+                scanHeap(name, (fragmentId, offset, vector, row) -> {
+                    valuesByFragment.get(fragmentId)[offset] = LanceFragmentLeafReader.readAsLong(vector, row);
+                    presenceByFragment.get(fragmentId).set(offset);
+                });
                 for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
                     leaf.publishNumericColumn(name, valuesByFragment.get(leaf.fragmentId()), presenceByFragment.get(leaf.fragmentId()));
                 }
@@ -750,38 +800,10 @@ public final class LanceShardColumnCache {
                     valuesByFragment.put(leaf.fragmentId(), new long[maxDoc]);
                     presenceByFragment.put(leaf.fragmentId(), new FixedBitSet(maxDoc));
                 }
-                ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(new java.util.ArrayList<>(leavesByFragmentId.keySet()))
-                    .columns(Collections.singletonList(name))
-                    .withRowAddress(true);
-                if (filterSql != null) {
-                    builder = builder.filter(filterSql);
-                }
-                heapScans.incrementAndGet();
-                try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
-                    while (reader.loadNextBatch()) {
-                        VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                        UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                        BitVector vector = (BitVector) root.getVector(name);
-                        for (int i = 0; i < root.getRowCount(); i++) {
-                            long addr = rowAddr.get(i);
-                            int fragId = (int) (addr >>> 32);
-                            int offset = (int) (addr & 0xFFFFFFFFL);
-                            long[] values = valuesByFragment.get(fragId);
-                            FixedBitSet presence = presenceByFragment.get(fragId);
-                            if (values == null || presence == null) {
-                                continue;
-                            }
-                            if (!vector.isNull(i)) {
-                                values[offset] = vector.get(i);
-                                presence.set(offset);
-                            }
-                        }
-                    }
-                } catch (IOException e) {
-                    throw e;
-                } catch (Exception e) {
-                    throw new IOException(e);
-                }
+                scanHeap(name, (fragmentId, offset, vector, row) -> {
+                    valuesByFragment.get(fragmentId)[offset] = ((BitVector) vector).get(row);
+                    presenceByFragment.get(fragmentId).set(offset);
+                });
                 for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
                     leaf.publishBooleanColumn(name, valuesByFragment.get(leaf.fragmentId()), presenceByFragment.get(leaf.fragmentId()));
                 }
@@ -855,36 +877,9 @@ public final class LanceShardColumnCache {
                     idsByFragment.put(leaf.fragmentId(), ids);
                     buildersByFragment.put(leaf.fragmentId(), new KeywordDictionaryBuilder());
                 }
-                ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(new java.util.ArrayList<>(leavesByFragmentId.keySet()))
-                    .columns(Collections.singletonList(name))
-                    .withRowAddress(true);
-                if (filterSql != null) {
-                    builder = builder.filter(filterSql);
-                }
-                heapScans.incrementAndGet();
-                try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
-                    while (reader.loadNextBatch()) {
-                        VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                        UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                        VarCharVector vector = (VarCharVector) root.getVector(name);
-                        for (int i = 0; i < root.getRowCount(); i++) {
-                            if (vector.isNull(i)) {
-                                continue;
-                            }
-                            long addr = rowAddr.get(i);
-                            int fragId = (int) (addr >>> 32);
-                            int[] ids = idsByFragment.get(fragId);
-                            if (ids == null) {
-                                continue;
-                            }
-                            ids[(int) (addr & 0xFFFFFFFFL)] = buildersByFragment.get(fragId).intern(vector, i);
-                        }
-                    }
-                } catch (IOException e) {
-                    throw e;
-                } catch (Exception e) {
-                    throw new IOException(e);
-                }
+                scanHeap(name, (fragmentId, offset, vector, row) -> {
+                    idsByFragment.get(fragmentId)[offset] = buildersByFragment.get(fragmentId).intern((VarCharVector) vector, row);
+                });
                 long termBytes = 0L;
                 for (KeywordDictionaryBuilder dictionaryBuilder : buildersByFragment.values()) {
                     termBytes += termsHeapBytes(dictionaryBuilder.size(), dictionaryBuilder.termBytes());
@@ -951,42 +946,15 @@ public final class LanceShardColumnCache {
                     rowsByFragment.put(leaf.fragmentId(), new int[leaf.maxDoc()][]);
                     buildersByFragment.put(leaf.fragmentId(), new KeywordDictionaryBuilder());
                 }
-                ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(new java.util.ArrayList<>(leavesByFragmentId.keySet()))
-                    .columns(Collections.singletonList(name))
-                    .withRowAddress(true);
-                if (filterSql != null) {
-                    builder = builder.filter(filterSql);
-                }
-                heapScans.incrementAndGet();
-                try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
-                    while (reader.loadNextBatch()) {
-                        VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                        UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                        ListVector vector = (ListVector) root.getVector(name);
-                        VarCharVector elements = (VarCharVector) vector.getDataVector();
-                        for (int i = 0; i < root.getRowCount(); i++) {
-                            if (vector.isNull(i)) {
-                                continue;
-                            }
-                            long addr = rowAddr.get(i);
-                            int fragId = (int) (addr >>> 32);
-                            int[][] rows = rowsByFragment.get(fragId);
-                            if (rows == null) {
-                                continue;
-                            }
-                            rows[(int) (addr & 0xFFFFFFFFL)] = LanceFragmentLeafReader.internListElements(
-                                buildersByFragment.get(fragId),
-                                vector,
-                                elements,
-                                i
-                            );
-                        }
-                    }
-                } catch (IOException e) {
-                    throw e;
-                } catch (Exception e) {
-                    throw new IOException(e);
-                }
+                scanHeap(name, (fragmentId, offset, vector, row) -> {
+                    ListVector list = (ListVector) vector;
+                    rowsByFragment.get(fragmentId)[offset] = LanceFragmentLeafReader.internListElements(
+                        buildersByFragment.get(fragmentId),
+                        list,
+                        (VarCharVector) list.getDataVector(),
+                        row
+                    );
+                });
                 Map<Integer, KeywordDictionaryBuilder.Dictionary> dictionaries = new HashMap<>(leavesByFragmentId.size() * 2);
                 long rowAndTermBytes = 0L;
                 for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {

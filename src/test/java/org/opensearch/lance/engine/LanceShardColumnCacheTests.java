@@ -8,11 +8,14 @@ package org.opensearch.lance.engine;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.arrow.memory.RootAllocator;
@@ -381,6 +384,214 @@ public class LanceShardColumnCacheTests extends OpenSearchTestCase {
                     assertEquals(0L, tight.getUsed());
                 }
             }
+        }
+    }
+
+    /** A reader whose column scans run in up to {@code parallelism} fragment groups on {@code pool}. */
+    private LanceDirectoryReader openParallel(
+        Snapshot snapshot,
+        ColumnStore store,
+        CircuitBreaker breaker,
+        String filterSql,
+        ExecutorService pool,
+        int parallelism
+    ) throws IOException {
+        return LanceDirectoryReader.openForSnapshot(
+            new ByteBuffersDirectory(),
+            snapshot,
+            store,
+            allFragments,
+            filterSql,
+            breaker,
+            new FragmentGroupScan(pool, parallelism)
+        );
+    }
+
+    /**
+     * Every doc value of every leaf of {@code reader} for the four column
+     * kinds, as one string per (leaf, doc) so two readers can be compared
+     * whole.
+     */
+    private static List<String> readEverything(LanceDirectoryReader reader) throws IOException {
+        List<String> rows = new ArrayList<>();
+        for (LanceFragmentLeafReader leaf : leavesOf(reader)) {
+            NumericDocValues rating = leaf.getNumericDocValues("rating");
+            NumericDocValues flag = leaf.getNumericDocValues("flag");
+            SortedDocValues category = leaf.getSortedDocValues("category");
+            SortedSetDocValues tags = leaf.getSortedSetDocValues("tags");
+            for (int doc = 0; doc < leaf.maxDoc(); doc++) {
+                StringBuilder row = new StringBuilder().append(leaf.fragmentId()).append('-').append(doc);
+                row.append(" rating=").append(rating.advanceExact(doc) ? Long.toString(rating.longValue()) : "null");
+                row.append(" flag=").append(flag.advanceExact(doc) ? Long.toString(flag.longValue()) : "null");
+                row.append(" category=")
+                    .append(category.advanceExact(doc) ? category.lookupOrd(category.ordValue()).utf8ToString() : "null");
+                row.append(" tags=");
+                if (tags.advanceExact(doc)) {
+                    for (int i = 0; i < tags.docValueCount(); i++) {
+                        row.append(tags.lookupOrd(tags.nextOrd()).utf8ToString()).append(',');
+                    }
+                } else {
+                    row.append("null");
+                }
+                rows.add(row.toString());
+            }
+        }
+        return rows;
+    }
+
+    public void testParallelHeapLoadsReadTheSameValuesAsOneScanAndChargeTheSameBytes() throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        try (Lease lease = acquire()) {
+            List<String> sequential;
+            LimitedBreaker one = new LimitedBreaker(Long.MAX_VALUE);
+            try (LanceDirectoryReader reader = openParallel(lease.snapshot(), null, one, null, pool, 1)) {
+                sequential = readEverything(reader);
+                assertEquals("one scan per column", 4L, leavesOf(reader).get(0).shardColumnCache().heapScanCount());
+            }
+            long expected = 2 * numericBytesOfAllFragments() + categoryBytesOfAllFragments() + tagsBytesOfAllFragments();
+            assertEquals(expected, one.charges.stream().mapToLong(Long::longValue).sum());
+            assertEquals(0L, one.getUsed());
+
+            LimitedBreaker four = new LimitedBreaker(Long.MAX_VALUE);
+            try (LanceDirectoryReader reader = openParallel(lease.snapshot(), null, four, null, pool, 4)) {
+                assertEquals(sequential, readEverything(reader));
+                assertEquals(
+                    "three fragments: one scan per fragment per column",
+                    12L,
+                    leavesOf(reader).get(0).shardColumnCache().heapScanCount()
+                );
+                assertEquals("the charges are the same sums as with one scan", expected, four.getUsed());
+                assertEquals(one.charges, four.charges);
+            }
+            assertEquals(0L, four.getUsed());
+            assertEquals(FRAGMENTS * ROWS, sequential.size());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    public void testParallelHeapLoadsWithATopLevelFilterMatchOneScan() throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        try (Lease lease = acquire()) {
+            List<String> sequential;
+            try (
+                LanceDirectoryReader reader = openParallel(
+                    lease.snapshot(),
+                    null,
+                    new LimitedBreaker(Long.MAX_VALUE),
+                    "rating > 500",
+                    pool,
+                    1
+                )
+            ) {
+                sequential = readEverything(reader);
+            }
+            try (
+                LanceDirectoryReader reader = openParallel(
+                    lease.snapshot(),
+                    null,
+                    new LimitedBreaker(Long.MAX_VALUE),
+                    "rating > 500",
+                    pool,
+                    3
+                )
+            ) {
+                assertEquals(sequential, readEverything(reader));
+            }
+            assertTrue(sequential.stream().anyMatch(row -> row.contains("rating=null")));
+            assertTrue(sequential.stream().anyMatch(row -> row.contains("rating=999")));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    public void testParallelStoreLoadsReadTheSameValuesAsOneScan() throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        try (
+            ColumnStore sequentialStore = new ColumnStore(allocator, 64L * 1024 * 1024);
+            ColumnStore parallelStore = new ColumnStore(allocator, 64L * 1024 * 1024)
+        ) {
+            try (Lease lease = acquire()) {
+                List<String> sequential;
+                try (
+                    LanceDirectoryReader reader = openParallel(
+                        lease.snapshot(),
+                        sequentialStore,
+                        new LimitedBreaker(Long.MAX_VALUE),
+                        null,
+                        pool,
+                        1
+                    )
+                ) {
+                    sequential = readEverything(reader);
+                    assertTrue(leavesOf(reader).get(0).isServingOffHeap("rating"));
+                    assertTrue(leavesOf(reader).get(0).isServingOffHeap("category"));
+                }
+                assertEquals(4L, sequentialStore.scanCount());
+                try (
+                    LanceDirectoryReader reader = openParallel(
+                        lease.snapshot(),
+                        parallelStore,
+                        new LimitedBreaker(Long.MAX_VALUE),
+                        null,
+                        pool,
+                        4
+                    )
+                ) {
+                    assertEquals(sequential, readEverything(reader));
+                    assertTrue(leavesOf(reader).get(0).isServingOffHeap("rating"));
+                    assertTrue(leavesOf(reader).get(0).isServingOffHeap("tags"));
+                }
+                assertEquals("one scan per fragment per column", 12L, parallelStore.scanCount());
+                assertEquals(sequentialStore.entryCount(), parallelStore.entryCount());
+                assertEquals(sequentialStore.allocatedBytes(), parallelStore.allocatedBytes());
+                // A second reader over the parallel store is a hit for every column.
+                try (
+                    LanceDirectoryReader reader = openParallel(
+                        lease.snapshot(),
+                        parallelStore,
+                        new LimitedBreaker(Long.MAX_VALUE),
+                        null,
+                        pool,
+                        4
+                    )
+                ) {
+                    assertEquals(sequential, readEverything(reader));
+                }
+                assertEquals(12L, parallelStore.scanCount());
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    public void testAFailingGroupScanFailsTheLoadAndGivesTheChargeBack() throws Exception {
+        // A filter Lance rejects makes every group's scan fail; the first
+        // failure ends the load, nothing is published and the breaker is
+        // back where it was. The reader stays usable for the store path.
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        LimitedBreaker breaker = new LimitedBreaker(Long.MAX_VALUE);
+        try (Lease lease = acquire()) {
+            try (LanceDirectoryReader reader = openParallel(lease.snapshot(), null, breaker, "no_such_column = 1", pool, 4)) {
+                LanceFragmentLeafReader leaf = leavesOf(reader).get(1);
+                NumericDocValues rating = leaf.getNumericDocValues("rating");
+                expectThrows(IOException.class, () -> rating.advanceExact(0));
+                assertEquals("the charge of the failed load is given back", 0L, breaker.getUsed());
+                assertEquals(0L, leaf.shardColumnCache().heapBytesCharged());
+                assertFalse(leaf.isColumnFullyLoaded("rating"));
+                assertTrue("at least one group was scanned", leaf.shardColumnCache().heapScanCount() >= 1L);
+                // The keyword load fails the same way; SortedDocValues
+                // surfaces the scan failure checked or unchecked depending
+                // on which accessor resolved the column.
+                Exception keywordFailure = expectThrows(Exception.class, () -> leaf.getSortedDocValues("category").advanceExact(0));
+                assertTrue(
+                    keywordFailure.toString(),
+                    keywordFailure instanceof IOException || keywordFailure instanceof UncheckedIOException
+                );
+                assertEquals(0L, breaker.getUsed());
+            }
+        } finally {
+            pool.shutdownNow();
         }
     }
 
