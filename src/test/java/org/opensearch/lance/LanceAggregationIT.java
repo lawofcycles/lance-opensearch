@@ -10,10 +10,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Stream;
 
 import org.opensearch.client.Request;
@@ -830,7 +832,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
     public void testSubstraitPushdownSketchesAgreeWithTheAggregators() throws Exception {
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 400, "pushdown-sketches")) {
             String index = fixture.indexName();
-            java.util.Set<Long> distinctRatings = new java.util.HashSet<>();
+            Set<Long> distinctRatings = new HashSet<>();
             for (int i = 0; i < 1200; i++) {
                 if (i % 5 != 4) {
                     distinctRatings.add((long) ((i * 37) % 1000));
@@ -1276,7 +1278,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             // cardinality: the true count comes from the fixture layout and
             // the default precision threshold (3000) keeps the HyperLogLog++
             // in its linear counting range for this many distinct values.
-            java.util.Set<Long> distinctRatings = new java.util.HashSet<>();
+            Set<Long> distinctRatings = new HashSet<>();
             for (int i = 0; i < 1200; i++) {
                 if (i % 5 != 4) {
                     distinctRatings.add((long) ((i * 37) % 1000));
