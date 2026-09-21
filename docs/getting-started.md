@@ -555,6 +555,17 @@ lance.aggregation.pushdown_parallelism: 4     # default: half the CPUs the JVM s
 
 Lance aggregates one scan on a single thread, so a node that holds many fragments cuts them into `pushdown_parallelism` contiguous groups, scans the groups at once on the `search` thread pool and merges the group rows before it builds its buckets. Set it to `1` to compare against a single scan; raise it up to the node's core count when a `terms` over many rows is slower than the same request with the setting off.
 
+### The coordinator thread pool
+
+A `_search` against a Lance-backed index has two halves. The coordinator half runs on the node that received the request: it resolves the index, enumerates the table's fragments, sends one request per data node, and merges the per-node answers (sorts the hits, reduces the aggregations). The executor half runs on every data node on the `search` pool: it scans its fragments. The plugin gives the coordinator half its own fixed pool, `lance_coordinator`, so that a burst of requests cannot fill a data node's `search` queue with coordinator work, and a full `search` queue cannot stop the transport layer from delivering a fragment response. The responses themselves are received on the transport thread and only stored there; the merge is queued on `lance_coordinator` once the last node has answered.
+
+```
+thread_pool.lance_coordinator.size: 8            # default max(1, allocated processors / 2)
+thread_pool.lance_coordinator.queue_size: 10000  # default
+```
+
+Both are static node settings. When the pool is full, the request fails with HTTP 429 and a `rejected_execution_exception` naming the pool, whether the rejection hit the request's entry or its merge; the plugin does not run the request on the shard path instead. `GET /_cat/thread_pool/lance_coordinator?v&h=node_name,active,queue,rejected` shows the pool per node. A `rejected` count that keeps growing means the coordinating nodes receive more concurrent requests than they can merge; spread the client's requests over more coordinating nodes or raise `queue_size`, which trades the 429s for longer queueing.
+
 ## 7. Cleanup and restart
 
 The namespace registry is held in process memory. Restarting OpenSearch clears the registrations, and any Lance-backed indices survive as regular OpenSearch indices without a live sync loop. To resume auto-surface after a restart:
