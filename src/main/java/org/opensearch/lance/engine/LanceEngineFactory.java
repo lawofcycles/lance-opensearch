@@ -27,6 +27,7 @@ import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.search.ReferenceManager;
+import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.Bits;
 import org.lance.Dataset;
@@ -724,14 +725,22 @@ public final class LanceEngineFactory implements EngineFactory {
                     searcher.close();
                     return GetResult.NOT_EXISTS;
                 }
+                // A reader over a table above the Lucene bound holds the
+                // leading fragments only; the key may sit in any fragment,
+                // so the scan then covers the whole table and a hit outside
+                // the reader is served through a reader over its fragment
+                // (resolveOutsideReader).
+                LanceDirectoryReader lanceReader = LanceDirectoryReader.unwrap(searcher.getDirectoryReader());
+                boolean boundExceeded = lanceReader != null && lanceReader.luceneBoundExceeded();
 
-                ScanOptions options = new ScanOptions.Builder().filter(filter)
+                ScanOptions.Builder options = new ScanOptions.Builder().filter(filter)
                     .columns(Collections.singletonList(field))
-                    .fragmentIds(fragmentIds)
-                    .withRowAddress(true)
-                    .build();
+                    .withRowAddress(true);
+                if (!boundExceeded) {
+                    options.fragmentIds(fragmentIds);
+                }
 
-                try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+                try (LanceScanner scanner = dataset.newScan(options.build()); ArrowReader reader = scanner.scanBatches()) {
                     while (reader.loadNextBatch()) {
                         VectorSchemaRoot root = reader.getVectorSchemaRoot();
                         UInt8Vector rowaddr = (UInt8Vector) root.getVector("_rowaddr");
@@ -741,6 +750,9 @@ public final class LanceEngineFactory implements EngineFactory {
                             int offset = (int) (addr & 0xFFFFFFFFL);
                             LeafReaderContext ctx = leavesByFragment.get(fragmentId);
                             if (ctx == null) {
+                                if (boundExceeded) {
+                                    return resolveOutsideReader(searcher, lanceReader, dataset, fragmentId, offset);
+                                }
                                 continue;
                             }
                             // The wrapper reader that the security plugin
@@ -768,6 +780,86 @@ public final class LanceEngineFactory implements EngineFactory {
                 searcher.close();
                 throw new RuntimeException(e);
             }
+        }
+
+        /**
+         * Serve a GET hit that sits in a fragment the shard reader does not
+         * hold (the table is above the Lucene bound): open a reader over
+         * that one fragment, on the shard reader's snapshot when it has
+         * one and on a dataset of its own at the same version otherwise,
+         * and return the hit through it. The result keeps the shard
+         * searcher open until it is released, which keeps the snapshot
+         * the extra reader reads from, and closes both together.
+         *
+         * <p>The shard searcher's top reader is the engine's own
+         * {@link OpenSearchDirectoryReader} unless the index's reader
+         * wrapper (the security plugin's DLS / FLS) applied itself for the
+         * caller; that filter cannot be applied to a reader opened here,
+         * so the lookup refuses instead of answering outside the wrapper.
+         */
+        private GetResult resolveOutsideReader(
+            Engine.Searcher searcher,
+            LanceDirectoryReader shardReader,
+            Dataset dataset,
+            int fragmentId,
+            int offset
+        ) throws IOException {
+            if (!(searcher.getDirectoryReader() instanceof OpenSearchDirectoryReader)) {
+                throw new IllegalStateException(
+                    "GET of a row outside the shard reader of ["
+                        + config().getShardId().getIndexName()
+                        + "] (table above the Lucene document bound) cannot apply the index's reader wrapper (DLS / FLS)"
+                );
+            }
+            LanceDirectoryReader single;
+            LanceWarmCache.Snapshot snapshot = shardReader.snapshot();
+            if (snapshot != null) {
+                single = LanceDirectoryReader.openForSnapshot(
+                    new ByteBuffersDirectory(),
+                    snapshot,
+                    snapshot.isCached() && warmCache != null ? warmCache.columnStore() : null,
+                    Collections.singletonList(fragmentId),
+                    null,
+                    requestBreaker()
+                );
+            } else {
+                Dataset own = LanceRegistry.openDataset(tablePath, storageOptions, Optional.of(dataset.version()));
+                try {
+                    single = LanceDirectoryReader.openForFragments(
+                        new ByteBuffersDirectory(),
+                        null,
+                        own,
+                        field,
+                        pkType,
+                        multiFields,
+                        Collections.singletonList(fragmentId)
+                    );
+                } catch (Throwable t) {
+                    own.close();
+                    throw t;
+                }
+            }
+            if (single.leaves().isEmpty()) {
+                single.close();
+                searcher.close();
+                return GetResult.NOT_EXISTS;
+            }
+            LeafReaderContext ctx = single.leaves().get(0);
+            Engine.Searcher both = new Engine.Searcher(
+                "get",
+                single,
+                engineConfig.getSimilarity(),
+                engineConfig.getQueryCache(),
+                engineConfig.getQueryCachingPolicy(),
+                () -> {
+                    try {
+                        single.close();
+                    } finally {
+                        searcher.close();
+                    }
+                }
+            );
+            return new GetResult(both, new DocIdAndVersion(offset, 1, 1, 1, ctx.reader(), ctx.docBase), false);
         }
     }
 
