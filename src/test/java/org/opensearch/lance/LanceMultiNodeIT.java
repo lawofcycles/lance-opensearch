@@ -1482,6 +1482,105 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         return extractIntPath(readAll(client().performRequest(new Request("GET", "/_nodes/data:true"))), "_nodes", "total");
     }
 
+    public void testCancelledExecutorOnOneNodeAnswersPartialResultsWithTimedOut() throws Exception {
+        // 1,200 rows written 400 per file give fragments 0, 1 and 2, one
+        // per data node. A script query that spins per document keeps
+        // every executor busy for a second or more; cancelling the
+        // executor task of one node while the request runs makes that
+        // node answer TaskCancelledException, which the coordinator
+        // treats like a node that timed out: the request completes from
+        // the other two nodes (800 rows), says timed_out, and reports the
+        // count as a lower bound.
+        String suffix = "mn-cancel-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 1200, 400);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(3, extractIntPath(readAll(attach), "fragments"));
+            assertEquals(3, dataNodeCount());
+
+            java.util.concurrent.CompletableFuture<LanceRestTestCase.ConcurrentResult> pending = LanceRestTestCase.postAsync(
+                client(),
+                "/" + indexName + "/_search",
+                "{\"size\":5,\"sort\":[{\"id\":\"asc\"}],\"query\":" + LanceRestTestCase.slowScriptQuery(900_000) + "}"
+            );
+            List<Map<String, Object>> executors = LanceRestTestCase.awaitTasks(client(), "*lance/fragment_query*", 3);
+            String victim = (String) executors.get(0).get("node");
+            String cancelled = readAll(postJson("/_tasks/_cancel?nodes=" + victim + "&actions=*lance/fragment_query*", ""));
+            assertTrue("the cancel must name one executor task: " + cancelled, cancelled.contains("lance/fragment_query"));
+
+            LanceRestTestCase.ConcurrentResult result = pending.get(60, java.util.concurrent.TimeUnit.SECONDS);
+            assertEquals("the request must complete from the other nodes: " + result.body(), RestStatus.OK.getStatus(), result.status());
+            Map<String, Object> response = parse(result.body());
+            assertEquals("the response must say a node did not answer: " + result.body(), Boolean.TRUE, response.get("timed_out"));
+            assertEquals("two of three fragments answered: " + result.body(), 800, extractIntPath(result.body(), "hits", "total", "value"));
+            assertEquals("a partial count is a lower bound: " + result.body(), "gte", relation(response));
+            assertEquals("the page comes from the answering nodes", 5, hitList(response).size());
+
+            assertBusy(() -> {
+                List<Map<String, Object>> left = LanceRestTestCase.tasksOf(
+                    client(),
+                    "*lance/fragment_query*,*lance/coordinator*,indices:data/read/search*"
+                );
+                assertEquals("tasks left behind: " + left, 0, left.size());
+            });
+
+            // Without a cancellation the same request answers in full.
+            String complete = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":5,\"query\":" + LanceRestTestCase.slowScriptQuery(1_000) + "}")
+            );
+            assertEquals(Boolean.FALSE, parse(complete).get("timed_out"));
+            assertEquals(1200, extractIntPath(complete, "hits", "total", "value"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testTimeoutAcrossThreeNodesCancelsEveryExecutor() throws Exception {
+        // With a 100 ms timeout no executor of the slow query answers in
+        // time; the coordinator answers from zero nodes with timed_out
+        // and cancels the executor task on each of the three nodes.
+        String suffix = "mn-timeout-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 1200, 400);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            String body = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"timeout\":\"100ms\",\"size\":5,\"query\":" + LanceRestTestCase.slowScriptQuery(900_000) + "}"
+                )
+            );
+            Map<String, Object> response = parse(body);
+            assertEquals("the response must say it timed out: " + body, Boolean.TRUE, response.get("timed_out"));
+            assertEquals(0, extractIntPath(body, "hits", "total", "value"));
+            assertEquals("gte", relation(response));
+
+            assertBusy(() -> {
+                List<Map<String, Object>> left = LanceRestTestCase.tasksOf(
+                    client(),
+                    "*lance/fragment_query*,*lance/coordinator*,indices:data/read/search*"
+                );
+                assertEquals("every timed out executor must have been cancelled, tasks left: " + left, 0, left.size());
+            });
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     /**
      * The node name of a log line, which log4j prints in the fourth
      * bracket: {@code [time][level][logger] [node] message}.
