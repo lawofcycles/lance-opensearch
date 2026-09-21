@@ -21,6 +21,7 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
@@ -67,6 +68,8 @@ import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchPlugin;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
+import org.opensearch.threadpool.ExecutorBuilder;
+import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.Scheduler.Cancellable;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -481,6 +484,49 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         );
     }
 
+    /**
+     * Name of the thread pool the coordinator side of the fragment path
+     * runs on: the entry of every {@code _search} against a Lance-backed
+     * index (resolving the request, enumerating fragments, sending the
+     * per-node requests) and the merge of the per-node responses (hit
+     * sort merge, aggregation reduce). The per-node fragment executors
+     * stay on the {@code search} pool. Keeping the two apart means a
+     * burst of coordinator work cannot fill the {@code search} queue of
+     * a data node, and a full {@code search} queue cannot make the
+     * transport layer drop a fragment response.
+     */
+    public static final String LANCE_COORDINATOR_THREAD_POOL = "lance_coordinator";
+
+    /**
+     * Default queue length of {@link #LANCE_COORDINATOR_THREAD_POOL}.
+     * Bounded, so a coordinator that cannot keep up rejects requests
+     * with 429 instead of queueing them without limit; large enough that
+     * the bound is only reached under a sustained overload.
+     */
+    static final int LANCE_COORDINATOR_QUEUE_SIZE = 10_000;
+
+    /**
+     * Register {@link #LANCE_COORDINATOR_THREAD_POOL} as a fixed pool of
+     * {@code max(1, allocated processors / 2)} threads. The size and the
+     * queue length are node settings under
+     * {@code thread_pool.lance_coordinator.*} like every other pool;
+     * OpenSearch registers them from this builder, so they are not part
+     * of {@link #getSettings()}.
+     */
+    @Override
+    public List<ExecutorBuilder<?>> getExecutorBuilders(Settings settings) {
+        int size = Math.max(1, OpenSearchExecutors.allocatedProcessors(settings) / 2);
+        return List.of(
+            new FixedExecutorBuilder(
+                settings,
+                LANCE_COORDINATOR_THREAD_POOL,
+                size,
+                LANCE_COORDINATOR_QUEUE_SIZE,
+                "thread_pool." + LANCE_COORDINATOR_THREAD_POOL
+            )
+        );
+    }
+
     private static void validateUncoveredFragmentPolicy(String value) {
         if (!"wait".equals(value) && !"immediate".equals(value)) {
             throw new IllegalArgumentException("index.lance.uncovered_fragment_policy must be 'wait' or 'immediate', got '" + value + "'");
@@ -701,10 +747,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
 
         // Register the shard-free dispatch ActionFilter. It
         // intercepts every _search request against Lance-backed
-        // indices, delegating to the plugin's own coordinator; the
-        // shard fan-out via ReadOnlyEngine only runs when the
-        // fragment executor cannot answer a shape yet (from > 0,
-        // search_after, highlighter, suggest, post_filter).
+        // indices, forks onto the lance_coordinator pool and delegates
+        // to the plugin's own coordinator; the shard fan-out via
+        // ReadOnlyEngine only runs when the fragment executor cannot
+        // answer a shape yet (highlighter, suggest, collapse, ...).
         this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client, threadPool);
         this.createIndexActionFilter = new LanceCreateIndexActionFilter(threadPool);
 

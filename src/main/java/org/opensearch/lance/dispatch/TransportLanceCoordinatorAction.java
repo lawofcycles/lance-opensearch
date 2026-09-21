@@ -5,6 +5,7 @@
 
 package org.opensearch.lance.dispatch;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -13,13 +14,16 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.search.TotalHits;
 import org.lance.Dataset;
+import org.opensearch.action.ActionRunnable;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchResponseSections;
@@ -35,8 +39,10 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -56,6 +62,8 @@ import org.opensearch.search.sort.SortBuilder;
 import org.opensearch.search.sort.SortOrder;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportException;
+import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.TransportService;
 
 /**
@@ -79,17 +87,31 @@ import org.opensearch.transport.TransportService;
  * of length one, so the transport hop reduces to a local
  * {@code sendRequest} against the loopback pool. Multi-node
  * behaviour is covered by {@code LanceMultiNodeIT}.
+ *
+ * <p>Threading: the entry (resolve, enumerate, send) and the merge
+ * run on the plugin's {@code lance_coordinator} pool; the per-node
+ * responses are received on the transport thread that read them and
+ * only stored and counted there (see {@link FragmentFanOut}).
  */
 public final class TransportLanceCoordinatorAction extends HandledTransportAction<SearchRequest, SearchResponse> {
 
     private static final Logger LOGGER = LogManager.getLogger(TransportLanceCoordinatorAction.class);
 
     private final TransportService transportService;
+    private final ThreadPool threadPool;
     private final ClusterService clusterService;
     private final IndexNameExpressionResolver indexNameExpressionResolver;
     private final BigArrays bigArrays;
     private final ScriptService scriptService;
 
+    /**
+     * Requests that reach this action over the transport layer (a
+     * coordinating node other than the one that received the HTTP
+     * request) are handled on the plugin's {@code lance_coordinator}
+     * pool, the same pool {@link LanceDispatchActionFilter} forks the
+     * local case onto, so no coordinator work runs on a transport
+     * thread or on the {@code search} pool of a data node.
+     */
     @Inject
     public TransportLanceCoordinatorAction(
         TransportService transportService,
@@ -99,12 +121,21 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         BigArrays bigArrays,
         ScriptService scriptService
     ) {
-        super(LanceCoordinatorAction.NAME, transportService, actionFilters, SearchRequest::new, ThreadPool.Names.SEARCH);
+        super(LanceCoordinatorAction.NAME, transportService, actionFilters, SearchRequest::new, LancePlugin.LANCE_COORDINATOR_THREAD_POOL);
         this.transportService = transportService;
+        this.threadPool = transportService.getThreadPool();
         this.clusterService = clusterService;
         this.indexNameExpressionResolver = indexNameExpressionResolver;
         this.bigArrays = bigArrays;
         this.scriptService = scriptService;
+    }
+
+    private void sendFragmentRequest(
+        DiscoveryNode node,
+        LanceFragmentQueryRequest request,
+        TransportResponseHandler<LanceFragmentQueryResponse> handler
+    ) {
+        transportService.sendRequest(node, LanceFragmentQueryAction.NAME, request, handler);
     }
 
     @Override
@@ -311,7 +342,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         }
 
         Map<DiscoveryNode, List<Integer>> perNode = groupFragmentsByNode(allFragmentIds, nodeList);
-        int fanOutSize = perNode.size();
 
         // Responses land in the slot of the node they came from, so
         // the merge sees them in fan-out (node id) order rather than
@@ -319,23 +349,18 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // address and does not depend on this order; keeping it fixed
         // keeps the per-node lists, and with them the logs and the
         // aggregation partials, in the same order on every request.
-        // GroupedActionListener's own collection is arrival-ordered
-        // and is only used here for the completion count.
-        AtomicReferenceArray<LanceFragmentQueryResponse> slots = new AtomicReferenceArray<>(fanOutSize);
-        // Any single per-node failure fails the whole request:
-        // GroupedActionListener forwards the first onFailure to
-        // `done` and ignores the remaining responses. There is no
+        // Any single per-node failure fails the whole request: the
+        // fan-out forwards the first failure to `done` once every node
+        // has answered and drops the remaining responses. There is no
         // partial-result mode on the fragment path because a missing
         // node means missing fragments, and a silently short result
         // set is worse than an error.
-        GroupedActionListener<LanceFragmentQueryResponse> gathered = new GroupedActionListener<>(ActionListener.wrap(responses -> {
-            List<LanceFragmentQueryResponse> ordered = new ArrayList<>(fanOutSize);
-            for (int i = 0; i < fanOutSize; i++) {
-                ordered.add(slots.get(i));
-            }
-            merged.absorbTargetResponses(target, ordered);
-            done.onResponse(null);
-        }, done::onFailure), fanOutSize);
+        FragmentFanOut fanOut = new FragmentFanOut(
+            perNode.size(),
+            threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL),
+            responses -> merged.absorbTargetResponses(target, responses),
+            done
+        );
 
         int slot = 0;
         for (Map.Entry<DiscoveryNode, List<Integer>> assignment : perNode.entrySet()) {
@@ -366,41 +391,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 fragmentsForNode
             );
             // Dispatch through TransportService so remote data nodes
-            // receive the request. For
-            // the local node this still executes in-process because
-            // TransportService's request handler dispatch is loopback
-            // aware, but any other node in the cluster picks up its
-            // slice through the network. The handler wraps the
-            // GroupedActionListener so per-node failures propagate
-            // through GroupedActionListener.onFailure and abort the
-            // fan-out cleanly.
-            transportService.sendRequest(
-                nodeTarget,
-                LanceFragmentQueryAction.NAME,
-                fragmentRequest,
-                new org.opensearch.transport.TransportResponseHandler<LanceFragmentQueryResponse>() {
-                    @Override
-                    public LanceFragmentQueryResponse read(org.opensearch.core.common.io.stream.StreamInput in) throws java.io.IOException {
-                        return new LanceFragmentQueryResponse(in);
-                    }
-
-                    @Override
-                    public void handleResponse(LanceFragmentQueryResponse response) {
-                        slots.set(slotIndex, response);
-                        gathered.onResponse(response);
-                    }
-
-                    @Override
-                    public void handleException(org.opensearch.transport.TransportException exp) {
-                        gathered.onFailure(exp);
-                    }
-
-                    @Override
-                    public String executor() {
-                        return org.opensearch.threadpool.ThreadPool.Names.SEARCH;
-                    }
-                }
-            );
+            // receive the request. For the local node this still
+            // executes in-process because TransportService's request
+            // handler dispatch is loopback aware, but any other node
+            // in the cluster picks up its slice through the network.
+            fanOut.send(this::sendFragmentRequest, slotIndex, nodeTarget, fragmentRequest);
         }
     }
 
@@ -444,33 +439,113 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             target.tableUri(),
             host.getId()
         );
-        transportService.sendRequest(
-            host,
-            LanceFragmentQueryAction.NAME,
-            fragmentRequest,
-            new org.opensearch.transport.TransportResponseHandler<LanceFragmentQueryResponse>() {
+        FragmentFanOut fanOut = new FragmentFanOut(
+            1,
+            threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL),
+            responses -> merged.absorbTargetResponses(target, responses),
+            done
+        );
+        fanOut.send(this::sendFragmentRequest, 0, host, fragmentRequest);
+    }
+
+    /**
+     * The per-node requests of one fan-out and the delivery of their
+     * responses to the merge.
+     *
+     * <p>Responses arrive on the transport thread that read them
+     * ({@link TransportResponseHandler#executor()} is
+     * {@link ThreadPool.Names#SAME}), so the transport layer never has
+     * to queue a response on a thread pool and can never reject one.
+     * A rejected response would close the channel it came on and fail
+     * every other request in flight on that channel, and the request
+     * whose response was dropped would never complete. On that thread
+     * a response is only stored in its slot and counted; nothing of
+     * Lance, Lucene or the reduce runs there.
+     *
+     * <p>When the last node has answered, the merge of the ordered
+     * responses is submitted to the coordinator pool. Every way the
+     * merge can fail to run or to finish reaches {@code done} exactly
+     * once: the pool rejecting the merge, the merge throwing, a node
+     * failing, and {@link #send} throwing before a request left the
+     * node all end in {@link ActionListener#onFailure}; the last
+     * response's merge completing ends in
+     * {@link ActionListener#onResponse}. A pool rejection is passed
+     * through as the pool's {@code OpenSearchRejectedExecutionException}
+     * so the client sees HTTP 429.
+     */
+    static final class FragmentFanOut {
+
+        /** How a per-node request leaves the coordinator; {@code TransportService::sendRequest} outside tests. */
+        interface Sender {
+            void send(DiscoveryNode node, LanceFragmentQueryRequest request, TransportResponseHandler<LanceFragmentQueryResponse> handler);
+        }
+
+        private final AtomicReferenceArray<LanceFragmentQueryResponse> slots;
+        private final GroupedActionListener<LanceFragmentQueryResponse> gathered;
+
+        /**
+         * @param size          number of per-node requests
+         * @param mergeExecutor pool the merge runs on once every response is in
+         * @param merge         consumes the responses in slot order
+         * @param done          completed once, after the merge or on the first failure
+         */
+        FragmentFanOut(int size, Executor mergeExecutor, Consumer<List<LanceFragmentQueryResponse>> merge, ActionListener<Void> done) {
+            this.slots = new AtomicReferenceArray<>(size);
+            ActionListener<Void> once = ActionListener.notifyOnce(done);
+            this.gathered = new GroupedActionListener<>(ActionListener.wrap(responses -> {
+                // ActionRunnable routes a throwing merge and a
+                // rejected submit (AbstractRunnable.onRejection
+                // defaults to onFailure) to once.onFailure, and a
+                // completed merge to once.onResponse.
+                mergeExecutor.execute(ActionRunnable.run(once, () -> {
+                    List<LanceFragmentQueryResponse> ordered = new ArrayList<>(size);
+                    for (int i = 0; i < size; i++) {
+                        ordered.add(slots.get(i));
+                    }
+                    merge.accept(ordered);
+                }));
+            }, once::onFailure), size);
+        }
+
+        /**
+         * Send the request for {@code slot}. A synchronous failure of
+         * the sender (the node is gone, the request does not serialise)
+         * counts as that node's failure so the fan-out still completes
+         * once the other nodes have answered.
+         */
+        void send(Sender sender, int slot, DiscoveryNode node, LanceFragmentQueryRequest request) {
+            try {
+                sender.send(node, request, handler(slot));
+            } catch (Exception e) {
+                gathered.onFailure(e);
+            }
+        }
+
+        /** The response handler for {@code slot}. */
+        TransportResponseHandler<LanceFragmentQueryResponse> handler(int slot) {
+            return new TransportResponseHandler<>() {
                 @Override
-                public LanceFragmentQueryResponse read(org.opensearch.core.common.io.stream.StreamInput in) throws java.io.IOException {
+                public LanceFragmentQueryResponse read(StreamInput in) throws IOException {
                     return new LanceFragmentQueryResponse(in);
                 }
 
                 @Override
                 public void handleResponse(LanceFragmentQueryResponse response) {
-                    merged.absorbTargetResponses(target, java.util.List.of(response));
-                    done.onResponse(null);
+                    slots.set(slot, response);
+                    gathered.onResponse(response);
                 }
 
                 @Override
-                public void handleException(org.opensearch.transport.TransportException exp) {
-                    done.onFailure(exp);
+                public void handleException(TransportException exp) {
+                    gathered.onFailure(exp);
                 }
 
                 @Override
                 public String executor() {
-                    return org.opensearch.threadpool.ThreadPool.Names.SEARCH;
+                    return ThreadPool.Names.SAME;
                 }
-            }
-        );
+            };
+        }
     }
 
     /**
