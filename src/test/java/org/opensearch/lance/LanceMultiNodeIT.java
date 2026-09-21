@@ -1123,6 +1123,103 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
+     * Sliced collection on three executors answers like the shard path.
+     * Twelve fragments of 25 rows, four per node, collected in two slices
+     * per executor with the pushdown off so every shape runs through the
+     * Lucene aggregators: the exact aggregations equal the shard path's
+     * and the sketches stay within their error. Every executor's DEBUG
+     * line reports its four leaves in two slices.
+     */
+    @SuppressWarnings("unchecked")
+    public void testSlicedCollectionAcrossThreeNodesAnswersLikeTheShardPath() throws Exception {
+        String suffix = "mn-slices-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 12;
+        int rowsPerFragment = 25;
+        LanceTableFactory.writeInterleavedTable(scratchDir, tableName, fragments, rowsPerFragment);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String[] exact = {
+            "\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"show_term_doc_count_error\":true},\"aggs\":{\"s\":{\"stats\":{\"field\":\"id\"}}}}}",
+            "\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}},\"es\":{\"extended_stats\":{\"field\":\"id\"}}}",
+            "\"size\":0,\"aggs\":{\"r\":{\"range\":{\"field\":\"id\",\"ranges\":[{\"to\":100},{\"from\":100,\"to\":200},{\"from\":200}]},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}",
+            "\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"},\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}}",
+            "\"size\":0,\"query\":{\"term\":{\"category\":\"c2\"}},\"aggs\":{\"c\":{\"composite\":{\"size\":4,\"sources\":[{\"month\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}},{\"cat\":{\"terms\":{\"field\":\"category\"}}}]},\"aggs\":{\"mx\":{\"max\":{\"field\":\"id\"}}}}}",
+            "\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":40}}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}},\"h\":{\"histogram\":{\"field\":\"id\",\"interval\":50}}}}",
+            "\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"id\",\"percents\":[10,50,90],\"hdr\":{\"number_of_significant_value_digits\":3}}}}" };
+        try {
+            updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
+            updateClusterSetting("lance.aggregation.pushdown", "false");
+            updateClusterSetting("lance.fragment_path.slices", "2");
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+
+            int fragmentPathRequests = 0;
+            for (String shape : exact) {
+                assertAggregationsMatchShardPath(indexName, shape);
+                fragmentPathRequests++;
+            }
+
+            String tdigest = "{\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"id\"}}}}";
+            Map<String, Object> viaFragments = parse(readAll(postJson("/" + indexName + "/_search", tdigest)));
+            fragmentPathRequests++;
+            Map<String, Object> viaShard = parse(
+                readAll(postJson("/" + indexName + "/_search?request_cache=false", "{\"explain\":true," + tdigest.substring(1)))
+            );
+            Map<String, Object> fragmentValues = (Map<String, Object>) aggregationOf(viaFragments, "p").get("values");
+            Map<String, Object> shardValues = (Map<String, Object>) aggregationOf(viaShard, "p").get("values");
+            assertEquals(shardValues.keySet(), fragmentValues.keySet());
+            for (String percentile : shardValues.keySet()) {
+                double expected = ((Number) shardValues.get(percentile)).doubleValue();
+                double actual = ((Number) fragmentValues.get(percentile)).doubleValue();
+                assertTrue(
+                    "percentile " + percentile + ": shard path " + expected + ", fragment path " + actual,
+                    Math.abs(expected - actual) <= 0.03d * 299d
+                );
+            }
+            Map<String, Object> counted = parse(
+                readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"aggs\":{\"ids\":{\"cardinality\":{\"field\":\"id\"}}}}"))
+            );
+            fragmentPathRequests++;
+            double ids = ((Number) aggregationOf(counted, "ids").get("value")).doubleValue();
+            assertTrue("cardinality(id) " + ids, Math.abs(ids - 300d) <= 3d);
+
+            int expectedRequests = fragmentPathRequests;
+            String marker = "lance.dispatch: fragment path slices for ["
+                + indexName
+                + "]: 4 leaves in 2 slices (lance.fragment_path.slices 2)";
+            assertBusy(() -> {
+                Map<String, Integer> perNode = new HashMap<>();
+                for (String line : clusterLogLines()) {
+                    if (line.contains(marker)) {
+                        perNode.merge(loggingNodeName(line), 1, Integer::sum);
+                    }
+                }
+                int dataNodes = dataNodeCount();
+                assertEquals("slice lines on " + perNode, dataNodes, perNode.size());
+                for (Map.Entry<String, Integer> node : perNode.entrySet()) {
+                    assertEquals("slice lines on " + node.getKey(), expectedRequests, node.getValue().intValue());
+                }
+            });
+        } finally {
+            for (String key : new String[] {
+                "logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction",
+                "lance.aggregation.pushdown",
+                "lance.fragment_path.slices" }) {
+                try {
+                    updateClusterSetting(key, null);
+                } catch (Exception ignored) {}
+            }
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
      * Run {@code shape} through the fragment path and, with
      * {@code "explain": true}, through the shard path, and assert the two
      * responses carry the same {@code hits.total} and the same
@@ -1164,7 +1261,9 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * 3.3 KB per fragment, on top of the 5 KB every aggregator reserves
      * on the same breaker when it is built. A request breaker limit of
      * 10 KB therefore refuses the two fragment node (about 11.7 KB) and
-     * lets the others (about 8.4 KB) through. The coordinator forwards
+     * lets the others (about 8.4 KB) through. The collection runs in one
+     * slice so that the two fragment node builds one aggregator tree, not
+     * one per slice. The coordinator forwards
      * the executor's {@code CircuitBreakingException} with its status,
      * and {@code _lance/stats} shows the refusal on exactly one node.
      */
@@ -1180,6 +1279,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String sum = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}";
         updateClusterSetting("lance.aggregation.pushdown", "false");
         updateClusterSetting("lance.cache.enabled", "false");
+        updateClusterSetting("lance.fragment_path.slices", "1");
         try {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
@@ -1228,6 +1328,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         } finally {
             updateClusterSetting("lance.cache.enabled", null);
             updateClusterSetting("lance.aggregation.pushdown", null);
+            updateClusterSetting("lance.fragment_path.slices", null);
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}

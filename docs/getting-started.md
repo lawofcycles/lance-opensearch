@@ -555,6 +555,17 @@ lance.aggregation.pushdown_parallelism: 4     # default: half the CPUs the JVM s
 
 Lance aggregates one scan on a single thread, so a node that holds many fragments cuts them into `pushdown_parallelism` contiguous groups, scans the groups at once on the `search` thread pool and merges the group rows before it builds its buckets. Set it to `1` to compare against a single scan; raise it up to the node's core count when a `terms` over many rows is slower than the same request with the setting off.
 
+### Aggregations and hit pages collected on several threads
+
+Every other aggregation, and every page of hits, runs through OpenSearch's collectors over the executor's fragments. Two dynamic cluster settings decide how many threads an executor uses for that:
+
+```
+lance.fragment_path.parallelism: 4            # default: half the CPUs the JVM sees (at least 1, at most 32)
+lance.fragment_path.slices: 4                 # default: half the CPUs the JVM sees (at least 1, at most 32)
+```
+
+`parallelism` is the number of Lance scans an executor runs side by side when it reads a column into memory. `slices` is the number of slices it cuts its fragments into when it collects: each slice collects on its own `search` pool thread with its own collector, the way concurrent segment search does on the shard path, and the slice results are reduced on the executor. Set `slices` to `1` to collect on one thread in fragment order (the tdigest `percentiles` and `cardinality` sketches are then built once per executor instead of once per slice); raise it towards the node's core count when an aggregation that the scan does not compute (`composite`, `percentiles`, `cardinality`, `stats`, or `terms` with the pushdown off) keeps one core busy while the others idle. With the log level of `org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction` at `DEBUG`, each request logs the number of leaves and slices it collected.
+
 ### The coordinator thread pool
 
 A `_search` against a Lance-backed index has two halves. The coordinator half runs on the node that received the request: it resolves the index, enumerates the table's fragments, sends one request per data node, and merges the per-node answers (sorts the hits, reduces the aggregations). The executor half runs on every data node on the `search` pool: it scans its fragments. The plugin gives the coordinator half its own fixed pool, `lance_coordinator`, so that a burst of requests cannot fill a data node's `search` queue with coordinator work, and a full `search` queue cannot stop the transport layer from delivering a fragment response. The responses themselves are received on the transport thread and only stored there; the merge is queued on `lance_coordinator` once the last node has answered.
