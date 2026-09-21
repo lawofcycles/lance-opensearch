@@ -14,12 +14,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 
@@ -51,6 +46,7 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.query.QueryShardContext;
+import org.opensearch.lance.engine.FragmentGroupScan;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.Cast;
@@ -501,9 +497,10 @@ final class LanceAggregatePushdown {
          *
          * <p>The fragments are cut into {@code min(fragments, parallelism)}
          * contiguous groups and every group is scanned with its own copy
-         * of the plan, the groups after the first on {@code executor} and
-         * the first on the calling thread; the partial results are merged
-         * per key list in Java before the buckets are built. Lance runs
+         * of the plan ({@link FragmentGroupScan}: the groups after the
+         * first on {@code executor}, the first on the calling thread); the
+         * partial results are merged per key list in Java before the
+         * buckets are built. Lance runs
          * the aggregate of one scan in a single DataFusion partition, so
          * this is what gives a node with many fragments more than one
          * core for the hash aggregation. One fragment, or a parallelism
@@ -512,9 +509,6 @@ final class LanceAggregatePushdown {
          * <p>Failures inside Lance (a plan it cannot parse, a function
          * its DataFusion build lacks) propagate: falling back to the
          * aggregator path would hide the regression behind a slow answer.
-         * When one group fails, no further group is started, the groups
-         * already running are left to finish (a Lance scan has no cancel
-         * from the Java side) and the first failure is thrown.
          */
         Result execute(
             Dataset dataset,
@@ -524,132 +518,21 @@ final class LanceAggregatePushdown {
             Executor executor,
             Function<String, InternalAggregation> dateHistogramPrototype
         ) throws Exception {
-            List<List<Integer>> fragmentGroups = splitContiguous(fragmentIds, parallelism);
+            List<List<Integer>> fragmentGroups = FragmentGroupScan.splitContiguous(fragmentIds, parallelism);
+            List<Partial> partials = new FragmentGroupScan(executor, parallelism).runGroups(
+                fragmentGroups,
+                group -> scan(dataset, group, filterSql)
+            );
             Partial merged;
-            if (fragmentGroups.size() == 1) {
-                merged = scan(dataset, fragmentGroups.get(0), filterSql);
+            if (partials.size() == 1) {
+                merged = partials.get(0);
             } else {
                 merged = new Partial();
-                for (Partial partial : scanInParallel(dataset, fragmentGroups, filterSql, executor)) {
+                for (Partial partial : partials) {
                     merged.merge(partial);
                 }
             }
             return assemble(merged, fragmentGroups.size(), dateHistogramPrototype);
-        }
-
-        /**
-         * Cuts the fragment list into {@code min(size, parallelism)}
-         * runs of consecutive fragments, as close to equal in count as
-         * the division allows. Consecutive rather than round robin so
-         * each scan reads fragments that are adjacent in the manifest,
-         * the order they were written in. A null or empty list (every
-         * fragment, handed to Lance as no fragment restriction) or a
-         * single fragment stays one group.
-         */
-        static List<List<Integer>> splitContiguous(List<Integer> fragmentIds, int parallelism) {
-            if (fragmentIds == null || fragmentIds.isEmpty()) {
-                return Collections.singletonList(null);
-            }
-            if (fragmentIds.size() == 1 || parallelism <= 1) {
-                return Collections.singletonList(fragmentIds);
-            }
-            int count = fragmentIds.size();
-            int groupCount = Math.min(count, parallelism);
-            List<List<Integer>> groups = new ArrayList<>(groupCount);
-            for (int g = 0; g < groupCount; g++) {
-                int from = (int) ((long) count * g / groupCount);
-                int to = (int) ((long) count * (g + 1) / groupCount);
-                groups.add(List.copyOf(fragmentIds.subList(from, to)));
-            }
-            return groups;
-        }
-
-        /**
-         * Scans every group, the first on the calling thread and the
-         * others as tasks on {@code executor}, and returns the partials
-         * in group order. The tasks and the caller draw group indexes
-         * from one shared counter, so a task that the executor has not
-         * started by the time the caller runs out of groups has nothing
-         * left to do: the caller marks it as taken over and does not wait
-         * for it, which keeps this method from blocking on a saturated
-         * pool (and from deadlocking when every thread of that pool is a
-         * caller waiting here) or on a task the pool rejected. Only tasks
-         * that did start are awaited.
-         */
-        private List<Partial> scanInParallel(Dataset dataset, List<List<Integer>> groups, String filterSql, Executor executor)
-            throws Exception {
-            int groupCount = groups.size();
-            Partial[] partials = new Partial[groupCount];
-            AtomicInteger next = new AtomicInteger();
-            AtomicReference<Exception> failure = new AtomicReference<>();
-            Runnable drain = () -> {
-                int index;
-                while (failure.get() == null && (index = next.getAndIncrement()) < groupCount) {
-                    try {
-                        partials[index] = scan(dataset, groups.get(index), filterSql);
-                    } catch (Exception e) {
-                        if (!failure.compareAndSet(null, e)) {
-                            failure.get().addSuppressed(e);
-                        }
-                    }
-                }
-            };
-            List<GroupTask> tasks = new ArrayList<>(groupCount - 1);
-            for (int i = 1; i < groupCount; i++) {
-                GroupTask task = new GroupTask(drain);
-                try {
-                    executor.execute(task);
-                    tasks.add(task);
-                } catch (RejectedExecutionException rejected) {
-                    // The pool is full; the calling thread scans what
-                    // the running tasks leave over.
-                    break;
-                }
-            }
-            drain.run();
-            for (GroupTask task : tasks) {
-                task.awaitIfStarted();
-            }
-            if (failure.get() != null) {
-                throw failure.get();
-            }
-            return Arrays.asList(partials);
-        }
-
-        /**
-         * One executor task of {@link #scanInParallel}. Whoever flips
-         * {@code taken} first owns the task: the pool thread runs the
-         * drain and signals {@code done}, or the caller declares the
-         * task never started and skips the wait, after which the pool
-         * thread returns at once when it eventually gets to it.
-         */
-        private static final class GroupTask implements Runnable {
-            private final Runnable drain;
-            private final AtomicBoolean taken = new AtomicBoolean();
-            private final CountDownLatch done = new CountDownLatch(1);
-
-            GroupTask(Runnable drain) {
-                this.drain = drain;
-            }
-
-            @Override
-            public void run() {
-                if (!taken.compareAndSet(false, true)) {
-                    return;
-                }
-                try {
-                    drain.run();
-                } finally {
-                    done.countDown();
-                }
-            }
-
-            void awaitIfStarted() throws InterruptedException {
-                if (taken.compareAndSet(false, true)) {
-                    return;
-                }
-                done.await();
-            }
         }
 
         /**
