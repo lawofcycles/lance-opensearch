@@ -17,7 +17,9 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
@@ -233,6 +235,15 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
     private volatile Mode mode;
     private final Map<String, Task> tasks = new ConcurrentHashMap<>();
     private volatile boolean closed;
+    /**
+     * Read locked by every warm-up while it runs, write locked by
+     * {@link #close}, so close returns only when no warm-up is inside a
+     * Lance scan.
+     */
+    private final ReentrantReadWriteLock runningLock = new ReentrantReadWriteLock();
+
+    /** How long {@link #close} waits for a warm-up that is inside a Lance scan. */
+    static final long CLOSE_WAIT_MILLIS = 60_000L;
 
     /**
      * @param warmCache the node's snapshot cache the warm-up leases the
@@ -274,11 +285,19 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
     /**
      * Start a warm-up for every Lance-backed index that appeared in the
      * metadata and cancel the one of every Lance-backed index that left
-     * it. Only data nodes execute fragment requests, so only they warm.
+     * it. Only data nodes execute fragment requests, so only they warm;
+     * a node without the data role cancels whatever it still holds.
      */
     @Override
     public void clusterChanged(ClusterChangedEvent event) {
-        if (closed || !event.metadataChanged()) {
+        if (closed) {
+            return;
+        }
+        if (!event.state().nodes().getLocalNode().isDataNode()) {
+            cancelAll();
+            return;
+        }
+        if (!event.metadataChanged()) {
             return;
         }
         Metadata current = event.state().metadata();
@@ -290,9 +309,6 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
                     task.cancelled.set(true);
                 }
             }
-        }
-        if (!event.state().nodes().getLocalNode().isDataNode()) {
-            return;
         }
         for (String name : current.indices().keySet()) {
             if (previous.hasIndex(name)) {
@@ -332,6 +348,19 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
     }
 
     private void run(Task task) {
+        if (!runningLock.readLock().tryLock()) {
+            // close() holds the write lock: nothing runs any more.
+            task.finish(State.CANCELLED);
+            return;
+        }
+        try {
+            warm(task);
+        } finally {
+            runningLock.readLock().unlock();
+        }
+    }
+
+    private void warm(Task task) {
         if (task.cancelled.get() || closed) {
             task.finish(State.CANCELLED);
             return;
@@ -441,7 +470,7 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
                 column,
                 task.indexName,
                 String.format(Locale.ROOT, "%.2f", seconds),
-                effective.settingValue(),
+                task.mode.settingValue(),
                 detail.isEmpty() ? "" : " (" + detail + ")"
             );
             return new IndexStatus(name, type, column, State.DONE, seconds, detail);
@@ -625,11 +654,37 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
         }
     }
 
-    @Override
-    public void close() {
-        closed = true;
+    private void cancelAll() {
         for (Task task : tasks.values()) {
             task.cancelled.set(true);
         }
+        tasks.clear();
+    }
+
+    /**
+     * Stop scheduling, cancel every pending warm-up and wait for the one
+     * inside a Lance scan to leave it, so the caller can close the
+     * snapshot cache without a scan still reading its dataset. A scan
+     * against a slow object store ends at the current index; the wait
+     * gives up after {@link #CLOSE_WAIT_MILLIS} with a WARN.
+     */
+    @Override
+    public void close() {
+        closed = true;
+        cancelAll();
+        try {
+            if (!runningLock.writeLock().tryLock(CLOSE_WAIT_MILLIS, TimeUnit.MILLISECONDS)) {
+                LOGGER.warn("a warm-up is still running after {} ms; closing without it", CLOSE_WAIT_MILLIS);
+            }
+            // The write lock is kept: a warm-up that starts after close
+            // finds it held and records itself as cancelled.
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Whether a warm-up is inside a Lance scan right now, for tests. */
+    boolean isWarmUpRunning() {
+        return runningLock.getReadLockCount() > 0;
     }
 }
