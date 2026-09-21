@@ -591,7 +591,7 @@ lance.aggregation.percentiles_bins: 4096      # default; bins of a pushed down t
 
 Lance aggregates one scan on a single thread, so a node that holds many fragments cuts them into `pushdown_parallelism` contiguous groups, scans the groups at once on the `search` thread pool and merges the group rows before it builds its buckets. Set it to `1` to compare against a single scan; raise it up to the node's core count when a `terms` over many rows is slower than the same request with the setting off.
 
-A tdigest `percentiles` is sketched from a histogram of `percentiles_bins` equal width bins over the field's range instead of from every document, and a reported percentile is within one bin width of the value the aggregators would sketch. Raise the bin count when a percentile needs to be closer than `(max - min) / 4096`; every bin the data fills is one row the executor reads per bucket.
+A tdigest `percentiles` is sketched from a histogram of `percentiles_bins` equal width bins over the field's range instead of from every document: the histogram is accurate to one bin width, and the TDigest built from it interpolates a little less accurately than one built from every document (see [limitations.md](limitations.md)). Raise the bin count when a percentile needs to be closer than `(max - min) / 4096`; every bin the data fills is one row the executor reads per bucket.
 
 ### Aggregations and hit pages collected on several threads
 
