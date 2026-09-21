@@ -6,8 +6,10 @@
 package org.opensearch.lance.query;
 
 import java.util.List;
+import java.util.function.Function;
 
 import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.RegexpFlag;
 import org.opensearch.test.OpenSearchTestCase;
@@ -205,7 +207,7 @@ public class LanceKnnFilterTranslatorTests extends OpenSearchTestCase {
     }
 
     public void testPatternQueriesRejectMultiFieldPath() {
-        for (org.opensearch.index.query.QueryBuilder q : List.of(
+        for (QueryBuilder q : List.of(
             QueryBuilders.wildcardQuery("body.raw", "h*"),
             QueryBuilders.regexpQuery("body.raw", "h.*"),
             QueryBuilders.prefixQuery("body.raw", "h")
@@ -219,7 +221,7 @@ public class LanceKnnFilterTranslatorTests extends OpenSearchTestCase {
         // With a mapping in hand a wildcard on a numeric column is
         // refused so the coordinator falls back to the Lucene path,
         // where the field type answers OpenSearch's stock 400.
-        java.util.function.Function<String, String> lookup = name -> switch (name) {
+        Function<String, String> lookup = name -> switch (name) {
             case "rating" -> "integer";
             case "body" -> "lance_text";
             case "category" -> "keyword";
@@ -239,7 +241,7 @@ public class LanceKnnFilterTranslatorTests extends OpenSearchTestCase {
     }
 
     public void testHasUnmappedFieldCoversPatternQueries() {
-        java.util.function.Function<String, String> lookup = name -> "body".equals(name) ? "lance_text" : null;
+        Function<String, String> lookup = name -> "body".equals(name) ? "lance_text" : null;
         assertFalse(LanceKnnFilterTranslator.hasUnmappedField(QueryBuilders.wildcardQuery("body", "h*"), lookup));
         assertTrue(LanceKnnFilterTranslator.hasUnmappedField(QueryBuilders.wildcardQuery("nope", "h*"), lookup));
         assertTrue(LanceKnnFilterTranslator.hasUnmappedField(QueryBuilders.regexpQuery("nope", "h.*"), lookup));
