@@ -5,6 +5,8 @@
 
 package org.opensearch.lance.stats;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -13,6 +15,7 @@ import org.opensearch.lance.LanceCircuitBreaker;
 import org.opensearch.lance.NativeMemoryLimit.IndexCacheSizing;
 import org.opensearch.lance.engine.ColumnStore;
 import org.opensearch.lance.engine.HeapFallbackStats;
+import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.query.LanceFtsQuery;
 
@@ -30,13 +33,17 @@ import org.opensearch.lance.query.LanceFtsQuery;
  * and shard share are fixed at startup. {@code column_store.heap_fallback_bytes}
  * and {@code heap_fallback_rejections} come from {@link HeapFallbackStats}
  * and are reported whether or not the node has a snapshot cache, since a
- * reader opened without one loads every column into heap.
+ * reader opened without one loads every column into heap. {@code warm_up}
+ * is the {@link LanceIndexWarmer}'s view of every Lance-backed index the
+ * node has seen, empty with the mode {@code none} when the node has no
+ * warmer.
  */
 public final class LanceStatsCollector {
 
     private final LanceWarmCache warmCache;
     private final LongSupplier sessionBytes;
     private final Supplier<IndexCacheSizing> indexCacheSizing;
+    private final LanceIndexWarmer indexWarmer;
 
     /**
      * @param warmCache        the node's snapshot cache, or {@code null}
@@ -51,9 +58,24 @@ public final class LanceStatsCollector {
      *                         then zero)
      */
     public LanceStatsCollector(LanceWarmCache warmCache, LongSupplier sessionBytes, Supplier<IndexCacheSizing> indexCacheSizing) {
+        this(warmCache, sessionBytes, indexCacheSizing, null);
+    }
+
+    /**
+     * @param indexWarmer the node's index warmer, or {@code null} when the
+     *                    plugin created none (the warm-up block is then
+     *                    empty)
+     */
+    public LanceStatsCollector(
+        LanceWarmCache warmCache,
+        LongSupplier sessionBytes,
+        Supplier<IndexCacheSizing> indexCacheSizing,
+        LanceIndexWarmer indexWarmer
+    ) {
         this.warmCache = warmCache;
         this.sessionBytes = sessionBytes;
         this.indexCacheSizing = indexCacheSizing;
+        this.indexWarmer = indexWarmer;
     }
 
     public LanceNodeStats collect() {
@@ -67,6 +89,14 @@ public final class LanceStatsCollector {
         int probeLimit = LanceFtsQuery.subsetProbeLimit();
         long heapFallbackBytes = HeapFallbackStats.bytes();
         long heapFallbackRejections = HeapFallbackStats.rejections();
+        String warmUpMode = indexWarmer == null ? "none" : indexWarmer.mode().settingValue();
+        List<LanceWarmUpStatus> warmUps = new ArrayList<>();
+        if (indexWarmer != null) {
+            for (LanceIndexWarmer.TableStatus status : indexWarmer.statuses()) {
+                warmUps.add(LanceWarmUpStatus.of(status));
+            }
+            warmUps.sort((a, b) -> a.index().compareTo(b.index()));
+        }
         if (warmCache == null) {
             return new LanceNodeStats(
                 false,
@@ -89,7 +119,9 @@ public final class LanceStatsCollector {
                 indexCacheCapacity,
                 indexCacheShards,
                 indexCacheShardShare,
-                probeLimit
+                probeLimit,
+                warmUpMode,
+                warmUps
             );
         }
         ColumnStore store = warmCache.columnStore();
@@ -114,7 +146,9 @@ public final class LanceStatsCollector {
             indexCacheCapacity,
             indexCacheShards,
             indexCacheShardShare,
-            probeLimit
+            probeLimit,
+            warmUpMode,
+            warmUps
         );
     }
 }

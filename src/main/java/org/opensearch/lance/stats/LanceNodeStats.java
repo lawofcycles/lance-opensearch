@@ -6,6 +6,8 @@
 package org.opensearch.lance.stats;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 
 import org.opensearch.core.common.io.stream.StreamInput;
@@ -24,8 +26,10 @@ import org.opensearch.core.xcontent.XContentBuilder;
  * counter or gauge read from the owning component.
  *
  * <p>Rendered as the {@code snapshots}, {@code column_store},
- * {@code native_memory} and {@code fts} objects of one node in
- * {@code GET /_lance/stats}.
+ * {@code native_memory}, {@code fts} and {@code warm_up} objects of one
+ * node in {@code GET /_lance/stats}. {@code warm_up} carries the mode in
+ * force and one {@link LanceWarmUpStatus} per Lance-backed index the
+ * node has seen since it started.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
@@ -54,6 +58,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
     private final int ftsSubsetProbeLimit;
 
+    private final String warmUpMode;
+    private final List<LanceWarmUpStatus> warmUps;
+
     public LanceNodeStats(
         boolean cacheEnabled,
         int snapshotCount,
@@ -77,6 +84,58 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         long indexCacheShardShareBytes,
         int ftsSubsetProbeLimit
     ) {
+        this(
+            cacheEnabled,
+            snapshotCount,
+            retiredSnapshotCount,
+            datasetOpenCount,
+            snapshotBuildCount,
+            snapshotHitCount,
+            columnStoreBytes,
+            columnStoreLimitBytes,
+            columnStoreEntries,
+            columnStoreHits,
+            columnStoreLoads,
+            columnStoreEvictions,
+            columnStoreBudgetMisses,
+            heapFallbackBytes,
+            heapFallbackRejections,
+            nativeEstimatedBytes,
+            sessionBytes,
+            indexCacheCapacityBytes,
+            indexCacheShards,
+            indexCacheShardShareBytes,
+            ftsSubsetProbeLimit,
+            "none",
+            List.of()
+        );
+    }
+
+    public LanceNodeStats(
+        boolean cacheEnabled,
+        int snapshotCount,
+        int retiredSnapshotCount,
+        long datasetOpenCount,
+        long snapshotBuildCount,
+        long snapshotHitCount,
+        long columnStoreBytes,
+        long columnStoreLimitBytes,
+        int columnStoreEntries,
+        long columnStoreHits,
+        long columnStoreLoads,
+        long columnStoreEvictions,
+        long columnStoreBudgetMisses,
+        long heapFallbackBytes,
+        long heapFallbackRejections,
+        long nativeEstimatedBytes,
+        long sessionBytes,
+        long indexCacheCapacityBytes,
+        int indexCacheShards,
+        long indexCacheShardShareBytes,
+        int ftsSubsetProbeLimit,
+        String warmUpMode,
+        List<LanceWarmUpStatus> warmUps
+    ) {
         this.cacheEnabled = cacheEnabled;
         this.snapshotCount = snapshotCount;
         this.retiredSnapshotCount = retiredSnapshotCount;
@@ -98,6 +157,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.indexCacheShards = indexCacheShards;
         this.indexCacheShardShareBytes = indexCacheShardShareBytes;
         this.ftsSubsetProbeLimit = ftsSubsetProbeLimit;
+        this.warmUpMode = warmUpMode;
+        this.warmUps = List.copyOf(warmUps);
     }
 
     public LanceNodeStats(StreamInput in) throws IOException {
@@ -122,6 +183,13 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.indexCacheShards = in.readVInt();
         this.indexCacheShardShareBytes = in.readVLong();
         this.ftsSubsetProbeLimit = in.readVInt();
+        this.warmUpMode = in.readString();
+        int warmUpCount = in.readVInt();
+        List<LanceWarmUpStatus> read = new ArrayList<>(warmUpCount);
+        for (int i = 0; i < warmUpCount; i++) {
+            read.add(new LanceWarmUpStatus(in));
+        }
+        this.warmUps = List.copyOf(read);
     }
 
     @Override
@@ -147,6 +215,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         out.writeVInt(indexCacheShards);
         out.writeVLong(indexCacheShardShareBytes);
         out.writeVInt(ftsSubsetProbeLimit);
+        out.writeString(warmUpMode);
+        out.writeVInt(warmUps.size());
+        for (LanceWarmUpStatus warmUp : warmUps) {
+            warmUp.writeTo(out);
+        }
     }
 
     @Override
@@ -183,6 +256,15 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
         builder.startObject("fts");
         builder.field("subset_probe_limit", ftsSubsetProbeLimit);
+        builder.endObject();
+
+        builder.startObject("warm_up");
+        builder.field("mode", warmUpMode);
+        builder.startArray("tables");
+        for (LanceWarmUpStatus warmUp : warmUps) {
+            warmUp.toXContent(builder, params);
+        }
+        builder.endArray();
         builder.endObject();
         return builder;
     }
@@ -273,6 +355,16 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         return ftsSubsetProbeLimit;
     }
 
+    /** Value of {@code lance.attach.warm_indexes} on the node. */
+    public String warmUpMode() {
+        return warmUpMode;
+    }
+
+    /** Warm-ups the node has seen since it started, one per Lance-backed index. */
+    public List<LanceWarmUpStatus> warmUps() {
+        return warmUps;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -301,7 +393,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && indexCacheCapacityBytes == other.indexCacheCapacityBytes
             && indexCacheShards == other.indexCacheShards
             && indexCacheShardShareBytes == other.indexCacheShardShareBytes
-            && ftsSubsetProbeLimit == other.ftsSubsetProbeLimit;
+            && ftsSubsetProbeLimit == other.ftsSubsetProbeLimit
+            && warmUpMode.equals(other.warmUpMode)
+            && warmUps.equals(other.warmUps);
     }
 
     @Override
@@ -327,7 +421,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             indexCacheCapacityBytes,
             indexCacheShards,
             indexCacheShardShareBytes,
-            ftsSubsetProbeLimit
+            ftsSubsetProbeLimit,
+            warmUpMode,
+            warmUps
         );
     }
 }

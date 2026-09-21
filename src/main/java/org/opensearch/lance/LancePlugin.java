@@ -32,6 +32,7 @@ import org.opensearch.lance.attach.TransportLanceAttachAction;
 import org.opensearch.lance.dispatch.LanceDispatchActionFilter;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.engine.LanceEngineFactory;
+import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.index.LanceBuildIndexesAction;
 import org.opensearch.lance.index.TransportLanceBuildIndexesAction;
@@ -501,6 +502,24 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.Dynamic
     );
 
+    /**
+     * What {@link LanceIndexWarmer} reads of a table's indexes into this
+     * node's Lance Session cache when a Lance-backed index appears
+     * (attach, namespace poll, node restart): {@code none} nothing,
+     * {@code metadata} what Lance loads to open each index (BTree page
+     * lookup, bitmap keys, full-text token dictionaries, IVF centroids
+     * and one partition), {@code all} additionally every BTree page,
+     * every bitmap and every IVF partition. Dynamic: warm-ups started
+     * after the change use the new value.
+     */
+    public static final Setting<LanceIndexWarmer.Mode> ATTACH_WARM_INDEXES_SETTING = new Setting<>(
+        "lance.attach.warm_indexes",
+        LanceIndexWarmer.Mode.METADATA.settingValue(),
+        LanceIndexWarmer.Mode::parse,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -530,7 +549,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             AGGREGATION_PUSHDOWN_PARALLELISM_SETTING,
             AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING,
             FRAGMENT_PATH_PARALLELISM_SETTING,
-            FRAGMENT_PATH_SLICES_SETTING
+            FRAGMENT_PATH_SLICES_SETTING,
+            ATTACH_WARM_INDEXES_SETTING
         );
     }
 
@@ -557,11 +577,15 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
 
     /**
      * Register {@link #LANCE_COORDINATOR_THREAD_POOL} as a fixed pool of
-     * {@code max(1, allocated processors / 2)} threads. The size and the
-     * queue length are node settings under
-     * {@code thread_pool.lance_coordinator.*} like every other pool;
-     * OpenSearch registers them from this builder, so they are not part
-     * of {@link #getSettings()}.
+     * {@code max(1, allocated processors / 2)} threads, and
+     * {@link LanceIndexWarmer#THREAD_POOL} as a fixed pool of one thread
+     * with a queue of {@link #LANCE_WARM_UP_QUEUE_SIZE}: one table warms
+     * at a time so the warm-ups do not compete with each other or with
+     * requests for the object store, and the queue holds the tables that
+     * appeared while one was warming. The sizes and the queue lengths
+     * are node settings under {@code thread_pool.<name>.*} like every
+     * other pool; OpenSearch registers them from these builders, so they
+     * are not part of {@link #getSettings()}.
      */
     @Override
     public List<ExecutorBuilder<?>> getExecutorBuilders(Settings settings) {
@@ -573,9 +597,19 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
                 size,
                 LANCE_COORDINATOR_QUEUE_SIZE,
                 "thread_pool." + LANCE_COORDINATOR_THREAD_POOL
+            ),
+            new FixedExecutorBuilder(
+                settings,
+                LanceIndexWarmer.THREAD_POOL,
+                1,
+                LANCE_WARM_UP_QUEUE_SIZE,
+                "thread_pool." + LanceIndexWarmer.THREAD_POOL
             )
         );
     }
+
+    /** Default queue length of {@link LanceIndexWarmer#THREAD_POOL}: tables waiting for their warm-up. */
+    static final int LANCE_WARM_UP_QUEUE_SIZE = 1_000;
 
     private static void validateUncoveredFragmentPolicy(String value) {
         if (!"wait".equals(value) && !"immediate".equals(value)) {
@@ -645,6 +679,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     private LanceDispatchActionFilter dispatchActionFilter;
     private LanceCreateIndexActionFilter createIndexActionFilter;
     private volatile LanceWarmCache warmCache;
+    private volatile LanceIndexWarmer indexWarmer;
 
     /**
      * Cancellable handle for the scheduled task that samples the shared
@@ -764,13 +799,23 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             CACHE_ENABLED_SETTING.get(environment.settings())
         );
         clusterService.getClusterSettings().addSettingsUpdateConsumer(CACHE_ENABLED_SETTING, warmCache::setEnabled);
+        // Index warm-up: every Lance-backed index that appears in the
+        // cluster state gets its indexes read into the Session cache on
+        // this node, on the single threaded lance_warm_up pool.
+        this.indexWarmer = new LanceIndexWarmer(
+            warmCache,
+            threadPool.executor(LanceIndexWarmer.THREAD_POOL),
+            ATTACH_WARM_INDEXES_SETTING.get(environment.settings())
+        );
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(ATTACH_WARM_INDEXES_SETTING, indexWarmer::setMode);
+        clusterService.addListener(indexWarmer);
         // Read side of GET /_lance/stats. The session size is read through
         // the registry here because the stats package cannot see the
         // registry's package-private session accessor.
         LanceStatsCollector statsCollector = new LanceStatsCollector(warmCache, () -> {
             Session session = LanceRegistry.currentSession();
             return session == null || session.isClosed() ? 0L : session.sizeBytes();
-        }, LanceRegistry::indexCacheSizing);
+        }, LanceRegistry::indexCacheSizing, indexWarmer);
 
         // Prime the circuit-breaker helper with the current cluster
         // settings and start the polling loop that keeps its accounting
@@ -873,6 +918,12 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         if (task != null) {
             task.cancel();
             circuitBreakerPollTask = null;
+        }
+        // Stop the warm-ups before their snapshots close under them.
+        LanceIndexWarmer warmer = indexWarmer;
+        if (warmer != null) {
+            warmer.close();
+            indexWarmer = null;
         }
         // Close every cached snapshot (their datasets) and the column
         // cache allocator before the Session goes away.

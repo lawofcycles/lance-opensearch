@@ -8,8 +8,11 @@ package org.opensearch.lance;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -167,6 +170,121 @@ public class LanceStatsIT extends LanceRestTestCase {
             }
             deleteRecursively(scratchDir);
         }
+    }
+
+    public void testWarmUpRunsAfterAttachAndAfterNamespaceSurface() throws Exception {
+        // A table with one index of every kind the warm-up scans: the
+        // attach creates the index, the node sees it in cluster state and
+        // warms every Lance index; the stats report one entry per index
+        // with state done.
+        String suffix = "warm-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeIndexedFixtureTable(scratchDir, tableName, 2, 150);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(readAll(attach), 200, attach.getStatusLine().getStatusCode());
+            ensureGreen(tableName);
+
+            Map<String, Object> warmUp = awaitWarmUp(tableName, "done");
+            assertEquals("metadata", warmUp.get("mode"));
+            assertEquals(tableUri, warmUp.get("table"));
+            assertTrue(warmUp.toString(), ((Number) warmUp.get("version")).longValue() >= 1L);
+            assertTrue(warmUp.containsKey("started_at"));
+            Map<String, Map<String, Object>> indexes = indexesByName(warmUp);
+            assertEquals(indexes.toString(), 4, indexes.size());
+            assertEquals("done", indexes.get("rating_btree").get("state"));
+            assertEquals("BTree", indexes.get("rating_btree").get("type"));
+            assertEquals("rating", indexes.get("rating_btree").get("column"));
+            assertEquals("done", indexes.get("category_bitmap").get("state"));
+            assertEquals("done", indexes.get("body_fts").get("state"));
+            assertEquals("done", indexes.get("embedding_ivf").get("state"));
+
+            // The requests then find the indexes loaded and answer as
+            // before.
+            String term = readAll(postJson("/" + tableName + "/_search", "{\"size\":0,\"query\":{\"term\":{\"rating\":37}}}"));
+            assertEquals(1, extractIntPath(term, "hits", "total", "value"));
+            String match = readAll(postJson("/" + tableName + "/_search", "{\"size\":0,\"query\":{\"match\":{\"body\":\"tok7\"}}}"));
+            assertEquals(1, extractIntPath(match, "hits", "total", "value"));
+
+            // Deleting the index drops its entry.
+            client().performRequest(new Request("DELETE", "/" + tableName));
+            assertBusy(() -> assertNull(warmUpOf(tableName)));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + tableName));
+            } catch (Exception ignored) {
+                // best-effort cleanup; the base class wipes indices too
+            }
+            deleteRecursively(scratchDir);
+        }
+
+        // The namespace poll surfacing a table takes the same path: the
+        // index appears in cluster state and the node warms it.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(2, 100, "warmns")) {
+            Map<String, Object> warmUp = awaitWarmUp(fixture.indexName(), "done");
+            Map<String, Map<String, Object>> indexes = indexesByName(warmUp);
+            assertEquals(indexes.toString(), 1, indexes.size());
+            assertEquals("done", indexes.get("body_fts").get("state"));
+            assertEquals("Inverted", indexes.get("body_fts").get("type"));
+            client().performRequest(new Request("DELETE", "/" + fixture.indexName()));
+        }
+    }
+
+    public void testWarmUpNoneRecordsSkipped() throws Exception {
+        Request none = new Request("PUT", "/_cluster/settings");
+        none.setJsonEntity("{\"transient\":{\"lance.attach.warm_indexes\":\"none\"}}");
+        client().performRequest(none);
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(2, 100, "warmnone")) {
+            Map<String, Object> node = nodeStats();
+            assertEquals("none", warmUpBlock(node).get("mode"));
+            Map<String, Object> warmUp = awaitWarmUp(fixture.indexName(), "skipped");
+            assertEquals("none", warmUp.get("mode"));
+            assertEquals(0, ((List<?>) warmUp.get("indexes")).size());
+            assertEquals(0.0d, ((Number) warmUp.get("seconds")).doubleValue(), 0.0d);
+            client().performRequest(new Request("DELETE", "/" + fixture.indexName()));
+        } finally {
+            Request reset = new Request("PUT", "/_cluster/settings");
+            reset.setJsonEntity("{\"transient\":{\"lance.attach.warm_indexes\":null}}");
+            client().performRequest(reset);
+        }
+    }
+
+    /** Wait for the warm-up entry of {@code index} to reach {@code state} and return it. */
+    private static Map<String, Object> awaitWarmUp(String index, String state) throws Exception {
+        assertBusy(() -> {
+            Map<String, Object> entry = warmUpOf(index);
+            assertNotNull("no warm_up entry for " + index, entry);
+            assertEquals(entry.toString(), state, entry.get("state"));
+        }, 60, TimeUnit.SECONDS);
+        return warmUpOf(index);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> warmUpOf(String index) throws IOException {
+        for (Object table : (List<Object>) warmUpBlock(nodeStats()).get("tables")) {
+            Map<String, Object> entry = (Map<String, Object>) table;
+            if (index.equals(entry.get("index"))) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Map<String, Object>> indexesByName(Map<String, Object> warmUp) {
+        Map<String, Map<String, Object>> byName = new HashMap<>();
+        for (Object index : (List<Object>) warmUp.get("indexes")) {
+            Map<String, Object> entry = (Map<String, Object>) index;
+            byName.put((String) entry.get("name"), entry);
+        }
+        return byName;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> warmUpBlock(Map<String, Object> node) {
+        return (Map<String, Object>) node.get("warm_up");
     }
 
     public void testStatsEnvelopeAndNodeFilter() throws Exception {
