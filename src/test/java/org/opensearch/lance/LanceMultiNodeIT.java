@@ -671,8 +671,22 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":150}}},\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\"}}}",
             "\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}},\"a\":{\"avg\":{\"field\":\"id\"}},\"c\":{\"value_count\":{\"field\":\"category\"}}}",
             "\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"id\",\"interval\":50}}}",
-            "\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\"},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}"
+            "\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\"},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}",
+            // nested buckets and composite: the per node partials of
+            // the inner terms lose groups the single shard keeps, the
+            // date_histogram under terms and the composite pages do not
+            "\"size\":0,\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":3},"
+                + "\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}}}",
+            "\"size\":0,\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\",\"size\":10},\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\"},"
+                + "\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}}}",
+            "\"size\":0,\"aggs\":{\"cd\":{\"composite\":{\"size\":5,\"sources\":[{\"c\":{\"terms\":{\"field\":\"category\"}}},{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\"}}}]},"
+                + "\"aggs\":{\"n\":{\"value_count\":{\"field\":\"id\"}}}}}",
+            "\"size\":0,\"aggs\":{\"cd\":{\"composite\":{\"size\":4,\"sources\":[{\"c\":{\"terms\":{\"field\":\"category\"}}},{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\"}}}],"
+                + "\"after\":{\"c\":\"c0\",\"d\":1706745600000}}}}"
         );
+        // Shapes whose three per node partials lose groups the single
+        // shard keeps: compared with the aggregators only.
+        Set<Integer> partialsLoseGroups = Set.of(1, 2, 9);
         try {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
@@ -687,9 +701,9 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 pushed.add(response);
                 assertFragmentPathMatchesShardPath(indexName, shape);
                 // Whole aggregations block against the single shard,
-                // except for the size 2 terms whose three partials lose
+                // except for the shapes whose three partials lose
                 // groups the single shard keeps.
-                if (i != 1 && i != 2) {
+                if (!partialsLoseGroups.contains(i)) {
                     Map<String, Object> shardPath = parse(
                         readAll(postJson("/" + indexName + "/_search", "{\"explain\":true," + shape + "}"))
                     );

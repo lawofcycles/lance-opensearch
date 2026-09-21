@@ -608,6 +608,34 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":100}}}}",
                 "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":250,\"min_doc_count\":1},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}}",
                 "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":100,\"lt\":700}}},\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":150,\"keyed\":true}}}}",
+                // nested buckets: two and three levels, metrics beside
+                // the nested bucket, small inner sizes so the inner
+                // truncation, sum_other_doc_count and the error bound
+                // matter, a histogram parent with min_doc_count 0
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":3},"
+                    + "\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"size\":2},\"aggs\":{\"a\":{\"avg\":{\"field\":\"rating\"}},"
+                    + "\"f\":{\"terms\":{\"field\":\"flag\"},\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}},\"s\":{\"sum\":{\"field\":\"id\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"order\":{\"_key\":\"desc\"}},\"aggs\":{\"f\":{\"terms\":{\"field\":\"flag\"},"
+                    + "\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":2,\"show_term_doc_count_error\":true},\"aggs\":{\"m\":{\"min\":{\"field\":\"id\"}}}}}}}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":250},"
+                    + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}}}}",
+                "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":250,\"min_doc_count\":0},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},"
+                    + "\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}}}}",
+                "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":500}}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},"
+                    + "\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":4,\"order\":{\"_key\":\"desc\"}}}}}}}",
+                // composite: size and after paging, a descending source,
+                // a boolean source, metric children
+                "{\"size\":0,\"aggs\":{\"cr\":{\"composite\":{\"sources\":[{\"c\":{\"terms\":{\"field\":\"category\"}}},{\"r\":{\"terms\":{\"field\":\"rating\"}}}]}}}}",
+                "{\"size\":0,\"aggs\":{\"cr\":{\"composite\":{\"size\":3,\"sources\":[{\"c\":{\"terms\":{\"field\":\"category\"}}},{\"r\":{\"terms\":{\"field\":\"rating\"}}}]},"
+                    + "\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"cr\":{\"composite\":{\"size\":4,\"sources\":[{\"c\":{\"terms\":{\"field\":\"category\"}}},{\"r\":{\"terms\":{\"field\":\"rating\"}}}],"
+                    + "\"after\":{\"c\":\"c1\",\"r\":500}}}}}",
+                "{\"size\":0,\"aggs\":{\"rc\":{\"composite\":{\"size\":5,\"sources\":[{\"r\":{\"terms\":{\"field\":\"rating\",\"order\":\"desc\"}}},{\"c\":{\"terms\":{\"field\":\"category\"}}}],"
+                    + "\"after\":{\"r\":900,\"c\":\"c0\"}}}}}",
+                "{\"size\":0,\"query\":{\"term\":{\"flag\":true}},\"aggs\":{\"fc\":{\"composite\":{\"size\":10,\"sources\":[{\"f\":{\"terms\":{\"field\":\"flag\"}}},{\"c\":{\"terms\":{\"field\":\"category\"}}}]},"
+                    + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}},\"n\":{\"value_count\":{\"field\":\"id\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":2,\"sources\":[{\"c\":{\"terms\":{\"field\":\"category\",\"order\":\"desc\"}}}]}}}}",
                 // track_total_hits variants
                 "{\"size\":0,\"track_total_hits\":true,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
                 "{\"size\":0,\"track_total_hits\":false,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
@@ -615,6 +643,15 @@ public class LanceAggregationIT extends LanceRestTestCase {
             String[] aggregatorShapes = new String[] {
                 // shapes outside the allow list stay on the aggregators
                 "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"t\":{\"terms\":{\"field\":\"tags\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"a\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"b\":{\"terms\":{\"field\":\"flag\"},\"aggs\":{\"c\":{\"terms\":{\"field\":\"rating\"},"
+                    + "\"aggs\":{\"d\":{\"histogram\":{\"field\":\"id\",\"interval\":100}}}}}}}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"f\":{\"terms\":{\"field\":\"flag\"}},\"r\":{\"terms\":{\"field\":\"rating\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"order\":{\"_count\":\"asc\"}}}}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"size\":1000},\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":1000}}}}}}",
+                "{\"size\":0,\"aggs\":{\"cr\":{\"composite\":{\"sources\":[{\"c\":{\"terms\":{\"field\":\"category\",\"missing_bucket\":true}}},{\"r\":{\"terms\":{\"field\":\"rating\"}}}]}}}}",
+                "{\"size\":0,\"aggs\":{\"h\":{\"composite\":{\"sources\":[{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":100}}}]}}}}",
+                "{\"size\":0,\"aggs\":{\"t\":{\"composite\":{\"sources\":[{\"t\":{\"terms\":{\"field\":\"tags\"}}}]}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"sources\":[{\"c\":{\"terms\":{\"field\":\"category\"}}}]},\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\"}}}}}}",
                 "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"tags\",\"size\":10}}}}",
                 "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"missing\":\"none\"}}}}",
                 "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"include\":\"c[01]\"}}}}",
@@ -674,14 +711,37 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"year\"}}}}",
                 "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"1M\",\"order\":{\"_key\":\"desc\"}}}}}",
                 "{\"size\":0,\"query\":{\"term\":{\"category\":\"odd\"}},\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}}}",
-                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"week\",\"min_doc_count\":0}}}}" };
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"week\",\"min_doc_count\":0}}}}",
+                // a calendar interval under terms and above terms
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\",\"min_doc_count\":0},"
+                    + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"week\"},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}}",
+                // a date_histogram under terms (built without the
+                // aggregator's prototype), terms under a date_histogram
+                // with min_doc_count 0, composite with a date source in
+                // both directions, raw and formatted after keys
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category.raw\"},\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\"},"
+                    + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"min_doc_count\":0,\"keyed\":true}}}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"min_doc_count\":0},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},"
+                    + "\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}}}}",
+                "{\"size\":0,\"aggs\":{\"cd\":{\"composite\":{\"sources\":[{\"c\":{\"terms\":{\"field\":\"category\"}}},{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\"}}}]},"
+                    + "\"aggs\":{\"n\":{\"value_count\":{\"field\":\"id\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"dc\":{\"composite\":{\"size\":2,\"sources\":[{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"order\":\"desc\"}}},"
+                    + "{\"c\":{\"terms\":{\"field\":\"category\"}}}],\"after\":{\"d\":1709510400000,\"c\":\"odd\"}}}}}",
+                "{\"size\":0,\"aggs\":{\"dc\":{\"composite\":{\"size\":2,\"sources\":[{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"format\":\"yyyy-MM-dd\"}}},"
+                    + "{\"c\":{\"terms\":{\"field\":\"category\"}}}],\"after\":{\"d\":\"2024-01-31\",\"c\":\"odd\"}}}}}",
+                "{\"size\":0,\"aggs\":{\"t\":{\"composite\":{\"size\":3,\"sources\":[{\"t\":{\"terms\":{\"field\":\"ts\"}}}],\"after\":{\"t\":1705276800000}}}}}" };
             String[] aggregatorShapes = new String[] {
                 "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\",\"time_zone\":\"+09:00\"}}}}",
                 "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"day\",\"offset\":\"6h\"}}}}",
                 "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"time_zone\":\"+09:00\"}}}}",
                 "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"offset\":\"1d\"}}}}",
                 "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\","
-                    + "\"extended_bounds\":{\"min\":\"2023-12-01\",\"max\":\"2024-07-01\"}}}}}" };
+                    + "\"extended_bounds\":{\"min\":\"2023-12-01\",\"max\":\"2024-07-01\"}}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\",\"time_zone\":\"+09:00\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"composite\":{\"sources\":[{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}}]}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"composite\":{\"sources\":[{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"time_zone\":\"+09:00\"}}}]}}}}" };
             assertPushdownAgreesWithAggregators(indexName, shapes, aggregatorShapes);
         } finally {
             try {
