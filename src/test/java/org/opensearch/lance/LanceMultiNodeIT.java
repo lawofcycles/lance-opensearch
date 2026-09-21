@@ -618,6 +618,20 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             for (int i = 0; i < 3; i++) {
                 assertEquals(bareIds, hitIdsOf(parse(readAll(postJson("/" + indexName + "/_search", bare)))));
             }
+
+            // Bounded total over the tie group: 300 rows match and the
+            // bound is 20, so every executor's count scan (limit 21 over
+            // the whole table) fills with 21 of the sixty tied rows, and
+            // which rows Lance returns differs between executors. The
+            // own shares can add up to fewer than 21, and the response
+            // still has to state the bound itself as the value, as the
+            // shard path does whenever the relation is gte.
+            String boundedBare = "{\"size\":10,\"track_total_hits\":20,\"query\":" + tied + "}";
+            for (int i = 0; i < 3; i++) {
+                Map<String, Object> bounded = parse(readAll(postJson("/" + indexName + "/_search", boundedBare)));
+                assertEquals(20, extractIntPath(bounded, "hits", "total", "value"));
+                assertEquals("gte", relation(bounded));
+            }
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
