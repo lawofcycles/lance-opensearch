@@ -45,9 +45,34 @@ public class ScalarFilterCountTests extends OpenSearchTestCase {
         uri = LanceTableFactory.writeMultiFragmentTable(scratchDir, "scalar-count-" + getTestName(), 12, 4);
     }
 
+    /**
+     * Run {@code countScalarFilter} and check which path answered: an
+     * accurate request must go through {@code LanceScanner.countRows()}
+     * and never a limited scan, a bounded request the other way round.
+     * Both counters are read before and after so a batch loop that
+     * returns the right number still fails the exact case.
+     */
+    private static TransportLanceFragmentQueryAction.MatchedCount count(Dataset dataset, String filter, List<Integer> fragmentIds, int upTo)
+        throws Exception {
+        long nativeBefore = TransportLanceFragmentQueryAction.NATIVE_SCALAR_COUNTS.get();
+        long boundedBefore = TransportLanceFragmentQueryAction.BOUNDED_SCALAR_COUNT_SCANS.get();
+        TransportLanceFragmentQueryAction.MatchedCount result = TransportLanceFragmentQueryAction.countScalarFilter(
+            dataset,
+            filter,
+            fragmentIds,
+            upTo
+        );
+        long nativeCalls = TransportLanceFragmentQueryAction.NATIVE_SCALAR_COUNTS.get() - nativeBefore;
+        long boundedScans = TransportLanceFragmentQueryAction.BOUNDED_SCALAR_COUNT_SCANS.get() - boundedBefore;
+        boolean accurate = upTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE;
+        assertEquals("native countRows calls for upTo " + upTo, accurate ? 1L : 0L, nativeCalls);
+        assertEquals("limited count scans for upTo " + upTo, accurate ? 0L : 1L, boundedScans);
+        return result;
+    }
+
     private static TransportLanceFragmentQueryAction.MatchedCount count(Dataset dataset, List<Integer> fragmentIds, int upTo)
         throws Exception {
-        return TransportLanceFragmentQueryAction.countScalarFilter(dataset, FILTER, fragmentIds, upTo);
+        return count(dataset, FILTER, fragmentIds, upTo);
     }
 
     private static void assertCount(long value, boolean lowerBound, TransportLanceFragmentQueryAction.MatchedCount actual) {
@@ -105,20 +130,8 @@ public class ScalarFilterCountTests extends OpenSearchTestCase {
 
     public void testFilterWithoutMatchesIsExactZero() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
-            TransportLanceFragmentQueryAction.MatchedCount exact = TransportLanceFragmentQueryAction.countScalarFilter(
-                dataset,
-                "id > 100",
-                ALL,
-                SearchContext.TRACK_TOTAL_HITS_ACCURATE
-            );
-            assertCount(0L, false, exact);
-            TransportLanceFragmentQueryAction.MatchedCount bounded = TransportLanceFragmentQueryAction.countScalarFilter(
-                dataset,
-                "id > 100",
-                ALL,
-                5
-            );
-            assertCount(0L, false, bounded);
+            assertCount(0L, false, count(dataset, "id > 100", ALL, SearchContext.TRACK_TOTAL_HITS_ACCURATE));
+            assertCount(0L, false, count(dataset, "id > 100", ALL, 5));
         }
     }
 }
