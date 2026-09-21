@@ -4,6 +4,8 @@
  */
 package org.opensearch.lance.dispatch;
 
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -14,6 +16,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.search.TotalHits;
 import org.opensearch.OpenSearchTimeoutException;
 import org.opensearch.Version;
 import org.opensearch.cluster.node.DiscoveryNode;
@@ -26,6 +30,15 @@ import org.opensearch.core.tasks.TaskId;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.FragmentFanOut;
 import org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.FragmentFanOut.Outcome;
+import org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.FragmentGroup;
+import org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.RankedHit;
+import org.opensearch.lance.engine.LanceDirectoryReader;
+import org.opensearch.search.DocValueFormat;
+import org.opensearch.search.SearchHit;
+import org.opensearch.search.internal.SearchContext;
+import org.opensearch.search.sort.FieldSortBuilder;
+import org.opensearch.search.sort.SortBuilder;
+import org.opensearch.search.sort.SortOrder;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.FixedExecutorBuilder;
@@ -486,6 +499,136 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
         assertTrue(FragmentFanOut.isIncomplete(new RemoteTransportException("a", new TaskCancelledException("cancelled"))));
         assertFalse(FragmentFanOut.isIncomplete(new RemoteTransportException("a", new IllegalStateException("boom"))));
         assertFalse(FragmentFanOut.isIncomplete(new TransportException("closed")));
+    }
+
+    public void testSplitByRowsKeepsOneGroupPerNodeUnderTheBound() {
+        // Six fragments of 100 rows round robin over two nodes: 300 rows
+        // per node, bound 1000. One group per node, the node's whole
+        // list, in node order.
+        List<Integer> ids = List.of(0, 1, 2, 3, 4, 5);
+        List<Long> rows = List.of(100L, 100L, 100L, 100L, 100L, 100L);
+        Map<DiscoveryNode, List<Integer>> perNode = new LinkedHashMap<>();
+        perNode.put(NODE_A, List.of(0, 2, 4));
+        perNode.put(NODE_B, List.of(1, 3, 5));
+
+        List<FragmentGroup> groups = TransportLanceCoordinatorAction.splitByRows(perNode, ids, rows, 1000L);
+
+        assertEquals(2, groups.size());
+        assertEquals(NODE_A, groups.get(0).node());
+        assertEquals(List.of(0, 2, 4), groups.get(0).fragmentIds());
+        assertEquals(300L, groups.get(0).rows());
+        assertEquals(1, groups.get(0).groupCount());
+        assertEquals(NODE_B, groups.get(1).node());
+        assertEquals(List.of(1, 3, 5), groups.get(1).fragmentIds());
+    }
+
+    public void testSplitByRowsCutsANodeAtTheBound() {
+        // Node A holds fragments of 60, 50, 40 and 70 rows under a bound
+        // of 100: 60 alone (60 + 50 > 100), then 50 + 40, then 70. Node
+        // B's two fragments of 50 fit together.
+        List<Integer> ids = List.of(0, 1, 2, 3, 4, 5);
+        List<Long> rows = List.of(60L, 50L, 50L, 40L, 50L, 70L);
+        Map<DiscoveryNode, List<Integer>> perNode = new LinkedHashMap<>();
+        perNode.put(NODE_A, List.of(0, 2, 3, 5));
+        perNode.put(NODE_B, List.of(1, 4));
+
+        List<FragmentGroup> groups = TransportLanceCoordinatorAction.splitByRows(perNode, ids, rows, 100L);
+
+        assertEquals(4, groups.size());
+        assertEquals(List.of(0), groups.get(0).fragmentIds());
+        assertEquals(60L, groups.get(0).rows());
+        assertEquals(0, groups.get(0).groupIndex());
+        assertEquals(3, groups.get(0).groupCount());
+        assertEquals(List.of(2, 3), groups.get(1).fragmentIds());
+        assertEquals(90L, groups.get(1).rows());
+        assertEquals(1, groups.get(1).groupIndex());
+        assertEquals(List.of(5), groups.get(2).fragmentIds());
+        assertEquals(2, groups.get(2).groupIndex());
+        assertEquals(3, groups.get(2).groupCount());
+        assertEquals(NODE_B, groups.get(3).node());
+        assertEquals(List.of(1, 4), groups.get(3).fragmentIds());
+        assertEquals(1, groups.get(3).groupCount());
+        for (FragmentGroup group : groups) {
+            assertTrue(group.rows() <= 100L);
+        }
+    }
+
+    public void testSplitByRowsGivesAFragmentAboveTheBoundItsOwnGroup() {
+        // A fragment no reader can hold is not dropped: it goes out alone
+        // and the executor reports the failure.
+        Map<DiscoveryNode, List<Integer>> perNode = new LinkedHashMap<>();
+        perNode.put(NODE_A, List.of(0, 1, 2));
+
+        List<FragmentGroup> groups = TransportLanceCoordinatorAction.splitByRows(perNode, List.of(0, 1, 2), List.of(10L, 500L, 10L), 100L);
+
+        assertEquals(3, groups.size());
+        assertEquals(List.of(0), groups.get(0).fragmentIds());
+        assertEquals(List.of(1), groups.get(1).fragmentIds());
+        assertEquals(500L, groups.get(1).rows());
+        assertEquals(List.of(2), groups.get(2).fragmentIds());
+    }
+
+    public void testGroupEndsAtTheLuceneBound() {
+        // Three fragments of a billion rows under IndexWriter.MAX_DOCS:
+        // two fit together, the third starts a group.
+        long billion = 1_000_000_000L;
+        assertArrayEquals(
+            new int[] { 2, 3 },
+            LanceDirectoryReader.groupEnds(new long[] { billion, billion, billion }, IndexWriter.MAX_DOCS)
+        );
+        assertEquals(2, LanceDirectoryReader.leadingFragmentsWithinBound(new long[] { billion, billion, billion }, IndexWriter.MAX_DOCS));
+        assertArrayEquals(new int[0], LanceDirectoryReader.groupEnds(new long[0], IndexWriter.MAX_DOCS));
+        assertEquals(0, LanceDirectoryReader.leadingFragmentsWithinBound(new long[0], IndexWriter.MAX_DOCS));
+        // Exactly the bound fits.
+        assertArrayEquals(new int[] { 2 }, LanceDirectoryReader.groupEnds(new long[] { 60L, 40L }, 100L));
+    }
+
+    public void testGroupResponsesMergeLikeOneResponse() {
+        // The merge of the responses of one node's groups must give the
+        // page and the total one response over the whole node would. Six
+        // hits sorted by id desc, once as one list, once cut into three
+        // group lists in fragment order.
+        List<SortBuilder<?>> sorts = List.of(new FieldSortBuilder("id").order(SortOrder.DESC));
+        List<RankedHit> whole = new ArrayList<>();
+        for (long id = 5; id >= 0; id--) {
+            whole.add(hit(id));
+        }
+        List<RankedHit> groupOne = List.of(hit(1), hit(0));
+        List<RankedHit> groupTwo = List.of(hit(3), hit(2));
+        List<RankedHit> groupThree = List.of(hit(5), hit(4));
+
+        List<SearchHit> fromWhole = TransportLanceCoordinatorAction.mergeHits(List.of(whole), sorts);
+        List<SearchHit> fromGroups = TransportLanceCoordinatorAction.mergeHits(List.of(groupOne, groupTwo, groupThree), sorts);
+
+        assertEquals(ids(fromWhole), ids(fromGroups));
+        assertEquals(List.of("5", "4", "3", "2", "1", "0"), ids(fromGroups));
+
+        // hits.total: exact counts add up; under a bound each group scans
+        // up to bound + 1 rows, so a sum past the bound reads gte at the
+        // bound, as one response that filled the bound would.
+        TotalHits exact = TransportLanceCoordinatorAction.totalHits(2 + 2 + 2, false, SearchContext.TRACK_TOTAL_HITS_ACCURATE);
+        assertEquals(6L, exact.value());
+        assertEquals(TotalHits.Relation.EQUAL_TO, exact.relation());
+        TotalHits bounded = TransportLanceCoordinatorAction.totalHits(2 + 2 + 2, false, 4);
+        assertEquals(4L, bounded.value());
+        assertEquals(TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO, bounded.relation());
+        TotalHits oneGroupFilled = TransportLanceCoordinatorAction.totalHits(3 + 1, true, 4);
+        assertEquals(bounded, oneGroupFilled);
+    }
+
+    private static RankedHit hit(long id) {
+        SearchHit hit = new SearchHit((int) id, Long.toString(id), Map.of(), Map.of());
+        hit.score(Float.NaN);
+        hit.sortValues(new Object[] { id }, new DocValueFormat[] { DocValueFormat.RAW });
+        return new RankedHit(hit, 0, id);
+    }
+
+    private static List<String> ids(List<SearchHit> hits) {
+        List<String> ids = new ArrayList<>(hits.size());
+        for (SearchHit hit : hits) {
+            ids.add(hit.getId());
+        }
+        return ids;
     }
 
     private static ReceiveTimeoutTransportException timeout(DiscoveryNode node) {
