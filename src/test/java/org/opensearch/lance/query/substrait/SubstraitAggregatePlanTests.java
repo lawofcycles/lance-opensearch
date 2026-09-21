@@ -350,7 +350,9 @@ public class SubstraitAggregatePlanTests extends OpenSearchTestCase {
         // Millisecond timestamps on the days around the epoch: 1969
         // rows have negative millis, the week of the epoch starts on
         // Monday 1969-12-29, and the quarter and year starts fall in
-        // 1969 for the negative rows.
+        // 1969 for the negative rows. Hour, minute and second are
+        // identities on these midnight values and confirm the units
+        // resolve and keep the key.
         Path dir = createTempDir();
         String uri = LanceTableFactory.writeSignedValuesTable(dir, "signed-calendar");
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
@@ -364,7 +366,11 @@ public class SubstraitAggregatePlanTests extends OpenSearchTestCase {
                 "year",
                 Rounding.DateTimeUnit.YEAR_OF_CENTURY,
                 "hour",
-                Rounding.DateTimeUnit.HOUR_OF_DAY
+                Rounding.DateTimeUnit.HOUR_OF_DAY,
+                "minute",
+                Rounding.DateTimeUnit.MINUTES_OF_HOUR,
+                "second",
+                Rounding.DateTimeUnit.SECOND_OF_MINUTE
             );
             for (Map.Entry<String, Rounding.DateTimeUnit> entry : units.entrySet()) {
                 ByteBuffer plan = new SubstraitAggregatePlan.Builder().groupBy(

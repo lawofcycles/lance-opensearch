@@ -527,6 +527,7 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
             DateHistogramInterval.YEAR,
             DateHistogramInterval.HOUR,
             DateHistogramInterval.MINUTE,
+            DateHistogramInterval.SECOND,
             new DateHistogramInterval("1M"),
             new DateHistogramInterval("1d")
         );
