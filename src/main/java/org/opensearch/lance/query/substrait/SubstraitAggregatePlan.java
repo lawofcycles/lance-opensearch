@@ -51,7 +51,8 @@ public final class SubstraitAggregatePlan {
     }
 
     /** An expression inside a grouping or a measure argument. */
-    public sealed interface Expression permits FieldReference, Int64Literal, Float64Literal, StringLiteral, ScalarFunction, Cast {}
+    public sealed interface Expression permits FieldReference, BoolLiteral, Int64Literal, Float64Literal, StringLiteral, ScalarFunction,
+        Cast, IfThen {}
 
     /**
      * {@code Expression.selection}: a direct struct field reference into
@@ -65,6 +66,10 @@ public final class SubstraitAggregatePlan {
                 throw new IllegalArgumentException("field index must not be negative: " + fieldIndex);
             }
         }
+    }
+
+    /** {@code Expression.literal.boolean}. */
+    public record BoolLiteral(boolean value) implements Expression {
     }
 
     /** {@code Expression.literal.i64}. */
@@ -92,9 +97,11 @@ public final class SubstraitAggregatePlan {
      * {@code Expression.scalar_function}. {@code name} is the DataFusion
      * side name: the binary operators {@code add}, {@code subtract},
      * {@code multiply}, {@code divide}, {@code modulus}, {@code lt},
-     * {@code gt} and friends map onto DataFusion operators in the
-     * consumer's {@code name_to_op}; anything else is looked up as a
-     * scalar UDF.
+     * {@code gt}, {@code and}, {@code or} and friends map onto DataFusion
+     * operators in the consumer's {@code name_to_op}; {@code not},
+     * {@code is_null}, {@code is_not_null} and {@code is_true} onto the
+     * matching unary expressions; anything else is looked up as a scalar
+     * UDF.
      *
      * @param name      DataFusion side function name
      * @param arguments the arguments, in order
@@ -114,6 +121,31 @@ public final class SubstraitAggregatePlan {
     }
 
     /**
+     * {@code Expression.if_then}: the searched {@code CASE WHEN c1 THEN
+     * v1 WHEN c2 THEN v2 ... ELSE e END}. datafusion-substrait's consumer
+     * turns it into DataFusion's {@code Case} expression, which evaluates
+     * the branches in order and takes the first whose condition is true;
+     * a null condition counts as not true. Without an {@code otherwise}
+     * the result is null when no branch matches, which is how a grouping
+     * on it leaves rows without a bucket.
+     *
+     * @param branches  the {@code WHEN ... THEN} pairs, at least one
+     * @param otherwise the {@code ELSE} value, or null for no {@code ELSE}
+     */
+    public record IfThen(List<Branch> branches, Expression otherwise) implements Expression {
+        public IfThen {
+            branches = List.copyOf(branches);
+            if (branches.isEmpty()) {
+                throw new IllegalArgumentException("an if-then needs at least one branch");
+            }
+        }
+
+        /** One {@code WHEN condition THEN value} pair. */
+        public record Branch(Expression condition, Expression value) {
+        }
+    }
+
+    /**
      * Builder for one plan: zero or more grouping expressions followed
      * by one or more measures. Output names go into
      * {@code RelRoot.names} in that order so the result batch carries
@@ -124,6 +156,7 @@ public final class SubstraitAggregatePlan {
         private static final String URN_ARITHMETIC = "extension:io.substrait:functions_arithmetic";
         private static final String URN_AGGREGATE_GENERIC = "extension:io.substrait:functions_aggregate_generic";
         private static final String URN_COMPARISON = "extension:io.substrait:functions_comparison";
+        private static final String URN_BOOLEAN = "extension:io.substrait:functions_boolean";
         private static final String URN_DATETIME = "extension:io.substrait:functions_datetime";
 
         private final List<Expression> groupings = new ArrayList<>();
@@ -245,6 +278,9 @@ public final class SubstraitAggregatePlan {
                 ProtoWriter segment = new ProtoWriter().message(2, structField);
                 ProtoWriter fieldReference = new ProtoWriter().message(1, segment).message(4, new ProtoWriter());
                 writer.message(2, fieldReference);
+            } else if (expression instanceof BoolLiteral literal) {
+                // Literal: boolean = 1, nullable = 50.
+                writer.message(1, new ProtoWriter().bool(1, literal.value()).bool(50, false));
             } else if (expression instanceof Int64Literal literal) {
                 // Literal: i64 = 7, nullable = 50.
                 writer.message(1, new ProtoWriter().varint(7, literal.value()).bool(50, false));
@@ -266,6 +302,18 @@ public final class SubstraitAggregatePlan {
                 // (FAILURE_BEHAVIOR_THROW_EXCEPTION = 2).
                 ProtoWriter castWriter = new ProtoWriter().message(1, type(cast.type())).message(2, expression(cast.input())).varint(3, 2);
                 writer.message(11, castWriter);
+            } else if (expression instanceof IfThen ifThen) {
+                // IfThen: ifs = 1 (IfClause: if = 1, then = 2), else = 2.
+                ProtoWriter ifThenWriter = new ProtoWriter();
+                for (IfThen.Branch branch : ifThen.branches()) {
+                    ProtoWriter clause = new ProtoWriter().message(1, expression(branch.condition()))
+                        .message(2, expression(branch.value()));
+                    ifThenWriter.message(1, clause);
+                }
+                if (ifThen.otherwise() != null) {
+                    ifThenWriter.message(2, expression(ifThen.otherwise()));
+                }
+                writer.message(6, ifThenWriter);
             } else {
                 throw new IllegalArgumentException("unsupported expression " + expression);
             }
@@ -297,7 +345,8 @@ public final class SubstraitAggregatePlan {
         private static String urnFor(String function) {
             return switch (function) {
                 case "count" -> URN_AGGREGATE_GENERIC;
-                case "lt", "gt", "lte", "gte", "equal", "not_equal" -> URN_COMPARISON;
+                case "lt", "gt", "lte", "gte", "equal", "not_equal", "is_null", "is_not_null", "is_true" -> URN_COMPARISON;
+                case "and", "or", "not" -> URN_BOOLEAN;
                 case "date_trunc" -> URN_DATETIME;
                 default -> URN_ARITHMETIC;
             };

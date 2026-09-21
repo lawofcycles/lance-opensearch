@@ -39,7 +39,12 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.Cast;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.Expression;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.FieldReference;
+import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.Float64Literal;
+import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.IfThen;
+import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.Int64Literal;
+import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.ScalarFunction;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.ScalarType;
+import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.StringLiteral;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -201,6 +206,163 @@ public class SubstraitAggregatePlanTests extends OpenSearchTestCase {
                 }
             }
             assertEquals(expected, counts);
+        }
+    }
+
+    public void testIfThenGroupsByTheFirstMatchingBranch() throws Exception {
+        // CASE WHEN rating < 300 THEN 0 WHEN rating < 700 THEN 1 ELSE 2
+        // END: the consumer turns the IfThen into DataFusion's Case, so
+        // the rows fall into the three ranges; a null rating fails every
+        // comparison and takes the ELSE branch. Without an ELSE the
+        // rows no branch matches (null rating, rating >= 700) yield a
+        // null key.
+        Path dir = createTempDir();
+        String uri = LanceTableFactory.writeHintFixtureTable(dir, "if-then", 3, 200);
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            Expression rating = new Cast(new FieldReference(fieldIndex(dataset, "rating")), ScalarType.FP64);
+            List<IfThen.Branch> branches = List.of(
+                new IfThen.Branch(ScalarFunction.of("lt", rating, new Float64Literal(300d)), new Int64Literal(0L)),
+                new IfThen.Branch(ScalarFunction.of("lt", rating, new Float64Literal(700d)), new Int64Literal(1L))
+            );
+            Map<Long, Long> expected = new TreeMap<>();
+            Map<Long, Long> expectedWithoutElse = new TreeMap<>();
+            long nulls = 0;
+            long unmatched = 0;
+            for (int i = 0; i < 600; i++) {
+                if (i % 5 == 4) {
+                    nulls++;
+                    continue;
+                }
+                long r = (i * 37L) % 1000L;
+                long branch = r < 300 ? 0L : r < 700 ? 1L : 2L;
+                expected.merge(branch, 1L, Long::sum);
+                if (branch < 2L) {
+                    expectedWithoutElse.merge(branch, 1L, Long::sum);
+                } else {
+                    unmatched++;
+                }
+            }
+            expected.merge(2L, nulls, Long::sum);
+
+            ByteBuffer withElse = new SubstraitAggregatePlan.Builder().groupBy(new IfThen(branches, new Int64Literal(2L)), "k")
+                .measure("count", List.of(), ScalarType.I64, "n")
+                .build();
+            assertEquals(expected, keyCounts(scan(dataset, withElse, null, null)));
+
+            ByteBuffer withoutElse = new SubstraitAggregatePlan.Builder().groupBy(new IfThen(branches, null), "k")
+                .measure("count", List.of(), ScalarType.I64, "n")
+                .build();
+            List<Map<String, Object>> rows = scan(dataset, withoutElse, null, null);
+            Map<Long, Long> counts = new TreeMap<>();
+            long nullKeyed = 0;
+            for (Map<String, Object> row : rows) {
+                if (row.get("k") == null) {
+                    nullKeyed += (Long) row.get("n");
+                } else {
+                    counts.put((Long) row.get("k"), (Long) row.get("n"));
+                }
+            }
+            assertEquals(expectedWithoutElse, counts);
+            assertEquals(nulls + unmatched, nullKeyed);
+        }
+    }
+
+    public void testMatchMaskCountsARowTowardEveryOverlappingCondition() throws Exception {
+        // Three overlapping conditions: rating < 500 (bit 1), rating >=
+        // 300 (bit 2) and category IS NULL (bit 4). The mask groups the
+        // rows by the set of conditions they satisfy; a null rating
+        // fails both comparisons and only sets bit 4 when its category
+        // is null too. NOT (flag IS TRUE) keeps the rows whose flag is
+        // false or null, the way a must_not clause does.
+        Path dir = createTempDir();
+        String uri = LanceTableFactory.writeHintFixtureTable(dir, "mask", 3, 200);
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            Expression rating = new Cast(new FieldReference(fieldIndex(dataset, "rating")), ScalarType.FP64);
+            Expression category = new FieldReference(fieldIndex(dataset, "category"));
+            Expression flag = new FieldReference(fieldIndex(dataset, "flag"));
+            Expression mask = SubstraitExpressions.matchMask(
+                List.of(
+                    ScalarFunction.of("lt", rating, new Float64Literal(500d)),
+                    ScalarFunction.of("gte", rating, new Float64Literal(300d)),
+                    SubstraitExpressions.isNull(category)
+                )
+            );
+            ByteBuffer plan = new SubstraitAggregatePlan.Builder().groupBy(mask, "k")
+                .measure("count", List.of(), ScalarType.I64, "n")
+                .measure("sum", List.of(new Cast(SubstraitExpressions.notTrue(flag), ScalarType.I64)), ScalarType.I64, "not_flagged")
+                .build();
+            Map<Long, Long> expected = new TreeMap<>();
+            Map<Long, Long> expectedNotFlagged = new TreeMap<>();
+            for (int i = 0; i < 600; i++) {
+                long bits = 0;
+                if (i % 5 != 4) {
+                    long r = (i * 37L) % 1000L;
+                    bits |= r < 500 ? 1 : 0;
+                    bits |= r >= 300 ? 2 : 0;
+                }
+                bits |= i % 4 == 3 ? 4 : 0;
+                expected.merge(bits, 1L, Long::sum);
+                boolean flagged = i % 7 != 6 && i % 2 == 0;
+                expectedNotFlagged.merge(bits, flagged ? 0L : 1L, Long::sum);
+            }
+            List<Map<String, Object>> rows = scan(dataset, plan, null, null);
+            Map<Long, Long> notFlagged = new TreeMap<>();
+            for (Map<String, Object> row : rows) {
+                notFlagged.put((Long) row.get("k"), (Long) row.get("not_flagged"));
+            }
+            assertEquals(expected, keyCounts(rows));
+            assertEquals(expectedNotFlagged, notFlagged);
+        }
+    }
+
+    public void testSquareAndBooleanOperatorsInMeasures() throws Exception {
+        Path dir = createTempDir();
+        String uri = LanceTableFactory.writeHintFixtureTable(dir, "square", 3, 200);
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            Expression rating = new FieldReference(fieldIndex(dataset, "rating"));
+            Expression category = new FieldReference(fieldIndex(dataset, "category"));
+            Expression flag = new FieldReference(fieldIndex(dataset, "flag"));
+            // AND / OR of a comparison and an equality, summed as 0 / 1.
+            Expression c1AndHigh = SubstraitExpressions.and(
+                ScalarFunction.of("equal", category, new StringLiteral("c1")),
+                ScalarFunction.of("gte", new Cast(rating, ScalarType.I64), new Int64Literal(500L))
+            );
+            Expression c1OrFlag = SubstraitExpressions.or(
+                ScalarFunction.of("equal", category, new StringLiteral("c1")),
+                ScalarFunction.of("equal", new Cast(flag, ScalarType.I64), new Int64Literal(1L))
+            );
+            ByteBuffer plan = new SubstraitAggregatePlan.Builder().measure("count", List.of(), ScalarType.I64, "n")
+                .measure("sum", List.of(SubstraitExpressions.square(rating)), ScalarType.FP64, "sq")
+                .measure("sum", List.of(new Cast(c1AndHigh, ScalarType.I64)), ScalarType.I64, "c1_high")
+                .measure("sum", List.of(new Cast(c1OrFlag, ScalarType.I64)), ScalarType.I64, "c1_or_flag")
+                .measure("sum", List.of(new Cast(SubstraitExpressions.isNotNull(rating), ScalarType.I64)), ScalarType.I64, "rated")
+                .build();
+            double expectedSquares = 0;
+            long expectedC1High = 0;
+            long expectedC1OrFlag = 0;
+            long expectedRated = 0;
+            for (int i = 0; i < 600; i++) {
+                boolean rated = i % 5 != 4;
+                long r = (i * 37L) % 1000L;
+                boolean c1 = i % 4 != 3 && i % 3 == 1;
+                boolean flagged = i % 7 != 6 && i % 2 == 0;
+                if (rated) {
+                    expectedSquares += (double) r * r;
+                    expectedRated++;
+                }
+                if (c1 && rated && r >= 500) {
+                    expectedC1High++;
+                }
+                if (c1 || flagged) {
+                    expectedC1OrFlag++;
+                }
+            }
+            Map<String, Object> row = scan(dataset, plan, null, null).get(0);
+            assertEquals(600L, row.get("n"));
+            assertEquals(expectedSquares, (Double) row.get("sq"), 0d);
+            assertEquals(expectedC1High, row.get("c1_high"));
+            assertEquals(expectedC1OrFlag, row.get("c1_or_flag"));
+            assertEquals(expectedRated, row.get("rated"));
         }
     }
 
