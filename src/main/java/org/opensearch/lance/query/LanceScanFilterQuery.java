@@ -25,6 +25,8 @@ import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.FixedBitSet;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.opensearch.core.tasks.TaskCancelledException;
+import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 
 /**
@@ -131,7 +133,7 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
 
     @Override
     public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) {
-        return new LanceScanFilterWeight(this);
+        return new LanceScanFilterWeight(this, LanceCancellation.of(searcher));
     }
 
     /**
@@ -157,9 +159,12 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
 
         private final java.util.concurrent.atomic.AtomicReference<java.util.Map<Integer, FixedBitSet>> shardMatches =
             new java.util.concurrent.atomic.AtomicReference<>();
+        // Checked at every batch boundary of the filter scan.
+        private final LanceCancellation cancellation;
 
-        LanceScanFilterWeight(LanceScanFilterQuery query) {
+        LanceScanFilterWeight(LanceScanFilterQuery query, LanceCancellation cancellation) {
             super(query);
+            this.cancellation = cancellation;
         }
 
         private LanceScanFilterQuery query() {
@@ -249,6 +254,7 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
             }
             try (LanceScanner scanner = leaf.dataset().newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
+                    cancellation.checkCancelled();
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
                     UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
                     for (int i = 0; i < root.getRowCount(); i++) {
@@ -259,7 +265,7 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
                         }
                     }
                 }
-            } catch (IOException e) {
+            } catch (IOException | TaskCancelledException e) {
                 throw e;
             } catch (Exception e) {
                 throw new IOException(e);

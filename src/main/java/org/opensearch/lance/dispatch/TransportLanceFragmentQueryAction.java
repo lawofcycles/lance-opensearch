@@ -83,7 +83,9 @@ import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.engine.ColumnStore;
+import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.lance.engine.FragmentGroupScan;
+import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
@@ -109,6 +111,7 @@ import org.opensearch.search.approximate.ApproximateScoreQuery;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.SortAndFormats;
+import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
@@ -284,7 +287,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             concurrencyLimit.acquire();
             acquired = true;
             long start = System.nanoTime();
-            LanceFragmentQueryResponse response = execute(request);
+            LanceFragmentQueryResponse response = execute(request, LanceCancellation.of(task instanceof CancellableTask c ? c : null));
             LOGGER.debug(
                 "lance.dispatch: fragment query for [{}] over {} fragments took {} us",
                 request.indexName(),
@@ -296,6 +299,26 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             Thread.currentThread().interrupt();
             listener.onFailure(interrupted);
         } catch (Exception e) {
+            // A cancelled task (the coordinator's request timed out, or
+            // the coordinator task itself was cancelled) ends a Lance
+            // scan with TaskCancelledException at a batch boundary and
+            // a Lucene collection between leaves; the exception may
+            // reach here wrapped in the IOException the Weight and
+            // reader contracts force on the scan loops. Report the
+            // TaskCancelledException itself so the coordinator
+            // recognises it, and log it at debug: it is the expected
+            // outcome of a cancellation, not a failure of this node.
+            TaskCancelledException cancelled = findCancelled(e);
+            if (cancelled != null) {
+                LOGGER.debug(
+                    "fragment query for [{}] on [{}] was cancelled: {}",
+                    request.indexName(),
+                    request.tableUri(),
+                    cancelled.getMessage()
+                );
+                listener.onFailure(cancelled);
+                return;
+            }
             // Lance's IllegalArgumentException (a phrase query on an
             // index without positions, a malformed predicate) reaches
             // this catch as the cause of the IOException the Lucene
@@ -335,6 +358,30 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
+     * The {@link TaskCancelledException} in the cause chain of
+     * {@code e}, or {@code null} when the chain has none.
+     */
+    static TaskCancelledException findCancelled(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof TaskCancelledException cancelled) {
+                return cancelled;
+            }
+            if (t.getCause() == t) {
+                break;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * {@link #execute(LanceFragmentQueryRequest, LanceCancellation)}
+     * without a task to cancel, for unit tests.
+     */
+    LanceFragmentQueryResponse execute(LanceFragmentQueryRequest request) throws Exception {
+        return execute(request, LanceCancellation.NONE);
+    }
+
+    /**
      * Package-private helper that does the actual scan work. Split
      * out so unit tests can call it without going through the
      * transport layer.
@@ -345,8 +392,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * previous per-request separation (Lance-native hits scan +
      * separate Lucene aggregator scan) collapses to one Lucene scan
      * that answers both.
+     *
+     * <p>{@code cancellation} is the task the request runs under. Every
+     * Lance scan of the request checks it at its batch boundaries and
+     * Lucene's collection loop between leaves, so a cancelled task ends
+     * the request with {@link TaskCancelledException} at the next such
+     * point; a scan already inside a batch runs that batch to its end.
      */
-    LanceFragmentQueryResponse execute(LanceFragmentQueryRequest request) throws Exception {
+    LanceFragmentQueryResponse execute(LanceFragmentQueryRequest request, LanceCancellation cancellation) throws Exception {
         IndexMetadata indexMetadata = clusterService.state().metadata().index(request.indexName());
         if (indexMetadata == null) {
             throw new IllegalStateException("Fragment path cannot resolve OpenSearch index [" + request.indexName() + "] on this node");
@@ -409,6 +462,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 snapshot,
                 multiFields,
                 request,
+                cancellation,
                 fragmentCount,
                 effectiveFragmentIds,
                 0
@@ -441,6 +495,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         LanceWarmCache.Snapshot snapshot,
         Map<String, LinkedHashMap<String, String>> multiFields,
         LanceFragmentQueryRequest request,
+        LanceCancellation cancellation,
         int fragmentCount,
         List<Integer> effectiveFragmentIds,
         int attempt
@@ -453,6 +508,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 snapshot,
                 multiFields,
                 request,
+                cancellation,
                 fragmentCount,
                 effectiveFragmentIds
             );
@@ -476,6 +532,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     snapshot,
                     multiFields,
                     request,
+                    cancellation,
                     fragmentCount,
                     effectiveFragmentIds
                 );
@@ -502,6 +559,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 snapshot,
                 multiFields,
                 request,
+                cancellation,
                 fragmentCount,
                 effectiveFragmentIds,
                 attempt + 1
@@ -523,6 +581,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         LanceWarmCache.Snapshot snapshot,
         Map<String, LinkedHashMap<String, String>> multiFields,
         LanceFragmentQueryRequest request,
+        LanceCancellation cancellation,
         int fragmentCount,
         List<Integer> effectiveFragmentIds
     ) throws Exception {
@@ -569,7 +628,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // store cannot serve them. FTS and knn queries have
                 // no SQL representation so filterSql is null there.
                 request.filterSql(),
-                readerWrapper
+                readerWrapper,
+                cancellation
             )
         ) {
             MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
@@ -591,7 +651,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     bigArrays,
                     indexService.cache().bitsetFilterCache(),
                     clusterService.localNode().getId()
-                )
+                ).withCancellation(cancellation)
             ) {
                 LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(
                     dr,
@@ -600,6 +660,16 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     circuitBreakerService.getBreaker(CircuitBreaker.REQUEST)
                 );
                 searchContext.withSearcher(searcher);
+                if (cancellation.hasTask()) {
+                    // Lucene side of the cancellation, the same hook the
+                    // shard path's QueryPhase installs: ContextIndexSearcher
+                    // runs it before every leaf and, through
+                    // CancellableBulkScorer, every few hundred documents
+                    // of a collection, and the Lance Weights created
+                    // against this searcher check the same task between
+                    // batches.
+                    searcher.addQueryCancellation(cancellation::checkCancelled);
+                }
                 QueryShardContext qsc = indexService.newQueryShardContext(0, searcher, System::currentTimeMillis, null);
                 searchContext.withQueryShardContext(qsc);
 
@@ -685,7 +755,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         pushdownOrderings,
                         sortAndFormats,
                         searcher.getIndexReader(),
-                        effectiveFragmentIds
+                        effectiveFragmentIds,
+                        cancellation
                     );
                 } else {
                     // The shared Weight drives the hits phase only when
@@ -719,6 +790,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         request.filterSql(),
                         clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING),
                         pushdownExecutor,
+                        cancellation,
                         name -> emptyTopLevelAggregation(request, searchContext, qsc, name)
                     );
                     LOGGER.debug(
@@ -734,7 +806,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         : MatchedCount.exact(result.totalRows());
                 } else {
                     aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query, lanceWeight);
-                    matched = computeMatched(dataset, request, searcher, countQuery, hasSecurityWrapper, ftsWeight);
+                    matched = computeMatched(dataset, request, searcher, countQuery, hasSecurityWrapper, ftsWeight, cancellation);
                 }
                 // A size 0 request (the only shape the pushdown takes)
                 // has an empty page, so its row address array is empty
@@ -1669,7 +1741,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         List<ColumnOrdering> orderings,
         SortAndFormats sortAndFormats,
         org.apache.lucene.index.IndexReader reader,
-        List<Integer> fragmentIds
+        List<Integer> fragmentIds,
+        LanceCancellation cancellation
     ) throws IOException {
         org.apache.lucene.search.SortField[] sortFields = sortAndFormats.sort.getSort();
         java.util.Map<Integer, LanceFragmentLeafReader> leafByFragment = new java.util.HashMap<>();
@@ -1702,6 +1775,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             org.apache.arrow.vector.ipc.ArrowReader arrowReader = scanner.scanBatches()
         ) {
             while (arrowReader.loadNextBatch()) {
+                cancellation.checkCancelled();
                 org.apache.arrow.vector.VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
                 org.apache.arrow.vector.UInt8Vector rowAddr = (org.apache.arrow.vector.UInt8Vector) root.getVector("_rowaddr");
                 org.apache.arrow.vector.FieldVector[] vectors = new org.apache.arrow.vector.FieldVector[orderings.size()];
@@ -1718,7 +1792,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     sortValues.add(raw);
                 }
             }
-        } catch (IOException e) {
+        } catch (IOException | TaskCancelledException e) {
             throw e;
         } catch (Exception e) {
             throw new IOException(e);
@@ -1994,15 +2068,20 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         ColumnStore columnStore,
         List<Integer> effectiveFragmentIds,
         String filterSql,
-        CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper
+        CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper,
+        LanceCancellation cancellation
     ) throws IOException {
         // Column loads of this reader (the store's and the heap
         // fallback's) scan the node's fragments in up to
         // lance.fragment_path.parallelism groups on the SEARCH pool,
-        // so a column is read into its arrays on several cores.
+        // so a column is read into its arrays on several cores. The
+        // scan carries the request's cancellation so every group, on
+        // whichever thread it runs, stops at its next batch once the
+        // task is cancelled.
         FragmentGroupScan groupScan = new FragmentGroupScan(
             pushdownExecutor,
-            clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_PARALLELISM_SETTING)
+            clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_PARALLELISM_SETTING),
+            cancellation
         );
         DirectoryReader lanceReader = LanceDirectoryReader.openForSnapshot(
             new ByteBuffersDirectory(),
@@ -2171,7 +2250,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         LanceFragmentIndexSearcher searcher,
         Query luceneQuery,
         boolean hasSecurityWrapper,
-        LanceFtsQuery.LanceFtsWeight ftsWeight
+        LanceFtsQuery.LanceFtsWeight ftsWeight,
+        LanceCancellation cancellation
     ) throws Exception {
         int upTo = request.trackTotalHitsUpTo();
         if (upTo == SearchContext.TRACK_TOTAL_HITS_DISABLED) {
@@ -2250,10 +2330,10 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 }
             }
             if (upTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
-                return MatchedCount.exact(countFtsHitsDirectly(dataset, fts, fragmentIds, 0L).own());
+                return MatchedCount.exact(countFtsHitsDirectly(dataset, fts, fragmentIds, 0L, cancellation).own());
             }
             long limit = (long) upTo + 1L;
-            FtsHitCount counted = countFtsHitsDirectly(dataset, fts, fragmentIds, limit);
+            FtsHitCount counted = countFtsHitsDirectly(dataset, fts, fragmentIds, limit, cancellation);
             // The bound is judged on the rows Lance returned before the
             // fragment filter. On a subset executor the own share of a
             // filled scan is a fraction of the limit and says nothing
@@ -2287,7 +2367,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (fragmentIds == null) {
             return MatchedCount.exact(dataset.countRows(filterSql));
         }
-        return countScalarFilter(dataset, filterSql, fragmentIds, upTo);
+        return countScalarFilter(dataset, filterSql, fragmentIds, upTo, cancellation);
     }
 
     /**
@@ -2342,8 +2422,25 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * count from a batch loop that happens to return the same number.
      */
     static MatchedCount countScalarFilter(Dataset dataset, String filterSql, List<Integer> fragmentIds, int upTo) throws Exception {
+        return countScalarFilter(dataset, filterSql, fragmentIds, upTo, LanceCancellation.NONE);
+    }
+
+    /**
+     * {@link #countScalarFilter(Dataset, String, List, int)} whose bounded
+     * scan stops once {@code cancellation} reports a cancelled task. The
+     * native count of an exact request runs inside Lance in one call and
+     * has no batch boundary to stop at.
+     */
+    static MatchedCount countScalarFilter(
+        Dataset dataset,
+        String filterSql,
+        List<Integer> fragmentIds,
+        int upTo,
+        LanceCancellation cancellation
+    ) throws Exception {
         ScanOptions.Builder builder = countOnlyScan(filterSql, fragmentIds);
         if (upTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
+            cancellation.checkCancelled();
             try (LanceScanner scanner = dataset.newScan(builder.build())) {
                 long counted = scanner.countRows();
                 NATIVE_SCALAR_COUNTS.incrementAndGet();
@@ -2351,7 +2448,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             }
         }
         long limit = (long) upTo + 1L;
-        long counted = countRows(dataset, builder.limit(limit).build());
+        long counted = countRows(dataset, builder.limit(limit).build(), cancellation);
         BOUNDED_SCALAR_COUNT_SCANS.incrementAndGet();
         return new MatchedCount(counted, counted >= limit);
     }
@@ -2447,17 +2544,28 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * {@code n + 1} and stops the scan there.
      */
     static FtsHitCount countFtsHitsDirectly(Dataset dataset, LanceFtsQuery fts, List<Integer> fragmentIds, long limit) throws Exception {
+        return countFtsHitsDirectly(dataset, fts, fragmentIds, limit, LanceCancellation.NONE);
+    }
+
+    /** {@link #countFtsHitsDirectly(Dataset, LanceFtsQuery, List, long)} whose scans stop once {@code cancellation} reports a cancelled task. */
+    static FtsHitCount countFtsHitsDirectly(
+        Dataset dataset,
+        LanceFtsQuery fts,
+        List<Integer> fragmentIds,
+        long limit,
+        LanceCancellation cancellation
+    ) throws Exception {
         boolean subset = fragmentIds != null && !LanceFtsQuery.coversAllFragments(fragmentIds, dataset);
         if (!subset) {
             ScanOptions.Builder builder = countOnlyScan(fts);
             if (limit > 0) {
                 builder = builder.limit(limit);
             }
-            return FtsHitCount.whole(countRows(dataset, builder.build()));
+            return FtsHitCount.whole(countRows(dataset, builder.build(), cancellation));
         }
         Set<Integer> own = new HashSet<>(fragmentIds);
         if (limit > 0) {
-            return countOwnRows(dataset, rowAddressScan(fts).limit(limit).build(), own);
+            return countOwnRows(dataset, rowAddressScan(fts).limit(limit).build(), own, cancellation);
         }
         long subsetRows = 0L;
         for (Fragment fragment : dataset.getFragments()) {
@@ -2466,12 +2574,12 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             }
         }
         long probeLimit = LanceFtsQuery.effectiveSubsetProbeLimit(subsetRows);
-        FtsHitCount probe = countOwnRows(dataset, rowAddressScan(fts).limit(probeLimit).build(), own);
+        FtsHitCount probe = countOwnRows(dataset, rowAddressScan(fts).limit(probeLimit).build(), own, cancellation);
         if (probe.scanned() < probeLimit) {
             return probe;
         }
         return FtsHitCount.whole(
-            countRows(dataset, LanceFtsQuery.restrictToFragmentsUnlessAll(countOnlyScan(fts), fragmentIds, dataset).build())
+            countRows(dataset, LanceFtsQuery.restrictToFragmentsUnlessAll(countOnlyScan(fts), fragmentIds, dataset).build(), cancellation)
         );
     }
 
@@ -2492,10 +2600,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         return countOnlyScan(fts).withRowAddress(true);
     }
 
-    private static long countRows(Dataset dataset, ScanOptions options) throws Exception {
+    private static long countRows(Dataset dataset, ScanOptions options, LanceCancellation cancellation) throws Exception {
         long total = 0L;
         try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
             while (reader.loadNextBatch()) {
+                cancellation.checkCancelled();
                 total += reader.getVectorSchemaRoot().getRowCount();
             }
         }
@@ -2521,11 +2630,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * Read {@code options} against {@code dataset} and count the rows
      * whose fragment id is in {@code own} next to every row returned.
      */
-    private static FtsHitCount countOwnRows(Dataset dataset, ScanOptions options, Set<Integer> own) throws Exception {
+    private static FtsHitCount countOwnRows(Dataset dataset, ScanOptions options, Set<Integer> own, LanceCancellation cancellation)
+        throws Exception {
         long scanned = 0L;
         long kept = 0L;
         try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
             while (reader.loadNextBatch()) {
+                cancellation.checkCancelled();
                 VectorSchemaRoot root = reader.getVectorSchemaRoot();
                 UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
                 int rows = root.getRowCount();

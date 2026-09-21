@@ -362,6 +362,9 @@ public final class LanceDirectoryReader extends DirectoryReader {
             if (!wanted.contains(meta.id())) {
                 continue;
             }
+            // One live-row scan per fragment with a deletion file; a
+            // cancelled request does not start the next one.
+            groupScan.cancellation().checkCancelled();
             meta.resolveLiveDocs(dataset);
             LanceFragmentLeafReader raw = new LanceFragmentLeafReader(dataset, meta.id(), meta, snapshot.schema(), filterSql);
             rawLeaves.add(raw);

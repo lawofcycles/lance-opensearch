@@ -37,6 +37,7 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
 import org.opensearch.lance.attach.LanceAttachRequest;
 import org.opensearch.lance.attach.LanceAttachResponse;
+import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.script.Script;
@@ -830,7 +831,15 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
                 AggregationBuilders.terms("c").field("category").subAggregation(AggregationBuilders.sum("s").field("rating"))
             );
             List<Integer> every = List.of(0, 1, 2, 3, 4, 5, 6, 7);
-            LanceAggregatePushdown.Result reference = plan.execute(dataset, every, null, 1, searchPool, name -> null);
+            LanceAggregatePushdown.Result reference = plan.execute(
+                dataset,
+                every,
+                null,
+                1,
+                searchPool,
+                LanceCancellation.NONE,
+                name -> null
+            );
             assertEquals(1, reference.scans());
             assertEquals(800L, reference.totalRows());
 
@@ -838,20 +847,31 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
             // scan fail inside Lance; the request fails instead of
             // answering from the groups that did succeed.
             List<Integer> withMissing = List.of(0, 1, 2, 3, 4, 5, 6, 7, 999);
-            Exception failure = expectThrows(Exception.class, () -> plan.execute(dataset, withMissing, null, 4, searchPool, name -> null));
+            Exception failure = expectThrows(
+                Exception.class,
+                () -> plan.execute(dataset, withMissing, null, 4, searchPool, LanceCancellation.NONE, name -> null)
+            );
             assertNotNull(failure.getMessage());
 
             // An executor that rejects everything, and one that accepts
             // but never runs: the calling thread scans every group itself
             // and the answer is the same.
             Executor rejecting = task -> { throw new RejectedExecutionException("full"); };
-            LanceAggregatePushdown.Result rejected = plan.execute(dataset, every, null, 4, rejecting, name -> null);
+            LanceAggregatePushdown.Result rejected = plan.execute(dataset, every, null, 4, rejecting, LanceCancellation.NONE, name -> null);
             assertEquals(4, rejected.scans());
             assertEquals(reference.aggregations(), rejected.aggregations());
             assertEquals(reference.totalRows(), rejected.totalRows());
 
             List<Runnable> parked = new ArrayList<>();
-            LanceAggregatePushdown.Result starved = plan.execute(dataset, every, null, 4, parked::add, name -> null);
+            LanceAggregatePushdown.Result starved = plan.execute(
+                dataset,
+                every,
+                null,
+                4,
+                parked::add,
+                LanceCancellation.NONE,
+                name -> null
+            );
             assertEquals(4, starved.scans());
             assertEquals(3, parked.size());
             assertEquals(reference.aggregations(), starved.aggregations());
@@ -860,7 +880,15 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
                 task.run();
             }
 
-            LanceAggregatePushdown.Result parallel = plan.execute(dataset, every, null, 8, searchPool, name -> null);
+            LanceAggregatePushdown.Result parallel = plan.execute(
+                dataset,
+                every,
+                null,
+                8,
+                searchPool,
+                LanceCancellation.NONE,
+                name -> null
+            );
             assertEquals(8, parallel.scans());
             assertEquals(reference.aggregations(), parallel.aggregations());
         }

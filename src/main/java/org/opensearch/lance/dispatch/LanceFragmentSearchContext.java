@@ -28,6 +28,7 @@ import org.opensearch.index.query.ParsedQuery;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.similarity.SimilarityService;
+import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.search.SearchExtBuilder;
 import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.BucketCollectorProcessor;
@@ -115,6 +116,7 @@ public final class LanceFragmentSearchContext extends SearchContext {
     private final SearchContextAggregations aggregations;
     private BucketCollectorProcessor bucketCollectorProcessor = new BucketCollectorProcessor();
     private final List<Releasable> releasables = new ArrayList<>();
+    private LanceCancellation cancellation = LanceCancellation.NONE;
 
     /**
      * Two-phase construction: {@link ContextIndexSearcher} keeps a
@@ -175,6 +177,23 @@ public final class LanceFragmentSearchContext extends SearchContext {
     public LanceFragmentSearchContext withQueryShardContext(QueryShardContext queryShardContext) {
         this.queryShardContext = queryShardContext;
         return this;
+    }
+
+    /**
+     * Attach the cancellation of the task the request runs under. The
+     * Lance Weights created against this context's searcher pick it up
+     * through {@link LanceCancellation#of(org.apache.lucene.search.IndexSearcher)}
+     * and check it between batches; {@link #isCancelled()} reads it.
+     * Defaults to {@link LanceCancellation#NONE}.
+     */
+    public LanceFragmentSearchContext withCancellation(LanceCancellation cancellation) {
+        this.cancellation = cancellation == null ? LanceCancellation.NONE : cancellation;
+        return this;
+    }
+
+    /** The cancellation of the task the request runs under, never null. */
+    public LanceCancellation cancellation() {
+        return cancellation;
     }
 
     // ------------- Real implementations -------------
@@ -310,7 +329,7 @@ public final class LanceFragmentSearchContext extends SearchContext {
 
     @Override
     public boolean isCancelled() {
-        return false;
+        return cancellation.isCancelled();
     }
 
     @Override
