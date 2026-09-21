@@ -107,6 +107,7 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
             "id",
             "{\"properties\":{\"id\":{\"type\":\"long\"}}}",
             List.of("column vec: stored only"),
+            true,
             true
         );
 
@@ -127,6 +128,7 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
         assertEquals(original.derivedMappingJson(), restored.derivedMappingJson());
         assertEquals(original.notes(), restored.notes());
         assertEquals(original.alreadyAttached(), restored.alreadyAttached());
+        assertEquals(original.luceneBoundExceeded(), restored.luceneBoundExceeded());
     }
 
     private static LanceAttachRequest roundTrip(LanceAttachRequest original) throws Exception {
