@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.lucene.search.MatchAllDocsQuery;
+import org.apache.lucene.search.MultiTermQuery;
 import org.apache.lucene.search.Query;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParametrizedFieldMapper;
@@ -19,13 +20,17 @@ import org.opensearch.index.mapper.TextSearchInfo;
 import org.opensearch.index.mapper.ValueFetcher;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.lance.query.LanceFtsQuery;
+import org.opensearch.lance.query.LanceScanFilterQuery;
+import org.opensearch.lance.query.LanceStringPatternSql;
 import org.opensearch.search.lookup.SearchLookup;
 
 /**
  * Field type "lance_text". Term and match queries on it are rewritten to
- * Lance FTS execution. The optional "tokens_column" parameter selects the
- * RFC's analyzer mode: queries target the derived column holding
- * OpenSearch-analyzed tokens instead of the raw column.
+ * Lance FTS execution; wildcard, regexp and prefix queries to a Lance
+ * scan filter over the raw column. The optional "tokens_column"
+ * parameter selects the RFC's analyzer mode: term and match queries
+ * target the derived column holding OpenSearch-analyzed tokens instead
+ * of the raw column.
  */
 public class LanceTextFieldMapper extends ParametrizedFieldMapper {
 
@@ -90,6 +95,45 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
         public Query existsQuery(QueryShardContext context) {
             rejectIfDropped();
             return MatchAllDocsQuery.INSTANCE;
+        }
+
+        /**
+         * Wildcard, regexp and prefix run as a Lance scan filter over
+         * the raw stored string of the column named by this field, not
+         * over the analyzed tokens of {@code tokens_column}: Lance's
+         * inverted index has no wildcard or regexp query type and keeps
+         * its term dictionary to itself, and a pattern match on the raw
+         * value is what the same filter means to a Lance user. The
+         * query is unbounded ({@link LanceScanFilterQuery#SCAN_LIMIT_UNBOUNDED});
+         * the fragment executor's top-k clip applies when the
+         * coordinator translated the whole request to SQL, which is the
+         * common case for a bare wildcard / regexp / prefix, and this
+         * query is what runs when the pattern sits inside a shape the
+         * translator does not cover, where every match is needed.
+         */
+        @Override
+        public Query wildcardQuery(String value, MultiTermQuery.RewriteMethod method, boolean caseInsensitive, QueryShardContext context) {
+            rejectIfDropped();
+            return new LanceScanFilterQuery(LanceStringPatternSql.wildcard(name(), value, caseInsensitive));
+        }
+
+        @Override
+        public Query regexpQuery(
+            String value,
+            int syntaxFlags,
+            int matchFlags,
+            int maxDeterminizedStates,
+            MultiTermQuery.RewriteMethod method,
+            QueryShardContext context
+        ) {
+            rejectIfDropped();
+            return new LanceScanFilterQuery(LanceStringPatternSql.regexp(name(), value, syntaxFlags, matchFlags));
+        }
+
+        @Override
+        public Query prefixQuery(String value, MultiTermQuery.RewriteMethod method, boolean caseInsensitive, QueryShardContext context) {
+            rejectIfDropped();
+            return new LanceScanFilterQuery(LanceStringPatternSql.prefix(name(), value, caseInsensitive));
         }
 
         @Override

@@ -9,6 +9,7 @@ import java.util.List;
 
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
+import org.opensearch.index.query.RegexpFlag;
 import org.opensearch.test.OpenSearchTestCase;
 
 public class LanceKnnFilterTranslatorTests extends OpenSearchTestCase {
@@ -130,5 +131,127 @@ public class LanceKnnFilterTranslatorTests extends OpenSearchTestCase {
 
     public void testTermsListValue() {
         assertEquals("tag IN ('a', 'b')", LanceKnnFilterTranslator.toLanceSql(QueryBuilders.termsQuery("tag", List.of("a", "b"))));
+    }
+
+    public void testWildcardTranslatesToLike() {
+        assertEquals(
+            "body LIKE '%w0001%' ESCAPE '\\'",
+            LanceKnnFilterTranslator.toLanceSql(QueryBuilders.wildcardQuery("body", "*w0001*"))
+        );
+        assertEquals(
+            "body ILIKE 'w_001' ESCAPE '\\'",
+            LanceKnnFilterTranslator.toLanceSql(QueryBuilders.wildcardQuery("body", "w?001").caseInsensitive(true))
+        );
+    }
+
+    public void testWildcardSqlAgreesWithTheFieldType() {
+        // The coordinator's SQL and the field type's LanceScanFilterQuery
+        // must express the same predicate, or hits.total (countRows on
+        // the SQL) and the hits (the query) could disagree.
+        String sql = LanceKnnFilterTranslator.toLanceSql(QueryBuilders.wildcardQuery("body", "50%_*O'B\\*"));
+        assertEquals(LanceStringPatternSql.wildcard("body", "50%_*O'B\\*", false), sql);
+        assertEquals("body LIKE '50\\%\\_%O''B*' ESCAPE '\\'", sql);
+    }
+
+    public void testRegexpTranslatesToAnchoredRegexpLike() {
+        assertEquals(
+            "regexp_like(body, '^(?:w0001.*)$')",
+            LanceKnnFilterTranslator.toLanceSql(QueryBuilders.regexpQuery("body", "w0001.*"))
+        );
+        assertEquals(
+            "regexp_like(body, '(?i)^(?:w0001.*)$')",
+            LanceKnnFilterTranslator.toLanceSql(QueryBuilders.regexpQuery("body", "w0001.*").caseInsensitive(true))
+        );
+    }
+
+    public void testRegexpWithLuceneOnlyOperatorRejected() {
+        // The default flags (ALL) enable intersection, so & is refused;
+        // the deprecated complement is off by default, so ~ passes as a
+        // literal and is refused only when the COMPLEMENT flag is set.
+        Exception e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceKnnFilterTranslator.toLanceSql(QueryBuilders.regexpQuery("body", "a&b"))
+        );
+        assertTrue("unexpected message: " + e.getMessage(), e.getMessage().contains("Rust regex"));
+        assertEquals("regexp_like(body, '^(?:~a)$')", LanceKnnFilterTranslator.toLanceSql(QueryBuilders.regexpQuery("body", "~a")));
+        Exception complement = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceKnnFilterTranslator.toLanceSql(QueryBuilders.regexpQuery("body", "~a").flags(RegexpFlag.COMPLEMENT))
+        );
+        assertTrue("unexpected message: " + complement.getMessage(), complement.getMessage().contains("complement"));
+        assertEquals(
+            "regexp_like(body, '^(?:a&b)$')",
+            LanceKnnFilterTranslator.toLanceSql(QueryBuilders.regexpQuery("body", "a&b").flags(RegexpFlag.NONE))
+        );
+    }
+
+    public void testPrefixTranslatesToStartsWith() {
+        assertEquals("starts_with(body, 'hel')", LanceKnnFilterTranslator.toLanceSql(QueryBuilders.prefixQuery("body", "hel")));
+        assertEquals(
+            "starts_with(lower(body), lower('HEL'))",
+            LanceKnnFilterTranslator.toLanceSql(QueryBuilders.prefixQuery("body", "HEL").caseInsensitive(true))
+        );
+    }
+
+    public void testPatternQueriesComposeInsideBool() {
+        BoolQueryBuilder b = QueryBuilders.boolQuery()
+            .filter(QueryBuilders.wildcardQuery("body", "*w0001*"))
+            .filter(QueryBuilders.termQuery("rating", 5))
+            .mustNot(QueryBuilders.prefixQuery("category", "cat1"));
+        assertEquals(
+            "(body LIKE '%w0001%' ESCAPE '\\' AND rating = 5 AND NOT (starts_with(category, 'cat1')))",
+            LanceKnnFilterTranslator.toLanceSql(b)
+        );
+    }
+
+    public void testPatternQueriesRejectMultiFieldPath() {
+        for (org.opensearch.index.query.QueryBuilder q : List.of(
+            QueryBuilders.wildcardQuery("body.raw", "h*"),
+            QueryBuilders.regexpQuery("body.raw", "h.*"),
+            QueryBuilders.prefixQuery("body.raw", "h")
+        )) {
+            Exception e = expectThrows(IllegalArgumentException.class, () -> LanceKnnFilterTranslator.toLanceSql(q));
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().contains("dotted field"));
+        }
+    }
+
+    public void testPatternQueriesOnNonStringColumnRejected() {
+        // With a mapping in hand a wildcard on a numeric column is
+        // refused so the coordinator falls back to the Lucene path,
+        // where the field type answers OpenSearch's stock 400.
+        java.util.function.Function<String, String> lookup = name -> switch (name) {
+            case "rating" -> "integer";
+            case "body" -> "lance_text";
+            case "category" -> "keyword";
+            default -> null;
+        };
+        Exception e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceKnnFilterTranslator.toLanceSql(QueryBuilders.wildcardQuery("rating", "1*"), lookup)
+        );
+        assertTrue("unexpected message: " + e.getMessage(), e.getMessage().contains("[integer]"));
+        assertEquals("body LIKE '1%' ESCAPE '\\'", LanceKnnFilterTranslator.toLanceSql(QueryBuilders.wildcardQuery("body", "1*"), lookup));
+        assertEquals("starts_with(category, 'c')", LanceKnnFilterTranslator.toLanceSql(QueryBuilders.prefixQuery("category", "c"), lookup));
+        assertEquals(
+            "regexp_like(unmapped, '^(?:.*)$')",
+            LanceKnnFilterTranslator.toLanceSql(QueryBuilders.regexpQuery("unmapped", ".*"), lookup)
+        );
+    }
+
+    public void testHasUnmappedFieldCoversPatternQueries() {
+        java.util.function.Function<String, String> lookup = name -> "body".equals(name) ? "lance_text" : null;
+        assertFalse(LanceKnnFilterTranslator.hasUnmappedField(QueryBuilders.wildcardQuery("body", "h*"), lookup));
+        assertTrue(LanceKnnFilterTranslator.hasUnmappedField(QueryBuilders.wildcardQuery("nope", "h*"), lookup));
+        assertTrue(LanceKnnFilterTranslator.hasUnmappedField(QueryBuilders.regexpQuery("nope", "h.*"), lookup));
+        assertTrue(LanceKnnFilterTranslator.hasUnmappedField(QueryBuilders.prefixQuery("nope", "h"), lookup));
+        assertTrue(
+            LanceKnnFilterTranslator.hasUnmappedField(
+                QueryBuilders.boolQuery().filter(QueryBuilders.wildcardQuery("body", "h*")).mustNot(QueryBuilders.prefixQuery("nope", "h")),
+                lookup
+            )
+        );
+        // A sub-field path is not "unmapped": rejectMultiFieldPath
+        // handles it inside toLanceSql.
+        assertFalse(LanceKnnFilterTranslator.hasUnmappedField(QueryBuilders.wildcardQuery("body.raw", "h*"), lookup));
     }
 }

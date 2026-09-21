@@ -6,16 +6,21 @@
 package org.opensearch.lance.query;
 
 import java.util.Locale;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import org.apache.lucene.util.automaton.RegExp;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
+import org.opensearch.index.query.PrefixQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
+import org.opensearch.index.query.RegexpQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
+import org.opensearch.index.query.WildcardQueryBuilder;
 
 /**
  * Translates a subset of OpenSearch {@link QueryBuilder}s to a Lance SQL
@@ -44,6 +49,13 @@ import org.opensearch.index.query.TermsQueryBuilder;
  *   <li>{@link TermQueryBuilder} / {@link TermsQueryBuilder} — numeric,
  *       string, or boolean literals.</li>
  *   <li>{@link ExistsQueryBuilder}.</li>
+ *   <li>{@link WildcardQueryBuilder} / {@link RegexpQueryBuilder} /
+ *       {@link PrefixQueryBuilder} on a string column ({@code keyword},
+ *       {@code text}, {@code lance_text}), lowered through
+ *       {@link LanceStringPatternSql} to {@code LIKE} /
+ *       {@code regexp_like} / {@code starts_with} over the stored
+ *       string. A regexp using an operator only Lucene's grammar has
+ *       rejects with 400 (see {@link LanceStringPatternSql#regexp}).</li>
  *   <li>{@link BoolQueryBuilder} with {@code filter} / {@code must} /
  *       {@code must_not} / {@code should}.</li>
  *   <li>{@link MatchAllQueryBuilder} (translated to {@code true}).</li>
@@ -122,6 +134,15 @@ public final class LanceKnnFilterTranslator {
         }
         if (builder instanceof RangeQueryBuilder r) {
             return isFieldUnmapped(r.fieldName(), fieldTypeLookup);
+        }
+        if (builder instanceof WildcardQueryBuilder w) {
+            return isFieldUnmapped(w.fieldName(), fieldTypeLookup);
+        }
+        if (builder instanceof RegexpQueryBuilder r) {
+            return isFieldUnmapped(r.fieldName(), fieldTypeLookup);
+        }
+        if (builder instanceof PrefixQueryBuilder p) {
+            return isFieldUnmapped(p.fieldName(), fieldTypeLookup);
         }
         if (builder instanceof BoolQueryBuilder b) {
             for (QueryBuilder q : b.filter()) {
@@ -238,12 +259,55 @@ public final class LanceKnnFilterTranslator {
             rejectMultiFieldPath(r.fieldName());
             return translateRange(r, lookup);
         }
+        if (builder instanceof WildcardQueryBuilder w) {
+            rejectMultiFieldPath(w.fieldName());
+            requireStringColumn(w.fieldName(), "wildcard", lookup);
+            return LanceStringPatternSql.wildcard(w.fieldName(), w.value(), w.caseInsensitive());
+        }
+        if (builder instanceof RegexpQueryBuilder r) {
+            rejectMultiFieldPath(r.fieldName());
+            requireStringColumn(r.fieldName(), "regexp", lookup);
+            // Same flag handling as RegexpQueryBuilder.doToQuery, so the
+            // field type and this translator agree on which Lucene
+            // operators the pattern may use and on case folding.
+            int syntaxFlags = r.flags() & (RegExp.ALL | RegExp.DEPRECATED_COMPLEMENT);
+            int matchFlags = r.caseInsensitive() ? RegExp.ASCII_CASE_INSENSITIVE : 0;
+            return LanceStringPatternSql.regexp(r.fieldName(), r.value(), syntaxFlags, matchFlags);
+        }
+        if (builder instanceof PrefixQueryBuilder p) {
+            rejectMultiFieldPath(p.fieldName());
+            requireStringColumn(p.fieldName(), "prefix", lookup);
+            return LanceStringPatternSql.prefix(p.fieldName(), p.value(), p.caseInsensitive());
+        }
         if (builder instanceof BoolQueryBuilder b) {
             return translateBool(b, lookup);
         }
         throw new IllegalArgumentException(
             "[lance_knn] filter type [" + builder.getClass().getSimpleName() + "] is not supported by the pre-filter translator"
         );
+    }
+
+    /** Mapping types whose Lance column is Utf8, the only type {@code LIKE} / {@code regexp_like} / {@code starts_with} accept. */
+    private static final Set<String> STRING_FIELD_TYPES = Set.of("keyword", "text", "lance_text");
+
+    /**
+     * Refuse a pattern query on a field whose mapping type is known
+     * and is not a string type. OpenSearch answers such a query with
+     * 400 ("Can only use wildcard queries on keyword and text fields")
+     * from the field type; lowering it to SQL instead would hand
+     * DataFusion a {@code LIKE} on a numeric column and surface its
+     * planning error. Throwing here sends the coordinator to the
+     * Lucene path, where the field type raises the stock error. An
+     * unknown type ({@code null} from the lookup) passes: callers
+     * without mapping context get the SQL they asked for.
+     */
+    private static void requireStringColumn(String fieldName, String queryName, Function<String, String> lookup) {
+        String fieldType = lookup.apply(fieldName);
+        if (fieldType != null && !STRING_FIELD_TYPES.contains(fieldType)) {
+            throw new IllegalArgumentException(
+                "[lance_knn] " + queryName + " filter on [" + fieldName + "] of type [" + fieldType + "] needs a string column"
+            );
+        }
     }
 
     /**
@@ -407,10 +471,10 @@ public final class LanceKnnFilterTranslator {
             }
             // Escape single quotes by doubling them, which is the standard
             // SQL literal escape that DataFusion accepts.
-            return "'" + s.replace("'", "''") + "'";
+            return LanceStringPatternSql.stringLiteral(s);
         }
         if (value instanceof org.apache.lucene.util.BytesRef b) {
-            return "'" + b.utf8ToString().replace("'", "''") + "'";
+            return LanceStringPatternSql.stringLiteral(b.utf8ToString());
         }
         throw new IllegalArgumentException(
             "[lance_knn] filter value on ["
