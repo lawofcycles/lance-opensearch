@@ -9,10 +9,12 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.stream.Stream;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
+import org.opensearch.client.RestClient;
 import org.opensearch.core.rest.RestStatus;
 
 /**
@@ -864,6 +866,66 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             int totalHits = extractIntPath(body, "hits", "total", "value");
             assertEquals("expected 16 total hits, saw response: " + body, 16, totalHits);
             assertTrue("expected hits[0]._source in response, saw: " + body, body.contains("\"_source\""));
+        }
+    }
+
+    public void testCoordinatorPoolOverloadReturns429AndLeavesNoTaskBehind() throws Exception {
+        // The test cluster runs the lance_coordinator pool with one
+        // thread and a queue of one (build.gradle), so a burst of
+        // concurrent requests makes the pool refuse some of them. A
+        // refused request must come back as 429 naming the pool, the
+        // served ones must be complete and correct, and afterwards no
+        // coordinator or search task may remain: the request whose
+        // work was refused has to be failed, not dropped.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpMultiFragment(120, 20, "overload")) {
+            String indexName = fixture.indexName();
+            String body = "{\"size\":5,\"sort\":[{\"id\":\"desc\"}],\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+            int served = 0;
+            int rejected = 0;
+            try (RestClient wide = concurrentClient(getClusterHosts(), 32)) {
+                // Whether a burst hits the bound depends on how the 32
+                // arrivals interleave with the pool's one thread, so
+                // bursts are repeated until one request was refused.
+                for (int round = 0; round < 20 && rejected == 0; round++) {
+                    for (ConcurrentResult result : postConcurrently(wide, "/" + indexName + "/_search", body, 32)) {
+                        if (result.status() == RestStatus.OK.getStatus()) {
+                            served++;
+                            assertEquals(
+                                "served request must be complete: " + result.body(),
+                                120,
+                                extractIntPath(result.body(), "hits", "total", "value")
+                            );
+                            assertEquals(7140.0d, extractDoublePath(result.body(), "aggregations", "s", "value"), 0.0d);
+                            assertEquals(List.of("5-19", "5-18", "5-17", "5-16", "5-15"), idsOf(hitsOf(result.body())));
+                        } else if (result.status() == RestStatus.TOO_MANY_REQUESTS.getStatus()) {
+                            rejected++;
+                            assertTrue(
+                                "429 body must carry the pool's rejection: " + result.body(),
+                                result.body().contains("rejected execution")
+                            );
+                            assertTrue("429 body must name the pool: " + result.body(), result.body().contains("lance_coordinator"));
+                        } else {
+                            fail("unexpected status " + result.status() + " from the fragment path: " + result.body());
+                        }
+                    }
+                }
+            }
+            assertTrue("expected the one-thread, one-slot pool to refuse a request in 20 bursts of 32", rejected > 0);
+            assertTrue("expected the pool to serve requests as well", served > 0);
+
+            // Every request has answered, so no task of the coordinator
+            // action or of the search it was started for may remain.
+            assertBusy(() -> {
+                String tasks = readAll(
+                    client().performRequest(new Request("GET", "/_tasks?actions=*lance/coordinator*,indices:data/read/search*"))
+                );
+                assertEquals("tasks left behind: " + tasks, 0, countOccurrences(tasks, "\"action\""));
+            });
+
+            String pool = readAll(
+                client().performRequest(new Request("GET", "/_cat/thread_pool/lance_coordinator?format=json&h=name,rejected"))
+            );
+            assertTrue("thread pool stats must count the rejections: " + pool, sumCatColumn(pool, "rejected") > 0);
         }
     }
 }

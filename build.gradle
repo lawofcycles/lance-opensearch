@@ -398,6 +398,13 @@ testClusters.integTest {
     // register a table then assertBusy for the index to appear.
     setting 'lance.namespace.poll_cadence', '1s'
     setting 'path.repo', sharedRepoDir.absolutePath
+    // One coordinator thread and a queue of one so the overload IT can
+    // make the lance_coordinator pool refuse a request with a burst of
+    // 32. The suite runs its other requests one at a time, and one
+    // request needs at most the thread (its entry) plus the queue
+    // slot (its merge), so nothing else is refused.
+    setting 'thread_pool.lance_coordinator.size', '1'
+    setting 'thread_pool.lance_coordinator.queue_size', '1'
     if (lanceLanguageModelHome != null) {
         environment 'LANCE_LANGUAGE_MODEL_HOME', lanceLanguageModelHome
     }
@@ -442,6 +449,10 @@ testClusters.multiNodeIntegTest {
     systemProperty('arrow.allocation.manager.type', 'Unsafe')
     setting 'lance.namespace.poll_cadence', '1s'
     setting 'path.repo', sharedRepoDir.absolutePath
+    // Same one-thread, one-slot lance_coordinator pool as integTest, so
+    // the overload IT can make every coordinating node refuse requests.
+    setting 'thread_pool.lance_coordinator.size', '1'
+    setting 'thread_pool.lance_coordinator.queue_size', '1'
 }
 
 check.dependsOn multiNodeIntegTest

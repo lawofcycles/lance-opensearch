@@ -10,12 +10,20 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
+import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManagerBuilder;
+import org.apache.hc.core5.http.HttpHost;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
+import org.opensearch.client.ResponseException;
+import org.opensearch.client.ResponseListener;
+import org.opensearch.client.RestClient;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
@@ -326,5 +334,91 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
             out.add(hit.get("_id") + " " + sortValuesOf(hit));
         }
         return out;
+    }
+
+    /**
+     * A REST client over {@code hosts} that keeps up to
+     * {@code connections} connections open at once, so a test can have
+     * that many requests in flight. The suite's {@link #client()} caps a
+     * route at ten connections and would serialise the rest.
+     */
+    static RestClient concurrentClient(List<HttpHost> hosts, int connections) {
+        return RestClient.builder(hosts.toArray(new HttpHost[0]))
+            .setHttpClientConfigCallback(
+                builder -> builder.setConnectionManager(
+                    PoolingAsyncClientConnectionManagerBuilder.create().setMaxConnPerRoute(connections).setMaxConnTotal(connections).build()
+                )
+            )
+            .build();
+    }
+
+    /** Status code and body of one request of {@link #postConcurrently}. */
+    record ConcurrentResult(int status, String body) {
+    }
+
+    /**
+     * POST {@code body} to {@code path} {@code count} times at once
+     * through {@code client} and wait for every answer. A non 2xx
+     * status is returned as a result like any other; a transport level
+     * failure (connection refused, timeout) is returned with status
+     * {@code -1} and the exception text as body.
+     */
+    static List<ConcurrentResult> postConcurrently(RestClient client, String path, String body, int count) throws InterruptedException {
+        CountDownLatch latch = new CountDownLatch(count);
+        List<ConcurrentResult> results = Collections.synchronizedList(new ArrayList<>(count));
+        for (int i = 0; i < count; i++) {
+            Request request = new Request("POST", path);
+            request.setJsonEntity(body);
+            client.performRequestAsync(request, new ResponseListener() {
+                @Override
+                public void onSuccess(Response response) {
+                    results.add(toResult(response));
+                    latch.countDown();
+                }
+
+                @Override
+                public void onFailure(Exception e) {
+                    if (e instanceof ResponseException responseException) {
+                        results.add(toResult(responseException.getResponse()));
+                    } else {
+                        results.add(new ConcurrentResult(-1, e.toString()));
+                    }
+                    latch.countDown();
+                }
+            });
+        }
+        assertTrue("concurrent requests did not all complete", latch.await(120, TimeUnit.SECONDS));
+        return new ArrayList<>(results);
+    }
+
+    private static ConcurrentResult toResult(Response response) {
+        try {
+            return new ConcurrentResult(response.getStatusLine().getStatusCode(), readAll(response));
+        } catch (IOException e) {
+            return new ConcurrentResult(response.getStatusLine().getStatusCode(), "unreadable body: " + e);
+        }
+    }
+
+    /**
+     * The rows of a {@code _cat} response asked for with
+     * {@code format=json}: a JSON array of objects whose values are
+     * all strings.
+     */
+    @SuppressWarnings("unchecked")
+    static List<Map<String, Object>> catRowsOf(String jsonArray) {
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, jsonArray)) {
+            return (List<Map<String, Object>>) (List<?>) parser.list();
+        } catch (IOException e) {
+            throw new AssertionError("could not parse JSON: " + jsonArray, e);
+        }
+    }
+
+    /** Sum of the integer column {@code column} over the rows of a {@code _cat} response. */
+    static int sumCatColumn(String jsonArray, String column) {
+        int sum = 0;
+        for (Map<String, Object> row : catRowsOf(jsonArray)) {
+            sum += Integer.parseInt(String.valueOf(row.get(column)));
+        }
+        return sum;
     }
 }
