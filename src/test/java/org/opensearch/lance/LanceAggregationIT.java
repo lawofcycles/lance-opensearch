@@ -10,6 +10,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -502,9 +503,12 @@ public class LanceAggregationIT extends LanceRestTestCase {
         // reserves 5 KB on the same breaker when it is built, so a limit
         // of 8 KB lets the aggregator through and refuses the column. The
         // pushdown is off because a size 0 sum over match_all would
-        // otherwise run inside the Lance scan and never touch the column.
+        // otherwise run inside the Lance scan and never touch the column,
+        // and the collection runs in one slice because every slice builds
+        // its own aggregator tree with its own 5 KB reservation.
         putTransientSetting("lance.aggregation.pushdown", "false");
         putTransientSetting("lance.cache.enabled", "false");
+        putTransientSetting("lance.fragment_path.slices", "1");
         String sum = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}";
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "heap-breaker")) {
             String index = fixture.indexName();
@@ -565,6 +569,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         } finally {
             putTransientSetting("lance.cache.enabled", null);
             putTransientSetting("lance.aggregation.pushdown", null);
+            putTransientSetting("lance.fragment_path.slices", null);
         }
     }
 
@@ -810,11 +815,18 @@ public class LanceAggregationIT extends LanceRestTestCase {
      * {@code took}. The executor logs each request the pushdown answers
      * at DEBUG, so the node log has to gain one line per shape in
      * {@code pushdownShapes} and none for {@code aggregatorShapes} or
-     * for the run with the setting off. Restores the settings afterwards.
+     * for the run with the setting off. The aggregators collect in one
+     * slice: the pushdown cuts a {@code terms} to {@code shard_size} once
+     * per executor, which is what a single slice does, while several
+     * slices each cut their own share and report the doc count error of
+     * the merge, as concurrent segment search does on the shard path.
+     * Restores the settings afterwards.
      */
     static void assertPushdownAgreesWithAggregators(String index, String[] pushdownShapes, String[] aggregatorShapes) throws Exception {
         Request debug = new Request("PUT", "/_cluster/settings");
-        debug.setJsonEntity("{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":\"DEBUG\"}}");
+        debug.setJsonEntity(
+            "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":\"DEBUG\",\"lance.fragment_path.slices\":1}}"
+        );
         client().performRequest(debug);
         try {
             long before = pushdownLogLines(index);
@@ -859,7 +871,9 @@ public class LanceAggregationIT extends LanceRestTestCase {
             }
         } finally {
             Request reset = new Request("PUT", "/_cluster/settings");
-            reset.setJsonEntity("{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":null}}");
+            reset.setJsonEntity(
+                "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":null,\"lance.fragment_path.slices\":null}}"
+            );
             client().performRequest(reset);
         }
     }
@@ -1073,6 +1087,104 @@ public class LanceAggregationIT extends LanceRestTestCase {
             assertEquals(48, ((Number) aggregation(viaShardOnly, "f").get("doc_count")).intValue());
             assertEquals(fanOut, fanOutLogLines(index));
         }
+    }
+
+    /**
+     * The slice count does not change what the executor answers. Every
+     * shape below runs through the Lucene collectors (the pushdown is off
+     * and the sorted pages carry a full text query, which the Lance sort
+     * pushdown does not take) with {@code lance.fragment_path.slices} at
+     * 1 and at 3 against the three fragment hint fixture. The exact
+     * aggregations and the hit pages have to answer byte for byte the
+     * same; the sketches (tdigest percentiles, cardinality) within their
+     * error, since three sketches merged are not one sketch. The
+     * executor's DEBUG line reports the slice count each request ran
+     * with, which is how the test knows the second run really cut the
+     * leaves into three slices.
+     */
+    @SuppressWarnings("unchecked")
+    public void testSliceCountDoesNotChangeTheCollectorAnswers() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 400, "slices")) {
+            String index = fixture.indexName();
+            String[] exact = {
+                "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\",\"show_term_doc_count_error\":true},\"aggs\":{\"st\":{\"stats\":{\"field\":\"rating\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}},\"es\":{\"extended_stats\":{\"field\":\"rating\"}},\"n\":{\"value_count\":{\"field\":\"flag\"}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":7,\"sources\":[{\"cat\":{\"terms\":{\"field\":\"category\"}}},{\"r\":{\"terms\":{\"field\":\"rating\"}}}]},\"aggs\":{\"n\":{\"value_count\":{\"field\":\"id\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"r\":{\"range\":{\"field\":\"rating\",\"ranges\":[{\"to\":300},{\"from\":300,\"to\":700},{\"from\":700}]},\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":250},\"aggs\":{\"tags\":{\"terms\":{\"field\":\"tags\"}}}}}}",
+                "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":500}}},\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\",\"size\":2,\"order\":{\"_key\":\"desc\"}}}}}",
+                "{\"size\":0,\"aggs\":{\"f\":{\"filters\":{\"other_bucket_key\":\"rest\",\"filters\":{\"low\":{\"range\":{\"rating\":{\"lt\":200}}},\"c0\":{\"term\":{\"category\":\"c0\"}}}},\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}}}",
+                "{\"size\":0,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}},\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"}},\"s\":{\"stats\":{\"field\":\"rating\"}}}}",
+                "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}}}",
+                "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}},\"sort\":[{\"rating\":\"desc\"}],\"track_scores\":true}",
+                "{\"size\":5,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"sort\":[{\"category\":\"asc\"},{\"id\":\"desc\"}],\"aggs\":{\"t\":{\"terms\":{\"field\":\"tags\"}}}}" };
+            String tdigest = "{\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"rating\"}}}}";
+            String cardinality =
+                "{\"size\":0,\"aggs\":{\"c\":{\"cardinality\":{\"field\":\"rating\"}},\"k\":{\"cardinality\":{\"field\":\"category\"}}}}";
+            Request debug = new Request("PUT", "/_cluster/settings");
+            debug.setJsonEntity(
+                "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":\"DEBUG\",\"lance.aggregation.pushdown\":false}}"
+            );
+            client().performRequest(debug);
+            try {
+                Map<Integer, List<String>> exactBySlices = new LinkedHashMap<>();
+                Map<Integer, Map<String, Object>> tdigestBySlices = new LinkedHashMap<>();
+                Map<Integer, Map<String, Object>> cardinalityBySlices = new LinkedHashMap<>();
+                for (int slices : new int[] { 1, 3 }) {
+                    Request setSlices = new Request("PUT", "/_cluster/settings");
+                    setSlices.setJsonEntity("{\"transient\":{\"lance.fragment_path.slices\":" + slices + "}}");
+                    client().performRequest(setSlices);
+                    String detail = "3 leaves in " + slices + " slices (lance.fragment_path.slices " + slices + ")";
+                    long before = sliceLogLines(index, detail);
+                    List<String> answers = new ArrayList<>();
+                    for (String shape : exact) {
+                        answers.add(withoutTook(readAll(postJson("/" + index + "/_search", shape))));
+                    }
+                    exactBySlices.put(slices, answers);
+                    tdigestBySlices.put(slices, parse(readAll(postJson("/" + index + "/_search", tdigest))));
+                    cardinalityBySlices.put(slices, parse(readAll(postJson("/" + index + "/_search", cardinality))));
+                    int requests = exact.length + 2;
+                    assertBusy(() -> assertEquals("executor lines reporting " + detail, before + requests, sliceLogLines(index, detail)));
+                }
+                for (int i = 0; i < exact.length; i++) {
+                    assertEquals("three slices differ from one for " + exact[i], exactBySlices.get(1).get(i), exactBySlices.get(3).get(i));
+                }
+                Map<String, Object> oneSlice = (Map<String, Object>) aggregation(tdigestBySlices.get(1), "p").get("values");
+                Map<String, Object> threeSlices = (Map<String, Object>) aggregation(tdigestBySlices.get(3), "p").get("values");
+                assertEquals(oneSlice.keySet(), threeSlices.keySet());
+                for (String percentile : oneSlice.keySet()) {
+                    assertWithinShareOfRange(
+                        "percentile " + percentile,
+                        ((Number) oneSlice.get(percentile)).doubleValue(),
+                        ((Number) threeSlices.get(percentile)).doubleValue(),
+                        0.03d,
+                        999d
+                    );
+                }
+                assertRelativeClose(
+                    "cardinality(rating)",
+                    ((Number) aggregation(cardinalityBySlices.get(1), "c").get("value")).doubleValue(),
+                    ((Number) aggregation(cardinalityBySlices.get(3), "c").get("value")).doubleValue(),
+                    0.01d
+                );
+                assertEquals(
+                    aggregation(cardinalityBySlices.get(1), "k").get("value"),
+                    aggregation(cardinalityBySlices.get(3), "k").get("value")
+                );
+            } finally {
+                Request reset = new Request("PUT", "/_cluster/settings");
+                reset.setJsonEntity(
+                    "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":null,"
+                        + "\"lance.aggregation.pushdown\":null,\"lance.fragment_path.slices\":null}}"
+                );
+                client().performRequest(reset);
+            }
+        }
+    }
+
+    /** Executor lines reporting the slice count of a request for {@code indexName} that also contain {@code detail}. */
+    private static long sliceLogLines(String indexName, String detail) throws IOException {
+        return logLines("lance.dispatch: fragment path slices for [" + indexName + "]", detail);
     }
 
     /**
