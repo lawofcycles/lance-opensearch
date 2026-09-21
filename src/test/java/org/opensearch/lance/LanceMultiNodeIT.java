@@ -1007,7 +1007,10 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals(28, keys.stream().distinct().count());
             assertEquals("{cat=c0, i=81}", keys.get(27));
 
-            // tdigest percentiles: three sketches merged against one.
+            // tdigest percentiles: three sketches merged against one. A
+            // tdigest at the default compression places a quantile within
+            // a couple of percentile points, so the values are compared
+            // as a share of the id range (0 to 299), not relatively.
             String tdigest = "{\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"id\"}}}}";
             Map<String, Object> viaFragments = parse(readAll(postJson("/" + indexName + "/_search", tdigest)));
             Map<String, Object> viaShard = parse(
@@ -1021,7 +1024,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 double actual = ((Number) fragmentValues.get(percentile)).doubleValue();
                 assertTrue(
                     "percentile " + percentile + ": shard path " + expected + ", fragment path " + actual,
-                    Math.abs(expected - actual) <= 0.01d * Math.max(Math.abs(expected), 1d)
+                    Math.abs(expected - actual) <= 0.03d * 299d
                 );
             }
 
