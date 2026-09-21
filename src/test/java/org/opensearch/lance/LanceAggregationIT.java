@@ -880,9 +880,23 @@ public class LanceAggregationIT extends LanceRestTestCase {
      * also contain {@code detail} (for example {@code "in 3 scans"}).
      */
     private static long pushdownLogLines(String indexName, String detail) throws IOException {
+        return logLines("lance.dispatch: aggregation pushdown for [" + indexName + "]", detail);
+    }
+
+    /** Coordinator fan-out lines for {@code indexName}: one per request that took the fragment path. */
+    private static long fanOutLogLines(String indexName) throws IOException {
+        return logLines("lance.dispatch: fan-out index [" + indexName + "]", "");
+    }
+
+    /**
+     * Lines of the test cluster's node logs (the log4j file under
+     * {@code build/testclusters/<task>-<n>/logs}, not the captured
+     * stdout which repeats every line) that contain {@code marker} and
+     * {@code detail}.
+     */
+    private static long logLines(String marker, String detail) throws IOException {
         Path clustersDir = sharedRoot().resolveSibling("testclusters");
         assertTrue("testclusters directory not found at " + clustersDir, Files.isDirectory(clustersDir));
-        String marker = "lance.dispatch: aggregation pushdown for [" + indexName + "]";
         long count = 0;
         try (Stream<Path> files = Files.walk(clustersDir)) {
             for (Path file : files.filter(Files::isRegularFile).toList()) {
@@ -898,5 +912,191 @@ public class LanceAggregationIT extends LanceRestTestCase {
             }
         }
         return count;
+    }
+
+    private static Map<String, Object> parse(String json) throws IOException {
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
+            return parser.map();
+        }
+    }
+
+    /**
+     * Run {@code shape} (a {@code _search} body without its outer braces)
+     * through the fragment path and, with {@code "explain": true} added,
+     * through the shard path, and assert the two responses carry the same
+     * {@code hits.total} and the same {@code aggregations} block. Returns
+     * the fragment path response.
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> assertShardPathAgrees(String index, String shape) throws IOException {
+        Map<String, Object> fragmentPath = parse(readAll(postJson("/" + index + "/_search", "{" + shape + "}")));
+        Map<String, Object> shardPath = parse(
+            readAll(postJson("/" + index + "/_search?request_cache=false", "{\"explain\":true," + shape + "}"))
+        );
+        assertEquals(
+            shape,
+            ((Map<String, Object>) shardPath.get("hits")).get("total"),
+            ((Map<String, Object>) fragmentPath.get("hits")).get("total")
+        );
+        assertEquals(shape, shardPath.get("aggregations"), fragmentPath.get("aggregations"));
+        return fragmentPath;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> aggregation(Map<String, Object> response, String name) {
+        return (Map<String, Object>) ((Map<String, Object>) response.get("aggregations")).get(name);
+    }
+
+    private static void assertRelativeClose(String what, double expected, double actual, double tolerance) {
+        double diff = Math.abs(expected - actual) / Math.max(Math.abs(expected), 1e-9);
+        assertTrue(what + ": expected " + expected + " got " + actual + " (relative diff " + diff + ")", diff <= tolerance);
+    }
+
+    /**
+     * Every aggregation type the allow list newly routes to the fragment
+     * path answers the same as the shard path. The hint fixture has three
+     * fragments of 400 rows: rating {@code (i * 37) % 1000}, null when
+     * {@code i % 5 == 4}; category {@code c(i % 3)}, null when
+     * {@code i % 4 == 3}; tags and flag likewise. The exact aggregations
+     * (stats, extended_stats, range, missing, filter, filters, composite
+     * with paging, hdr percentiles) have to match the shard path byte for
+     * byte; the sketches (tdigest percentiles, cardinality) within their
+     * error. Every fragment path request leaves one fan-out line in the
+     * node log, which is how the test knows the requests did not fall to
+     * the shard path.
+     */
+    @SuppressWarnings("unchecked")
+    public void testWiderAllowListAnswersLikeTheShardPath() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 400, "allow-list")) {
+            String index = fixture.indexName();
+            long fanOutBefore = fanOutLogLines(index);
+            String[] exact = {
+                "\"size\":0,\"aggs\":{\"s\":{\"stats\":{\"field\":\"rating\"}},\"es\":{\"extended_stats\":{\"field\":\"rating\",\"sigma\":2}}}",
+                "\"size\":0,\"query\":{\"term\":{\"category\":\"c1\"}},\"aggs\":{\"s\":{\"stats\":{\"field\":\"rating\"}}}",
+                "\"size\":0,\"aggs\":{\"r\":{\"range\":{\"field\":\"rating\",\"keyed\":true,\"ranges\":[{\"to\":300},{\"from\":300,\"to\":700},{\"from\":700}]},\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}",
+                "\"size\":0,\"aggs\":{\"m\":{\"missing\":{\"field\":\"category\"},\"aggs\":{\"mx\":{\"max\":{\"field\":\"rating\"}}}}}",
+                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"range\":{\"rating\":{\"gte\":500}}},\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"}}}}}",
+                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"bool\":{\"filter\":[{\"exists\":{\"field\":\"category\"}}],\"must_not\":[{\"term\":{\"flag\":true}}]}}}}",
+                "\"size\":0,\"aggs\":{\"fs\":{\"filters\":{\"other_bucket_key\":\"rest\",\"filters\":{\"low\":{\"range\":{\"rating\":{\"lt\":200}}},\"c0\":{\"term\":{\"category\":\"c0\"}}}},\"aggs\":{\"tags\":{\"terms\":{\"field\":\"tags\"}}}}}",
+                "\"size\":0,\"aggs\":{\"fs\":{\"filters\":{\"filters\":[{\"terms\":{\"category\":[\"c0\",\"c2\"]}},{\"match_all\":{}}]}}}",
+                "\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":7,\"sources\":[{\"cat\":{\"terms\":{\"field\":\"category\"}}},{\"r\":{\"terms\":{\"field\":\"rating\"}}}]},\"aggs\":{\"n\":{\"value_count\":{\"field\":\"id\"}}}}}",
+                "\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":5,\"sources\":[{\"cat\":{\"terms\":{\"field\":\"category\",\"order\":\"desc\",\"missing_bucket\":true}}},{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":250}}}]}}}",
+                "\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"rating\",\"hdr\":{\"number_of_significant_value_digits\":3}}}}",
+                "\"size\":0,\"aggs\":{\"pr\":{\"percentile_ranks\":{\"field\":\"rating\",\"values\":[250,750],\"hdr\":{\"number_of_significant_value_digits\":3}}}}",
+                "\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"st\":{\"stats\":{\"field\":\"rating\"}},\"r\":{\"range\":{\"field\":\"rating\",\"ranges\":[{\"to\":500},{\"from\":500}]}}}}}" };
+            int requests = 0;
+            for (String shape : exact) {
+                assertShardPathAgrees(index, shape);
+                requests++;
+            }
+
+            // Composite paging: the second page starts at the after_key of
+            // the first and is the same page on both paths.
+            String firstPage =
+                "\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":7,\"sources\":[{\"cat\":{\"terms\":{\"field\":\"category\"}}},{\"r\":{\"terms\":{\"field\":\"rating\"}}}]}}}";
+            Map<String, Object> page = assertShardPathAgrees(index, firstPage);
+            requests++;
+            Map<String, Object> afterKey = (Map<String, Object>) aggregation(page, "c").get("after_key");
+            assertEquals("c0", afterKey.get("cat"));
+            List<String> keysSeen = new ArrayList<>();
+            for (int pages = 0; pages < 4 && afterKey != null; pages++) {
+                String after = "{\"cat\":\"" + afterKey.get("cat") + "\",\"r\":" + afterKey.get("r") + "}";
+                String nextPage = "\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":7,\"after\":"
+                    + after
+                    + ",\"sources\":[{\"cat\":{\"terms\":{\"field\":\"category\"}}},{\"r\":{\"terms\":{\"field\":\"rating\"}}}]}}}";
+                page = assertShardPathAgrees(index, nextPage);
+                requests++;
+                for (Map<String, Object> bucket : (List<Map<String, Object>>) aggregation(page, "c").get("buckets")) {
+                    keysSeen.add(String.valueOf(bucket.get("key")));
+                }
+                afterKey = (Map<String, Object>) aggregation(page, "c").get("after_key");
+            }
+            assertEquals("four pages of seven buckets", 28, keysSeen.size());
+            assertEquals("no bucket repeats across pages", keysSeen.size(), keysSeen.stream().distinct().count());
+
+            // tdigest percentiles: one sketch per executor on the fragment
+            // path, so the values are within the algorithm's error of the
+            // shard path's single sketch.
+            String tdigest = "{\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"rating\"}}}}";
+            Map<String, Object> viaFragments = parse(readAll(postJson("/" + index + "/_search", tdigest)));
+            requests++;
+            Map<String, Object> viaShard = parse(
+                readAll(postJson("/" + index + "/_search?request_cache=false", "{\"explain\":true," + tdigest.substring(1)))
+            );
+            Map<String, Object> fragmentValues = (Map<String, Object>) aggregation(viaFragments, "p").get("values");
+            Map<String, Object> shardValues = (Map<String, Object>) aggregation(viaShard, "p").get("values");
+            assertEquals(shardValues.keySet(), fragmentValues.keySet());
+            for (String percentile : shardValues.keySet()) {
+                assertRelativeClose(
+                    "percentile " + percentile,
+                    ((Number) shardValues.get(percentile)).doubleValue(),
+                    ((Number) fragmentValues.get(percentile)).doubleValue(),
+                    0.01d
+                );
+            }
+
+            // cardinality: the true count comes from the fixture layout and
+            // the default precision threshold (3000) keeps the HyperLogLog++
+            // in its linear counting range for this many distinct values.
+            java.util.Set<Long> distinctRatings = new java.util.HashSet<>();
+            for (int i = 0; i < 1200; i++) {
+                if (i % 5 != 4) {
+                    distinctRatings.add((long) ((i * 37) % 1000));
+                }
+            }
+            String cardinality =
+                "{\"size\":0,\"aggs\":{\"c\":{\"cardinality\":{\"field\":\"rating\"}},\"k\":{\"cardinality\":{\"field\":\"category\"}}}}";
+            Map<String, Object> counted = parse(readAll(postJson("/" + index + "/_search", cardinality)));
+            requests++;
+            assertRelativeClose(
+                "cardinality(rating)",
+                distinctRatings.size(),
+                ((Number) aggregation(counted, "c").get("value")).doubleValue(),
+                0.01d
+            );
+            assertEquals(3, ((Number) aggregation(counted, "k").get("value")).intValue());
+
+            long fanOut = fanOutLogLines(index);
+            assertEquals("every request above took the fragment path", fanOutBefore + requests, fanOut);
+
+            // A filter bucket over a Lance query and a scripted metric stay
+            // on the shard path: they answer, and leave no fan-out line.
+            String ftsFilter = "{\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}}}}}";
+            Map<String, Object> viaShardOnly = parse(readAll(postJson("/" + index + "/_search", ftsFilter)));
+            assertEquals(48, ((Number) aggregation(viaShardOnly, "f").get("doc_count")).intValue());
+            assertEquals(fanOut, fanOutLogLines(index));
+        }
+    }
+
+    /**
+     * {@code date_range} and a {@code composite} over a
+     * {@code date_histogram} source on a timestamp column, against the
+     * interleaved fixture (ts is 2024-01-01 plus {@code id} days).
+     */
+    public void testDateAggregationsOnTheWiderAllowListAnswerLikeTheShardPath() throws Exception {
+        String suffix = "allow-dates-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeInterleavedTable(scratchDir, tableName, 4, 30);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            long fanOutBefore = fanOutLogLines(indexName);
+            String[] shapes = {
+                "\"size\":0,\"aggs\":{\"d\":{\"date_range\":{\"field\":\"ts\",\"format\":\"yyyy-MM-dd\",\"ranges\":[{\"to\":\"2024-02-01\"},{\"from\":\"2024-02-01\",\"to\":\"2024-04-01\"},{\"from\":\"2024-04-01\"}]},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}",
+                "\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":3,\"sources\":[{\"month\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}},{\"cat\":{\"terms\":{\"field\":\"category\"}}}]},\"aggs\":{\"s\":{\"stats\":{\"field\":\"id\"}}}}}",
+                "\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":3,\"after\":{\"month\":1706745600000,\"cat\":\"c0\"},\"sources\":[{\"month\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}},{\"cat\":{\"terms\":{\"field\":\"category\"}}}]}}}",
+                "\"size\":0,\"query\":{\"range\":{\"ts\":{\"gte\":\"2024-02-15\"}}},\"aggs\":{\"d\":{\"date_range\":{\"field\":\"ts\",\"ranges\":[{\"to\":\"2024-03-01\"},{\"from\":\"2024-03-01\"}]}}}" };
+            for (String shape : shapes) {
+                assertShardPathAgrees(indexName, shape);
+            }
+            assertEquals(fanOutBefore + shapes.length, fanOutLogLines(indexName));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
     }
 }
