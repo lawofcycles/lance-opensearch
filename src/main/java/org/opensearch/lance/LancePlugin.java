@@ -453,6 +453,29 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.NodeScope
     );
 
+    /**
+     * How many Lance scans a fragment path request runs side by side on
+     * one executor when it materialises a column (the aggregator and
+     * sort paths that read a column into the off-heap store or into
+     * heap). The executor cuts its fragments into that many contiguous
+     * groups (fewer when it holds fewer fragments) and scans each group
+     * on the search pool. Lance decodes a scan on its own threads, but
+     * the Java side that reads the batches into the column arrays is one
+     * thread per scan, so a node holding many fragments loads a column
+     * on one core unless the plugin splits the scan. Same default and
+     * bounds as {@link #AGGREGATION_PUSHDOWN_PARALLELISM_SETTING}, for
+     * the same reason: each scan already keeps Lance's decode threads
+     * busy next to the consuming thread. 1 restores the single scan.
+     */
+    public static final Setting<Integer> FRAGMENT_PATH_PARALLELISM_SETTING = Setting.intSetting(
+        "lance.fragment_path.parallelism",
+        Math.max(1, Math.min(32, NativeMemoryLimit.availableCpus() / 2)),
+        1,
+        32,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -480,7 +503,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             FTS_SUBSET_PROBE_MIN_ROWS_SETTING,
             AGGREGATION_PUSHDOWN_SETTING,
             AGGREGATION_PUSHDOWN_PARALLELISM_SETTING,
-            AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING
+            AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING,
+            FRAGMENT_PATH_PARALLELISM_SETTING
         );
     }
 

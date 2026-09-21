@@ -50,10 +50,13 @@ import org.opensearch.lance.engine.LanceWarmCache.SnapshotKey;
  * budget, so {@link #allocatedBytes()} is the exact off-heap footprint
  * the {@code lance_native} circuit breaker has to account for.
  *
- * <p>Loading is one Lance scan per (snapshot, column) over the fragments
- * a request needs and does not have yet, without any filter, so the
- * loaded slice serves every later request over the same snapshot
- * regardless of its query. Numeric columns are sized from the fragment's
+ * <p>Loading scans the fragments a request needs and does not have yet,
+ * without any filter, so the loaded slice serves every later request over
+ * the same snapshot regardless of its query. The scan is cut into
+ * contiguous fragment groups that run side by side
+ * ({@link FragmentGroupScan}, the caller decides how many), because the
+ * Java side that reads the batches into the vectors is otherwise one
+ * thread for the whole request. Numeric columns are sized from the fragment's
  * row count before the scan and written while the batches stream.
  * Keyword columns cannot be sized up front (the dictionary size depends
  * on the values), so their scan interns the values into a heap
@@ -136,7 +139,7 @@ public final class ColumnStore implements Closeable {
      */
     @FunctionalInterface
     private interface Loader<T extends StoreEntry, H> {
-        Loaded<T, H> load(Dataset dataset, String column, Map<Integer, Integer> missing) throws IOException;
+        Loaded<T, H> load(Dataset dataset, String column, Map<Integer, Integer> missing, FragmentGroupScan groupScan) throws IOException;
     }
 
     private final BufferAllocator allocator;
@@ -166,9 +169,10 @@ public final class ColumnStore implements Closeable {
 
     /**
      * Return the numeric or boolean columns for {@code fragmentRows}
-     * (fragment id to row count), loading the missing ones with one scan
-     * of {@code dataset}, and pin every returned column. The caller
-     * unpins them through {@link #unpin} when its request ends.
+     * (fragment id to row count), loading the missing ones by scanning
+     * {@code dataset} through {@code groupScan} (one scan per fragment
+     * group, the groups side by side), and pin every returned column. The
+     * caller unpins them through {@link #unpin} when its request ends.
      *
      * @return one {@link CachedColumn} per requested fragment, or
      *         {@code null} when the missing fragments do not fit the
@@ -183,18 +187,27 @@ public final class ColumnStore implements Closeable {
         Dataset dataset,
         String column,
         boolean isBoolean,
-        Map<Integer, Integer> fragmentRows
+        Map<Integer, Integer> fragmentRows,
+        FragmentGroupScan groupScan
     ) throws IOException {
-        Loaded<CachedColumn, Void> loaded = acquire(snapshot, dataset, column, fragmentRows, CachedColumn.class, (d, c, missing) -> {
-            long needed = 0L;
-            for (int rows : missing.values()) {
-                needed += estimateBytes(rows, isBoolean);
+        Loaded<CachedColumn, Void> loaded = acquire(
+            snapshot,
+            dataset,
+            column,
+            fragmentRows,
+            CachedColumn.class,
+            groupScan,
+            (d, c, missing, scan) -> {
+                long needed = 0L;
+                for (int rows : missing.values()) {
+                    needed += estimateBytes(rows, isBoolean);
+                }
+                if (!makeRoom(needed)) {
+                    return null;
+                }
+                return new Loaded<>(loadNumeric(d, c, isBoolean, missing, scan), Collections.emptyMap());
             }
-            if (!makeRoom(needed)) {
-                return null;
-            }
-            return new Loaded<>(loadNumeric(d, c, isBoolean, missing), Collections.emptyMap());
-        });
+        );
         return loaded == null ? null : loaded.stored();
     }
 
@@ -213,14 +226,20 @@ public final class ColumnStore implements Closeable {
      *         allocator limit (the caller then loads into heap for
      *         itself)
      */
-    public KeywordLoad acquireKeyword(SnapshotKey snapshot, Dataset dataset, String column, Map<Integer, Integer> fragmentRows)
-        throws IOException {
+    public KeywordLoad acquireKeyword(
+        SnapshotKey snapshot,
+        Dataset dataset,
+        String column,
+        Map<Integer, Integer> fragmentRows,
+        FragmentGroupScan groupScan
+    ) throws IOException {
         Loaded<CachedKeywordColumn, HeapKeyword> loaded = acquire(
             snapshot,
             dataset,
             column,
             fragmentRows,
             CachedKeywordColumn.class,
+            groupScan,
             this::loadKeyword
         );
         return loaded == null ? null : new KeywordLoad(loaded.stored(), loaded.heap());
@@ -230,14 +249,20 @@ public final class ColumnStore implements Closeable {
      * Same as {@link #acquireKeyword} for a multi-valued keyword
      * ({@code List<Utf8>}) column.
      */
-    public KeywordArrayLoad acquireKeywordArray(SnapshotKey snapshot, Dataset dataset, String column, Map<Integer, Integer> fragmentRows)
-        throws IOException {
+    public KeywordArrayLoad acquireKeywordArray(
+        SnapshotKey snapshot,
+        Dataset dataset,
+        String column,
+        Map<Integer, Integer> fragmentRows,
+        FragmentGroupScan groupScan
+    ) throws IOException {
         Loaded<CachedKeywordArrayColumn, HeapKeywordArray> loaded = acquire(
             snapshot,
             dataset,
             column,
             fragmentRows,
             CachedKeywordArrayColumn.class,
+            groupScan,
             this::loadKeywordArray
         );
         return loaded == null ? null : new KeywordArrayLoad(loaded.stored(), loaded.heap());
@@ -256,6 +281,7 @@ public final class ColumnStore implements Closeable {
         String column,
         Map<Integer, Integer> fragmentRows,
         Class<T> type,
+        FragmentGroupScan groupScan,
         Loader<T, H> loader
     ) throws IOException {
         Map<Integer, T> found = lookupAndPin(snapshot, column, fragmentRows.keySet(), type);
@@ -284,7 +310,7 @@ public final class ColumnStore implements Closeable {
                 LanceCircuitBreaker.checkAndTrip(BREAKER_LABEL);
                 Loaded<T, H> loaded;
                 try {
-                    loaded = loader.load(dataset, column, missing);
+                    loaded = loader.load(dataset, column, missing, groupScan);
                 } catch (OutOfMemoryException oom) {
                     // The estimate undershot the allocator's rounding, or
                     // a concurrent load of another column took the room.
@@ -406,8 +432,41 @@ public final class ColumnStore implements Closeable {
         void accept(int fragmentId, int offset, FieldVector vector, int row);
     }
 
-    /** Run {@code scan} and hand every non-null cell to {@code consumer}. */
-    private void scan(Dataset dataset, String column, Iterable<Integer> fragmentIds, ScannedCellConsumer consumer) throws IOException {
+    /**
+     * Scan {@code column} over {@code fragmentIds} through
+     * {@code groupScan} and hand every non-null cell to {@code consumer}.
+     * The groups run side by side, so {@code consumer} is called from
+     * several threads at once; every loader here writes each cell to the
+     * structure of its own fragment and a fragment belongs to exactly one
+     * group, so no two threads touch the same structure.
+     */
+    private void scan(
+        Dataset dataset,
+        String column,
+        Iterable<Integer> fragmentIds,
+        FragmentGroupScan groupScan,
+        ScannedCellConsumer consumer
+    ) throws IOException {
+        List<Integer> ids = new ArrayList<>();
+        for (int id : fragmentIds) {
+            ids.add(id);
+        }
+        try {
+            groupScan.run(ids, group -> {
+                scanGroup(dataset, column, group, consumer);
+                return null;
+            });
+        } catch (OutOfMemoryException oom) {
+            throw oom;
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e);
+        }
+    }
+
+    /** One Lance scan of {@code column} over {@code fragmentIds}, every non-null cell handed to {@code consumer}. */
+    private void scanGroup(Dataset dataset, String column, List<Integer> fragmentIds, ScannedCellConsumer consumer) throws IOException {
         scans.incrementAndGet();
         try (LanceScanner scanner = dataset.newScan(scanOf(column, fragmentIds)); ArrowReader reader = scanner.scanBatches()) {
             while (reader.loadNextBatch()) {
@@ -437,8 +496,13 @@ public final class ColumnStore implements Closeable {
      * bucketed by the fragment id carried in {@code _rowaddr}. Returns the
      * vectors as {@link CachedColumn}s (not yet in the map, not pinned).
      */
-    private Map<Integer, CachedColumn> loadNumeric(Dataset dataset, String column, boolean isBoolean, Map<Integer, Integer> missing)
-        throws IOException {
+    private Map<Integer, CachedColumn> loadNumeric(
+        Dataset dataset,
+        String column,
+        boolean isBoolean,
+        Map<Integer, Integer> missing,
+        FragmentGroupScan groupScan
+    ) throws IOException {
         Map<Integer, FieldVector> vectors = new HashMap<>(missing.size() * 2);
         boolean success = false;
         try {
@@ -456,7 +520,7 @@ public final class ColumnStore implements Closeable {
                     vectors.put(entry.getKey(), v);
                 }
             }
-            scan(dataset, column, missing.keySet(), (fragmentId, offset, source, row) -> {
+            scan(dataset, column, missing.keySet(), groupScan, (fragmentId, offset, source, row) -> {
                 FieldVector target = vectors.get(fragmentId);
                 if (target == null) {
                     return;
@@ -491,8 +555,12 @@ public final class ColumnStore implements Closeable {
      * ids are finished into {@link HeapKeyword}s instead, so the scan
      * serves the request either way.
      */
-    private Loaded<CachedKeywordColumn, HeapKeyword> loadKeyword(Dataset dataset, String column, Map<Integer, Integer> missing)
-        throws IOException {
+    private Loaded<CachedKeywordColumn, HeapKeyword> loadKeyword(
+        Dataset dataset,
+        String column,
+        Map<Integer, Integer> missing,
+        FragmentGroupScan groupScan
+    ) throws IOException {
         Map<Integer, int[]> idsByFragment = new HashMap<>(missing.size() * 2);
         Map<Integer, KeywordDictionaryBuilder> builders = new HashMap<>(missing.size() * 2);
         for (Map.Entry<Integer, Integer> entry : missing.entrySet()) {
@@ -501,7 +569,7 @@ public final class ColumnStore implements Closeable {
             idsByFragment.put(entry.getKey(), ids);
             builders.put(entry.getKey(), new KeywordDictionaryBuilder());
         }
-        scan(dataset, column, missing.keySet(), (fragmentId, offset, source, row) -> {
+        scan(dataset, column, missing.keySet(), groupScan, (fragmentId, offset, source, row) -> {
             int[] ids = idsByFragment.get(fragmentId);
             if (ids != null) {
                 ids[offset] = builders.get(fragmentId).intern((VarCharVector) source, row);
@@ -589,7 +657,8 @@ public final class ColumnStore implements Closeable {
     private Loaded<CachedKeywordArrayColumn, HeapKeywordArray> loadKeywordArray(
         Dataset dataset,
         String column,
-        Map<Integer, Integer> missing
+        Map<Integer, Integer> missing,
+        FragmentGroupScan groupScan
     ) throws IOException {
         Map<Integer, int[][]> rowsByFragment = new HashMap<>(missing.size() * 2);
         Map<Integer, KeywordDictionaryBuilder> builders = new HashMap<>(missing.size() * 2);
@@ -597,7 +666,7 @@ public final class ColumnStore implements Closeable {
             rowsByFragment.put(entry.getKey(), new int[entry.getValue()][]);
             builders.put(entry.getKey(), new KeywordDictionaryBuilder());
         }
-        scan(dataset, column, missing.keySet(), (fragmentId, offset, source, row) -> {
+        scan(dataset, column, missing.keySet(), groupScan, (fragmentId, offset, source, row) -> {
             int[][] rows = rowsByFragment.get(fragmentId);
             if (rows != null) {
                 ListVector list = (ListVector) source;
@@ -787,7 +856,7 @@ public final class ColumnStore implements Closeable {
         return loads.get();
     }
 
-    /** Lance scans the store ran, whether their result entered the store or went to a request's heap, for tests. */
+    /** Lance scans the store ran (one per fragment group), whether their result entered the store or went to a request's heap, for tests. */
     long scanCount() {
         return scans.get();
     }

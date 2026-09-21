@@ -82,6 +82,7 @@ import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.engine.ColumnStore;
+import org.opensearch.lance.engine.FragmentGroupScan;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
@@ -234,11 +235,12 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      */
     private final java.util.concurrent.Semaphore concurrencyLimit;
     /**
-     * Pool the aggregation pushdown runs its extra fragment group scans
-     * on: the SEARCH pool this action itself executes on. No pool is
-     * added for it, and the pushdown never blocks on a scan the pool has
-     * not started, so a saturated SEARCH pool degrades the pushdown to
-     * one scan on the request's own thread instead of parking it.
+     * Pool the aggregation pushdown and the column loads run their extra
+     * fragment group scans on: the SEARCH pool this action itself
+     * executes on. No pool is added for it, and a group scan never blocks
+     * on a task the pool has not started, so a saturated SEARCH pool
+     * degrades a request to one scan on its own thread instead of
+     * parking it.
      */
     private final Executor pushdownExecutor;
     /**
@@ -1986,13 +1988,22 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         String filterSql,
         CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper
     ) throws IOException {
+        // Column loads of this reader (the store's and the heap
+        // fallback's) scan the node's fragments in up to
+        // lance.fragment_path.parallelism groups on the SEARCH pool,
+        // so a column is read into its arrays on several cores.
+        FragmentGroupScan groupScan = new FragmentGroupScan(
+            pushdownExecutor,
+            clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_PARALLELISM_SETTING)
+        );
         DirectoryReader lanceReader = LanceDirectoryReader.openForSnapshot(
             new ByteBuffersDirectory(),
             snapshot,
             columnStore,
             effectiveFragmentIds,
             filterSql,
-            circuitBreakerService.getBreaker(CircuitBreaker.REQUEST)
+            circuitBreakerService.getBreaker(CircuitBreaker.REQUEST),
+            groupScan
         );
         OpenSearchDirectoryReader wrapped = null;
         try {

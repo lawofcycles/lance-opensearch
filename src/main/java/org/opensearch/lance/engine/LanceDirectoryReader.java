@@ -174,7 +174,15 @@ public final class LanceDirectoryReader extends DirectoryReader {
         // so every leaf's ensureXxxLoaded delegates through one
         // dataset.newScan per column. See LanceShardColumnCache
         // javadoc for the rationale.
-        LanceShardColumnCache cache = new LanceShardColumnCache(dataset, null, rawLeaves, null, null, requestBreaker);
+        LanceShardColumnCache cache = new LanceShardColumnCache(
+            dataset,
+            null,
+            rawLeaves,
+            null,
+            null,
+            requestBreaker,
+            FragmentGroupScan.SEQUENTIAL
+        );
         for (LanceFragmentLeafReader raw : rawLeaves) {
             raw.setShardColumnCache(cache);
         }
@@ -325,6 +333,27 @@ public final class LanceDirectoryReader extends DirectoryReader {
         String filterSql,
         CircuitBreaker requestBreaker
     ) throws IOException {
+        return openForSnapshot(directory, snapshot, columnStore, fragmentIds, filterSql, requestBreaker, FragmentGroupScan.SEQUENTIAL);
+    }
+
+    /**
+     * Same as {@link #openForSnapshot(Directory, LanceWarmCache.Snapshot,
+     * ColumnStore, List, String, CircuitBreaker)}, with the column scans
+     * of the reader cut into fragment groups by {@code groupScan} so a
+     * request over many fragments loads a column on several threads (see
+     * {@link FragmentGroupScan}). The fragment executor passes the node's
+     * search pool and {@code lance.fragment_path.parallelism}; the six
+     * argument form scans on the calling thread.
+     */
+    public static LanceDirectoryReader openForSnapshot(
+        Directory directory,
+        LanceWarmCache.Snapshot snapshot,
+        ColumnStore columnStore,
+        List<Integer> fragmentIds,
+        String filterSql,
+        CircuitBreaker requestBreaker,
+        FragmentGroupScan groupScan
+    ) throws IOException {
         java.util.Set<Integer> wanted = new java.util.HashSet<>(fragmentIds);
         List<LeafReader> leaves = new ArrayList<>(wanted.size());
         List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>(wanted.size());
@@ -338,7 +367,15 @@ public final class LanceDirectoryReader extends DirectoryReader {
             rawLeaves.add(raw);
             leaves.add(LanceSequentialLeafReader.wrap(raw));
         }
-        LanceShardColumnCache cache = new LanceShardColumnCache(dataset, filterSql, rawLeaves, columnStore, snapshot.key(), requestBreaker);
+        LanceShardColumnCache cache = new LanceShardColumnCache(
+            dataset,
+            filterSql,
+            rawLeaves,
+            columnStore,
+            snapshot.key(),
+            requestBreaker,
+            groupScan
+        );
         for (LanceFragmentLeafReader raw : rawLeaves) {
             raw.setShardColumnCache(cache);
         }
@@ -392,7 +429,15 @@ public final class LanceDirectoryReader extends DirectoryReader {
                 rawLeaves.add(raw);
                 leaves.add(LanceSequentialLeafReader.wrap(raw));
             }
-            LanceShardColumnCache cache = new LanceShardColumnCache(dataset, null, rawLeaves, columnStore, snapshot.key(), requestBreaker);
+            LanceShardColumnCache cache = new LanceShardColumnCache(
+                dataset,
+                null,
+                rawLeaves,
+                columnStore,
+                snapshot.key(),
+                requestBreaker,
+                FragmentGroupScan.SEQUENTIAL
+            );
             for (LanceFragmentLeafReader raw : rawLeaves) {
                 raw.setShardColumnCache(cache);
             }
