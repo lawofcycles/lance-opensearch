@@ -17,13 +17,19 @@ import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.bucket.composite.CompositeKey;
 import org.opensearch.search.aggregations.bucket.composite.InternalComposite;
+import org.opensearch.search.aggregations.bucket.filter.InternalFilter;
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
+import org.opensearch.search.aggregations.bucket.missing.InternalMissing;
 import org.opensearch.search.aggregations.bucket.missing.MissingOrder;
+import org.opensearch.search.aggregations.metrics.AbstractHyperLogLogPlusPlus;
+import org.opensearch.search.aggregations.metrics.InternalCardinality;
 
 /**
  * Builds the aggregation results whose constructors OpenSearch keeps
  * package private: {@link InternalComposite} with its buckets and keys,
- * and {@link InternalDateHistogram} for a nested level. The aggregators
+ * {@link InternalDateHistogram} for a nested level,
+ * {@link InternalCardinality}, {@link InternalMissing} and
+ * {@link InternalFilter}. The aggregators
  * build them from inside their package; the pushdown builds the same
  * objects from Lance group rows and has no other way in.
  *
@@ -86,6 +92,43 @@ final class CoreAggregationResults {
         boolean.class,
         Map.class
     );
+    private static final Constructor<InternalCardinality> CARDINALITY = constructor(
+        InternalCardinality.class,
+        String.class,
+        AbstractHyperLogLogPlusPlus.class,
+        Map.class
+    );
+    private static final Constructor<InternalMissing> MISSING = constructor(
+        InternalMissing.class,
+        String.class,
+        long.class,
+        InternalAggregations.class,
+        Map.class
+    );
+    private static final Constructor<InternalFilter> FILTER = constructor(
+        InternalFilter.class,
+        String.class,
+        long.class,
+        InternalAggregations.class,
+        Map.class
+    );
+
+    /**
+     * A cardinality result over {@code counts}, a single bucket sketch
+     * (bucket 0). Null counts is what the aggregator reports for a bucket
+     * that saw no value.
+     */
+    static InternalCardinality cardinality(String name, AbstractHyperLogLogPlusPlus counts, Map<String, Object> metadata) {
+        return newInstance(CARDINALITY, name, counts, metadata);
+    }
+
+    static InternalMissing missing(String name, long docCount, InternalAggregations aggregations, Map<String, Object> metadata) {
+        return newInstance(MISSING, name, docCount, aggregations, metadata);
+    }
+
+    static InternalFilter filter(String name, long docCount, InternalAggregations aggregations, Map<String, Object> metadata) {
+        return newInstance(FILTER, name, docCount, aggregations, metadata);
+    }
 
     /** A composite key over the raw bucket values ({@code BytesRef}, {@code Long} or {@code Double} per source). */
     static CompositeKey compositeKey(Comparable<?>[] values) {
@@ -155,8 +198,8 @@ final class CoreAggregationResults {
         }
     }
 
-    @SuppressForbidden(reason = "the composite and date histogram result constructors are package private in core; "
-        + "the pushdown builds the same results the aggregators build and has no public way to construct them")
+    @SuppressForbidden(reason = "the composite, date histogram, cardinality, missing and filter result constructors are package private "
+        + "in core; the pushdown builds the same results the aggregators build and has no public way to construct them")
     private static <T> Constructor<T> constructor(Class<T> type, Class<?>... parameterTypes) {
         try {
             Constructor<T> constructor = type.getDeclaredConstructor(parameterTypes);

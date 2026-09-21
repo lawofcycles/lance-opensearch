@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -24,11 +25,14 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.IndexService;
+import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.ExistsQueryBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
+import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
@@ -39,20 +43,26 @@ import org.opensearch.lance.attach.LanceAttachRequest;
 import org.opensearch.lance.attach.LanceAttachResponse;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
+import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.script.Script;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregationBuilders;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.BucketOrder;
+import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
+import org.opensearch.search.aggregations.InternalMultiBucketAggregation;
 import org.opensearch.search.aggregations.PipelineAggregatorBuilders;
+import org.opensearch.search.aggregations.bucket.InternalSingleBucketAggregation;
 import org.opensearch.search.aggregations.bucket.composite.CompositeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.composite.CompositeValuesSourceBuilder;
 import org.opensearch.search.aggregations.bucket.composite.DateHistogramValuesSourceBuilder;
 import org.opensearch.search.aggregations.bucket.composite.HistogramValuesSourceBuilder;
 import org.opensearch.search.aggregations.bucket.composite.InternalComposite;
 import org.opensearch.search.aggregations.bucket.composite.TermsValuesSourceBuilder;
+import org.opensearch.search.aggregations.bucket.filter.FiltersAggregator;
+import org.opensearch.search.aggregations.bucket.filter.InternalFilter;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
 import org.opensearch.search.aggregations.bucket.histogram.InternalHistogram;
@@ -60,6 +70,11 @@ import org.opensearch.search.aggregations.bucket.terms.IncludeExclude;
 import org.opensearch.search.aggregations.bucket.terms.LongTerms;
 import org.opensearch.search.aggregations.bucket.terms.StringTerms;
 import org.opensearch.search.aggregations.metrics.InternalAvg;
+import org.opensearch.search.aggregations.metrics.InternalCardinality;
+import org.opensearch.search.aggregations.metrics.InternalTDigestPercentileRanks;
+import org.opensearch.search.aggregations.metrics.InternalTDigestPercentiles;
+import org.opensearch.search.aggregations.metrics.Percentile;
+import org.opensearch.search.aggregations.metrics.PercentilesMethod;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.SortOrder;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
@@ -314,6 +329,682 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
                     .subAggregation(PipelineAggregatorBuilders.bucketScript("bs", Map.of("x", "s"), new Script("params.x")))
             )
         );
+    }
+
+    public void testStructuralAllowListForTheWiderShapes() {
+        // Metrics the scan computes outright, and the sketch metrics.
+        assertTrue(candidate(AggregationBuilders.stats("s").field("rating")));
+        assertTrue(candidate(AggregationBuilders.extendedStats("e").field("rating").sigma(3)));
+        assertTrue(candidate(AggregationBuilders.cardinality("c").field("category").precisionThreshold(100)));
+        assertTrue(candidate(AggregationBuilders.percentiles("p").field("rating")));
+        assertTrue(candidate(AggregationBuilders.percentiles("p").field("rating").percentiles(10, 50).compression(200)));
+        assertTrue(candidate(AggregationBuilders.percentileRanks("pr", new double[] { 100, 500 }).field("rating")));
+        assertFalse("hdr percentiles", candidate(AggregationBuilders.percentiles("p").field("rating").method(PercentilesMethod.HDR)));
+        assertFalse(
+            "hdr percentile ranks",
+            candidate(AggregationBuilders.percentileRanks("pr", new double[] { 100 }).field("rating").method(PercentilesMethod.HDR))
+        );
+        assertFalse("stats with missing", candidate(AggregationBuilders.stats("s").field("rating").missing(0)));
+        assertTrue(
+            "sketch metrics under a bucket",
+            candidate(
+                AggregationBuilders.terms("c")
+                    .field("category")
+                    .subAggregation(AggregationBuilders.cardinality("u").field("rating"))
+                    .subAggregation(AggregationBuilders.percentiles("p").field("id"))
+            )
+        );
+        // Range, date_range, missing, filter, filters as bucket levels.
+        assertTrue(candidate(AggregationBuilders.range("r").field("rating").addUnboundedTo(300).addRange(300, 700).addUnboundedFrom(700)));
+        assertTrue(candidate(AggregationBuilders.dateRange("d").field("ts").addUnboundedTo("2024-03-01").addUnboundedFrom("2024-03-01")));
+        assertFalse("range without ranges", candidate(AggregationBuilders.range("r").field("rating")));
+        assertTrue(candidate(AggregationBuilders.missing("m").field("category")));
+        assertTrue(candidate(AggregationBuilders.filter("f", new RangeQueryBuilder("rating").gte(500))));
+        assertTrue(candidate(AggregationBuilders.filter("f", new MatchAllQueryBuilder())));
+        assertTrue(
+            candidate(
+                AggregationBuilders.filters(
+                    "fs",
+                    new FiltersAggregator.KeyedFilter("low", new RangeQueryBuilder("rating").lt(200)),
+                    new FiltersAggregator.KeyedFilter("c0", new TermQueryBuilder("category", "c0"))
+                ).otherBucket(true)
+            )
+        );
+        assertTrue(candidate(AggregationBuilders.filters("fs", new TermsQueryBuilder("category", "c0", "c2"), new MatchAllQueryBuilder())));
+        assertFalse(
+            "filters over a Lance query",
+            candidate(
+                AggregationBuilders.filters("fs", new TermQueryBuilder("category", "c0"), new LanceMatchQueryBuilder("body", "hello"))
+            )
+        );
+        assertFalse("filter over a Lance query", candidate(AggregationBuilders.filter("f", new LanceMatchQueryBuilder("body", "hello"))));
+        assertTrue(
+            "metrics and a nested bucket under a range",
+            candidate(
+                AggregationBuilders.range("r")
+                    .field("rating")
+                    .addUnboundedTo(500)
+                    .addUnboundedFrom(500)
+                    .subAggregation(AggregationBuilders.stats("s").field("id"))
+                    .subAggregation(AggregationBuilders.terms("c").field("category"))
+            )
+        );
+        assertTrue(
+            "filters under terms under missing",
+            candidate(
+                AggregationBuilders.missing("m")
+                    .field("category")
+                    .subAggregation(
+                        AggregationBuilders.terms("f")
+                            .field("flag")
+                            .subAggregation(AggregationBuilders.filters("fs", new RangeQueryBuilder("rating").gte(500)))
+                    )
+            )
+        );
+    }
+
+    public void testWiderShapesPlanAgainstTheTableSchema() throws Exception {
+        String indexName = "pushdown-plan-wider";
+        String tableUri = attach(indexName);
+        IndexService indexService = getInstanceFromNode(IndicesService.class).indexService(resolveIndex(indexName));
+        QueryShardContext qsc = indexService.newQueryShardContext(0, null, () -> 0L, null);
+        try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
+            Map<String, LinkedHashMap<String, String>> noMultiFields = Map.of();
+            assertNotNull("stats on integer", plan(dataset, noMultiFields, qsc, AggregationBuilders.stats("s").field("rating")));
+            assertNull("stats on keyword", plan(dataset, noMultiFields, qsc, AggregationBuilders.stats("s").field("category")));
+            assertNotNull(
+                "cardinality on keyword",
+                plan(dataset, noMultiFields, qsc, AggregationBuilders.cardinality("c").field("category"))
+            );
+            assertNotNull("cardinality on boolean", plan(dataset, noMultiFields, qsc, AggregationBuilders.cardinality("c").field("flag")));
+            assertNull(
+                "cardinality on a keyword list",
+                plan(dataset, noMultiFields, qsc, AggregationBuilders.cardinality("c").field("tags"))
+            );
+            assertNull(
+                "two cardinalities would multiply the distinct values",
+                LanceAggregatePushdown.plan(
+                    AggregatorFactories.builder()
+                        .addAggregator(AggregationBuilders.cardinality("a").field("category"))
+                        .addAggregator(AggregationBuilders.cardinality("b").field("rating")),
+                    dataset.getSchema(),
+                    noMultiFields,
+                    qsc
+                )
+            );
+            assertNotNull(
+                "percentiles on integer",
+                plan(dataset, noMultiFields, qsc, AggregationBuilders.percentiles("p").field("rating"))
+            );
+            assertNull("percentiles on keyword", plan(dataset, noMultiFields, qsc, AggregationBuilders.percentiles("p").field("category")));
+            assertNotNull(
+                "range on integer",
+                plan(dataset, noMultiFields, qsc, AggregationBuilders.range("r").field("rating").addUnboundedTo(500).addUnboundedFrom(500))
+            );
+            assertNull(
+                "range on keyword",
+                plan(dataset, noMultiFields, qsc, AggregationBuilders.range("r").field("category").addUnboundedTo(500))
+            );
+            assertNull(
+                "range on boolean",
+                plan(dataset, noMultiFields, qsc, AggregationBuilders.range("r").field("flag").addUnboundedTo(1))
+            );
+            assertNull(
+                "date_range on integer",
+                plan(dataset, noMultiFields, qsc, AggregationBuilders.dateRange("d").field("rating").addUnboundedTo("2024-01-01"))
+            );
+            assertNotNull("missing on keyword", plan(dataset, noMultiFields, qsc, AggregationBuilders.missing("m").field("category")));
+            assertNull("missing on a keyword list", plan(dataset, noMultiFields, qsc, AggregationBuilders.missing("m").field("tags")));
+            assertNotNull(
+                "filters over scalar queries",
+                plan(
+                    dataset,
+                    noMultiFields,
+                    qsc,
+                    AggregationBuilders.filters(
+                        "fs",
+                        new FiltersAggregator.KeyedFilter("a", new RangeQueryBuilder("rating").gte(100).lt(900)),
+                        new FiltersAggregator.KeyedFilter("b", new TermsQueryBuilder("category", "c0", "c1")),
+                        new FiltersAggregator.KeyedFilter("c", new ExistsQueryBuilder("flag")),
+                        new FiltersAggregator.KeyedFilter(
+                            "d",
+                            new BoolQueryBuilder().filter(new TermQueryBuilder("flag", true))
+                                .mustNot(new TermQueryBuilder("category", "c2"))
+                        )
+                    )
+                )
+            );
+            assertNull(
+                "filter over an unmapped field",
+                plan(dataset, noMultiFields, qsc, AggregationBuilders.filter("f", new TermQueryBuilder("nope", 1)))
+            );
+            assertNull(
+                "filter over a keyword list column",
+                plan(dataset, noMultiFields, qsc, AggregationBuilders.filter("f", new TermQueryBuilder("tags", "t1")))
+            );
+            assertNull(
+                "filter over a text column",
+                plan(dataset, noMultiFields, qsc, AggregationBuilders.filter("f", new TermQueryBuilder("body", "hello")))
+            );
+            assertNull(
+                "range filter on a keyword",
+                plan(dataset, noMultiFields, qsc, AggregationBuilders.filter("f", new RangeQueryBuilder("category").gte("c1")))
+            );
+            assertNull(
+                "fractional term on an integer",
+                plan(dataset, noMultiFields, qsc, AggregationBuilders.filter("f", new TermQueryBuilder("rating", 1.5)))
+            );
+            assertNull(
+                "bool with minimum_should_match",
+                plan(
+                    dataset,
+                    noMultiFields,
+                    qsc,
+                    AggregationBuilders.filter(
+                        "f",
+                        new BoolQueryBuilder().should(new TermQueryBuilder("flag", true))
+                            .should(new ExistsQueryBuilder("rating"))
+                            .minimumShouldMatch(2)
+                    )
+                )
+            );
+        }
+    }
+
+    public void testWiderExactShapesEqualAggregatorResults() throws Exception {
+        String indexName = "pushdown-wider-equal";
+        String tableUri = attach(indexName);
+        List<AggregatorFactories.Builder> trees = List.of(
+            AggregatorFactories.builder()
+                .addAggregator(AggregationBuilders.stats("s").field("rating"))
+                .addAggregator(AggregationBuilders.extendedStats("e").field("rating"))
+                .addAggregator(AggregationBuilders.extendedStats("e3").field("id").sigma(3))
+                .addAggregator(AggregationBuilders.stats("f").field("flag")),
+            // range: unbounded ends, keyed, named and unnamed ranges,
+            // overlapping ranges (a row counts in every range it is in),
+            // a range no row falls in, metric and bucket children
+            AggregatorFactories.builder()
+                .addAggregator(AggregationBuilders.range("r").field("rating").addUnboundedTo(300).addRange(300, 700).addUnboundedFrom(700)),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.range("r")
+                        .field("rating")
+                        .keyed(true)
+                        .addRange("low", 0, 500)
+                        .addRange("mid", 250, 750)
+                        .addRange(900, 950)
+                        .addRange("none", 2000, 3000)
+                        .subAggregation(AggregationBuilders.avg("a").field("id"))
+                        .subAggregation(AggregationBuilders.terms("c").field("category"))
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .subAggregation(AggregationBuilders.stats("st").field("rating"))
+                        .subAggregation(AggregationBuilders.range("r").field("rating").addUnboundedTo(500).addUnboundedFrom(500))
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.range("r")
+                        .field("id")
+                        .addRange(0, 250)
+                        .addRange(250, 600)
+                        .subAggregation(
+                            AggregationBuilders.histogram("h")
+                                .field("rating")
+                                .interval(250)
+                                .minDocCount(0)
+                                .subAggregation(AggregationBuilders.terms("c").field("category"))
+                        )
+                ),
+            // missing: alone, with children, nested
+            AggregatorFactories.builder().addAggregator(AggregationBuilders.missing("m").field("category")),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.missing("m")
+                        .field("rating")
+                        .subAggregation(AggregationBuilders.count("n").field("id"))
+                        .subAggregation(AggregationBuilders.terms("c").field("category"))
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.terms("c").field("category").subAggregation(AggregationBuilders.missing("m").field("flag"))
+                ),
+            // filter: every scalar query shape, including a must_not on a
+            // nullable column, a should only bool and a match_all
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.filter("f", new RangeQueryBuilder("rating").gte(500))
+                        .subAggregation(AggregationBuilders.terms("c").field("category"))
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.filter(
+                        "f",
+                        new BoolQueryBuilder().filter(new ExistsQueryBuilder("category")).mustNot(new TermQueryBuilder("flag", true))
+                    )
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(AggregationBuilders.filter("f", new BoolQueryBuilder().mustNot(new TermQueryBuilder("category", "c1")))),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.filter(
+                        "f",
+                        new BoolQueryBuilder().should(new TermQueryBuilder("category", "c1"))
+                            .should(new RangeQueryBuilder("rating").lt(100))
+                    )
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.filter(
+                        "f",
+                        new BoolQueryBuilder().must(new TermQueryBuilder("flag", false)).should(new TermQueryBuilder("category", "c1"))
+                    )
+                ),
+            AggregatorFactories.builder().addAggregator(AggregationBuilders.filter("f", new MatchAllQueryBuilder())),
+            AggregatorFactories.builder()
+                .addAggregator(AggregationBuilders.filter("f", new TermsQueryBuilder("rating", new int[] { 37, 74, 111, 5000 }))),
+            AggregatorFactories.builder().addAggregator(AggregationBuilders.filter("f", new TermQueryBuilder("category", "c7"))),
+            // filters: keyed and anonymous, other bucket with and without
+            // its own key, overlapping filters, a filter matching nothing
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.filters(
+                        "fs",
+                        new FiltersAggregator.KeyedFilter("low", new RangeQueryBuilder("rating").lt(200)),
+                        new FiltersAggregator.KeyedFilter("c0", new TermQueryBuilder("category", "c0")),
+                        new FiltersAggregator.KeyedFilter("none", new TermQueryBuilder("category", "c9"))
+                    ).otherBucket(true).otherBucketKey("rest").subAggregation(AggregationBuilders.max("m").field("rating"))
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.filters(
+                        "fs",
+                        new FiltersAggregator.KeyedFilter("low", new RangeQueryBuilder("rating").lt(600)),
+                        new FiltersAggregator.KeyedFilter("high", new RangeQueryBuilder("rating").gte(400))
+                    ).otherBucket(true)
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.filters("fs", new TermsQueryBuilder("category", "c0", "c2"), new MatchAllQueryBuilder())
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.filters(
+                        "fs",
+                        new FiltersAggregator.KeyedFilter("flagged", new TermQueryBuilder("flag", true)),
+                        new FiltersAggregator.KeyedFilter("rated", new ExistsQueryBuilder("rating"))
+                    )
+                        .subAggregation(
+                            AggregationBuilders.terms("c").field("category").subAggregation(AggregationBuilders.sum("s").field("id"))
+                        )
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.histogram("h")
+                        .field("rating")
+                        .interval(500)
+                        .minDocCount(0)
+                        .subAggregation(
+                            AggregationBuilders.filters("fs", new TermQueryBuilder("flag", true), new TermQueryBuilder("flag", false))
+                                .otherBucket(true)
+                        )
+                )
+        );
+        List<QueryBuilder> queries = List.of(new MatchAllQueryBuilder(), new RangeQueryBuilder("rating").gte(500));
+        for (AggregatorFactories.Builder tree : trees) {
+            for (QueryBuilder query : queries) {
+                compare(tableUri, indexName, query, tree, List.of());
+                compare(tableUri, indexName, query, tree, List.of(1));
+            }
+        }
+    }
+
+    public void testDateRangeAndDateFiltersEqualAggregatorResults() throws Exception {
+        // The interleaved fixture: ts is 2024-01-01 plus id days on a
+        // timestamp[us] column, a keyword category, an integer id.
+        String indexName = "pushdown-date-range";
+        Path dir = createTempDir();
+        String tableUri = LanceTableFactory.writeInterleavedTable(dir, indexName, 3, 40);
+        attachTable(indexName, tableUri);
+        List<AggregatorFactories.Builder> trees = List.of(
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.dateRange("d")
+                        .field("ts")
+                        .addUnboundedTo("2024-02-01")
+                        .addRange("2024-02-01", "2024-04-01")
+                        .addUnboundedFrom("2024-04-01")
+                        .subAggregation(AggregationBuilders.terms("c").field("category"))
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.dateRange("d")
+                        .field("ts")
+                        .format("yyyy-MM-dd")
+                        .keyed(true)
+                        .addRange("q1", "2024-01-01", "2024-04-01")
+                        .addRange("2024-03-15", "2024-05-01")
+                        .subAggregation(AggregationBuilders.stats("s").field("id"))
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.dateRange("d").field("ts").addUnboundedTo(1706745600000L).addUnboundedFrom(1706745600000L)
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(AggregationBuilders.range("r").field("ts").addUnboundedTo(1706745600000L).addUnboundedFrom(1706745600000L)),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .subAggregation(
+                            AggregationBuilders.dateRange("d").field("ts").addUnboundedTo("2024-03-01").addUnboundedFrom("2024-03-01")
+                        )
+                ),
+            // date bounds in filters: inclusive and exclusive, a day
+            // rounded term, a formatted bound with a time zone
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.filters(
+                        "fs",
+                        new FiltersAggregator.KeyedFilter("jan", new RangeQueryBuilder("ts").gte("2024-01-01").lt("2024-02-01")),
+                        new FiltersAggregator.KeyedFilter("feb_on", new RangeQueryBuilder("ts").gt("2024-01-31")),
+                        new FiltersAggregator.KeyedFilter("to_feb", new RangeQueryBuilder("ts").lte("2024-02-01")),
+                        new FiltersAggregator.KeyedFilter("day", new TermQueryBuilder("ts", "2024-01-10")),
+                        new FiltersAggregator.KeyedFilter("millis", new TermQueryBuilder("ts", 1704844800000L)),
+                        new FiltersAggregator.KeyedFilter(
+                            "zoned",
+                            new RangeQueryBuilder("ts").gte("2024/01/10").format("yyyy/MM/dd").timeZone("+09:00")
+                        )
+                    ).otherBucket(true)
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(AggregationBuilders.filter("f", new RangeQueryBuilder("ts").gte(1704844800000L).lte("2024-02-10T12:00:00")))
+        );
+        for (AggregatorFactories.Builder tree : trees) {
+            for (QueryBuilder query : List.of(new MatchAllQueryBuilder(), new RangeQueryBuilder("id").gte(30))) {
+                compare(tableUri, indexName, query, tree, List.of());
+                compare(tableUri, indexName, query, tree, List.of(0, 2));
+            }
+        }
+    }
+
+    public void testSketchMetricsAgreeWithTheAggregatorsWithinTolerance() throws Exception {
+        // 8 fragments of 100 rows: 640 distinct ratings, 3 categories, 2
+        // flags. Cardinality is compared at a relative 1 %, percentiles
+        // within one bin width plus the digest's own slack, both at
+        // parallelism 1 and 4, on every fragment and on the contiguous
+        // fragments 2 and 3 (a gap between the fragments' id ranges would
+        // leave the median undefined and the two digests free to differ),
+        // alone and under buckets.
+        String indexName = "pushdown-sketches";
+        String tableUri = attach(indexName, 8, 100);
+        List<AggregatorFactories.Builder> trees = List.of(
+            AggregatorFactories.builder()
+                .addAggregator(AggregationBuilders.cardinality("r").field("rating"))
+                .addAggregator(AggregationBuilders.percentiles("p").field("rating"))
+                .addAggregator(AggregationBuilders.percentileRanks("pr", new double[] { 100, 500, 900 }).field("rating"))
+                .addAggregator(AggregationBuilders.sum("s").field("rating")),
+            AggregatorFactories.builder().addAggregator(AggregationBuilders.cardinality("c").field("category")),
+            AggregatorFactories.builder().addAggregator(AggregationBuilders.cardinality("f").field("flag").precisionThreshold(10)),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.percentiles("p").field("id").percentiles(1, 25, 50, 75, 99).keyed(false).compression(50)
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .subAggregation(AggregationBuilders.cardinality("u").field("rating"))
+                        .subAggregation(AggregationBuilders.percentiles("p").field("id"))
+                        .subAggregation(AggregationBuilders.avg("a").field("rating"))
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.range("r")
+                        .field("rating")
+                        .addUnboundedTo(500)
+                        .addUnboundedFrom(500)
+                        .subAggregation(AggregationBuilders.cardinality("u").field("category"))
+                        .subAggregation(AggregationBuilders.percentileRanks("pr", new double[] { 250, 750 }).field("rating"))
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    composite("cr", new TermsValuesSourceBuilder("c").field("category")).subAggregation(
+                        AggregationBuilders.cardinality("u").field("rating")
+                    ).subAggregation(AggregationBuilders.percentiles("p").field("rating"))
+                )
+        );
+        List<QueryBuilder> queries = List.of(new MatchAllQueryBuilder(), new RangeQueryBuilder("rating").gte(500));
+        for (AggregatorFactories.Builder tree : trees) {
+            for (QueryBuilder query : queries) {
+                for (List<Integer> fragments : List.of(List.<Integer>of(), List.of(2, 3))) {
+                    LanceFragmentQueryRequest request = request(tableUri, indexName, query, tree, fragments);
+                    setPushdown(false);
+                    LanceFragmentQueryResponse viaAggregators;
+                    try {
+                        viaAggregators = execute(request);
+                    } finally {
+                        setPushdown(null);
+                    }
+                    for (int parallelism : new int[] { 1, 4 }) {
+                        setParallelism(parallelism);
+                        try {
+                            LanceFragmentQueryResponse pushed = execute(request);
+                            String label = tree + " with " + query + " on " + fragments + " at parallelism " + parallelism;
+                            assertEquals(label, viaAggregators.matched(), pushed.matched());
+                            assertSketchesClose(label, viaAggregators.aggregations(), pushed.aggregations(), 1d / 4096d);
+                        } finally {
+                            setParallelism(null);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Share of the rank scale (or, against exact quantiles of gap free
+     * data, of the value range) two TDigests of the same compression can
+     * disagree by when they saw the same data in a different order or
+     * (the pushdown) each bin's rows at the bin's edges and centre: the
+     * sketch merges neighbouring rows into one centroid depending on the
+     * order it met them and interpolates between centroids. Two percent
+     * is well above what compression 100 shows on the fixtures, and well
+     * below the sixteen bin width the bin test measures against it.
+     */
+    private static final double TDIGEST_SLACK = 0.02d;
+
+    public void testPercentilesErrorStaysWithinTheBinWidth() throws Exception {
+        // 8 fragments of 100 rows: ratings (i * 37) % 1000 over the 640
+        // non null rows span 0..999. The pushdown's percentiles are
+        // compared with the exact quantiles of that list: the error is
+        // the bin width plus the digest's own interpolation, and shrinks
+        // from 16 bins to 100 to the default 4096.
+        String indexName = "pushdown-bins";
+        String tableUri = attach(indexName, 8, 100);
+        double[] percents = new double[] { 1, 5, 25, 50, 75, 95, 99 };
+        AggregatorFactories.Builder tree = AggregatorFactories.builder()
+            .addAggregator(AggregationBuilders.percentiles("p").field("rating").percentiles(percents))
+            .addAggregator(AggregationBuilders.percentileRanks("pr", new double[] { 0, 333, 666, 999 }).field("rating"));
+        LanceFragmentQueryRequest request = request(tableUri, indexName, new MatchAllQueryBuilder(), tree, List.of());
+        List<Long> ratings = new ArrayList<>();
+        for (int i = 0; i < 800; i++) {
+            if (i % 5 != 4) {
+                ratings.add((i * 37L) % 1000L);
+            }
+        }
+        Collections.sort(ratings);
+        double range = ratings.get(ratings.size() - 1) - ratings.get(0);
+        Map<Integer, Double> worstByBins = new LinkedHashMap<>();
+        for (Integer bins : new Integer[] { 16, 100, null }) {
+            setBins(bins);
+            try {
+                LanceFragmentQueryResponse pushed = execute(request);
+                InternalTDigestPercentiles percentiles = pushed.aggregations().get("p");
+                double binWidth = range / (bins == null ? 4096 : bins);
+                double worst = 0d;
+                for (double percent : percents) {
+                    double exact = ratings.get((int) Math.min(ratings.size() - 1, Math.floor(percent / 100d * ratings.size())));
+                    double error = Math.abs(percentiles.percentile(percent) - exact);
+                    worst = Math.max(worst, error);
+                    assertTrue(
+                        "bins " + bins + " percentile " + percent + " exact " + exact + " got " + percentiles.percentile(percent),
+                        error <= binWidth + TDIGEST_SLACK * range
+                    );
+                }
+                worstByBins.put(bins == null ? 4096 : bins, worst);
+                InternalTDigestPercentileRanks ranks = pushed.aggregations().get("pr");
+                for (double value : ranks.getKeys()) {
+                    long below = 0;
+                    for (long rating : ratings) {
+                        if (rating <= value) {
+                            below++;
+                        }
+                    }
+                    double exact = 100d * below / ratings.size();
+                    assertTrue(
+                        "bins " + bins + " rank of " + value + " exact " + exact + " got " + ranks.percent(value),
+                        Math.abs(ranks.percent(value) - exact) <= 100d * (binWidth / range + TDIGEST_SLACK)
+                    );
+                }
+            } finally {
+                setBins(null);
+            }
+        }
+        // Sixteen bins are far coarser than the digest's own error, so the
+        // error has to fall when the bins get finer.
+        assertTrue(worstByBins.toString(), worstByBins.get(16) > worstByBins.get(4096));
+
+        // A field of one value: min == max makes one bin whose centre is
+        // the value, so every percentile is exact.
+        AggregatorFactories.Builder constant = AggregatorFactories.builder()
+            .addAggregator(
+                AggregationBuilders.filter("one", new TermQueryBuilder("rating", 37))
+                    .subAggregation(AggregationBuilders.percentiles("p").field("rating"))
+            );
+        LanceFragmentQueryResponse one = execute(request(tableUri, indexName, new MatchAllQueryBuilder(), constant, List.of()));
+        InternalFilter bucket = one.aggregations().get("one");
+        assertEquals(1L, bucket.getDocCount());
+        InternalTDigestPercentiles percentiles = bucket.getAggregations().get("p");
+        for (Percentile percentile : percentiles) {
+            assertEquals(37d, percentile.getValue(), 0d);
+        }
+        // No value at all: the empty digest the aggregator reports.
+        AggregatorFactories.Builder none = AggregatorFactories.builder()
+            .addAggregator(
+                AggregationBuilders.filter("none", new TermQueryBuilder("category", "c9"))
+                    .subAggregation(AggregationBuilders.percentiles("p").field("rating"))
+            );
+        compare(tableUri, indexName, new MatchAllQueryBuilder(), none, List.of());
+    }
+
+    /**
+     * Compares two aggregation trees: exact aggregations must be equal,
+     * a cardinality within a relative 1 %, a tdigest percentile within
+     * {@code share} of the range of the aggregators' own percentiles
+     * (the bin width the pushdown sketched with) plus
+     * {@link #TDIGEST_SLACK} of the range for the TDigest's own
+     * interpolation error, which the two sketches do not share point for
+     * point; a percentile rank within the same share of the rank scale.
+     */
+    private static void assertSketchesClose(String label, InternalAggregations expected, InternalAggregations actual, double share) {
+        List<InternalAggregation> expectedList = expected.copyResults();
+        List<InternalAggregation> actualList = actual.copyResults();
+        assertEquals(label, expectedList.size(), actualList.size());
+        for (int i = 0; i < expectedList.size(); i++) {
+            InternalAggregation e = expectedList.get(i);
+            InternalAggregation a = actualList.get(i);
+            assertEquals(label, e.getName(), a.getName());
+            if (e instanceof InternalCardinality ec) {
+                InternalCardinality ac = (InternalCardinality) a;
+                double diff = Math.abs(ec.getValue() - ac.getValue()) / Math.max(1d, ec.getValue());
+                assertTrue(label + ": cardinality " + e.getName() + " expected " + ec.getValue() + " got " + ac.getValue(), diff <= 0.01d);
+            } else if (e instanceof InternalTDigestPercentiles ep) {
+                InternalTDigestPercentiles ap = (InternalTDigestPercentiles) a;
+                // Compared in rank space: the reference digest's rank of
+                // the pushdown's value has to be within the tolerance of
+                // the requested percent. A value comparison would charge
+                // the pushdown for the data's gaps (one rank across an
+                // empty stretch of the range is a large value move) and
+                // for TDigest's own order dependence, which both sketches
+                // have. The bin width is the only error the pushdown adds,
+                // so the value is widened by it before it is ranked.
+                double range = ep.getState().size() == 0 ? 0d : ep.getState().getMax() - ep.getState().getMin();
+                double pointShare = ep.getState().size() == 0 ? 0d : 100d / ep.getState().size();
+                for (double key : ep.getKeys()) {
+                    double expectedValue = ep.percentile(key);
+                    double actualValue = ap.percentile(key);
+                    if (Double.isNaN(expectedValue)) {
+                        assertTrue(label + ": percentile " + key + " expected NaN got " + actualValue, Double.isNaN(actualValue));
+                        continue;
+                    }
+                    double binWidth = share * range;
+                    double rankBelow = 100d * ep.getState().cdf(actualValue - binWidth);
+                    double rankAbove = 100d * ep.getState().cdf(actualValue + binWidth);
+                    double tolerance = 100d * TDIGEST_SLACK + pointShare + 1e-9d;
+                    assertTrue(
+                        label
+                            + ": percentile "
+                            + key
+                            + " expected "
+                            + expectedValue
+                            + " got "
+                            + actualValue
+                            + " ranked "
+                            + rankBelow
+                            + ".."
+                            + rankAbove,
+                        key >= rankBelow - tolerance && key <= rankAbove + tolerance
+                    );
+                }
+            } else if (e instanceof InternalTDigestPercentileRanks ep) {
+                InternalTDigestPercentileRanks ap = (InternalTDigestPercentileRanks) a;
+                double pointShare = ep.getState().size() == 0 ? 0d : 100d / ep.getState().size();
+                for (double key : ep.getKeys()) {
+                    double expectedValue = ep.percent(key);
+                    double actualValue = ap.percent(key);
+                    if (Double.isNaN(expectedValue)) {
+                        assertTrue(label + ": rank of " + key + " expected NaN got " + actualValue, Double.isNaN(actualValue));
+                        continue;
+                    }
+                    assertTrue(
+                        label + ": percentile rank of " + key + " expected " + expectedValue + " got " + actualValue,
+                        Math.abs(expectedValue - actualValue) <= 100d * (share + TDIGEST_SLACK) + pointShare + 1e-9d
+                    );
+                }
+            } else if (e instanceof InternalMultiBucketAggregation<?, ?> eb) {
+                InternalMultiBucketAggregation<?, ?> ab = (InternalMultiBucketAggregation<?, ?>) a;
+                assertEquals(label, eb.getBuckets().size(), ab.getBuckets().size());
+                for (int b = 0; b < eb.getBuckets().size(); b++) {
+                    assertEquals(label, eb.getBuckets().get(b).getKey(), ab.getBuckets().get(b).getKey());
+                    assertEquals(label, eb.getBuckets().get(b).getDocCount(), ab.getBuckets().get(b).getDocCount());
+                    assertSketchesClose(
+                        label + " > " + eb.getBuckets().get(b).getKey(),
+                        (InternalAggregations) eb.getBuckets().get(b).getAggregations(),
+                        (InternalAggregations) ab.getBuckets().get(b).getAggregations(),
+                        share
+                    );
+                }
+            } else if (e instanceof InternalSingleBucketAggregation eb) {
+                InternalSingleBucketAggregation ab = (InternalSingleBucketAggregation) a;
+                assertEquals(label, eb.getDocCount(), ab.getDocCount());
+                assertSketchesClose(label + " > " + e.getName(), eb.getAggregations(), ab.getAggregations(), share);
+            } else {
+                assertEquals(label, e, a);
+            }
+        }
+    }
+
+    private void setBins(Integer value) {
+        Settings.Builder settings = Settings.builder();
+        if (value == null) {
+            settings.putNull(LancePlugin.AGGREGATION_PERCENTILES_BINS_SETTING.getKey());
+        } else {
+            settings.put(LancePlugin.AGGREGATION_PERCENTILES_BINS_SETTING.getKey(), value);
+        }
+        client().admin().cluster().updateSettings(new ClusterUpdateSettingsRequest().transientSettings(settings)).actionGet();
     }
 
     public void testPlanResolvesFieldsAgainstTheTableSchema() throws Exception {

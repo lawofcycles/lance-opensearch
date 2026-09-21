@@ -30,6 +30,7 @@ import org.opensearch.index.mapper.Mapper;
 import org.opensearch.indices.breaker.BreakerSettings;
 import org.opensearch.lance.attach.LanceAttachAction;
 import org.opensearch.lance.attach.TransportLanceAttachAction;
+import org.opensearch.lance.dispatch.LanceAggregatePushdown;
 import org.opensearch.lance.dispatch.LanceDispatchActionFilter;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -395,8 +396,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
 
     /**
      * Whether a {@code size: 0} aggregation request whose shape the
-     * scan can compute (metrics; {@code terms} / {@code histogram} /
-     * fixed interval {@code date_histogram} nested up to three levels
+     * scan can compute (metrics including stats, cardinality and tdigest
+     * percentiles; {@code terms} / {@code histogram} / {@code date_histogram}
+     * / {@code range} / {@code date_range} / {@code filter} /
+     * {@code filters} / {@code missing} nested up to three levels
      * with metric children; {@code composite} over terms and fixed
      * interval date_histogram sources; over a {@code match_all} or
      * scalar filter query; see
@@ -453,6 +456,29 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         1_000_000,
         1,
         Setting.Property.NodeScope
+    );
+
+    /**
+     * Number of equal width bins a pushed down tdigest {@code percentiles}
+     * / {@code percentile_ranks} cuts the value range into. The executor
+     * asks Lance for the minimum and maximum of the field, then for the
+     * row count of every bin of width {@code (max - min) / bins}, and
+     * feeds each bin's centre and count to the TDigest sketch the
+     * coordinator merges. A reported percentile is therefore within one
+     * bin width of the value the aggregators, which sketch every
+     * document, would report; more bins mean a finer answer and more
+     * rows for the executor to read (one per non empty bin, per bucket
+     * of the enclosing aggregation). Dynamic so the trade-off can be
+     * tuned without a restart; the executor reads it when it plans a
+     * request.
+     */
+    public static final Setting<Integer> AGGREGATION_PERCENTILES_BINS_SETTING = Setting.intSetting(
+        "lance.aggregation.percentiles_bins",
+        4096,
+        16,
+        1_000_000,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
     );
 
     /**
@@ -573,6 +599,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             AGGREGATION_PUSHDOWN_SETTING,
             AGGREGATION_PUSHDOWN_PARALLELISM_SETTING,
             AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING,
+            AGGREGATION_PERCENTILES_BINS_SETTING,
             FRAGMENT_PATH_PARALLELISM_SETTING,
             FRAGMENT_PATH_SLICES_SETTING,
             ATTACH_WARM_INDEXES_SETTING,
@@ -874,6 +901,12 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LanceFtsQuery.setSubsetProbeMinRows(FTS_SUBSET_PROBE_MIN_ROWS_SETTING.get(environment.settings()));
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(FTS_SUBSET_PROBE_MIN_ROWS_SETTING, LanceFtsQuery::setSubsetProbeMinRows);
+
+        // The percentiles bin count is read by the aggregation pushdown
+        // when it plans a request, from the same kind of static holder.
+        LanceAggregatePushdown.setPercentilesBins(AGGREGATION_PERCENTILES_BINS_SETTING.get(environment.settings()));
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(AGGREGATION_PERCENTILES_BINS_SETTING, LanceAggregatePushdown::setPercentilesBins);
 
         // Register the shard-free dispatch ActionFilter. It
         // intercepts every _search request against Lance-backed

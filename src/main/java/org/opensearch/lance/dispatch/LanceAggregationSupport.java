@@ -17,6 +17,7 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
+import org.opensearch.lance.query.substrait.SubstraitExpressions;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.InternalOrder;
@@ -33,6 +34,7 @@ import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval
 import org.opensearch.search.aggregations.bucket.histogram.Histogram;
 import org.opensearch.search.aggregations.bucket.histogram.HistogramAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.missing.MissingAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.range.AbstractRangeBuilder;
 import org.opensearch.search.aggregations.bucket.range.DateRangeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
@@ -43,6 +45,7 @@ import org.opensearch.search.aggregations.metrics.MaxAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.MinAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.PercentileRanksAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.PercentilesAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.PercentilesConfig;
 import org.opensearch.search.aggregations.metrics.StatsAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.SumAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.ValueCountAggregationBuilder;
@@ -87,7 +90,11 @@ import org.opensearch.search.builder.SearchSourceBuilder;
  * fragment path where the single shard of the shard path keeps one
  * sketch over the whole table, so their values can differ from the shard
  * path within the algorithm's error, as they would between shards of an
- * ordinary index.
+ * ordinary index. When the aggregation pushdown answers them, the
+ * executor's sketch is fed from the groups Lance returns (the distinct
+ * values for {@code cardinality}, a bin histogram for
+ * {@code percentiles}) instead of from every document; see
+ * {@link LanceAggregatePushdown} for the error that adds.
  */
 final class LanceAggregationSupport {
 
@@ -399,16 +406,24 @@ final class LanceAggregationSupport {
     }
 
     /**
-     * A sum / avg / min / max / value_count over a field, with no
-     * script, no {@code missing} substitute and no {@code value_type}
-     * hint, and no children of its own.
+     * A metric the scan computes, over a field with no script, no
+     * {@code missing} substitute and no {@code value_type} hint, and no
+     * children of its own: sum / avg / min / max / value_count / stats /
+     * extended_stats, cardinality, and tdigest percentiles /
+     * percentile_ranks ({@code hdr} keeps its own histogram and stays on
+     * the aggregators).
      */
     static boolean isPushdownMetric(AggregationBuilder builder) {
         boolean metric = builder instanceof SumAggregationBuilder
             || builder instanceof AvgAggregationBuilder
             || builder instanceof MinAggregationBuilder
             || builder instanceof MaxAggregationBuilder
-            || builder instanceof ValueCountAggregationBuilder;
+            || builder instanceof ValueCountAggregationBuilder
+            || builder instanceof StatsAggregationBuilder
+            || builder instanceof ExtendedStatsAggregationBuilder
+            || builder instanceof CardinalityAggregationBuilder
+            || (builder instanceof PercentilesAggregationBuilder percentiles && isTDigest(percentiles.percentilesConfig()))
+            || (builder instanceof PercentileRanksAggregationBuilder ranks && isTDigest(ranks.percentilesConfig()));
         if (!metric) {
             return false;
         }
@@ -418,6 +433,11 @@ final class LanceAggregationSupport {
         return hasPlainFieldSource((ValuesSourceAggregationBuilder<?>) builder);
     }
 
+    /** The default percentiles method is tdigest, so a request without a {@code tdigest} / {@code hdr} block qualifies. */
+    private static boolean isTDigest(PercentilesConfig config) {
+        return config == null || config instanceof PercentilesConfig.TDigest;
+    }
+
     /**
      * One bucket level the pushdown builds: {@code terms} ordered by
      * {@code _count} descending or by {@code _key} with the default
@@ -425,12 +445,32 @@ final class LanceAggregationSupport {
      * {@code histogram} with {@code offset} 0 and no bounds;
      * {@code date_histogram} with a {@code fixed_interval} or a
      * {@code calendar_interval} that {@link #calendarUnit} knows,
-     * {@code offset} 0, no bounds and no time zone. The remaining options ({@code size},
+     * {@code offset} 0, no bounds and no time zone; {@code range} and
+     * {@code date_range} with one to {@link SubstraitExpressions#MAX_MASK_CONDITIONS}
+     * ranges; {@code missing}; {@code filter} and {@code filters} (one to
+     * that many filters) whose every query is a scalar filter
+     * ({@link #isFilterQuerySupported}) the executor can spell as a
+     * Substrait predicate. The remaining options ({@code size},
      * {@code shard_size}, {@code keyed}, {@code min_doc_count} on the
-     * histograms, {@code order} on the histograms) are honoured by the
-     * result the executor builds or by the coordinator's reduce.
+     * histograms, {@code order} on the histograms, {@code other_bucket}
+     * on {@code filters}) are honoured by the result the executor builds
+     * or by the coordinator's reduce.
      */
     static boolean isPushdownBucket(AggregationBuilder builder) {
+        if (builder instanceof FilterAggregationBuilder filter) {
+            return isFilterQuerySupported(filter.getFilter());
+        }
+        if (builder instanceof FiltersAggregationBuilder filters) {
+            if (filters.filters().isEmpty() || filters.filters().size() > SubstraitExpressions.MAX_MASK_CONDITIONS) {
+                return false;
+            }
+            for (FiltersAggregator.KeyedFilter keyed : filters.filters()) {
+                if (!isFilterQuerySupported(keyed.filter())) {
+                    return false;
+                }
+            }
+            return true;
+        }
         if (!(builder instanceof ValuesSourceAggregationBuilder<?> valuesSource) || !hasPlainFieldSource(valuesSource)) {
             return false;
         }
@@ -458,7 +498,10 @@ final class LanceAggregationSupport {
                 && dateHistogram.hardBounds() == null
                 && dateHistogram.timeZone() == null;
         }
-        return false;
+        if (builder instanceof AbstractRangeBuilder<?, ?> range) {
+            return !range.ranges().isEmpty() && range.ranges().size() <= SubstraitExpressions.MAX_MASK_CONDITIONS;
+        }
+        return builder instanceof MissingAggregationBuilder;
     }
 
     /**
