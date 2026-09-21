@@ -594,16 +594,47 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             );
             assertFalse("track_total_hits:false should omit hits.total: " + trackFalseBody, trackFalseBody.contains("\"total\":{"));
 
-            // A scalar filter counts through Dataset.countRows(sql):
-            // exact on the executor, capped by the coordinator.
+            // A scalar filter is counted on the executor by a Lance
+            // scan restricted to its fragments: under an integer
+            // bound the scan stops at bound + 1 rows and reports a
+            // lower bound, which the coordinator answers as the bound
+            // with gte; with track_total_hits: true (and so _count)
+            // Lance counts natively and the value is exact. id >= 4
+            // matches eight of the twelve rows, all in fragments 1
+            // and 2.
             String filterBound = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":5}")
             );
             assertEquals(5, extractIntPath(filterBound, "hits", "total", "value"));
             assertTrue(filterBound.contains("\"relation\":\"gte\""));
+            // Bound one below the match count: the limit of eight
+            // fills exactly, which still means more than seven.
+            String filterEdge = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":7}")
+            );
+            assertEquals(7, extractIntPath(filterEdge, "hits", "total", "value"));
+            assertTrue(filterEdge.contains("\"relation\":\"gte\""));
+            // Bound equal to the match count: the scan of nine rows
+            // comes back with eight, so the count is exact.
+            String filterAtBound = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":8}")
+            );
+            assertEquals(8, extractIntPath(filterAtBound, "hits", "total", "value"));
+            assertTrue(filterAtBound.contains("\"relation\":\"eq\""));
+            // Default bound (10,000) with hits: exact because the
+            // table has fewer matches than the bound.
+            String filterDefault = readAll(postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"term\":{\"id\":5}}}"));
+            assertEquals(1, extractIntPath(filterDefault, "hits", "total", "value"));
+            assertTrue(filterDefault.contains("\"relation\":\"eq\""));
+            assertTrue("hit for id 5 sits at fragment 1 offset 1: " + filterDefault, filterDefault.contains("\"_id\":\"1-1\""));
             String filterExact = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}}}"));
             assertEquals(8, extractIntPath(filterExact, "hits", "total", "value"));
             assertTrue(filterExact.contains("\"relation\":\"eq\""));
+            String filterTrue = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":true}")
+            );
+            assertEquals(8, extractIntPath(filterTrue, "hits", "total", "value"));
+            assertTrue(filterTrue.contains("\"relation\":\"eq\""));
 
             // _count agrees with `_search size 0` for match_all, a
             // scalar filter and an FTS query, and each _count request

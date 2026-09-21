@@ -135,6 +135,41 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 postJson("/" + indexName + "/_count", "{\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"4\"}}}")
             );
             assertEquals("_count for token 4: " + singleCountBody, 1, extractIntPath(singleCountBody, "count"));
+
+            // A scalar filter over the same three executors: id >= 4
+            // matches no row of fragment 0 and four rows of each of
+            // fragments 1 and 2. The three nodes each count their own
+            // fragments and the coordinator sums them, so the answers
+            // equal the single node ones in LanceSearchDispatchIT.
+            String rangeDefault = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}}}")
+            );
+            assertEquals("range default bound: " + rangeDefault, 8, extractIntPath(rangeDefault, "hits", "total", "value"));
+            assertTrue(rangeDefault.contains("\"relation\":\"eq\""));
+            String rangeTrue = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":true}")
+            );
+            assertEquals("range exact: " + rangeTrue, 8, extractIntPath(rangeTrue, "hits", "total", "value"));
+            assertTrue(rangeTrue.contains("\"relation\":\"eq\""));
+            // A bound of 5: each matching executor scans with a limit
+            // of six, gets its four rows back short of the limit and
+            // reports them exact; the coordinator sums to eight, above
+            // the bound, and answers the bound with gte.
+            String rangeBound = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":5}")
+            );
+            assertEquals("range bound 5: " + rangeBound, 5, extractIntPath(rangeBound, "hits", "total", "value"));
+            assertTrue(rangeBound.contains("\"relation\":\"gte\""));
+            // A bound of 3 is filled on each of the two matching
+            // executors (limit four, four rows), so each reports a
+            // lower bound and the coordinator answers gte at the bound.
+            String rangeLow = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":3}")
+            );
+            assertEquals("range bound 3: " + rangeLow, 3, extractIntPath(rangeLow, "hits", "total", "value"));
+            assertTrue(rangeLow.contains("\"relation\":\"gte\""));
+            String rangeCount = readAll(postJson("/" + indexName + "/_count", "{\"query\":{\"range\":{\"id\":{\"gte\":4}}}}"));
+            assertEquals("_count for id >= 4: " + rangeCount, 8, extractIntPath(rangeCount, "count"));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
