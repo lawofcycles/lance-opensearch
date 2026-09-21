@@ -873,6 +873,168 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
+     * The wider pushdown shapes on three executors, one fragment of the
+     * interleaved fixture each (ids {@code i % 3 == f} on fragment
+     * {@code f}, ts {@code 2024-01-01 + id days}, categories c0 to c2).
+     * The exact shapes (stats, extended_stats, range, date_range,
+     * missing, filter, filters, nested) have to answer the same as the
+     * aggregators and as the single shard path; cardinality and tdigest
+     * percentiles, which the pushdown builds from the distinct values
+     * and a bin histogram, have to land within their tolerance of the
+     * shard path's single sketch: a relative 1 % for the count, and for
+     * the percentiles 3 % of the value range, the tolerance the single
+     * node IT allows two tdigests of the same data. Every request has to
+     * leave a pushdown line on all three data nodes.
+     */
+    @SuppressWarnings("unchecked")
+    public void testWiderAggregationPushdownAcrossThreeNodes() throws Exception {
+        String suffix = "mn-agg-wider-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 3;
+        LanceTableFactory.writeInterleavedTable(scratchDir, tableName, fragments, 100);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        List<String> exact = List.of(
+            "\"size\":0,\"aggs\":{\"s\":{\"stats\":{\"field\":\"id\"}},\"e\":{\"extended_stats\":{\"field\":\"id\",\"sigma\":2}}}",
+            "\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"1d\"},\"aggs\":{\"s\":{\"stats\":{\"field\":\"id\"}}}}}",
+            "\"size\":0,\"aggs\":{\"r\":{\"range\":{\"field\":\"id\",\"keyed\":true,\"ranges\":[{\"to\":100},{\"from\":50,\"to\":250},{\"from\":250},{\"from\":900}]},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}",
+            "\"size\":0,\"aggs\":{\"d\":{\"date_range\":{\"field\":\"ts\",\"format\":\"yyyy-MM-dd\",\"ranges\":[{\"to\":\"2024-02-01\"},{\"from\":\"2024-02-01\",\"to\":\"2024-06-01\"},{\"from\":\"2024-06-01\"}]},\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}",
+            "\"size\":0,\"aggs\":{\"m\":{\"missing\":{\"field\":\"category\"}}}",
+            "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"bool\":{\"filter\":[{\"range\":{\"id\":{\"gte\":100}}}],\"must_not\":[{\"term\":{\"category\":\"c1\"}}]}},\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"}}}}}",
+            "\"size\":0,\"aggs\":{\"fs\":{\"filters\":{\"other_bucket_key\":\"rest\",\"filters\":{\"low\":{\"range\":{\"id\":{\"lt\":120}}},\"c0\":{\"term\":{\"category\":\"c0\"}},\"jan\":{\"range\":{\"ts\":{\"lt\":\"2024-02-01\"}}}}},\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}}",
+            "\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":30}}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"r\":{\"range\":{\"field\":\"id\",\"ranges\":[{\"to\":150},{\"from\":150}]},\"aggs\":{\"e\":{\"extended_stats\":{\"field\":\"id\"}}}}}}}"
+        );
+        List<String> sketches = List.of(
+            "\"size\":0,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"id\"}},\"k\":{\"cardinality\":{\"field\":\"category\"}}}",
+            "\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"id\"}},\"pr\":{\"percentile_ranks\":{\"field\":\"id\",\"values\":[75,225]}}}",
+            "\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"id\"}},\"p\":{\"percentiles\":{\"field\":\"id\",\"percents\":[50,90]}}}}}"
+        );
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+            assertEquals("fixture assumes one fragment per data node", fragments, dataNodeCount());
+            updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
+            try {
+                List<Map<String, Object>> pushed = new ArrayList<>();
+                for (String shape : exact) {
+                    pushed.add(assertAggregationsMatchShardPath(indexName, shape));
+                }
+                List<Map<String, Object>> pushedSketches = new ArrayList<>();
+                for (String shape : sketches) {
+                    Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
+                    Map<String, Object> shardPath = parse(
+                        readAll(postJson("/" + indexName + "/_search?request_cache=false", "{\"explain\":true," + shape + "}"))
+                    );
+                    assertSketchesClose(shape, shardPath.get("aggregations"), fragmentPath.get("aggregations"), 300d);
+                    pushedSketches.add(fragmentPath);
+                }
+                // Exactly 300 distinct ids and 3 categories, both in the
+                // linear counting range of the default precision.
+                assertEquals(300, extractIntPath(pushedSketches.get(0), "aggregations", "u", "value"));
+                assertEquals(3, extractIntPath(pushedSketches.get(0), "aggregations", "k", "value"));
+
+                updateClusterSetting("lance.aggregation.pushdown", "false");
+                try {
+                    for (int i = 0; i < exact.size(); i++) {
+                        Map<String, Object> viaAggregators = parse(
+                            readAll(postJson("/" + indexName + "/_search", "{" + exact.get(i) + "}"))
+                        );
+                        assertEquals(exact.get(i), viaAggregators.get("aggregations"), pushed.get(i).get("aggregations"));
+                        assertEquals(exact.get(i), viaAggregators.get("hits"), pushed.get(i).get("hits"));
+                    }
+                } finally {
+                    updateClusterSetting("lance.aggregation.pushdown", null);
+                }
+                // The pushdown answered on every data node for each of the
+                // requests above (the shard path and the aggregator run
+                // leave no such line).
+                assertBusy(() -> {
+                    Set<String> nodes = new HashSet<>();
+                    int lines = 0;
+                    for (String line : clusterLogLines()) {
+                        if (line.contains("lance.dispatch: aggregation pushdown for [" + indexName + "]")) {
+                            nodes.add(loggingNodeName(line));
+                            lines++;
+                        }
+                    }
+                    assertEquals("pushdown answers logged on " + nodes, dataNodeCount(), nodes.size());
+                    assertEquals("one pushdown line per data node per request", (exact.size() + sketches.size()) * fragments, lines);
+                });
+            } finally {
+                updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", null);
+            }
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Two parsed {@code aggregations} blocks agree up to the sketches'
+     * tolerance: the {@code cardinality} values (named {@code u} and
+     * {@code k} in the shapes above) within a relative 1 %, a percentile
+     * ({@code values} of a {@code percentiles}) within 3 % of
+     * {@code range}, a percentile rank (the {@code pr} aggregation)
+     * within 3 points; everything else, bucket keys and doc counts
+     * included, equal. Recurses into buckets.
+     */
+    @SuppressWarnings("unchecked")
+    private static void assertSketchesClose(String label, Object expected, Object actual, double range) {
+        Map<String, Object> expectedAggregations = (Map<String, Object>) expected;
+        Map<String, Object> actualAggregations = (Map<String, Object>) actual;
+        assertEquals(label, expectedAggregations.keySet(), actualAggregations.keySet());
+        for (String name : expectedAggregations.keySet()) {
+            Map<String, Object> e = (Map<String, Object>) expectedAggregations.get(name);
+            Map<String, Object> a = (Map<String, Object>) actualAggregations.get(name);
+            assertEquals(label + " > " + name, e.keySet(), a.keySet());
+            if (e.containsKey("values")) {
+                Map<String, Object> ev = (Map<String, Object>) e.get("values");
+                Map<String, Object> av = (Map<String, Object>) a.get("values");
+                assertEquals(label + " > " + name, ev.keySet(), av.keySet());
+                boolean ranks = name.equals("pr");
+                for (String key : ev.keySet()) {
+                    double diff = Math.abs(((Number) ev.get(key)).doubleValue() - ((Number) av.get(key)).doubleValue());
+                    double bound = ranks ? 3d : 0.03d * range;
+                    assertTrue(label + " > " + name + " " + key + ": " + ev.get(key) + " vs " + av.get(key), diff <= bound);
+                }
+            } else if (e.containsKey("buckets")) {
+                Object eb = e.get("buckets");
+                Object ab = a.get("buckets");
+                List<Map<String, Object>> expectedBuckets = eb instanceof List
+                    ? (List<Map<String, Object>>) eb
+                    : new ArrayList<>(((Map<String, Map<String, Object>>) eb).values());
+                List<Map<String, Object>> actualBuckets = ab instanceof List
+                    ? (List<Map<String, Object>>) ab
+                    : new ArrayList<>(((Map<String, Map<String, Object>>) ab).values());
+                assertEquals(label + " > " + name, expectedBuckets.size(), actualBuckets.size());
+                for (int i = 0; i < expectedBuckets.size(); i++) {
+                    Map<String, Object> expectedBucket = new HashMap<>(expectedBuckets.get(i));
+                    Map<String, Object> actualBucket = new HashMap<>(actualBuckets.get(i));
+                    Map<String, Object> expectedSubs = new HashMap<>();
+                    Map<String, Object> actualSubs = new HashMap<>();
+                    for (String key : new ArrayList<>(expectedBucket.keySet())) {
+                        if (expectedBucket.get(key) instanceof Map) {
+                            expectedSubs.put(key, expectedBucket.remove(key));
+                            actualSubs.put(key, actualBucket.remove(key));
+                        }
+                    }
+                    assertEquals(label + " > " + name + " bucket " + i, expectedBucket, actualBucket);
+                    assertSketchesClose(label + " > " + name + " bucket " + i, expectedSubs, actualSubs, range);
+                }
+            } else if (e.containsKey("value") && (name.equals("u") || name.equals("k"))) {
+                double ev = ((Number) e.get("value")).doubleValue();
+                double av = ((Number) a.get("value")).doubleValue();
+                assertTrue(label + " > " + name + ": " + ev + " vs " + av, Math.abs(ev - av) <= 0.01d * Math.max(1d, ev));
+            } else {
+                assertEquals(label + " > " + name, e, a);
+            }
+        }
+    }
+
+    /**
      * The pushdown with parallel group scans on three executors: twelve
      * fragments of 25 rows, so every node holds several fragments and
      * cuts them into up to four scans per request. The responses have

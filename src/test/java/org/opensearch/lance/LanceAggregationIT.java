@@ -641,6 +641,25 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "{\"size\":0,\"query\":{\"term\":{\"flag\":true}},\"aggs\":{\"fc\":{\"composite\":{\"size\":10,\"sources\":[{\"f\":{\"terms\":{\"field\":\"flag\"}}},{\"c\":{\"terms\":{\"field\":\"category\"}}}]},"
                     + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}},\"n\":{\"value_count\":{\"field\":\"id\"}}}}}}",
                 "{\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":2,\"sources\":[{\"c\":{\"terms\":{\"field\":\"category\",\"order\":\"desc\"}}}]}}}}",
+                // stats and extended_stats, alone and under buckets
+                "{\"size\":0,\"aggs\":{\"s\":{\"stats\":{\"field\":\"rating\"}},\"e\":{\"extended_stats\":{\"field\":\"rating\",\"sigma\":2}},\"f\":{\"stats\":{\"field\":\"flag\"}}}}",
+                "{\"size\":0,\"query\":{\"term\":{\"category\":\"c1\"}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"st\":{\"stats\":{\"field\":\"rating\"}},\"e\":{\"extended_stats\":{\"field\":\"id\"}}}}}}",
+                // range: unbounded ends, keyed, overlapping and empty
+                // ranges, metric and bucket children, nested under terms
+                "{\"size\":0,\"aggs\":{\"r\":{\"range\":{\"field\":\"rating\",\"ranges\":[{\"to\":300},{\"from\":300,\"to\":700},{\"from\":700}]}}}}",
+                "{\"size\":0,\"aggs\":{\"r\":{\"range\":{\"field\":\"rating\",\"keyed\":true,\"ranges\":[{\"key\":\"low\",\"from\":0,\"to\":500},{\"key\":\"mid\",\"from\":250,\"to\":750},{\"from\":2000,\"to\":3000}]},"
+                    + "\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}},\"c\":{\"terms\":{\"field\":\"category\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"r\":{\"range\":{\"field\":\"rating\",\"ranges\":[{\"to\":500},{\"from\":500}]},\"aggs\":{\"s\":{\"stats\":{\"field\":\"id\"}}}}}}}}",
+                // missing, filter and filters, with the other bucket, a
+                // must_not on a nullable column, nested levels
+                "{\"size\":0,\"aggs\":{\"m\":{\"missing\":{\"field\":\"category\"},\"aggs\":{\"mx\":{\"max\":{\"field\":\"rating\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"range\":{\"rating\":{\"gte\":500}}},\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"bool\":{\"filter\":[{\"exists\":{\"field\":\"category\"}}],\"must_not\":[{\"term\":{\"flag\":true}}]}}}}}",
+                "{\"size\":0,\"aggs\":{\"fs\":{\"filters\":{\"other_bucket_key\":\"rest\",\"filters\":{\"low\":{\"range\":{\"rating\":{\"lt\":200}}},\"c0\":{\"term\":{\"category\":\"c0\"}}}},"
+                    + "\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"fs\":{\"filters\":{\"filters\":[{\"terms\":{\"category\":[\"c0\",\"c2\"]}},{\"match_all\":{}}]}}}}",
+                "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":500,\"min_doc_count\":0},\"aggs\":{\"fs\":{\"filters\":{\"other_bucket\":true,"
+                    + "\"filters\":{\"on\":{\"term\":{\"flag\":true}},\"off\":{\"term\":{\"flag\":false}}}}}}}}}",
                 // track_total_hits variants
                 "{\"size\":0,\"track_total_hits\":true,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
                 "{\"size\":0,\"track_total_hits\":false,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
@@ -669,6 +688,11 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "{\"size\":2,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
                 "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\",\"missing\":0}}}}",
                 "{\"size\":0,\"aggs\":{\"u\":{\"sum\":{\"field\":\"unmapped\"}}}}",
+                // hdr percentiles keep their own histogram, a filters
+                // over a Lance query, two cardinalities in one request
+                "{\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"rating\",\"hdr\":{\"number_of_significant_value_digits\":3}}}}}",
+                "{\"size\":0,\"aggs\":{\"fs\":{\"filters\":{\"filters\":{\"a\":{\"term\":{\"category\":\"c0\"}},\"b\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}}}}}}",
+                "{\"size\":0,\"aggs\":{\"a\":{\"cardinality\":{\"field\":\"category\"}},\"b\":{\"cardinality\":{\"field\":\"rating\"}}}}",
                 // the namespace registered this fixture without multi_fields, so body.raw is unmapped
                 "{\"size\":0,\"aggs\":{\"b\":{\"terms\":{\"field\":\"body.raw\",\"size\":5}}}}" };
             assertPushdownAgreesWithAggregators(index, shapes, aggregatorShapes);
@@ -752,6 +776,199 @@ public class LanceAggregationIT extends LanceRestTestCase {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
+        }
+    }
+
+    public void testSubstraitPushdownAnswersDateRangesAndFiltersLikeTheAggregators() throws Exception {
+        // The dated fixture again: date_range with string, formatted and
+        // epoch bounds, date bounds inside filter queries, and a daily
+        // date_histogram with a stats child, which has to come from a
+        // single scan per request (the log says "in 1 scans").
+        String suffix = "pushdown-date-range-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeDatedTable(scratchDir, tableName);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            String[] shapes = new String[] {
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_range\":{\"field\":\"ts\",\"ranges\":[{\"to\":\"2024-03-01\"},{\"from\":\"2024-03-01\",\"to\":\"2024-04-01\"},{\"from\":\"2024-04-01\"}]},"
+                    + "\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_range\":{\"field\":\"ts\",\"format\":\"yyyy-MM-dd\",\"keyed\":true,\"ranges\":[{\"key\":\"q1\",\"from\":\"2024-01-01\",\"to\":\"2024-04-01\"},{\"from\":\"2024-03-15\"}]},"
+                    + "\"aggs\":{\"s\":{\"stats\":{\"field\":\"id\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_range\":{\"field\":\"ts\",\"ranges\":[{\"to\":1709251200000},{\"from\":1709251200000}]}}}}",
+                "{\"size\":0,\"query\":{\"term\":{\"category\":\"even\"}},\"aggs\":{\"d\":{\"date_range\":{\"field\":\"ts\",\"ranges\":[{\"to\":\"2024-03-01\"},{\"from\":\"2024-03-01\"}]}}}}",
+                "{\"size\":0,\"aggs\":{\"fs\":{\"filters\":{\"other_bucket\":true,\"filters\":{\"march\":{\"range\":{\"ts\":{\"gte\":\"2024-03-01\",\"lt\":\"2024-04-01\"}}},"
+                    + "\"early\":{\"range\":{\"ts\":{\"lte\":\"2024-02-15\"}}},\"day\":{\"term\":{\"ts\":\"2024-03-15\"}}}}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"1d\"},\"aggs\":{\"s\":{\"stats\":{\"field\":\"id\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"},\"aggs\":{\"s\":{\"extended_stats\":{\"field\":\"id\"}},\"m\":{\"missing\":{\"field\":\"category\"}}}}}}" };
+            long singleScanBefore = pushdownLogLines(indexName, "in 1 scans");
+            assertPushdownAgreesWithAggregators(indexName, shapes, new String[0]);
+            assertEquals("every request above was one scan", singleScanBefore + shapes.length, pushdownLogLines(indexName, "in 1 scans"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * The sketch metrics through the pushdown against the aggregators:
+     * {@code cardinality} built from the distinct values Lance returns,
+     * {@code percentiles} / {@code percentile_ranks} from a bin
+     * histogram. The values are compared with the setting off within the
+     * tolerance the two constructions allow (a relative 1 % for the
+     * count; 3 % of the value range for a percentile, 3 points for a
+     * rank, the tolerance two tdigests of the same data get elsewhere in
+     * this class), and with {@code pushdown_parallelism} 1 the
+     * percentiles requests have to take two scans per executor (the
+     * bounds, then the bins) while cardinality takes one.
+     */
+    @SuppressWarnings("unchecked")
+    public void testSubstraitPushdownSketchesAgreeWithTheAggregators() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 400, "pushdown-sketches")) {
+            String index = fixture.indexName();
+            java.util.Set<Long> distinctRatings = new java.util.HashSet<>();
+            for (int i = 0; i < 1200; i++) {
+                if (i % 5 != 4) {
+                    distinctRatings.add((long) ((i * 37) % 1000));
+                }
+            }
+            String cardinality = "{\"size\":0,\"aggs\":{\"c\":{\"cardinality\":{\"field\":\"rating\"}}}}";
+            String perCategoryFlags =
+                "{\"size\":0,\"aggs\":{\"k\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"flag\"}}}}}}";
+            String percentiles =
+                "{\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"rating\"}},\"pr\":{\"percentile_ranks\":{\"field\":\"rating\",\"values\":[250,750]}},\"s\":{\"sum\":{\"field\":\"rating\"}}}}";
+            String nested =
+                "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":100}}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"id\",\"percents\":[50,95]}},\"u\":{\"cardinality\":{\"field\":\"rating\"}}}}}}";
+            Request debug = new Request("PUT", "/_cluster/settings");
+            debug.setJsonEntity(
+                "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":\"DEBUG\",\"lance.aggregation.pushdown_parallelism\":1}}"
+            );
+            client().performRequest(debug);
+            try {
+                long oneScanBefore = pushdownLogLines(index, "in 1 scans");
+                long twoScansBefore = pushdownLogLines(index, "in 2 scans");
+                long threeScansBefore = pushdownLogLines(index, "in 3 scans");
+                Map<String, Object> counted = parse(readAll(postJson("/" + index + "/_search", cardinality)));
+                Map<String, Object> flagsCounted = parse(readAll(postJson("/" + index + "/_search", perCategoryFlags)));
+                Map<String, Object> sketched = parse(readAll(postJson("/" + index + "/_search", percentiles)));
+                Map<String, Object> perCategory = parse(readAll(postJson("/" + index + "/_search", nested)));
+                assertBusy(() -> {
+                    assertEquals(
+                        "the two cardinality requests are one scan each",
+                        oneScanBefore + 2,
+                        pushdownLogLines(index, "in 1 scans")
+                    );
+                    assertEquals("one percentiles metric adds one bin scan", twoScansBefore + 1, pushdownLogLines(index, "in 2 scans"));
+                    assertEquals("two percentiles metrics add two bin scans", threeScansBefore + 1, pushdownLogLines(index, "in 3 scans"));
+                });
+
+                Request disable = new Request("PUT", "/_cluster/settings");
+                disable.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":false}}");
+                client().performRequest(disable);
+                try {
+                    Map<String, Object> countedByAggregators = parse(readAll(postJson("/" + index + "/_search", cardinality)));
+                    Map<String, Object> flagsCountedByAggregators = parse(readAll(postJson("/" + index + "/_search", perCategoryFlags)));
+                    Map<String, Object> sketchedByAggregators = parse(readAll(postJson("/" + index + "/_search", percentiles)));
+                    Map<String, Object> perCategoryByAggregators = parse(readAll(postJson("/" + index + "/_search", nested)));
+
+                    assertEquals(counted.get("hits"), countedByAggregators.get("hits"));
+                    assertRelativeClose(
+                        "cardinality(rating)",
+                        ((Number) aggregation(countedByAggregators, "c").get("value")).doubleValue(),
+                        ((Number) aggregation(counted, "c").get("value")).doubleValue(),
+                        0.01d
+                    );
+                    assertRelativeClose(
+                        "cardinality(rating) against the fixture",
+                        distinctRatings.size(),
+                        ((Number) aggregation(counted, "c").get("value")).doubleValue(),
+                        0.01d
+                    );
+                    assertEquals(flagsCounted.get("hits"), flagsCountedByAggregators.get("hits"));
+                    List<Map<String, Object>> categories = (List<Map<String, Object>>) aggregation(flagsCounted, "k").get("buckets");
+                    List<Map<String, Object>> categoriesByAggregators = (List<Map<String, Object>>) aggregation(
+                        flagsCountedByAggregators,
+                        "k"
+                    ).get("buckets");
+                    assertEquals(3, categories.size());
+                    for (int i = 0; i < categories.size(); i++) {
+                        assertEquals(categoriesByAggregators.get(i).get("key"), categories.get(i).get("key"));
+                        assertEquals(categoriesByAggregators.get(i).get("doc_count"), categories.get(i).get("doc_count"));
+                        assertEquals(2, ((Number) ((Map<String, Object>) categories.get(i).get("u")).get("value")).intValue());
+                    }
+
+                    assertEquals(sketched.get("hits"), sketchedByAggregators.get("hits"));
+                    assertEquals(aggregation(sketchedByAggregators, "s"), aggregation(sketched, "s"));
+                    Map<String, Object> values = (Map<String, Object>) aggregation(sketched, "p").get("values");
+                    Map<String, Object> valuesByAggregators = (Map<String, Object>) aggregation(sketchedByAggregators, "p").get("values");
+                    assertEquals(valuesByAggregators.keySet(), values.keySet());
+                    for (String percentile : valuesByAggregators.keySet()) {
+                        assertWithinShareOfRange(
+                            "percentile " + percentile,
+                            ((Number) valuesByAggregators.get(percentile)).doubleValue(),
+                            ((Number) values.get(percentile)).doubleValue(),
+                            0.03d,
+                            999d
+                        );
+                    }
+                    Map<String, Object> ranks = (Map<String, Object>) aggregation(sketched, "pr").get("values");
+                    Map<String, Object> ranksByAggregators = (Map<String, Object>) aggregation(sketchedByAggregators, "pr").get("values");
+                    for (String value : ranksByAggregators.keySet()) {
+                        assertWithinShareOfRange(
+                            "rank of " + value,
+                            ((Number) ranksByAggregators.get(value)).doubleValue(),
+                            ((Number) ranks.get(value)).doubleValue(),
+                            0.03d,
+                            100d
+                        );
+                    }
+
+                    assertEquals(perCategory.get("hits"), perCategoryByAggregators.get("hits"));
+                    List<Map<String, Object>> buckets = (List<Map<String, Object>>) aggregation(perCategory, "c").get("buckets");
+                    List<Map<String, Object>> bucketsByAggregators = (List<Map<String, Object>>) aggregation(perCategoryByAggregators, "c")
+                        .get("buckets");
+                    assertEquals(bucketsByAggregators.size(), buckets.size());
+                    for (int i = 0; i < buckets.size(); i++) {
+                        assertEquals(bucketsByAggregators.get(i).get("key"), buckets.get(i).get("key"));
+                        assertEquals(bucketsByAggregators.get(i).get("doc_count"), buckets.get(i).get("doc_count"));
+                        assertRelativeClose(
+                            "cardinality under " + buckets.get(i).get("key"),
+                            ((Number) ((Map<String, Object>) bucketsByAggregators.get(i).get("u")).get("value")).doubleValue(),
+                            ((Number) ((Map<String, Object>) buckets.get(i).get("u")).get("value")).doubleValue(),
+                            0.01d
+                        );
+                        Map<String, Object> bucketValues = (Map<String, Object>) ((Map<String, Object>) buckets.get(i).get("p")).get(
+                            "values"
+                        );
+                        Map<String, Object> bucketValuesByAggregators = (Map<String, Object>) ((Map<String, Object>) bucketsByAggregators
+                            .get(i)
+                            .get("p")).get("values");
+                        for (String percentile : bucketValuesByAggregators.keySet()) {
+                            assertWithinShareOfRange(
+                                "percentile " + percentile + " under " + buckets.get(i).get("key"),
+                                ((Number) bucketValuesByAggregators.get(percentile)).doubleValue(),
+                                ((Number) bucketValues.get(percentile)).doubleValue(),
+                                0.03d,
+                                1199d
+                            );
+                        }
+                    }
+                } finally {
+                    Request enable = new Request("PUT", "/_cluster/settings");
+                    enable.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":null}}");
+                    client().performRequest(enable);
+                }
+            } finally {
+                Request reset = new Request("PUT", "/_cluster/settings");
+                reset.setJsonEntity(
+                    "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":null,\"lance.aggregation.pushdown_parallelism\":null}}"
+                );
+                client().performRequest(reset);
+            }
         }
     }
 
