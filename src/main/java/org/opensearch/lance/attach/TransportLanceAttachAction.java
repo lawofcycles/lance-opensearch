@@ -6,11 +6,14 @@
 package org.opensearch.lance.attach;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.lance.Dataset;
+import org.lance.Fragment;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
@@ -30,10 +33,12 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.lance.LanceInternalHeaders;
+import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
+import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.namespace.AllowedTableRoots;
 import org.opensearch.lance.namespace.LanceNamespaceService;
@@ -183,11 +188,98 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             }
         }
         RestAttachAction.Derivation derivation;
+        long[] fragmentRows;
         try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions(), openVersion)) {
             derivation = RestAttachAction.derive(dataset, request.multiFields());
+            List<Fragment> fragments = dataset.getFragments();
+            fragmentRows = new long[fragments.size()];
+            for (int i = 0; i < fragmentRows.length; i++) {
+                fragmentRows[i] = fragments.get(i).metadata().getPhysicalRows();
+            }
         }
         warnIfInvertedIndexExceedsShardShare(indexName, derivation);
-        createIndex(indexName, table, derivation, request.storageOptions(), request.pinnedVersion(), request.tag(), listener);
+        long maxDocs = clusterService.getClusterSettings().get(LancePlugin.MAX_DOCS_PER_READER_SETTING);
+        boolean luceneBoundExceeded = checkLuceneBound(
+            indexName,
+            table,
+            fragmentRows,
+            maxDocs,
+            clusterService.state().nodes().getDataNodes().size()
+        );
+        createIndex(
+            indexName,
+            table,
+            derivation,
+            request.storageOptions(),
+            request.pinnedVersion(),
+            request.tag(),
+            luceneBoundExceeded,
+            listener
+        );
+    }
+
+    /**
+     * Whether the table has more physical rows than one Lucene reader may
+     * hold ({@code maxDocs}). Such a table attaches: the fragment path
+     * serves it in groups of fragments within the bound and the shard
+     * reader holds the leading fragments that fit, which one WARN says.
+     * A single fragment above the bound cannot be read by any reader, so
+     * that table is refused with 400.
+     */
+    static boolean checkLuceneBound(String indexName, String table, long[] fragmentRows, long maxDocs, int dataNodes) {
+        long totalRows = 0L;
+        for (long rows : fragmentRows) {
+            if (rows > maxDocs) {
+                throw new OpenSearchStatusException(
+                    "table ["
+                        + table
+                        + "] has a fragment of "
+                        + rows
+                        + " rows, above the bound of "
+                        + maxDocs
+                        + " rows per Lucene reader; no reader can hold it. Rewrite the table with smaller fragments",
+                    RestStatus.BAD_REQUEST
+                );
+            }
+            totalRows += rows;
+        }
+        if (totalRows <= maxDocs) {
+            return false;
+        }
+        long readerRows = 0L;
+        int held = LanceDirectoryReader.leadingFragmentsWithinBound(fragmentRows, maxDocs);
+        for (int i = 0; i < held; i++) {
+            readerRows += fragmentRows[i];
+        }
+        // The fragment path spreads the fragments round robin over the
+        // data nodes and cuts each node's share into groups within the
+        // bound; count the groups that would give right now.
+        int groups = 0;
+        int nodes = Math.max(1, dataNodes);
+        for (int node = 0; node < nodes; node++) {
+            List<Long> share = new ArrayList<>();
+            for (int i = node; i < fragmentRows.length; i += nodes) {
+                share.add(fragmentRows[i]);
+            }
+            long[] shareRows = new long[share.size()];
+            for (int i = 0; i < shareRows.length; i++) {
+                shareRows[i] = share.get(i);
+            }
+            groups += LanceDirectoryReader.groupEnds(shareRows, maxDocs).length;
+        }
+        LOG.warn(
+            "lance.attach: table [{}] has {} rows, above the bound of {} rows per Lucene reader; the shard reader of [{}] holds {} of {} rows; "
+                + "searches run on the fragment path in {} groups over {} data nodes",
+            table,
+            totalRows,
+            maxDocs,
+            indexName,
+            readerRows,
+            totalRows,
+            groups,
+            nodes
+        );
+        return true;
     }
 
     private static void warnIfInvertedIndexExceedsShardShare(String indexName, RestAttachAction.Derivation derivation) {
@@ -236,6 +328,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         StorageOptions storageOptions,
         Optional<Long> pinnedVersion,
         Optional<String> tag,
+        boolean luceneBoundExceeded,
         ActionListener<LanceAttachResponse> listener
     ) {
         Settings.Builder settings = Settings.builder()
@@ -282,7 +375,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                     if (pinnedVersion.isEmpty()) {
                         namespaceService.registerAttachedIndex(indexName, table, derivation.version(), storageOptions, tag.orElse(null));
                     }
-                    listener.onResponse(response(indexName, table, derivation, false));
+                    listener.onResponse(response(indexName, table, derivation, false, luceneBoundExceeded));
                 }
 
                 @Override
@@ -295,7 +388,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                     // for the same table before claiming success; otherwise
                     // attach would silently take credit for an unrelated
                     // index.
-                    verifyExistingLanceIndex(indexName, table, derivation, storageOptions, listener);
+                    verifyExistingLanceIndex(indexName, table, derivation, storageOptions, luceneBoundExceeded, listener);
                 }
             });
         }
@@ -306,6 +399,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         String table,
         RestAttachAction.Derivation derivation,
         StorageOptions storageOptions,
+        boolean luceneBoundExceeded,
         ActionListener<LanceAttachResponse> listener
     ) {
         // This runs on the elected cluster manager, whose applied state
@@ -364,14 +458,15 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                 existingTag.isEmpty() ? null : existingTag
             );
         }
-        listener.onResponse(response(indexName, table, derivation, true));
+        listener.onResponse(response(indexName, table, derivation, true, luceneBoundExceeded));
     }
 
     private static LanceAttachResponse response(
         String indexName,
         String table,
         RestAttachAction.Derivation derivation,
-        boolean alreadyAttached
+        boolean alreadyAttached,
+        boolean luceneBoundExceeded
     ) {
         return new LanceAttachResponse(
             indexName,
@@ -382,7 +477,8 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             derivation.keyField(),
             derivation.mappingJson(),
             derivation.notes(),
-            alreadyAttached
+            alreadyAttached,
+            luceneBoundExceeded
         );
     }
 

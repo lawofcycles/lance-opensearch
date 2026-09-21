@@ -33,6 +33,10 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
     private final String derivedMappingJson;
     private final List<String> notes;
     private final boolean alreadyAttached;
+    // Whether the table has more rows than one Lucene reader may hold, so
+    // the shard reader serves part of it and searches run in fragment
+    // groups; rendered only when true.
+    private final boolean luceneBoundExceeded;
 
     public LanceAttachResponse(
         String index,
@@ -43,7 +47,8 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
         String derivedKeyField,
         String derivedMappingJson,
         List<String> notes,
-        boolean alreadyAttached
+        boolean alreadyAttached,
+        boolean luceneBoundExceeded
     ) {
         this.index = index;
         this.table = table;
@@ -54,6 +59,7 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
         this.derivedMappingJson = derivedMappingJson;
         this.notes = List.copyOf(notes);
         this.alreadyAttached = alreadyAttached;
+        this.luceneBoundExceeded = luceneBoundExceeded;
     }
 
     public LanceAttachResponse(StreamInput in) throws IOException {
@@ -67,6 +73,7 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
         this.derivedMappingJson = in.readString();
         this.notes = in.readStringList();
         this.alreadyAttached = in.readBoolean();
+        this.luceneBoundExceeded = in.readBoolean();
     }
 
     @Override
@@ -80,6 +87,7 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
         out.writeString(derivedMappingJson);
         out.writeStringCollection(notes);
         out.writeBoolean(alreadyAttached);
+        out.writeBoolean(luceneBoundExceeded);
     }
 
     public String index() {
@@ -118,6 +126,10 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
         return alreadyAttached;
     }
 
+    public boolean luceneBoundExceeded() {
+        return luceneBoundExceeded;
+    }
+
     @Override
     public XContentBuilder toXContent(XContentBuilder b, Params params) throws IOException {
         b.startObject();
@@ -134,6 +146,9 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
         );
         b.field("notes", notes);
         b.field("already_attached", alreadyAttached);
+        if (luceneBoundExceeded) {
+            b.field("lucene_bound_exceeded", true);
+        }
         return b.endObject();
     }
 }
