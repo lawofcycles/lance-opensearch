@@ -890,14 +890,15 @@ public final class LanceAggregatePushdown {
         }
 
         /**
-         * One Lance scan of this plan: the first scan carries every
+         * The plan of one Lance scan: the main scan carries every
          * grouping and measure of the request; a percentiles metric adds
-         * a scan of its own afterwards, grouped by the same bucket keys
-         * plus its bin, whose rows carry that metric's bin counts only.
-         * {@code min}, {@code max} and {@code width} are the bin bounds of that scan.
+         * a bin scan of its own afterwards, grouped by the same bucket
+         * keys plus its bin, whose rows carry that metric's bin counts
+         * only. {@code min}, {@code max} and {@code width} are the bin
+         * bounds of a bin scan.
          */
-        private record Stage(ByteBuffer substrait, Metric percentiles, double min, double max, double width) {
-            boolean isFirst() {
+        private record ScanPlan(ByteBuffer substrait, Metric percentiles, double min, double max, double width) {
+            boolean isMain() {
                 return percentiles == null;
             }
         }
@@ -966,14 +967,14 @@ public final class LanceAggregatePushdown {
         ) throws Exception {
             List<List<Integer>> fragmentGroups = FragmentGroupScan.splitContiguous(fragmentIds, parallelism);
             FragmentGroupScan scans = new FragmentGroupScan(executor, parallelism, cancellation);
-            Stage first = new Stage(substrait, null, 0d, 0d, 0d);
-            Partial merged = mergePartials(scans.runGroups(fragmentGroups, group -> scan(dataset, group, filterSql, first, cancellation)));
+            ScanPlan main = new ScanPlan(substrait, null, 0d, 0d, 0d);
+            Partial merged = mergePartials(scans.runGroups(fragmentGroups, group -> scan(dataset, group, filterSql, main, cancellation)));
             int scanCount = fragmentGroups.size();
             for (Metric metric : allMetrics) {
                 if (!metric.isPercentiles()) {
                     continue;
                 }
-                Stage bins = binStage(metric, merged);
+                ScanPlan bins = binScan(metric, merged);
                 if (bins == null) {
                     continue;
                 }
@@ -995,11 +996,11 @@ public final class LanceAggregatePushdown {
         }
 
         /**
-         * The bin scan of one percentiles metric from the bounds the first
-         * round returned, node wide over every group; null when no row
-         * had a value.
+         * The bin scan of one percentiles metric from the bounds the main
+         * scan returned, node wide over every group; null when no row had
+         * a value.
          */
-        private Stage binStage(Metric metric, Partial merged) {
+        private ScanPlan binScan(Metric metric, Partial merged) {
             double min = Double.POSITIVE_INFINITY;
             double max = Double.NEGATIVE_INFINITY;
             if (merged.metricsOnly != null) {
@@ -1024,20 +1025,20 @@ public final class LanceAggregatePushdown {
             // count(field), not count(*): a row without a value has a null
             // bin and must not weigh in.
             builder.measure("count", List.of(new FieldReference(metric.column().index())), ScalarType.I64, metric.binCountColumn());
-            return new Stage(builder.build(), metric, min, max, width);
+            return new ScanPlan(builder.build(), metric, min, max, width);
         }
 
         /**
-         * One scan of {@code stage} over {@code fragmentIds} (null: every
+         * One scan of {@code plan} over {@code fragmentIds} (null: every
          * fragment), read into a {@link Partial} keyed by the full key
          * list of every row that opens a bucket. The row count and the
-         * metrics' partial values are read from a first stage row; a bin
-         * stage row carries only its metric's bin, and adds nothing to
+         * metrics' partial values are read from a main scan row; a bin
+         * scan row carries only its metric's bin, and adds nothing to
          * the totals.
          */
-        private Partial scan(Dataset dataset, List<Integer> fragmentIds, String filterSql, Stage stage, LanceCancellation cancellation)
+        private Partial scan(Dataset dataset, List<Integer> fragmentIds, String filterSql, ScanPlan plan, LanceCancellation cancellation)
             throws Exception {
-            ScanOptions.Builder options = new ScanOptions.Builder().substraitAggregate(stage.substrait().duplicate());
+            ScanOptions.Builder options = new ScanOptions.Builder().substraitAggregate(plan.substrait().duplicate());
             if (fragmentIds != null) {
                 options.fragmentIds(fragmentIds);
             }
@@ -1050,7 +1051,7 @@ public final class LanceAggregatePushdown {
                 while (reader.loadNextBatch()) {
                     cancellation.checkCancelled();
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                    FieldVector counts = stage.isFirst() ? root.getVector(COUNT_COLUMN) : null;
+                    FieldVector counts = plan.isMain() ? root.getVector(COUNT_COLUMN) : null;
                     FieldVector[] keyVectors = new FieldVector[keyCount];
                     for (int key = 0; key < keyCount; key++) {
                         keyVectors[key] = root.getVector(KEY_COLUMN_PREFIX + key);
@@ -1059,10 +1060,10 @@ public final class LanceAggregatePushdown {
                         MetricState[] states = new MetricState[allMetrics.size()];
                         for (int i = 0; i < states.length; i++) {
                             Metric metric = allMetrics.get(i);
-                            if (stage.isFirst()) {
+                            if (plan.isMain()) {
                                 states[i] = metric.read(root, row);
-                            } else if (metric == stage.percentiles()) {
-                                states[i] = metric.readBin(root, row, stage.min(), stage.max(), stage.width(), percentilesBins);
+                            } else if (metric == plan.percentiles()) {
+                                states[i] = metric.readBin(root, row, plan.min(), plan.max(), plan.width(), percentilesBins);
                             } else {
                                 states[i] = new MetricState();
                             }

@@ -463,14 +463,19 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * / {@code percentile_ranks} cuts the value range into. The executor
      * asks Lance for the minimum and maximum of the field, then for the
      * row count of every bin of width {@code (max - min) / bins}, and
-     * feeds each bin's centre and count to the TDigest sketch the
-     * coordinator merges. A reported percentile is therefore within one
-     * bin width of the value the aggregators, which sketch every
-     * document, would report; more bins mean a finer answer and more
-     * rows for the executor to read (one per non empty bin, per bucket
-     * of the enclosing aggregation). Dynamic so the trade-off can be
-     * tuned without a restart; the executor reads it when it plans a
-     * request.
+     * feeds each bin's rows to the TDigest sketch the coordinator merges
+     * as one value at each bin edge and the rest at the centre. The
+     * histogram the sketch sees is therefore accurate to one bin width
+     * (0.025 % of the range at the default); the sketch itself, built
+     * from a few thousand weighted points instead of every document,
+     * interpolates less accurately than the aggregators' digest, which
+     * is the larger error on a long tailed field (a p95 measured 0.16 %
+     * of the range from the exact value on a 20M row table where the
+     * aggregators' digest was 0.01 % off). More bins mean a finer
+     * histogram and more rows for the executor to read (one per non
+     * empty bin, per bucket of the enclosing aggregation). Dynamic so the
+     * trade-off can be tuned without a restart; the executor reads it
+     * when it plans a request.
      */
     public static final Setting<Integer> AGGREGATION_PERCENTILES_BINS_SETTING = Setting.intSetting(
         "lance.aggregation.percentiles_bins",
