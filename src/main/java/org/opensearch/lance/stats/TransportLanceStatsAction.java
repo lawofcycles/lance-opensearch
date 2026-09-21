@@ -122,11 +122,19 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
                     if (reader == null) {
                         continue;
                     }
+                    // Count through the searcher's reader chain, not the
+                    // Lance reader underneath it: a DLS / FLS wrapper the
+                    // index interposes filters through liveDocs, and the
+                    // caller's stats must not count rows the wrapper
+                    // hides. Only the table's rows outside a cut reader
+                    // have no wrapped figure; that one comes from Lance.
+                    long shardReaderRows = searcher.getIndexReader().numDocs();
+                    long rows = reader.luceneBoundExceeded() ? reader.tableRows() : shardReaderRows;
                     stats.add(
                         new LanceNodeStats.IndexReaderStats(
                             shard.shardId().getIndexName(),
-                            reader.tableRows(),
-                            reader.numDocs(),
+                            rows,
+                            shardReaderRows,
                             reader.luceneBoundExceeded()
                         )
                     );

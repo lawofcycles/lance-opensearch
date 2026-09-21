@@ -741,6 +741,12 @@ public final class LanceEngineFactory implements EngineFactory {
                 }
 
                 try (LanceScanner scanner = dataset.newScan(options.build()); ArrowReader reader = scanner.scanBatches()) {
+                    // Set once the wrapper's liveDocs hid a match inside the
+                    // reader: the caller may not see the key's row, so a
+                    // later scan match outside the reader must answer
+                    // NOT_EXISTS rather than resolve through a reader the
+                    // wrapper does not cover.
+                    boolean hiddenByWrapper = false;
                     while (reader.loadNextBatch()) {
                         VectorSchemaRoot root = reader.getVectorSchemaRoot();
                         UInt8Vector rowaddr = (UInt8Vector) root.getVector("_rowaddr");
@@ -750,7 +756,7 @@ public final class LanceEngineFactory implements EngineFactory {
                             int offset = (int) (addr & 0xFFFFFFFFL);
                             LeafReaderContext ctx = leavesByFragment.get(fragmentId);
                             if (ctx == null) {
-                                if (boundExceeded) {
+                                if (boundExceeded && !hiddenByWrapper) {
                                     return resolveOutsideReader(searcher, lanceReader, dataset, fragmentId, offset);
                                 }
                                 continue;
@@ -764,6 +770,7 @@ public final class LanceEngineFactory implements EngineFactory {
                             // GET a row with `rating = 1`).
                             Bits liveDocs = ctx.reader().getLiveDocs();
                             if (liveDocs != null && !liveDocs.get(offset)) {
+                                hiddenByWrapper = true;
                                 continue;
                             }
                             DocIdAndVersion dv = new DocIdAndVersion(offset, 1, 1, 1, ctx.reader(), ctx.docBase);
