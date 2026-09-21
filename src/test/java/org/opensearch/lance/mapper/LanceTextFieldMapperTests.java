@@ -10,7 +10,9 @@ import java.util.Map;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.automaton.RegExp;
 import org.opensearch.lance.query.LanceFtsQuery;
+import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -82,6 +84,112 @@ public class LanceTextFieldMapperTests extends OpenSearchTestCase {
         );
         Exception e = expectThrows(IllegalArgumentException.class, () -> dropped.existsQuery(null));
         assertTrue("unexpected message: " + e.getMessage(), e.getMessage().contains("no longer exists"));
+    }
+
+    public void testWildcardQueryBecomesLikeScanFilter() {
+        Query query = fieldType(null).wildcardQuery("*w0001*", null, false, null);
+        assertEquals(new LanceScanFilterQuery("body LIKE '%w0001%' ESCAPE '\\'"), query);
+        assertEquals(LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED, ((LanceScanFilterQuery) query).scanLimit());
+    }
+
+    public void testWildcardQuestionMarkBecomesUnderscore() {
+        Query query = fieldType(null).wildcardQuery("w?001", null, false, null);
+        assertEquals(new LanceScanFilterQuery("body LIKE 'w_001' ESCAPE '\\'"), query);
+    }
+
+    public void testWildcardEscapesLikeMetaCharactersAndQuotes() {
+        // A literal %, _ or \ in the pattern is escaped for LIKE, a
+        // single quote is doubled for the SQL literal, and Lucene's
+        // own \* escape yields a literal asterisk.
+        Query query = fieldType(null).wildcardQuery("100%_O'Brien\\\\\\*", null, false, null);
+        assertEquals(new LanceScanFilterQuery("body LIKE '100\\%\\_O''Brien\\\\*' ESCAPE '\\'"), query);
+    }
+
+    public void testWildcardCaseInsensitiveUsesIlike() {
+        Query query = fieldType(null).wildcardQuery("*Hello*", null, true, null);
+        assertEquals(new LanceScanFilterQuery("body ILIKE '%Hello%' ESCAPE '\\'"), query);
+    }
+
+    public void testWildcardTargetsRawColumnNotTokensColumn() {
+        // A wildcard matches the stored string; the derived tokens
+        // column holds analyzed tokens and is the wrong target for it.
+        Query query = fieldType("body_tokens").wildcardQuery("hel*", null, false, null);
+        assertEquals(new LanceScanFilterQuery("body LIKE 'hel%' ESCAPE '\\'"), query);
+    }
+
+    public void testRegexpQueryIsAnchoredRegexpLike() {
+        Query query = fieldType(null).regexpQuery("w0001.*", RegExp.ALL, 0, 10000, null, null);
+        assertEquals(new LanceScanFilterQuery("regexp_like(body, '^(?:w0001.*)$')"), query);
+    }
+
+    public void testRegexpPassesRustCompatibleSyntaxThrough() {
+        Query query = fieldType(null).regexpQuery("(hello|quick) [a-z]+ \\d{1,3}?", RegExp.ALL, 0, 10000, null, null);
+        assertEquals(new LanceScanFilterQuery("regexp_like(body, '^(?:(hello|quick) [a-z]+ \\d{1,3}?)$')"), query);
+    }
+
+    public void testRegexpCaseInsensitiveAddsInlineFlag() {
+        Query query = fieldType(null).regexpQuery("hello.*", RegExp.ALL, RegExp.ASCII_CASE_INSENSITIVE, 10000, null, null);
+        assertEquals(new LanceScanFilterQuery("regexp_like(body, '(?i)^(?:hello.*)$')"), query);
+    }
+
+    public void testRegexpEscapesSingleQuote() {
+        Query query = fieldType(null).regexpQuery("O'Brien.*", RegExp.ALL, 0, 10000, null, null);
+        assertEquals(new LanceScanFilterQuery("regexp_like(body, '^(?:O''Brien.*)$')"), query);
+    }
+
+    public void testRegexpRejectsLuceneOnlyOperators() {
+        int all = RegExp.ALL | RegExp.DEPRECATED_COMPLEMENT;
+        for (String pattern : new String[] { "~(hello)", "a&b", "<1-100>", "hello@", "hello#", "\"quoted\"" }) {
+            Exception e = expectThrows(
+                IllegalArgumentException.class,
+                () -> fieldType(null).regexpQuery(pattern, all, 0, 10000, null, null)
+            );
+            assertTrue("unexpected message for " + pattern + ": " + e.getMessage(), e.getMessage().contains("Rust regex"));
+            assertTrue("message must name the field: " + e.getMessage(), e.getMessage().contains("[body]"));
+        }
+    }
+
+    public void testRegexpTreatsOperatorAsLiteralWhenItsFlagIsOff() {
+        // With the flag off Lucene reads the character literally, which
+        // is also what Rust does, so the pattern passes through. The
+        // default flags of RegexpQueryBuilder (RegExp.ALL) do not
+        // include the deprecated complement, so ~ is literal by default.
+        Query tilde = fieldType(null).regexpQuery("a~b", RegExp.ALL, 0, 10000, null, null);
+        assertEquals(new LanceScanFilterQuery("regexp_like(body, '^(?:a~b)$')"), tilde);
+        Query ampersand = fieldType(null).regexpQuery("a&b", RegExp.NONE, 0, 10000, null, null);
+        assertEquals(new LanceScanFilterQuery("regexp_like(body, '^(?:a&b)$')"), ampersand);
+    }
+
+    public void testRegexpIgnoresOperatorsInsideCharacterClassesAndEscapes() {
+        int all = RegExp.ALL | RegExp.DEPRECATED_COMPLEMENT;
+        Query inClass = fieldType(null).regexpQuery("[~&<@#\"]+", all, 0, 10000, null, null);
+        assertEquals(new LanceScanFilterQuery("regexp_like(body, '^(?:[~&<@#\"]+)$')"), inClass);
+        Query escaped = fieldType(null).regexpQuery("a\\&b\\~c\\\"", all, 0, 10000, null, null);
+        assertEquals(new LanceScanFilterQuery("regexp_like(body, '^(?:a\\&b\\~c\\\")$')"), escaped);
+    }
+
+    public void testPrefixQueryBecomesStartsWith() {
+        Query query = fieldType(null).prefixQuery("hel", null, false, null);
+        assertEquals(new LanceScanFilterQuery("starts_with(body, 'hel')"), query);
+    }
+
+    public void testPrefixCaseInsensitiveLowersBothSides() {
+        Query query = fieldType(null).prefixQuery("HEL'lo", null, true, null);
+        assertEquals(new LanceScanFilterQuery("starts_with(lower(body), lower('HEL''lo'))"), query);
+    }
+
+    public void testPatternQueriesRejectDroppedField() {
+        LanceTextFieldMapper.LanceTextFieldType dropped = new LanceTextFieldMapper.LanceTextFieldType(
+            "body",
+            null,
+            Map.of("lance_dropped", "true")
+        );
+        Exception wildcard = expectThrows(IllegalArgumentException.class, () -> dropped.wildcardQuery("h*", null, false, null));
+        assertTrue(wildcard.getMessage(), wildcard.getMessage().contains("no longer exists"));
+        Exception regexp = expectThrows(IllegalArgumentException.class, () -> dropped.regexpQuery("h.*", RegExp.ALL, 0, 1, null, null));
+        assertTrue(regexp.getMessage(), regexp.getMessage().contains("no longer exists"));
+        Exception prefix = expectThrows(IllegalArgumentException.class, () -> dropped.prefixQuery("h", null, false, null));
+        assertTrue(prefix.getMessage(), prefix.getMessage().contains("no longer exists"));
     }
 
     public void testContentTypeConstantIsLanceText() {
