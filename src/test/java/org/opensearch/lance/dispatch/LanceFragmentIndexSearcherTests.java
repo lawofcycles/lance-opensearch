@@ -50,8 +50,11 @@ import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.tasks.TaskCancelledException;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.cache.query.DisabledQueryCache;
+import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.script.ScriptModule;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.aggregations.BucketCollector;
@@ -330,6 +333,27 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
             assertEquals(searcher.getSlices().length, manager.created.get());
             assertEquals("all but one slice were offered to the pool", searcher.getSlices().length - 1, rejected.get());
             assertEquals(Set.of(Thread.currentThread().getName()), manager.threads);
+        }
+    }
+
+    public void testCancelledTaskStopsTheSlices() throws Exception {
+        // The request's cancellation reaches every slice, on the pool
+        // threads as well as on the calling thread: a task cancelled
+        // before the search starts collects nothing and the search ends
+        // with the task's TaskCancelledException.
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        try (DirectoryReader reader = DirectoryReader.open(dir); LanceFragmentSearchContext context = newContext()) {
+            LanceFragmentQueryTask task = new LanceFragmentQueryTask(1L, "transport", "test", "cancelled", TaskId.EMPTY_TASK_ID, Map.of());
+            task.cancel("test");
+            context.withTargetMaxSliceCount(4).withCancellation(LanceCancellation.of(task));
+            LanceFragmentIndexSearcher searcher = newSearcher(reader, context, pool);
+            assertTrue(searcher.getSlices().length > 1);
+            CountingManager manager = new CountingManager();
+            expectThrows(TaskCancelledException.class, () -> searcher.search(MatchAllDocsQuery.INSTANCE, manager));
+            assertTrue("no slice collected a leaf: " + manager.threads, manager.threads.isEmpty());
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
         }
     }
 

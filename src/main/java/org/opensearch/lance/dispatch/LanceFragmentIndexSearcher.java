@@ -72,7 +72,12 @@ import org.opensearch.search.internal.ContextIndexSearcher;
  * reader order and runs it on the calling thread, which is the
  * behaviour the fragment path had before slicing and is what keeps a
  * one slice request identical, down to the order in which an
- * approximate aggregation sees its values, to the older one.
+ * approximate aggregation sees its values, to the older one. Every
+ * slice task checks the request's {@link LanceCancellation} before it
+ * collects, and the inherited {@link #searchLeaf} checks it before
+ * every leaf and inside the bulk scorer on whichever thread runs the
+ * slice, so a cancelled task stops the pool threads as well as the
+ * calling thread.
  *
  * <p>Leaves are visited in reader order within a slice.
  * {@link LanceFragmentSearchContext} reports
@@ -267,6 +272,11 @@ final class LanceFragmentIndexSearcher extends ContextIndexSearcher implements L
             LeafReaderContextPartition[] partitions = slices[i].partitions;
             C collector = collectors.get(i);
             tasks.add(() -> {
+                // A slice that a pool thread picks up after the task was
+                // cancelled stops here rather than collecting its leaves;
+                // the inherited searchLeaf checks the same cancellation
+                // before every leaf and inside the bulk scorer.
+                fragmentContext.cancellation().checkCancelled();
                 search(partitions, weight, collector);
                 return collector;
             });
