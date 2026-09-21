@@ -654,6 +654,9 @@ public final class LanceShardColumnCache {
      */
     private void scanHeap(String name, HeapCellConsumer consumer) throws IOException {
         List<Integer> fragmentIds = new ArrayList<>(leavesByFragmentId.keySet());
+        if (fragmentIds.isEmpty()) {
+            return;
+        }
         Collections.sort(fragmentIds);
         try {
             groupScan.run(fragmentIds, group -> {
