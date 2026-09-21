@@ -975,14 +975,19 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
 
+            // Fragment path requests issued below; the shard path
+            // requests (explain) leave no executor line.
+            int fragmentPathRequests = 0;
             for (String shape : exact) {
                 assertAggregationsMatchShardPath(indexName, shape);
+                fragmentPathRequests++;
             }
 
             // Composite paging: every page and its after_key equal the
             // shard path's, and the pages cover the 300 (category, id)
             // pairs without a repeat.
             Map<String, Object> page = assertAggregationsMatchShardPath(indexName, firstPage);
+            fragmentPathRequests++;
             Map<String, Object> afterKey = (Map<String, Object>) aggregationOf(page, "c").get("after_key");
             assertEquals("c0", afterKey.get("cat"));
             assertEquals(18, ((Number) afterKey.get("i")).intValue());
@@ -998,6 +1003,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                         + after
                         + ",\"sources\":[{\"cat\":{\"terms\":{\"field\":\"category\"}}},{\"i\":{\"terms\":{\"field\":\"id\"}}}]}}}"
                 );
+                fragmentPathRequests++;
                 for (Map<String, Object> bucket : buckets(page)) {
                     keys.add(String.valueOf(bucket.get("key")));
                 }
@@ -1013,6 +1019,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // as a share of the id range (0 to 299), not relatively.
             String tdigest = "{\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"id\"}}}}";
             Map<String, Object> viaFragments = parse(readAll(postJson("/" + indexName + "/_search", tdigest)));
+            fragmentPathRequests++;
             Map<String, Object> viaShard = parse(
                 readAll(postJson("/" + indexName + "/_search?request_cache=false", "{\"explain\":true," + tdigest.substring(1)))
             );
@@ -1039,22 +1046,34 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                     )
                 )
             );
+            fragmentPathRequests++;
             double ids = ((Number) aggregationOf(counted, "ids").get("value")).doubleValue();
             assertTrue("cardinality(id) " + ids, Math.abs(ids - 300d) <= 3d);
             assertEquals(3, ((Number) aggregationOf(counted, "cats").get("value")).intValue());
 
-            // Every data node executed its four fragments for these
-            // requests: the executor logs one line per request with its
-            // fragment count and duration.
+            // Every data node executed its four fragments for every one
+            // of these requests: the executor logs one line per request
+            // with its fragment count and duration, so each node has as
+            // many lines as requests were issued and a request that had
+            // fallen to the shard path would leave a gap.
+            int expectedRequests = fragmentPathRequests;
+            assertEquals(13, expectedRequests);
             assertBusy(() -> {
                 Map<String, Integer> perNode = new HashMap<>();
+                int total = 0;
                 for (String line : clusterLogLines()) {
                     if (!line.contains("lance.dispatch: fragment query for [" + indexName + "] over 4 fragments took ")) {
                         continue;
                     }
                     perNode.merge(loggingNodeName(line), 1, Integer::sum);
+                    total++;
                 }
-                assertEquals("executor lines on " + perNode, dataNodeCount(), perNode.size());
+                int dataNodes = dataNodeCount();
+                assertEquals("executor lines on " + perNode, dataNodes, perNode.size());
+                assertEquals("executor lines per node " + perNode, expectedRequests * dataNodes, total);
+                for (Map.Entry<String, Integer> node : perNode.entrySet()) {
+                    assertEquals("executor lines on " + node.getKey(), expectedRequests, node.getValue().intValue());
+                }
             });
         } finally {
             try {
@@ -1447,7 +1466,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * Every line of every node log under the test clusters directory
      * the build passes in {@code tests.lance.cluster_logs_dir}. The
      * testclusters plugin keeps one {@code <task>-<n>/logs/<task>.log}
-     * per node.
+     * per node; its captured stdout ({@code opensearch.stdout.log})
+     * repeats every line and is skipped so counts are per log line.
      */
     private static List<String> clusterLogLines() throws IOException {
         String property = System.getProperty("tests.lance.cluster_logs_dir");
@@ -1455,7 +1475,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         List<String> lines = new ArrayList<>();
         try (Stream<Path> files = Files.walk(Path.of(property))) {
             for (Path file : files.filter(Files::isRegularFile).toList()) {
-                if (!file.toString().endsWith(".log") || !file.getParent().getFileName().toString().equals("logs")) {
+                String name = file.getFileName().toString();
+                if (!name.endsWith(".log") || name.startsWith("opensearch.") || !file.getParent().getFileName().toString().equals("logs")) {
                     continue;
                 }
                 lines.addAll(Files.readAllLines(file, StandardCharsets.UTF_8));
