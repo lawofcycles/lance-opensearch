@@ -640,6 +640,83 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    /**
+     * Wildcard, regexp and prefix on the {@code lance_text} column and
+     * on the keyword column, fanned out over three executors that each
+     * hold two of the six fragments. The coordinator's SQL drives both
+     * the count only scan and the per executor hits scan, so the
+     * totals, the hits and the pages have to be those of the single
+     * shard path. Rows are {@code "hello tok<i> grp<i % 25> sp<i %
+     * 625> lance..."} for {@code i} in 0..599.
+     */
+    public void testWildcardRegexpPrefixAcrossThreeNodesMatchWholeTableAnswer() throws Exception {
+        String suffix = "mn-pattern-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 6;
+        int rowsPerFragment = 100;
+        LanceTableFactory.writeHintFixtureTable(scratchDir, tableName, fragments, rowsPerFragment);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String grp3 = "{\"wildcard\":{\"body\":{\"value\":\"*grp3 *\"}}}";
+        String byId = ",\"sort\":[{\"id\":\"asc\"}]";
+        List<String> shapes = List.of(
+            "\"size\":10,\"query\":" + grp3,
+            "\"size\":10,\"query\":" + grp3 + byId,
+            "\"from\":5,\"size\":10,\"query\":" + grp3 + byId,
+            "\"size\":0,\"query\":" + grp3,
+            "\"size\":10,\"query\":{\"wildcard\":{\"body\":{\"value\":\"*GRP3 *\",\"case_insensitive\":true}}}" + byId,
+            "\"size\":10,\"query\":{\"regexp\":{\"body\":{\"value\":\"hello tok[0-9] .*\"}}}" + byId,
+            "\"size\":10,\"query\":{\"prefix\":{\"body\":{\"value\":\"hello tok1\"}}}" + byId,
+            "\"size\":10,\"query\":{\"bool\":{\"filter\":[" + grp3 + ",{\"range\":{\"id\":{\"gte\":300}}}]}}" + byId,
+            "\"size\":10,\"query\":{\"prefix\":{\"category\":{\"value\":\"c1\"}}}" + byId,
+            "\"size\":10,\"query\":{\"regexp\":{\"category\":{\"value\":\"c[12]\"}}}" + byId,
+            "\"size\":0,\"query\":{\"wildcard\":{\"category\":{\"value\":\"c*\"}}}"
+        );
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+
+            for (String shape : shapes) {
+                assertFragmentPathMatchesShardPath(indexName, shape);
+            }
+
+            Map<String, Object> page = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(0) + "}")));
+            assertEquals(24, extractIntPath(page, "hits", "total", "value"));
+            assertEquals("eq", relation(page));
+            // The bare page is the first ten matches in row address
+            // order, whichever executors held their fragments.
+            assertEquals(List.of(3, 28, 53, 78, 103, 128, 153, 178, 203, 228), sourceIds(page));
+
+            String count = readAll(postJson("/" + indexName + "/_count", "{\"query\":" + grp3 + "}"));
+            assertEquals(24, extractIntPath(count, "count"));
+            String prefixCount = readAll(
+                postJson("/" + indexName + "/_count", "{\"query\":{\"prefix\":{\"body\":{\"value\":\"hello tok1\"}}}}")
+            );
+            assertEquals(111, extractIntPath(prefixCount, "count"));
+            String regexpCount = readAll(
+                postJson("/" + indexName + "/_count", "{\"query\":{\"regexp\":{\"body\":{\"value\":\"hello tok[0-9] .*\"}}}}")
+            );
+            assertEquals(10, extractIntPath(regexpCount, "count"));
+
+            // A Lucene only regexp operator is refused with 400: the
+            // coordinator cannot translate it, and the executors' field
+            // type refuses the same pattern.
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"regexp\":{\"body\":{\"value\":\"a&b\"}}}}")
+            );
+            assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
+            assertTrue(readAll(failure.getResponse()).contains("Rust regex"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     /** Ids of the form {@code <fragment>-<offset>} ascend by fragment, then by offset. */
     private static void assertRowAddressAscending(List<String> ids) {
         long previous = -1L;

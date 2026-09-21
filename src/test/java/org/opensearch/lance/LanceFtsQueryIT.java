@@ -911,6 +911,219 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         }
     }
 
+    /**
+     * Wildcard, regexp and prefix on a {@code lance_text} column run as
+     * a Lance scan filter over the stored string. The hint fixture's
+     * body is {@code "hello tok<i> grp<i % 25> sp<i % 625> lance..."}
+     * for {@code i} in 0..599, so {@code *grp3 *} (the space keeps
+     * {@code grp30} out) matches the 24 rows {@code lance_match grp3}
+     * matches, and the two hit sets have to agree.
+     */
+    public void testWildcardRegexpPrefixOnLanceTextRunAsScanFilters() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "ltextpattern")) {
+            String indexName = fixture.indexName();
+            String grp3Wildcard = "{\"wildcard\":{\"body\":{\"value\":\"*grp3 *\"}}}";
+            String grp3Match = "{\"lance_match\":{\"field\":\"body\",\"query\":\"grp3\"}}";
+
+            // size 10: total is the full match count, the page is clipped.
+            String page = readAll(postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":" + grp3Wildcard + "}"));
+            assertEquals("24 rows have i % 25 == 3: " + page, 24, extractIntPath(page, "hits", "total", "value"));
+            assertEquals("size 10 must return ten hits: " + page, 10, hitsOf(page).size());
+
+            // The full wildcard hit set is the lance_match hit set.
+            Set<String> wildcardIds = new HashSet<>(
+                idsOf(hitsOf(readAll(postJson("/" + indexName + "/_search", "{\"size\":100,\"query\":" + grp3Wildcard + "}"))))
+            );
+            Set<String> matchIds = new HashSet<>(
+                idsOf(hitsOf(readAll(postJson("/" + indexName + "/_search", "{\"size\":100,\"query\":" + grp3Match + "}"))))
+            );
+            assertEquals(24, wildcardIds.size());
+            assertEquals("wildcard *grp3 * and lance_match grp3 select the same rows", matchIds, wildcardIds);
+            assertTrue("row 3 lives at fragment 0 offset 3: " + wildcardIds, wildcardIds.contains("0-3"));
+            assertTrue("row 578 lives at fragment 2 offset 178: " + wildcardIds, wildcardIds.contains("2-178"));
+
+            // size 0 and _count take the count only scan on the same SQL.
+            String countOnly = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":" + grp3Wildcard + "}"));
+            assertEquals(24, extractIntPath(countOnly, "hits", "total", "value"));
+            assertEquals(0, hitsOf(countOnly).size());
+            assertEquals(24, extractIntPath(readAll(postJson("/" + indexName + "/_count", "{\"query\":" + grp3Wildcard + "}")), "count"));
+
+            // ? is one character: tok?? are the rows 10..99.
+            String twoDigits = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"wildcard\":{\"body\":{\"value\":\"hello tok?? *\"}}}}")
+            );
+            assertEquals(90, extractIntPath(twoDigits, "hits", "total", "value"));
+
+            // Case: the stored string is lower case, so the upper case
+            // pattern matches nothing unless case_insensitive is set.
+            String upper = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"wildcard\":{\"body\":{\"value\":\"*GRP3 *\"}}}}")
+            );
+            assertEquals(0, extractIntPath(upper, "hits", "total", "value"));
+            String upperInsensitive = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"wildcard\":{\"body\":{\"value\":\"*GRP3 *\",\"case_insensitive\":true}}}}"
+                )
+            );
+            assertEquals(24, extractIntPath(upperInsensitive, "hits", "total", "value"));
+
+            // Inside bool.filter next to a range: i % 25 == 3 and i >= 300
+            // leaves 12 rows; the hits are the same as the range alone
+            // intersected with the wildcard alone.
+            String boolFilter = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":100,\"query\":{\"bool\":{\"filter\":[" + grp3Wildcard + ",{\"range\":{\"id\":{\"gte\":300}}}]}}}"
+                )
+            );
+            assertEquals(12, extractIntPath(boolFilter, "hits", "total", "value"));
+            Set<String> boolIds = new HashSet<>(idsOf(hitsOf(boolFilter)));
+            assertEquals(12, boolIds.size());
+            assertTrue("every bool hit is a wildcard hit: " + boolIds, wildcardIds.containsAll(boolIds));
+            assertTrue(boolIds.contains("1-103"));
+            assertFalse(boolIds.contains("0-3"));
+
+            // Inside lance_knn.filter: embedding[0] = i, so the two rows
+            // with i % 25 == 3 nearest to 300.4 are 303 and 278.
+            String knn = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":2,\"query\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":[300.4,0,0,0,0,0,0,0],\"k\":2,\"filter\":"
+                        + grp3Wildcard
+                        + "}}}"
+                )
+            );
+            assertEquals(2, extractIntPath(knn, "hits", "total", "value"));
+            assertEquals(303, extractIntPath(knn, "hits", "hits", "0", "_source", "id"));
+            assertEquals(278, extractIntPath(knn, "hits", "hits", "1", "_source", "id"));
+
+            // regexp: whole string match in Rust regex syntax; rows 0..9
+            // have a one digit tok and a one digit grp.
+            String regexp = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":100,\"query\":{\"regexp\":{\"body\":{\"value\":\"hello tok[0-9] grp[0-9] sp[0-9]( lance)+\"}}}}"
+                )
+            );
+            assertEquals(10, extractIntPath(regexp, "hits", "total", "value"));
+            assertEquals(
+                Set.of("0-0", "0-1", "0-2", "0-3", "0-4", "0-5", "0-6", "0-7", "0-8", "0-9"),
+                new HashSet<>(idsOf(hitsOf(regexp)))
+            );
+            // Not anchored by the caller, anchored by the plugin: a
+            // pattern that matches a substring only does not match.
+            String substring = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"regexp\":{\"body\":{\"value\":\"tok[0-9]\"}}}}")
+            );
+            assertEquals(0, extractIntPath(substring, "hits", "total", "value"));
+            String regexpInsensitive = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"regexp\":{\"body\":{\"value\":\"HELLO TOK[0-9] .*\",\"case_insensitive\":true}}}}"
+                )
+            );
+            assertEquals(10, extractIntPath(regexpInsensitive, "hits", "total", "value"));
+
+            // A Lucene only operator is refused before anything runs.
+            ResponseException luceneOnly = expectThrows(
+                ResponseException.class,
+                () -> postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"regexp\":{\"body\":{\"value\":\"hello.*&.*lance\"}}}}"
+                )
+            );
+            assertEquals(400, luceneOnly.getResponse().getStatusLine().getStatusCode());
+            assertTrue(readAll(luceneOnly.getResponse()).contains("Rust regex"));
+            // A pattern Rust's parser rejects is refused by Lance when
+            // it plans the scan; Lance's message names the parse error.
+            ResponseException rustRejects = expectThrows(
+                ResponseException.class,
+                () -> postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"regexp\":{\"body\":{\"value\":\"hello (tok\"}}}}")
+            );
+            assertEquals(400, rustRejects.getResponse().getStatusLine().getStatusCode());
+            assertTrue(readAll(rustRejects.getResponse()).contains("regex parse error"));
+
+            // prefix: tok1, tok10..19, tok100..199 are 111 rows.
+            String prefix = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"prefix\":{\"body\":{\"value\":\"hello tok1\"}}}}")
+            );
+            assertEquals(111, extractIntPath(prefix, "hits", "total", "value"));
+            String prefixInsensitive = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"prefix\":{\"body\":{\"value\":\"HELLO TOK1\",\"case_insensitive\":true}}}}"
+                )
+            );
+            assertEquals(111, extractIntPath(prefixInsensitive, "hits", "total", "value"));
+            assertEquals(
+                0,
+                extractIntPath(
+                    readAll(
+                        postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"prefix\":{\"body\":{\"value\":\"HELLO TOK1\"}}}}")
+                    ),
+                    "hits",
+                    "total",
+                    "value"
+                )
+            );
+
+            // The same queries on the keyword column take the same SQL
+            // and agree with a terms / exists reference. category is
+            // "c" + (i % 3), null when i % 4 == 3.
+            String keywordWildcard = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"wildcard\":{\"category\":{\"value\":\"c*\"}}}}")
+            );
+            String exists = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"exists\":{\"field\":\"category\"}}}"));
+            assertEquals(450, extractIntPath(exists, "hits", "total", "value"));
+            assertEquals(extractIntPath(exists, "hits", "total", "value"), extractIntPath(keywordWildcard, "hits", "total", "value"));
+            String sortById = ",\"sort\":[{\"id\":\"asc\"}]";
+            String keywordRegexp = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":500,\"query\":{\"regexp\":{\"category\":{\"value\":\"c[12]\"}}}" + sortById + "}"
+                )
+            );
+            String keywordTerms = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":500,\"query\":{\"terms\":{\"category\":[\"c1\",\"c2\"]}}" + sortById + "}"
+                )
+            );
+            assertEquals(300, extractIntPath(keywordTerms, "hits", "total", "value"));
+            assertEquals(idsOf(hitsOf(keywordTerms)), idsOf(hitsOf(keywordRegexp)));
+            String keywordPrefix = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":500,\"query\":{\"prefix\":{\"category\":{\"value\":\"c1\"}}}" + sortById + "}"
+                )
+            );
+            String keywordTerm = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":500,\"query\":{\"term\":{\"category\":\"c1\"}}" + sortById + "}")
+            );
+            assertEquals(150, extractIntPath(keywordTerm, "hits", "total", "value"));
+            assertEquals(idsOf(hitsOf(keywordTerm)), idsOf(hitsOf(keywordPrefix)));
+
+            // A wildcard on a numeric column keeps OpenSearch's stock 400.
+            ResponseException numeric = expectThrows(
+                ResponseException.class,
+                () -> postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"wildcard\":{\"rating\":{\"value\":\"1*\"}}}}")
+            );
+            assertEquals(400, numeric.getResponse().getStatusLine().getStatusCode());
+            assertTrue(readAll(numeric.getResponse()).contains("Can only use wildcard queries on keyword and text fields"));
+
+            // A multi-valued keyword column (list<utf8>) has no common
+            // type with the LIKE pattern; Lance refuses the scan as
+            // invalid input, which is answered as 400.
+            ResponseException list = expectThrows(
+                ResponseException.class,
+                () -> postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"wildcard\":{\"tags\":{\"value\":\"t*\"}}}}")
+            );
+            assertEquals(400, list.getResponse().getStatusLine().getStatusCode());
+            assertTrue(readAll(list.getResponse()).contains("List(Utf8)"));
+        }
+    }
+
     public void testLanceMultiMatchLimitsToListedFields() throws Exception {
         // "morning" only appears in title.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "lmmscope")) {
