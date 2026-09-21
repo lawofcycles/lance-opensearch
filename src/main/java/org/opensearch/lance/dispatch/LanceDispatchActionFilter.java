@@ -140,9 +140,9 @@ public class LanceDispatchActionFilter implements ActionFilter {
         }
 
         if (!LanceAggregationSupport.isSupported(searchRequest.source())) {
-            // Aggregation shape the fragment executor cannot answer
-            // yet (scripts, missing values, sub-aggregations, or a
-            // metric on a non-ValuesSource builder).
+            // Aggregation shape the fragment executor has not taken
+            // over yet (a script, a type off the allow list, a filter
+            // bucket over a Lance query, a pipeline).
             chain.proceed(task, action, request, listener);
             return;
         }
