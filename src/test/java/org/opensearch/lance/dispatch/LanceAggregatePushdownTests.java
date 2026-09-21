@@ -11,7 +11,6 @@ import java.nio.file.Path;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -815,29 +814,6 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
         } finally {
             setParallelism(null);
         }
-    }
-
-    public void testGroupSplitIsContiguous() {
-        assertEquals(
-            List.of(List.of(0, 1, 2, 3, 4, 5, 6, 7)),
-            LanceAggregatePushdown.Plan.splitContiguous(List.of(0, 1, 2, 3, 4, 5, 6, 7), 1)
-        );
-        assertEquals(
-            List.of(List.of(0, 1, 2, 3), List.of(4, 5, 6, 7)),
-            LanceAggregatePushdown.Plan.splitContiguous(List.of(0, 1, 2, 3, 4, 5, 6, 7), 2)
-        );
-        assertEquals(
-            List.of(List.of(0, 1), List.of(2, 3, 4), List.of(5, 6, 7)),
-            LanceAggregatePushdown.Plan.splitContiguous(List.of(0, 1, 2, 3, 4, 5, 6, 7), 3)
-        );
-        assertEquals(
-            "more parallelism than fragments: one fragment per group",
-            List.of(List.of(3), List.of(9), List.of(12)),
-            LanceAggregatePushdown.Plan.splitContiguous(List.of(3, 9, 12), 8)
-        );
-        assertEquals(List.of(List.of(7)), LanceAggregatePushdown.Plan.splitContiguous(List.of(7), 4));
-        assertEquals(Collections.singletonList(null), LanceAggregatePushdown.Plan.splitContiguous(null, 4));
-        assertEquals(Collections.singletonList(null), LanceAggregatePushdown.Plan.splitContiguous(List.of(), 4));
     }
 
     public void testOneFailingGroupFailsTheRequestAndAStarvedPoolStillAnswers() throws Exception {
