@@ -15,6 +15,7 @@ import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.function.BiFunction;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -22,6 +23,7 @@ import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.IndexCommit;
+import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.search.ReferenceManager;
@@ -93,6 +95,7 @@ import org.opensearch.lance.StorageOptions;
 public final class LanceEngineFactory implements EngineFactory {
 
     private final LanceWarmCache warmCache;
+    private final LongSupplier maxDocsPerReader;
 
     /** Factory whose engines open their own dataset per reader. */
     public LanceEngineFactory() {
@@ -104,7 +107,22 @@ public final class LanceEngineFactory implements EngineFactory {
      *                  from, or {@code null} to open a dataset per reader
      */
     public LanceEngineFactory(LanceWarmCache warmCache) {
+        this(warmCache, () -> IndexWriter.MAX_DOCS);
+    }
+
+    /**
+     * @param warmCache        snapshot cache the engines take their readers
+     *                         from, or {@code null} to open a dataset per
+     *                         reader
+     * @param maxDocsPerReader read at every reader open: the most physical
+     *                         rows a shard reader may hold, the current
+     *                         value of {@code lance.test.max_docs_per_reader}
+     *                         ({@code IndexWriter.MAX_DOCS} unless a test
+     *                         lowered it)
+     */
+    public LanceEngineFactory(LanceWarmCache warmCache, LongSupplier maxDocsPerReader) {
         this.warmCache = warmCache;
+        this.maxDocsPerReader = maxDocsPerReader;
     }
 
     public static final String TABLE_SETTING = "index.lance.table";
@@ -234,7 +252,8 @@ public final class LanceEngineFactory implements EngineFactory {
             storageOptions,
             multiFields,
             warmCache,
-            indexUuid
+            indexUuid,
+            maxDocsPerReader
         );
     }
 
@@ -274,6 +293,8 @@ public final class LanceEngineFactory implements EngineFactory {
         final LanceWarmCache warmCache;
         /** Key the snapshots of this index are filed under, with the version. */
         final String indexUuid;
+        /** Bound on the physical rows a reader of this shard may hold; see {@link LanceEngineFactory#LanceEngineFactory(LanceWarmCache, LongSupplier)}. */
+        final LongSupplier maxDocsPerReader;
         private final LanceReaderManager lanceReaderManager;
 
         LanceReadOnlyEngine(
@@ -287,7 +308,8 @@ public final class LanceEngineFactory implements EngineFactory {
             StorageOptions storageOptions,
             java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
             LanceWarmCache warmCache,
-            String indexUuid
+            String indexUuid,
+            LongSupplier maxDocsPerReader
         ) {
             super(config, null, null, true, Function.identity(), true);
             this.tablePath = table;
@@ -300,6 +322,7 @@ public final class LanceEngineFactory implements EngineFactory {
             this.multiFields = multiFields;
             this.warmCache = warmCache;
             this.indexUuid = indexUuid;
+            this.maxDocsPerReader = maxDocsPerReader;
             // The super constructor has already taken store.incRef(), the
             // IndexWriter write lock, and a DirectoryReader on the empty
             // commit. If the Lance side fails to open (table missing,
@@ -413,7 +436,17 @@ public final class LanceEngineFactory implements EngineFactory {
             OpenSearchDirectoryReader wrapped = null;
             LanceDirectoryReader reader = null;
             try {
-                reader = LanceDirectoryReader.open(directory, commit, dataset, field, pkType, multiFields, requestBreaker());
+                reader = LanceDirectoryReader.open(
+                    directory,
+                    commit,
+                    dataset,
+                    field,
+                    pkType,
+                    multiFields,
+                    requestBreaker(),
+                    maxDocsPerReader.getAsLong()
+                );
+                warnIfBoundExceeded(reader);
                 wrapped = OpenSearchDirectoryReader.wrap(reader, config().getShardId());
                 return wrapped;
             } catch (Throwable t) {
@@ -454,9 +487,11 @@ public final class LanceEngineFactory implements EngineFactory {
                 commit,
                 lease,
                 lease.snapshot().isCached() ? warmCache.columnStore() : null,
-                requestBreaker()
+                requestBreaker(),
+                maxDocsPerReader.getAsLong()
             );
             try {
+                warnIfBoundExceeded(reader);
                 return OpenSearchDirectoryReader.wrap(reader, config().getShardId());
             } catch (Throwable t) {
                 try {
@@ -465,6 +500,25 @@ public final class LanceEngineFactory implements EngineFactory {
                     t.addSuppressed(suppressed);
                 }
                 throw t;
+            }
+        }
+
+        /**
+         * One WARN per reader open of a table one Lucene reader cannot
+         * hold whole: GET and the fragment path still see every row, but
+         * {@code _stats} counts the reader's rows only.
+         */
+        private void warnIfBoundExceeded(LanceDirectoryReader reader) {
+            if (reader.luceneBoundExceeded()) {
+                LOG.warn(
+                    "lance: shard reader of [{}] holds {} of {} physical rows (table [{}] is above the bound of {} rows per Lucene reader); "
+                        + "searches and GET read every row through Lance, _stats docs.count reports the reader's rows",
+                    config().getShardId().getIndexName(),
+                    reader.maxDoc(),
+                    reader.tablePhysicalRows(),
+                    tablePath,
+                    maxDocsPerReader.getAsLong()
+                );
             }
         }
 

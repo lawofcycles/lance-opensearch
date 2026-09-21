@@ -72,7 +72,56 @@ public final class LanceDirectoryReader extends DirectoryReader {
         return new DataFileSizes(knownBytes, filesWithoutSize);
     }
 
+    /**
+     * Cut a sequence of fragments, given as their physical row counts in
+     * order, into contiguous groups whose row total stays within
+     * {@code maxDocs}, and return the end index (exclusive) of every
+     * group. A single Lucene composite reader refuses leaves whose
+     * {@code maxDoc} sum exceeds {@link IndexWriter#MAX_DOCS}, and a
+     * fragment leaf's {@code maxDoc} is its physical row count, so this
+     * is the unit a reader may hold. A fragment alone above the bound
+     * forms a group of its own (a reader over it fails; attach refuses
+     * such a table). An empty input yields no group.
+     */
+    public static int[] groupEnds(long[] physicalRows, long maxDocs) {
+        List<Integer> ends = new ArrayList<>();
+        long inGroup = 0L;
+        for (int i = 0; i < physicalRows.length; i++) {
+            long rows = physicalRows[i];
+            if (inGroup > 0L && inGroup + rows > maxDocs) {
+                ends.add(i);
+                inGroup = 0L;
+            }
+            inGroup += rows;
+        }
+        if (physicalRows.length > 0) {
+            ends.add(physicalRows.length);
+        }
+        int[] result = new int[ends.size()];
+        for (int i = 0; i < result.length; i++) {
+            result[i] = ends.get(i);
+        }
+        return result;
+    }
+
+    /**
+     * How many leading fragments of {@code physicalRows} one reader may
+     * hold under {@code maxDocs}: the first group of
+     * {@link #groupEnds}, zero for no fragments.
+     */
+    public static int leadingFragmentsWithinBound(long[] physicalRows, long maxDocs) {
+        int[] ends = groupEnds(physicalRows, maxDocs);
+        return ends.length == 0 ? 0 : ends[0];
+    }
+
     private final IndexCommit commit;
+    // Every row of the table version this reader was opened over, live or
+    // deleted, whether or not the reader holds it. Equal to maxDoc()
+    // unless the bound cut the reader short.
+    private final long totalRows;
+    // Live rows of the table version (Dataset.countRows), or -1 when the
+    // reader holds every fragment and numDocs() is that count already.
+    private final long liveRows;
     // Data file byte total of the fragments this reader exposes, computed
     // once at open from the manifest the reader was built from. The engine
     // reports it through DocsStats.totalSizeInBytes; a refresh that swaps
@@ -148,6 +197,29 @@ public final class LanceDirectoryReader extends DirectoryReader {
         java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
         CircuitBreaker requestBreaker
     ) throws IOException {
+        return open(directory, commit, dataset, intField, pkType, multiFields, requestBreaker, IndexWriter.MAX_DOCS);
+    }
+
+    /**
+     * Same as {@link #open(Directory, IndexCommit, Dataset, String,
+     * org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType,
+     * java.util.Map, CircuitBreaker)} with the row bound of the reader
+     * given: when the table's fragments hold more physical rows than
+     * {@code maxDocs} together, only the leading fragments that fit
+     * become leaves and the reader reports {@link #luceneBoundExceeded()}.
+     * {@code IndexWriter.MAX_DOCS} is the bound Lucene enforces; a smaller
+     * value only serves tests.
+     */
+    public static LanceDirectoryReader open(
+        Directory directory,
+        IndexCommit commit,
+        Dataset dataset,
+        String intField,
+        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+        CircuitBreaker requestBreaker,
+        long maxDocs
+    ) throws IOException {
         List<LeafReader> leaves = new ArrayList<>();
         List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>();
         // One describeIndices sweep for the whole reader; every leaf's
@@ -155,7 +227,12 @@ public final class LanceDirectoryReader extends DirectoryReader {
         // Lance per (leaf, Utf8 column).
         java.util.Set<String> ftsColumns = LanceFragmentLeafReader.resolveFtsColumns(dataset);
         List<Fragment> fragments = dataset.getFragments();
-        for (Fragment fragment : fragments) {
+        long[] physicalRows = new long[fragments.size()];
+        for (int i = 0; i < fragments.size(); i++) {
+            physicalRows[i] = fragments.get(i).metadata().getPhysicalRows();
+        }
+        int held = leadingFragmentsWithinBound(physicalRows, maxDocs);
+        for (Fragment fragment : fragments.subList(0, held)) {
             LanceFragmentLeafReader raw = new LanceFragmentLeafReader(
                 dataset,
                 fragment.getId(),
@@ -186,7 +263,38 @@ public final class LanceDirectoryReader extends DirectoryReader {
         for (LanceFragmentLeafReader raw : rawLeaves) {
             raw.setShardColumnCache(cache);
         }
-        return openWithLeaves(directory, commit, dataset, true, null, cache, leaves, sumDataFileSizes(fragments));
+        return openWithLeaves(
+            directory,
+            commit,
+            dataset,
+            true,
+            null,
+            cache,
+            leaves,
+            sumDataFileSizes(fragments),
+            tableRows(dataset, physicalRows, held)
+        );
+    }
+
+    /**
+     * Row totals of the table version behind a whole table reader that
+     * holds the first {@code held} of the fragments with
+     * {@code physicalRows}: every physical row, and the live row count
+     * when the reader was cut short (the leaves alone cannot tell it
+     * then; one metadata read of the manifest can).
+     */
+    private static TableRows tableRows(Dataset dataset, long[] physicalRows, int held) {
+        long total = 0L;
+        for (long rows : physicalRows) {
+            total += rows;
+        }
+        long live = held < physicalRows.length ? dataset.countRows() : -1L;
+        return new TableRows(total, live);
+    }
+
+    /** Physical and live row totals of a table version; live is -1 when the leaves already give it. */
+    private record TableRows(long physical, long live) {
+        static final TableRows FROM_LEAVES = new TableRows(-1L, -1L);
     }
 
     /**
@@ -293,7 +401,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         }
         // Per-request fragment readers do not report shard stats, so skip
         // the manifest walk here.
-        return openWithLeaves(directory, commit, dataset, true, null, cache, leaves, DataFileSizes.NONE);
+        return openWithLeaves(directory, commit, dataset, true, null, cache, leaves, DataFileSizes.NONE, TableRows.FROM_LEAVES);
     }
 
     /**
@@ -382,7 +490,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         for (LanceFragmentLeafReader raw : rawLeaves) {
             raw.setShardColumnCache(cache);
         }
-        return openWithLeaves(directory, null, dataset, false, null, cache, leaves, DataFileSizes.NONE);
+        return openWithLeaves(directory, null, dataset, false, null, cache, leaves, DataFileSizes.NONE, TableRows.FROM_LEAVES);
     }
 
     /**
@@ -421,12 +529,40 @@ public final class LanceDirectoryReader extends DirectoryReader {
         ColumnStore columnStore,
         CircuitBreaker requestBreaker
     ) throws IOException {
+        return openForSnapshot(directory, commit, lease, columnStore, requestBreaker, IndexWriter.MAX_DOCS);
+    }
+
+    /**
+     * Same as {@link #openForSnapshot(Directory, IndexCommit,
+     * LanceWarmCache.Lease, ColumnStore, CircuitBreaker)} with the row
+     * bound of the reader given, as for {@link #open(Directory,
+     * IndexCommit, Dataset, String,
+     * org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType,
+     * java.util.Map, CircuitBreaker, long)}: the reader holds the leading
+     * fragments of the snapshot whose physical rows fit in
+     * {@code maxDocs} and reports {@link #luceneBoundExceeded()} when
+     * that is not every fragment.
+     */
+    public static LanceDirectoryReader openForSnapshot(
+        Directory directory,
+        IndexCommit commit,
+        LanceWarmCache.Lease lease,
+        ColumnStore columnStore,
+        CircuitBreaker requestBreaker,
+        long maxDocs
+    ) throws IOException {
         LanceWarmCache.Snapshot snapshot = lease.snapshot();
         Dataset dataset = snapshot.dataset();
         try {
-            List<LeafReader> leaves = new ArrayList<>(snapshot.fragments().size());
-            List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>(snapshot.fragments().size());
-            for (LanceWarmCache.FragmentMeta meta : snapshot.fragments()) {
+            List<LanceWarmCache.FragmentMeta> fragments = snapshot.fragments();
+            long[] physicalRows = new long[fragments.size()];
+            for (int i = 0; i < fragments.size(); i++) {
+                physicalRows[i] = fragments.get(i).physicalRows();
+            }
+            int held = leadingFragmentsWithinBound(physicalRows, maxDocs);
+            List<LeafReader> leaves = new ArrayList<>(held);
+            List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>(held);
+            for (LanceWarmCache.FragmentMeta meta : fragments.subList(0, held)) {
                 meta.resolveLiveDocs(dataset);
                 LanceFragmentLeafReader raw = new LanceFragmentLeafReader(dataset, meta.id(), meta, snapshot.schema(), null);
                 rawLeaves.add(raw);
@@ -444,7 +580,17 @@ public final class LanceDirectoryReader extends DirectoryReader {
             for (LanceFragmentLeafReader raw : rawLeaves) {
                 raw.setShardColumnCache(cache);
             }
-            return openWithLeaves(directory, commit, dataset, false, lease, cache, leaves, snapshot.dataFileSizes());
+            return openWithLeaves(
+                directory,
+                commit,
+                dataset,
+                false,
+                lease,
+                cache,
+                leaves,
+                snapshot.dataFileSizes(),
+                tableRows(dataset, physicalRows, held)
+            );
         } catch (Throwable t) {
             // The reader never came to own the lease; give the snapshot
             // reference back so a failed engine open does not pin it.
@@ -461,7 +607,8 @@ public final class LanceDirectoryReader extends DirectoryReader {
         LanceWarmCache.Lease lease,
         LanceShardColumnCache columnCache,
         List<LeafReader> leaves,
-        DataFileSizes dataFileSizes
+        DataFileSizes dataFileSizes,
+        TableRows tableRows
     ) throws IOException {
         ByteBuffersDirectory bridgeDir = new ByteBuffersDirectory();
         try (IndexWriter writer = new IndexWriter(bridgeDir, new IndexWriterConfig())) {
@@ -478,7 +625,8 @@ public final class LanceDirectoryReader extends DirectoryReader {
             lease,
             columnCache,
             bridge,
-            dataFileSizes
+            dataFileSizes,
+            tableRows
         );
     }
 
@@ -491,7 +639,8 @@ public final class LanceDirectoryReader extends DirectoryReader {
         LanceWarmCache.Lease lease,
         LanceShardColumnCache columnCache,
         DirectoryReader cacheLifetimeBridge,
-        DataFileSizes dataFileSizes
+        DataFileSizes dataFileSizes,
+        TableRows tableRows
     ) throws IOException {
         super(directory, leaves, null);
         this.commit = commit;
@@ -501,6 +650,52 @@ public final class LanceDirectoryReader extends DirectoryReader {
         this.columnCache = columnCache;
         this.cacheLifetimeBridge = cacheLifetimeBridge;
         this.dataFileSizes = dataFileSizes;
+        this.totalRows = tableRows.physical() < 0 ? maxDoc() : tableRows.physical();
+        this.liveRows = tableRows.live();
+    }
+
+    /**
+     * Whether the table version behind this reader has more physical
+     * rows than one Lucene reader may hold, so that the reader holds
+     * only the leading fragments that fit. Only a whole table reader
+     * ({@link #open} or the lease form of {@link #openForSnapshot}) can
+     * report {@code true}; a fragment path reader is opened over a
+     * fragment group the coordinator already cut to the bound.
+     */
+    public boolean luceneBoundExceeded() {
+        return totalRows > maxDoc();
+    }
+
+    /**
+     * Live rows of the whole table version this reader was opened over,
+     * whether or not the reader holds them: {@link #numDocs()} when it
+     * holds every fragment, else the manifest's count.
+     */
+    public long tableRows() {
+        return liveRows < 0 ? numDocs() : liveRows;
+    }
+
+    /**
+     * Physical rows (live and deleted) of the whole table version,
+     * whether or not the reader holds them; {@link #maxDoc()} unless
+     * {@link #luceneBoundExceeded()}.
+     */
+    public long tablePhysicalRows() {
+        return totalRows;
+    }
+
+    /**
+     * The {@link LanceDirectoryReader} behind an arbitrary reader handed
+     * out by the engine (unwrapping the {@link FilterDirectoryReader}
+     * chain as {@link #dataFileSizesOf} does), or {@code null} when the
+     * innermost reader is not one.
+     */
+    public static LanceDirectoryReader unwrap(IndexReader reader) {
+        if (reader instanceof DirectoryReader directoryReader
+            && FilterDirectoryReader.unwrap(directoryReader) instanceof LanceDirectoryReader lanceReader) {
+            return lanceReader;
+        }
+        return null;
     }
 
     /**

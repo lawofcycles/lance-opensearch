@@ -12,6 +12,7 @@ import java.util.function.Supplier;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.index.IndexWriter;
 import org.lance.Session;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
@@ -520,6 +521,30 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.Dynamic
     );
 
+    /**
+     * The most physical rows one Lucene reader of a Lance table may
+     * hold. Lucene refuses a composite reader whose leaves' {@code maxDoc}
+     * sum exceeds {@link IndexWriter#MAX_DOCS} (2,147,483,519), and a
+     * fragment leaf's {@code maxDoc} is the fragment's physical row
+     * count, so a table with more rows than that is served in pieces:
+     * the coordinator cuts each data node's fragments into groups within
+     * the bound and sends one fragment request per group, and the shard
+     * engine's whole table reader holds the leading fragments that fit.
+     * The default is the Lucene bound itself. The setting exists so the
+     * integration tests can exercise the split on a small table; it is
+     * not meant to be changed on a real node. Dynamic: the coordinator
+     * and the dispatch filter read it per request, the engine at every
+     * reader open.
+     */
+    public static final Setting<Long> MAX_DOCS_PER_READER_SETTING = Setting.longSetting(
+        "lance.test.max_docs_per_reader",
+        IndexWriter.MAX_DOCS,
+        1L,
+        IndexWriter.MAX_DOCS,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -550,7 +575,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING,
             FRAGMENT_PATH_PARALLELISM_SETTING,
             FRAGMENT_PATH_SLICES_SETTING,
-            ATTACH_WARM_INDEXES_SETTING
+            ATTACH_WARM_INDEXES_SETTING,
+            MAX_DOCS_PER_READER_SETTING
         );
     }
 
@@ -655,7 +681,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     @Override
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
         if (indexSettings.getSettings().get(LanceEngineFactory.TABLE_SETTING) != null) {
-            return Optional.of(new LanceEngineFactory(warmCache));
+            return Optional.of(new LanceEngineFactory(warmCache, () -> maxDocsPerReader));
         }
         return Optional.empty();
     }
@@ -680,6 +706,13 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     private LanceCreateIndexActionFilter createIndexActionFilter;
     private volatile LanceWarmCache warmCache;
     private volatile LanceIndexWarmer indexWarmer;
+    /**
+     * Current {@link #MAX_DOCS_PER_READER_SETTING}, handed to the engine
+     * factories as a supplier so a reader opened after a settings update
+     * sees the new bound. The Lucene bound until the components are
+     * created.
+     */
+    private volatile long maxDocsPerReader = IndexWriter.MAX_DOCS;
 
     /**
      * Cancellable handle for the scheduled task that samples the shared
@@ -809,6 +842,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         );
         clusterService.getClusterSettings().addSettingsUpdateConsumer(ATTACH_WARM_INDEXES_SETTING, indexWarmer::setMode);
         clusterService.addListener(indexWarmer);
+        this.maxDocsPerReader = MAX_DOCS_PER_READER_SETTING.get(environment.settings());
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(MAX_DOCS_PER_READER_SETTING, value -> maxDocsPerReader = value);
         // Read side of GET /_lance/stats. The session size is read through
         // the registry here because the stats package cannot see the
         // registry's package-private session accessor.
