@@ -490,10 +490,23 @@ public final class LanceTableFactory {
      * </ul>
      */
     static String writeStringPkTable(Path parent, String name, int rowCount) throws Exception {
-        return withLocaleRoot(() -> writeStringPkTableOnce(parent, name, rowCount));
+        return withLocaleRoot(() -> writeStringPkTableOnce(parent, name, rowCount, 0));
     }
 
-    private static String writeStringPkTableOnce(Path parent, String name, int rowCount) throws Exception {
+    /**
+     * Same rows as {@link #writeStringPkTable(Path, String, int)}, written
+     * {@code maxRowsPerFile} rows per fragment, so a table with a primary
+     * key spans several fragments (row {@code i} sits in fragment
+     * {@code i / maxRowsPerFile}).
+     */
+    public static String writeStringPkTable(Path parent, String name, int rowCount, int maxRowsPerFile) throws Exception {
+        if (maxRowsPerFile <= 0) {
+            throw new IllegalArgumentException("maxRowsPerFile must be positive, was " + maxRowsPerFile);
+        }
+        return withLocaleRoot(() -> writeStringPkTableOnce(parent, name, rowCount, maxRowsPerFile));
+    }
+
+    private static String writeStringPkTableOnce(Path parent, String name, int rowCount, int maxRowsPerFile) throws Exception {
         Path tablePath = parent.resolve(name + ".lance");
         String uri = tablePath.toString();
         java.util.Map<String, String> pkMeta = Map.of("lance-schema:unenforced-primary-key", "true");
@@ -544,12 +557,15 @@ public final class LanceTableFactory {
                 ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
             ) {
                 Data.exportArrayStream(allocator, reader, stream);
-                WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
+                WriteParams.Builder writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE);
+                if (maxRowsPerFile > 0) {
+                    writeParams = writeParams.withMaxRowsPerFile(maxRowsPerFile);
+                }
                 // No FTS index on either column: the point is to exercise
                 // the keyword PK path, not FTS. Derivation surfaces the
                 // key column as `keyword` and the mapping still lets term
                 // and match queries resolve.
-                Dataset.create(allocator, stream, uri, writeParams).close();
+                Dataset.create(allocator, stream, uri, writeParams.build()).close();
             }
         }
         return uri;

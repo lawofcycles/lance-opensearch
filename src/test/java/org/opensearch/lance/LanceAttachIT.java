@@ -61,6 +61,59 @@ public class LanceAttachIT extends LanceRestTestCase {
         assertTrue("expected error to point at /_lance/attach: " + body, body.contains("/_lance/attach"));
     }
 
+    public void testAttachFlagsATableAboveTheLuceneBoundAndRefusesAnOversizeFragment() throws Exception {
+        // 12 rows in 3 fragments of 4. Under a bound of 4 rows per reader
+        // the table attaches (the fragment path reads it in groups) and
+        // the response says the shard reader holds part of it; under a
+        // bound of 3 no reader can hold a single fragment and attach is
+        // refused. A re-attach of the flagged table reports the flag too.
+        String suffix = "bound-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 12, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        try {
+            setMaxDocsPerReader("4");
+            String attach = readAll(postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
+            assertEquals(attach, 12, extractIntPath(attach, "rows"));
+            assertEquals(attach, 3, extractIntPath(attach, "fragments"));
+            assertTrue(attach, attach.contains("\"lucene_bound_exceeded\":true"));
+            assertTrue(attach, attach.contains("\"already_attached\":false"));
+            ensureGreen(tableName);
+            String again = readAll(postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
+            assertTrue(again, again.contains("\"already_attached\":true"));
+            assertTrue(again, again.contains("\"lucene_bound_exceeded\":true"));
+            client().performRequest(new Request("DELETE", "/" + tableName));
+
+            setMaxDocsPerReader("3");
+            ResponseException refused = expectThrows(
+                ResponseException.class,
+                () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}")
+            );
+            assertEquals(400, refused.getResponse().getStatusLine().getStatusCode());
+            String body = readAll(refused.getResponse());
+            assertTrue(body, body.contains("has a fragment of 4 rows, above the bound of 3 rows per Lucene reader"));
+
+            // Under the default bound the flag is absent.
+            setMaxDocsPerReader(null);
+            String plain = readAll(postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
+            assertFalse(plain, plain.contains("lucene_bound_exceeded"));
+        } finally {
+            setMaxDocsPerReader(null);
+            try {
+                client().performRequest(new Request("DELETE", "/" + tableName));
+            } catch (Exception ignored) {}
+            deleteRecursively(scratchDir);
+        }
+    }
+
+    private static void setMaxDocsPerReader(String value) throws IOException {
+        Request request = new Request("PUT", "/_cluster/settings");
+        String encoded = value == null ? "null" : "\"" + value + "\"";
+        request.setJsonEntity("{\"transient\":{\"lance.test.max_docs_per_reader\":" + encoded + "}}");
+        assertEquals(RestStatus.OK.getStatus(), client().performRequest(request).getStatusLine().getStatusCode());
+    }
+
     public void testAttachRejectsNumberOfShards() throws IOException {
         // Lance-backed indices are single-shard; search fans out per
         // fragment, so an explicit number_of_shards is rejected rather
