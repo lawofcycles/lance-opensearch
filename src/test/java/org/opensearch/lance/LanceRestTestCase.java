@@ -14,6 +14,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -235,6 +236,36 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
         }
     }
 
+    /** The string at {@code path} in {@code json}; fails when the path is missing or not a string. */
+    static String stringPath(String json, String... path) {
+        Object value = parseJson(json);
+        for (String step : path) {
+            if (value instanceof Map<?, ?> map) {
+                value = map.get(step);
+            } else if (value instanceof List<?> list) {
+                value = list.get(Integer.parseInt(step));
+            } else {
+                throw new AssertionError("cannot descend into " + value + " with step " + step);
+            }
+            if (value == null) {
+                throw new AssertionError("missing key " + step + " in path " + String.join(".", path) + ", json=" + json);
+            }
+        }
+        if (value instanceof String string) {
+            return string;
+        }
+        throw new AssertionError("expected string at " + String.join(".", path) + ", saw " + value);
+    }
+
+    /** {@code json} as the map {@code XContentParser.map()} produces. */
+    static Map<String, Object> parseJson(String json) {
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
+            return parser.map();
+        } catch (IOException e) {
+            throw new AssertionError("could not parse JSON: " + json, e);
+        }
+    }
+
     static double extractDoublePath(String json, String... path) {
         try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
             Object value = parser.map();
@@ -397,6 +428,92 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
         } catch (IOException e) {
             return new ConcurrentResult(response.getStatusLine().getStatusCode(), "unreadable body: " + e);
         }
+    }
+
+    /**
+     * POST {@code body} to {@code path} without waiting for the answer.
+     * The future completes with the status and body of the response, a
+     * non 2xx status included; a transport level failure completes it
+     * with status {@code -1} and the exception text as body.
+     */
+    static CompletableFuture<ConcurrentResult> postAsync(RestClient client, String path, String body) {
+        CompletableFuture<ConcurrentResult> future = new CompletableFuture<>();
+        Request request = new Request("POST", path);
+        request.setJsonEntity(body);
+        client.performRequestAsync(request, new ResponseListener() {
+            @Override
+            public void onSuccess(Response response) {
+                future.complete(toResult(response));
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                if (e instanceof ResponseException responseException) {
+                    future.complete(toResult(responseException.getResponse()));
+                } else {
+                    future.complete(new ConcurrentResult(-1, e.toString()));
+                }
+            }
+        });
+        return future;
+    }
+
+    /**
+     * A {@code script} query whose Painless script spins
+     * {@code iterations} times per document before it matches every
+     * document, so a request over a small fixture still takes long
+     * enough to time out or to be cancelled while it runs. Painless
+     * caps a script at one million loop iterations per execution; the
+     * fragment executor evaluates the script once per row for the hits
+     * and once more for the count, so 900,000 iterations over a few
+     * hundred rows keep a request busy for a second or more on the
+     * test cluster.
+     */
+    static String slowScriptQuery(int iterations) {
+        return "{\"script\":{\"script\":{\"source\":\"long x = 0; for (int i = 0; i < "
+            + iterations
+            + "; i++) { x += i; } return x >= 0 && doc['id'].value >= 0;\"}}}";
+    }
+
+    /** The tasks {@code GET /_tasks?actions=<actions>} lists right now, each with its node id under {@code node}. */
+    @SuppressWarnings("unchecked")
+    static List<Map<String, Object>> tasksOf(RestClient client, String actions) throws IOException {
+        String body = readAll(client.performRequest(new Request("GET", "/_tasks?actions=" + actions)));
+        List<Map<String, Object>> tasks = new ArrayList<>();
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, body)) {
+            Map<String, Object> nodes = (Map<String, Object>) parser.map().get("nodes");
+            if (nodes == null) {
+                return tasks;
+            }
+            for (Object node : nodes.values()) {
+                Map<String, Object> nodeTasks = (Map<String, Object>) ((Map<String, Object>) node).get("tasks");
+                if (nodeTasks == null) {
+                    continue;
+                }
+                for (Object task : nodeTasks.values()) {
+                    tasks.add((Map<String, Object>) task);
+                }
+            }
+        }
+        return tasks;
+    }
+
+    /**
+     * Poll {@code GET /_tasks?actions=<actions>} every few milliseconds
+     * until at least {@code count} tasks are listed, for at most thirty
+     * seconds. The poll is tight on purpose: a request that is being
+     * cancelled from the test runs for a second or two, and
+     * {@code assertBusy}'s backoff would miss that window.
+     */
+    static List<Map<String, Object>> awaitTasks(RestClient client, String actions, int count) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        List<Map<String, Object>> tasks = tasksOf(client, actions);
+        while (tasks.size() < count && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+            tasks = tasksOf(client, actions);
+        }
+        assertTrue("expected at least " + count + " task(s) for " + actions + ", saw " + tasks, tasks.size() >= count);
+        return tasks;
     }
 
     /**

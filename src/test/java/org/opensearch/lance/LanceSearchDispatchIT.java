@@ -10,10 +10,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
+import org.opensearch.client.ResponseException;
 import org.opensearch.client.RestClient;
 import org.opensearch.core.rest.RestStatus;
 
@@ -957,6 +961,121 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
                 client().performRequest(new Request("GET", "/_cat/thread_pool/lance_coordinator?format=json&h=name,rejected"))
             );
             assertTrue("thread pool stats must count the rejections: " + pool, sumCatColumn(pool, "rejected") > 0);
+        }
+    }
+
+    public void testTimeoutAnswersPartialResultsWithTimedOutAndCancelsTheExecutor() throws Exception {
+        // The request's timeout is the transport timeout of every per-node
+        // request. A script query that spins per document keeps the one
+        // executor of this single-node cluster busy well past 100 ms, so
+        // the coordinator gets no answer in time, cancels the executor
+        // task, and answers from zero nodes: timed_out true, no hits, and
+        // hits.total as a lower bound. The executor sees the cancellation
+        // between documents and ends, so no fragment query task remains.
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(400, "timeout")) {
+            String indexName = fixture.indexName();
+            String body = readAll(
+                postJson("/" + indexName + "/_search", "{\"timeout\":\"100ms\",\"size\":5,\"query\":" + slowScriptQuery(900_000) + "}")
+            );
+            Map<String, Object> response = parseJson(body);
+            assertEquals("the response must say it timed out: " + body, Boolean.TRUE, response.get("timed_out"));
+            assertEquals("no node answered, so no hits: " + body, 0, hitsOf(body).size());
+            assertEquals("no node answered, so the count is zero: " + body, 0, extractIntPath(body, "hits", "total", "value"));
+            assertEquals("a partial count is a lower bound: " + body, "gte", stringPath(body, "hits", "total", "relation"));
+            assertEquals("the fan-out is still one logical unit: " + body, 1, extractIntPath(body, "_shards", "successful"));
+
+            assertBusy(() -> {
+                List<Map<String, Object>> left = tasksOf(client(), "*lance/fragment_query*,*lance/coordinator*,indices:data/read/search*");
+                assertEquals("the timed out executor must have been cancelled, tasks left: " + left, 0, left.size());
+            });
+
+            // The same query without a timeout answers in full.
+            String complete = readAll(postJson("/" + indexName + "/_search", "{\"size\":5,\"query\":" + slowScriptQuery(1_000) + "}"));
+            assertEquals(Boolean.FALSE, parseJson(complete).get("timed_out"));
+            assertEquals(400, extractIntPath(complete, "hits", "total", "value"));
+            assertEquals("eq", stringPath(complete, "hits", "total", "relation"));
+        }
+    }
+
+    public void testTimeoutWithoutPartialResultsFailsWithGatewayTimeout() throws Exception {
+        // allow_partial_search_results=false turns a node that did not
+        // answer in time into a failure of the whole request: HTTP 504
+        // with the transport timeout as the cause. The low level REST
+        // client retries a 504 once on the same host (its only one), so
+        // the cluster sees two timed out requests; both executors must
+        // be cancelled.
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(400, "timeout-strict")) {
+            String indexName = fixture.indexName();
+            Request request = new Request("POST", "/" + indexName + "/_search?allow_partial_search_results=false");
+            request.setJsonEntity("{\"timeout\":\"100ms\",\"size\":5,\"query\":" + slowScriptQuery(900_000) + "}");
+            ResponseException failure = expectThrows(ResponseException.class, () -> client().performRequest(request));
+            String body = readAll(failure.getResponse());
+            assertEquals(
+                "expected 504, got: " + body,
+                RestStatus.GATEWAY_TIMEOUT.getStatus(),
+                failure.getResponse().getStatusLine().getStatusCode()
+            );
+            assertEquals("timeout_exception", stringPath(body, "error", "type"));
+            assertTrue("the body must name the node that did not answer: " + body, body.contains("did not complete in time"));
+            assertTrue("the transport timeout must be the cause: " + body, body.contains("receive_timeout_transport_exception"));
+
+            assertBusy(() -> {
+                List<Map<String, Object>> left = tasksOf(client(), "*lance/fragment_query*,*lance/coordinator*,indices:data/read/search*");
+                assertEquals("the timed out executor must have been cancelled, tasks left: " + left, 0, left.size());
+            });
+        }
+    }
+
+    public void testCancellingTheSearchTaskCancelsTheCoordinatorAndItsExecutor() throws Exception {
+        // The coordinator task is a child of the search task and the
+        // executor task a child of the coordinator task, so
+        // _tasks/_cancel on the search task (what a client that closes
+        // its connection also triggers) reaches the executor: the
+        // request ends with task_cancelled_exception and no task of the
+        // three actions remains.
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(400, "cancel")) {
+            String indexName = fixture.indexName();
+            CompletableFuture<ConcurrentResult> pending = postAsync(
+                client(),
+                "/" + indexName + "/_search",
+                "{\"size\":5,\"query\":" + slowScriptQuery(900_000) + "}"
+            );
+            awaitTasks(client(), "*lance/fragment_query*", 1);
+            assertEquals(1, tasksOf(client(), "*lance/coordinator*").size());
+
+            String cancelled = readAll(postJson("/_tasks/_cancel?actions=indices:data/read/search", ""));
+            assertTrue("the cancel must name the search task: " + cancelled, cancelled.contains("indices:data/read/search"));
+
+            ConcurrentResult result = pending.get(60, TimeUnit.SECONDS);
+            assertTrue("a cancelled request must fail, got " + result.status() + ": " + result.body(), result.status() >= 500);
+            assertEquals("task_cancelled_exception", stringPath(result.body(), "error", "type"));
+
+            assertBusy(() -> {
+                List<Map<String, Object>> left = tasksOf(client(), "*lance/fragment_query*,*lance/coordinator*,indices:data/read/search*");
+                assertEquals("tasks left behind after the cancel: " + left, 0, left.size());
+            });
+        }
+    }
+
+    public void testCancellingTheCoordinatorTaskDirectlyCancelsItsExecutor() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(400, "cancel-coordinator")) {
+            String indexName = fixture.indexName();
+            CompletableFuture<ConcurrentResult> pending = postAsync(
+                client(),
+                "/" + indexName + "/_search",
+                "{\"size\":5,\"query\":" + slowScriptQuery(900_000) + "}"
+            );
+            awaitTasks(client(), "*lance/fragment_query*", 1);
+
+            postJson("/_tasks/_cancel?actions=*lance/coordinator*", "");
+
+            ConcurrentResult result = pending.get(60, TimeUnit.SECONDS);
+            assertTrue("a cancelled request must fail, got " + result.status() + ": " + result.body(), result.status() >= 500);
+            assertEquals("task_cancelled_exception", stringPath(result.body(), "error", "type"));
+            assertBusy(() -> {
+                List<Map<String, Object>> left = tasksOf(client(), "*lance/fragment_query*,*lance/coordinator*,indices:data/read/search*");
+                assertEquals("tasks left behind after the cancel: " + left, 0, left.size());
+            });
         }
     }
 }
