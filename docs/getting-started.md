@@ -516,6 +516,24 @@ curl -sS localhost:9200/_lance/stats?pretty
       },
       "fts" : {
         "subset_probe_limit" : 1000000
+      },
+      "warm_up" : {
+        "mode" : "metadata",
+        "tables" : [
+          {
+            "index" : "perf20m",
+            "table" : "s3://bucket/perf20m.lance",
+            "version" : 8,
+            "mode" : "metadata",
+            "state" : "done",
+            "started_at" : "2026-09-21T03:39:23.435Z",
+            "seconds" : 5.71,
+            "indexes" : [
+              { "name" : "body_idx", "type" : "Inverted", "column" : "body", "state" : "done", "seconds" : 5.55 },
+              { "name" : "rating_idx", "type" : "BTree", "column" : "rating", "state" : "done", "seconds" : 0.01 }
+            ]
+          }
+        ]
       }
     }
   }
@@ -529,8 +547,25 @@ How to read it:
 - `column_store.bytes` against `limit_bytes` tells you how much of `lance.cache.column_share` is in use. `loads` grows on the first request that reads a column of a fragment, `hits` on every later one. `budget_misses` above zero means requests fell back to heap loads because the store was full; raise `lance.cache.column_share` or `lance.native_memory.limit`, or reduce the number of columns aggregated or sorted on. `heap_fallback_bytes` is the heap those loads currently hold on the request circuit breaker, and `heap_fallback_rejections` counts the loads the breaker refused (HTTP 429 to the client); a rising rejection count means the columns that miss the store are too large for `indices.breaker.request.limit` on this node.
 - `native_memory.estimated_bytes` is what the breaker enforces against `lance.native_memory.limit`; it lags `session_bytes + column_store_bytes` by at most one `lance.native_memory.circuit_breaker.poll_interval`. Compare it with the process RSS to see how much of the native footprint the plugin accounts for.
 - `native_memory.index_cache_capacity`, `index_cache_shards` and `index_cache_shard_share` are the index cache the plugin handed Lance at startup and the shard layout Lance derives from it (see "Cap Lance's native memory footprint"). `index_cache_shard_share` is the heaviest entry the cache admits; a table whose inverted index is heavier than it (about 52 bytes per row per full-text column) is reloaded on every full-text query.
+- `warm_up` is the index warm-up of the section below: `mode` is the value of `lance.attach.warm_indexes` on the node, and `tables` has one entry per Lance-backed index the node has seen since it started, with the table, the manifest version the warm-up read, the mode it ran under, its `state` (`pending`, `running`, `done`, `failed`, `skipped` for mode `none`, `cancelled` when the index was deleted first), when it started, how long it took, and one entry per Lance index (`name`, `type`, `column`, `state`, `seconds`, and a `detail` when it failed or was skipped). A table whose entry stays `running` for minutes on an object store is reading its indexes page by page; the INFO log shows one line per index as it finishes.
 
 The endpoint is read only. With the security plugin, grant `cluster:monitor/lance/stats`.
+
+### Warm the indexes when a table is attached
+
+Lance opens an index the first time a scan uses it: a BTree reads its page lookup and then one object store request per page that holds a matching value, a full-text index reads the token dictionary of every partition, an IVF index reads its centroids and the codes of the probed partitions. The loaded parts stay in the Lance Session cache, so on a table read from S3 the first request that uses an index pays for the load in latency bound page reads while the next one takes a fraction of a second. On a 20M row table on a local MinIO the first `match` took 9 to 13 s (63 MB of token dictionaries) and the first `lance_knn` 2.1 s, against 0.5 s and 0.1 s warm; on a 1B row table on S3 the first `term` on a BTree column took 200 to 350 s.
+
+The plugin therefore warms the indexes of every Lance-backed index on every data node as soon as the index appears in the cluster state, which is right after `POST /_lance/attach` returns, when the namespace poll surfaces a table, and when a node applies its first cluster state after a restart. The attach response does not wait for it. The warm-up runs on the `lance_warm_up` thread pool (one thread, so tables warm one after another and the indexes of a table one after another) and issues, per Lance index, the smallest scan that makes Lance load the part named by the mode; no data column is read. A request that arrives while the warm-up runs does not wait: it loads what it needs on its own and Lance's cache reconciles the two. A warm-up that fails logs a WARN line and leaves the request path unchanged.
+
+```
+lance.attach.warm_indexes: metadata   # default; none | metadata | all; dynamic
+```
+
+- `none`: nothing is read. The stats record the index with `state: skipped`.
+- `metadata`: every index is opened. BTree: the page lookup (`page_lookup.lance`, a few KB per thousand pages). Bitmap: the keys. Full-text: the token dictionaries (63 MB and 5.5 s on a 20M row column; about 3 bytes per row). IVF: the centroids and one partition. The pages, bitmaps, posting lists and doc lengths a query needs are still read by the first query that needs them, so on a large BTree the first `term` still pays for its pages; what this mode removes is the open of every index (the token dictionaries dominate) and the round trips before the first page read.
+- `all`: `metadata`, plus every BTree page, every bitmap and every IVF partition (full-text indexes are opened as under `metadata`: their posting lists are only reachable by token). The read is one object store request per page, in parallel up to the CPU count, so on the 20M table it read 45,000 objects and 820 MB in 57 s. The pages are useful only while they stay in the Session index cache: when the index files of a table (full-text ones excluded) add up to more than half of `native_memory.index_cache_capacity`, the warm-up opens the indexes only, as under `metadata`, and says so in the `detail` of every index entry. Size the cache with `lance.native_memory.limit` before choosing `all` for a table whose BTrees are large; a 1B row BTree is about 4.7 GB of pages per column.
+
+Changing the setting affects warm-ups that start after the change; re-attach the index (or restart the node) to warm an already attached table under a different mode. The `lance_warm_up` pool is a fixed pool of one thread with a queue of 1,000 tables (`thread_pool.lance_warm_up.queue_size`); `GET /_cat/thread_pool/lance_warm_up?v&h=node_name,active,queue` shows whether a warm-up is running.
 
 ### Full-text lookups on several data nodes
 
