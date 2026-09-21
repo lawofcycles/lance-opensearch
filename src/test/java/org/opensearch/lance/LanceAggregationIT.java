@@ -952,6 +952,11 @@ public class LanceAggregationIT extends LanceRestTestCase {
         assertTrue(what + ": expected " + expected + " got " + actual + " (relative diff " + diff + ")", diff <= tolerance);
     }
 
+    /** {@code actual} is within {@code share} of {@code range} of {@code expected}: the tolerance of a sketch over values spanning {@code range}. */
+    private static void assertWithinShareOfRange(String what, double expected, double actual, double share, double range) {
+        assertTrue(what + ": expected " + expected + " got " + actual, Math.abs(expected - actual) <= share * range);
+    }
+
     /**
      * Every aggregation type the allow list newly routes to the fragment
      * path answers the same as the shard path. The hint fixture has three
@@ -1016,7 +1021,8 @@ public class LanceAggregationIT extends LanceRestTestCase {
 
             // tdigest percentiles: one sketch per executor on the fragment
             // path, so the values are within the algorithm's error of the
-            // shard path's single sketch.
+            // shard path's single sketch: a couple of percentile points of
+            // the rating range (0 to 999) at the default compression.
             String tdigest = "{\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"rating\"}}}}";
             Map<String, Object> viaFragments = parse(readAll(postJson("/" + index + "/_search", tdigest)));
             requests++;
@@ -1027,11 +1033,12 @@ public class LanceAggregationIT extends LanceRestTestCase {
             Map<String, Object> shardValues = (Map<String, Object>) aggregation(viaShard, "p").get("values");
             assertEquals(shardValues.keySet(), fragmentValues.keySet());
             for (String percentile : shardValues.keySet()) {
-                assertRelativeClose(
+                assertWithinShareOfRange(
                     "percentile " + percentile,
                     ((Number) shardValues.get(percentile)).doubleValue(),
                     ((Number) fragmentValues.get(percentile)).doubleValue(),
-                    0.01d
+                    0.03d,
+                    999d
                 );
             }
 
