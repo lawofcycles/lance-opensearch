@@ -7,7 +7,9 @@ package org.opensearch.lance.engine;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 
 import org.apache.lucene.document.Document;
@@ -25,6 +27,7 @@ import org.lance.Fragment;
 import org.lance.fragment.DataFile;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
+import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 
 /** DirectoryReader whose leaves are Lance fragments. */
 public final class LanceDirectoryReader extends DirectoryReader {
@@ -177,10 +180,10 @@ public final class LanceDirectoryReader extends DirectoryReader {
      *                  string when the Lance table has no declared primary
      *                  key.
      * @param pkType    Arrow type family of the declared primary key. When
-     *                  it is {@link org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType#KEYWORD}
+     *                  it is {@link LancePrimaryKeyType#KEYWORD}
      *                  the reader holds string PK values so {@code _id}
      *                  echoes them verbatim; otherwise (including
-     *                  {@link org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType#NONE})
+     *                  {@link LancePrimaryKeyType#NONE})
      *                  the reader falls back to the integer / synthesised
      *                  paths.
      * @param requestBreaker breaker every column the leaves materialise
@@ -193,8 +196,8 @@ public final class LanceDirectoryReader extends DirectoryReader {
         IndexCommit commit,
         Dataset dataset,
         String intField,
-        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+        LancePrimaryKeyType pkType,
+        Map<String, LinkedHashMap<String, String>> multiFields,
         CircuitBreaker requestBreaker
     ) throws IOException {
         return open(directory, commit, dataset, intField, pkType, multiFields, requestBreaker, IndexWriter.MAX_DOCS);
@@ -202,8 +205,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
 
     /**
      * Same as {@link #open(Directory, IndexCommit, Dataset, String,
-     * org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType,
-     * java.util.Map, CircuitBreaker)} with the row bound of the reader
+     * LancePrimaryKeyType, Map, CircuitBreaker)} with the row bound of the reader
      * given: when the table's fragments hold more physical rows than
      * {@code maxDocs} together, only the leading fragments that fit
      * become leaves and the reader reports {@link #luceneBoundExceeded()}.
@@ -215,8 +217,8 @@ public final class LanceDirectoryReader extends DirectoryReader {
         IndexCommit commit,
         Dataset dataset,
         String intField,
-        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+        LancePrimaryKeyType pkType,
+        Map<String, LinkedHashMap<String, String>> multiFields,
         CircuitBreaker requestBreaker,
         long maxDocs
     ) throws IOException {
@@ -336,8 +338,8 @@ public final class LanceDirectoryReader extends DirectoryReader {
         IndexCommit commit,
         Dataset dataset,
         String intField,
-        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+        LancePrimaryKeyType pkType,
+        Map<String, LinkedHashMap<String, String>> multiFields,
         List<Integer> fragmentIds
     ) throws IOException {
         return openForFragments(directory, commit, dataset, intField, pkType, multiFields, fragmentIds, null);
@@ -346,8 +348,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
     /**
      * Same as
      * {@link #openForFragments(Directory, IndexCommit, Dataset, String,
-     * org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType,
-     * java.util.Map, List)}, plus a Lance SQL predicate the caller
+     * LancePrimaryKeyType, Map, List)}, plus a Lance SQL predicate the caller
      * wants attached to every per-column Lance scan the resulting
      * leaves issue. See {@link LanceFragmentLeafReader#filterSql} for
      * the rationale and semantics; {@code filterSql} is nullable and
@@ -364,8 +365,8 @@ public final class LanceDirectoryReader extends DirectoryReader {
         IndexCommit commit,
         Dataset dataset,
         String intField,
-        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+        LancePrimaryKeyType pkType,
+        Map<String, LinkedHashMap<String, String>> multiFields,
         List<Integer> fragmentIds,
         String filterSql
     ) throws IOException {
@@ -536,9 +537,8 @@ public final class LanceDirectoryReader extends DirectoryReader {
      * Same as {@link #openForSnapshot(Directory, IndexCommit,
      * LanceWarmCache.Lease, ColumnStore, CircuitBreaker)} with the row
      * bound of the reader given, as for {@link #open(Directory,
-     * IndexCommit, Dataset, String,
-     * org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType,
-     * java.util.Map, CircuitBreaker, long)}: the reader holds the leading
+     * IndexCommit, Dataset, String, LancePrimaryKeyType, Map,
+     * CircuitBreaker, long)}: the reader holds the leading
      * fragments of the snapshot whose physical rows fit in
      * {@code maxDocs} and reports {@link #luceneBoundExceeded()} when
      * that is not every fragment.
