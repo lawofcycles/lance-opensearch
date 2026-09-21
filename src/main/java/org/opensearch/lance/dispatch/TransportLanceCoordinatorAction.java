@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -24,6 +25,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.search.TotalHits;
 import org.lance.Dataset;
+import org.lance.Fragment;
 import org.opensearch.OpenSearchTimeoutException;
 import org.opensearch.action.ActionRunnable;
 import org.opensearch.action.admin.cluster.node.tasks.cancel.CancelTasksRequest;
@@ -52,6 +54,7 @@ import org.opensearch.core.tasks.TaskId;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.script.ScriptService;
@@ -85,7 +88,11 @@ import org.opensearch.transport.client.node.NodeClient;
  * indexes and query metadata, enumerates fragments through the
  * shared {@link LanceRegistry}, groups them round-robin across every
  * data node in cluster state (sorted by node id), and fans
- * requests out via {@link LanceFragmentQueryAction}. The executor
+ * requests out via {@link LanceFragmentQueryAction}. A node whose
+ * fragments hold more rows than one Lucene reader may
+ * ({@code IndexWriter.MAX_DOCS}) receives one request per group of
+ * fragments that fits, so a table of any size is searchable; the merge
+ * treats a group's response like a node's. The executor
  * builds its query context from cluster state alone, so a node needs
  * no shard copy of the index to take a share; the plugin has to be
  * installed on every data node, which OpenSearch expects of plugins
@@ -413,7 +420,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     /**
      * Enumerate fragments for one Lance-backed index, group them
      * across the data-node list, and issue one
-     * {@link LanceFragmentQueryAction} per node. Completion signals
+     * {@link LanceFragmentQueryAction} per node, or several per node
+     * when the node's fragments hold more rows than one Lucene reader
+     * may (see {@link #splitByRows}). Completion signals
      * through {@code done} once every response is merged into
      * {@code merged}.
      */
@@ -426,6 +435,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         ActionListener<Void> done
     ) throws Exception {
         List<Integer> allFragmentIds;
+        // Physical rows of every fragment, in the same order, for the cut
+        // into groups a Lucene reader can hold.
+        List<Long> allFragmentRows;
         // The manifest version this fan-out enumerates fragments from.
         // Every per-node request carries it, for a pinned or tag
         // following index as well as for one that follows the table,
@@ -436,7 +448,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         try (Dataset dataset = LanceRegistry.openDataset(target.tableUri(), target.storageOptions(), target.pinnedVersionOrEmpty())) {
             observedVersion = dataset.version();
             allFragmentIds = new ArrayList<>(dataset.getFragments().size());
-            dataset.getFragments().forEach(fragment -> allFragmentIds.add(fragment.getId()));
+            allFragmentRows = new ArrayList<>(dataset.getFragments().size());
+            dataset.getFragments().forEach(fragment -> {
+                allFragmentIds.add(fragment.getId());
+                allFragmentRows.add(fragment.metadata().getPhysicalRows());
+            });
         }
         if (allFragmentIds.isEmpty()) {
             if (spec.aggregations() == null) {
@@ -463,10 +479,16 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         }
 
         Map<DiscoveryNode, List<Integer>> perNode = groupFragmentsByNode(allFragmentIds, nodeList);
+        // A node's fragments go out in one request unless their rows
+        // would not fit one Lucene reader on the executor; then the node
+        // gets one request per group of fragments that fits. Every table
+        // under the bound (the usual case) keeps one request per node.
+        long maxDocs = clusterService.getClusterSettings().get(LancePlugin.MAX_DOCS_PER_READER_SETTING);
+        List<FragmentGroup> groups = splitByRows(perNode, allFragmentIds, allFragmentRows, maxDocs);
 
-        // Responses land in the slot of the node they came from, so
-        // the merge sees them in fan-out (node id) order rather than
-        // arrival order. The merge itself orders equal hits by row
+        // Responses land in the slot of the request they answer, so the
+        // merge sees them in fan-out (node id, then group) order rather
+        // than arrival order. The merge itself orders equal hits by row
         // address and does not depend on this order; keeping it fixed
         // keeps the per-node lists, and with them the logs and the
         // aggregation partials, in the same order on every request.
@@ -479,14 +501,14 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // allow_partial_search_results the request answers from the
         // other nodes and says so with timed_out: true, the contract
         // of the shard path's timeout.
-        FragmentFanOut fanOut = newFanOut(perNode.size(), target, policy, merged, done);
+        FragmentFanOut fanOut = newFanOut(groups.size(), target, policy, merged, done);
         FragmentFanOut.Sender sender = sender(policy.task(), policy.timeout());
 
         int slot = 0;
-        for (Map.Entry<DiscoveryNode, List<Integer>> assignment : perNode.entrySet()) {
+        for (FragmentGroup group : groups) {
             final int slotIndex = slot++;
-            DiscoveryNode nodeTarget = assignment.getKey();
-            List<Integer> fragmentsForNode = assignment.getValue();
+            DiscoveryNode nodeTarget = group.node();
+            List<Integer> fragmentsForNode = group.fragmentIds();
             LanceFragmentQueryRequest fragmentRequest = new LanceFragmentQueryRequest(
                 target.tableUri(),
                 target.indexName(),
@@ -503,13 +525,26 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 spec.trackScores(),
                 spec.trackTotalHitsUpTo()
             );
-            LOGGER.info(
-                "lance.dispatch: fan-out index [{}] table [{}] to node [{}] with fragments {}",
-                target.indexName(),
-                target.tableUri(),
-                nodeTarget.getId(),
-                fragmentsForNode
-            );
+            if (group.groupCount() == 1) {
+                LOGGER.info(
+                    "lance.dispatch: fan-out index [{}] table [{}] to node [{}] with fragments {}",
+                    target.indexName(),
+                    target.tableUri(),
+                    nodeTarget.getId(),
+                    fragmentsForNode
+                );
+            } else {
+                LOGGER.info(
+                    "lance.dispatch: fan-out index [{}] table [{}] to node [{}] with fragments {} (group {} of {}, {} rows)",
+                    target.indexName(),
+                    target.tableUri(),
+                    nodeTarget.getId(),
+                    fragmentsForNode,
+                    group.groupIndex() + 1,
+                    group.groupCount(),
+                    group.rows()
+                );
+            }
             // Dispatch through TransportService so remote data nodes
             // receive the request. For the local node this still
             // executes in-process because TransportService's request
@@ -517,6 +552,58 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // in the cluster picks up its slice through the network.
             fanOut.send(sender, slotIndex, nodeTarget, fragmentRequest);
         }
+    }
+
+    /**
+     * The fragments of one per-node request: a node's fragments, or the
+     * {@code groupIndex}th of {@code groupCount} contiguous groups of them
+     * when they do not fit one Lucene reader together, with the physical
+     * rows of the group.
+     */
+    record FragmentGroup(DiscoveryNode node, List<Integer> fragmentIds, long rows, int groupIndex, int groupCount) {
+    }
+
+    /**
+     * Cut every node's fragment list of {@code perNode} into contiguous
+     * groups whose physical rows fit in {@code maxDocs}, in the order of
+     * the map and of each list ({@link LanceDirectoryReader#groupEnds}).
+     * {@code fragmentIds} and {@code fragmentRows} are the table's
+     * fragments and their physical rows in the same order; a fragment id
+     * the rows are not known for counts as zero rows. A node whose
+     * fragments fit yields one group, so a table under the bound fans
+     * out exactly as before: one request per node.
+     */
+    static List<FragmentGroup> splitByRows(
+        Map<DiscoveryNode, List<Integer>> perNode,
+        List<Integer> fragmentIds,
+        List<Long> fragmentRows,
+        long maxDocs
+    ) {
+        Map<Integer, Long> rowsById = new HashMap<>(fragmentIds.size());
+        for (int i = 0; i < fragmentIds.size(); i++) {
+            rowsById.put(fragmentIds.get(i), fragmentRows.get(i));
+        }
+        List<FragmentGroup> groups = new ArrayList<>(perNode.size());
+        for (Map.Entry<DiscoveryNode, List<Integer>> assignment : perNode.entrySet()) {
+            List<Integer> nodeFragments = assignment.getValue();
+            long[] rows = new long[nodeFragments.size()];
+            for (int i = 0; i < rows.length; i++) {
+                rows[i] = rowsById.getOrDefault(nodeFragments.get(i), 0L);
+            }
+            int[] ends = LanceDirectoryReader.groupEnds(rows, maxDocs);
+            int start = 0;
+            for (int g = 0; g < ends.length; g++) {
+                long groupRows = 0L;
+                for (int i = start; i < ends[g]; i++) {
+                    groupRows += rows[i];
+                }
+                groups.add(
+                    new FragmentGroup(assignment.getKey(), List.copyOf(nodeFragments.subList(start, ends[g])), groupRows, g, ends.length)
+                );
+                start = ends[g];
+            }
+        }
+        return groups;
     }
 
     /**
@@ -974,27 +1061,69 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 continue;
             }
             StorageOptions storageOptions = StorageOptions.fromIndexSettings(indexMetadata.getSettings());
-            // Same reading of index.lance.version as the shard engine
-            // (LanceEngineFactory.newReadWriteEngine): -1 follows the
-            // latest manifest, anything else pins. Resolving it here and
-            // shipping it to the per-node executor keeps _search and
-            // _count on the manifest _stats / GET already serve.
-            long pinnedVersion = indexMetadata.getSettings().getAsLong(LanceEngineFactory.VERSION_SETTING, -1L);
-            String tag = indexMetadata.getSettings().get(LanceEngineFactory.TAG_SETTING, "");
-            if (pinnedVersion < 0 && !tag.isEmpty()) {
-                // A tag-following index pins to whatever version the tag
-                // points at right now, so resolve it here and ship the
-                // version exactly like an explicit pin. This costs one
-                // extra Dataset.open of the latest manifest per request
-                // per tag-following index (the tag lives in the table's
-                // refs, not in any manifest); the shared Lance Session
-                // keeps the metadata cached so it is a small, fixed cost
-                // rather than a table scan.
-                pinnedVersion = LanceRegistry.resolveTagVersion(tableUri, storageOptions, tag);
-            }
+            long pinnedVersion = resolvePinnedVersion(indexMetadata, tableUri, storageOptions);
             targets.add(new IndexTarget(index.getName(), tableUri, storageOptions, pinnedVersion, buildFieldTypeLookup(indexMetadata)));
         }
         return targets;
+    }
+
+    /**
+     * The manifest version a Lance-backed index reads right now, or
+     * {@code -1} when it follows the latest. Same reading of
+     * {@code index.lance.version} as the shard engine
+     * ({@link LanceEngineFactory#newReadWriteEngine}): -1 follows the
+     * latest manifest, anything else pins. A tag-following index pins to
+     * whatever version the tag points at right now; resolving it costs
+     * one extra Dataset.open of the latest manifest (the tag lives in
+     * the table's refs, not in any manifest), which the shared Lance
+     * Session keeps cheap.
+     */
+    private static long resolvePinnedVersion(IndexMetadata indexMetadata, String tableUri, StorageOptions storageOptions) {
+        long pinnedVersion = indexMetadata.getSettings().getAsLong(LanceEngineFactory.VERSION_SETTING, -1L);
+        String tag = indexMetadata.getSettings().get(LanceEngineFactory.TAG_SETTING, "");
+        if (pinnedVersion < 0 && !tag.isEmpty()) {
+            pinnedVersion = LanceRegistry.resolveTagVersion(tableUri, storageOptions, tag);
+        }
+        return pinnedVersion;
+    }
+
+    /**
+     * How much of the table behind a Lance-backed index one Lucene
+     * reader holds under {@code maxDocs}: the table's physical rows at
+     * the version the index reads, and the rows of the leading fragments
+     * that fit ({@link LanceDirectoryReader#leadingFragmentsWithinBound}),
+     * which is what the shard engine's reader serves. Opens the table
+     * (metadata only) and must not run on a transport thread.
+     */
+    static ReaderBound readerBound(IndexMetadata indexMetadata, long maxDocs) {
+        String tableUri = indexMetadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+        StorageOptions storageOptions = StorageOptions.fromIndexSettings(indexMetadata.getSettings());
+        long pinnedVersion = resolvePinnedVersion(indexMetadata, tableUri, storageOptions);
+        Optional<Long> version = pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();
+        try (Dataset dataset = LanceRegistry.openDataset(tableUri, storageOptions, version)) {
+            List<Fragment> fragments = dataset.getFragments();
+            long[] rows = new long[fragments.size()];
+            for (int i = 0; i < rows.length; i++) {
+                rows[i] = fragments.get(i).metadata().getPhysicalRows();
+            }
+            int held = LanceDirectoryReader.leadingFragmentsWithinBound(rows, maxDocs);
+            long tableRows = 0L;
+            long readerRows = 0L;
+            for (int i = 0; i < rows.length; i++) {
+                tableRows += rows[i];
+                if (i < held) {
+                    readerRows += rows[i];
+                }
+            }
+            return new ReaderBound(tableRows, readerRows);
+        }
+    }
+
+    /** Physical rows of a table and the rows of it one shard reader holds. */
+    record ReaderBound(long tableRows, long readerRows) {
+        boolean exceeded() {
+            return readerRows < tableRows;
+        }
     }
 
     /**
