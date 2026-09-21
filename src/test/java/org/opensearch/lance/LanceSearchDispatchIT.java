@@ -1077,4 +1077,143 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             });
         }
     }
+
+    public void testTableAboveTheLuceneBoundIsServedInFragmentGroups() throws Exception {
+        // A table with more rows than one Lucene reader may hold cannot
+        // be tested at its real size, so the bound is lowered to one
+        // fragment of the fixture: 120 rows in 6 fragments of 20 under a
+        // bound of 20. The index must come up green with a shard reader
+        // over the first fragment, every search shape must answer from
+        // all 120 rows through six fragment requests, GET must reach
+        // every row, a shape only the shard path serves must be refused,
+        // and attach and _lance/stats must say what happened.
+        updateClusterSetting("lance.test.max_docs_per_reader", "20");
+        String suffix = "bound-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 120, 20);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String pkTable = "pk-" + suffix;
+        LanceTableFactory.writeStringPkTable(scratchDir, pkTable, 12, 4);
+        String pkTableUri = scratchDir.resolve(pkTable + ".lance").toString();
+        try {
+            String attach = readAll(postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
+            assertEquals("attach must succeed for a table above the bound: " + attach, 120, extractIntPath(attach, "rows"));
+            assertTrue("attach must flag the bound: " + attach, attach.contains("\"lucene_bound_exceeded\":true"));
+            ensureGreen(tableName);
+            String pkAttach = readAll(postJson("/_lance/attach", "{\"table\":\"" + pkTableUri + "\"}"));
+            assertFalse("a table of 12 rows in 3 fragments of 4 is under the bound of 20: " + pkAttach, pkAttach.contains("lucene_bound"));
+            ensureGreen(pkTable);
+
+            // The shard reader holds the first fragment only; _stats
+            // counts it, _lance/stats reports both figures.
+            String docStats = readAll(client().performRequest(new Request("GET", "/" + tableName + "/_stats/docs")));
+            assertEquals(20, extractIntPath(docStats, "indices", tableName, "primaries", "docs", "count"));
+            String lanceStats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+            Map<String, Object> nodes = castMap(parseJson(lanceStats).get("nodes"));
+            Map<String, Object> indices = castMap(castMap(nodes.values().iterator().next()).get("indices"));
+            Map<String, Object> indexStats = castMap(indices.get(tableName));
+            assertEquals(lanceStats, 120, ((Number) indexStats.get("rows")).intValue());
+            assertEquals(lanceStats, 20, ((Number) indexStats.get("shard_reader_rows")).intValue());
+            assertEquals(lanceStats, true, indexStats.get("lucene_bound_exceeded"));
+            Map<String, Object> pkStats = castMap(indices.get(pkTable));
+            assertEquals(lanceStats, 12, ((Number) pkStats.get("rows")).intValue());
+            assertEquals(lanceStats, 12, ((Number) pkStats.get("shard_reader_rows")).intValue());
+            assertEquals(lanceStats, false, pkStats.get("lucene_bound_exceeded"));
+
+            // Every fragment path shape over all 120 rows.
+            String matchAll = "{\"query\":{\"match_all\":{}},\"size\":10}";
+            String sortDesc = "{\"size\":5,\"sort\":[{\"id\":\"desc\"}]}";
+            String sum = "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+            String terms = "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"id\",\"size\":3,\"order\":{\"_key\":\"desc\"}}}}}";
+            String range = "{\"size\":0,\"track_total_hits\":true,\"query\":{\"range\":{\"id\":{\"gte\":30,\"lt\":100}}}}";
+            String knn = "{\"size\":3,\"query\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":[57.4,0,0,0,0,0,0,0],\"k\":3}}}";
+            String matchAllBody = readAll(postJson("/" + tableName + "/_search", matchAll));
+            assertEquals(matchAllBody, 120, extractIntPath(matchAllBody, "hits", "total", "value"));
+            assertEquals(matchAllBody, 10, countOccurrences(matchAllBody, "\"_id\":"));
+            String sortBody = readAll(postJson("/" + tableName + "/_search", sortDesc));
+            assertEquals(List.of("5-19", "5-18", "5-17", "5-16", "5-15"), idsOf(hitsOf(sortBody)));
+            String sumBody = readAll(postJson("/" + tableName + "/_search", sum));
+            assertEquals(7140.0d, extractDoublePath(sumBody, "aggregations", "s", "value"), 0.0d);
+            assertEquals(List.of("119=1", "118=1", "117=1"), bucketsOf(readAll(postJson("/" + tableName + "/_search", terms)), "t"));
+            String rangeBody = readAll(postJson("/" + tableName + "/_search", range));
+            assertEquals(rangeBody, 70, extractIntPath(rangeBody, "hits", "total", "value"));
+            assertEquals("eq", stringPath(rangeBody, "hits", "total", "relation"));
+            String knnBody = readAll(postJson("/" + tableName + "/_search", knn));
+            assertEquals(List.of("2-17", "2-18", "2-16"), idsOf(hitsOf(knnBody)));
+            String count = readAll(client().performRequest(new Request("GET", "/" + tableName + "/_count")));
+            assertEquals(120, extractIntPath(count, "count"));
+
+            // GET resolves the key through the Lance scan filter, so a
+            // row in a fragment the shard reader does not hold is found.
+            // The bound is lowered to one fragment of the key table too.
+            updateClusterSetting("lance.test.max_docs_per_reader", "4");
+            client().performRequest(new Request("POST", "/" + pkTable + "/_close"));
+            client().performRequest(new Request("POST", "/" + pkTable + "/_open"));
+            ensureGreen(pkTable);
+            String pkDocStats = readAll(client().performRequest(new Request("GET", "/" + pkTable + "/_stats/docs")));
+            assertEquals(4, extractIntPath(pkDocStats, "indices", pkTable, "primaries", "docs", "count"));
+            for (String key : List.of("alpha-0", "alpha-5", "alpha-11")) {
+                Response hit = client().performRequest(new Request("GET", "/" + pkTable + "/_doc/" + key));
+                assertEquals(200, hit.getStatusLine().getStatusCode());
+                assertTrue(readAll(hit).contains("\"_id\":\"" + key + "\""));
+            }
+            String pkCount = readAll(client().performRequest(new Request("GET", "/" + pkTable + "/_count")));
+            assertEquals(12, extractIntPath(pkCount, "count"));
+
+            // A shape only the shard path serves would see the shard
+            // reader's rows; it is refused with 400 naming both counts.
+            ResponseException refused = expectThrows(
+                ResponseException.class,
+                () -> postJson("/" + pkTable + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"explain\":true}")
+            );
+            assertEquals(400, refused.getResponse().getStatusLine().getStatusCode());
+            String refusedBody = readAll(refused.getResponse());
+            assertEquals("illegal_argument_exception", stringPath(refusedBody, "error", "type"));
+            assertTrue(refusedBody, refusedBody.contains("has 12 rows, above the Lucene bound of 4"));
+            assertTrue(refusedBody, refusedBody.contains("would see only 4 rows"));
+
+            // With the bound back at its default the same requests run as
+            // one fragment request and answer the same.
+            updateClusterSetting("lance.test.max_docs_per_reader", null);
+            String oneGroup = readAll(postJson("/" + tableName + "/_search", matchAll));
+            assertEquals(120, extractIntPath(oneGroup, "hits", "total", "value"));
+            assertEquals(idsOf(hitsOf(matchAllBody)), idsOf(hitsOf(oneGroup)));
+            assertEquals(
+                List.of("5-19", "5-18", "5-17", "5-16", "5-15"),
+                idsOf(hitsOf(readAll(postJson("/" + tableName + "/_search", sortDesc))))
+            );
+            assertEquals(
+                7140.0d,
+                extractDoublePath(readAll(postJson("/" + tableName + "/_search", sum)), "aggregations", "s", "value"),
+                0.0d
+            );
+            assertEquals(List.of("119=1", "118=1", "117=1"), bucketsOf(readAll(postJson("/" + tableName + "/_search", terms)), "t"));
+            assertEquals(List.of("2-17", "2-18", "2-16"), idsOf(hitsOf(readAll(postJson("/" + tableName + "/_search", knn)))));
+            // The shard path is open again for a table under the default bound.
+            String explained = readAll(postJson("/" + pkTable + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"explain\":true}"));
+            assertTrue(explained, explained.contains("\"_explanation\""));
+        } finally {
+            updateClusterSetting("lance.test.max_docs_per_reader", null);
+            for (String index : List.of(tableName, pkTable)) {
+                try {
+                    client().performRequest(new Request("DELETE", "/" + index));
+                } catch (Exception ignored) {}
+            }
+            deleteRecursively(scratchDir);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> castMap(Object value) {
+        return (Map<String, Object>) value;
+    }
+
+    private static void updateClusterSetting(String key, String value) throws IOException {
+        Request request = new Request("PUT", "/_cluster/settings");
+        String encoded = value == null ? "null" : "\"" + value + "\"";
+        request.setJsonEntity("{\"transient\":{\"" + key + "\":" + encoded + "}}");
+        Response response = client().performRequest(request);
+        assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
+    }
 }

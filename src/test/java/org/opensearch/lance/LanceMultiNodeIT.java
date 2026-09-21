@@ -1690,10 +1690,139 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
-    /**
-     * The node name of a log line, which log4j prints in the fourth
-     * bracket: {@code [time][level][logger] [node] message}.
-     */
+    @SuppressWarnings("unchecked")
+    public void testTableAboveTheLuceneBoundFansOutInGroupsPerNode() throws Exception {
+        // 120 rows in 6 fragments of 20 over 3 data nodes: 2 fragments (40
+        // rows) per node. Under a bound of 20 rows per reader each node's
+        // share is cut into 2 groups, so the coordinator sends 6 requests
+        // and merges 6 responses; the answers must match the one request
+        // per node the default bound gives, the shard comes up green with a
+        // reader over the first fragment, GET reaches every row, and a
+        // shape only the shard path serves is refused.
+        String suffix = "mn-bound-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 120, 20);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String pkTable = "pk-" + suffix;
+        LanceTableFactory.writeStringPkTable(scratchDir, pkTable, 12, 4);
+        String pkTableUri = scratchDir.resolve(pkTable + ".lance").toString();
+        String[] requests = new String[] {
+            "{\"query\":{\"match_all\":{}},\"size\":10}",
+            "{\"size\":5,\"sort\":[{\"id\":\"desc\"}]}",
+            "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}",
+            "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"id\",\"size\":3,\"order\":{\"_key\":\"desc\"}}}}}",
+            "{\"size\":3,\"query\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":[57.4,0,0,0,0,0,0,0],\"k\":3}}}",
+            "{\"size\":0,\"track_total_hits\":true,\"query\":{\"range\":{\"id\":{\"gte\":30,\"lt\":100}}}}" };
+        try {
+            assertEquals("fixture assumes two fragments per data node", 3, dataNodeCount());
+            updateClusterSetting("lance.test.max_docs_per_reader", "20");
+            String attach = readAll(postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
+            assertEquals(attach, 6, extractIntPath(attach, "fragments"));
+            assertTrue(attach, attach.contains("\"lucene_bound_exceeded\":true"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + tableName + "?wait_for_status=green&timeout=60s"));
+            String docStats = readAll(client().performRequest(new Request("GET", "/" + tableName + "/_stats/docs")));
+            assertEquals(20, extractIntPath(docStats, "indices", tableName, "primaries", "docs", "count"));
+            // The node that hosts the shard reports the table's rows next
+            // to the reader's.
+            Map<String, Object> lanceStats = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+            Map<String, Object> indexStats = null;
+            for (Object node : ((Map<String, Object>) lanceStats.get("nodes")).values()) {
+                Map<String, Object> indices = (Map<String, Object>) ((Map<String, Object>) node).get("indices");
+                if (indices.containsKey(tableName)) {
+                    assertNull("one shard copy, one node reports it", indexStats);
+                    indexStats = (Map<String, Object>) indices.get(tableName);
+                }
+            }
+            assertNotNull(lanceStats.toString(), indexStats);
+            assertEquals(120, ((Number) indexStats.get("rows")).intValue());
+            assertEquals(20, ((Number) indexStats.get("shard_reader_rows")).intValue());
+            assertEquals(true, indexStats.get("lucene_bound_exceeded"));
+
+            List<Map<String, Object>> grouped = new ArrayList<>();
+            for (String request : requests) {
+                grouped.add(parse(readAll(postJson("/" + tableName + "/_search", request))));
+            }
+            assertEquals(120, extractIntPath(grouped.get(0), "hits", "total", "value"));
+            assertEquals(10, sourceIds(grouped.get(0)).size());
+            assertEquals(List.of(119, 118, 117, 116, 115), sourceIds(grouped.get(1)));
+            assertEquals(
+                7140.0d,
+                ((Number) ((Map<String, Object>) ((Map<String, Object>) grouped.get(2).get("aggregations")).get("s")).get("value"))
+                    .doubleValue(),
+                0.0d
+            );
+            assertEquals(3, buckets(grouped.get(3)).size());
+            assertEquals(119, ((Number) buckets(grouped.get(3)).get(0).get("key")).intValue());
+            assertEquals(List.of(57, 58, 56), sourceIds(grouped.get(4)));
+            assertEquals(70, extractIntPath(grouped.get(5), "hits", "total", "value"));
+            String count = readAll(client().performRequest(new Request("GET", "/" + tableName + "/_count")));
+            assertEquals(120, extractIntPath(count, "count"));
+
+            // Six fan-out lines for the index, two per node, each naming
+            // its group of two.
+            assertBusy(() -> {
+                Map<String, Integer> groupsPerNode = new HashMap<>();
+                for (String line : clusterLogLines()) {
+                    if (!line.contains("lance.dispatch: fan-out index [" + tableName + "]") || !line.contains("(group ")) {
+                        continue;
+                    }
+                    int at = line.indexOf(" to node [");
+                    String node = line.substring(at + " to node [".length(), line.indexOf(']', at + " to node [".length()));
+                    assertTrue(line, line.contains(" of 2, 20 rows)"));
+                    groupsPerNode.merge(node, 1, Integer::sum);
+                }
+                assertEquals("groups per node: " + groupsPerNode, 3, groupsPerNode.size());
+                for (int groups : groupsPerNode.values()) {
+                    // Two groups per request, over the requests above.
+                    assertEquals("groups per node: " + groupsPerNode, 0, groups % 2);
+                    assertTrue("groups per node: " + groupsPerNode, groups >= 2 * requests.length);
+                }
+            });
+
+            // GET through the Lance scan filter reaches rows outside the
+            // shard reader; the shard path is refused for the table.
+            updateClusterSetting("lance.test.max_docs_per_reader", "4");
+            String pkAttach = readAll(postJson("/_lance/attach", "{\"table\":\"" + pkTableUri + "\"}"));
+            assertTrue(pkAttach, pkAttach.contains("\"lucene_bound_exceeded\":true"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + pkTable + "?wait_for_status=green&timeout=60s"));
+            for (String key : List.of("alpha-0", "alpha-5", "alpha-11")) {
+                Response hit = client().performRequest(new Request("GET", "/" + pkTable + "/_doc/" + key));
+                assertEquals(200, hit.getStatusLine().getStatusCode());
+                assertTrue(readAll(hit).contains("\"_id\":\"" + key + "\""));
+            }
+            ResponseException refused = expectThrows(
+                ResponseException.class,
+                () -> postJson("/" + pkTable + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"explain\":true}")
+            );
+            assertEquals(400, refused.getResponse().getStatusLine().getStatusCode());
+            assertTrue(readAll(refused.getResponse()).contains("above the Lucene bound"));
+
+            // The default bound gives one request per node and the same
+            // answers.
+            updateClusterSetting("lance.test.max_docs_per_reader", null);
+            for (int i = 0; i < requests.length; i++) {
+                Map<String, Object> oneGroup = parse(readAll(postJson("/" + tableName + "/_search", requests[i])));
+                assertEquals(requests[i], sourceIds(grouped.get(i)), sourceIds(oneGroup));
+                assertEquals(requests[i], grouped.get(i).get("aggregations"), oneGroup.get("aggregations"));
+                assertEquals(
+                    requests[i],
+                    extractIntPath(grouped.get(i), "hits", "total", "value"),
+                    extractIntPath(oneGroup, "hits", "total", "value")
+                );
+            }
+        } finally {
+            try {
+                updateClusterSetting("lance.test.max_docs_per_reader", null);
+            } catch (Exception ignored) {}
+            for (String index : List.of(tableName, pkTable)) {
+                try {
+                    client().performRequest(new Request("DELETE", "/" + index));
+                } catch (Exception ignored) {}
+            }
+        }
+    }
+
     private static String loggingNodeName(String line) {
         int open = -1;
         for (int i = 0; i < 4; i++) {
