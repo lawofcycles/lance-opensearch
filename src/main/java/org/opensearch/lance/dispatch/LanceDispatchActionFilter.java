@@ -183,7 +183,7 @@ public class LanceDispatchActionFilter implements ActionFilter {
         // fragment path refuse, and hide the overload from the client.
         @SuppressWarnings("unchecked")
         final ActionListener<SearchResponse> typedListener = (ActionListener<SearchResponse>) listener;
-        threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL).execute(new AbstractRunnable() {
+        AbstractRunnable entry = new AbstractRunnable() {
             @Override
             protected void doRun() {
                 client.execute(LanceCoordinatorAction.INSTANCE, searchRequest, typedListener);
@@ -204,7 +204,17 @@ public class LanceDispatchActionFilter implements ActionFilter {
             public String toString() {
                 return "lance dispatch coordinator entry for " + Arrays.toString(searchRequest.indices());
             }
-        });
+        };
+        try {
+            threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL).execute(entry);
+        } catch (Exception e) {
+            // A rejection is delivered to entry.onRejection inside
+            // execute and does not reach here. Anything execute throws
+            // synchronously means the runnable was never accepted, so
+            // the listener has not been completed yet; complete it
+            // rather than leave the request open.
+            listener.onFailure(e);
+        }
     }
 
     /**
