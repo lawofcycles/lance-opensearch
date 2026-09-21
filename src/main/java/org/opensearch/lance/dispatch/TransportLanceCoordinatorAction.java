@@ -959,40 +959,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         }
 
         /**
-         * {@code hits.total} under the request's {@code track_total_hits}
-         * contract, composed the way
-         * {@code SearchPhaseController.TopDocsStats#getTotalHits} does
-         * it for shard results. {@code null} (no {@code total} block in
-         * the response) when tracking is disabled. With an integer
-         * bound the value is capped at the bound and the relation
-         * becomes {@code gte} when the sum exceeds it or any executor
-         * stopped counting early; otherwise, and always for
-         * {@code track_total_hits: true}, the sum is exact.
+         * {@code hits.total} of the merged response; see
+         * {@link TransportLanceCoordinatorAction#totalHits(long, boolean, int)}.
          */
         private TotalHits totalHits() {
-            if (trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_DISABLED) {
-                return null;
-            }
-            if (trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
-                if (matchedIsLowerBound) {
-                    // An executor may only stop counting under an
-                    // integer bound; a lower bound with an accurate
-                    // request is an executor contract bug. The value
-                    // is still reported as gte so the response does
-                    // not claim an exactness it does not have.
-                    LOGGER.warn(
-                        "lance.dispatch: executor reported hits.total as a lower bound [{}] although track_total_hits requested "
-                            + "an accurate count; reporting gte",
-                        totalMatched
-                    );
-                    return new TotalHits(totalMatched, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
-                }
-                return new TotalHits(totalMatched, TotalHits.Relation.EQUAL_TO);
-            }
-            if (matchedIsLowerBound || totalMatched > trackTotalHitsUpTo) {
-                return new TotalHits(Math.min(totalMatched, trackTotalHitsUpTo), TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
-            }
-            return new TotalHits(totalMatched, TotalHits.Relation.EQUAL_TO);
+            return TransportLanceCoordinatorAction.totalHits(totalMatched, matchedIsLowerBound, trackTotalHitsUpTo);
         }
 
         SearchResponse buildResponse(long startMillis) {
@@ -1065,5 +1036,54 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 SearchResponse.Clusters.EMPTY
             );
         }
+    }
+
+    /**
+     * {@code hits.total} under the request's {@code track_total_hits}
+     * contract, composed the way
+     * {@code SearchPhaseController.TopDocsStats#getTotalHits} does it
+     * for shard results. {@code null} (no {@code total} block in the
+     * response) when tracking is disabled. For {@code track_total_hits:
+     * true} the summed per-node count is exact. With an integer bound
+     * the relation is {@code gte} when the sum exceeds the bound or any
+     * executor stopped counting at it, and the value is then the bound
+     * itself, never the sum: each executor counts its own fragments'
+     * share of one scan limited to {@code bound + 1} rows, and because
+     * Lance picks among tied rows differently on every executor, the
+     * shares can add up to less than the bound even though every scan
+     * filled. Clients read {@code gte} with the bound as "more than the
+     * bound" (the shard path never reports a smaller value with
+     * {@code gte}), so the sum is only reported when it is exact.
+     *
+     * @param totalMatched sum of the per-node matched counts
+     * @param matchedIsLowerBound whether any executor stopped counting
+     *        at the bound
+     * @param trackTotalHitsUpTo the bound the request asked for, or one
+     *        of the {@link SearchContext} tracking constants
+     */
+    static TotalHits totalHits(long totalMatched, boolean matchedIsLowerBound, int trackTotalHitsUpTo) {
+        if (trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_DISABLED) {
+            return null;
+        }
+        if (trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
+            if (matchedIsLowerBound) {
+                // An executor may only stop counting under an integer
+                // bound; a lower bound with an accurate request is an
+                // executor contract bug. The value is still reported as
+                // gte so the response does not claim an exactness it
+                // does not have.
+                LOGGER.warn(
+                    "lance.dispatch: executor reported hits.total as a lower bound [{}] although track_total_hits requested "
+                        + "an accurate count; reporting gte",
+                    totalMatched
+                );
+                return new TotalHits(totalMatched, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+            }
+            return new TotalHits(totalMatched, TotalHits.Relation.EQUAL_TO);
+        }
+        if (matchedIsLowerBound || totalMatched > trackTotalHitsUpTo) {
+            return new TotalHits(trackTotalHitsUpTo, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+        }
+        return new TotalHits(totalMatched, TotalHits.Relation.EQUAL_TO);
     }
 }
