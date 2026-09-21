@@ -649,10 +649,14 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
 
         AggregatorFactories.Builder withAvg = AggregatorFactories.builder()
             .addAggregator(AggregationBuilders.terms("c").field("category").subAggregation(AggregationBuilders.avg("a").field("rating")));
-        StringTerms withSub = execute(request(tableUri, indexName, new RangeQueryBuilder("rating").gte(500), withAvg, List.of(1)))
-            .aggregations()
-            .get("c");
+        LanceFragmentQueryResponse withSubResponse = execute(
+            request(tableUri, indexName, new RangeQueryBuilder("rating").gte(500), withAvg, List.of(1))
+        );
+        StringTerms withSub = withSubResponse.aggregations().get("c");
+        // Every row the filter keeps counts toward the match total; only
+        // the rows with a category open a bucket.
         long expectedRows = 0;
+        long expectedBucketRows = 0;
         Map<String, long[]> expected = new LinkedHashMap<>();
         for (int i = 200; i < 400; i++) {
             if (i % 5 == 4 || (i * 37L) % 1000L < 500L) {
@@ -662,16 +666,21 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
             if (i % 4 == 3) {
                 continue;
             }
+            expectedBucketRows++;
             long[] sumAndCount = expected.computeIfAbsent("c" + (i % 3), k -> new long[2]);
             sumAndCount[0] += (i * 37L) % 1000L;
             sumAndCount[1]++;
         }
+        assertEquals(expectedRows, withSubResponse.matched());
+        long bucketRows = 0;
         for (StringTerms.Bucket bucket : withSub.getBuckets()) {
             long[] sumAndCount = expected.get(bucket.getKeyAsString());
             assertEquals(sumAndCount[1], bucket.getDocCount());
+            bucketRows += bucket.getDocCount();
             InternalAvg avg = bucket.getAggregations().get("a");
             assertEquals((double) sumAndCount[0] / sumAndCount[1], avg.getValue(), 1e-9d);
         }
+        assertEquals(expectedBucketRows, bucketRows);
         assertEquals(expected.size(), withSub.getBuckets().size());
 
         InternalHistogram histogram = execute(
