@@ -9,17 +9,20 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.SortBuilder;
+import org.opensearch.tasks.Task;
 
 /**
  * Per-node dispatch request. The coordinator groups the target
@@ -223,6 +226,24 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         // sending; a null table or negative size would be a bug
         // rather than user input.
         return null;
+    }
+
+    /**
+     * The executor's task is cancellable (see {@link LanceFragmentQueryTask})
+     * so the coordinator can stop a timed out executor and a cancelled
+     * coordinator task takes its executors down with it.
+     */
+    @Override
+    public Task createTask(long id, String type, String action, TaskId parentTaskId, Map<String, String> headers) {
+        String fragments = fragmentIds.isEmpty() ? "all fragments" : fragmentIds.size() + " fragments";
+        return new LanceFragmentQueryTask(
+            id,
+            type,
+            action,
+            "lance fragment query on [" + indexName + "], " + fragments,
+            parentTaskId,
+            headers
+        );
     }
 
     public String tableUri() {

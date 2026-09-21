@@ -47,6 +47,7 @@ import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.lance.engine.FragmentGroupScan;
+import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.Cast;
@@ -509,6 +510,11 @@ final class LanceAggregatePushdown {
          * <p>Failures inside Lance (a plan it cannot parse, a function
          * its DataFusion build lacks) propagate: falling back to the
          * aggregator path would hide the regression behind a slow answer.
+         *
+         * <p>{@code cancellation} is checked before every group scan
+         * starts and at every batch boundary inside a scan; a cancelled
+         * task ends the pushdown with {@code TaskCancelledException} the
+         * same way a failing group does.
          */
         Result execute(
             Dataset dataset,
@@ -516,12 +522,13 @@ final class LanceAggregatePushdown {
             String filterSql,
             int parallelism,
             Executor executor,
+            LanceCancellation cancellation,
             Function<String, InternalAggregation> dateHistogramPrototype
         ) throws Exception {
             List<List<Integer>> fragmentGroups = FragmentGroupScan.splitContiguous(fragmentIds, parallelism);
-            List<Partial> partials = new FragmentGroupScan(executor, parallelism).runGroups(
+            List<Partial> partials = new FragmentGroupScan(executor, parallelism, cancellation).runGroups(
                 fragmentGroups,
-                group -> scan(dataset, group, filterSql)
+                group -> scan(dataset, group, filterSql, cancellation)
             );
             Partial merged;
             if (partials.size() == 1) {
@@ -540,7 +547,8 @@ final class LanceAggregatePushdown {
          * fragment), read into a {@link Partial} keyed by the full key
          * list of every row that opens a bucket.
          */
-        private Partial scan(Dataset dataset, List<Integer> fragmentIds, String filterSql) throws Exception {
+        private Partial scan(Dataset dataset, List<Integer> fragmentIds, String filterSql, LanceCancellation cancellation)
+            throws Exception {
             ScanOptions.Builder options = new ScanOptions.Builder().substraitAggregate(substrait.duplicate());
             if (fragmentIds != null) {
                 options.fragmentIds(fragmentIds);
@@ -552,6 +560,7 @@ final class LanceAggregatePushdown {
             Partial partial = new Partial();
             try (LanceScanner scanner = dataset.newScan(options.build()); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
+                    cancellation.checkCancelled();
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
                     FieldVector counts = root.getVector(COUNT_COLUMN);
                     FieldVector[] keyVectors = new FieldVector[keyCount];

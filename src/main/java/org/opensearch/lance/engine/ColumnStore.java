@@ -37,6 +37,7 @@ import org.apache.lucene.util.BytesRef;
 import org.lance.Dataset;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.lance.LanceCircuitBreaker;
 import org.opensearch.lance.engine.LanceWarmCache.SnapshotKey;
 
@@ -453,11 +454,11 @@ public final class ColumnStore implements Closeable {
         }
         try {
             groupScan.run(ids, group -> {
-                scanGroup(dataset, column, group, consumer);
+                scanGroup(dataset, column, group, groupScan.cancellation(), consumer);
                 return null;
             });
-        } catch (OutOfMemoryException oom) {
-            throw oom;
+        } catch (OutOfMemoryException | TaskCancelledException e) {
+            throw e;
         } catch (IOException e) {
             throw e;
         } catch (Exception e) {
@@ -465,11 +466,24 @@ public final class ColumnStore implements Closeable {
         }
     }
 
-    /** One Lance scan of {@code column} over {@code fragmentIds}, every non-null cell handed to {@code consumer}. */
-    private void scanGroup(Dataset dataset, String column, List<Integer> fragmentIds, ScannedCellConsumer consumer) throws IOException {
+    /**
+     * One Lance scan of {@code column} over {@code fragmentIds}, every
+     * non-null cell handed to {@code consumer}. {@code cancellation} is
+     * checked before every batch; a cancelled task ends the scan with
+     * {@code TaskCancelledException} and the caller drops what it had
+     * loaded so far.
+     */
+    private void scanGroup(
+        Dataset dataset,
+        String column,
+        List<Integer> fragmentIds,
+        LanceCancellation cancellation,
+        ScannedCellConsumer consumer
+    ) throws IOException {
         scans.incrementAndGet();
         try (LanceScanner scanner = dataset.newScan(scanOf(column, fragmentIds)); ArrowReader reader = scanner.scanBatches()) {
             while (reader.loadNextBatch()) {
+                cancellation.checkCancelled();
                 VectorSchemaRoot root = reader.getVectorSchemaRoot();
                 UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
                 FieldVector source = root.getVector(column);
@@ -482,8 +496,8 @@ public final class ColumnStore implements Closeable {
                     consumer.accept((int) (addr >>> 32), (int) (addr & 0xFFFFFFFFL), source, i);
                 }
             }
-        } catch (OutOfMemoryException oom) {
-            throw oom;
+        } catch (OutOfMemoryException | TaskCancelledException e) {
+            throw e;
         } catch (IOException e) {
             throw e;
         } catch (Exception e) {

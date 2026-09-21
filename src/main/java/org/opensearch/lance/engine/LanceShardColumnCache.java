@@ -33,6 +33,7 @@ import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.common.unit.ByteSizeValue;
+import org.opensearch.core.tasks.TaskCancelledException;
 
 /**
  * Per-{@link LanceDirectoryReader} coordinator that reads a single
@@ -366,7 +367,7 @@ public final class LanceShardColumnCache {
             name,
             isBoolean,
             Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc()),
-            FragmentGroupScan.SEQUENTIAL
+            groupScan.sequential()
         );
         if (columns == null) {
             LOGGER.debug(
@@ -492,7 +493,7 @@ public final class LanceShardColumnCache {
             dataset,
             name,
             Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc()),
-            FragmentGroupScan.SEQUENTIAL
+            groupScan.sequential()
         );
         if (load == null) {
             LOGGER.debug(
@@ -517,7 +518,7 @@ public final class LanceShardColumnCache {
             dataset,
             name,
             Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc()),
-            FragmentGroupScan.SEQUENTIAL
+            groupScan.sequential()
         );
         if (load == null) {
             LOGGER.debug(
@@ -663,7 +664,7 @@ public final class LanceShardColumnCache {
                 scanHeapGroup(name, group, consumer);
                 return null;
             });
-        } catch (IOException e) {
+        } catch (IOException | TaskCancelledException e) {
             throw e;
         } catch (Exception e) {
             throw new IOException(e);
@@ -681,6 +682,9 @@ public final class LanceShardColumnCache {
         heapScans.incrementAndGet();
         try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
             while (reader.loadNextBatch()) {
+                // A cancelled request stops at the next batch; the
+                // arrays filled so far are dropped by the caller.
+                groupScan.cancellation().checkCancelled();
                 VectorSchemaRoot root = reader.getVectorSchemaRoot();
                 UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
                 FieldVector vector = root.getVector(name);
@@ -697,7 +701,7 @@ public final class LanceShardColumnCache {
                     consumer.accept(fragmentId, (int) (addr & 0xFFFFFFFFL), vector, i);
                 }
             }
-        } catch (IOException e) {
+        } catch (IOException | TaskCancelledException e) {
             throw e;
         } catch (Exception e) {
             throw new IOException(e);

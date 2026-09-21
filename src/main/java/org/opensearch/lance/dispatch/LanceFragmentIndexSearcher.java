@@ -18,6 +18,7 @@ import org.apache.lucene.search.Weight;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.cache.query.DisabledQueryCache;
+import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.query.LanceHitsAccounting;
 import org.opensearch.search.internal.ContextIndexSearcher;
 
@@ -62,8 +63,12 @@ import org.opensearch.search.internal.ContextIndexSearcher;
  * context as a releasable, so the bytes go back to the breaker when
  * the executor closes the context at the end of the request, after
  * the hits, aggregation and count phases that used the Weights.
+ *
+ * <p>The searcher also hands the Lance Weights the request's
+ * {@link LanceCancellation} (from the search context), so their scans
+ * stop at the next batch boundary once the task has been cancelled.
  */
-final class LanceFragmentIndexSearcher extends ContextIndexSearcher implements LanceHitsAccounting.Provider {
+final class LanceFragmentIndexSearcher extends ContextIndexSearcher implements LanceHitsAccounting.Provider, LanceCancellation.Provider {
 
     private static final QueryCachingPolicy NEVER_CACHE = new QueryCachingPolicy() {
         @Override
@@ -101,6 +106,11 @@ final class LanceFragmentIndexSearcher extends ContextIndexSearcher implements L
     @Override
     public LanceHitsAccounting hitsAccounting() {
         return hitsAccounting;
+    }
+
+    @Override
+    public LanceCancellation cancellation() {
+        return fragmentContext.cancellation();
     }
 
     @Override

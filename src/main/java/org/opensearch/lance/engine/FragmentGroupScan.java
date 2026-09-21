@@ -45,10 +45,16 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>When one group fails no further group is started, the groups already
  * running are left to finish (a Lance scan has no cancel from the Java
  * side) and the first failure is thrown with the others suppressed.
+ *
+ * <p>The instance also carries the {@link LanceCancellation} of the
+ * request it scans for: {@link #runGroups} checks it before it starts a
+ * group, and the group scans read it through {@link #cancellation()} to
+ * check it between the batches of a scan, so a cancelled request stops
+ * at the next group or batch boundary on every thread it runs on.
  */
 public final class FragmentGroupScan {
 
-    /** One scan per request: every fragment in one group, on the calling thread. */
+    /** One scan per request: every fragment in one group, on the calling thread, under no task. */
     public static final FragmentGroupScan SEQUENTIAL = new FragmentGroupScan(Runnable::run, 1);
 
     /** The scan of one group of fragments; {@code fragmentIds} is {@code null} when the group is "every fragment". */
@@ -59,22 +65,44 @@ public final class FragmentGroupScan {
 
     private final Executor executor;
     private final int parallelism;
+    private final LanceCancellation cancellation;
 
     /**
-     * @param executor    pool the groups after the first run on; the
-     *                    caller's thread scans the first group and whatever
-     *                    the pool does not pick up
-     * @param parallelism upper bound of groups per request; 1 means one
-     *                    scan over every fragment
+     * A scan under no task; see
+     * {@link #FragmentGroupScan(Executor, int, LanceCancellation)}.
      */
     public FragmentGroupScan(Executor executor, int parallelism) {
+        this(executor, parallelism, LanceCancellation.NONE);
+    }
+
+    /**
+     * @param executor     pool the groups after the first run on; the
+     *                     caller's thread scans the first group and whatever
+     *                     the pool does not pick up
+     * @param parallelism  upper bound of groups per request; 1 means one
+     *                     scan over every fragment
+     * @param cancellation the request's task, checked before every group
+     *                     and, by the group scans, between batches
+     */
+    public FragmentGroupScan(Executor executor, int parallelism, LanceCancellation cancellation) {
         this.executor = executor;
         this.parallelism = Math.max(1, parallelism);
+        this.cancellation = cancellation == null ? LanceCancellation.NONE : cancellation;
     }
 
     /** Upper bound of groups per request. */
     public int parallelism() {
         return parallelism;
+    }
+
+    /** The cancellation of the request this scan runs for, never null. */
+    public LanceCancellation cancellation() {
+        return cancellation;
+    }
+
+    /** One group on the calling thread, under the same task as this scan. */
+    public FragmentGroupScan sequential() {
+        return parallelism == 1 && executor == SEQUENTIAL.executor ? this : new FragmentGroupScan(Runnable::run, 1, cancellation);
     }
 
     /**
@@ -120,6 +148,7 @@ public final class FragmentGroupScan {
     public <T> List<T> runGroups(List<List<Integer>> groups, GroupScan<T> scan) throws Exception {
         int groupCount = groups.size();
         if (groupCount == 1) {
+            cancellation.checkCancelled();
             return Collections.singletonList(scan.scan(groups.get(0)));
         }
         Object[] results = new Object[groupCount];
@@ -129,6 +158,9 @@ public final class FragmentGroupScan {
             int index;
             while (failure.get() == null && (index = next.getAndIncrement()) < groupCount) {
                 try {
+                    // A group of a cancelled request is not started; a
+                    // group already running stops at its next batch.
+                    cancellation.checkCancelled();
                     results[index] = scan.scan(groups.get(index));
                 } catch (Exception e) {
                     if (!failure.compareAndSet(null, e)) {

@@ -30,7 +30,9 @@ import org.apache.lucene.search.Weight;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
+import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.lance.LanceCircuitBreaker;
+import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 
 /**
@@ -85,7 +87,7 @@ public final class LanceKnnQuery extends Query {
 
     @Override
     public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) {
-        return new LanceKnnWeight(this, boost, LanceHitsAccounting.of(searcher));
+        return new LanceKnnWeight(this, boost, LanceHitsAccounting.of(searcher), LanceCancellation.of(searcher));
     }
 
     /**
@@ -107,15 +109,18 @@ public final class LanceKnnQuery extends Query {
         // but the path is the one the FTS Weight takes and a refusal
         // surfaces the same way (CircuitBreakingException, HTTP 429).
         private final LanceHitsAccounting accounting;
+        // Checked at every batch boundary of the nearest scan.
+        private final LanceCancellation cancellation;
         // Cache is populated on the first Lance-backed leaf we visit and then
         // reused for every other leaf in the same shard. The volatile field is
         // set once via CAS so concurrent readers see a fully constructed map.
         private final AtomicReference<Map<Integer, LanceFragmentHits>> shardHits = new AtomicReference<>();
 
-        LanceKnnWeight(LanceKnnQuery query, float boost, LanceHitsAccounting accounting) {
+        LanceKnnWeight(LanceKnnQuery query, float boost, LanceHitsAccounting accounting, LanceCancellation cancellation) {
             super(query);
             this.boost = boost;
             this.accounting = Objects.requireNonNull(accounting, "accounting must not be null");
+            this.cancellation = Objects.requireNonNull(cancellation, "cancellation must not be null");
         }
 
         @Override
@@ -240,6 +245,7 @@ public final class LanceKnnQuery extends Query {
             }
             try (LanceScanner scanner = leaf.dataset().newScan(options.build()); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
+                    cancellation.checkCancelled();
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
                     UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
                     Float4Vector distance = (Float4Vector) root.getVector("_distance");
@@ -252,7 +258,7 @@ public final class LanceKnnQuery extends Query {
                         fresh.computeIfAbsent(fragId, id -> new LanceFragmentHits(accounting)).add(offset, boost / (1f + distance.get(i)));
                     }
                 }
-            } catch (IOException | CircuitBreakingException e) {
+            } catch (IOException | CircuitBreakingException | TaskCancelledException e) {
                 throw e;
             } catch (Exception e) {
                 throw new IOException(e);
