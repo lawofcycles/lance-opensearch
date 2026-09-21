@@ -5,6 +5,8 @@
 package org.opensearch.lance.dispatch;
 
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
@@ -243,7 +245,7 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
     public void testTimedOutNodeLeavesItsSlotEmptyAndMarksTheOutcomeWhenPartialResultsAreAllowed() throws Exception {
         CountingListener done = new CountingListener(coordinatorPool());
         AtomicReference<Outcome> merged = new AtomicReference<>();
-        List<String> incomplete = new java.util.concurrent.CopyOnWriteArrayList<>();
+        List<String> incomplete = new CopyOnWriteArrayList<>();
         FragmentFanOut fanOut = new FragmentFanOut(
             2,
             coordinatorPool(),
@@ -273,7 +275,7 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
     public void testTimedOutNodeFailsTheFanOutWithGatewayTimeoutWhenPartialResultsAreNotAllowed() throws Exception {
         CountingListener done = new CountingListener(coordinatorPool());
         AtomicInteger merges = new AtomicInteger();
-        List<String> incomplete = new java.util.concurrent.CopyOnWriteArrayList<>();
+        List<String> incomplete = new CopyOnWriteArrayList<>();
         FragmentFanOut fanOut = new FragmentFanOut(
             2,
             coordinatorPool(),
@@ -417,7 +419,7 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
     /** A coordinator task that can be cancelled from the test. */
     private static final class TestTask extends CancellableTask {
         TestTask() {
-            super(1L, "transport", LanceCoordinatorAction.NAME, "test", TaskId.EMPTY_TASK_ID, java.util.Map.of());
+            super(1L, "transport", LanceCoordinatorAction.NAME, "test", TaskId.EMPTY_TASK_ID, Map.of());
         }
 
         @Override

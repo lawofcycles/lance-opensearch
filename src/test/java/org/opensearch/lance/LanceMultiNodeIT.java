@@ -18,6 +18,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import org.apache.hc.core5.http.HttpHost;
@@ -1503,7 +1505,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals(3, extractIntPath(readAll(attach), "fragments"));
             assertEquals(3, dataNodeCount());
 
-            java.util.concurrent.CompletableFuture<LanceRestTestCase.ConcurrentResult> pending = LanceRestTestCase.postAsync(
+            CompletableFuture<LanceRestTestCase.ConcurrentResult> pending = LanceRestTestCase.postAsync(
                 client(),
                 "/" + indexName + "/_search",
                 "{\"size\":5,\"sort\":[{\"id\":\"asc\"}],\"query\":" + LanceRestTestCase.slowScriptQuery(900_000) + "}"
@@ -1513,7 +1515,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             String cancelled = readAll(postJson("/_tasks/_cancel?nodes=" + victim + "&actions=*lance/fragment_query*", ""));
             assertTrue("the cancel must name one executor task: " + cancelled, cancelled.contains("lance/fragment_query"));
 
-            LanceRestTestCase.ConcurrentResult result = pending.get(60, java.util.concurrent.TimeUnit.SECONDS);
+            LanceRestTestCase.ConcurrentResult result = pending.get(60, TimeUnit.SECONDS);
             assertEquals("the request must complete from the other nodes: " + result.body(), RestStatus.OK.getStatus(), result.status());
             Map<String, Object> response = parse(result.body());
             assertEquals("the response must say a node did not answer: " + result.body(), Boolean.TRUE, response.get("timed_out"));
