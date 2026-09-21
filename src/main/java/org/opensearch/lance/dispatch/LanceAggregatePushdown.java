@@ -6,6 +6,7 @@
 package org.opensearch.lance.dispatch;
 
 import java.nio.ByteBuffer;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -39,21 +40,37 @@ import org.lance.Dataset;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.opensearch.common.Rounding;
+import org.opensearch.common.hash.MurmurHash3;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.BigArrays;
+import org.opensearch.common.util.BitMixer;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.index.mapper.MappedFieldType;
+import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.ExistsQueryBuilder;
+import org.opensearch.index.query.MatchAllQueryBuilder;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
+import org.opensearch.index.query.RangeQueryBuilder;
+import org.opensearch.index.query.TermQueryBuilder;
+import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.lance.engine.FragmentGroupScan;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan;
+import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.BoolLiteral;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.Cast;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.Expression;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.FieldReference;
+import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.Float64Literal;
+import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.Int64Literal;
+import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.ScalarFunction;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.ScalarType;
+import org.opensearch.lance.query.substrait.SubstraitAggregatePlan.StringLiteral;
 import org.opensearch.lance.query.substrait.SubstraitExpressions;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.AggregationBuilder;
@@ -68,25 +85,48 @@ import org.opensearch.search.aggregations.bucket.composite.CompositeKey;
 import org.opensearch.search.aggregations.bucket.composite.CompositeValuesSourceBuilder;
 import org.opensearch.search.aggregations.bucket.composite.DateHistogramValuesSourceBuilder;
 import org.opensearch.search.aggregations.bucket.composite.InternalComposite;
+import org.opensearch.search.aggregations.bucket.filter.FilterAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.filter.FiltersAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.filter.FiltersAggregator;
+import org.opensearch.search.aggregations.bucket.filter.InternalFilters;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.HistogramAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
 import org.opensearch.search.aggregations.bucket.histogram.InternalHistogram;
 import org.opensearch.search.aggregations.bucket.missing.MissingOrder;
+import org.opensearch.search.aggregations.bucket.range.AbstractRangeBuilder;
+import org.opensearch.search.aggregations.bucket.range.DateRangeAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.range.InternalDateRange;
+import org.opensearch.search.aggregations.bucket.range.InternalRange;
+import org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.range.RangeAggregator;
 import org.opensearch.search.aggregations.bucket.terms.DoubleTerms;
 import org.opensearch.search.aggregations.bucket.terms.LongTerms;
 import org.opensearch.search.aggregations.bucket.terms.StringTerms;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregator;
+import org.opensearch.search.aggregations.metrics.AbstractPercentilesAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.CardinalityAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.ExtendedStatsAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus;
 import org.opensearch.search.aggregations.metrics.InternalAvg;
+import org.opensearch.search.aggregations.metrics.InternalExtendedStats;
 import org.opensearch.search.aggregations.metrics.InternalMax;
 import org.opensearch.search.aggregations.metrics.InternalMin;
+import org.opensearch.search.aggregations.metrics.InternalStats;
 import org.opensearch.search.aggregations.metrics.InternalSum;
+import org.opensearch.search.aggregations.metrics.InternalTDigestPercentileRanks;
+import org.opensearch.search.aggregations.metrics.InternalTDigestPercentiles;
 import org.opensearch.search.aggregations.metrics.InternalValueCount;
 import org.opensearch.search.aggregations.metrics.MaxAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.MinAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.PercentileRanksAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.PercentilesAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.PercentilesConfig;
+import org.opensearch.search.aggregations.metrics.StatsAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.SumAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.TDigestState;
 import org.opensearch.search.aggregations.metrics.ValueCountAggregationBuilder;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
 import org.opensearch.search.sort.SortOrder;
@@ -176,7 +216,7 @@ import org.opensearch.search.sort.SortOrder;
  *       single scan meaning.</li>
  * </ul>
  */
-final class LanceAggregatePushdown {
+public final class LanceAggregatePushdown {
 
     private LanceAggregatePushdown() {}
 
@@ -190,6 +230,17 @@ final class LanceAggregatePushdown {
     };
 
     /**
+     * Bins of a pushed down percentiles histogram, from
+     * {@code lance.aggregation.percentiles_bins}; the plugin stores the
+     * node setting here at start and every dynamic update after.
+     */
+    private static volatile int percentilesBins = LancePlugin.AGGREGATION_PERCENTILES_BINS_SETTING.getDefault(Settings.EMPTY);
+
+    public static void setPercentilesBins(int bins) {
+        percentilesBins = bins;
+    }
+
+    /**
      * Aggregations plus the row total of the fragments this node
      * scanned, and the number of Lance scans that produced them.
      */
@@ -201,13 +252,40 @@ final class LanceAggregatePushdown {
         AVG,
         MIN,
         MAX,
-        VALUE_COUNT
+        VALUE_COUNT,
+        STATS,
+        EXTENDED_STATS,
+        CARDINALITY,
+        PERCENTILES,
+        PERCENTILE_RANKS
     }
 
     private enum KeyKind {
         STRING,
         LONG,
         DOUBLE
+    }
+
+    /**
+     * How a bucket level turns its key into buckets. The first three
+     * open one bucket per distinct key; the mask kinds read the key as
+     * the bit set of the ranges or filters the row falls in
+     * ({@link SubstraitExpressions#matchMask}) and put the row into
+     * every bucket whose bit is set.
+     */
+    private enum LevelKind {
+        TERMS,
+        HISTOGRAM,
+        DATE_HISTOGRAM,
+        RANGE,
+        DATE_RANGE,
+        FILTERS,
+        FILTER,
+        MISSING;
+
+        boolean isMask() {
+            return this == RANGE || this == DATE_RANGE || this == FILTERS || this == FILTER || this == MISSING;
+        }
     }
 
     /** A mapped field resolved to its Lance column. */
@@ -263,29 +341,79 @@ final class LanceAggregatePushdown {
      * {@code prefix + "_c"} ({@code avg}, requested from Lance as a sum
      * and a count rather than as DataFusion's {@code avg}, so the partial
      * values of several scans and of the rows of an outer bucket add up
-     * and {@code InternalAvg} carries both for the coordinator's merge).
-     * {@code slot} is the metric's position in the plan's metric list
-     * and in every {@link GroupState}.
+     * and {@code InternalAvg} carries both for the coordinator's merge);
+     * {@code stats} and {@code extended_stats} take the count, sum, min,
+     * max and (extended) sum of squares columns at once. A
+     * {@code cardinality} has no measure: it adds the field as a grouping
+     * column {@code prefix + "_d"}, so the scan returns one row per
+     * distinct value (per bucket), and the executor hashes each into a
+     * HyperLogLog++ sketch as the row is read. A {@code percentiles} /
+     * {@code percentile_ranks} takes {@code min} and {@code max} in the
+     * first scan and, in a second scan of its own, the row count per
+     * equal width bin ({@code prefix + "_b"} and {@code prefix + "_bc"}),
+     * which the executor feeds to a TDigest sketch. {@code slot} is the
+     * metric's position in the plan's metric list and in every
+     * {@link GroupState}.
      */
-    private record Metric(String name, MetricKind kind, Column column, DocValueFormat format, Map<String, Object> metadata, int slot) {
+    private record Metric(String name, MetricKind kind, Column column, DocValueFormat format, Map<String, Object> metadata, int slot,
+        ValuesSourceAggregationBuilder<?> builder) {
 
         String prefix() {
             return "m" + slot;
         }
 
+        /** Output column of the distinct values a {@code cardinality} groups by. */
+        String distinctColumn() {
+            return prefix() + "_d";
+        }
+
+        /** Output columns of the percentiles bin ordinal and its row count. */
+        String binColumn() {
+            return prefix() + "_b";
+        }
+
+        String binCountColumn() {
+            return prefix() + "_bc";
+        }
+
         void addMeasures(SubstraitAggregatePlan.Builder builder) {
             Expression value = column.numericExpression();
             ScalarType type = column.isFloating() ? ScalarType.FP64 : ScalarType.I64;
+            Expression reference = new FieldReference(column.index());
             switch (kind) {
                 case SUM -> builder.measure("sum", List.of(value), type, prefix());
                 case MIN -> builder.measure("min", List.of(value), type, prefix());
                 case MAX -> builder.measure("max", List.of(value), type, prefix());
-                case VALUE_COUNT -> builder.measure("count", List.of(new FieldReference(column.index())), ScalarType.I64, prefix());
+                case VALUE_COUNT -> builder.measure("count", List.of(reference), ScalarType.I64, prefix());
                 case AVG -> {
                     builder.measure("sum", List.of(value), type, prefix() + "_s");
-                    builder.measure("count", List.of(new FieldReference(column.index())), ScalarType.I64, prefix() + "_c");
+                    builder.measure("count", List.of(reference), ScalarType.I64, prefix() + "_c");
+                }
+                case STATS, EXTENDED_STATS -> {
+                    builder.measure("count", List.of(reference), ScalarType.I64, prefix() + "_c");
+                    builder.measure("sum", List.of(value), type, prefix() + "_s");
+                    builder.measure("min", List.of(value), type, prefix() + "_mn");
+                    builder.measure("max", List.of(value), type, prefix() + "_mx");
+                    if (kind == MetricKind.EXTENDED_STATS) {
+                        builder.measure("sum", List.of(SubstraitExpressions.square(value)), ScalarType.FP64, prefix() + "_q");
+                    }
+                }
+                case PERCENTILES, PERCENTILE_RANKS -> {
+                    // The bounds the bins of the second scan are cut from.
+                    builder.measure("min", List.of(value), type, prefix() + "_mn");
+                    builder.measure("max", List.of(value), type, prefix() + "_mx");
+                }
+                case CARDINALITY -> {
+                    // No measure: the grouping on the field is added by
+                    // the planner, and the distinct values come back as
+                    // the group keys.
                 }
             }
+        }
+
+        /** The grouping expression a {@code cardinality} adds: the value as the aggregator hashes it. */
+        Expression distinctExpression() {
+            return column.isUtf8() || column.isFloating() ? new FieldReference(column.index()) : column.numericExpression();
         }
 
         /** The metric's partial values on one group row of one scan. */
@@ -300,8 +428,103 @@ final class LanceAggregatePushdown {
                     state.sum = doubleOrZero(root.getVector(prefix() + "_s"), row);
                     state.count = longOrZero(root.getVector(prefix() + "_c"), row);
                 }
+                case STATS, EXTENDED_STATS -> {
+                    state.count = longOrZero(root.getVector(prefix() + "_c"), row);
+                    state.sum = doubleOrZero(root.getVector(prefix() + "_s"), row);
+                    state.min = doubleOr(root.getVector(prefix() + "_mn"), row, Double.POSITIVE_INFINITY);
+                    state.max = doubleOr(root.getVector(prefix() + "_mx"), row, Double.NEGATIVE_INFINITY);
+                    if (kind == MetricKind.EXTENDED_STATS) {
+                        state.sumOfSquares = doubleOrZero(root.getVector(prefix() + "_q"), row);
+                    }
+                }
+                case PERCENTILES, PERCENTILE_RANKS -> {
+                    state.min = doubleOr(root.getVector(prefix() + "_mn"), row, Double.POSITIVE_INFINITY);
+                    state.max = doubleOr(root.getVector(prefix() + "_mx"), row, Double.NEGATIVE_INFINITY);
+                }
+                case CARDINALITY -> {
+                    FieldVector distinct = root.getVector(distinctColumn());
+                    if (!distinct.isNull(row)) {
+                        state.hash = hash(distinct, row);
+                        state.hashed = true;
+                        state.precision = precision();
+                    }
+                }
             }
             return state;
+        }
+
+        /**
+         * The metric's values on one row of its bin scan: the rows of one
+         * bin, spread over the bin as one value at each edge and the rest
+         * at the centre. {@code min}, {@code max} and {@code width} are
+         * the bounds the scan was planned with. The edges matter to
+         * TDigest, which expects its lowest and highest centroids to be
+         * single values (it reports them as the 0th and 100th percentile
+         * and asserts it when it compresses): whatever bins a bucket's
+         * rows occupy, its digest then starts and ends on a singleton.
+         * Every value stays inside its bin, so the digest is accurate to
+         * the bin width, and the edges of the outermost bins are the
+         * exact minimum and maximum.
+         */
+        MetricState readBin(VectorSchemaRoot root, int row, double min, double max, double width, int bins) {
+            MetricState state = new MetricState();
+            FieldVector bin = root.getVector(binColumn());
+            long count = longOrZero(root.getVector(binCountColumn()), row);
+            if (bin.isNull(row) || count == 0L) {
+                return state;
+            }
+            // The maximum value itself lands in bin `bins` (its quotient is
+            // exactly bins); it belongs to the last bin.
+            long ordinal = Math.max(0L, Math.min(asLong(bin, row), bins - 1L));
+            double lower = ordinal == 0L ? min : min + ordinal * width;
+            double upper = ordinal == bins - 1L || max == min ? max : Math.min(max, min + (ordinal + 1L) * width);
+            double centre = (lower + upper) / 2d;
+            if (count == 1L) {
+                state.binValues = new double[] { centre };
+                state.binWeights = new long[] { 1L };
+            } else if (count == 2L) {
+                state.binValues = new double[] { lower, upper };
+                state.binWeights = new long[] { 1L, 1L };
+            } else {
+                state.binValues = new double[] { lower, centre, upper };
+                state.binWeights = new long[] { 1L, count - 2L, 1L };
+            }
+            state.compression = compression();
+            return state;
+        }
+
+        /**
+         * The hash the cardinality aggregator computes for the value:
+         * MurmurHash3 of the UTF-8 bytes for strings, the mixed bits for
+         * numbers (a float as the double it widens to, a date as its
+         * epoch millis, a boolean as 0 / 1).
+         */
+        private static long hash(FieldVector vector, int row) {
+            if (vector instanceof VarCharVector v) {
+                byte[] bytes = v.get(row);
+                return MurmurHash3.hash128(bytes, 0, bytes.length, 0, new MurmurHash3.Hash128()).h1;
+            }
+            if (vector instanceof Float4Vector v) {
+                return BitMixer.mix64(Double.doubleToLongBits(v.get(row)));
+            }
+            if (vector instanceof Float8Vector v) {
+                return BitMixer.mix64(Double.doubleToLongBits(v.get(row)));
+            }
+            return BitMixer.mix64(asLong(vector, row));
+        }
+
+        /** HyperLogLog++ precision from the request's {@code precision_threshold}, as the aggregator factory derives it. */
+        int precision() {
+            Long threshold = precisionThreshold((CardinalityAggregationBuilder) builder);
+            return threshold == null ? HyperLogLogPlusPlus.DEFAULT_PRECISION : HyperLogLogPlusPlus.precisionFromThreshold(threshold);
+        }
+
+        /** TDigest compression of a percentiles builder, the default 100 when the request names none. */
+        double compression() {
+            PercentilesConfig config = ((AbstractPercentilesAggregationBuilder<?>) builder).percentilesConfig();
+            return config instanceof PercentilesConfig.TDigest tdigest
+                ? tdigest.getCompression()
+                : new PercentilesConfig.TDigest().getCompression();
         }
 
         /** The aggregation the aggregator would report for the merged values. */
@@ -312,6 +535,47 @@ final class LanceAggregatePushdown {
                 case MAX -> new InternalMax(name, state.max, format, metadata);
                 case VALUE_COUNT -> new InternalValueCount(name, state.count, metadata);
                 case AVG -> new InternalAvg(name, state.sum, state.count, format, metadata);
+                case STATS -> new InternalStats(name, state.count, state.sum, state.min, state.max, format, metadata);
+                case EXTENDED_STATS -> new InternalExtendedStats(
+                    name,
+                    state.count,
+                    state.sum,
+                    state.min,
+                    state.max,
+                    state.sumOfSquares,
+                    ((ExtendedStatsAggregationBuilder) builder).sigma(),
+                    format,
+                    metadata
+                );
+                case CARDINALITY -> {
+                    // The aggregator reports null counts for a bucket
+                    // without a value, not an empty sketch.
+                    state.materialize();
+                    HyperLogLogPlusPlus sketch = state.sketch != null && state.sketch.cardinality(0) > 0L ? state.sketch : null;
+                    yield CoreAggregationResults.cardinality(name, sketch, metadata);
+                }
+                case PERCENTILES -> {
+                    state.materialize();
+                    yield new InternalTDigestPercentiles(
+                        name,
+                        ((PercentilesAggregationBuilder) builder).percentiles(),
+                        state.digest != null ? state.digest : new TDigestState(compression()),
+                        ((PercentilesAggregationBuilder) builder).keyed(),
+                        format,
+                        metadata
+                    );
+                }
+                case PERCENTILE_RANKS -> {
+                    state.materialize();
+                    yield new InternalTDigestPercentileRanks(
+                        name,
+                        ((PercentileRanksAggregationBuilder) builder).values(),
+                        state.digest != null ? state.digest : new TDigestState(compression()),
+                        ((PercentileRanksAggregationBuilder) builder).keyed(),
+                        format,
+                        metadata
+                    );
+                }
             };
         }
 
@@ -324,27 +588,113 @@ final class LanceAggregatePushdown {
         InternalAggregation empty() {
             return toAggregation(new MetricState());
         }
+
+        boolean isPercentiles() {
+            return kind == MetricKind.PERCENTILES || kind == MetricKind.PERCENTILE_RANKS;
+        }
     }
 
     /**
      * Running values of one metric over the rows of one group. A fresh
      * state holds the neutral element of every measure (0 for sums and
-     * counts, the infinities for min and max), which is also what the
-     * aggregator reports for a bucket without documents, so merging a
-     * state into a fresh one copies it and merging two partial states
-     * adds the sums and counts and keeps the smaller min and larger max.
+     * counts, the infinities for min and max, no sketch), which is also
+     * what the aggregator reports for a bucket without documents, so
+     * merging a state into a fresh one copies it and merging two partial
+     * states adds the sums and counts and keeps the smaller min and
+     * larger max. The sketches are lazy: a row state carries one hash
+     * (cardinality) or one bin (percentiles), the first merge into a
+     * group state opens the sketch and inserts it, and merging two group
+     * states merges the sketches. A sketch is copied before it is merged
+     * into a fresh state, so the states of the scan's groups can be
+     * folded into an outer bucket and still feed the nested level.
      */
     private static final class MetricState {
         double sum;
         long count;
         double min = Double.POSITIVE_INFINITY;
         double max = Double.NEGATIVE_INFINITY;
+        double sumOfSquares;
+
+        /** Cardinality: the hash of one row's value, and the sketch of a group. */
+        long hash;
+        boolean hashed;
+        int precision;
+        HyperLogLogPlusPlus sketch;
+
+        /** Percentiles: the values and weights of one bin, and the digest of a group. */
+        double[] binValues;
+        long[] binWeights;
+        double compression;
+        TDigestState digest;
 
         void merge(MetricState other) {
             sum += other.sum;
             count += other.count;
             min = Math.min(min, other.min);
             max = Math.max(max, other.max);
+            sumOfSquares += other.sumOfSquares;
+            // This state may still be the single row it was read as;
+            // its own value goes into the sketch before the other's.
+            materialize();
+            if (other.sketch != null) {
+                if (sketch == null) {
+                    sketch = new HyperLogLogPlusPlus(other.sketch.precision(), BigArrays.NON_RECYCLING_INSTANCE, 1);
+                }
+                sketch.merge(0, other.sketch, 0);
+            } else if (other.hashed) {
+                collect(other.precision, other.hash);
+            }
+            if (other.digest != null) {
+                if (digest == null) {
+                    digest = new TDigestState(other.digest.compression());
+                }
+                digest.add(other.digest);
+            } else if (other.binValues != null) {
+                addBin(other.compression, other.binValues, other.binWeights);
+            }
+        }
+
+        /**
+         * Moves a row's own hash or bin into this state's sketch. A state
+         * read from one row keeps the value itself until it is merged
+         * with another or reported, so the scan does not allocate a
+         * sketch per row.
+         */
+        void materialize() {
+            if (hashed) {
+                hashed = false;
+                collect(precision, hash);
+            }
+            if (binValues != null) {
+                double[] values = binValues;
+                long[] weights = binWeights;
+                binValues = null;
+                binWeights = null;
+                addBin(compression, values, weights);
+            }
+        }
+
+        private void collect(int precision, long hash) {
+            if (sketch == null) {
+                sketch = new HyperLogLogPlusPlus(precision, BigArrays.NON_RECYCLING_INSTANCE, 1);
+            }
+            sketch.collect(0, hash);
+        }
+
+        private void addBin(double compression, double[] values, long[] weights) {
+            if (digest == null) {
+                digest = new TDigestState(compression);
+            }
+            for (int i = 0; i < values.length; i++) {
+                // TDigest weights are ints; a bin of more rows is added in
+                // slices.
+                long remaining = weights[i];
+                while (remaining > 0L) {
+                    int slice = (int) Math.min(remaining, Integer.MAX_VALUE);
+                    digest.add(values[i], slice);
+                    remaining -= slice;
+                }
+            }
         }
     }
 
@@ -417,16 +767,57 @@ final class LanceAggregatePushdown {
     }
 
     /**
-     * One bucket level of the tree, outermost first. For a
-     * {@code date_histogram}, {@code dateInterval} is the
+     * One bucket level of the tree, outermost first. {@code column} and
+     * {@code format} are null for a {@code filter} / {@code filters}
+     * level, which has no field. For a {@code date_histogram},
+     * {@code dateInterval} is the
      * {@code fixed_interval} in milliseconds the scan's key ordinal is
      * multiplied back by (0 for a calendar interval, whose key is
      * already the bucket start in millis) and {@code rounding} is the
      * rounding the aggregator would attach to its result; both are 0 /
-     * null for the other kinds.
+     * null for the other kinds. For a mask level ({@link LevelKind#isMask}),
+     * {@code branchKeys} names the buckets in order (the range keys,
+     * null where the request left one unnamed; the filter keys; one
+     * entry for {@code filter} / {@code missing}), {@code ranges} holds
+     * the resolved ranges of a {@code range} / {@code date_range}, and
+     * {@code otherBucketKey} is the {@code filters} other bucket's key,
+     * null when the request did not ask for one.
      */
-    private record Level(ValuesSourceAggregationBuilder<?> builder, Column column, KeyKind keyKind, DocValueFormat format, List<
-        Child> children, List<Metric> metrics, long dateInterval, Rounding rounding) {
+    private record Level(AggregationBuilder builder, LevelKind kind, Column column, KeyKind keyKind, DocValueFormat format, List<
+        Child> children, List<Metric> metrics, long dateInterval, Rounding rounding, List<String> branchKeys,
+        RangeAggregator.Range[] ranges, String otherBucketKey) {
+        static Level keyed(
+            ValuesSourceAggregationBuilder<?> builder,
+            LevelKind kind,
+            Column column,
+            KeyKind keyKind,
+            DocValueFormat format,
+            List<Child> children,
+            List<Metric> metrics,
+            long dateInterval,
+            Rounding rounding
+        ) {
+            return new Level(builder, kind, column, keyKind, format, children, metrics, dateInterval, rounding, null, null, null);
+        }
+
+        static Level mask(
+            AggregationBuilder builder,
+            LevelKind kind,
+            Column column,
+            DocValueFormat format,
+            List<Child> children,
+            List<Metric> metrics,
+            List<String> branchKeys,
+            RangeAggregator.Range[] ranges,
+            String otherBucketKey
+        ) {
+            return new Level(builder, kind, column, KeyKind.LONG, format, children, metrics, 0L, null, branchKeys, ranges, otherBucketKey);
+        }
+
+        /** Number of buckets a mask level always reports, the other bucket included. */
+        int bucketCount() {
+            return branchKeys.size() + (otherBucketKey != null ? 1 : 0);
+        }
     }
 
     /**
@@ -460,20 +851,34 @@ final class LanceAggregatePushdown {
     /**
      * An encoded plan ready to run. Created by {@link #plan}; a
      * {@code null} plan means the request takes the aggregator path.
+     * {@code keyExpressions} are the bucket key groupings in key order,
+     * kept so the percentiles bin scans can group by the same keys.
      */
     static final class Plan {
         private final ByteBuffer substrait;
+        private final List<Expression> keyExpressions;
         private final List<Level> levels;
         private final Composite composite;
         private final List<Metric> topMetrics;
         private final List<Metric> allMetrics;
+        private final int percentilesBins;
 
-        private Plan(ByteBuffer substrait, List<Level> levels, Composite composite, List<Metric> topMetrics, List<Metric> allMetrics) {
+        private Plan(
+            ByteBuffer substrait,
+            List<Expression> keyExpressions,
+            List<Level> levels,
+            Composite composite,
+            List<Metric> topMetrics,
+            List<Metric> allMetrics,
+            int percentilesBins
+        ) {
             this.substrait = substrait;
+            this.keyExpressions = keyExpressions;
             this.levels = levels;
             this.composite = composite;
             this.topMetrics = topMetrics;
             this.allMetrics = allMetrics;
+            this.percentilesBins = percentilesBins;
         }
 
         private int keyCount() {
@@ -482,6 +887,19 @@ final class LanceAggregatePushdown {
 
         private long dateInterval(int key) {
             return composite != null ? composite.sources().get(key).dateInterval() : levels.get(key).dateInterval();
+        }
+
+        /**
+         * One Lance scan of this plan: the first scan carries every
+         * grouping and measure of the request; a percentiles metric adds
+         * a scan of its own afterwards, grouped by the same bucket keys
+         * plus its bin, whose rows carry that metric's bin counts only.
+         * {@code min}, {@code max} and {@code width} are the bin bounds of that scan.
+         */
+        private record Stage(ByteBuffer substrait, Metric percentiles, double min, double max, double width) {
+            boolean isFirst() {
+                return percentiles == null;
+            }
         }
 
         /**
@@ -507,6 +925,27 @@ final class LanceAggregatePushdown {
          * core for the hash aggregation. One fragment, or a parallelism
          * of 1, means one scan over {@code fragmentIds} as given.
          *
+         * <p>A tdigest {@code percentiles} / {@code percentile_ranks}
+         * takes two rounds: the first scan returns the field's minimum
+         * and maximum next to the other measures, then one more round of
+         * scans (same fragment groups, same filter) groups the rows by
+         * {@code floor((value - min) / width)} with
+         * {@code width = (max - min) / bins} and counts them, and the
+         * executor feeds each bin's centre and count to the TDigest.
+         * Two rounds because the bins cannot be laid out before the
+         * bounds are known. A single round with a fixed number of
+         * quantiles per node (DataFusion's {@code approx_percentile_cont}
+         * or {@code NTILE}) was not taken: the coordinator merges one
+         * sketch per node, and per node quantiles cannot be merged into
+         * an answer over every node. The bounds are node wide over the
+         * rows the filter keeps, so every bucket's histogram shares one
+         * bin width and a reported percentile is within that width of
+         * the exact value; {@code min == max} makes one bin. A field
+         * without a value skips the second round and reports an empty
+         * digest, as the aggregator does. Each percentiles metric runs
+         * its own second round: grouping several metrics' bins in one
+         * scan would multiply the rows by the bins of each.
+         *
          * <p>Failures inside Lance (a plan it cannot parse, a function
          * its DataFusion build lacks) propagate: falling back to the
          * aggregator path would hide the regression behind a slow answer.
@@ -526,30 +965,79 @@ final class LanceAggregatePushdown {
             Function<String, InternalAggregation> dateHistogramPrototype
         ) throws Exception {
             List<List<Integer>> fragmentGroups = FragmentGroupScan.splitContiguous(fragmentIds, parallelism);
-            List<Partial> partials = new FragmentGroupScan(executor, parallelism, cancellation).runGroups(
-                fragmentGroups,
-                group -> scan(dataset, group, filterSql, cancellation)
-            );
-            Partial merged;
-            if (partials.size() == 1) {
-                merged = partials.get(0);
-            } else {
-                merged = new Partial();
-                for (Partial partial : partials) {
-                    merged.merge(partial);
+            FragmentGroupScan scans = new FragmentGroupScan(executor, parallelism, cancellation);
+            Stage first = new Stage(substrait, null, 0d, 0d, 0d);
+            Partial merged = mergePartials(scans.runGroups(fragmentGroups, group -> scan(dataset, group, filterSql, first, cancellation)));
+            int scanCount = fragmentGroups.size();
+            for (Metric metric : allMetrics) {
+                if (!metric.isPercentiles()) {
+                    continue;
                 }
+                Stage bins = binStage(metric, merged);
+                if (bins == null) {
+                    continue;
+                }
+                merged.merge(mergePartials(scans.runGroups(fragmentGroups, group -> scan(dataset, group, filterSql, bins, cancellation))));
+                scanCount += fragmentGroups.size();
             }
-            return assemble(merged, fragmentGroups.size(), dateHistogramPrototype);
+            return assemble(merged, scanCount, dateHistogramPrototype);
+        }
+
+        private static Partial mergePartials(List<Partial> partials) {
+            if (partials.size() == 1) {
+                return partials.get(0);
+            }
+            Partial merged = new Partial();
+            for (Partial partial : partials) {
+                merged.merge(partial);
+            }
+            return merged;
         }
 
         /**
-         * One scan of the plan over {@code fragmentIds} (null: every
-         * fragment), read into a {@link Partial} keyed by the full key
-         * list of every row that opens a bucket.
+         * The bin scan of one percentiles metric from the bounds the first
+         * round returned, node wide over every group; null when no row
+         * had a value.
          */
-        private Partial scan(Dataset dataset, List<Integer> fragmentIds, String filterSql, LanceCancellation cancellation)
+        private Stage binStage(Metric metric, Partial merged) {
+            double min = Double.POSITIVE_INFINITY;
+            double max = Double.NEGATIVE_INFINITY;
+            if (merged.metricsOnly != null) {
+                min = Math.min(min, merged.metricsOnly.metrics[metric.slot()].min);
+                max = Math.max(max, merged.metricsOnly.metrics[metric.slot()].max);
+            }
+            for (GroupState group : merged.groups.values()) {
+                min = Math.min(min, group.metrics[metric.slot()].min);
+                max = Math.max(max, group.metrics[metric.slot()].max);
+            }
+            if (min == Double.POSITIVE_INFINITY) {
+                return null;
+            }
+            // Every value falls into bin 0 when they are all equal; any
+            // positive width does that, and keeps the centre at the value.
+            double width = max > min ? (max - min) / percentilesBins : 1d;
+            SubstraitAggregatePlan.Builder builder = new SubstraitAggregatePlan.Builder();
+            for (int key = 0; key < keyExpressions.size(); key++) {
+                builder.groupBy(keyExpressions.get(key), KEY_COLUMN_PREFIX + key);
+            }
+            builder.groupBy(SubstraitExpressions.floorFp64(metric.column().numericExpression(), min, width), metric.binColumn());
+            // count(field), not count(*): a row without a value has a null
+            // bin and must not weigh in.
+            builder.measure("count", List.of(new FieldReference(metric.column().index())), ScalarType.I64, metric.binCountColumn());
+            return new Stage(builder.build(), metric, min, max, width);
+        }
+
+        /**
+         * One scan of {@code stage} over {@code fragmentIds} (null: every
+         * fragment), read into a {@link Partial} keyed by the full key
+         * list of every row that opens a bucket. The row count and the
+         * metrics' partial values are read from a first stage row; a bin
+         * stage row carries only its metric's bin, and adds nothing to
+         * the totals.
+         */
+        private Partial scan(Dataset dataset, List<Integer> fragmentIds, String filterSql, Stage stage, LanceCancellation cancellation)
             throws Exception {
-            ScanOptions.Builder options = new ScanOptions.Builder().substraitAggregate(substrait.duplicate());
+            ScanOptions.Builder options = new ScanOptions.Builder().substraitAggregate(stage.substrait().duplicate());
             if (fragmentIds != null) {
                 options.fragmentIds(fragmentIds);
             }
@@ -562,7 +1050,7 @@ final class LanceAggregatePushdown {
                 while (reader.loadNextBatch()) {
                     cancellation.checkCancelled();
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                    FieldVector counts = root.getVector(COUNT_COLUMN);
+                    FieldVector counts = stage.isFirst() ? root.getVector(COUNT_COLUMN) : null;
                     FieldVector[] keyVectors = new FieldVector[keyCount];
                     for (int key = 0; key < keyCount; key++) {
                         keyVectors[key] = root.getVector(KEY_COLUMN_PREFIX + key);
@@ -570,9 +1058,16 @@ final class LanceAggregatePushdown {
                     for (int row = 0; row < root.getRowCount(); row++) {
                         MetricState[] states = new MetricState[allMetrics.size()];
                         for (int i = 0; i < states.length; i++) {
-                            states[i] = allMetrics.get(i).read(root, row);
+                            Metric metric = allMetrics.get(i);
+                            if (stage.isFirst()) {
+                                states[i] = metric.read(root, row);
+                            } else if (metric == stage.percentiles()) {
+                                states[i] = metric.readBin(root, row, stage.min(), stage.max(), stage.width(), percentilesBins);
+                            } else {
+                                states[i] = new MetricState();
+                            }
                         }
-                        GroupState state = new GroupState(longOrZero(counts, row), states);
+                        GroupState state = new GroupState(counts != null ? longOrZero(counts, row) : 0L, states);
                         partial.total += state.count;
                         if (keyCount == 0) {
                             partial.metricsOnly = partial.metricsOnly == null ? state : partial.metricsOnly.merge(state);
@@ -589,6 +1084,10 @@ final class LanceAggregatePushdown {
                                 opensBucket = key > 0 && composite == null;
                             } else {
                                 keys[key] = key(keyVectors[key], row, dateInterval(key));
+                                // A mask of 0 at the outermost level with no
+                                // other bucket to hold it is the same: the
+                                // row is in no bucket of the tree.
+                                opensBucket = key > 0 || composite != null || inSomeBucket(levels.get(0), keys[key]);
                             }
                         }
                         if (!opensBucket) {
@@ -601,12 +1100,19 @@ final class LanceAggregatePushdown {
             return partial;
         }
 
+        /** Whether a key at {@code level} puts its row into at least one bucket; every key of a non mask level does. */
+        private static boolean inSomeBucket(Level level, Object key) {
+            return !level.kind().isMask() || (Long) key != 0L || level.otherBucketKey() != null;
+        }
+
         /** Builds the node's aggregations from the merged partials. */
         private Result assemble(Partial merged, int scans, Function<String, InternalAggregation> dateHistogramPrototype) {
             if (keyCount() == 0) {
                 // Lance returns exactly one row for a plan without
                 // groupings, even over zero fragments; the fallback only
-                // covers a reader that yielded no batch at all.
+                // covers a reader that yielded no batch at all, and a
+                // cardinality plan, whose distinct grouping returns no
+                // row over no rows.
                 GroupState state = merged.metricsOnly != null ? merged.metricsOnly : GroupState.empty(allMetrics.size());
                 return new Result(toAggregations(topMetrics, state), merged.total, scans);
             }
@@ -622,10 +1128,15 @@ final class LanceAggregatePushdown {
          * Folds {@code rows} into the bucket aggregation of level
          * {@code depth}: the rows are grouped by that level's key, each
          * key becomes a bucket candidate with the summed count, and the
-         * level's kind decides which candidates become buckets.
+         * level's kind decides which candidates become buckets. A mask
+         * level has a fixed bucket list instead, and a row joins every
+         * bucket whose bit its key carries.
          */
         private InternalAggregation buildLevel(int depth, List<Group> rows, Function<String, InternalAggregation> dateHistogramPrototype) {
             Level level = levels.get(depth);
+            if (level.kind().isMask()) {
+                return buildMaskLevel(depth, rows, dateHistogramPrototype);
+            }
             LinkedHashMap<Object, List<Group>> byKey = new LinkedHashMap<>();
             for (Group row : rows) {
                 Object key = row.keys().get(depth);
@@ -642,13 +1153,141 @@ final class LanceAggregatePushdown {
                 }
                 candidates.add(new Candidate(entry.getKey(), count, entry.getValue()));
             }
-            if (level.builder() instanceof TermsAggregationBuilder) {
-                return buildTerms(depth, candidates, dateHistogramPrototype);
+            return switch (level.kind()) {
+                case TERMS -> buildTerms(depth, candidates, dateHistogramPrototype);
+                case HISTOGRAM -> buildHistogram(depth, candidates, dateHistogramPrototype);
+                case DATE_HISTOGRAM -> buildDateHistogram(depth, candidates, dateHistogramPrototype);
+                default -> throw new IllegalStateException("unexpected level kind " + level.kind());
+            };
+        }
+
+        /**
+         * The buckets of a {@code range} / {@code date_range} /
+         * {@code filters} / {@code filter} / {@code missing} level: every
+         * bucket the request names, in request order, with the rows
+         * whose mask has its bit; then the other bucket of a
+         * {@code filters} with the rows no filter matched. Every bucket
+         * is reported, with a count of 0 and the sub aggregations built
+         * over no rows when nothing fell in, as the aggregators do.
+         */
+        private InternalAggregation buildMaskLevel(int depth, List<Group> rows, Function<String, InternalAggregation> prototype) {
+            Level level = levels.get(depth);
+            int branches = level.branchKeys().size();
+            List<List<Group>> perBucket = new ArrayList<>(level.bucketCount());
+            for (int i = 0; i < level.bucketCount(); i++) {
+                perBucket.add(new ArrayList<>());
             }
-            if (level.builder() instanceof HistogramAggregationBuilder) {
-                return buildHistogram(depth, candidates, dateHistogramPrototype);
+            for (Group row : rows) {
+                long mask = (Long) row.keys().get(depth);
+                if (mask == 0L) {
+                    if (level.otherBucketKey() != null) {
+                        perBucket.get(branches).add(row);
+                    }
+                    continue;
+                }
+                for (int i = 0; i < branches; i++) {
+                    if ((mask & (1L << i)) != 0L) {
+                        perBucket.get(i).add(row);
+                    }
+                }
             }
-            return buildDateHistogram(depth, candidates, dateHistogramPrototype);
+            List<Candidate> buckets = new ArrayList<>(level.bucketCount());
+            for (int i = 0; i < level.bucketCount(); i++) {
+                long count = 0L;
+                for (Group row : perBucket.get(i)) {
+                    count += row.count();
+                }
+                buckets.add(new Candidate(i < branches ? level.branchKeys().get(i) : level.otherBucketKey(), count, perBucket.get(i)));
+            }
+            List<InternalAggregations> subAggregations = new ArrayList<>(buckets.size());
+            for (Candidate bucket : buckets) {
+                subAggregations.add(subAggregations(depth, bucket, prototype));
+            }
+            return maskAggregation(depth, buckets, subAggregations);
+        }
+
+        /**
+         * The result of a mask level from its buckets, in order, and
+         * their sub aggregations. {@code range} buckets carry the
+         * resolved bounds; a {@code filter} / {@code missing} is the one
+         * bucket itself.
+         */
+        private InternalAggregation maskAggregation(int depth, List<Candidate> buckets, List<InternalAggregations> subAggregations) {
+            Level level = levels.get(depth);
+            Map<String, Object> metadata = metadata(level.builder());
+            switch (level.kind()) {
+                case RANGE -> {
+                    RangeAggregationBuilder range = (RangeAggregationBuilder) level.builder();
+                    List<InternalRange.Bucket> rangeBuckets = new ArrayList<>(buckets.size());
+                    for (int i = 0; i < buckets.size(); i++) {
+                        RangeAggregator.Range bounds = level.ranges()[i];
+                        rangeBuckets.add(
+                            new InternalRange.Bucket(
+                                bounds.getKey(),
+                                bounds.getFrom(),
+                                bounds.getTo(),
+                                buckets.get(i).count(),
+                                subAggregations.get(i),
+                                range.keyed(),
+                                level.format()
+                            )
+                        );
+                    }
+                    return new InternalRange<>(range.getName(), rangeBuckets, level.format(), range.keyed(), metadata);
+                }
+                case DATE_RANGE -> {
+                    DateRangeAggregationBuilder range = (DateRangeAggregationBuilder) level.builder();
+                    List<InternalDateRange.Bucket> rangeBuckets = new ArrayList<>(buckets.size());
+                    for (int i = 0; i < buckets.size(); i++) {
+                        RangeAggregator.Range bounds = level.ranges()[i];
+                        rangeBuckets.add(
+                            new InternalDateRange.Bucket(
+                                bounds.getKey(),
+                                bounds.getFrom(),
+                                bounds.getTo(),
+                                buckets.get(i).count(),
+                                subAggregations.get(i),
+                                range.keyed(),
+                                level.format()
+                            )
+                        );
+                    }
+                    return InternalDateRange.FACTORY.create(range.getName(), rangeBuckets, level.format(), range.keyed(), metadata);
+                }
+                case FILTERS -> {
+                    FiltersAggregationBuilder filters = (FiltersAggregationBuilder) level.builder();
+                    List<InternalFilters.InternalBucket> filterBuckets = new ArrayList<>(buckets.size());
+                    for (int i = 0; i < buckets.size(); i++) {
+                        Candidate bucket = buckets.get(i);
+                        filterBuckets.add(
+                            new InternalFilters.InternalBucket(
+                                (String) bucket.key(),
+                                bucket.count(),
+                                subAggregations.get(i),
+                                filters.isKeyed()
+                            )
+                        );
+                    }
+                    return new InternalFilters(filters.getName(), filterBuckets, filters.isKeyed(), metadata);
+                }
+                case FILTER -> {
+                    return CoreAggregationResults.filter(
+                        level.builder().getName(),
+                        buckets.get(0).count(),
+                        subAggregations.get(0),
+                        metadata
+                    );
+                }
+                case MISSING -> {
+                    return CoreAggregationResults.missing(
+                        level.builder().getName(),
+                        buckets.get(0).count(),
+                        subAggregations.get(0),
+                        metadata
+                    );
+                }
+                default -> throw new IllegalStateException("not a mask level: " + level.kind());
+            }
         }
 
         /**
@@ -698,7 +1337,8 @@ final class LanceAggregatePushdown {
          * filling of a histogram parent with {@code min_doc_count} 0
          * reads it. {@code terms} keeps the request order as its reduce
          * order here, unlike a built result, which the aggregator sorts
-         * by key.
+         * by key. A mask level reports every bucket with a count of 0 and
+         * the empty sub aggregations.
          */
         private InternalAggregation emptyLevel(int depth) {
             Level level = levels.get(depth);
@@ -709,7 +1349,18 @@ final class LanceAggregatePushdown {
             if (level.builder() instanceof HistogramAggregationBuilder histogram) {
                 return histogramAggregation(depth, histogram, List.of());
             }
-            return dateHistogramAggregation(depth, (DateHistogramAggregationBuilder) level.builder(), List.of());
+            if (level.builder() instanceof DateHistogramAggregationBuilder dateHistogram) {
+                return dateHistogramAggregation(depth, dateHistogram, List.of());
+            }
+            List<Candidate> buckets = new ArrayList<>(level.bucketCount());
+            List<InternalAggregations> subAggregations = new ArrayList<>(level.bucketCount());
+            InternalAggregations empty = emptySubAggregations(depth);
+            for (int i = 0; i < level.bucketCount(); i++) {
+                String key = i < level.branchKeys().size() ? level.branchKeys().get(i) : level.otherBucketKey();
+                buckets.add(new Candidate(key, 0L, List.of()));
+                subAggregations.add(empty);
+            }
+            return maskAggregation(depth, buckets, subAggregations);
         }
 
         private InternalAggregation buildTerms(int depth, List<Candidate> candidates, Function<String, InternalAggregation> prototype) {
@@ -1094,16 +1745,19 @@ final class LanceAggregatePushdown {
         QueryShardContext qsc
     ) {
         int maxGroups = LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
-        return plan(aggregations, schema, multiFields, qsc, maxGroups);
+        return plan(aggregations, schema, multiFields, qsc, maxGroups, percentilesBins);
     }
 
     /**
      * As {@link #plan(AggregatorFactories.Builder, Schema, Map, QueryShardContext)}
      * with an explicit bound on the estimated number of groups: the
-     * product of the {@code shard_size} of every {@code terms} level.
-     * A tree whose estimate exceeds {@code maxGroups} takes the
-     * aggregator path, because the scan returns one row per key
-     * combination and this node would hold them all.
+     * product of the {@code shard_size} of every {@code terms} level and
+     * the bucket count of every range / filters level. A tree whose
+     * estimate exceeds {@code maxGroups} takes the aggregator path,
+     * because the scan returns one row per key combination and this
+     * node would hold them all. The distinct values a {@code cardinality}
+     * groups by are not in the estimate: they are hashed into the sketch
+     * as the rows are read and never held.
      */
     static Plan plan(
         AggregatorFactories.Builder aggregations,
@@ -1111,6 +1765,18 @@ final class LanceAggregatePushdown {
         Map<String, LinkedHashMap<String, String>> multiFields,
         QueryShardContext qsc,
         int maxGroups
+    ) {
+        return plan(aggregations, schema, multiFields, qsc, maxGroups, percentilesBins);
+    }
+
+    /** As above with an explicit percentiles bin count. */
+    static Plan plan(
+        AggregatorFactories.Builder aggregations,
+        Schema schema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        QueryShardContext qsc,
+        int maxGroups,
+        int bins
     ) {
         if (!LanceAggregationSupport.isPushdownCandidate(aggregations)) {
             return null;
@@ -1123,98 +1789,164 @@ final class LanceAggregatePushdown {
             if (metrics == null) {
                 return null;
             }
-            builder.measure("count", List.of(), ScalarType.I64, COUNT_COLUMN);
-            for (Metric metric : metrics) {
-                metric.addMeasures(builder);
-            }
-            return new Plan(builder.build(), List.of(), null, metrics, allMetrics);
+            return new Plan(finish(builder, List.of(), allMetrics), List.of(), List.of(), null, metrics, allMetrics, bins);
         }
         if (top.get(0) instanceof CompositeAggregationBuilder compositeBuilder) {
-            Composite composite = resolveComposite(compositeBuilder, schema, multiFields, qsc, builder, allMetrics);
+            List<Expression> keyExpressions = new ArrayList<>();
+            Composite composite = resolveComposite(compositeBuilder, schema, multiFields, qsc, keyExpressions, allMetrics);
             if (composite == null) {
                 return null;
             }
-            builder.measure("count", List.of(), ScalarType.I64, COUNT_COLUMN);
-            for (Metric metric : allMetrics) {
-                metric.addMeasures(builder);
-            }
-            return new Plan(builder.build(), List.of(), composite, List.of(), allMetrics);
+            return new Plan(finish(builder, keyExpressions, allMetrics), keyExpressions, List.of(), composite, List.of(), allMetrics, bins);
         }
         List<Level> levels = new ArrayList<>();
+        List<Expression> keyExpressions = new ArrayList<>();
         long estimatedGroups = 1L;
         AggregationBuilder current = top.get(0);
         while (current != null) {
-            ValuesSourceAggregationBuilder<?> bucketBuilder = (ValuesSourceAggregationBuilder<?>) current;
-            Column column = resolveColumn(bucketBuilder.field(), schema, multiFields, qsc);
-            if (column == null) {
-                return null;
-            }
+            Level level;
             Expression keyExpression;
-            KeyKind keyKind;
-            long dateInterval = 0L;
-            Rounding rounding = null;
-            if (bucketBuilder instanceof TermsAggregationBuilder terms) {
-                if (column.isUtf8()) {
-                    keyExpression = new FieldReference(column.index());
-                    keyKind = KeyKind.STRING;
-                } else if (column.isFloating()) {
-                    keyExpression = new FieldReference(column.index());
-                    keyKind = KeyKind.DOUBLE;
+            if (current instanceof FilterAggregationBuilder || current instanceof FiltersAggregationBuilder) {
+                List<QueryBuilder> queries = new ArrayList<>();
+                List<String> keys = new ArrayList<>();
+                String otherBucketKey = null;
+                LevelKind kind;
+                if (current instanceof FilterAggregationBuilder filter) {
+                    kind = LevelKind.FILTER;
+                    queries.add(filter.getFilter());
+                    keys.add(filter.getName());
                 } else {
-                    keyExpression = column.numericExpression();
-                    keyKind = KeyKind.LONG;
+                    FiltersAggregationBuilder filters = (FiltersAggregationBuilder) current;
+                    kind = LevelKind.FILTERS;
+                    for (FiltersAggregator.KeyedFilter keyed : filters.filters()) {
+                        queries.add(keyed.filter());
+                        keys.add(keyed.key());
+                    }
+                    otherBucketKey = filters.otherBucket() ? filters.otherBucketKey() : null;
                 }
-                // Every terms level multiplies the combinations the scan
-                // may return by the groups this level keeps.
-                estimatedGroups = saturatingMultiply(estimatedGroups, thresholds(terms).getShardSize());
-                if (estimatedGroups > maxGroups) {
-                    return null;
+                List<Expression> conditions = new ArrayList<>(queries.size());
+                for (QueryBuilder query : queries) {
+                    Expression condition = FilterPredicates.predicate(query, schema, multiFields, qsc);
+                    if (condition == null) {
+                        return null;
+                    }
+                    conditions.add(condition);
                 }
-            } else if (bucketBuilder instanceof HistogramAggregationBuilder histogram) {
-                if (column.isUtf8() || column.isDate() || column.isBoolean()) {
-                    return null;
-                }
-                keyExpression = SubstraitExpressions.floorFp64(
-                    new FieldReference(column.index()),
-                    histogram.offset(),
-                    histogram.interval()
-                );
-                keyKind = KeyKind.LONG;
+                keyExpression = SubstraitExpressions.matchMask(conditions);
+                estimatedGroups = saturatingMultiply(estimatedGroups, keys.size() + 1L);
+                level = Level.mask(current, kind, null, null, null, null, keys, null, otherBucketKey);
             } else {
-                DateHistogramAggregationBuilder dateHistogram = (DateHistogramAggregationBuilder) bucketBuilder;
-                if (!column.isDate()) {
+                ValuesSourceAggregationBuilder<?> bucketBuilder = (ValuesSourceAggregationBuilder<?>) current;
+                Column column = resolveColumn(bucketBuilder.field(), schema, multiFields, qsc);
+                if (column == null) {
                     return null;
                 }
-                String calendarUnit = LanceAggregationSupport.calendarUnit(dateHistogram);
-                if (calendarUnit != null) {
-                    // date_trunc takes a Timestamp array only (no Date32) and
-                    // truncates in the column's zone, which has to be UTC to
-                    // match the aggregator's rounding for a request without
-                    // time_zone; other columns take the aggregator path. The
-                    // key is the bucket start in millis, so no interval is
-                    // multiplied back.
-                    if (!column.isUtcTimestamp()) {
+                DocValueFormat format = column.fieldType().docValueFormat(bucketBuilder.format(), bucketBuilder.timeZone());
+                KeyKind keyKind = KeyKind.LONG;
+                long dateInterval = 0L;
+                Rounding rounding = null;
+                LevelKind kind;
+                List<String> branchKeys = null;
+                RangeAggregator.Range[] ranges = null;
+                if (bucketBuilder instanceof TermsAggregationBuilder terms) {
+                    kind = LevelKind.TERMS;
+                    if (column.isUtf8()) {
+                        keyExpression = new FieldReference(column.index());
+                        keyKind = KeyKind.STRING;
+                    } else if (column.isFloating()) {
+                        keyExpression = new FieldReference(column.index());
+                        keyKind = KeyKind.DOUBLE;
+                    } else {
+                        keyExpression = column.numericExpression();
+                    }
+                    // Every terms level multiplies the combinations the scan
+                    // may return by the groups this level keeps.
+                    estimatedGroups = saturatingMultiply(estimatedGroups, thresholds(terms).getShardSize());
+                } else if (bucketBuilder instanceof HistogramAggregationBuilder histogram) {
+                    kind = LevelKind.HISTOGRAM;
+                    if (column.isUtf8() || column.isDate() || column.isBoolean()) {
                         return null;
                     }
-                    Expression truncated = SubstraitExpressions.dateTrunc(calendarUnit, new FieldReference(column.index()));
-                    keyExpression = SubstraitExpressions.epochMillis(truncated, column.type());
-                    rounding = Rounding.builder(
-                        DateHistogramAggregationBuilder.DATE_FIELD_UNITS.get(dateHistogram.getCalendarInterval().toString())
-                    ).build();
+                    keyExpression = SubstraitExpressions.floorFp64(
+                        new FieldReference(column.index()),
+                        histogram.offset(),
+                        histogram.interval()
+                    );
+                } else if (bucketBuilder instanceof DateHistogramAggregationBuilder dateHistogram) {
+                    kind = LevelKind.DATE_HISTOGRAM;
+                    if (!column.isDate()) {
+                        return null;
+                    }
+                    String calendarUnit = LanceAggregationSupport.calendarUnit(dateHistogram);
+                    if (calendarUnit != null) {
+                        // date_trunc takes a Timestamp array only (no Date32) and
+                        // truncates in the column's zone, which has to be UTC to
+                        // match the aggregator's rounding for a request without
+                        // time_zone; other columns take the aggregator path. The
+                        // key is the bucket start in millis, so no interval is
+                        // multiplied back.
+                        if (!column.isUtcTimestamp()) {
+                            return null;
+                        }
+                        Expression truncated = SubstraitExpressions.dateTrunc(calendarUnit, new FieldReference(column.index()));
+                        keyExpression = SubstraitExpressions.epochMillis(truncated, column.type());
+                        rounding = Rounding.builder(
+                            DateHistogramAggregationBuilder.DATE_FIELD_UNITS.get(dateHistogram.getCalendarInterval().toString())
+                        ).build();
+                    } else {
+                        dateInterval = fixedIntervalMillisOrZero(dateHistogram.getFixedInterval().toString());
+                        if (dateInterval <= 0L) {
+                            return null;
+                        }
+                        keyExpression = SubstraitExpressions.floorDivInt64(
+                            column.numericExpression(),
+                            dateHistogram.offset(),
+                            dateInterval
+                        );
+                        rounding = Rounding.builder(TimeValue.timeValueMillis(dateInterval)).build();
+                    }
+                } else if (bucketBuilder instanceof AbstractRangeBuilder<?, ?> rangeBuilder) {
+                    // range takes any number; date_range the date columns
+                    // only, whose bounds the date format parses. Booleans
+                    // and keywords take the aggregator path.
+                    boolean date = rangeBuilder instanceof DateRangeAggregationBuilder;
+                    if (column.isUtf8() || column.isBoolean() || (date && !column.isDate())) {
+                        return null;
+                    }
+                    kind = date ? LevelKind.DATE_RANGE : LevelKind.RANGE;
+                    ranges = resolveRanges(rangeBuilder, format, date, qsc);
+                    if (ranges == null) {
+                        return null;
+                    }
+                    branchKeys = new ArrayList<>(ranges.length);
+                    List<Expression> conditions = new ArrayList<>(ranges.length);
+                    Expression value = new Cast(column.numericExpression(), ScalarType.FP64);
+                    for (RangeAggregator.Range range : ranges) {
+                        branchKeys.add(range.getKey());
+                        conditions.add(rangeCondition(value, range.getFrom(), range.getTo()));
+                    }
+                    keyExpression = SubstraitExpressions.matchMask(conditions);
+                    estimatedGroups = saturatingMultiply(estimatedGroups, ranges.length + 1L);
                 } else {
-                    dateInterval = fixedIntervalMillisOrZero(dateHistogram.getFixedInterval().toString());
-                    if (dateInterval <= 0L) {
-                        return null;
-                    }
-                    keyExpression = SubstraitExpressions.floorDivInt64(column.numericExpression(), dateHistogram.offset(), dateInterval);
-                    rounding = Rounding.builder(TimeValue.timeValueMillis(dateInterval)).build();
+                    kind = LevelKind.MISSING;
+                    branchKeys = List.of(bucketBuilder.getName());
+                    keyExpression = SubstraitExpressions.matchMask(
+                        List.of(SubstraitExpressions.isNull(new FieldReference(column.index())))
+                    );
                 }
-                keyKind = KeyKind.LONG;
+                if (kind.isMask()) {
+                    level = Level.mask(bucketBuilder, kind, column, format, null, null, branchKeys, ranges, null);
+                } else {
+                    level = Level.keyed(bucketBuilder, kind, column, keyKind, format, null, null, dateInterval, rounding);
+                }
+            }
+            if (estimatedGroups > maxGroups) {
+                return null;
             }
             List<Child> children = new ArrayList<>();
             List<Metric> metrics = new ArrayList<>();
             AggregationBuilder nested = null;
-            for (AggregationBuilder sub : bucketBuilder.getSubAggregations()) {
+            for (AggregationBuilder sub : current.getSubAggregations()) {
                 if (LanceAggregationSupport.isPushdownMetric(sub)) {
                     Metric metric = resolveMetric(sub, schema, multiFields, qsc, allMetrics);
                     if (metric == null) {
@@ -1227,16 +1959,104 @@ final class LanceAggregatePushdown {
                     children.add(new Child(null));
                 }
             }
-            builder.groupBy(keyExpression, KEY_COLUMN_PREFIX + levels.size());
-            DocValueFormat format = column.fieldType().docValueFormat(bucketBuilder.format(), bucketBuilder.timeZone());
-            levels.add(new Level(bucketBuilder, column, keyKind, format, children, metrics, dateInterval, rounding));
+            keyExpressions.add(keyExpression);
+            levels.add(
+                new Level(
+                    level.builder(),
+                    level.kind(),
+                    level.column(),
+                    level.keyKind(),
+                    level.format(),
+                    children,
+                    metrics,
+                    level.dateInterval(),
+                    level.rounding(),
+                    level.branchKeys(),
+                    level.ranges(),
+                    level.otherBucketKey()
+                )
+            );
             current = nested;
+        }
+        return new Plan(finish(builder, keyExpressions, allMetrics), keyExpressions, levels, null, List.of(), allMetrics, bins);
+    }
+
+    /**
+     * Encodes the first scan: the bucket key groupings in order, the
+     * distinct value grouping of a {@code cardinality} after them,
+     * {@code count(*)} and every metric's measures. At most one
+     * {@code cardinality} per plan: a second would multiply the rows by
+     * the distinct values of both fields ({@link #resolveMetric} refuses
+     * it).
+     */
+    private static ByteBuffer finish(SubstraitAggregatePlan.Builder builder, List<Expression> keyExpressions, List<Metric> allMetrics) {
+        for (int key = 0; key < keyExpressions.size(); key++) {
+            builder.groupBy(keyExpressions.get(key), KEY_COLUMN_PREFIX + key);
+        }
+        for (Metric metric : allMetrics) {
+            if (metric.kind() == MetricKind.CARDINALITY) {
+                builder.groupBy(metric.distinctExpression(), metric.distinctColumn());
+            }
         }
         builder.measure("count", List.of(), ScalarType.I64, COUNT_COLUMN);
         for (Metric metric : allMetrics) {
             metric.addMeasures(builder);
         }
-        return new Plan(builder.build(), levels, null, List.of(), allMetrics);
+        return builder.build();
+    }
+
+    /**
+     * The request's ranges with their bounds resolved and sorted the way
+     * the range aggregator factory prepares them: a string bound is
+     * parsed by the field's format ({@code now} included), a numeric
+     * bound of a {@code date_range} is parsed as text as well so numeric
+     * formats such as {@code epoch_second} apply, and the ranges are
+     * ordered by {@code from} then {@code to}. Null when a bound does
+     * not parse, in which case the aggregator raises the request error.
+     */
+    private static RangeAggregator.Range[] resolveRanges(
+        AbstractRangeBuilder<?, ?> builder,
+        DocValueFormat format,
+        boolean date,
+        QueryShardContext qsc
+    ) {
+        List<? extends RangeAggregator.Range> requested = builder.ranges();
+        RangeAggregator.Range[] ranges = new RangeAggregator.Range[requested.size()];
+        try {
+            for (int i = 0; i < ranges.length; i++) {
+                RangeAggregator.Range range = requested.get(i);
+                double from = range.getFrom();
+                double to = range.getTo();
+                if (range.getFromAsString() != null) {
+                    from = format.parseDouble(range.getFromAsString(), false, qsc::nowInMillis);
+                } else if (date && Double.isFinite(from)) {
+                    from = format.parseDouble(Long.toString((long) from), false, qsc::nowInMillis);
+                }
+                if (range.getToAsString() != null) {
+                    to = format.parseDouble(range.getToAsString(), false, qsc::nowInMillis);
+                } else if (date && Double.isFinite(to)) {
+                    to = format.parseDouble(Long.toString((long) to), false, qsc::nowInMillis);
+                }
+                ranges[i] = new RangeAggregator.Range(range.getKey(), from, range.getFromAsString(), to, range.getToAsString());
+            }
+        } catch (RuntimeException unparseable) {
+            return null;
+        }
+        Arrays.sort(ranges, Comparator.comparingDouble(RangeAggregator.Range::getFrom).thenComparingDouble(RangeAggregator.Range::getTo));
+        return ranges;
+    }
+
+    /** {@code value >= from AND value < to} on doubles, an infinite bound left out. */
+    private static Expression rangeCondition(Expression value, double from, double to) {
+        Expression lower = Double.isInfinite(from) ? null : ScalarFunction.of("gte", value, new Float64Literal(from));
+        Expression upper = Double.isInfinite(to) ? null : ScalarFunction.of("lt", value, new Float64Literal(to));
+        if (lower == null && upper == null) {
+            return SubstraitExpressions.isNotNull(value);
+        }
+        if (lower == null) {
+            return upper;
+        }
+        return upper == null ? lower : SubstraitExpressions.and(lower, upper);
     }
 
     /**
@@ -1251,7 +2071,7 @@ final class LanceAggregatePushdown {
         Schema schema,
         Map<String, LinkedHashMap<String, String>> multiFields,
         QueryShardContext qsc,
-        SubstraitAggregatePlan.Builder builder,
+        List<Expression> keyExpressions,
         List<Metric> allMetrics
     ) {
         Map<String, Object> after = afterKey(compositeBuilder);
@@ -1304,7 +2124,7 @@ final class LanceAggregatePushdown {
                 }
             }
             int reverseMul = sourceBuilder.order() == SortOrder.ASC ? 1 : -1;
-            builder.groupBy(keyExpression, KEY_COLUMN_PREFIX + sources.size());
+            keyExpressions.add(keyExpression);
             sources.add(new Source(sourceBuilder, column, keyKind, format, reverseMul, afterValue, dateInterval));
         }
         List<Metric> metrics = resolveMetrics(new ArrayList<>(compositeBuilder.getSubAggregations()), schema, multiFields, qsc, allMetrics);
@@ -1394,18 +2214,365 @@ final class LanceAggregatePushdown {
             kind = MetricKind.MAX;
         } else if (builder instanceof ValueCountAggregationBuilder) {
             kind = MetricKind.VALUE_COUNT;
+        } else if (builder instanceof StatsAggregationBuilder) {
+            kind = MetricKind.STATS;
+        } else if (builder instanceof ExtendedStatsAggregationBuilder) {
+            kind = MetricKind.EXTENDED_STATS;
+        } else if (builder instanceof CardinalityAggregationBuilder) {
+            kind = MetricKind.CARDINALITY;
+            // A second distinct grouping would multiply the rows by the
+            // distinct values of both fields.
+            for (Metric other : allMetrics) {
+                if (other.kind() == MetricKind.CARDINALITY) {
+                    return null;
+                }
+            }
+        } else if (builder instanceof PercentilesAggregationBuilder) {
+            kind = MetricKind.PERCENTILES;
+        } else if (builder instanceof PercentileRanksAggregationBuilder) {
+            kind = MetricKind.PERCENTILE_RANKS;
         } else {
             return null;
         }
-        // Arithmetic metrics need a number; value_count only needs
-        // the column to be single valued, which every accepted type is.
-        if (kind != MetricKind.VALUE_COUNT && column.isUtf8()) {
+        // Arithmetic metrics need a number; value_count and cardinality
+        // only need the column to be single valued, which every accepted
+        // type is.
+        if (kind != MetricKind.VALUE_COUNT && kind != MetricKind.CARDINALITY && column.isUtf8()) {
             return null;
         }
         DocValueFormat format = column.fieldType().docValueFormat(source.format(), source.timeZone());
-        Metric metric = new Metric(builder.getName(), kind, column, format, metadata(builder), allMetrics.size());
+        Metric metric = new Metric(builder.getName(), kind, column, format, metadata(builder), allMetrics.size(), source);
         allMetrics.add(metric);
         return metric;
+    }
+
+    /**
+     * The {@code precision_threshold} of a cardinality builder, null
+     * when the request named none. The builder has a setter but no
+     * getter, so it is read back from the builder's own JSON rendering,
+     * which writes the key only when the option was set.
+     */
+    @SuppressWarnings("unchecked")
+    private static Long precisionThreshold(CardinalityAggregationBuilder cardinality) {
+        String json = Strings.toString(XContentType.JSON, cardinality);
+        Map<String, Object> rendered = XContentHelper.convertToMap(new BytesArray(json), false, XContentType.JSON).v2();
+        Map<String, Object> body = (Map<String, Object>) rendered.get(cardinality.getName());
+        Map<String, Object> definition = (Map<String, Object>) body.get(CardinalityAggregationBuilder.NAME);
+        Object threshold = definition.get(CardinalityAggregationBuilder.PRECISION_THRESHOLD_FIELD.getPreferredName());
+        return threshold instanceof Number number ? number.longValue() : null;
+    }
+
+    /**
+     * Turns the query of a {@code filter} / {@code filters} bucket into
+     * a Substrait predicate over the table columns, with the semantics
+     * the Lucene query the aggregator would run has: {@code term} and
+     * {@code terms} compare in the field's own type (a float literal in
+     * single precision, a date through the field's date format with the
+     * day rounding the date field type applies), {@code range} bounds
+     * likewise, {@code exists} is {@code IS NOT NULL}, and a {@code bool}
+     * ANDs its {@code must} / {@code filter} clauses, negates
+     * {@code must_not} without excluding rows that have no value, and
+     * requires one {@code should} only when there is no {@code must} /
+     * {@code filter}, as {@code BooleanQuery} does with no
+     * {@code minimum_should_match}. Every other query, a value the field
+     * type would reject, an unmapped field or a column the pushdown does
+     * not handle yields null and the request takes the aggregator path.
+     */
+    private static final class FilterPredicates {
+
+        private FilterPredicates() {}
+
+        static Expression predicate(
+            QueryBuilder query,
+            Schema schema,
+            Map<String, LinkedHashMap<String, String>> multiFields,
+            QueryShardContext qsc
+        ) {
+            if (query == null || query instanceof MatchAllQueryBuilder) {
+                return new BoolLiteral(true);
+            }
+            if (query instanceof TermQueryBuilder term) {
+                Column column = resolveColumn(term.fieldName(), schema, multiFields, qsc);
+                return column == null ? null : equalTo(column, term.value(), qsc);
+            }
+            if (query instanceof TermsQueryBuilder terms) {
+                Column column = resolveColumn(terms.fieldName(), schema, multiFields, qsc);
+                if (column == null) {
+                    return null;
+                }
+                if (terms.values() == null || terms.values().isEmpty()) {
+                    return new BoolLiteral(false);
+                }
+                Expression any = null;
+                for (Object value : terms.values()) {
+                    Expression equal = equalTo(column, value, qsc);
+                    if (equal == null) {
+                        return null;
+                    }
+                    any = any == null ? equal : SubstraitExpressions.or(any, equal);
+                }
+                return any;
+            }
+            if (query instanceof ExistsQueryBuilder exists) {
+                Column column = resolveColumn(exists.fieldName(), schema, multiFields, qsc);
+                return column == null ? null : SubstraitExpressions.isNotNull(new FieldReference(column.index()));
+            }
+            if (query instanceof RangeQueryBuilder range) {
+                Column column = resolveColumn(range.fieldName(), schema, multiFields, qsc);
+                return column == null ? null : rangeOf(column, range, qsc);
+            }
+            if (query instanceof BoolQueryBuilder bool) {
+                return boolOf(bool, schema, multiFields, qsc);
+            }
+            return null;
+        }
+
+        private static Expression boolOf(
+            BoolQueryBuilder bool,
+            Schema schema,
+            Map<String, LinkedHashMap<String, String>> multiFields,
+            QueryShardContext qsc
+        ) {
+            if (bool.minimumShouldMatch() != null) {
+                return null;
+            }
+            Expression all = null;
+            for (QueryBuilder clause : bool.must()) {
+                all = conjoin(all, predicate(clause, schema, multiFields, qsc));
+                if (all == null) {
+                    return null;
+                }
+            }
+            for (QueryBuilder clause : bool.filter()) {
+                all = conjoin(all, predicate(clause, schema, multiFields, qsc));
+                if (all == null) {
+                    return null;
+                }
+            }
+            boolean required = bool.must().isEmpty() && bool.filter().isEmpty();
+            if (required && !bool.should().isEmpty()) {
+                Expression any = null;
+                for (QueryBuilder clause : bool.should()) {
+                    Expression one = predicate(clause, schema, multiFields, qsc);
+                    if (one == null) {
+                        return null;
+                    }
+                    any = any == null ? one : SubstraitExpressions.or(any, one);
+                }
+                all = any;
+            }
+            if (all == null && !bool.mustNot().isEmpty() && !bool.adjustPureNegative()) {
+                // A purely negative BooleanQuery matches nothing unless
+                // the builder adds the match_all it does by default.
+                return null;
+            }
+            for (QueryBuilder clause : bool.mustNot()) {
+                Expression excluded = predicate(clause, schema, multiFields, qsc);
+                if (excluded == null) {
+                    return null;
+                }
+                all = conjoin(all, SubstraitExpressions.notTrue(excluded));
+            }
+            return all == null ? new BoolLiteral(true) : all;
+        }
+
+        private static Expression conjoin(Expression left, Expression right) {
+            if (right == null) {
+                return null;
+            }
+            return left == null ? right : SubstraitExpressions.and(left, right);
+        }
+
+        /** {@code column = value} in the column's type, or null for a value the field type would not accept. */
+        private static Expression equalTo(Column column, Object value, QueryShardContext qsc) {
+            if (value == null) {
+                return null;
+            }
+            if (column.isUtf8()) {
+                return ScalarFunction.of("equal", new FieldReference(column.index()), new StringLiteral(text(value)));
+            }
+            if (column.isDate()) {
+                // The date field type answers a term with the range
+                // [floor, ceiling] of the value's precision.
+                Long lower = parseDate(column, null, value, false, qsc);
+                Long upper = parseDate(column, null, value, true, qsc);
+                if (lower == null || upper == null) {
+                    return null;
+                }
+                Expression millis = column.numericExpression();
+                return SubstraitExpressions.and(
+                    ScalarFunction.of("gte", millis, new Int64Literal(lower)),
+                    ScalarFunction.of("lte", millis, new Int64Literal(upper))
+                );
+            }
+            if (column.isBoolean()) {
+                Boolean flag = bool(value);
+                return flag == null
+                    ? null
+                    : ScalarFunction.of(
+                        "equal",
+                        new Cast(new FieldReference(column.index()), ScalarType.I64),
+                        new Int64Literal(flag ? 1L : 0L)
+                    );
+            }
+            if (column.isFloating()) {
+                Double number = floating(column, value);
+                return number == null
+                    ? null
+                    : ScalarFunction.of("equal", new Cast(new FieldReference(column.index()), ScalarType.FP64), new Float64Literal(number));
+            }
+            Long number = integral(value);
+            return number == null
+                ? null
+                : ScalarFunction.of("equal", new Cast(new FieldReference(column.index()), ScalarType.I64), new Int64Literal(number));
+        }
+
+        /**
+         * The range query's bounds as the field type resolves them: a
+         * date bound parsed by the field's format with the query's own
+         * {@code format} / {@code time_zone}, rounded up for an exclusive
+         * lower or inclusive upper bound and then moved off the excluded
+         * millisecond; a number in the column's precision. Keyword and
+         * boolean ranges take the aggregator path.
+         */
+        private static Expression rangeOf(Column column, RangeQueryBuilder range, QueryShardContext qsc) {
+            if (column.isUtf8() || column.isBoolean() || (range.from() == null && range.to() == null)) {
+                return null;
+            }
+            if (column.isDate()) {
+                Expression millis = column.numericExpression();
+                Expression lower = null;
+                Expression upper = null;
+                if (range.from() != null) {
+                    Long from = parseDate(column, range, range.from(), !range.includeLower(), qsc);
+                    if (from == null) {
+                        return null;
+                    }
+                    lower = ScalarFunction.of("gte", millis, new Int64Literal(range.includeLower() ? from : from + 1L));
+                }
+                if (range.to() != null) {
+                    Long to = parseDate(column, range, range.to(), range.includeUpper(), qsc);
+                    if (to == null) {
+                        return null;
+                    }
+                    upper = ScalarFunction.of("lte", millis, new Int64Literal(range.includeUpper() ? to : to - 1L));
+                }
+                return lower == null ? upper : upper == null ? lower : SubstraitExpressions.and(lower, upper);
+            }
+            Expression value;
+            Expression lowerBound = null;
+            Expression upperBound = null;
+            if (column.isFloating()) {
+                value = new Cast(new FieldReference(column.index()), ScalarType.FP64);
+                if (range.from() != null) {
+                    Double from = floating(column, range.from());
+                    if (from == null) {
+                        return null;
+                    }
+                    lowerBound = new Float64Literal(from);
+                }
+                if (range.to() != null) {
+                    Double to = floating(column, range.to());
+                    if (to == null) {
+                        return null;
+                    }
+                    upperBound = new Float64Literal(to);
+                }
+            } else {
+                value = new Cast(new FieldReference(column.index()), ScalarType.I64);
+                if (range.from() != null) {
+                    Long from = integral(range.from());
+                    if (from == null) {
+                        return null;
+                    }
+                    lowerBound = new Int64Literal(from);
+                }
+                if (range.to() != null) {
+                    Long to = integral(range.to());
+                    if (to == null) {
+                        return null;
+                    }
+                    upperBound = new Int64Literal(to);
+                }
+            }
+            Expression lower = lowerBound == null ? null : ScalarFunction.of(range.includeLower() ? "gte" : "gt", value, lowerBound);
+            Expression upper = upperBound == null ? null : ScalarFunction.of(range.includeUpper() ? "lte" : "lt", value, upperBound);
+            return lower == null ? upper : upper == null ? lower : SubstraitExpressions.and(lower, upper);
+        }
+
+        /**
+         * Epoch millis of a date bound through the field's date format
+         * (the range query's {@code format} and {@code time_zone} when it
+         * names them), null when the text does not parse.
+         */
+        private static Long parseDate(Column column, RangeQueryBuilder range, Object value, boolean roundUp, QueryShardContext qsc) {
+            try {
+                String pattern = range == null ? null : range.format();
+                ZoneId zone = range == null || range.timeZone() == null ? null : ZoneId.of(range.timeZone());
+                DocValueFormat format = column.fieldType().docValueFormat(pattern, zone);
+                return format.parseLong(text(value), roundUp, qsc::nowInMillis);
+            } catch (RuntimeException unparseable) {
+                return null;
+            }
+        }
+
+        private static String text(Object value) {
+            return value instanceof BytesRef bytes ? bytes.utf8ToString() : String.valueOf(value);
+        }
+
+        private static Boolean bool(Object value) {
+            if (value instanceof Boolean flag) {
+                return flag;
+            }
+            String text = text(value);
+            if (text.equals("true")) {
+                return true;
+            }
+            return text.equals("false") ? false : null;
+        }
+
+        /** A whole number, or null: a fractional value on an integer column has rounding rules the pushdown does not replicate. */
+        private static Long integral(Object value) {
+            if (value instanceof Boolean) {
+                return null;
+            }
+            double number;
+            if (value instanceof Number n) {
+                number = n.doubleValue();
+            } else {
+                try {
+                    number = Double.parseDouble(text(value));
+                } catch (NumberFormatException unparseable) {
+                    return null;
+                }
+            }
+            if (!Double.isFinite(number) || number != Math.rint(number) || Math.abs(number) > 9.007199254740992E15d) {
+                return null;
+            }
+            return (long) number;
+        }
+
+        /** The value in the column's precision: a float column compares in single precision, as the float field type does. */
+        private static Double floating(Column column, Object value) {
+            if (value instanceof Boolean) {
+                return null;
+            }
+            double number;
+            if (value instanceof Number n) {
+                number = n.doubleValue();
+            } else {
+                try {
+                    number = Double.parseDouble(text(value));
+                } catch (NumberFormatException unparseable) {
+                    return null;
+                }
+            }
+            if (Double.isNaN(number)) {
+                return null;
+            }
+            boolean single = column.type() instanceof ArrowType.FloatingPoint fp && fp.getPrecision() == FloatingPointPrecision.SINGLE;
+            return single ? (double) (float) number : number;
+        }
     }
 
     /**
