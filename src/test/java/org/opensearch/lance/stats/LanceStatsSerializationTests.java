@@ -60,7 +60,23 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             17_179_869_183L,
             2,
             8_589_934_591L,
-            1_000_000
+            1_000_000,
+            "metadata",
+            List.of(
+                new LanceWarmUpStatus(
+                    "perf",
+                    "s3://bucket/perf.lance",
+                    8L,
+                    "metadata",
+                    "done",
+                    1_700_000_000_000L,
+                    3.456d,
+                    List.of(
+                        new LanceWarmUpStatus.IndexEntry("rating_idx", "BTree", "rating", "done", 0.4d, ""),
+                        new LanceWarmUpStatus.IndexEntry("body_idx", "Inverted", "body", "failed", 1.25d, "boom")
+                    )
+                )
+            )
         );
     }
 
@@ -89,7 +105,12 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"budget_misses\":1,\"heap_fallback_bytes\":2048,\"heap_fallback_rejections\":3},"
                     + "\"native_memory\":{\"estimated_bytes\":5000,\"session_bytes\":900,\"column_store_bytes\":4096,"
                     + "\"index_cache_capacity\":17179869183,\"index_cache_shards\":2,\"index_cache_shard_share\":8589934591},"
-                    + "\"fts\":{\"subset_probe_limit\":1000000}}",
+                    + "\"fts\":{\"subset_probe_limit\":1000000},"
+                    + "\"warm_up\":{\"mode\":\"metadata\",\"tables\":[{\"index\":\"perf\",\"table\":\"s3://bucket/perf.lance\","
+                    + "\"version\":8,\"mode\":\"metadata\",\"state\":\"done\",\"started_at\":\"2023-11-14T22:13:20Z\",\"seconds\":3.46,"
+                    + "\"indexes\":[{\"name\":\"rating_idx\",\"type\":\"BTree\",\"column\":\"rating\",\"state\":\"done\",\"seconds\":0.4},"
+                    + "{\"name\":\"body_idx\",\"type\":\"Inverted\",\"column\":\"body\",\"state\":\"failed\",\"seconds\":1.25,"
+                    + "\"detail\":\"boom\"}]}]}}",
                 builder.toString()
             );
         }
@@ -128,7 +149,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             builder.endObject();
             String json = builder.toString();
             assertTrue(json, json.startsWith("{\"nodes\":{\"node-1\":{\"name\":\"node-1\",\"snapshots\":{"));
-            assertTrue(json, json.endsWith("\"fts\":{\"subset_probe_limit\":1000000}}}}"));
+            assertTrue(json, json.contains("\"fts\":{\"subset_probe_limit\":1000000},\"warm_up\":{\"mode\":\"metadata\""));
         }
     }
 
@@ -156,6 +177,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         assertEquals(0, stats.indexCacheShards());
         assertEquals(0L, stats.indexCacheShardShareBytes());
         assertEquals(LanceFtsQuery.subsetProbeLimit(), stats.ftsSubsetProbeLimit());
+        assertEquals("none", stats.warmUpMode());
+        assertTrue(stats.warmUps().isEmpty());
     }
 
     public void testCollectorReadsTheWarmCache() throws Exception {

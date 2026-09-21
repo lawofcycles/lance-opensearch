@@ -41,10 +41,12 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.lance.Dataset;
 import org.lance.WriteParams;
+import org.lance.index.DistanceType;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
+import org.lance.index.vector.VectorIndexParams;
 
 /**
  * Test-only helper that writes a small Lance table onto the local
@@ -1189,6 +1191,50 @@ public final class LanceTableFactory {
      */
     public static String writeHintFixtureTable(Path parent, String name, int fragments, int rowsPerFragment) throws Exception {
         return withLocaleRoot(() -> writeHintFixtureTableOnce(parent, name, fragments, rowsPerFragment));
+    }
+
+    /**
+     * The {@link #writeHintFixtureTable} layout with one index of every
+     * kind the plugin's index warm-up knows a scan for: the inverted
+     * index on {@code body} the hint fixture already builds, a BTree on
+     * {@code rating}, a bitmap on {@code category} and an IVF_PQ vector
+     * index on {@code embedding}. IVF_PQ trains on at least 256 rows, so
+     * {@code fragments * rowsPerFragment} must reach that.
+     *
+     * @return absolute URI of the table.
+     */
+    public static String writeIndexedFixtureTable(Path parent, String name, int fragments, int rowsPerFragment) throws Exception {
+        return withLocaleRoot(() -> {
+            String uri = writeHintFixtureTableOnce(parent, name, fragments, rowsPerFragment);
+            try (
+                RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+                Dataset dataset = Dataset.open().allocator(allocator).uri(uri).build()
+            ) {
+                dataset.createIndex(
+                    IndexOptions.builder(
+                        Collections.singletonList("rating"),
+                        IndexType.BTREE,
+                        IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree")).build()
+                    ).withIndexName("rating_btree").build()
+                );
+                dataset.createIndex(
+                    IndexOptions.builder(
+                        Collections.singletonList("category"),
+                        IndexType.BITMAP,
+                        IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("bitmap")).build()
+                    ).withIndexName("category_bitmap").build()
+                );
+                VectorIndexParams ivfPq = VectorIndexParams.ivfPq(1, 8, 8, DistanceType.L2, 20);
+                dataset.createIndex(
+                    IndexOptions.builder(
+                        Collections.singletonList(VECTOR_COLUMN),
+                        IndexType.IVF_PQ,
+                        IndexParams.builder().setVectorIndexParams(ivfPq).build()
+                    ).withIndexName(VECTOR_COLUMN + "_ivf").train(true).build()
+                );
+            }
+            return uri;
+        });
     }
 
     private static String writeHintFixtureTableOnce(Path parent, String name, int fragments, int rowsPerFragment) throws Exception {

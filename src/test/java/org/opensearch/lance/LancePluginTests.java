@@ -7,6 +7,7 @@ package org.opensearch.lance;
 
 import org.opensearch.common.settings.Setting;
 import org.opensearch.lance.engine.LanceEngineFactory;
+import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
 import org.opensearch.lance.query.LanceFtsBoolQueryBuilder;
 import org.opensearch.lance.query.LanceFtsBoostQueryBuilder;
@@ -93,5 +94,35 @@ public class LancePluginTests extends OpenSearchTestCase {
             .orElseThrow();
         assertEquals(Long.valueOf(1_000_000L), setting.getDefault(org.opensearch.common.settings.Settings.EMPTY));
         assertTrue("max_rows should be node-scoped", setting.hasNodeScope());
+    }
+
+    public void testAttachWarmIndexesDefaultsToMetadata() {
+        Setting<?> setting = plugin.getSettings()
+            .stream()
+            .filter(s -> "lance.attach.warm_indexes".equals(s.getKey()))
+            .findFirst()
+            .orElseThrow();
+        assertEquals(LanceIndexWarmer.Mode.METADATA, setting.getDefault(org.opensearch.common.settings.Settings.EMPTY));
+        assertTrue(setting.hasNodeScope());
+        assertTrue(setting.isDynamic());
+        assertEquals(
+            LanceIndexWarmer.Mode.ALL,
+            LancePlugin.ATTACH_WARM_INDEXES_SETTING.get(
+                org.opensearch.common.settings.Settings.builder().put("lance.attach.warm_indexes", "ALL").build()
+            )
+        );
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LancePlugin.ATTACH_WARM_INDEXES_SETTING.get(
+                org.opensearch.common.settings.Settings.builder().put("lance.attach.warm_indexes", "pages").build()
+            )
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("none, metadata, all"));
+        assertTrue(
+            plugin.getExecutorBuilders(org.opensearch.common.settings.Settings.EMPTY)
+                .stream()
+                .flatMap(builder -> builder.getRegisteredSettings().stream())
+                .anyMatch(s -> s.getKey().equals("thread_pool." + LanceIndexWarmer.THREAD_POOL + ".queue_size"))
+        );
     }
 }
