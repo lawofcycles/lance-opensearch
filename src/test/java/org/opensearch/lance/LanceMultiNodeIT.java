@@ -932,7 +932,12 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals(298, extractIntPath(sizeTwo, "aggregations", "by_id", "sum_other_doc_count"));
             assertEquals(3, extractIntPath(sizeTwo, "aggregations", "by_id", "doc_count_error_upper_bound"));
 
+            // The aggregators collect in one slice for the comparison:
+            // the pushdown cuts the terms once per executor, as one slice
+            // does, while several slices each cut their own share and
+            // report the doc count error of the merge.
             updateClusterSetting("lance.aggregation.pushdown", "false");
+            updateClusterSetting("lance.fragment_path.slices", "1");
             try {
                 for (int i = 0; i < shapes.size(); i++) {
                     Map<String, Object> viaAggregators = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(i) + "}")));
@@ -941,6 +946,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 }
             } finally {
                 updateClusterSetting("lance.aggregation.pushdown", null);
+                updateClusterSetting("lance.fragment_path.slices", null);
             }
             // Every executor announced its answers, and with twelve
             // fragments over three nodes at least one of them merged
@@ -1146,7 +1152,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "\"size\":0,\"aggs\":{\"r\":{\"range\":{\"field\":\"id\",\"ranges\":[{\"to\":100},{\"from\":100,\"to\":200},{\"from\":200}]},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}",
             "\"size\":0,\"aggs\":{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"},\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}}",
             "\"size\":0,\"query\":{\"term\":{\"category\":\"c2\"}},\"aggs\":{\"c\":{\"composite\":{\"size\":4,\"sources\":[{\"month\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}},{\"cat\":{\"terms\":{\"field\":\"category\"}}}]},\"aggs\":{\"mx\":{\"max\":{\"field\":\"id\"}}}}}",
-            "\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":40}}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}},\"h\":{\"histogram\":{\"field\":\"id\",\"interval\":50}}}}",
+            "\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":40}}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}},\"h\":{\"histogram\":{\"field\":\"id\",\"interval\":50}}}",
             "\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"id\",\"percents\":[10,50,90],\"hdr\":{\"number_of_significant_value_digits\":3}}}}" };
         try {
             updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
