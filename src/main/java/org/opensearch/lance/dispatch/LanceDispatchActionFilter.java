@@ -5,6 +5,8 @@
 
 package org.opensearch.lance.dispatch;
 
+import java.util.Arrays;
+
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
@@ -23,6 +25,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.index.Index;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
@@ -50,17 +53,19 @@ import org.opensearch.transport.client.Client;
  *       metrics.</li>
  *   <li>Delegate the request to {@link LanceCoordinatorAction} via
  *       {@link Client#execute(org.opensearch.action.ActionType,
- *       org.opensearch.action.ActionRequest, ActionListener)}.
- *       The coordinator has {@code TransportService} injected and
- *       can fan out the fragment-level work to every data node;
+ *       org.opensearch.action.ActionRequest, ActionListener)} on the
+ *       plugin's {@code lance_coordinator} thread pool. The
+ *       coordinator has {@code TransportService} injected and can
+ *       fan out the fragment-level work to every data node;
  *       single-node clusters take the same path with a fan-out of
- *       one local hop.</li>
+ *       one local hop. When the pool refuses the request, the
+ *       request fails with the pool's rejection (HTTP 429).</li>
  *   <li>Fall through to the standard shard fan-out via
  *       {@code chain.proceed} for anything else (non-Lance targets,
  *       unsupported query or aggregation shapes, cross-index
  *       requests with metrics). The shard path still exists as a
  *       safety net for shapes the fragment executor has not yet
- *       taken over.</li>
+ *       taken over; it is never used because of load.</li>
  * </ul>
  *
  * <p>The heavy lifting — opening the Lance dataset, enumerating
@@ -151,51 +156,55 @@ public class LanceDispatchActionFilter implements ActionFilter {
             return;
         }
 
-        try {
-            // Delegate to the coordinator transport action. It has
-            // TransportService injected and can fan out fragment
-            // queries to every data node. In single-node clusters
-            // the fan-out reduces to a local executeLocally hop so
-            // the same code path serves both.
-            //
-            // Fork onto the SEARCH threadpool before entering the
-            // coordinator: this filter runs on the transport worker
-            // that received the HTTP request, and
-            // NodeClient.executeLocally invokes the coordinator's
-            // doExecute inline (its request handler executor only
-            // fires when the call arrives over the transport
-            // layer). Without the fork, SQL translation, Lance
-            // native scan, Lucene collection, and Semaphore.acquire
-            // would all run on netty transport_worker threads,
-            // stalling node I/O; core enforces this via
-            // Transports.assertNotTransportThread on hot paths. The
-            // AbstractRunnable form ensures fork failures
-            // (thread-pool rejection, shutting-down node) surface
-            // via listener.onFailure rather than being silently
-            // swallowed.
-            @SuppressWarnings("unchecked")
-            final ActionListener<SearchResponse> typedListener = (ActionListener<SearchResponse>) listener;
-            threadPool.executor(ThreadPool.Names.SEARCH).execute(new AbstractRunnable() {
-                @Override
-                protected void doRun() {
-                    client.execute(LanceCoordinatorAction.INSTANCE, searchRequest, typedListener);
-                }
+        // Delegate to the coordinator transport action. It has
+        // TransportService injected and can fan out fragment
+        // queries to every data node. In single-node clusters
+        // the fan-out reduces to a local executeLocally hop so
+        // the same code path serves both.
+        //
+        // Fork onto the plugin's lance_coordinator pool before
+        // entering the coordinator: this filter runs on the transport
+        // worker that received the HTTP request, and
+        // NodeClient.executeLocally invokes the coordinator's
+        // doExecute inline (its request handler executor only fires
+        // when the call arrives over the transport layer). Without
+        // the fork, SQL translation, Lance dataset open and the
+        // fan-out would all run on netty transport_worker threads,
+        // stalling node I/O; core enforces this via
+        // Transports.assertNotTransportThread on hot paths. The pool
+        // is the plugin's own rather than `search` so the coordinator
+        // side of a request never competes with the fragment
+        // executors of a data node for the same queue.
+        //
+        // A rejected fork fails the request with the pool's
+        // OpenSearchRejectedExecutionException (HTTP 429). It is not
+        // retried on the shard path: that would run the whole table
+        // through one node's shard under the very load that made the
+        // fragment path refuse, and hide the overload from the client.
+        @SuppressWarnings("unchecked")
+        final ActionListener<SearchResponse> typedListener = (ActionListener<SearchResponse>) listener;
+        threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL).execute(new AbstractRunnable() {
+            @Override
+            protected void doRun() {
+                client.execute(LanceCoordinatorAction.INSTANCE, searchRequest, typedListener);
+            }
 
-                @Override
-                public void onFailure(Exception e) {
-                    LOGGER.warn("fragment dispatch fork failed for {}; falling back to shard path", (Object) searchRequest.indices(), e);
-                    chain.proceed(task, action, request, listener);
-                }
+            @Override
+            public void onRejection(Exception e) {
+                LOGGER.warn("fragment dispatch rejected for {}; returning 429: {}", (Object) searchRequest.indices(), e.getMessage());
+                listener.onFailure(e);
+            }
 
-                @Override
-                public String toString() {
-                    return "lance dispatch coordinator entry for " + java.util.Arrays.toString(searchRequest.indices());
-                }
-            });
-        } catch (Exception e) {
-            LOGGER.warn("fragment dispatch failed for {}; falling back to shard path", (Object) searchRequest.indices(), e);
-            chain.proceed(task, action, request, listener);
-        }
+            @Override
+            public void onFailure(Exception e) {
+                listener.onFailure(e);
+            }
+
+            @Override
+            public String toString() {
+                return "lance dispatch coordinator entry for " + Arrays.toString(searchRequest.indices());
+            }
+        });
     }
 
     /**
