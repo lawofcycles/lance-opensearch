@@ -906,7 +906,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":30}}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"r\":{\"range\":{\"field\":\"id\",\"ranges\":[{\"to\":150},{\"from\":150}]},\"aggs\":{\"e\":{\"extended_stats\":{\"field\":\"id\"}}}}}}}"
         );
         List<String> sketches = List.of(
-            "\"size\":0,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"id\"}},\"k\":{\"cardinality\":{\"field\":\"category\"}}}",
+            "\"size\":0,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"id\"}}}",
+            "\"size\":0,\"query\":{\"range\":{\"id\":{\"lt\":200}}},\"aggs\":{\"k\":{\"cardinality\":{\"field\":\"category\"}},\"s\":{\"stats\":{\"field\":\"id\"}}}",
             "\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"id\"}},\"pr\":{\"percentile_ranks\":{\"field\":\"id\",\"values\":[75,225]}}}",
             "\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"id\"}},\"p\":{\"percentiles\":{\"field\":\"id\",\"percents\":[50,90]}}}}}"
         );
@@ -933,7 +934,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 // Exactly 300 distinct ids and 3 categories, both in the
                 // linear counting range of the default precision.
                 assertEquals(300, extractIntPath(pushedSketches.get(0), "aggregations", "u", "value"));
-                assertEquals(3, extractIntPath(pushedSketches.get(0), "aggregations", "k", "value"));
+                assertEquals(3, extractIntPath(pushedSketches.get(1), "aggregations", "k", "value"));
 
                 updateClusterSetting("lance.aggregation.pushdown", "false");
                 try {
