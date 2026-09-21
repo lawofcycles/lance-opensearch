@@ -390,9 +390,11 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
 
     /**
      * Whether a {@code size: 0} aggregation request whose shape the
-     * scan can compute (metrics, or one {@code terms} / {@code histogram}
-     * / fixed interval {@code date_histogram} with metric children, over
-     * a {@code match_all} or scalar filter query; see
+     * scan can compute (metrics; {@code terms} / {@code histogram} /
+     * fixed interval {@code date_histogram} nested up to three levels
+     * with metric children; {@code composite} over terms and fixed
+     * interval date_histogram sources; over a {@code match_all} or
+     * scalar filter query; see
      * {@code LanceAggregatePushdown} in the dispatch package) runs
      * as a Substrait group by inside the Lance scan. Off, every
      * aggregation goes through the Lucene aggregators over the fragment
@@ -431,6 +433,23 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.Dynamic
     );
 
+    /**
+     * Largest number of groups a nested bucket tree may be expected to
+     * produce and still take the aggregation pushdown. The estimate is
+     * the product of the {@code shard_size} of every {@code terms}
+     * level (a histogram level has no size and counts as one); above
+     * it the request goes through the Lucene aggregators, because the
+     * scan would return one row per key combination and the executor
+     * would hold them all. Static: the executor reads it from the node
+     * settings when it plans a request.
+     */
+    public static final Setting<Integer> AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING = Setting.intSetting(
+        "lance.aggregation.pushdown_max_groups",
+        1_000_000,
+        1,
+        Setting.Property.NodeScope
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -457,7 +476,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             FTS_SUBSET_PROBE_RATIO_SETTING,
             FTS_SUBSET_PROBE_MIN_ROWS_SETTING,
             AGGREGATION_PUSHDOWN_SETTING,
-            AGGREGATION_PUSHDOWN_PARALLELISM_SETTING
+            AGGREGATION_PUSHDOWN_PARALLELISM_SETTING,
+            AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING
         );
     }
 
