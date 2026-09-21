@@ -32,6 +32,7 @@ Inspired by [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - The Lance scan behind a full-text or knn query returns `_rowaddr` and `_score` (`_distance` for knn) only. Without a projection Lance materialised every column of every matching row into the Arrow batches, so an unbounded full-text shape (sort by a field, aggregation, `size 0`) over a large match set held native memory proportional to matches times row width and the kernel killed the node, and past 2 GiB of text in one take the Utf8 offsets overflowed into a 500.
 - The hit buffers a full-text or knn query keeps on heap are reserved with the `request` circuit breaker (label `lance_fts_hits`) before they are allocated and returned when the request ends, so a hit set the heap cannot hold answers 429 `circuit_breaking_exception` instead of `OutOfMemoryError`.
+- `hits.total` with a bounded `track_total_hits` reports the bound as the value whenever the relation is `gte`, as the shard path does. On several data nodes each executor counts its own fragments' share of one scan stopped at the bound, and Lance returns different tied rows to each of them, so the shares could add up to less than the bound and the response read, for example, `{"value": 9991, "relation": "gte"}` under the default bound of 10,000.
 
 ### Infrastructure
 
