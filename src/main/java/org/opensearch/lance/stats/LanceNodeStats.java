@@ -26,10 +26,11 @@ import org.opensearch.core.xcontent.XContentBuilder;
  * counter or gauge read from the owning component.
  *
  * <p>Rendered as the {@code snapshots}, {@code column_store},
- * {@code native_memory}, {@code fts} and {@code warm_up} objects of one
- * node in {@code GET /_lance/stats}. {@code warm_up} carries the mode in
- * force and one {@link LanceWarmUpStatus} per Lance-backed index the
- * node has seen since it started.
+ * {@code native_memory}, {@code fts}, {@code warm_up} and {@code indices}
+ * objects of one node in {@code GET /_lance/stats}. {@code warm_up} carries
+ * the mode in force and one {@link LanceWarmUpStatus} per Lance-backed
+ * index the node has seen since it started; {@code indices} the shard
+ * reader of every Lance-backed shard the node hosts.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
@@ -60,6 +61,28 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
     private final String warmUpMode;
     private final List<LanceWarmUpStatus> warmUps;
+    private final List<IndexReaderStats> indices;
+
+    /**
+     * The shard reader of one Lance-backed index this node hosts: the
+     * live rows of the table version it was opened over, the live rows
+     * it holds, and whether the two differ because the table is above
+     * the Lucene document bound. {@code _stats} counts the reader's rows.
+     */
+    public record IndexReaderStats(String index, long rows, long shardReaderRows, boolean luceneBoundExceeded) implements Writeable {
+
+        public IndexReaderStats(StreamInput in) throws IOException {
+            this(in.readString(), in.readVLong(), in.readVLong(), in.readBoolean());
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeString(index);
+            out.writeVLong(rows);
+            out.writeVLong(shardReaderRows);
+            out.writeBoolean(luceneBoundExceeded);
+        }
+    }
 
     public LanceNodeStats(
         boolean cacheEnabled,
@@ -107,6 +130,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             indexCacheShardShareBytes,
             ftsSubsetProbeLimit,
             "none",
+            List.of(),
             List.of()
         );
     }
@@ -134,7 +158,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         long indexCacheShardShareBytes,
         int ftsSubsetProbeLimit,
         String warmUpMode,
-        List<LanceWarmUpStatus> warmUps
+        List<LanceWarmUpStatus> warmUps,
+        List<IndexReaderStats> indices
     ) {
         this.cacheEnabled = cacheEnabled;
         this.snapshotCount = snapshotCount;
@@ -159,6 +184,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.ftsSubsetProbeLimit = ftsSubsetProbeLimit;
         this.warmUpMode = warmUpMode;
         this.warmUps = List.copyOf(warmUps);
+        this.indices = List.copyOf(indices);
     }
 
     public LanceNodeStats(StreamInput in) throws IOException {
@@ -190,6 +216,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             read.add(new LanceWarmUpStatus(in));
         }
         this.warmUps = List.copyOf(read);
+        this.indices = in.readList(IndexReaderStats::new);
     }
 
     @Override
@@ -220,6 +247,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         for (LanceWarmUpStatus warmUp : warmUps) {
             warmUp.writeTo(out);
         }
+        out.writeList(indices);
     }
 
     @Override
@@ -265,6 +293,16 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             warmUp.toXContent(builder, params);
         }
         builder.endArray();
+        builder.endObject();
+
+        builder.startObject("indices");
+        for (IndexReaderStats index : indices) {
+            builder.startObject(index.index());
+            builder.field("rows", index.rows());
+            builder.field("shard_reader_rows", index.shardReaderRows());
+            builder.field("lucene_bound_exceeded", index.luceneBoundExceeded());
+            builder.endObject();
+        }
         builder.endObject();
         return builder;
     }
@@ -365,6 +403,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         return warmUps;
     }
 
+    /** The shard readers of the Lance-backed indexes this node hosts, in index name order. */
+    public List<IndexReaderStats> indices() {
+        return indices;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -395,7 +438,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && indexCacheShardShareBytes == other.indexCacheShardShareBytes
             && ftsSubsetProbeLimit == other.ftsSubsetProbeLimit
             && warmUpMode.equals(other.warmUpMode)
-            && warmUps.equals(other.warmUps);
+            && warmUps.equals(other.warmUps)
+            && indices.equals(other.indices);
     }
 
     @Override
@@ -423,7 +467,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             indexCacheShardShareBytes,
             ftsSubsetProbeLimit,
             warmUpMode,
-            warmUps
+            warmUps,
+            indices
         );
     }
 }

@@ -78,7 +78,17 @@ public final class LanceStatsCollector {
         this.indexWarmer = indexWarmer;
     }
 
+    /** The node's cache figures with no index block; {@link #collect(List)} adds the shard readers. */
     public LanceNodeStats collect() {
+        return collect(List.of());
+    }
+
+    /**
+     * @param indices the shard readers of the Lance-backed indexes this
+     *                node hosts, read by the transport action from the
+     *                node's index services
+     */
+    public LanceNodeStats collect(List<LanceNodeStats.IndexReaderStats> indices) {
         CircuitBreaker breaker = LanceCircuitBreaker.getBreaker();
         long estimatedBytes = breaker == null ? 0L : breaker.getUsed();
         long session = sessionBytes.getAsLong();
@@ -121,7 +131,8 @@ public final class LanceStatsCollector {
                 indexCacheShardShare,
                 probeLimit,
                 warmUpMode,
-                warmUps
+                warmUps,
+                indices
             );
         }
         ColumnStore store = warmCache.columnStore();
@@ -148,7 +159,8 @@ public final class LanceStatsCollector {
             indexCacheShardShare,
             probeLimit,
             warmUpMode,
-            warmUps
+            warmUps,
+            indices
         );
     }
 }
