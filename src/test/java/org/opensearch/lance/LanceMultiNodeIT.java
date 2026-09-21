@@ -24,6 +24,7 @@ import org.apache.hc.core5.http.HttpHost;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
+import org.opensearch.client.RestClient;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
@@ -1102,6 +1103,89 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // the namespace registered.
             try {
                 deleteJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * With three data nodes every fragment response of a request crosses
+     * the transport layer. The cluster runs the {@code lance_coordinator}
+     * pool with one thread and a queue of one (build.gradle), so a burst
+     * of concurrent requests makes each coordinating node refuse some of
+     * them. The refused ones must be 429s, the served ones complete, no
+     * task may remain, and no transport channel may have been closed:
+     * a response the transport layer cannot hand over closes the
+     * channel it came on and fails every other request on it.
+     */
+    public void testCoordinatorPoolOverloadOnThreeNodesClosesNoChannel() throws Exception {
+        String suffix = "mn-overload-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 120, 20);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(6, extractIntPath(readAll(attach), "fragments"));
+
+            String body = "{\"size\":5,\"sort\":[{\"id\":\"desc\"}],\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+            int served = 0;
+            int rejected = 0;
+            try (RestClient wide = LanceRestTestCase.concurrentClient(getClusterHosts(), 32)) {
+                for (int round = 0; round < 20 && rejected == 0; round++) {
+                    for (LanceRestTestCase.ConcurrentResult result : LanceRestTestCase.postConcurrently(
+                        wide,
+                        "/" + indexName + "/_search",
+                        body,
+                        32
+                    )) {
+                        if (result.status() == RestStatus.OK.getStatus()) {
+                            served++;
+                            assertEquals(
+                                "served request must be complete: " + result.body(),
+                                120,
+                                extractIntPath(result.body(), "hits", "total", "value")
+                            );
+                            assertEquals(7140.0d, extractDoublePath(result.body(), "aggregations", "s", "value"), 0.0d);
+                            assertEquals(List.of("5-19", "5-18", "5-17", "5-16", "5-15"), hitIds(result.body()));
+                        } else if (result.status() == RestStatus.TOO_MANY_REQUESTS.getStatus()) {
+                            rejected++;
+                            assertTrue(
+                                "429 body must carry the pool's rejection: " + result.body(),
+                                result.body().contains("rejected execution")
+                            );
+                            assertTrue("429 body must name the pool: " + result.body(), result.body().contains("lance_coordinator"));
+                        } else {
+                            fail("unexpected status " + result.status() + " from the fragment path: " + result.body());
+                        }
+                    }
+                }
+            }
+            assertTrue("expected the one-thread, one-slot pools to refuse a request in 20 bursts of 32", rejected > 0);
+            assertTrue("expected the pools to serve requests as well", served > 0);
+
+            assertBusy(() -> {
+                String tasks = readAll(
+                    client().performRequest(new Request("GET", "/_tasks?actions=*lance/coordinator*,indices:data/read/search*"))
+                );
+                assertEquals("tasks left behind: " + tasks, 0, LanceRestTestCase.countOccurrences(tasks, "\"action\""));
+            });
+
+            String pools = readAll(
+                client().performRequest(new Request("GET", "/_cat/thread_pool/lance_coordinator?format=json&h=node_name,rejected"))
+            );
+            assertTrue("thread pool stats must count the rejections: " + pools, LanceRestTestCase.sumCatColumn(pools, "rejected") > 0);
+
+            for (String line : clusterLogLines()) {
+                assertFalse(
+                    "a fragment response was refused by the transport layer: " + line,
+                    line.contains("exception caught on transport layer")
+                );
+            }
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
         }
     }
