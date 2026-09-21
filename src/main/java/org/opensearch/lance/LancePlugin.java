@@ -476,6 +476,31 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.Dynamic
     );
 
+    /**
+     * How many slices a fragment path executor cuts its fragment leaves
+     * into when it collects a page of hits or an aggregation, the way
+     * concurrent segment search slices a shard's segments. Each slice
+     * collects on its own thread of the search pool with its own
+     * collector (its own aggregator tree), and the slice results are
+     * reduced on the executor before the answer goes to the
+     * coordinator. Without this an executor collected every fragment
+     * of the node on the one search thread that carried the request,
+     * so the aggregators, which the column loads and the pushdown do
+     * not speed up, kept a large node at one busy core. Same default
+     * and bounds as {@link #FRAGMENT_PATH_PARALLELISM_SETTING}: a slice
+     * shares the cores with the column loads of the same request. 1
+     * collects on the request's thread alone, in fragment order, and
+     * reduces nothing, which is the behaviour before slicing existed.
+     */
+    public static final Setting<Integer> FRAGMENT_PATH_SLICES_SETTING = Setting.intSetting(
+        "lance.fragment_path.slices",
+        Math.max(1, Math.min(32, NativeMemoryLimit.availableCpus() / 2)),
+        1,
+        32,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -504,7 +529,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             AGGREGATION_PUSHDOWN_SETTING,
             AGGREGATION_PUSHDOWN_PARALLELISM_SETTING,
             AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING,
-            FRAGMENT_PATH_PARALLELISM_SETTING
+            FRAGMENT_PATH_PARALLELISM_SETTING,
+            FRAGMENT_PATH_SLICES_SETTING
         );
     }
 

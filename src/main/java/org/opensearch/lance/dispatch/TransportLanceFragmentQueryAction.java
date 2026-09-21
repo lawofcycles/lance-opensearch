@@ -10,6 +10,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -32,6 +33,8 @@ import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.ReaderUtil;
 import org.apache.lucene.search.BoostQuery;
+import org.apache.lucene.search.Collector;
+import org.apache.lucene.search.CollectorManager;
 import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.MatchAllDocsQuery;
@@ -98,7 +101,9 @@ import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.lance.query.LanceKnnQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.lance.rest.RestAttachAction;
+import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
+import org.opensearch.search.aggregations.Aggregation;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.BucketCollector;
@@ -239,14 +244,19 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      */
     private final java.util.concurrent.Semaphore concurrencyLimit;
     /**
-     * Pool the aggregation pushdown and the column loads run their extra
-     * fragment group scans on: the SEARCH pool this action itself
-     * executes on. No pool is added for it, and a group scan never blocks
-     * on a task the pool has not started, so a saturated SEARCH pool
-     * degrades a request to one scan on its own thread instead of
-     * parking it.
+     * Pool the aggregation pushdown, the column loads and the collection
+     * slices run their extra work on: the SEARCH pool this action itself
+     * executes on. No pool is added for it. A group scan and a slice loop
+     * never block on a task the pool has not started (the calling thread
+     * runs whatever the pool does not pick up), so a saturated SEARCH
+     * pool degrades a request to one thread instead of parking it.
      */
-    private final Executor pushdownExecutor;
+    private final Executor searchExecutor;
+    /**
+     * Reduce context ingredient for the slice level merge of the
+     * aggregators; none of the allowed aggregations runs a script there.
+     */
+    private final ScriptService scriptService;
     /**
      * Node scoped snapshot and column cache every request acquires its
      * table view from; created by {@code LancePlugin.createComponents}.
@@ -261,7 +271,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         IndicesService indicesService,
         BigArrays bigArrays,
         CircuitBreakerService circuitBreakerService,
-        LanceWarmCache warmCache
+        LanceWarmCache warmCache,
+        ScriptService scriptService
     ) {
         super(LanceFragmentQueryAction.NAME, transportService, actionFilters, LanceFragmentQueryRequest::new, ThreadPool.Names.SEARCH);
         this.clusterService = clusterService;
@@ -269,9 +280,10 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         this.bigArrays = bigArrays;
         this.circuitBreakerService = circuitBreakerService;
         this.warmCache = warmCache;
+        this.scriptService = scriptService;
         int permits = LancePlugin.FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING.get(clusterService.getSettings());
         this.concurrencyLimit = new java.util.concurrent.Semaphore(permits, /*fair*/ false);
-        this.pushdownExecutor = transportService.getThreadPool().executor(ThreadPool.Names.SEARCH);
+        this.searchExecutor = transportService.getThreadPool().executor(ThreadPool.Names.SEARCH);
     }
 
     @Override
@@ -653,11 +665,19 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     clusterService.localNode().getId()
                 ).withCancellation(cancellation)
             ) {
+                // The searcher cuts the node's fragment leaves into up
+                // to lance.fragment_path.slices slices and collects
+                // them side by side on the SEARCH pool; the aggregators
+                // read the same count through the context to decide
+                // how they apply their shard thresholds.
+                int slices = clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_SLICES_SETTING);
+                searchContext.withTargetMaxSliceCount(slices).withScriptService(scriptService);
                 LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(
                     dr,
                     indexService.getIndexSettings(),
                     searchContext,
-                    circuitBreakerService.getBreaker(CircuitBreaker.REQUEST)
+                    circuitBreakerService.getBreaker(CircuitBreaker.REQUEST),
+                    searchExecutor
                 );
                 searchContext.withSearcher(searcher);
                 if (cancellation.hasTask()) {
@@ -789,7 +809,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         effectiveFragmentIds,
                         request.filterSql(),
                         clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING),
-                        pushdownExecutor,
+                        searchExecutor,
                         cancellation,
                         name -> emptyTopLevelAggregation(request, searchContext, qsc, name)
                     );
@@ -807,6 +827,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 } else {
                     aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query, lanceWeight);
                     matched = computeMatched(dataset, request, searcher, countQuery, hasSecurityWrapper, ftsWeight, cancellation);
+                }
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug(
+                        "lance.dispatch: fragment path slices for [{}]: {} leaves in {} slices (lance.fragment_path.slices {})",
+                        request.indexName(),
+                        searcher.getIndexReader().leaves().size(),
+                        searcher.getSlices().length,
+                        slices
+                    );
                 }
                 // A size 0 request (the only shape the pushdown takes)
                 // has an empty page, so its row address array is empty
@@ -1945,6 +1974,17 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * satisfied by a {@link ScoreMode#COMPLETE} Weight the same way it
      * is by the no-scores Weight the searcher would otherwise build:
      * it simply does not call {@code score()}.
+     *
+     * <p>The aggregators run through a {@link CollectorManager} of the
+     * shape of OpenSearch's {@code AggregationCollectorManager}: one
+     * aggregator tree per slice, built by {@code newCollector} from
+     * the same factories, so the searcher collects the slices side by
+     * side, and a {@code reduce} that reads each tree's result and
+     * merges them with the slice level partial reduce
+     * ({@link LanceFragmentSearchContext#partialOnShard()}). With one
+     * slice the single tree's result is returned as it is, which is
+     * what the shard path does without concurrent segment search and
+     * what this method returned before slicing.
      */
     private InternalAggregations aggregateViaIndexSearcher(
         LanceFragmentQueryRequest request,
@@ -1960,37 +2000,77 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         }
 
         AggregatorFactories factories = factoriesBuilder.build(qsc, null);
-        List<Aggregator> topLevelAggregators = factories.createTopLevelAggregators(searchContext);
-        Aggregator[] aggregators = topLevelAggregators.toArray(new Aggregator[0]);
-        for (Aggregator agg : aggregators) {
-            agg.preCollection();
-        }
-        BucketCollector wrapped = MultiBucketCollector.wrap(topLevelAggregators);
+        CollectorManager<Collector, InternalAggregations> manager = new SliceAggregationCollectorManager(searchContext, factories);
         if (sharedWeight != null) {
-            searcher.search(sharedWeight, wrapped);
-        } else {
-            searcher.search(query, wrapped);
+            return searcher.search(sharedWeight, manager);
+        }
+        return searcher.search(query, manager);
+    }
+
+    /**
+     * One aggregator tree per slice, reduced on the executor. The
+     * slice loop of {@link LanceFragmentIndexSearcher} ends every slice
+     * with {@code BucketCollectorProcessor.processPostCollection},
+     * which runs {@code postCollection()} and {@code buildTopLevel()}
+     * on each top-level aggregator of the slice's tree on the slice's
+     * own thread and stores the result inside the aggregator;
+     * {@link #reduce} reads those stored results back through
+     * {@code toInternalAggregations}, as the shard path's
+     * {@code AggregationCollectorManager} does. Calling
+     * {@code postCollection()} or {@code buildAggregations()} a second
+     * time here would drive a {@code DeferableBucketAggregator}
+     * (breadth_first terms with metric children) through
+     * {@code BestBucketsDeferringCollector#prepareSelectedBuckets}
+     * twice; the second call throws "Already been replayed".
+     *
+     * <p>The request's {@link MultiBucketConsumer} is shared by the
+     * trees of every slice, as it is between slices on the shard path,
+     * and reset once the slice results have been read, before the
+     * partial reduce counts its own buckets, at the same point
+     * {@code AggregationCollectorManager.reduce} resets it.
+     */
+    private static final class SliceAggregationCollectorManager implements CollectorManager<Collector, InternalAggregations> {
+        private final LanceFragmentSearchContext searchContext;
+        private final AggregatorFactories factories;
+
+        SliceAggregationCollectorManager(LanceFragmentSearchContext searchContext, AggregatorFactories factories) {
+            this.searchContext = searchContext;
+            this.factories = factories;
         }
 
-        // ContextIndexSearcher.search() ends by calling
-        // searchContext.bucketCollectorProcessor().processPostCollection(collector),
-        // which already runs postCollection() and buildTopLevel() on
-        // every top-level aggregator in the collector tree and stores
-        // the result inside the aggregator (Aggregator#internalAggregation).
-        // Read those stored results back out through
-        // getPostCollectionAggregation(), matching the shard path
-        // (BucketCollectorProcessor#toInternalAggregations).
-        //
-        // Calling postCollection() or buildAggregations() a second
-        // time here would drive DeferableBucketAggregator (breadth_first
-        // terms with metric sub-aggregations such as avg / sum / max /
-        // terms) through BestBucketsDeferringCollector#prepareSelectedBuckets
-        // twice; the second call throws "Already been replayed".
-        List<InternalAggregation> results = new ArrayList<>(aggregators.length);
-        for (Aggregator agg : aggregators) {
-            results.add(agg.getPostCollectionAggregation());
+        @Override
+        public Collector newCollector() throws IOException {
+            List<Aggregator> topLevelAggregators = factories.createTopLevelAggregators(searchContext);
+            BucketCollector collector = MultiBucketCollector.wrap(topLevelAggregators);
+            collector.preCollection();
+            return collector;
         }
-        return InternalAggregations.from(results);
+
+        @Override
+        public InternalAggregations reduce(Collection<Collector> collectors) throws IOException {
+            List<InternalAggregation> internals = searchContext.bucketCollectorProcessor().toInternalAggregations(collectors);
+            searchContext.aggregations().multiBucketConsumer().reset();
+            InternalAggregations aggregations = InternalAggregations.from(internals);
+            if (!searchContext.shouldUseConcurrentSearch()) {
+                return aggregations;
+            }
+            InternalAggregations reduced = InternalAggregations.reduce(
+                Collections.singletonList(aggregations),
+                searchContext.partialOnShard()
+            );
+            // The reduce groups the slice results by name in a hash map
+            // and returns them in that map's order. Put them back in the
+            // request's order, which is the order a single tree yields,
+            // so the executor's answer does not depend on the slice count.
+            Map<String, InternalAggregation> byName = new LinkedHashMap<>();
+            for (InternalAggregation aggregation : internals) {
+                byName.putIfAbsent(aggregation.getName(), null);
+            }
+            for (Aggregation aggregation : reduced.asList()) {
+                byName.put(aggregation.getName(), (InternalAggregation) aggregation);
+            }
+            return InternalAggregations.from(new ArrayList<>(byName.values()));
+        }
     }
 
     /**
@@ -2079,7 +2159,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         // whichever thread it runs, stops at its next batch once the
         // task is cancelled.
         FragmentGroupScan groupScan = new FragmentGroupScan(
-            pushdownExecutor,
+            searchExecutor,
             clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_PARALLELISM_SETTING),
             cancellation
         );
@@ -2159,12 +2239,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * only thing that decides the count is the scorer intersected with
      * the liveDocs.
      *
-     * <p>The counter is a plain {@code long[]}: {@link LanceFragmentIndexSearcher}
-     * is built with a null executor, so its slice loop visits every
-     * leaf on the calling thread and the collector is never shared
-     * across threads. Handing the searcher an executor would require
-     * an atomic counter (or a {@link org.apache.lucene.search.CollectorManager})
-     * here.
+     * <p>The counter is a plain {@code long[]}: {@code search(Query, Collector)}
+     * of {@link LanceFragmentIndexSearcher} visits every leaf on the
+     * calling thread whatever the searcher's slice count (a single
+     * collector cannot be shared between slices), so the collector is
+     * never touched by two threads. Counting through a
+     * {@link org.apache.lucene.search.CollectorManager} would run the
+     * slices in parallel and need one counter per slice.
      */
     static long countThroughLiveDocs(LanceFragmentIndexSearcher searcher, Query query) throws IOException {
         long[] total = new long[1];
