@@ -65,7 +65,11 @@ import org.opensearch.transport.client.Client;
  *       unsupported query or aggregation shapes, cross-index
  *       requests with metrics). The shard path still exists as a
  *       safety net for shapes the fragment executor has not yet
- *       taken over; it is never used because of load.</li>
+ *       taken over; it is never used because of load. A Lance-backed
+ *       target whose table has more rows than one Lucene reader may
+ *       hold is not handed to it (the shard reader holds part of the
+ *       table); such a request fails with 400 instead
+ *       ({@link #proceedOnShardPath}).</li>
  * </ul>
  *
  * <p>The heavy lifting — opening the Lance dataset, enumerating
@@ -135,7 +139,7 @@ public class LanceDispatchActionFilter implements ActionFilter {
             // or a top-level query builder outside the fragment
             // executor's supported shape. Fall through so the
             // standard path can still answer.
-            chain.proceed(task, action, request, listener);
+            proceedOnShardPath(task, action, request, listener, chain, concrete);
             return;
         }
 
@@ -143,7 +147,7 @@ public class LanceDispatchActionFilter implements ActionFilter {
             // Aggregation shape the fragment executor has not taken
             // over yet (a script, a type off the allow list, a filter
             // bucket over a Lance query, a pipeline).
-            chain.proceed(task, action, request, listener);
+            proceedOnShardPath(task, action, request, listener, chain, concrete);
             return;
         }
 
@@ -152,7 +156,7 @@ public class LanceDispatchActionFilter implements ActionFilter {
             // merges partials across independent Lance datasets. Until
             // then multi-index aggregation requests route through the
             // shard path.
-            chain.proceed(task, action, request, listener);
+            proceedOnShardPath(task, action, request, listener, chain, concrete);
             return;
         }
 
@@ -236,6 +240,84 @@ public class LanceDispatchActionFilter implements ActionFilter {
             return indexNameExpressionResolver.concreteIndices(clusterService.state(), searchRequest);
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    /**
+     * Hand a request over Lance-backed indexes whose shape the fragment
+     * path does not serve to the shard path, unless a target table has
+     * more rows than one Lucene reader may hold. The shard engine's
+     * reader of such a table holds the leading fragments that fit
+     * ({@link org.opensearch.lance.engine.LanceDirectoryReader}), so the
+     * shard path would answer from part of the table without saying so;
+     * the request fails with 400 instead, naming the rows the table has
+     * and the rows the shard reader holds.
+     *
+     * <p>Deciding that means reading each table's manifest, which is
+     * Lance I/O and does not belong on the transport thread this filter
+     * runs on, so the check and the {@code chain.proceed} it may end in
+     * run on the {@code lance_coordinator} pool, the pool the fragment
+     * path's entry runs on. The pool preserves the thread context, so
+     * the shard path sees the caller's headers as it would from here.
+     * A refused fork fails the request with the pool's rejection (HTTP
+     * 429), as for the fragment path.
+     */
+    private <Request extends ActionRequest, Response extends ActionResponse> void proceedOnShardPath(
+        Task task,
+        String action,
+        Request request,
+        ActionListener<Response> listener,
+        ActionFilterChain<Request, Response> chain,
+        Index[] concrete
+    ) {
+        AbstractRunnable check = new AbstractRunnable() {
+            @Override
+            protected void doRun() {
+                long maxDocs = clusterService.getClusterSettings().get(LancePlugin.MAX_DOCS_PER_READER_SETTING);
+                Metadata metadata = clusterService.state().metadata();
+                for (Index index : concrete) {
+                    IndexMetadata indexMetadata = metadata.index(index);
+                    if (indexMetadata == null) {
+                        continue;
+                    }
+                    TransportLanceCoordinatorAction.ReaderBound bound = TransportLanceCoordinatorAction.readerBound(indexMetadata, maxDocs);
+                    if (bound.exceeded()) {
+                        throw new IllegalArgumentException(
+                            "table of index ["
+                                + index.getName()
+                                + "] has "
+                                + bound.tableRows()
+                                + " rows, above the Lucene bound of "
+                                + maxDocs
+                                + " rows per reader; this request shape is served by the shard path and would see only "
+                                + bound.readerRows()
+                                + " rows. Use a shape the fragment path serves (see docs/limitations.md)"
+                        );
+                    }
+                }
+                chain.proceed(task, action, request, listener);
+            }
+
+            @Override
+            public void onRejection(Exception e) {
+                LOGGER.warn("shard path entry rejected for {}; returning 429: {}", Arrays.toString(concrete), e.getMessage());
+                listener.onFailure(e);
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                listener.onFailure(e);
+            }
+
+            @Override
+            public String toString() {
+                return "lance dispatch shard path entry for " + Arrays.toString(concrete);
+            }
+        };
+        try {
+            threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL).execute(check);
+        } catch (Exception e) {
+            listener.onFailure(e);
         }
     }
 
