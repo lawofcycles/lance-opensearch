@@ -219,9 +219,14 @@ public final class LanceFragmentSearchContext extends SearchContext {
 
     /**
      * {@link ScriptService} the slice level reduce of
-     * {@link #partialOnShard()} carries. None of the aggregations the
-     * fragment path accepts runs a script during a reduce, so a null
-     * service (unit tests) only matters if that list ever changes.
+     * {@link #partialOnShard()} carries. Set before the aggregators run
+     * with more than one slice; {@link #partialOnShard()} refuses to
+     * build a slice level reduce context without it, rather than hand
+     * the reduce a null service that would surface as a
+     * {@link NullPointerException} deep inside an aggregation's reduce.
+     * None of the aggregations the fragment path accepts runs a script
+     * during a reduce today, so the check is what keeps that assumption
+     * visible if the allow list ever changes.
      */
     public LanceFragmentSearchContext withScriptService(ScriptService scriptService) {
         this.scriptService = scriptService;
@@ -795,9 +800,21 @@ public final class LanceFragmentSearchContext extends SearchContext {
      * {@code size} and {@code min_doc_count} the coordinator applies
      * later. The fragment path routes every request with a pipeline
      * aggregation to the shard path, so the pipeline tree is empty.
+     *
+     * @throws IllegalStateException when several slices are configured
+     *         and no {@link ScriptService} was attached through
+     *         {@link #withScriptService}; the slice level reduce is the
+     *         only consumer of this context and must not run without one
      */
     @Override
     public InternalAggregation.ReduceContext partialOnShard() {
+        if (scriptService == null && shouldUseConcurrentSearch()) {
+            throw new IllegalStateException(
+                "LanceFragmentSearchContext.partialOnShard() called with "
+                    + targetMaxSliceCount
+                    + " slices before withScriptService(...) attached the ScriptService the slice level reduce needs"
+            );
+        }
         InternalAggregation.ReduceContext reduceContext = InternalAggregation.ReduceContext.forPartialReduction(
             bigArrays,
             scriptService,

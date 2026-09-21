@@ -1097,7 +1097,10 @@ public class LanceAggregationIT extends LanceRestTestCase {
      * 1 and at 3 against the three fragment hint fixture. The exact
      * aggregations and the hit pages have to answer byte for byte the
      * same; the sketches (tdigest percentiles, cardinality) within their
-     * error, since three sketches merged are not one sketch. The
+     * error, since three sketches merged are not one sketch; and a
+     * {@code terms} clipped by {@code shard_size} keeps the same buckets
+     * and other count while its doc count error grows with the slices,
+     * as it does on the shard path with concurrent segment search. The
      * executor's DEBUG line reports the slice count each request ran
      * with, which is how the test knows the second run really cut the
      * leaves into three slices.
@@ -1121,6 +1124,10 @@ public class LanceAggregationIT extends LanceRestTestCase {
             String tdigest = "{\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"rating\"}}}}";
             String cardinality =
                 "{\"size\":0,\"aggs\":{\"c\":{\"cardinality\":{\"field\":\"rating\"}},\"k\":{\"cardinality\":{\"field\":\"category\"}}}}";
+            // 1200 distinct ids of one row each cut to shard_size 5: the
+            // one shape here whose shard side fields the slices change.
+            String clipped =
+                "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"id\",\"size\":5,\"shard_size\":5,\"show_term_doc_count_error\":true}}}}";
             Request debug = new Request("PUT", "/_cluster/settings");
             debug.setJsonEntity(
                 "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":\"DEBUG\",\"lance.aggregation.pushdown\":false}}"
@@ -1130,6 +1137,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 Map<Integer, List<String>> exactBySlices = new LinkedHashMap<>();
                 Map<Integer, Map<String, Object>> tdigestBySlices = new LinkedHashMap<>();
                 Map<Integer, Map<String, Object>> cardinalityBySlices = new LinkedHashMap<>();
+                Map<Integer, Map<String, Object>> clippedBySlices = new LinkedHashMap<>();
                 for (int slices : new int[] { 1, 3 }) {
                     Request setSlices = new Request("PUT", "/_cluster/settings");
                     setSlices.setJsonEntity("{\"transient\":{\"lance.fragment_path.slices\":" + slices + "}}");
@@ -1143,7 +1151,8 @@ public class LanceAggregationIT extends LanceRestTestCase {
                     exactBySlices.put(slices, answers);
                     tdigestBySlices.put(slices, parse(readAll(postJson("/" + index + "/_search", tdigest))));
                     cardinalityBySlices.put(slices, parse(readAll(postJson("/" + index + "/_search", cardinality))));
-                    int requests = exact.length + 2;
+                    clippedBySlices.put(slices, aggregation(parse(readAll(postJson("/" + index + "/_search", clipped))), "t"));
+                    int requests = exact.length + 3;
                     assertBusy(() -> assertEquals("executor lines reporting " + detail, before + requests, sliceLogLines(index, detail)));
                 }
                 for (int i = 0; i < exact.length; i++) {
@@ -1171,6 +1180,36 @@ public class LanceAggregationIT extends LanceRestTestCase {
                     aggregation(cardinalityBySlices.get(1), "k").get("value"),
                     aggregation(cardinalityBySlices.get(3), "k").get("value")
                 );
+
+                // The clipped terms: the buckets (ids 0 to 4, one row each)
+                // and sum_other_doc_count (the 1195 rows outside them) are
+                // the same at both slice counts. The doc count error is
+                // not: one slice cuts 1200 buckets to 5 once, and a single
+                // executor's answer reduced alone at the coordinator has
+                // no error to report, 0; three slices each cut their 400
+                // to 5, the executor's reduce charges each slice the count
+                // of its last kept bucket, 1, sums them to 3 and gives each
+                // kept bucket the 2 it may have missed on the slices that
+                // did not report it, which is what the shard path reports
+                // with concurrent segment search on (see limitations.md).
+                Map<String, Object> clippedOne = clippedBySlices.get(1);
+                Map<String, Object> clippedThree = clippedBySlices.get(3);
+                List<Map<String, Object>> bucketsOne = (List<Map<String, Object>>) clippedOne.get("buckets");
+                List<Map<String, Object>> bucketsThree = (List<Map<String, Object>>) clippedThree.get("buckets");
+                assertEquals(5, bucketsOne.size());
+                assertEquals(bucketsOne.size(), bucketsThree.size());
+                for (int i = 0; i < bucketsOne.size(); i++) {
+                    assertEquals(i, ((Number) bucketsOne.get(i).get("key")).intValue());
+                    assertEquals(bucketsOne.get(i).get("key"), bucketsThree.get(i).get("key"));
+                    assertEquals(1, ((Number) bucketsOne.get(i).get("doc_count")).intValue());
+                    assertEquals(bucketsOne.get(i).get("doc_count"), bucketsThree.get(i).get("doc_count"));
+                    assertEquals(0, ((Number) bucketsOne.get(i).get("doc_count_error_upper_bound")).intValue());
+                    assertEquals(2, ((Number) bucketsThree.get(i).get("doc_count_error_upper_bound")).intValue());
+                }
+                assertEquals(1195, ((Number) clippedOne.get("sum_other_doc_count")).intValue());
+                assertEquals(clippedOne.get("sum_other_doc_count"), clippedThree.get("sum_other_doc_count"));
+                assertEquals(0, ((Number) clippedOne.get("doc_count_error_upper_bound")).intValue());
+                assertEquals(3, ((Number) clippedThree.get("doc_count_error_upper_bound")).intValue());
             } finally {
                 Request reset = new Request("PUT", "/_cluster/settings");
                 reset.setJsonEntity(
