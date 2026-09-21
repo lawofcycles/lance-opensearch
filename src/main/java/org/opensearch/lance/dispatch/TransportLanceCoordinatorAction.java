@@ -533,6 +533,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             done,
             policy.allowPartialSearchResults(),
             policy.task(),
+            // The generic pool, not lance_coordinator: its queue is
+            // unbounded, so the log line and the cancel of a node that
+            // timed out never take the coordinator pool's queue slot the
+            // merge of the same request needs (three nodes timing out
+            // would otherwise refuse the merge on a small pool and turn
+            // a timeout into a 429).
+            threadPool.generic(),
             (node, request, cause) -> {
                 String nodeId = node == null ? "?" : node.getId();
                 String fragments = request == null
@@ -649,7 +656,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      *
      * <p>A cancelled coordinator task ends the fan-out with
      * {@link TaskCancelledException} in place of the merge (and in
-     * place of any other failure), whatever the nodes answered.
+     * place of any other failure), whatever the nodes answered. The
+     * task's state is read at the moment {@code done} is completed, so
+     * a cancellation that lands between a node's failure and the
+     * completion still wins.
      */
     static final class FragmentFanOut {
 
@@ -677,6 +687,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         }
 
         private final int size;
+        private final Executor notifyExecutor;
         private final AtomicReferenceArray<LanceFragmentQueryResponse> slots;
         private final AtomicReferenceArray<DiscoveryNode> nodes;
         private final AtomicReferenceArray<LanceFragmentQueryRequest> requests;
@@ -691,7 +702,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
          * tells nobody about a node that did not answer.
          */
         FragmentFanOut(int size, Executor mergeExecutor, Consumer<Outcome> merge, ActionListener<Void> done) {
-            this(size, mergeExecutor, merge, done, true, null, (node, request, cause) -> {});
+            this(size, mergeExecutor, merge, done, true, null, Runnable::run, (node, request, cause) -> {});
         }
 
         /**
@@ -701,6 +712,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
          * @param done                completed once, after the merge or on the first failure
          * @param allowPartialResults whether a node that did not answer leaves its slot empty (true) or fails the fan-out (false)
          * @param task                the coordinator task, or null; a cancelled task ends the fan-out with TaskCancelledException
+         * @param notifyExecutor      pool the incomplete listener runs on, off the transport thread; a pool with an
+         *                            unbounded queue, so a notification never takes a queue slot from the merge
          * @param incompleteListener  told once about every node that did not answer
          */
         FragmentFanOut(
@@ -710,16 +723,28 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             ActionListener<Void> done,
             boolean allowPartialResults,
             CancellableTask task,
+            Executor notifyExecutor,
             IncompleteNodeListener incompleteListener
         ) {
             this.size = size;
+            this.notifyExecutor = notifyExecutor;
             this.slots = new AtomicReferenceArray<>(size);
             this.nodes = new AtomicReferenceArray<>(size);
             this.requests = new AtomicReferenceArray<>(size);
             this.allowPartialResults = allowPartialResults;
             this.task = task;
             this.incompleteListener = incompleteListener;
-            ActionListener<Void> once = ActionListener.notifyOnce(done);
+            // The task's state is read here, at the completion of done,
+            // and not where the failure or the merge result was produced:
+            // a cancellation that lands in between still ends the request
+            // as cancelled.
+            ActionListener<Void> once = ActionListener.notifyOnce(ActionListener.wrap(v -> {
+                if (isCancelled()) {
+                    done.onFailure(cancelled());
+                } else {
+                    done.onResponse(v);
+                }
+            }, e -> done.onFailure(cancelledOr(e))));
             this.gathered = new GroupedActionListener<>(ActionListener.wrap(responses -> {
                 // ActionRunnable routes a throwing merge and a
                 // rejected submit (AbstractRunnable.onRejection
@@ -736,7 +761,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                     }
                     merge.accept(new Outcome(ordered, incompleteNodes.get()));
                 }));
-            }, e -> once.onFailure(cancelledOr(e))), size);
+            }, once::onFailure), size);
         }
 
         /**
@@ -777,11 +802,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                         return;
                     }
                     incompleteNodes.incrementAndGet();
-                    try {
-                        incompleteListener.onIncomplete(nodes.get(slot), requests.get(slot), exp);
-                    } catch (Exception e) {
-                        exp.addSuppressed(e);
-                    }
+                    notifyIncomplete(nodes.get(slot), requests.get(slot), exp);
                     if (allowPartialResults) {
                         gathered.onResponse(null);
                     } else {
@@ -794,6 +815,39 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                     return ThreadPool.Names.SAME;
                 }
             };
+        }
+
+        /**
+         * Tell the listener about a node that will not answer, on the
+         * notify pool: this runs from the transport thread that delivered
+         * the exception (or the timeout handler's thread), and the
+         * listener formats a log line and sends a cancel request, neither
+         * of which belongs on a transport thread. The node is counted as
+         * incomplete before this is called, so a pool that refuses the
+         * runnable only costs the log line and the cancel of that
+         * executor, which the timeout has already detached from the
+         * request; the fan-out itself completes as before.
+         */
+        private void notifyIncomplete(DiscoveryNode node, LanceFragmentQueryRequest request, TransportException cause) {
+            try {
+                notifyExecutor.execute(() -> {
+                    try {
+                        incompleteListener.onIncomplete(node, request, cause);
+                    } catch (Exception e) {
+                        LOGGER.warn(
+                            "lance.dispatch: the incomplete node listener failed for node [{}]",
+                            node == null ? "?" : node.getId(),
+                            e
+                        );
+                    }
+                });
+            } catch (Exception rejected) {
+                LOGGER.warn(
+                    "lance.dispatch: could not report node [{}] as incomplete on the coordinator pool: {}",
+                    node == null ? "?" : node.getId(),
+                    rejected.toString()
+                );
+            }
         }
 
         /**
@@ -813,16 +867,24 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             );
         }
 
+        private boolean isCancelled() {
+            return task != null && task.isCancelled();
+        }
+
+        private TaskCancelledException cancelled() {
+            return new TaskCancelledException("cancelled task with reason: " + task.getReasonCancelled());
+        }
+
         private void ensureNotCancelled() {
-            if (task != null && task.isCancelled()) {
-                throw new TaskCancelledException("cancelled task with reason: " + task.getReasonCancelled());
+            if (isCancelled()) {
+                throw cancelled();
             }
         }
 
         /** {@code e}, or a {@link TaskCancelledException} carrying it when the coordinator task has been cancelled. */
         private Exception cancelledOr(Exception e) {
-            if (task != null && task.isCancelled()) {
-                TaskCancelledException cancelled = new TaskCancelledException("cancelled task with reason: " + task.getReasonCancelled());
+            if (isCancelled()) {
+                TaskCancelledException cancelled = cancelled();
                 cancelled.addSuppressed(e);
                 return cancelled;
             }

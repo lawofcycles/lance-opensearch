@@ -1040,8 +1040,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
                 "/" + indexName + "/_search",
                 "{\"size\":5,\"query\":" + slowScriptQuery(900_000) + "}"
             );
-            awaitTasks(client(), "*lance/fragment_query*", 1);
-            assertEquals(1, tasksOf(client(), "*lance/coordinator*").size());
+            awaitFragmentQueryRunning(client(), 1);
 
             String cancelled = readAll(postJson("/_tasks/_cancel?actions=indices:data/read/search", ""));
             assertTrue("the cancel must name the search task: " + cancelled, cancelled.contains("indices:data/read/search"));
@@ -1065,7 +1064,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
                 "/" + indexName + "/_search",
                 "{\"size\":5,\"query\":" + slowScriptQuery(900_000) + "}"
             );
-            awaitTasks(client(), "*lance/fragment_query*", 1);
+            awaitFragmentQueryRunning(client(), 1);
 
             postJson("/_tasks/_cancel?actions=*lance/coordinator*", "");
 

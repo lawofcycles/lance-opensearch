@@ -1510,7 +1510,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 "/" + indexName + "/_search",
                 "{\"size\":5,\"sort\":[{\"id\":\"asc\"}],\"query\":" + LanceRestTestCase.slowScriptQuery(900_000) + "}"
             );
-            List<Map<String, Object>> executors = LanceRestTestCase.awaitTasks(client(), "*lance/fragment_query*", 3);
+            List<Map<String, Object>> executors = LanceRestTestCase.awaitFragmentQueryRunning(client(), 3);
             String victim = (String) executors.get(0).get("node");
             String cancelled = readAll(postJson("/_tasks/_cancel?nodes=" + victim + "&actions=*lance/fragment_query*", ""));
             assertTrue("the cancel must name one executor task: " + cancelled, cancelled.contains("lance/fragment_query"));
