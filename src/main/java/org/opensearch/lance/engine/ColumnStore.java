@@ -212,7 +212,7 @@ public final class ColumnStore implements Closeable {
     }
 
     /**
-     * Same as {@link #acquire(SnapshotKey, Dataset, String, boolean, Map)}
+     * Same as {@link #acquire(SnapshotKey, Dataset, String, boolean, Map, FragmentGroupScan)}
      * for a single-valued keyword (Utf8) column: each stored entry holds
      * the fragment's sorted term dictionary and per-row ordinals. The
      * dictionary size is only known after the scan, so when the missing
