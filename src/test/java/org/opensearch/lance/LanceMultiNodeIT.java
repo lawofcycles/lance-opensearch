@@ -936,6 +936,159 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    /**
+     * The wider allow list on three executors: every fragment path answer
+     * equals the shard path's for the exact aggregations (stats,
+     * extended_stats, range, date_range, filters, missing, hdr
+     * percentiles, composite with paging over a date_histogram or terms
+     * sources), and the sketches (tdigest percentiles, cardinality) stay
+     * within their error of the single shard's value. Twelve fragments of
+     * 25 rows, four per node: composite pages are merged from three
+     * executors, each having applied the {@code after} key on its own.
+     * The executors' DEBUG lines show every node answered with its four
+     * fragments.
+     */
+    @SuppressWarnings("unchecked")
+    public void testWiderAllowListAcrossThreeNodes() throws Exception {
+        String suffix = "mn-allow-list-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 12;
+        int rowsPerFragment = 25;
+        LanceTableFactory.writeInterleavedTable(scratchDir, tableName, fragments, rowsPerFragment);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String[] exact = {
+            "\"size\":0,\"aggs\":{\"s\":{\"stats\":{\"field\":\"id\"}},\"es\":{\"extended_stats\":{\"field\":\"id\"}}}",
+            "\"size\":0,\"aggs\":{\"r\":{\"range\":{\"field\":\"id\",\"ranges\":[{\"to\":100},{\"from\":100,\"to\":200},{\"from\":200}]},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}",
+            "\"size\":0,\"aggs\":{\"d\":{\"date_range\":{\"field\":\"ts\",\"format\":\"yyyy-MM-dd\",\"ranges\":[{\"to\":\"2024-04-01\"},{\"from\":\"2024-04-01\"}]}}}",
+            "\"size\":0,\"aggs\":{\"fs\":{\"filters\":{\"other_bucket\":true,\"filters\":{\"even\":{\"range\":{\"id\":{\"lt\":150}}},\"c1\":{\"term\":{\"category\":\"c1\"}}}}}}",
+            "\"size\":0,\"aggs\":{\"m\":{\"missing\":{\"field\":\"category\"}}}",
+            "\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"id\",\"percents\":[10,50,90],\"hdr\":{\"number_of_significant_value_digits\":3}}}}",
+            "\"size\":0,\"query\":{\"term\":{\"category\":\"c2\"}},\"aggs\":{\"c\":{\"composite\":{\"size\":4,\"sources\":[{\"month\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}}]},\"aggs\":{\"mx\":{\"max\":{\"field\":\"id\"}}}}}" };
+        String firstPage =
+            "\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":7,\"sources\":[{\"cat\":{\"terms\":{\"field\":\"category\"}}},{\"i\":{\"terms\":{\"field\":\"id\"}}}]}}}";
+        try {
+            updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+
+            for (String shape : exact) {
+                assertAggregationsMatchShardPath(indexName, shape);
+            }
+
+            // Composite paging: every page and its after_key equal the
+            // shard path's, and the pages cover the 300 (category, id)
+            // pairs without a repeat.
+            Map<String, Object> page = assertAggregationsMatchShardPath(indexName, firstPage);
+            Map<String, Object> afterKey = (Map<String, Object>) aggregationOf(page, "c").get("after_key");
+            assertEquals("c0", afterKey.get("cat"));
+            assertEquals(18, ((Number) afterKey.get("i")).intValue());
+            List<String> keys = new ArrayList<>();
+            for (Map<String, Object> bucket : buckets(page)) {
+                keys.add(String.valueOf(bucket.get("key")));
+            }
+            for (int pages = 0; pages < 3; pages++) {
+                String after = "{\"cat\":\"" + afterKey.get("cat") + "\",\"i\":" + afterKey.get("i") + "}";
+                page = assertAggregationsMatchShardPath(
+                    indexName,
+                    "\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":7,\"after\":"
+                        + after
+                        + ",\"sources\":[{\"cat\":{\"terms\":{\"field\":\"category\"}}},{\"i\":{\"terms\":{\"field\":\"id\"}}}]}}}"
+                );
+                for (Map<String, Object> bucket : buckets(page)) {
+                    keys.add(String.valueOf(bucket.get("key")));
+                }
+                afterKey = (Map<String, Object>) aggregationOf(page, "c").get("after_key");
+            }
+            assertEquals(28, keys.size());
+            assertEquals(28, keys.stream().distinct().count());
+            assertEquals("{cat=c0, i=81}", keys.get(27));
+
+            // tdigest percentiles: three sketches merged against one.
+            String tdigest = "{\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"id\"}}}}";
+            Map<String, Object> viaFragments = parse(readAll(postJson("/" + indexName + "/_search", tdigest)));
+            Map<String, Object> viaShard = parse(
+                readAll(postJson("/" + indexName + "/_search?request_cache=false", "{\"explain\":true," + tdigest.substring(1)))
+            );
+            Map<String, Object> fragmentValues = (Map<String, Object>) aggregationOf(viaFragments, "p").get("values");
+            Map<String, Object> shardValues = (Map<String, Object>) aggregationOf(viaShard, "p").get("values");
+            assertEquals(shardValues.keySet(), fragmentValues.keySet());
+            for (String percentile : shardValues.keySet()) {
+                double expected = ((Number) shardValues.get(percentile)).doubleValue();
+                double actual = ((Number) fragmentValues.get(percentile)).doubleValue();
+                assertTrue(
+                    "percentile " + percentile + ": shard path " + expected + ", fragment path " + actual,
+                    Math.abs(expected - actual) <= 0.01d * Math.max(Math.abs(expected), 1d)
+                );
+            }
+
+            // cardinality: 300 distinct ids and 3 categories, both under
+            // the default precision threshold, so the merged sketches are
+            // within one percent of the truth.
+            Map<String, Object> counted = parse(
+                readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":0,\"aggs\":{\"ids\":{\"cardinality\":{\"field\":\"id\"}},\"cats\":{\"cardinality\":{\"field\":\"category\"}}}}"
+                    )
+                )
+            );
+            double ids = ((Number) aggregationOf(counted, "ids").get("value")).doubleValue();
+            assertTrue("cardinality(id) " + ids, Math.abs(ids - 300d) <= 3d);
+            assertEquals(3, ((Number) aggregationOf(counted, "cats").get("value")).intValue());
+
+            // Every data node executed its four fragments for these
+            // requests: the executor logs one line per request with its
+            // fragment count and duration.
+            assertBusy(() -> {
+                Map<String, Integer> perNode = new HashMap<>();
+                for (String line : clusterLogLines()) {
+                    if (!line.contains("lance.dispatch: fragment query for [" + indexName + "] over 4 fragments took ")) {
+                        continue;
+                    }
+                    perNode.merge(loggingNodeName(line), 1, Integer::sum);
+                }
+                assertEquals("executor lines on " + perNode, dataNodeCount(), perNode.size());
+            });
+        } finally {
+            try {
+                updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", null);
+            } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Run {@code shape} through the fragment path and, with
+     * {@code "explain": true}, through the shard path, and assert the two
+     * responses carry the same {@code hits.total} and the same
+     * {@code aggregations} block. Returns the fragment path response.
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> assertAggregationsMatchShardPath(String indexName, String shape) throws IOException {
+        Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
+        Map<String, Object> shardPath = parse(
+            readAll(postJson("/" + indexName + "/_search?request_cache=false", "{\"explain\":true," + shape + "}"))
+        );
+        assertEquals(
+            shape,
+            ((Map<String, Object>) shardPath.get("hits")).get("total"),
+            ((Map<String, Object>) fragmentPath.get("hits")).get("total")
+        );
+        assertEquals(shape, shardPath.get("aggregations"), fragmentPath.get("aggregations"));
+        return fragmentPath;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> aggregationOf(Map<String, Object> response, String name) {
+        return (Map<String, Object>) ((Map<String, Object>) response.get("aggregations")).get(name);
+    }
+
     /** Name of the elected cluster manager, from {@code GET /_cat/cluster_manager}. */
     private static String clusterManagerNodeName() throws IOException {
         String name = readAll(client().performRequest(new Request("GET", "/_cat/cluster_manager?h=node"))).trim();

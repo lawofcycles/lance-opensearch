@@ -282,7 +282,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // breaker into OOM.
             concurrencyLimit.acquire();
             acquired = true;
+            long start = System.nanoTime();
             LanceFragmentQueryResponse response = execute(request);
+            LOGGER.debug(
+                "lance.dispatch: fragment query for [{}] over {} fragments took {} us",
+                request.indexName(),
+                request.fragmentIds().isEmpty() ? "all" : Integer.toString(request.fragmentIds().size()),
+                (System.nanoTime() - start) / 1_000L
+            );
             listener.onResponse(response);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
