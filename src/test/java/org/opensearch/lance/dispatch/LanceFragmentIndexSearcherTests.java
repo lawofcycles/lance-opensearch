@@ -7,14 +7,19 @@ package org.opensearch.lance.dispatch;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.lucene.document.Document;
@@ -47,6 +52,8 @@ import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.cache.query.DisabledQueryCache;
+import org.opensearch.script.ScriptModule;
+import org.opensearch.script.ScriptService;
 import org.opensearch.search.aggregations.BucketCollector;
 import org.opensearch.search.aggregations.BucketCollectorProcessor;
 import org.opensearch.search.aggregations.LeafBucketCollector;
@@ -271,6 +278,19 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
                 assertEquals("one collector per slice", searcher.getSlices().length, manager.created.get());
                 assertEquals("every slice's collector went through post collection", manager.created.get(), processed.size());
 
+                // The slices really ran on several threads: a manager
+                // whose collectors wait for each other at a barrier can
+                // only complete when every slice collects at once, which
+                // the calling thread alone could never do. A silent fall
+                // back to the calling thread would time out here.
+                CountingManager barrier = new CountingManager(new CyclicBarrier(searcher.getSlices().length));
+                assertEquals(TOTAL, searcher.search(MatchAllDocsQuery.INSTANCE, barrier).intValue());
+                assertEquals(searcher.getSlices().length, barrier.threads.size());
+                assertTrue("a pool thread collected: " + barrier.threads, barrier.threads.size() > 1);
+                Set<String> others = new HashSet<>(barrier.threads);
+                others.remove(Thread.currentThread().getName());
+                assertFalse("a thread other than the caller collected: " + barrier.threads, others.isEmpty());
+
                 TopFieldDocs sliced = searcher.search(
                     MatchAllDocsQuery.INSTANCE,
                     new TopFieldCollectorManager(sort, 3, null, Integer.MAX_VALUE)
@@ -344,7 +364,16 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
         try (LanceFragmentSearchContext context = newContext()) {
             assertFalse(context.withTargetMaxSliceCount(1).partialOnShard().isSliceLevel());
             assertFalse(context.partialOnShard().isFinalReduce());
-            assertTrue(context.withTargetMaxSliceCount(2).partialOnShard().isSliceLevel());
+            // Several slices without a script service: the slice level
+            // reduce must not run with a null service, so the context
+            // refuses to build its reduce context.
+            IllegalStateException refused = expectThrows(
+                IllegalStateException.class,
+                () -> context.withTargetMaxSliceCount(2).partialOnShard()
+            );
+            assertTrue(refused.getMessage(), refused.getMessage().contains("withScriptService"));
+            context.withScriptService(new ScriptService(Settings.EMPTY, Map.of(), ScriptModule.CORE_CONTEXTS));
+            assertTrue(context.partialOnShard().isSliceLevel());
             assertFalse(context.partialOnShard().isFinalReduce());
         }
     }
@@ -352,16 +381,28 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
     /**
      * One {@link CountingBucketCollector} per {@code newCollector} call;
      * {@code reduce} sums their counts. Records the threads that
-     * collected so a test can tell where the slices ran.
+     * collected so a test can tell where the slices ran. With a
+     * {@link CyclicBarrier}, every collector waits at its first leaf
+     * until as many collectors have reached theirs, which only several
+     * threads collecting at once can satisfy.
      */
     private static final class CountingManager implements CollectorManager<CountingBucketCollector, Integer> {
         final AtomicInteger created = new AtomicInteger();
         final Set<String> threads = ConcurrentHashMap.newKeySet();
+        private final CyclicBarrier barrier;
+
+        CountingManager() {
+            this(null);
+        }
+
+        CountingManager(CyclicBarrier barrier) {
+            this.barrier = barrier;
+        }
 
         @Override
         public CountingBucketCollector newCollector() {
             created.incrementAndGet();
-            return new CountingBucketCollector(threads);
+            return new CountingBucketCollector(threads, barrier);
         }
 
         @Override
@@ -378,18 +419,29 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
 
         final AtomicInteger collected = new AtomicInteger();
         private final Set<String> threads;
+        private final CyclicBarrier barrier;
+        private boolean waited;
 
         CountingBucketCollector() {
-            this(ConcurrentHashMap.newKeySet());
+            this(ConcurrentHashMap.newKeySet(), null);
         }
 
-        CountingBucketCollector(Set<String> threads) {
+        CountingBucketCollector(Set<String> threads, CyclicBarrier barrier) {
             this.threads = threads;
+            this.barrier = barrier;
         }
 
         @Override
-        public LeafBucketCollector getLeafCollector(LeafReaderContext ctx) {
+        public LeafBucketCollector getLeafCollector(LeafReaderContext ctx) throws IOException {
             threads.add(Thread.currentThread().getName());
+            if (barrier != null && !waited) {
+                waited = true;
+                try {
+                    barrier.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException | BrokenBarrierException | TimeoutException e) {
+                    throw new IOException("the slices did not collect at the same time", e);
+                }
+            }
             return new LeafBucketCollector() {
                 @Override
                 public void collect(int doc, long owningBucketOrd) {
