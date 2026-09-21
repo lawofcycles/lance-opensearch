@@ -181,6 +181,14 @@ public class LanceDispatchActionFilter implements ActionFilter {
         // retried on the shard path: that would run the whole table
         // through one node's shard under the very load that made the
         // fragment path refuse, and hide the overload from the client.
+        //
+        // The coordinator's task is registered as a child of this
+        // search task: cancelling the search task (a client that
+        // closes its connection, _tasks/_cancel on
+        // indices:data/read/search) then reaches the coordinator task,
+        // and through it the per-node executor tasks, instead of
+        // leaving them to run to the end.
+        searchRequest.setParentTask(clusterService.localNode().getId(), task.getId());
         @SuppressWarnings("unchecked")
         final ActionListener<SearchResponse> typedListener = (ActionListener<SearchResponse>) listener;
         AbstractRunnable entry = new AbstractRunnable() {
