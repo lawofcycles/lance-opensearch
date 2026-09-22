@@ -15,6 +15,7 @@ import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.sql.SqlAggFunction;
 import org.apache.calcite.sql.fun.SqlLibraryOperators;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
@@ -267,33 +268,44 @@ final class AggregationToRel {
         }
 
         /**
-         * Projects the key expressions and the metric argument columns,
-         * then builds the aggregate over the projection. Key fields take
-         * the bucket aggregation names, metric arguments their column
-         * names; the builder uniquifies clashes.
+         * Projects the key expressions followed by a pass through of
+         * every scan column, then builds the aggregate over the
+         * projection. Key fields take the bucket aggregation names, the
+         * pass through columns their own names (the builder uniquifies
+         * clashes); metric arguments and the stored filter predicates
+         * reference the pass through positions, so both are valid over
+         * the aggregate's input row type.
          */
         private RelNode assemble() {
             int keyCount = keyExpressions.size();
+            RelDataType scanRowType = relBuilder.peek().getRowType();
             List<RexNode> projections = new ArrayList<>(keyExpressions);
-            List<String> names = new ArrayList<>(projections.size());
+            List<String> names = new ArrayList<>(keyCount + scanRowType.getFieldCount());
             for (BucketSpec spec : bucketSpecs) {
                 names.add(spec.aggregationName());
             }
-            Map<String, Integer> argPositions = new LinkedHashMap<>();
-            for (MetricIntent metric : metrics) {
-                argPositions.computeIfAbsent(metric.column().name(), column -> {
-                    projections.add(relBuilder.field(column));
-                    names.add(column);
-                    return projections.size() - 1;
-                });
+            for (int i = 0; i < scanRowType.getFieldCount(); i++) {
+                projections.add(relBuilder.field(i));
+                names.add(scanRowType.getFieldList().get(i).getName());
             }
             relBuilder.project(projections, names, true);
             RelNode input = relBuilder.build();
             List<AggregateCall> calls = new ArrayList<>(metrics.size());
             for (MetricIntent metric : metrics) {
-                calls.add(call(metric, argPositions.get(metric.column().name()), keyCount, input));
+                calls.add(call(metric, keyCount + metric.column().index(), keyCount, input));
             }
-            return LanceAggregate.create(input, ImmutableBitSet.range(keyCount), calls, bucketSpecs, specsOf(metrics), filterPredicates);
+            // The filter predicates were built over the scan; the pass
+            // through puts scan column i at position keyCount + i, so a
+            // uniform shift makes them expressions over the projection.
+            List<List<RexNode>> shiftedPredicates = new ArrayList<>(filterPredicates.size());
+            for (List<RexNode> perKey : filterPredicates) {
+                List<RexNode> shifted = new ArrayList<>(perKey.size());
+                for (RexNode predicate : perKey) {
+                    shifted.add(RexUtil.shift(predicate, keyCount));
+                }
+                shiftedPredicates.add(shifted);
+            }
+            return LanceAggregate.create(input, ImmutableBitSet.range(keyCount), calls, bucketSpecs, specsOf(metrics), shiftedPredicates);
         }
 
         /**
