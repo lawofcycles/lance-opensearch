@@ -287,6 +287,73 @@ public final class LanceOverrides {
     }
 
     /**
+     * The same overrides with every column key that appears in
+     * {@code renames} moved to its new name, preserving declaration
+     * order. The namespace poll calls this when the Lance table renamed
+     * a column (same field id, same Arrow type, new name), so the
+     * operator's {@code type} / {@code format} / {@code fields} rules
+     * and the {@code indexes} clause's per-column index preference
+     * follow the column instead of dangling on the old name. Keys not
+     * named in {@code renames} are untouched. A rename whose target
+     * name already carries its own declared entry loses to that
+     * declaration (the operator named the new column explicitly).
+     * Returns {@code this} when nothing changes.
+     */
+    public LanceOverrides withRenamedColumns(Map<String, String> renames) {
+        if (renames == null || renames.isEmpty() || isEmpty()) {
+            return this;
+        }
+        boolean changed = false;
+        LinkedHashMap<String, Column> outColumns = new LinkedHashMap<>();
+        for (Map.Entry<String, Column> entry : columns.entrySet()) {
+            String newName = renames.get(entry.getKey());
+            if (newName == null || newName.equals(entry.getKey())) {
+                outColumns.put(entry.getKey(), entry.getValue());
+                continue;
+            }
+            changed = true;
+            if (columns.containsKey(newName)) {
+                // The target name has its own declared override; the
+                // renamed entry folds away rather than clobbering it.
+                continue;
+            }
+            outColumns.put(newName, entry.getValue());
+        }
+        LinkedHashMap<String, IndexPreference> outPreferences = new LinkedHashMap<>();
+        for (Map.Entry<String, IndexPreference> entry : indexPreferences.entrySet()) {
+            String newName = renames.get(entry.getKey());
+            if (newName == null || newName.equals(entry.getKey())) {
+                outPreferences.put(entry.getKey(), entry.getValue());
+                continue;
+            }
+            changed = true;
+            if (indexPreferences.containsKey(newName)) {
+                continue;
+            }
+            outPreferences.put(newName, entry.getValue());
+        }
+        return changed ? new LanceOverrides(outColumns, outPreferences) : this;
+    }
+
+    /**
+     * The same overrides without the named column's {@code type} /
+     * {@code format} / {@code fields} entry, or {@code this} when the
+     * column declares none. The namespace poll calls this when a schema
+     * reset gave the column an Arrow type its override no longer fits.
+     * The column's {@code indexes} preference, if any, stays: index
+     * preferences validate against the schema on their own and wait for
+     * a column shape that admits them.
+     */
+    public LanceOverrides withoutColumn(String baseName) {
+        if (!columns.containsKey(baseName)) {
+            return this;
+        }
+        LinkedHashMap<String, Column> out = new LinkedHashMap<>(columns);
+        out.remove(baseName);
+        return out.isEmpty() && indexPreferences.isEmpty() ? EMPTY : new LanceOverrides(out, new LinkedHashMap<>(indexPreferences));
+    }
+
+    /**
      * Compact canonical JSON for the {@code index.lance.overrides}
      * setting; empty string on empty overrides so the caller can skip
      * writing the setting at all.

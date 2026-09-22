@@ -1017,6 +1017,7 @@ public final class LanceNamespaceService {
                         // poll only advances the reader.
                         rederivedMappingJson = null;
                     } else if (target == latest) {
+                        storedOverrides = rewriteOverridesForSchemaDrift(indexName, storedOverrides, latestDataset.getLanceSchema());
                         RestAttachAction.Derivation derivation = RestAttachAction.derive(latestDataset, storedOverrides, true);
                         rederivedMappingJson = derivation.mappingJson();
                         warnOnLanceFieldRename(indexName, latestDataset.getLanceSchema());
@@ -1025,6 +1026,7 @@ public final class LanceNamespaceService {
                         // that snapshot so the mapping matches the schema
                         // the shard is about to read.
                         try (Dataset tagged = LanceRegistry.openDataset(table, storageOptions, Optional.of(target))) {
+                            storedOverrides = rewriteOverridesForSchemaDrift(indexName, storedOverrides, tagged.getLanceSchema());
                             RestAttachAction.Derivation derivation = RestAttachAction.derive(tagged, storedOverrides, true);
                             rederivedMappingJson = derivation.mappingJson();
                             warnOnLanceFieldRename(indexName, tagged.getLanceSchema());
@@ -1228,6 +1230,103 @@ public final class LanceNamespaceService {
     public void registerAttachedIndex(String indexName, String tablePath, long version, StorageOptions storageOptions, String tag) {
         attachedIndexes.put(indexName, new AttachedIndex(tablePath, storageOptions, tag));
         servedVersions.put(indexName, version);
+    }
+
+    /**
+     * Follow the operator's mapping overrides across schema drift before
+     * the mapping is re-derived. Two moves:
+     * <ul>
+     *   <li>Rename (a mapping field id now carries a different name in
+     *       the Lance schema): every override keyed by the old column
+     *       name is re-keyed to the new name, so the operator's
+     *       {@code type} / {@code format} / {@code fields} rules follow
+     *       the column and the re-derivation applies them to the new
+     *       name.</li>
+     *   <li>Reset (a column's Arrow type changed): the override is
+     *       checked against the new type. A still-valid override stays
+     *       ({@code type: date} on a column recast from Int64 to
+     *       Timestamp); an override the new type does not admit is
+     *       dropped from the setting with one warning naming the
+     *       column, the override and the new type, so the setting does
+     *       not carry a rule that can never apply again.</li>
+     * </ul>
+     * An override whose column is absent from the schema entirely is
+     * left in the setting, as ever: it waits for a manifest that
+     * restores the column.
+     *
+     * <p>The rewritten JSON is persisted with an update-settings call on
+     * {@code index.lance.overrides} (Dynamic for exactly this purpose).
+     * When persisting fails the stored overrides are returned unchanged
+     * and the rewrite retries on the next poll cycle.
+     */
+    private LanceOverrides rewriteOverridesForSchemaDrift(String indexName, LanceOverrides stored, LanceSchema lanceSchema) {
+        if (stored.isEmpty()) {
+            return stored;
+        }
+        Map<Integer, MappingFieldInfo> mappingFieldIds;
+        try {
+            mappingFieldIds = readMappingFieldIds(indexName);
+        } catch (Exception e) {
+            LOG.debug("could not inspect mapping meta for {}: {}", indexName, e.getMessage());
+            return stored;
+        }
+        Map<String, LanceField> lanceFieldsByName = new LinkedHashMap<>();
+        for (LanceField field : lanceSchema.fields()) {
+            lanceFieldsByName.put(field.getName(), field);
+        }
+        // Old name -> new name for every field id whose name moved.
+        // A reset (different Arrow type under the same id) re-keys too:
+        // the compatibility check below decides whether the override
+        // survives on the new name.
+        Map<String, String> renames = new LinkedHashMap<>();
+        for (LanceField field : lanceSchema.fields()) {
+            MappingFieldInfo mapped = mappingFieldIds.get(field.getId());
+            if (mapped != null && !mapped.name.equals(field.getName())) {
+                renames.put(mapped.name, field.getName());
+            }
+        }
+        LanceOverrides rewritten = stored.withRenamedColumns(renames);
+        // Compatibility: a column present in the schema must still admit
+        // its override. Covers in-place type changes (same name, new
+        // Arrow type) and renamed-plus-reset ids alike.
+        for (Map.Entry<String, LanceOverrides.Column> entry : new LinkedHashMap<>(rewritten.columns()).entrySet()) {
+            LanceField field = lanceFieldsByName.get(entry.getKey());
+            if (field == null) {
+                continue;
+            }
+            try {
+                RestAttachAction.validateColumnOverride(entry.getKey(), entry.getValue(), field, lanceFieldsByName.keySet());
+            } catch (IllegalArgumentException e) {
+                rewritten = rewritten.withoutColumn(entry.getKey());
+                String key = indexName + ":override-drop:" + entry.getKey() + ":" + field.getType();
+                if (warnedRenamed.add(key)) {
+                    LOG.warn(
+                        "dropping mapping override on column '{}' of {}: the Lance schema reset the column to {} and the "
+                            + "override no longer applies ({})",
+                        entry.getKey(),
+                        indexName,
+                        field.getType(),
+                        e.getMessage()
+                    );
+                }
+            }
+        }
+        if (rewritten.equals(stored)) {
+            return stored;
+        }
+        try {
+            client.admin()
+                .indices()
+                .prepareUpdateSettings(indexName)
+                .setSettings(Settings.builder().put(LanceEngineFactory.OVERRIDES_SETTING, rewritten.toJson()).build())
+                .execute()
+                .actionGet();
+            LOG.info("rewrote index.lance.overrides of {} after a Lance schema change: {}", indexName, rewritten.toJson());
+            return rewritten;
+        } catch (Exception e) {
+            LOG.warn("could not persist rewritten overrides for {}: {}", indexName, e.getMessage());
+            return stored;
+        }
     }
 
     /**
@@ -1441,7 +1540,11 @@ public final class LanceNamespaceService {
     /**
      * Read Lance-related meta off every top-level field in the current
      * mapping. Fields without {@code meta.lance_field_id} (older indexes,
-     * non-Lance mappings) are skipped. Returns a map from Lance field id
+     * non-Lance mappings) are skipped, and so are fields already marked
+     * {@code lance_dropped}: after a rename both the stale and the live
+     * name carry the same field id, and drift detection must see the
+     * live one only, or every later poll would re-detect the rename the
+     * mapping already recorded. Returns a map from Lance field id
      * to the field's OpenSearch name, type, Arrow type identifier, and
      * remaining top-level options (so a subsequent update can round-trip
      * the field unchanged).
@@ -1464,6 +1567,9 @@ public final class LanceNamespaceService {
             }
             Object meta = field.get("meta");
             if (!(meta instanceof Map<?, ?> metaMap)) {
+                continue;
+            }
+            if ("true".equals(metaMap.get("lance_dropped"))) {
                 continue;
             }
             Object rawId = metaMap.get("lance_field_id");

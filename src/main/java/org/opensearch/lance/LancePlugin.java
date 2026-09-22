@@ -182,13 +182,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * manifest version advance. Empty means no overrides declared. New
      * attaches write this setting only; {@link #MULTI_FIELDS_SETTING}
      * stays registered so indexes created before it existed keep
-     * opening.
+     * opening. Dynamic rather than Final because the namespace poll
+     * itself rewrites the value when the Lance table renames an
+     * overridden column (the override follows the column to its new
+     * name) or resets one to a type the override no longer fits.
      */
     public static final Setting<String> OVERRIDES_SETTING = Setting.simpleString(
         LanceEngineFactory.OVERRIDES_SETTING,
         "",
         Setting.Property.IndexScope,
-        Setting.Property.Final
+        Setting.Property.Dynamic
     );
     public static final Setting<String> UNCOVERED_FRAGMENT_POLICY_SETTING = Setting.simpleString(
         "index.lance.uncovered_fragment_policy",
