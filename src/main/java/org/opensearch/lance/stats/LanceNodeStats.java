@@ -65,6 +65,28 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     private final String warmUpMode;
     private final List<LanceWarmUpStatus> warmUps;
     private final List<IndexReaderStats> indices;
+    private final List<LocalCloneStats> localClones;
+
+    /**
+     * One node-local shallow clone directory on this node (an index
+     * attached with {@code index.lance.index_placement = node_local}):
+     * the bytes its files occupy under the node's data path (manifests
+     * and search-index files only; data files stay in the source) and
+     * the source manifest version the clone was created at.
+     */
+    public record LocalCloneStats(String index, long bytes, long sourceVersion) implements Writeable {
+
+        public LocalCloneStats(StreamInput in) throws IOException {
+            this(in.readString(), in.readVLong(), in.readLong());
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeString(index);
+            out.writeVLong(bytes);
+            out.writeLong(sourceVersion);
+        }
+    }
 
     /**
      * The shard reader of one Lance-backed index this node hosts: the
@@ -141,6 +163,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             0L,
             "none",
             List.of(),
+            List.of(),
             List.of()
         );
     }
@@ -171,7 +194,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         long ftsAdmissionLastEstimateBytes,
         String warmUpMode,
         List<LanceWarmUpStatus> warmUps,
-        List<IndexReaderStats> indices
+        List<IndexReaderStats> indices,
+        List<LocalCloneStats> localClones
     ) {
         this.cacheEnabled = cacheEnabled;
         this.snapshotCount = snapshotCount;
@@ -199,6 +223,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.warmUpMode = warmUpMode;
         this.warmUps = List.copyOf(warmUps);
         this.indices = List.copyOf(indices);
+        this.localClones = List.copyOf(localClones);
     }
 
     public LanceNodeStats(StreamInput in) throws IOException {
@@ -233,6 +258,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         }
         this.warmUps = List.copyOf(read);
         this.indices = in.readList(IndexReaderStats::new);
+        this.localClones = in.readList(LocalCloneStats::new);
     }
 
     @Override
@@ -266,6 +292,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             warmUp.writeTo(out);
         }
         out.writeList(indices);
+        out.writeList(localClones);
     }
 
     @Override
@@ -329,7 +356,20 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             builder.endObject();
         }
         builder.endObject();
+
+        builder.startObject("local_clones");
+        for (LocalCloneStats clone : localClones) {
+            builder.startObject(clone.index());
+            builder.field("local_clone_bytes", clone.bytes());
+            builder.field("source_version", clone.sourceVersion());
+            builder.endObject();
+        }
+        builder.endObject();
         return builder;
+    }
+
+    public List<LocalCloneStats> localClones() {
+        return localClones;
     }
 
     public boolean cacheEnabled() {
@@ -476,7 +516,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && ftsAdmissionLastEstimateBytes == other.ftsAdmissionLastEstimateBytes
             && warmUpMode.equals(other.warmUpMode)
             && warmUps.equals(other.warmUps)
-            && indices.equals(other.indices);
+            && indices.equals(other.indices)
+            && localClones.equals(other.localClones);
     }
 
     @Override
@@ -507,7 +548,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             ftsAdmissionLastEstimateBytes,
             warmUpMode,
             warmUps,
-            indices
+            indices,
+            localClones
         );
     }
 }

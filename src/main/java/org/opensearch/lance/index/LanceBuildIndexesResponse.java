@@ -6,7 +6,9 @@
 package org.opensearch.lance.index;
 
 import java.io.IOException;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 import org.opensearch.common.xcontent.StatusToXContentObject;
@@ -144,6 +146,67 @@ public final class LanceBuildIndexesResponse extends ActionResponse implements S
         }
     }
 
+    /**
+     * One data node's leg of a {@code node_local} build: its per-kind
+     * results, or an {@code error} message when the whole leg failed
+     * (the node was unreachable or its clone could not be created).
+     */
+    public static final class NodeResult implements Writeable {
+        private final KindResult fts;
+        private final KindResult scalar;
+        private final KindResult vector;
+        private final String error;
+
+        public NodeResult(KindResult fts, KindResult scalar, KindResult vector, String error) {
+            this.fts = fts;
+            this.scalar = scalar;
+            this.vector = vector;
+            this.error = error;
+        }
+
+        public NodeResult(StreamInput in) throws IOException {
+            if (in.readBoolean()) {
+                this.fts = new KindResult(in);
+                this.scalar = new KindResult(in);
+                this.vector = new KindResult(in);
+            } else {
+                this.fts = null;
+                this.scalar = null;
+                this.vector = null;
+            }
+            this.error = in.readOptionalString();
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            if (fts != null) {
+                out.writeBoolean(true);
+                fts.writeTo(out);
+                scalar.writeTo(out);
+                vector.writeTo(out);
+            } else {
+                out.writeBoolean(false);
+            }
+            out.writeOptionalString(error);
+        }
+
+        public KindResult fts() {
+            return fts;
+        }
+
+        public KindResult scalar() {
+            return scalar;
+        }
+
+        public KindResult vector() {
+            return vector;
+        }
+
+        public String error() {
+            return error;
+        }
+    }
+
     private final String index;
     private final KindResult fts;
     private final KindResult scalar;
@@ -151,6 +214,12 @@ public final class LanceBuildIndexesResponse extends ActionResponse implements S
     private final List<String> columnsFilter;
     private final List<Integer> fragmentIds;
     private final RestStatus status;
+    /**
+     * Per data node outcomes of a {@code node_local} build, keyed by node
+     * id; {@code null} for the in-table build, whose single commit has no
+     * per-node story.
+     */
+    private final Map<String, NodeResult> nodes;
 
     public LanceBuildIndexesResponse(
         String index,
@@ -161,6 +230,19 @@ public final class LanceBuildIndexesResponse extends ActionResponse implements S
         List<Integer> fragmentIds,
         RestStatus status
     ) {
+        this(index, fts, scalar, vector, columnsFilter, fragmentIds, status, null);
+    }
+
+    public LanceBuildIndexesResponse(
+        String index,
+        KindResult fts,
+        KindResult scalar,
+        KindResult vector,
+        List<String> columnsFilter,
+        List<Integer> fragmentIds,
+        RestStatus status,
+        Map<String, NodeResult> nodes
+    ) {
         this.index = index;
         this.fts = Objects.requireNonNull(fts, "fts");
         this.scalar = Objects.requireNonNull(scalar, "scalar");
@@ -168,6 +250,7 @@ public final class LanceBuildIndexesResponse extends ActionResponse implements S
         this.columnsFilter = columnsFilter == null ? null : List.copyOf(columnsFilter);
         this.fragmentIds = fragmentIds == null ? null : List.copyOf(fragmentIds);
         this.status = Objects.requireNonNull(status, "status");
+        this.nodes = nodes == null ? null : new LinkedHashMap<>(nodes);
     }
 
     public LanceBuildIndexesResponse(StreamInput in) throws IOException {
@@ -180,6 +263,16 @@ public final class LanceBuildIndexesResponse extends ActionResponse implements S
         this.columnsFilter = columnsFilterIn == null ? null : List.copyOf(columnsFilterIn);
         this.fragmentIds = in.readBoolean() ? List.copyOf(in.readList(StreamInput::readVInt)) : null;
         this.status = RestStatus.readFrom(in);
+        if (in.readBoolean()) {
+            int size = in.readVInt();
+            LinkedHashMap<String, NodeResult> read = new LinkedHashMap<>();
+            for (int i = 0; i < size; i++) {
+                read.put(in.readString(), new NodeResult(in));
+            }
+            this.nodes = read;
+        } else {
+            this.nodes = null;
+        }
     }
 
     @Override
@@ -196,6 +289,16 @@ public final class LanceBuildIndexesResponse extends ActionResponse implements S
             out.writeCollection(fragmentIds, StreamOutput::writeVInt);
         }
         RestStatus.writeTo(out, status);
+        if (nodes == null) {
+            out.writeBoolean(false);
+        } else {
+            out.writeBoolean(true);
+            out.writeVInt(nodes.size());
+            for (Map.Entry<String, NodeResult> entry : nodes.entrySet()) {
+                out.writeString(entry.getKey());
+                entry.getValue().writeTo(out);
+            }
+        }
     }
 
     public String index() {
@@ -236,6 +339,11 @@ public final class LanceBuildIndexesResponse extends ActionResponse implements S
         return fragmentIds;
     }
 
+    /** Per node outcomes of a {@code node_local} build, or {@code null} for the in-table build. */
+    public Map<String, NodeResult> nodes() {
+        return nodes;
+    }
+
     /** True when at least one column, of any kind, is listed under {@code failed}. */
     public boolean hasFailures() {
         return !fts.failed().isEmpty() || !scalar.failed().isEmpty() || !vector.failed().isEmpty();
@@ -265,6 +373,34 @@ public final class LanceBuildIndexesResponse extends ActionResponse implements S
         columnResults(b, "scalar", scalar.failed(), params);
         columnResults(b, "vector", vector.failed(), params);
         b.endObject();
+        if (nodes != null) {
+            b.startObject("nodes");
+            for (Map.Entry<String, NodeResult> entry : nodes.entrySet()) {
+                b.startObject(entry.getKey());
+                NodeResult node = entry.getValue();
+                if (node.error() != null) {
+                    b.field("error", node.error());
+                } else {
+                    b.startObject("built");
+                    b.field("fts", node.fts().built());
+                    b.field("scalar", node.scalar().built());
+                    b.field("vector", node.vector().built());
+                    b.endObject();
+                    b.startObject("skipped");
+                    columnResults(b, "fts", node.fts().skipped(), params);
+                    columnResults(b, "scalar", node.scalar().skipped(), params);
+                    columnResults(b, "vector", node.vector().skipped(), params);
+                    b.endObject();
+                    b.startObject("failed");
+                    columnResults(b, "fts", node.fts().failed(), params);
+                    columnResults(b, "scalar", node.scalar().failed(), params);
+                    columnResults(b, "vector", node.vector().failed(), params);
+                    b.endObject();
+                }
+                b.endObject();
+            }
+            b.endObject();
+        }
         if (columnsFilter != null) {
             b.field("columns_filter", columnsFilter);
         }
