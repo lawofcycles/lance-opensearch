@@ -98,10 +98,7 @@ public class LanceIpWildcardIT extends LanceRestTestCase {
 
             // Ascending sort follows address order (10.0.0.2 mapped row
             // first, 10.0.0.4 before 10.0.0.30). The exists query keeps
-            // the request on the Lucene collector path, which reads the
-            // encoded doc values; a plain match_all + sort page takes
-            // the Lance sorted-scan pushdown, which cannot order an ip
-            // column yet (see the pull request's blocker note).
+            // the invalid row out of the page.
             String sortBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":6,\"query\":{\"exists\":{\"field\":\"ip\"}},\"sort\":[{\"ip\":\"asc\"}]}")
             );
@@ -113,8 +110,9 @@ public class LanceIpWildcardIT extends LanceRestTestCase {
             assertEquals(3, extractIntPath(sortBody, "hits", "hits", "4", "_source", "id"));
 
             // The invalid row sorts last as a missing value; the metric
-            // aggregation keeps this request off the sorted-scan
-            // pushdown too, and its _source keeps the original string.
+            // aggregation makes this a different request shape than the
+            // plain page below, and its _source keeps the original
+            // string.
             String sortAllBody = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -130,6 +128,25 @@ public class LanceIpWildcardIT extends LanceRestTestCase {
             );
             // The invalid row is present in _source with its original string.
             assertEquals("not-an-ip", stringPath(sortAllBody, "hits", "hits", "5", "_source", "ip"));
+
+            // A plain sorted page (match_all, size above zero, no
+            // aggregation) is the shape the Lance sorted-scan pushdown
+            // takes; the pushdown declines ip clauses so this page also
+            // comes from the Lucene collector, in address order, with
+            // sort values formatted as addresses.
+            String plainSortBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":6,\"query\":{\"match_all\":{}},\"sort\":[{\"ip\":\"asc\"}]}")
+            );
+            assertEquals(6, extractIntPath(plainSortBody, "hits", "total", "value"));
+            assertEquals(4, extractIntPath(plainSortBody, "hits", "hits", "0", "_source", "id"));
+            assertEquals(0, extractIntPath(plainSortBody, "hits", "hits", "1", "_source", "id"));
+            assertEquals(1, extractIntPath(plainSortBody, "hits", "hits", "2", "_source", "id"));
+            assertEquals(2, extractIntPath(plainSortBody, "hits", "hits", "3", "_source", "id"));
+            assertEquals(3, extractIntPath(plainSortBody, "hits", "hits", "4", "_source", "id"));
+            assertEquals(5, extractIntPath(plainSortBody, "hits", "hits", "5", "_source", "id"));
+            assertEquals("10.0.0.2", stringPath(plainSortBody, "hits", "hits", "0", "sort", "0"));
+            assertEquals("10.0.0.4", stringPath(plainSortBody, "hits", "hits", "1", "sort", "0"));
+            assertEquals("10.0.0.30", stringPath(plainSortBody, "hits", "hits", "2", "sort", "0"));
 
             // terms aggregation formats keys as canonical addresses; five
             // distinct values, the invalid row in no bucket.
