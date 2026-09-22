@@ -306,6 +306,9 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
                 (parser, ctx) -> parser.mapStrings(),
                 STORAGE_OPTIONS
             );
+            // Optional so gateway state written before the field existed
+            // still parses.
+            ENTRY_PARSER.declareString(ConstructingObjectParser.optionalConstructorArg(), OVERRIDES);
             ENTRY_PARSER.declareString(ConstructingObjectParser.optionalConstructorArg(), NAME);
             ENTRY_PARSER.declareString(ConstructingObjectParser.optionalConstructorArg(), CATALOG_TYPE);
             ENTRY_PARSER.declareObject(ConstructingObjectParser.optionalConstructorArg(), (parser, ctx) -> parser.mapStrings(), CONFIG);
@@ -333,6 +336,11 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
         /** Directory registration named after its root, carrying mapping overrides. */
         public Entry(String rootUri, StorageOptions storageOptions, String overridesJson) {
             this(rootUri, TYPE_DIRECTORY, rootUri, storageOptions, Map.of(), overridesJson);
+        }
+
+        /** Registration without mapping overrides. */
+        public Entry(String name, String type, String rootUri, StorageOptions storageOptions, Map<String, String> config) {
+            this(name, type, rootUri, storageOptions, config, "");
         }
 
         public Entry(
