@@ -1,8 +1,8 @@
 # lance-opensearch
 
-Distributed search layer over [Lance](https://github.com/lancedb/lance) tables for OpenSearch. Implementation of [RFC #22643](https://github.com/opensearch-project/OpenSearch/issues/22643).
+An OpenSearch plugin that surfaces [Lance](https://github.com/lancedb/lance) tables as searchable indexes. Implementation of [RFC #22643](https://github.com/opensearch-project/OpenSearch/issues/22643).
 
-Lance is an open columnar table format designed for machine learning workloads: multimodal columns, evolving embeddings, tables that receive concurrent writes from Ray or Spark, and time travel via manifest versions. What has been missing is an open source, distributed search layer on top of it. This plugin surfaces a Lance table as a shardable OpenSearch index without copying data out of Lance: OpenSearch's engine treats each Lance fragment as a Lucene leaf, delegates full-text and vector work to the indexes stored inside the Lance table, and follows the table forward as new manifest versions land.
+Lance is an open columnar table format designed for machine learning workloads: multimodal columns, evolving embeddings, tables that receive concurrent writes from Ray or Spark, and time travel via manifest versions. This plugin registers a Lance table as a shardable OpenSearch index without copying data out of Lance: OpenSearch's engine treats each Lance fragment as a Lucene leaf, delegates full-text and vector work to the indexes stored inside the Lance table, and follows the table forward as new manifest versions land.
 
 ## Status
 
