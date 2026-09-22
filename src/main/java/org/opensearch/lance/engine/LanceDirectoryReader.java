@@ -472,9 +472,12 @@ public final class LanceDirectoryReader extends DirectoryReader {
                 continue;
             }
             // One live-row scan per fragment with a deletion file; a
-            // cancelled request does not start the next one.
+            // cancelled request does not start the next one. Tables with
+            // nested columns also resolve the fragment's doc id layout
+            // once per snapshot here.
             groupScan.cancellation().checkCancelled();
             meta.resolveLiveDocs(dataset);
+            meta.resolveNestedLayout(dataset, snapshot.schema());
             LanceFragmentLeafReader raw = new LanceFragmentLeafReader(dataset, meta.id(), meta, snapshot.schema(), filterSql);
             rawLeaves.add(raw);
             leaves.add(LanceSequentialLeafReader.wrap(raw));
@@ -564,6 +567,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
             List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>(held);
             for (LanceWarmCache.FragmentMeta meta : fragments.subList(0, held)) {
                 meta.resolveLiveDocs(dataset);
+                meta.resolveNestedLayout(dataset, snapshot.schema());
                 LanceFragmentLeafReader raw = new LanceFragmentLeafReader(dataset, meta.id(), meta, snapshot.schema(), null);
                 rawLeaves.add(raw);
                 leaves.add(LanceSequentialLeafReader.wrap(raw));

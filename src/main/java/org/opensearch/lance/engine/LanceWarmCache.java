@@ -8,6 +8,7 @@ package org.opensearch.lance.engine;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -24,6 +25,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -90,6 +92,8 @@ public final class LanceWarmCache implements Closeable {
         private volatile boolean liveDocsResolved;
         private FixedBitSet liveDocs;
         private int numDocs;
+        private volatile boolean nestedLayoutResolved;
+        private NestedDocLayout nestedLayout;
 
         FragmentMeta(int id, long physicalRows, boolean hasDeletionFile) {
             this.id = id;
@@ -165,6 +169,65 @@ public final class LanceWarmCache implements Closeable {
 
         int numDocs() {
             return numDocs;
+        }
+
+        /**
+         * Resolve the nested doc id layout once for fragments of a table
+         * with {@code List<Struct>} columns; a no-op when the schema has
+         * none. One scan of the fragment projecting the nested columns
+         * reads each row's element counts from the list offsets; the
+         * layout is kept for the life of the snapshot, like the live-row
+         * bitmap. The scan skips rows a deletion file hides, so deleted
+         * rows contribute no child docs.
+         */
+        void resolveNestedLayout(Dataset dataset, LanceFragmentSchema schema) throws IOException {
+            if (nestedLayoutResolved) {
+                return;
+            }
+            synchronized (this) {
+                if (nestedLayoutResolved) {
+                    return;
+                }
+                if (schema.nestedColumns().isEmpty()) {
+                    nestedLayout = null;
+                    nestedLayoutResolved = true;
+                    return;
+                }
+                String[] columns = schema.nestedColumns().toArray(new String[0]);
+                int[][] counts = new int[columns.length][physicalRows];
+                ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(id))
+                    .columns(Arrays.asList(columns))
+                    .withRowAddress(true)
+                    .build();
+                try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+                    while (reader.loadNextBatch()) {
+                        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                        UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                        for (int c = 0; c < columns.length; c++) {
+                            ListVector list = (ListVector) root.getVector(columns[c]);
+                            for (int i = 0; i < root.getRowCount(); i++) {
+                                if (list.isNull(i)) {
+                                    continue;
+                                }
+                                int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
+                                counts[c][offset] = list.getElementEndIndex(i) - list.getElementStartIndex(i);
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    throw new IOException(e);
+                }
+                nestedLayout = NestedDocLayout.build(columns, physicalRows, counts);
+                nestedLayoutResolved = true;
+            }
+        }
+
+        /**
+         * The nested doc id layout, or {@code null} when the schema has
+         * no nested columns. Call {@link #resolveNestedLayout} first.
+         */
+        NestedDocLayout nestedLayout() {
+            return nestedLayout;
         }
     }
 

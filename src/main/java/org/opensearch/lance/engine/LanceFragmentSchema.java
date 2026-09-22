@@ -27,6 +27,8 @@ import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.lance.Dataset;
 import org.lance.index.IndexCriteria;
+import org.opensearch.index.mapper.NestedPathFieldMapper;
+import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 
 /**
@@ -95,6 +97,8 @@ public final class LanceFragmentSchema {
     private final Map<String, String> keywordSubFields;
     private final Set<String> basesWithKeywordSub;
     private final Set<String> structColumns;
+    private final Set<String> nestedColumns;
+    private final Map<String, String> nestedChildToParent;
     private final List<String> takeColumns;
     private final int sourceColumnCount;
     private final int pkTakeIndex;
@@ -108,6 +112,8 @@ public final class LanceFragmentSchema {
         Map<String, String> keywordSubFields,
         Set<String> basesWithKeywordSub,
         Set<String> structColumns,
+        Set<String> nestedColumns,
+        Map<String, String> nestedChildToParent,
         List<String> takeColumns,
         int sourceColumnCount,
         int pkTakeIndex,
@@ -120,6 +126,8 @@ public final class LanceFragmentSchema {
         this.keywordSubFields = keywordSubFields;
         this.basesWithKeywordSub = basesWithKeywordSub;
         this.structColumns = structColumns;
+        this.nestedColumns = nestedColumns;
+        this.nestedChildToParent = nestedChildToParent;
         this.takeColumns = takeColumns;
         this.sourceColumnCount = sourceColumnCount;
         this.pkTakeIndex = pkTakeIndex;
@@ -213,6 +221,8 @@ public final class LanceFragmentSchema {
         LinkedHashMap<String, ColumnKind> columnKind = new LinkedHashMap<>();
         Map<String, NumericPrecision> numericPrecision = new LinkedHashMap<>();
         Set<String> structColumns = new LinkedHashSet<>();
+        Set<String> nestedColumns = new LinkedHashSet<>();
+        Map<String, String> nestedChildToParent = new LinkedHashMap<>();
         List<String> topLevelOrder = new ArrayList<>();
         try {
             for (Field field : dataset.getSchema().getFields()) {
@@ -222,6 +232,24 @@ public final class LanceFragmentSchema {
                     if (columnKind.size() > before) {
                         structColumns.add(field.getName());
                         topLevelOrder.add(field.getName());
+                    }
+                    continue;
+                }
+                if (isListOfStruct(field)) {
+                    // List<Struct> surfaces as a nested field: every list
+                    // element becomes a hidden child doc of the row's
+                    // parent doc (see NestedDocLayout), so the children's
+                    // doc values live on the child docs, not on the row.
+                    int before = columnKind.size();
+                    classifyNestedChildren(field.getChildren().get(0), field.getName(), columnKind, numericPrecision);
+                    if (columnKind.size() > before) {
+                        nestedColumns.add(field.getName());
+                        topLevelOrder.add(field.getName());
+                        for (String path : columnKind.keySet()) {
+                            if (path.startsWith(field.getName() + ".") && !nestedChildToParent.containsKey(path)) {
+                                nestedChildToParent.put(path, field.getName());
+                            }
+                        }
                     }
                     continue;
                 }
@@ -299,6 +327,17 @@ public final class LanceFragmentSchema {
         for (String subName : subToBase.keySet()) {
             infos.add(fieldInfo(subName, number++, DocValuesType.SORTED_SET));
         }
+        if (!nestedColumns.isEmpty()) {
+            // The two fields OpenSearch's nested machinery reads. The
+            // parent filter (Queries.newNonNestedFilter) is a
+            // FieldExistsQuery on _primary_term, answered by numeric doc
+            // values present on parent docs only; the child filter
+            // (NestedPathFieldMapper.filter) is a TermQuery on
+            // _nested_path, answered by postings whose one term per
+            // nested column matches that column's child docs.
+            infos.add(fieldInfo(SeqNoFieldMapper.PRIMARY_TERM_NAME, number++, DocValuesType.NUMERIC));
+            infos.add(indexedFieldInfo(NestedPathFieldMapper.NAME, number++));
+        }
 
         return new LanceFragmentSchema(
             intField,
@@ -308,11 +347,61 @@ public final class LanceFragmentSchema {
             Collections.unmodifiableMap(subToBase),
             Collections.unmodifiableSet(basesWithKeywordSub),
             Collections.unmodifiableSet(structColumns),
+            Collections.unmodifiableSet(nestedColumns),
+            Collections.unmodifiableMap(nestedChildToParent),
             Collections.unmodifiableList(take),
             sourceColumnCount,
             pkIndex,
             new FieldInfos(infos.toArray(new FieldInfo[0]))
         );
+    }
+
+    /** Whether {@code field} is a {@code List} whose single child is a {@code Struct}. */
+    static boolean isListOfStruct(Field field) {
+        return field.getType() instanceof ArrowType.List
+            && field.getChildren().size() == 1
+            && field.getChildren().get(0).getType() instanceof ArrowType.Struct;
+    }
+
+    /**
+     * Classify the fields of a nested column's element struct into
+     * {@code columnKind} under their dotted path, recursing into struct
+     * children. The kinds a nested child may take are narrower than a
+     * top-level struct child's: only scalars a child doc can carry as a
+     * single-valued doc value (NUMERIC, BOOLEAN, TEXT_KEYWORD).
+     * {@code List<Utf8>}, Binary and every other type are skipped, and
+     * Utf8 always classifies as TEXT_KEYWORD (Lance FTS indexes target
+     * top-level columns). {@code List<Struct>} inside an element (nested
+     * in nested) is skipped as well.
+     */
+    private static void classifyNestedChildren(
+        Field elementStruct,
+        String path,
+        LinkedHashMap<String, ColumnKind> columnKind,
+        Map<String, NumericPrecision> numericPrecision
+    ) {
+        for (Field child : elementStruct.getChildren()) {
+            String childPath = path + "." + child.getName();
+            if (child.getType() instanceof ArrowType.Struct) {
+                classifyNestedChildren(child, childPath, columnKind, numericPrecision);
+                continue;
+            }
+            ColumnKind kind = classify(child);
+            if (kind == null || kind == ColumnKind.BINARY || kind == ColumnKind.KEYWORD_ARRAY) {
+                continue;
+            }
+            if (kind == ColumnKind.TEXT_FTS) {
+                kind = ColumnKind.TEXT_KEYWORD;
+            }
+            columnKind.put(childPath, kind);
+            if (child.getType() instanceof ArrowType.FloatingPoint fp) {
+                if (fp.getPrecision() == FloatingPointPrecision.SINGLE) {
+                    numericPrecision.put(childPath, NumericPrecision.FLOAT);
+                } else if (fp.getPrecision() == FloatingPointPrecision.DOUBLE) {
+                    numericPrecision.put(childPath, NumericPrecision.DOUBLE);
+                }
+            }
+        }
     }
 
     /**
@@ -365,6 +454,35 @@ public final class LanceFragmentSchema {
             false,
             IndexOptions.NONE,
             dvType,
+            DocValuesSkipIndexType.NONE,
+            -1,
+            Collections.emptyMap(),
+            0,
+            0,
+            0,
+            0,
+            VectorEncoding.FLOAT32,
+            VectorSimilarityFunction.EUCLIDEAN,
+            false,
+            false
+        );
+    }
+
+    /**
+     * A postings-only field ({@code IndexOptions.DOCS}, no doc values),
+     * the shape {@code NestedPathFieldMapper} indexes {@code _nested_path}
+     * with, so a {@code TermQuery} on it resolves through
+     * {@code LeafReader.terms}.
+     */
+    private static FieldInfo indexedFieldInfo(String name, int number) {
+        return new FieldInfo(
+            name,
+            number,
+            false,
+            true,
+            false,
+            IndexOptions.DOCS,
+            DocValuesType.NONE,
             DocValuesSkipIndexType.NONE,
             -1,
             Collections.emptyMap(),
@@ -472,6 +590,22 @@ public final class LanceFragmentSchema {
      */
     Set<String> structColumns() {
         return structColumns;
+    }
+
+    /**
+     * Top-level {@code List<Struct>} column names with at least one
+     * surfaced child. Their children live in {@link #columnKind()} under
+     * dotted paths but are served on nested child docs (see
+     * {@link NestedDocLayout}); the parent name joins
+     * {@link #takeColumns()} so {@code _source} renders the array.
+     */
+    public Set<String> nestedColumns() {
+        return nestedColumns;
+    }
+
+    /** Dotted child path → its nested column, for children of {@link #nestedColumns()}. */
+    Map<String, String> nestedChildToParent() {
+        return nestedChildToParent;
     }
 
     /** Projection of the per-hit row take, in {@code _source} order. */

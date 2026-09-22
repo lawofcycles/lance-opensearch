@@ -7,13 +7,16 @@ package org.opensearch.lance.engine;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.arrow.vector.BigIntVector;
@@ -41,6 +44,7 @@ import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.lucene.document.Document;
+import org.apache.lucene.index.BaseTermsEnum;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.DocValues;
@@ -51,11 +55,14 @@ import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.FloatVectorValues;
+import org.apache.lucene.index.ImpactsEnum;
 import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.index.LeafMetaData;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.PointValues;
+import org.apache.lucene.index.PostingsEnum;
+import org.apache.lucene.index.SlowImpactsEnum;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
@@ -63,6 +70,7 @@ import org.apache.lucene.index.StoredFieldVisitor;
 import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.index.TermVectors;
 import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
@@ -199,6 +207,23 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * aliased to it).
      */
     private final Set<String> structColumns;
+    /**
+     * Top-level {@code List<Struct>} column names with at least one
+     * surfaced child. Each element of such a column is a hidden nested
+     * child doc placed before the row's parent doc; see
+     * {@link NestedDocLayout}. The row take projects the whole column so
+     * {@link #materialiseStoredFields} renders the array of objects.
+     */
+    private final Set<String> nestedColumns;
+    /** Dotted child path → nested column, for children served on child docs. */
+    private final Map<String, String> nestedChildToParent;
+    /**
+     * Doc id layout of this fragment when the schema has nested columns,
+     * {@code null} otherwise. When present, {@link #maxDoc} counts rows
+     * plus nested elements and every accessor keyed by doc id maps
+     * through it; without it doc id == physical row offset as before.
+     */
+    private final NestedDocLayout nestedLayout;
     private final Bits liveDocs;
     private final FieldInfos fieldInfos;
     private final Dataset dataset;
@@ -287,6 +312,19 @@ public final class LanceFragmentLeafReader extends LeafReader {
     /** Multi-valued counterpart of {@link #offHeapKeywordColumns}. */
     private final Map<String, CachedKeywordArrayColumn> offHeapKeywordArrayColumns = new ConcurrentHashMap<>();
 
+    // Nested child columns, keyed by dotted child path and indexed by the
+    // element ordinal of the child's nested column (see NestedDocLayout).
+    // Loaded per leaf by ensureNestedColumnLoaded in one scan of the
+    // parent List<Struct> column; they bypass the shard column cache, the
+    // off-heap store and the hint machinery (nested predicates never push
+    // to Lance, so no hint describes child docs).
+    private final Map<String, long[]> nestedNumericColumns = new ConcurrentHashMap<>();
+    private final Map<String, FixedBitSet> nestedNumericPresence = new ConcurrentHashMap<>();
+    private final Map<String, BytesRef[]> nestedKeywordTerms = new ConcurrentHashMap<>();
+    private final Map<String, int[]> nestedKeywordOrds = new ConcurrentHashMap<>();
+    /** Nested columns whose children have been decoded into the maps above. */
+    private final Set<String> nestedColumnsLoaded = ConcurrentHashMap.newKeySet();
+
     /**
      * Largest fraction of {@link #maxDoc} a hinted hit set may cover
      * before the doc value accessors stop taking the hit rows by
@@ -322,7 +360,8 @@ public final class LanceFragmentLeafReader extends LeafReader {
     /**
      * Request-scoped hit set for this leaf, or {@code null} when no
      * Lance-side scorer has reported one. Sorted ascending doc ids
-     * (physical row offsets) that the last {@link #hintMatchedOffsets}
+     * (physical row offsets, or their parent doc ids when the table has
+     * nested columns) that the last {@link #hintMatchedOffsets}
      * call passed in. The doc value accessors use it to fetch only the
      * hit rows of a sort or aggregation column instead of scanning the
      * whole column; see {@link #hintMatchedOffsets} for the contract.
@@ -493,17 +532,19 @@ public final class LanceFragmentLeafReader extends LeafReader {
         LanceFragmentSchema schema,
         String filterSql
     ) throws IOException {
-        this(dataset, fragmentId, resolveFragmentMeta(dataset, fragmentId, physicalRows, hasDeletionFile), schema, filterSql);
+        this(dataset, fragmentId, resolveFragmentMeta(dataset, fragmentId, physicalRows, hasDeletionFile, schema), schema, filterSql);
     }
 
     private static LanceWarmCache.FragmentMeta resolveFragmentMeta(
         Dataset dataset,
         int fragmentId,
         long physicalRows,
-        boolean hasDeletionFile
+        boolean hasDeletionFile,
+        LanceFragmentSchema schema
     ) throws IOException {
         LanceWarmCache.FragmentMeta meta = new LanceWarmCache.FragmentMeta(fragmentId, physicalRows, hasDeletionFile);
         meta.resolveLiveDocs(dataset);
+        meta.resolveNestedLayout(dataset, schema);
         return meta;
     }
 
@@ -531,19 +572,90 @@ public final class LanceFragmentLeafReader extends LeafReader {
         this.schema = schema;
         this.fieldName = schema.fieldName();
         this.pkType = schema.pkType();
-        this.maxDoc = meta.physicalRows();
         this.filterSql = filterSql;
         this.keywordSubFields = schema.keywordSubFields();
         this.basesWithKeywordSub = schema.basesWithKeywordSub();
         this.structColumns = schema.structColumns();
+        this.nestedColumns = schema.nestedColumns();
+        this.nestedChildToParent = schema.nestedChildToParent();
+        this.nestedLayout = meta.nestedLayout();
+        if (!schema.nestedColumns().isEmpty() && nestedLayout == null) {
+            // Fail fast rather than expose a doc id space without the
+            // child docs the mapping promises: a nested query on such a
+            // leaf would silently match nothing.
+            throw new IllegalStateException(
+                "fragment " + fragmentId + " was opened without its nested doc layout; call FragmentMeta.resolveNestedLayout first"
+            );
+        }
         this.columnKind = schema.columnKind();
         this.numericPrecision = schema.numericPrecision();
         this.sourceColumnCount = schema.sourceColumnCount();
         this.pkTakeIndex = schema.pkTakeIndex();
         this.takeColumns = schema.takeColumns();
-        this.numDocs = meta.numDocs();
-        this.liveDocs = meta.liveDocs();
+        if (nestedLayout == null) {
+            this.maxDoc = meta.physicalRows();
+            this.numDocs = meta.numDocs();
+            this.liveDocs = meta.liveDocs();
+        } else {
+            // Rows plus nested elements; children of deleted rows do not
+            // exist in the layout, so only dead parents are masked.
+            this.maxDoc = nestedLayout.maxDoc();
+            this.numDocs = nestedLayout.numDocs(meta.numDocs());
+            this.liveDocs = nestedLayout.docLiveDocs(meta.liveDocs());
+        }
         this.fieldInfos = schema.fieldInfos();
+    }
+
+    /**
+     * Doc id of the parent doc of physical row {@code row}: the row
+     * offset itself without nested columns, the row's parent doc in the
+     * {@link NestedDocLayout} otherwise. The boundary every Lance-side
+     * hit (a decoded {@code _rowaddr}) crosses to become a Lucene doc id.
+     */
+    public int docOfRow(int row) {
+        return nestedLayout == null ? row : nestedLayout.parentDocOf(row);
+    }
+
+    /**
+     * Physical row offset behind doc id {@code doc} (the row whose block
+     * a child doc belongs to, or the parent's own row). The boundary a
+     * Lucene doc id crosses back into Lance row-address space.
+     */
+    public int rowOf(int doc) {
+        return nestedLayout == null ? doc : nestedLayout.rowOfDoc(doc);
+    }
+
+    /**
+     * Map an ascending array of physical row offsets to parent doc ids.
+     * Returns the argument itself without nested columns; the mapping is
+     * monotonic, so a sorted input stays sorted.
+     */
+    public int[] docsOfRows(int[] rows) {
+        if (nestedLayout == null) {
+            return rows;
+        }
+        int[] docs = new int[rows.length];
+        for (int i = 0; i < rows.length; i++) {
+            docs[i] = nestedLayout.parentDocOf(rows[i]);
+        }
+        return docs;
+    }
+
+    /** Child docs this leaf carries beyond its rows (0 without nested columns). */
+    public int nestedDocCount() {
+        return nestedLayout == null ? 0 : nestedLayout.nestedDocCount();
+    }
+
+    /**
+     * Row behind {@code doc} when it is a parent doc (every doc without
+     * nested columns), or -1 for a nested child doc, which carries no
+     * row-scoped values.
+     */
+    private int rowIfParent(int doc) {
+        if (nestedLayout == null) {
+            return doc;
+        }
+        return nestedLayout.isParent(doc) ? nestedLayout.rowOfDoc(doc) : -1;
     }
 
     /**
@@ -1337,7 +1449,8 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 if (i > from) {
                     sql.append(',');
                 }
-                sql.append(((long) fragmentId << 32) | (sortedOffsets[i] & 0xFFFFFFFFL));
+                // Hint entries are doc ids; the take addresses rows.
+                sql.append(((long) fragmentId << 32) | (rowOf(sortedOffsets[i]) & 0xFFFFFFFFL));
             }
             sql.append(')');
             ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
@@ -1352,7 +1465,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     FieldVector vector = root.getVector(column);
                     for (int i = 0; i < root.getRowCount(); i++) {
                         int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
-                        int hintIndex = Arrays.binarySearch(sortedOffsets, offset);
+                        int hintIndex = Arrays.binarySearch(sortedOffsets, docOfRow(offset));
                         if (hintIndex >= 0) {
                             consumer.accept(hintIndex, vector, i);
                         }
@@ -1491,6 +1604,19 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
     @Override
     public NumericDocValues getNumericDocValues(String field) {
+        if (nestedLayout != null && "_primary_term".equals(field)) {
+            // Queries.newNonNestedFilter is a FieldExistsQuery on
+            // _primary_term; parents carry it, nested child docs do not.
+            return new ParentDocValues();
+        }
+        String nestedParent = nestedChildToParent.get(field);
+        if (nestedParent != null) {
+            ColumnKind kind = columnKind.get(field);
+            if (kind != ColumnKind.NUMERIC && kind != ColumnKind.BOOLEAN) {
+                return null;
+            }
+            return new NestedChildNumericDocValues(field, nestedParent);
+        }
         ColumnKind kind = columnKind.get(field);
         if (kind != ColumnKind.NUMERIC && kind != ColumnKind.BOOLEAN) {
             return null;
@@ -1545,6 +1671,8 @@ public final class LanceFragmentLeafReader extends LeafReader {
         private SparseNumeric sparse;
         private int sparseIndex = -1;
         private int doc = -1;
+        /** Row behind {@link #doc}; what the full column and presence are indexed by. */
+        private int row = -1;
 
         HintedNumericDocValues(String name, boolean isBoolean) {
             this.name = name;
@@ -1620,13 +1748,18 @@ public final class LanceFragmentLeafReader extends LeafReader {
             if (sparse != null) {
                 return sparse.values[sparseIndex];
             }
-            return offHeap != null ? offHeap.get(doc) : column[doc];
+            return offHeap != null ? offHeap.get(row) : column[row];
         }
 
         @Override
         public boolean advanceExact(int target) throws IOException {
             doc = target;
             if (liveDocs != null && !liveDocs.get(target)) {
+                return false;
+            }
+            row = rowIfParent(target);
+            if (row < 0) {
+                // A nested child doc carries no top-level values.
                 return false;
             }
             resolve();
@@ -1646,7 +1779,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             // presence bit is clear for Arrow-null docs; exists / term /
             // range / agg / sort all check advanceExact and stop reading
             // the value here.
-            return offHeap != null ? offHeap.isSet(target) : presence.get(target);
+            return offHeap != null ? offHeap.isSet(row) : presence.get(row);
         }
 
         @Override
@@ -1674,8 +1807,13 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 if (liveDocs != null && !liveDocs.get(candidate)) {
                     continue;
                 }
-                if (offHeap != null ? offHeap.isSet(candidate) : presence.get(candidate)) {
+                int candidateRow = rowIfParent(candidate);
+                if (candidateRow < 0) {
+                    continue;
+                }
+                if (offHeap != null ? offHeap.isSet(candidateRow) : presence.get(candidateRow)) {
                     doc = candidate;
+                    row = candidateRow;
                     return doc;
                 }
             }
@@ -1728,6 +1866,12 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
     @Override
     public Terms terms(String field) {
+        if (nestedLayout != null && "_nested_path".equals(field)) {
+            // NestedPathFieldMapper.filter is a TermQuery on
+            // _nested_path whose term is the nested field's path; serve
+            // it from the layout as postings over the child docs.
+            return new NestedPathTerms();
+        }
         return null;
     }
 
@@ -1738,6 +1882,13 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
     @Override
     public SortedDocValues getSortedDocValues(String field) {
+        String nestedParent = nestedChildToParent.get(field);
+        if (nestedParent != null) {
+            if (columnKind.get(field) != ColumnKind.TEXT_KEYWORD) {
+                return null;
+            }
+            return new NestedChildSortedDocValues(field, nestedParent);
+        }
         // A keyword sub-field (multi-fields) resolves to its base column's
         // ord data structure. Route through the base column name so
         // ensureTextLoaded reuses whatever ords were already built for
@@ -1860,10 +2011,14 @@ public final class LanceFragmentLeafReader extends LeafReader {
          */
         private int ordOutsideHint(int target) throws IOException {
             ensureTextLoaded(name, false);
+            int targetRow = rowIfParent(target);
+            if (targetRow < 0) {
+                return -1;
+            }
             BytesRef term;
             CachedKeywordColumn full = offHeapKeywordColumns.get(name);
             if (full != null) {
-                int fullOrd = full.ord(target);
+                int fullOrd = full.ord(targetRow);
                 if (fullOrd < 0) {
                     return -1;
                 }
@@ -1872,7 +2027,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 }
                 term = full.term(fullOrd, scratch);
             } else {
-                int fullOrd = keywordOrds.get(name)[target];
+                int fullOrd = keywordOrds.get(name)[targetRow];
                 if (fullOrd < 0) {
                     return -1;
                 }
@@ -1928,10 +2083,13 @@ public final class LanceFragmentLeafReader extends LeafReader {
             if (sparse != null) {
                 int index = Arrays.binarySearch(sparse.offsets, target);
                 currentOrd = index >= 0 ? sparse.ords[index] : ordOutsideHint(target);
-            } else if (offHeap != null) {
-                currentOrd = offHeap.ord(target);
             } else {
-                currentOrd = ords[target];
+                int targetRow = rowIfParent(target);
+                if (targetRow < 0) {
+                    currentOrd = -1;
+                    return false;
+                }
+                currentOrd = offHeap != null ? offHeap.ord(targetRow) : ords[targetRow];
             }
             return currentOrd >= 0;
         }
@@ -1969,7 +2127,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     if (liveDocs != null && !liveDocs.get(i)) {
                         continue;
                     }
-                    int ord = offHeap != null ? offHeap.ord(i) : ords[i];
+                    int candidateRow = rowIfParent(i);
+                    if (candidateRow < 0) {
+                        continue;
+                    }
+                    int ord = offHeap != null ? offHeap.ord(candidateRow) : ords[candidateRow];
                     if (ord >= 0) {
                         doc = i;
                         currentOrd = ord;
@@ -2056,11 +2218,15 @@ public final class LanceFragmentLeafReader extends LeafReader {
          */
         private int[] rowOutsideHint(int target) throws IOException {
             ensureKeywordArrayLoaded(name, false);
+            int targetRow = rowIfParent(target);
+            if (targetRow < 0) {
+                return null;
+            }
             CachedKeywordArrayColumn full = offHeapKeywordArrayColumns.get(name);
             int[] row;
             if (full != null) {
-                int start = full.rowStart(target);
-                int count = full.rowEnd(target) - start;
+                int start = full.rowStart(targetRow);
+                int count = full.rowEnd(targetRow) - start;
                 if (count == 0) {
                     return null;
                 }
@@ -2072,7 +2238,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     row[i] = sparseOrdOf(target, full.term(full.ordinal(start + i), scratch));
                 }
             } else {
-                int[] fullRow = keywordArrayOrds.get(name)[target];
+                int[] fullRow = keywordArrayOrds.get(name)[targetRow];
                 if (fullRow == null) {
                     return null;
                 }
@@ -2136,11 +2302,16 @@ public final class LanceFragmentLeafReader extends LeafReader {
             return offHeap != null ? offHeap.valueCount() : terms.length;
         }
 
-        /** Point the current doc at the off-heap range of {@code target}; returns whether it has values. */
+        /** Point the current doc at the off-heap range of the row behind {@code target}; returns whether it has values. */
         private boolean setStoreRow(int target) {
             currentRow = null;
-            rowStart = offHeap.rowStart(target);
-            rowCount = offHeap.rowEnd(target) - rowStart;
+            int targetRow = rowIfParent(target);
+            if (targetRow < 0) {
+                rowCount = 0;
+                return false;
+            }
+            rowStart = offHeap.rowStart(targetRow);
+            rowCount = offHeap.rowEnd(targetRow) - rowStart;
             return rowCount > 0;
         }
 
@@ -2160,7 +2331,8 @@ public final class LanceFragmentLeafReader extends LeafReader {
             } else if (offHeap != null) {
                 return setStoreRow(target);
             } else {
-                currentRow = rowOrds[target];
+                int targetRow = rowIfParent(target);
+                currentRow = targetRow < 0 ? null : rowOrds[targetRow];
             }
             rowCount = currentRow == null ? 0 : currentRow.length;
             return rowCount > 0;
@@ -2203,10 +2375,17 @@ public final class LanceFragmentLeafReader extends LeafReader {
                     }
                 }
             } else {
-                for (int i = target; i < rowOrds.length; i++) {
-                    if ((liveDocs == null || liveDocs.get(i)) && rowOrds[i] != null && rowOrds[i].length > 0) {
+                for (int i = target; i < maxDoc; i++) {
+                    if (liveDocs != null && !liveDocs.get(i)) {
+                        continue;
+                    }
+                    int candidateRow = rowIfParent(i);
+                    if (candidateRow < 0) {
+                        continue;
+                    }
+                    if (rowOrds[candidateRow] != null && rowOrds[candidateRow].length > 0) {
                         doc = i;
-                        currentRow = rowOrds[i];
+                        currentRow = rowOrds[candidateRow];
                         rowCount = currentRow.length;
                         return i;
                     }
@@ -2224,6 +2403,607 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 return maxDoc;
             }
             return sparse != null ? sparse.offsets.length : maxDoc;
+        }
+    }
+
+    /**
+     * Decode every surfaced child of the nested column
+     * {@code nestedColumn} in one Lance scan of the fragment, projecting
+     * the whole column. Values land in the nested child maps indexed by
+     * element ordinal. {@link #filterSql} is deliberately not applied:
+     * element ordinals cover every live row, and a filtered scan would
+     * leave holes the doc id layout does not know about.
+     */
+    private void ensureNestedColumnLoaded(String nestedColumn) throws IOException {
+        if (nestedColumnsLoaded.contains(nestedColumn)) {
+            return;
+        }
+        synchronized (columnLock(nestedColumn)) {
+            if (nestedColumnsLoaded.contains(nestedColumn)) {
+                return;
+            }
+            int col = nestedLayout.columnIndexOf(nestedColumn);
+            int totalElements = nestedLayout.totalElements(col);
+            List<String> childPaths = new ArrayList<>();
+            for (Map.Entry<String, String> entry : nestedChildToParent.entrySet()) {
+                if (entry.getValue().equals(nestedColumn)) {
+                    childPaths.add(entry.getKey());
+                }
+            }
+            Map<String, long[]> numericValues = new HashMap<>();
+            Map<String, FixedBitSet> numericPresent = new HashMap<>();
+            Map<String, int[]> keywordIds = new HashMap<>();
+            Map<String, KeywordDictionaryBuilder> keywordBuilders = new HashMap<>();
+            for (String path : childPaths) {
+                ColumnKind kind = columnKind.get(path);
+                if (kind == ColumnKind.TEXT_KEYWORD) {
+                    int[] ids = new int[totalElements];
+                    Arrays.fill(ids, -1);
+                    keywordIds.put(path, ids);
+                    keywordBuilders.put(path, new KeywordDictionaryBuilder());
+                } else {
+                    numericValues.put(path, new long[totalElements]);
+                    numericPresent.put(path, new FixedBitSet(totalElements));
+                }
+            }
+            ScanOptions options = new ScanOptions.Builder().fragmentIds(Collections.singletonList(fragmentId))
+                .columns(Collections.singletonList(nestedColumn))
+                .withRowAddress(true)
+                .build();
+            try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+                while (reader.loadNextBatch()) {
+                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                    UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                    ListVector list = (ListVector) root.getVector(nestedColumn);
+                    StructVector elements = (StructVector) list.getDataVector();
+                    for (int i = 0; i < root.getRowCount(); i++) {
+                        if (list.isNull(i)) {
+                            continue;
+                        }
+                        int row = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
+                        int base = nestedLayout.elementBase(col, row);
+                        int start = list.getElementStartIndex(i);
+                        int end = list.getElementEndIndex(i);
+                        for (int e = start; e < end; e++) {
+                            int ordinal = base + (e - start);
+                            for (String path : childPaths) {
+                                FieldVector child = nestedChildVector(elements, nestedColumn, path, e);
+                                if (child == null || child.isNull(e)) {
+                                    continue;
+                                }
+                                ColumnKind kind = columnKind.get(path);
+                                if (kind == ColumnKind.TEXT_KEYWORD) {
+                                    keywordIds.get(path)[ordinal] = keywordBuilders.get(path).intern((VarCharVector) child, e);
+                                } else if (kind == ColumnKind.BOOLEAN) {
+                                    numericValues.get(path)[ordinal] = ((BitVector) child).get(e);
+                                    numericPresent.get(path).set(ordinal);
+                                } else {
+                                    numericValues.get(path)[ordinal] = readAsLong(child, e);
+                                    numericPresent.get(path).set(ordinal);
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (IOException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new IOException(e);
+            }
+            for (String path : childPaths) {
+                ColumnKind kind = columnKind.get(path);
+                if (kind == ColumnKind.TEXT_KEYWORD) {
+                    KeywordDictionaryBuilder.Dictionary dictionary = keywordBuilders.get(path).finish();
+                    int[] ids = keywordIds.get(path);
+                    dictionary.remap(ids);
+                    nestedKeywordTerms.put(path, dictionary.terms());
+                    nestedKeywordOrds.put(path, ids);
+                } else {
+                    nestedNumericColumns.put(path, numericValues.get(path));
+                    nestedNumericPresence.put(path, numericPresent.get(path));
+                }
+            }
+            nestedColumnsLoaded.add(nestedColumn);
+        }
+    }
+
+    /**
+     * The leaf vector behind the child path {@code path} inside the
+     * element struct of {@code nestedColumn}, or {@code null} when an
+     * intermediate struct is Arrow null at element {@code index} (its
+     * descendants are absent for that element).
+     */
+    private static FieldVector nestedChildVector(StructVector elements, String nestedColumn, String path, int index) {
+        String relative = path.substring(nestedColumn.length() + 1);
+        FieldVector current = elements;
+        for (String segment : relative.split("\\.")) {
+            if (current.isNull(index)) {
+                return null;
+            }
+            current = ((StructVector) current).getChild(segment);
+            if (current == null) {
+                return null;
+            }
+        }
+        return current;
+    }
+
+    /**
+     * Numeric doc values present on parent docs only, backing
+     * {@code Queries.newNonNestedFilter()}'s {@code FieldExistsQuery} on
+     * {@code _primary_term}. The value itself (1) is never read by that
+     * query; only presence matters. Deliberately blind to liveDocs, as
+     * postings and doc values are: the consumer intersects with accepted
+     * docs itself.
+     */
+    private final class ParentDocValues extends NumericDocValues {
+        private int doc = -1;
+
+        @Override
+        public long longValue() {
+            return 1L;
+        }
+
+        @Override
+        public boolean advanceExact(int target) {
+            doc = target;
+            return nestedLayout.isParent(target);
+        }
+
+        @Override
+        public int docID() {
+            return doc;
+        }
+
+        @Override
+        public int nextDoc() {
+            return advance(doc + 1);
+        }
+
+        @Override
+        public int advance(int target) {
+            if (target >= maxDoc) {
+                doc = NO_MORE_DOCS;
+                return doc;
+            }
+            // The parent of the block target falls in is the first
+            // parent at or after target (the parent closes its block).
+            doc = nestedLayout.parentDocOf(nestedLayout.rowOfDoc(target));
+            return doc;
+        }
+
+        @Override
+        public long cost() {
+            return nestedLayout.rows();
+        }
+    }
+
+    /**
+     * Numeric or boolean doc values of a nested child field, present on
+     * the child docs of its nested column only. Parent docs and other
+     * columns' child docs report no value, matching how OpenSearch
+     * stores a nested field's values on its hidden child documents.
+     */
+    private final class NestedChildNumericDocValues extends NumericDocValues {
+        private final String path;
+        private final String parentColumn;
+        private final int col;
+        private boolean resolved;
+        private long[] values;
+        private FixedBitSet present;
+        private int doc = -1;
+        private int ordinal = -1;
+
+        NestedChildNumericDocValues(String path, String parentColumn) {
+            this.path = path;
+            this.parentColumn = parentColumn;
+            this.col = nestedLayout.columnIndexOf(parentColumn);
+        }
+
+        private void resolve() throws IOException {
+            if (resolved) {
+                return;
+            }
+            resolved = true;
+            ensureNestedColumnLoaded(parentColumn);
+            values = nestedNumericColumns.get(path);
+            present = nestedNumericPresence.get(path);
+        }
+
+        @Override
+        public long longValue() {
+            return values[ordinal];
+        }
+
+        @Override
+        public boolean advanceExact(int target) throws IOException {
+            doc = target;
+            if (liveDocs != null && !liveDocs.get(target)) {
+                return false;
+            }
+            if (nestedLayout.childColumnOf(target) != col) {
+                return false;
+            }
+            resolve();
+            ordinal = nestedLayout.childElementOrdinalOf(col, target);
+            return present.get(ordinal);
+        }
+
+        @Override
+        public int docID() {
+            return doc;
+        }
+
+        @Override
+        public int nextDoc() throws IOException {
+            return advance(doc + 1);
+        }
+
+        @Override
+        public int advance(int target) throws IOException {
+            resolve();
+            for (int candidate = target; candidate < maxDoc; candidate++) {
+                if (liveDocs != null && !liveDocs.get(candidate)) {
+                    continue;
+                }
+                if (nestedLayout.childColumnOf(candidate) != col) {
+                    continue;
+                }
+                int candidateOrdinal = nestedLayout.childElementOrdinalOf(col, candidate);
+                if (present.get(candidateOrdinal)) {
+                    doc = candidate;
+                    ordinal = candidateOrdinal;
+                    return doc;
+                }
+            }
+            doc = NO_MORE_DOCS;
+            return doc;
+        }
+
+        @Override
+        public long cost() {
+            return nestedLayout.totalElements(col);
+        }
+    }
+
+    /** Keyword doc values of a nested child field, on its column's child docs only. */
+    private final class NestedChildSortedDocValues extends SortedDocValues {
+        private final String path;
+        private final String parentColumn;
+        private final int col;
+        private boolean resolved;
+        private BytesRef[] terms;
+        private int[] ords;
+        private int doc = -1;
+        private int currentOrd = -1;
+
+        NestedChildSortedDocValues(String path, String parentColumn) {
+            this.path = path;
+            this.parentColumn = parentColumn;
+            this.col = nestedLayout.columnIndexOf(parentColumn);
+        }
+
+        private void resolve() {
+            if (resolved) {
+                return;
+            }
+            resolved = true;
+            try {
+                ensureNestedColumnLoaded(parentColumn);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+            terms = nestedKeywordTerms.get(path);
+            ords = nestedKeywordOrds.get(path);
+        }
+
+        @Override
+        public int ordValue() {
+            return currentOrd;
+        }
+
+        @Override
+        public BytesRef lookupOrd(int ord) {
+            resolve();
+            return terms[ord];
+        }
+
+        @Override
+        public int getValueCount() {
+            resolve();
+            return terms.length;
+        }
+
+        @Override
+        public boolean advanceExact(int target) {
+            doc = target;
+            if (liveDocs != null && !liveDocs.get(target)) {
+                currentOrd = -1;
+                return false;
+            }
+            if (nestedLayout.childColumnOf(target) != col) {
+                currentOrd = -1;
+                return false;
+            }
+            resolve();
+            currentOrd = ords[nestedLayout.childElementOrdinalOf(col, target)];
+            return currentOrd >= 0;
+        }
+
+        @Override
+        public int docID() {
+            return doc;
+        }
+
+        @Override
+        public int nextDoc() {
+            return advance(doc + 1);
+        }
+
+        @Override
+        public int advance(int target) {
+            resolve();
+            for (int candidate = target; candidate < maxDoc; candidate++) {
+                if (liveDocs != null && !liveDocs.get(candidate)) {
+                    continue;
+                }
+                if (nestedLayout.childColumnOf(candidate) != col) {
+                    continue;
+                }
+                int ord = ords[nestedLayout.childElementOrdinalOf(col, candidate)];
+                if (ord >= 0) {
+                    doc = candidate;
+                    currentOrd = ord;
+                    return doc;
+                }
+            }
+            doc = NO_MORE_DOCS;
+            currentOrd = -1;
+            return doc;
+        }
+
+        @Override
+        public long cost() {
+            return nestedLayout.totalElements(col);
+        }
+    }
+
+    /**
+     * Postings view of the synthetic {@code _nested_path} field: one term
+     * per nested column (the column's path), whose postings are the
+     * column's child docs. Backs the {@code TermQuery} that
+     * {@code NestedPathFieldMapper.filter} builds as the child filter of
+     * a nested query.
+     */
+    private final class NestedPathTerms extends Terms {
+
+        /** Nested column names sorted in unsigned byte order, with their layout indices. */
+        private BytesRef[] sortedTerms;
+        private int[] sortedColumns;
+
+        NestedPathTerms() {
+            TreeMap<BytesRef, Integer> sorted = new TreeMap<>();
+            for (String column : nestedColumns) {
+                sorted.put(new BytesRef(column), nestedLayout.columnIndexOf(column));
+            }
+            sortedTerms = new BytesRef[sorted.size()];
+            sortedColumns = new int[sorted.size()];
+            int i = 0;
+            for (Map.Entry<BytesRef, Integer> entry : sorted.entrySet()) {
+                sortedTerms[i] = entry.getKey();
+                sortedColumns[i] = entry.getValue();
+                i++;
+            }
+        }
+
+        @Override
+        public TermsEnum iterator() {
+            return new NestedPathTermsEnum(sortedTerms, sortedColumns);
+        }
+
+        @Override
+        public long size() {
+            return sortedTerms.length;
+        }
+
+        @Override
+        public long getSumTotalTermFreq() {
+            return nestedLayout.nestedDocCount();
+        }
+
+        @Override
+        public long getSumDocFreq() {
+            return nestedLayout.nestedDocCount();
+        }
+
+        @Override
+        public int getDocCount() {
+            return nestedLayout.nestedDocCount();
+        }
+
+        @Override
+        public boolean hasFreqs() {
+            return false;
+        }
+
+        @Override
+        public boolean hasOffsets() {
+            return false;
+        }
+
+        @Override
+        public boolean hasPositions() {
+            return false;
+        }
+
+        @Override
+        public boolean hasPayloads() {
+            return false;
+        }
+
+        @Override
+        public BytesRef getMin() {
+            return sortedTerms.length == 0 ? null : sortedTerms[0];
+        }
+
+        @Override
+        public BytesRef getMax() {
+            return sortedTerms.length == 0 ? null : sortedTerms[sortedTerms.length - 1];
+        }
+    }
+
+    private final class NestedPathTermsEnum extends BaseTermsEnum {
+        private final BytesRef[] terms;
+        private final int[] columns;
+        private int cursor = -1;
+
+        NestedPathTermsEnum(BytesRef[] terms, int[] columns) {
+            this.terms = terms;
+            this.columns = columns;
+        }
+
+        @Override
+        public BytesRef next() {
+            cursor++;
+            return cursor < terms.length ? terms[cursor] : null;
+        }
+
+        @Override
+        public SeekStatus seekCeil(BytesRef text) {
+            int index = Arrays.binarySearch(terms, text);
+            if (index >= 0) {
+                cursor = index;
+                return SeekStatus.FOUND;
+            }
+            cursor = -index - 1;
+            return cursor < terms.length ? SeekStatus.NOT_FOUND : SeekStatus.END;
+        }
+
+        @Override
+        public void seekExact(long ord) {
+            cursor = (int) ord;
+        }
+
+        @Override
+        public BytesRef term() {
+            return terms[cursor];
+        }
+
+        @Override
+        public long ord() {
+            return cursor;
+        }
+
+        @Override
+        public int docFreq() {
+            return nestedLayout.totalElements(columns[cursor]);
+        }
+
+        @Override
+        public long totalTermFreq() {
+            return docFreq();
+        }
+
+        @Override
+        public PostingsEnum postings(PostingsEnum reuse, int flags) {
+            return new NestedPathPostingsEnum(columns[cursor]);
+        }
+
+        @Override
+        public ImpactsEnum impacts(int flags) {
+            return new SlowImpactsEnum(postings(null, PostingsEnum.FREQS));
+        }
+    }
+
+    /** Iterates the child docs of one nested column in doc id order. */
+    private final class NestedPathPostingsEnum extends PostingsEnum {
+        private final int col;
+        private int row = -1;
+        private int inRow;
+        private int doc = -1;
+
+        NestedPathPostingsEnum(int col) {
+            this.col = col;
+        }
+
+        @Override
+        public int docID() {
+            return doc;
+        }
+
+        @Override
+        public int nextDoc() {
+            if (row >= 0 && inRow + 1 < nestedLayout.childCount(col, row)) {
+                inRow++;
+                doc = nestedLayout.childDocStart(col, row) + inRow;
+                return doc;
+            }
+            for (int r = row + 1; r < nestedLayout.rows(); r++) {
+                if (nestedLayout.childCount(col, r) > 0) {
+                    row = r;
+                    inRow = 0;
+                    doc = nestedLayout.childDocStart(col, r);
+                    return doc;
+                }
+            }
+            doc = NO_MORE_DOCS;
+            return doc;
+        }
+
+        @Override
+        public int advance(int target) {
+            if (target >= maxDoc) {
+                doc = NO_MORE_DOCS;
+                return doc;
+            }
+            for (int r = Math.max(0, nestedLayout.rowOfDoc(target)); r < nestedLayout.rows(); r++) {
+                int n = nestedLayout.childCount(col, r);
+                if (n == 0) {
+                    continue;
+                }
+                int start = nestedLayout.childDocStart(col, r);
+                int candidate = Math.max(start, target);
+                if (candidate < start + n) {
+                    row = r;
+                    inRow = candidate - start;
+                    doc = candidate;
+                    return doc;
+                }
+                // target sits past this row's slice of the column; later
+                // rows start after target, so their first child qualifies.
+            }
+            doc = NO_MORE_DOCS;
+            return doc;
+        }
+
+        @Override
+        public long cost() {
+            return nestedLayout.totalElements(col);
+        }
+
+        @Override
+        public int freq() {
+            return 1;
+        }
+
+        @Override
+        public int nextPosition() {
+            return -1;
+        }
+
+        @Override
+        public int startOffset() {
+            return -1;
+        }
+
+        @Override
+        public int endOffset() {
+            return -1;
+        }
+
+        @Override
+        public BytesRef getPayload() {
+            return null;
         }
     }
 
@@ -2303,13 +3083,16 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * rows the caller has decided to return.
      */
     public void prefetchRows(int[] docIds) throws IOException {
-        List<Long> addresses = new java.util.ArrayList<>(docIds.length);
+        List<Long> addresses = new ArrayList<>(docIds.length);
         java.util.Set<Integer> requested = new java.util.HashSet<>();
         for (int docId : docIds) {
             if (takenRows.containsKey(docId) || !requested.add(docId)) {
                 continue;
             }
-            addresses.add(((long) fragmentId << 32) | (docId & 0xFFFFFFFFL));
+            // Doc ids address rows through the layout (identity without
+            // nested columns); only parent docs reach here, because hits
+            // are parents.
+            addresses.add(((long) fragmentId << 32) | (rowOf(docId) & 0xFFFFFFFFL));
         }
         if (addresses.isEmpty()) {
             return;
@@ -2353,7 +3136,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                         for (int c = 0; c < vectors.length; c++) {
                             row[c] = decodeTakeValue(takeColumns.get(c), vectors[c], i);
                         }
-                        takenRows.put(offset, row);
+                        takenRows.put(docOfRow(offset), row);
                     }
                 }
             } catch (IOException e) {
@@ -2389,6 +3172,9 @@ public final class LanceFragmentLeafReader extends LeafReader {
         if (kind == null) {
             if (vector instanceof StructVector struct && structColumns.contains(name)) {
                 return decodeStructValue(name, struct, i);
+            }
+            if (vector instanceof ListVector list && nestedColumns.contains(name)) {
+                return decodeNestedValue(name, list, i);
             }
             if (vector instanceof VarCharVector vc) {
                 return new String(vc.get(i), java.nio.charset.StandardCharsets.UTF_8);
@@ -2472,6 +3258,30 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     /**
+     * Decode one {@code List<Struct>} cell of a take-scan batch into the
+     * list of element objects {@link #materialiseStoredFields} renders as
+     * a JSON array. Each element decodes through
+     * {@link #decodeStructValue} under the nested column's dotted paths,
+     * so only surfaced children appear as keys; a null element struct
+     * decodes to {@code null} and renders as a JSON {@code null} element.
+     * An Arrow-null list returns {@code null} (the key stays out of
+     * {@code _source}); an empty list returns an empty array.
+     */
+    private Object decodeNestedValue(String path, ListVector vector, int i) {
+        if (vector.isNull(i)) {
+            return null;
+        }
+        StructVector elements = (StructVector) vector.getDataVector();
+        int start = vector.getElementStartIndex(i);
+        int end = vector.getElementEndIndex(i);
+        List<Object> out = new ArrayList<>(end - start);
+        for (int e = start; e < end; e++) {
+            out.add(decodeStructValue(path, elements, e));
+        }
+        return out;
+    }
+
+    /**
      * Materialise stored fields for a single doc. Extracted from the {@code
      * storedFields()} anonymous class so the sequential wrapper (see
      * {@link LanceSequentialLeafReader}) can call the same routine when
@@ -2510,14 +3320,15 @@ public final class LanceFragmentLeafReader extends LeafReader {
             // synthesised form so the row still gets a unique id rather
             // than repeating an empty string.
             Object pk = pkTakeIndex >= 0 && pkTakeIndex < row.length ? row[pkTakeIndex] : null;
+            int rowOffset = rowOf(docID);
             String idString = switch (pkType) {
-                case KEYWORD -> pk instanceof String s ? s : fragmentId + "-" + docID;
-                case LONG -> pk instanceof Long l ? Long.toString(l) : fragmentId + "-" + docID;
+                case KEYWORD -> pk instanceof String s ? s : fragmentId + "-" + rowOffset;
+                case LONG -> pk instanceof Long l ? Long.toString(l) : fragmentId + "-" + rowOffset;
                 // readAsLong returns the unsigned bit pattern for
                 // UInt8Vector; Long.toUnsignedString decodes it back into
                 // the 0..2^64-1 range the operator wrote.
-                case UNSIGNED_LONG -> pk instanceof Long l ? Long.toUnsignedString(l) : fragmentId + "-" + docID;
-                default -> fragmentId + "-" + docID;
+                case UNSIGNED_LONG -> pk instanceof Long l ? Long.toUnsignedString(l) : fragmentId + "-" + rowOffset;
+                default -> fragmentId + "-" + rowOffset;
             };
             org.apache.lucene.util.BytesRef encoded = org.opensearch.index.mapper.Uid.encodeId(idString);
             byte[] bytes = new byte[encoded.length];
@@ -2577,11 +3388,26 @@ public final class LanceFragmentLeafReader extends LeafReader {
         }
         if (value instanceof Map<?, ?> struct) {
             builder.startObject(key);
-            for (Map.Entry<?, ?> entry : struct.entrySet()) {
-                String childName = (String) entry.getKey();
-                writeSourceField(builder, path + "." + childName, childName, entry.getValue());
-            }
+            writeStructBody(builder, path, struct);
             builder.endObject();
+            return;
+        }
+        if (value instanceof List<?> array) {
+            // A decoded List<Struct> (nested) column: render the array of
+            // element objects. Elements are maps of the surfaced children
+            // under the same dotted paths as the parent's mapping; a null
+            // element struct renders as a JSON null element.
+            builder.startArray(key);
+            for (Object element : array) {
+                if (element == null) {
+                    builder.nullValue();
+                } else {
+                    builder.startObject();
+                    writeStructBody(builder, path, (Map<?, ?>) element);
+                    builder.endObject();
+                }
+            }
+            builder.endArray();
             return;
         }
         switch (columnKind.get(path)) {
@@ -2611,6 +3437,14 @@ public final class LanceFragmentLeafReader extends LeafReader {
             case TEXT_FTS, TEXT_KEYWORD -> builder.field(key, (String) value);
             case KEYWORD_ARRAY -> builder.field(key, (String[]) value);
             case BINARY -> builder.field(key, Base64.getEncoder().encodeToString((byte[]) value));
+        }
+    }
+
+    /** Render the children of one decoded struct (or nested element) under {@code path}. */
+    private void writeStructBody(org.opensearch.core.xcontent.XContentBuilder builder, String path, Map<?, ?> struct) throws IOException {
+        for (Map.Entry<?, ?> entry : struct.entrySet()) {
+            String childName = (String) entry.getKey();
+            writeSourceField(builder, path + "." + childName, childName, entry.getValue());
         }
     }
 
