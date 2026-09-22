@@ -360,7 +360,14 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
 
         public Entry(StreamInput in) throws IOException {
             this.name = in.readString();
-            this.type = in.readString();
+            String readType = in.readString();
+            if (!ACCEPTED_TYPES.contains(readType)) {
+                // The primary constructor validates the same way; a wire
+                // value outside the accepted set means a corrupted stream
+                // or a sender with a type this build does not know.
+                throw new IOException("unknown namespace type [" + readType + "] on the wire; accepted values are " + ACCEPTED_TYPES);
+            }
+            this.type = readType;
             this.rootUri = in.readOptionalString();
             this.storageOptions = StorageOptions.readFromStream(in);
             this.config = Collections.unmodifiableMap(new TreeMap<>(in.readMap(StreamInput::readString, StreamInput::readString)));

@@ -5,6 +5,8 @@
 
 package org.opensearch.lance.namespace;
 
+import java.io.IOException;
+
 import java.util.List;
 import java.util.Map;
 
@@ -175,6 +177,23 @@ public class LanceNamespaceMetadataTests extends OpenSearchTestCase {
         // A directory entry unregisters by its path too.
         assertEquals(2, current.withUnregistered("/data/lance").entries().size());
         assertSame(current, current.withUnregistered("unknown"));
+    }
+
+    public void testWireRejectsUnknownTypeString() throws Exception {
+        // The stream constructor guards the type the same way the
+        // primary constructor does; a value outside the accepted set
+        // means a corrupted stream or an unknown sender build.
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.writeVInt(LanceNamespaceMetadata.WIRE_FORMAT_VERSION);
+            out.writeVInt(1);
+            out.writeString("x");
+            out.writeString("hive");
+            try (StreamInput in = out.bytes().streamInput()) {
+                IOException e = expectThrows(IOException.class, () -> new LanceNamespaceMetadata(in));
+                assertTrue(e.getMessage(), e.getMessage().contains("hive"));
+                assertTrue(e.getMessage(), e.getMessage().contains("directory"));
+            }
+        }
     }
 
     public void testEntryRejectsUnknownType() {
