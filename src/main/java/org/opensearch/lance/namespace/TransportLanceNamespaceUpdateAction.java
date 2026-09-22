@@ -206,7 +206,7 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
                     }
                     LanceNamespaceMetadata next = switch (request.operation()) {
                         case REGISTER -> existing.withRegistered(
-                            new LanceNamespaceMetadata.Entry(request.rootUri(), request.storageOptions())
+                            new LanceNamespaceMetadata.Entry(request.rootUri(), request.storageOptions(), request.overridesJson())
                         );
                         case UNREGISTER -> existing.withUnregistered(request.rootUri());
                     };

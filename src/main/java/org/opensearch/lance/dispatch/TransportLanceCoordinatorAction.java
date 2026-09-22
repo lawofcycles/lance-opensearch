@@ -1174,9 +1174,31 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             if (!(field instanceof java.util.Map)) {
                 return null;
             }
-            Object type = ((java.util.Map<String, Object>) field).get("type");
-            return type instanceof String ? (String) type : null;
+            java.util.Map<String, Object> fieldMap = (java.util.Map<String, Object>) field;
+            Object type = fieldMap.get("type");
+            if (!(type instanceof String typeName)) {
+                return null;
+            }
+            return "date".equals(typeName) && isIntegerArrowType(fieldMap) ? LanceKnnFilterTranslator.DATE_ON_INTEGER : typeName;
         };
+    }
+
+    /**
+     * Whether the mapping entry's {@code meta.lance_arrow_type} names an
+     * integer Arrow column. True for a {@code date} field the attach
+     * body overrode onto an epoch-millis integer column, whose SQL
+     * literals must stay numeric (see
+     * {@link LanceKnnFilterTranslator#DATE_ON_INTEGER}); a real Date /
+     * Timestamp column keeps the plain {@code date} answer.
+     */
+    @SuppressWarnings("unchecked")
+    static boolean isIntegerArrowType(Map<String, Object> fieldMap) {
+        Object meta = fieldMap.get("meta");
+        if (!(meta instanceof Map)) {
+            return false;
+        }
+        Object arrowType = ((Map<String, Object>) meta).get("lance_arrow_type");
+        return arrowType instanceof String s && s.startsWith("Int(");
     }
 
     /**

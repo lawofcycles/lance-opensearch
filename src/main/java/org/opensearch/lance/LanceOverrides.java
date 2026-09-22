@@ -209,7 +209,9 @@ public final class LanceOverrides {
             return EMPTY;
         }
         try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
-            return parseAttachClauses(parser.map(), null);
+            // mapOrdered keeps the declaration order, which drives the
+            // order of the emitted mapping fields.
+            return parseAttachClauses(parser.mapOrdered(), null);
         } catch (IllegalArgumentException e) {
             throw e;
         } catch (Exception e) {

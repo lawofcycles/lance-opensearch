@@ -11,6 +11,7 @@ import java.util.Map;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.namespace.LanceNamespaceListAction;
 import org.opensearch.lance.namespace.LanceNamespaceListRequest;
@@ -120,15 +121,23 @@ public class RestNamespaceAction extends BaseRestHandler {
             );
         }
         StorageOptions storageOptions;
+        String overridesJson;
         try {
             storageOptions = StorageOptions.parseFromRequestField(body.get("storage_options"), "[lance_namespace]");
+            // Same clause as on the attach body. Structural validation
+            // happens here (a 400 before anything is registered);
+            // schema-dependent validation happens per table when the
+            // poll surfaces it, leniently, because one override list
+            // applies to every table under the root and a table that
+            // lacks a named column just skips that override.
+            overridesJson = LanceOverrides.parseAttachClauses(body.get("overrides"), null).toJson();
         } catch (IllegalArgumentException e) {
             String message = e.getMessage();
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
         }
         return channel -> client.execute(
             LanceNamespaceUpdateAction.INSTANCE,
-            LanceNamespaceUpdateRequest.register(path, storageOptions),
+            LanceNamespaceUpdateRequest.register(path, storageOptions, overridesJson),
             new RestBuilderListener<>(channel) {
                 @Override
                 public RestResponse buildResponse(LanceNamespaceUpdateResponse response, XContentBuilder b) throws Exception {

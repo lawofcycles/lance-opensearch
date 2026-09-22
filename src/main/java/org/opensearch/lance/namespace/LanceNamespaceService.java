@@ -348,7 +348,7 @@ public final class LanceNamespaceService {
                     continue;
                 }
                 for (String tableName : tables) {
-                    syncTable(entry.rootUri(), tableName, entry.storageOptions());
+                    syncTable(entry.rootUri(), tableName, entry.storageOptions(), entry.overridesJson());
                 }
             } catch (Exception e) {
                 LOG.warn("namespace poll failed for {}", entry.rootUri(), e);
@@ -368,9 +368,9 @@ public final class LanceNamespaceService {
         }
     }
 
-    private void syncTable(String rootUri, String tableName, StorageOptions storageOptions) {
+    private void syncTable(String rootUri, String tableName, StorageOptions storageOptions, String overridesJson) {
         String table = rootUri + "/" + tableName + ".lance";
-        runSyncCycle(table, tableName, storageOptions, null);
+        runSyncCycle(table, tableName, storageOptions, null, overridesJson);
     }
 
     /**
@@ -497,10 +497,14 @@ public final class LanceNamespaceService {
     // that a tag-following index compares against the version its tag
     // resolves to instead of the latest manifest.
     private void syncAttachedTable(String indexName, String tablePath, StorageOptions storageOptions, String tag) {
-        runSyncCycle(tablePath, indexName, storageOptions, tag);
+        // An attach-created index that got deleted and resurfaces after
+        // the grace period carries no overrides: they lived in the
+        // deleted index's settings, and attach is where the operator
+        // declares them again.
+        runSyncCycle(tablePath, indexName, storageOptions, tag, "");
     }
 
-    private void runSyncCycle(String table, String indexName, StorageOptions storageOptions, String tag) {
+    private void runSyncCycle(String table, String indexName, StorageOptions storageOptions, String tag, String surfaceOverridesJson) {
         try {
             boolean exists = client.admin().indices().exists(new IndicesExistsRequest(indexName)).actionGet().isExists();
             if (!exists) {
@@ -521,7 +525,7 @@ public final class LanceNamespaceService {
                     // bound and let surfacing proceed.
                     tombstones.remove(indexName);
                 }
-                surface(indexName, table, storageOptions);
+                surface(indexName, table, storageOptions, surfaceOverridesJson);
                 return;
             }
             Long served = servedVersions.get(indexName);
@@ -547,6 +551,7 @@ public final class LanceNamespaceService {
             long target;
             boolean moved;
             String rederivedMappingJson = null;
+            LanceOverrides storedOverrides = LanceOverrides.EMPTY;
             try (Dataset latestDataset = LanceRegistry.openDataset(table, storageOptions)) {
                 long latest = latestDataset.version();
                 // An index adopted from cluster state serves -1 until this
@@ -576,7 +581,7 @@ public final class LanceNamespaceService {
                     // the setting, so it applies again if a later manifest
                     // restores the column.
                     IndexMetadata rederivationMetadata = clusterService.state().metadata().index(indexName);
-                    LanceOverrides storedOverrides = rederivationMetadata == null
+                    storedOverrides = rederivationMetadata == null
                         ? LanceOverrides.EMPTY
                         : LanceOverrides.of(rederivationMetadata.getSettings());
                     if (target == latest) {
@@ -658,7 +663,11 @@ public final class LanceNamespaceService {
                                     .delete(new org.opensearch.action.admin.indices.delete.DeleteIndexRequest(indexName))
                                     .actionGet();
                                 servedVersions.remove(indexName);
-                                surface(indexName, table, storageOptions);
+                                // The recreate must keep the index's own
+                                // overrides; without them the rebuilt
+                                // mapping would drop the operator's type
+                                // and sub-field declarations.
+                                surface(indexName, table, storageOptions, storedOverrides.toJson());
                                 return;
                             } catch (Exception rebuild) {
                                 LOG.warn("rebuild after type change failed for {}: {}", indexName, rebuild.getMessage());
@@ -686,14 +695,25 @@ public final class LanceNamespaceService {
         }
     }
 
-    private void surface(String indexName, String table, StorageOptions storageOptions) throws Exception {
+    private void surface(String indexName, String table, StorageOptions storageOptions, String overridesJson) throws Exception {
+        // Overrides apply leniently: the register call's override list
+        // covers every table under the root, so a column this table
+        // lacks is skipped (visible once at debug) while the full list
+        // is persisted in the index settings, ready for a manifest that
+        // adds the column.
+        LanceOverrides overrides = LanceOverrides.parse(overridesJson);
         RestAttachAction.Derivation derivation;
         try (Dataset dataset = LanceRegistry.openDataset(table, storageOptions)) {
             // Derive first so the CreateIndex settings and mapping reflect
             // the current Lance schema. Automatic index creation is off by
             // default; operators build indexes explicitly through
             // POST /_lance/build_indexes.
-            derivation = RestAttachAction.derive(dataset);
+            derivation = RestAttachAction.derive(dataset, overrides, true);
+        }
+        if (!derivation.notes().isEmpty() && LOG.isDebugEnabled()) {
+            for (String note : derivation.notes()) {
+                LOG.debug("surface of {} at {}: {}", indexName, table, note);
+            }
         }
         // Fire the CreateIndex asynchronously so a red shard on this table
         // does not block the poll thread for 30 seconds waiting for ack.
@@ -706,6 +726,9 @@ public final class LanceNamespaceService {
             .put(LanceEngineFactory.TABLE_SETTING, table)
             .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField())
             .put(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, derivation.keyFieldType());
+        if (!derivation.overridesJson().isEmpty()) {
+            settings.put(LanceEngineFactory.OVERRIDES_SETTING, derivation.overridesJson());
+        }
         storageOptions.writeToSettings(settings);
         // LanceCreateIndexActionFilter blocks user PUT /{index} with
         // index.lance.table in settings. This surface call is

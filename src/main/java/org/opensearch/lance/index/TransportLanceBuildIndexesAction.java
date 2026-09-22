@@ -25,6 +25,7 @@ import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.IndexNotFoundException;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -114,14 +115,19 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
             return;
         }
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(metadata.getSettings());
+        // The stored overrides steer the derivation below: a column the
+        // operator overrode to keyword must not become an FTS build
+        // target even though it is Utf8.
+        LanceOverrides overrides = LanceOverrides.of(metadata.getSettings());
         threadPool.executor(ThreadPool.Names.GENERIC)
-            .execute(ActionRunnable.wrap(listener, l -> buildAndRefresh(request, tableUri, storageOptions, l)));
+            .execute(ActionRunnable.wrap(listener, l -> buildAndRefresh(request, tableUri, storageOptions, overrides, l)));
     }
 
     private void buildAndRefresh(
         LanceBuildIndexesRequest request,
         String tableUri,
         StorageOptions storageOptions,
+        LanceOverrides overrides,
         ActionListener<LanceBuildIndexesResponse> listener
     ) throws Exception {
         String indexName = request.index();
@@ -129,7 +135,7 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
         LanceIndexBuilder.BuildResult scalar;
         LanceIndexBuilder.BuildResult vector;
         try (Dataset dataset = LanceRegistry.openDataset(tableUri, storageOptions)) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset);
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides, true);
             Set<String> columnsFilter = request.columns() != null ? new LinkedHashSet<>(request.columns()) : null;
             if (columnsFilter != null) {
                 // Reject unknown columns up front so callers don't get a 200
