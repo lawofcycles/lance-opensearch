@@ -440,7 +440,10 @@ final class LanceAggregationSupport {
 
     /**
      * One bucket level the pushdown builds: {@code terms} ordered by
-     * {@code _count} descending or by {@code _key} with the default
+     * {@code _count} descending, by {@code _key}, or by one sub
+     * aggregation (the executor honours the last for a single terms
+     * level ordering on its own single value metric child and falls
+     * back to the aggregators otherwise), with the default
      * {@code min_doc_count} and no {@code include} / {@code exclude};
      * {@code histogram} with {@code offset} 0 and no bounds;
      * {@code date_histogram} with a {@code fixed_interval} or a
@@ -475,7 +478,9 @@ final class LanceAggregationSupport {
             return false;
         }
         if (builder instanceof TermsAggregationBuilder terms) {
-            return (InternalOrder.isCountDesc(terms.order()) || InternalOrder.isKeyOrder(terms.order()))
+            return (InternalOrder.isCountDesc(terms.order())
+                || InternalOrder.isKeyOrder(terms.order())
+                || terms.order() instanceof InternalOrder.Aggregation)
                 && terms.minDocCount() == 1L
                 && terms.shardMinDocCount() == 0L
                 && terms.includeExclude() == null;

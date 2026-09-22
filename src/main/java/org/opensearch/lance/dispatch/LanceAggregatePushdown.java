@@ -5,13 +5,13 @@
 
 package org.opensearch.lance.dispatch;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -35,20 +35,25 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.BytesRefBuilder;
+import org.apache.lucene.util.BytesRefHash;
 import org.apache.lucene.util.PriorityQueue;
 import org.lance.Dataset;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.opensearch.common.Rounding;
 import org.opensearch.common.hash.MurmurHash3;
+import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.util.BitMixer;
+import org.opensearch.common.util.Comparators;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
@@ -238,6 +243,18 @@ public final class LanceAggregatePushdown {
 
     public static void setPercentilesBins(int bins) {
         percentilesBins = bins;
+    }
+
+    /**
+     * How many times {@code shard_size} groups each scan of a single
+     * level {@code terms} keeps, from
+     * {@code lance.aggregation.pushdown_topk_slack}; the plugin stores
+     * the node setting here at start and every dynamic update after.
+     */
+    private static volatile int topkSlack = LancePlugin.AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.getDefault(Settings.EMPTY);
+
+    public static void setTopkSlack(int slack) {
+        topkSlack = slack;
     }
 
     /**
@@ -732,29 +749,970 @@ public final class LanceAggregatePushdown {
     }
 
     /**
-     * What one scan returned, and the merge of several. {@code total} is
-     * the row count over every group, null keyed rows included; a plan
-     * without groupings keeps its single row in {@code metricsOnly}
-     * ({@code null} until a row arrived), a plan with groupings keeps
-     * one state per key list in {@code groups}. Keys are the objects the
-     * bucket types expect ({@link BytesRef}, {@link Long}, {@link Double},
-     * or null where the row has no value at an inner level), whose
-     * {@code equals} identifies the same group across scans.
+     * What one scan returned, and the merge of several. {@code total}
+     * is the row count over every group, null keyed rows included. A
+     * plan without groupings keeps its single row in
+     * {@code metricsOnly} ({@code null} until a row arrived). A plan
+     * with groupings keeps one state per key list in the primitive
+     * columns of {@code groups}; the single level {@code terms} shape
+     * ordered by {@code _count} or by one metric keeps the bounded per
+     * scan selection in {@code topK} instead, with the row count over
+     * every keyed group in {@code keyedCount}
+     * ({@link Plan#mergePartials} folds the top-k partials into a
+     * {@code groups} table before the buckets are built).
      */
     private static final class Partial {
         long total;
+        long keyedCount;
         GroupState metricsOnly;
-        final Map<List<Object>, GroupState> groups = new HashMap<>();
+        GroupTable groups;
+        TopKGroups topK;
 
         void merge(Partial other) {
             total += other.total;
+            keyedCount += other.keyedCount;
             if (other.metricsOnly != null) {
                 metricsOnly = metricsOnly == null ? other.metricsOnly : metricsOnly.merge(other.metricsOnly);
             }
-            for (Map.Entry<List<Object>, GroupState> entry : other.groups.entrySet()) {
-                groups.merge(entry.getKey(), entry.getValue(), GroupState::merge);
+            if (other.groups != null) {
+                if (groups == null) {
+                    groups = other.groups;
+                } else {
+                    groups.mergeFrom(other.groups);
+                }
             }
         }
+    }
+
+    /**
+     * Columnar running values of every metric of the plan over the
+     * groups of a {@link GroupTable} or {@link TopKGroups}: one
+     * primitive array per measure per metric slot, indexed by group, so
+     * a scan reading millions of group rows writes into arrays instead
+     * of allocating a {@link MetricState} per row and metric. The
+     * sketches (the HyperLogLog++ of a {@code cardinality}, the TDigest
+     * a percentiles bin scan feeds) stay one object per group, created
+     * on the group's first value; their group count is bounded by the
+     * plan's group estimate, not by the rows read. {@link #box} turns
+     * one group's values back into the {@link MetricState} the bucket
+     * assembly folds and reports.
+     */
+    private static final class MetricStore {
+        private final List<Metric> metrics;
+        private final double[][] sums;
+        private final long[][] counts;
+        private final double[][] mins;
+        private final double[][] maxes;
+        private final double[][] squares;
+        private final HyperLogLogPlusPlus[][] sketches;
+        private final TDigestState[][] digests;
+        private int capacity;
+
+        MetricStore(List<Metric> metrics, int initialCapacity) {
+            this.metrics = metrics;
+            this.capacity = initialCapacity;
+            int slots = metrics.size();
+            sums = new double[slots][];
+            counts = new long[slots][];
+            mins = new double[slots][];
+            maxes = new double[slots][];
+            squares = new double[slots][];
+            sketches = new HyperLogLogPlusPlus[slots][];
+            digests = new TDigestState[slots][];
+            for (Metric metric : metrics) {
+                int slot = metric.slot();
+                switch (metric.kind()) {
+                    case SUM -> sums[slot] = new double[capacity];
+                    case MIN -> mins[slot] = filled(new double[capacity], 0, Double.POSITIVE_INFINITY);
+                    case MAX -> maxes[slot] = filled(new double[capacity], 0, Double.NEGATIVE_INFINITY);
+                    case VALUE_COUNT -> counts[slot] = new long[capacity];
+                    case AVG -> {
+                        sums[slot] = new double[capacity];
+                        counts[slot] = new long[capacity];
+                    }
+                    case STATS, EXTENDED_STATS -> {
+                        counts[slot] = new long[capacity];
+                        sums[slot] = new double[capacity];
+                        mins[slot] = filled(new double[capacity], 0, Double.POSITIVE_INFINITY);
+                        maxes[slot] = filled(new double[capacity], 0, Double.NEGATIVE_INFINITY);
+                        if (metric.kind() == MetricKind.EXTENDED_STATS) {
+                            squares[slot] = new double[capacity];
+                        }
+                    }
+                    case CARDINALITY -> sketches[slot] = new HyperLogLogPlusPlus[capacity];
+                    case PERCENTILES, PERCENTILE_RANKS -> {
+                        mins[slot] = filled(new double[capacity], 0, Double.POSITIVE_INFINITY);
+                        maxes[slot] = filled(new double[capacity], 0, Double.NEGATIVE_INFINITY);
+                        digests[slot] = new TDigestState[capacity];
+                    }
+                }
+            }
+        }
+
+        private static double[] filled(double[] array, int from, double value) {
+            Arrays.fill(array, from, array.length, value);
+            return array;
+        }
+
+        void ensureCapacity(int needed) {
+            if (needed <= capacity) {
+                return;
+            }
+            int grown = Math.max(needed, capacity * 2);
+            for (int slot = 0; slot < metrics.size(); slot++) {
+                if (sums[slot] != null) {
+                    sums[slot] = Arrays.copyOf(sums[slot], grown);
+                }
+                if (counts[slot] != null) {
+                    counts[slot] = Arrays.copyOf(counts[slot], grown);
+                }
+                if (mins[slot] != null) {
+                    mins[slot] = filled(Arrays.copyOf(mins[slot], grown), capacity, Double.POSITIVE_INFINITY);
+                }
+                if (maxes[slot] != null) {
+                    maxes[slot] = filled(Arrays.copyOf(maxes[slot], grown), capacity, Double.NEGATIVE_INFINITY);
+                }
+                if (squares[slot] != null) {
+                    squares[slot] = Arrays.copyOf(squares[slot], grown);
+                }
+                if (sketches[slot] != null) {
+                    sketches[slot] = Arrays.copyOf(sketches[slot], grown);
+                }
+                if (digests[slot] != null) {
+                    digests[slot] = Arrays.copyOf(digests[slot], grown);
+                }
+            }
+            capacity = grown;
+        }
+
+        /** Back to the neutral element at {@code idx}, for a reused top-k slot. */
+        void reset(int idx) {
+            for (int slot = 0; slot < metrics.size(); slot++) {
+                if (sums[slot] != null) {
+                    sums[slot][idx] = 0d;
+                }
+                if (counts[slot] != null) {
+                    counts[slot][idx] = 0L;
+                }
+                if (mins[slot] != null) {
+                    mins[slot][idx] = Double.POSITIVE_INFINITY;
+                }
+                if (maxes[slot] != null) {
+                    maxes[slot][idx] = Double.NEGATIVE_INFINITY;
+                }
+                if (squares[slot] != null) {
+                    squares[slot][idx] = 0d;
+                }
+                if (sketches[slot] != null) {
+                    sketches[slot][idx] = null;
+                }
+                if (digests[slot] != null) {
+                    digests[slot][idx] = null;
+                }
+            }
+        }
+
+        void addSum(int slot, int idx, double value) {
+            sums[slot][idx] += value;
+        }
+
+        void addCount(int slot, int idx, long value) {
+            counts[slot][idx] += value;
+        }
+
+        void addMin(int slot, int idx, double value) {
+            if (value < mins[slot][idx]) {
+                mins[slot][idx] = value;
+            }
+        }
+
+        void addMax(int slot, int idx, double value) {
+            if (value > maxes[slot][idx]) {
+                maxes[slot][idx] = value;
+            }
+        }
+
+        void addSquare(int slot, int idx, double value) {
+            squares[slot][idx] += value;
+        }
+
+        void collectHash(int slot, int idx, long hash, int precision) {
+            HyperLogLogPlusPlus sketch = sketches[slot][idx];
+            if (sketch == null) {
+                sketch = new HyperLogLogPlusPlus(precision, BigArrays.NON_RECYCLING_INSTANCE, 1);
+                sketches[slot][idx] = sketch;
+            }
+            sketch.collect(0, hash);
+        }
+
+        /**
+         * One bin scan row into the group's digest: the bin's rows as
+         * one value at each bin edge and the rest at the centre, the
+         * spread {@link Metric#readBin} documents.
+         */
+        void addBin(int slot, int idx, double compression, double min, double max, double width, int bins, long ordinal, long count) {
+            TDigestState digest = digests[slot][idx];
+            if (digest == null) {
+                digest = new TDigestState(compression);
+                digests[slot][idx] = digest;
+            }
+            long bin = Math.max(0L, Math.min(ordinal, bins - 1L));
+            double lower = bin == 0L ? min : min + bin * width;
+            double upper = bin == bins - 1L || max == min ? max : Math.min(max, min + (bin + 1L) * width);
+            double centre = (lower + upper) / 2d;
+            if (count == 1L) {
+                digest.add(centre, 1);
+                return;
+            }
+            digest.add(lower, 1);
+            long remaining = count - 2L;
+            while (remaining > 0L) {
+                int slice = (int) Math.min(remaining, Integer.MAX_VALUE);
+                digest.add(centre, slice);
+                remaining -= slice;
+            }
+            digest.add(upper, 1);
+        }
+
+        void merge(int destIdx, MetricStore src, int srcIdx) {
+            for (Metric metric : metrics) {
+                int slot = metric.slot();
+                if (src.sums[slot] != null) {
+                    sums[slot][destIdx] += src.sums[slot][srcIdx];
+                }
+                if (src.counts[slot] != null) {
+                    counts[slot][destIdx] += src.counts[slot][srcIdx];
+                }
+                if (src.mins[slot] != null) {
+                    addMin(slot, destIdx, src.mins[slot][srcIdx]);
+                }
+                if (src.maxes[slot] != null) {
+                    addMax(slot, destIdx, src.maxes[slot][srcIdx]);
+                }
+                if (src.squares[slot] != null) {
+                    squares[slot][destIdx] += src.squares[slot][srcIdx];
+                }
+                if (src.sketches[slot] != null && src.sketches[slot][srcIdx] != null) {
+                    HyperLogLogPlusPlus other = src.sketches[slot][srcIdx];
+                    HyperLogLogPlusPlus sketch = sketches[slot][destIdx];
+                    if (sketch == null) {
+                        sketch = new HyperLogLogPlusPlus(other.precision(), BigArrays.NON_RECYCLING_INSTANCE, 1);
+                        sketches[slot][destIdx] = sketch;
+                    }
+                    sketch.merge(0, other, 0);
+                }
+                if (src.digests[slot] != null && src.digests[slot][srcIdx] != null) {
+                    TDigestState other = src.digests[slot][srcIdx];
+                    TDigestState digest = digests[slot][destIdx];
+                    if (digest == null) {
+                        digest = new TDigestState(other.compression());
+                        digests[slot][destIdx] = digest;
+                    }
+                    digest.add(other);
+                }
+            }
+        }
+
+        /**
+         * The value of a single value metric at {@code idx}, as the
+         * order comparator reads it from the built aggregation: the
+         * sum, the min / max (an infinity when no row had a value), the
+         * value count, or the average ({@code NaN} over a count of 0,
+         * which sorts last in either direction).
+         */
+        double sortValue(int slot, int idx) {
+            return switch (metrics.get(slot).kind()) {
+                case SUM -> sums[slot][idx];
+                case MIN -> mins[slot][idx];
+                case MAX -> maxes[slot][idx];
+                case VALUE_COUNT -> (double) counts[slot][idx];
+                case AVG -> sums[slot][idx] / counts[slot][idx];
+                default -> throw new IllegalStateException("not a single value metric: " + metrics.get(slot).kind());
+            };
+        }
+
+        /** The smallest group minimum of {@code slot} over the first {@code size} groups, for the percentiles bin bounds. */
+        double minOf(int slot, int size) {
+            double min = Double.POSITIVE_INFINITY;
+            for (int idx = 0; idx < size; idx++) {
+                min = Math.min(min, mins[slot][idx]);
+            }
+            return min;
+        }
+
+        double maxOf(int slot, int size) {
+            double max = Double.NEGATIVE_INFINITY;
+            for (int idx = 0; idx < size; idx++) {
+                max = Math.max(max, maxes[slot][idx]);
+            }
+            return max;
+        }
+
+        /** One group's values as the states the bucket assembly reads, by slot. */
+        MetricState[] boxAll(int idx) {
+            MetricState[] states = new MetricState[metrics.size()];
+            for (int slot = 0; slot < states.length; slot++) {
+                states[slot] = box(slot, idx);
+            }
+            return states;
+        }
+
+        private MetricState box(int slot, int idx) {
+            MetricState state = new MetricState();
+            switch (metrics.get(slot).kind()) {
+                case SUM -> state.sum = sums[slot][idx];
+                case MIN -> state.min = mins[slot][idx];
+                case MAX -> state.max = maxes[slot][idx];
+                case VALUE_COUNT -> state.count = counts[slot][idx];
+                case AVG -> {
+                    state.sum = sums[slot][idx];
+                    state.count = counts[slot][idx];
+                }
+                case STATS, EXTENDED_STATS -> {
+                    state.count = counts[slot][idx];
+                    state.sum = sums[slot][idx];
+                    state.min = mins[slot][idx];
+                    state.max = maxes[slot][idx];
+                    if (squares[slot] != null) {
+                        state.sumOfSquares = squares[slot][idx];
+                    }
+                }
+                case CARDINALITY -> state.sketch = sketches[slot][idx];
+                case PERCENTILES, PERCENTILE_RANKS -> {
+                    state.min = mins[slot][idx];
+                    state.max = maxes[slot][idx];
+                    state.digest = digests[slot][idx];
+                }
+            }
+            return state;
+        }
+    }
+
+    /**
+     * The output vectors of one metric in one batch of a main scan,
+     * resolved once per batch so the row loop reads primitives only:
+     * the columnar counterpart of {@link Metric#read}.
+     */
+    private static final class MetricBatch {
+        private final Metric metric;
+        private final int slot;
+        private final FieldVector value;
+        private final FieldVector count;
+        private final FieldVector min;
+        private final FieldVector max;
+        private final FieldVector square;
+        private final FieldVector distinct;
+        private final int precision;
+        private final MurmurHash3.Hash128 hashScratch;
+        private final BytesRefBuilder bytesScratch;
+
+        MetricBatch(Metric metric, VectorSchemaRoot root) {
+            this.metric = metric;
+            this.slot = metric.slot();
+            String prefix = metric.prefix();
+            FieldVector value = null;
+            FieldVector count = null;
+            FieldVector min = null;
+            FieldVector max = null;
+            FieldVector square = null;
+            FieldVector distinct = null;
+            int precision = 0;
+            switch (metric.kind()) {
+                case SUM, MIN, MAX, VALUE_COUNT -> value = root.getVector(prefix);
+                case AVG -> {
+                    value = root.getVector(prefix + "_s");
+                    count = root.getVector(prefix + "_c");
+                }
+                case STATS, EXTENDED_STATS -> {
+                    count = root.getVector(prefix + "_c");
+                    value = root.getVector(prefix + "_s");
+                    min = root.getVector(prefix + "_mn");
+                    max = root.getVector(prefix + "_mx");
+                    if (metric.kind() == MetricKind.EXTENDED_STATS) {
+                        square = root.getVector(prefix + "_q");
+                    }
+                }
+                case CARDINALITY -> {
+                    distinct = root.getVector(metric.distinctColumn());
+                    precision = metric.precision();
+                }
+                case PERCENTILES, PERCENTILE_RANKS -> {
+                    min = root.getVector(prefix + "_mn");
+                    max = root.getVector(prefix + "_mx");
+                }
+            }
+            this.value = value;
+            this.count = count;
+            this.min = min;
+            this.max = max;
+            this.square = square;
+            this.distinct = distinct;
+            this.precision = precision;
+            this.hashScratch = distinct instanceof VarCharVector ? new MurmurHash3.Hash128() : null;
+            this.bytesScratch = distinct instanceof VarCharVector ? new BytesRefBuilder() : null;
+        }
+
+        static MetricBatch[] resolve(List<Metric> metrics, VectorSchemaRoot root) {
+            MetricBatch[] batches = new MetricBatch[metrics.size()];
+            for (int i = 0; i < batches.length; i++) {
+                batches[i] = new MetricBatch(metrics.get(i), root);
+            }
+            return batches;
+        }
+
+        /** The metric's values on one group row, into the group's columns. */
+        void add(MetricStore store, int idx, int row) {
+            switch (metric.kind()) {
+                case SUM -> store.addSum(slot, idx, doubleOrZero(value, row));
+                case MIN -> store.addMin(slot, idx, doubleOr(value, row, Double.POSITIVE_INFINITY));
+                case MAX -> store.addMax(slot, idx, doubleOr(value, row, Double.NEGATIVE_INFINITY));
+                case VALUE_COUNT -> store.addCount(slot, idx, longOrZero(value, row));
+                case AVG -> {
+                    store.addSum(slot, idx, doubleOrZero(value, row));
+                    store.addCount(slot, idx, longOrZero(count, row));
+                }
+                case STATS, EXTENDED_STATS -> {
+                    store.addCount(slot, idx, longOrZero(count, row));
+                    store.addSum(slot, idx, doubleOrZero(value, row));
+                    store.addMin(slot, idx, doubleOr(min, row, Double.POSITIVE_INFINITY));
+                    store.addMax(slot, idx, doubleOr(max, row, Double.NEGATIVE_INFINITY));
+                    if (square != null) {
+                        store.addSquare(slot, idx, doubleOrZero(square, row));
+                    }
+                }
+                case CARDINALITY -> {
+                    if (!distinct.isNull(row)) {
+                        store.collectHash(slot, idx, hash(row), precision);
+                    }
+                }
+                case PERCENTILES, PERCENTILE_RANKS -> {
+                    store.addMin(slot, idx, doubleOr(min, row, Double.POSITIVE_INFINITY));
+                    store.addMax(slot, idx, doubleOr(max, row, Double.NEGATIVE_INFINITY));
+                }
+            }
+        }
+
+        /**
+         * The hash the cardinality aggregator computes for the row's
+         * distinct value, without the per row copies of
+         * {@link Metric#hash}: the string bytes are read into a reused
+         * scratch.
+         */
+        private long hash(int row) {
+            if (distinct instanceof VarCharVector v) {
+                BytesRef bytes = readUtf8(v, row, bytesScratch);
+                return MurmurHash3.hash128(bytes.bytes, bytes.offset, bytes.length, 0, hashScratch).h1;
+            }
+            if (distinct instanceof Float4Vector v) {
+                return BitMixer.mix64(Double.doubleToLongBits(v.get(row)));
+            }
+            if (distinct instanceof Float8Vector v) {
+                return BitMixer.mix64(Double.doubleToLongBits(v.get(row)));
+            }
+            return BitMixer.mix64(asLong(distinct, row));
+        }
+
+        /** The row's value under {@link MetricStore#sortValue}, for the top-k test before the row is retained. */
+        double rowSortValue(int row) {
+            return switch (metric.kind()) {
+                case SUM -> doubleOrZero(value, row);
+                case MIN -> doubleOr(value, row, Double.POSITIVE_INFINITY);
+                case MAX -> doubleOr(value, row, Double.NEGATIVE_INFINITY);
+                case VALUE_COUNT -> (double) longOrZero(value, row);
+                case AVG -> doubleOrZero(value, row) / longOrZero(count, row);
+                default -> throw new IllegalStateException("not a single value metric: " + metric.kind());
+            };
+        }
+    }
+
+    /**
+     * The groups of one scan (and the merge of several), keyed by the
+     * full key list, in primitive columns: one {@code long} per key and
+     * group (the value of an integer or date key, the
+     * {@link Double#doubleToLongBits} of a floating point key, the id
+     * of a string key in {@code dict}), a null bit set, the row counts,
+     * and the metric columns of a {@link MetricStore}. Group identity
+     * is an open addressing hash over the encoded keys, so merging a
+     * row allocates nothing; the string dictionary is a
+     * {@link BytesRefHash}, whose pooled bytes outlive the Arrow batch
+     * the key was read from. {@link #box} converts the groups into the
+     * {@link Group} list the bucket assembly folds, once, after every
+     * partial is merged.
+     */
+    private static final class GroupTable {
+
+        /** Ordering of two groups by index, for {@link #selectTop}. */
+        interface GroupOrder {
+            int compare(int a, int b);
+        }
+
+        private static final int INITIAL_CAPACITY = 16;
+
+        private final KeyKind[] kinds;
+        private final long[][] keys;
+        private long[] nullBits;
+        private long[] counts;
+        final MetricStore metrics;
+        private BytesRefHash dict;
+        private final BytesRef spare = new BytesRef();
+        private final BytesRef otherSpare = new BytesRef();
+        private int[] slots;
+        private int slotMask;
+        private int size;
+
+        GroupTable(KeyKind[] kinds, List<Metric> metrics) {
+            this.kinds = kinds;
+            this.keys = new long[kinds.length][];
+            for (int k = 0; k < kinds.length; k++) {
+                keys[k] = new long[INITIAL_CAPACITY];
+            }
+            this.nullBits = new long[INITIAL_CAPACITY];
+            this.counts = new long[INITIAL_CAPACITY];
+            this.metrics = new MetricStore(metrics, INITIAL_CAPACITY);
+            this.slots = new int[INITIAL_CAPACITY * 2];
+            this.slotMask = slots.length - 1;
+        }
+
+        int size() {
+            return size;
+        }
+
+        /** The dictionary id of {@code bytes}, adding it when new. */
+        long intern(BytesRef bytes) {
+            if (dict == null) {
+                dict = new BytesRefHash();
+            }
+            int id = dict.add(bytes);
+            return id < 0 ? -id - 1 : id;
+        }
+
+        /** The group's index, adding an empty group when the key list is new. */
+        int findOrAdd(long[] encoded, long nulls) {
+            int slot = (int) (hashOf(encoded, nulls) & slotMask);
+            while (true) {
+                int entry = slots[slot];
+                if (entry == 0) {
+                    return add(encoded, nulls, slot);
+                }
+                int idx = entry - 1;
+                if (nullBits[idx] == nulls && keysEqual(idx, encoded)) {
+                    return idx;
+                }
+                slot = (slot + 1) & slotMask;
+            }
+        }
+
+        private int add(long[] encoded, long nulls, int slot) {
+            if (size == counts.length) {
+                grow();
+                // The slot table was rebuilt; probe again for the
+                // insertion point.
+                slot = (int) (hashOf(encoded, nulls) & slotMask);
+                while (slots[slot] != 0) {
+                    slot = (slot + 1) & slotMask;
+                }
+            }
+            int idx = size++;
+            for (int k = 0; k < kinds.length; k++) {
+                keys[k][idx] = encoded[k];
+            }
+            nullBits[idx] = nulls;
+            slots[slot] = idx + 1;
+            return idx;
+        }
+
+        private void grow() {
+            int grown = counts.length * 2;
+            for (int k = 0; k < kinds.length; k++) {
+                keys[k] = Arrays.copyOf(keys[k], grown);
+            }
+            nullBits = Arrays.copyOf(nullBits, grown);
+            counts = Arrays.copyOf(counts, grown);
+            metrics.ensureCapacity(grown);
+            slots = new int[grown * 2];
+            slotMask = slots.length - 1;
+            for (int idx = 0; idx < size; idx++) {
+                int slot = (int) (hashAt(idx) & slotMask);
+                while (slots[slot] != 0) {
+                    slot = (slot + 1) & slotMask;
+                }
+                slots[slot] = idx + 1;
+            }
+        }
+
+        private long hashOf(long[] encoded, long nulls) {
+            long hash = BitMixer.mix64(nulls);
+            for (long value : encoded) {
+                hash = BitMixer.mix64(hash ^ value);
+            }
+            return hash;
+        }
+
+        private long hashAt(int idx) {
+            long hash = BitMixer.mix64(nullBits[idx]);
+            for (int k = 0; k < kinds.length; k++) {
+                hash = BitMixer.mix64(hash ^ keys[k][idx]);
+            }
+            return hash;
+        }
+
+        private boolean keysEqual(int idx, long[] encoded) {
+            for (int k = 0; k < kinds.length; k++) {
+                if (keys[k][idx] != encoded[k]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        void addCount(int idx, long count) {
+            counts[idx] += count;
+        }
+
+        long countAt(int idx) {
+            return counts[idx];
+        }
+
+        /** Sum of the counts of every group, for {@code sum_other_doc_count} under a key order. */
+        long totalCount() {
+            long total = 0L;
+            for (int idx = 0; idx < size; idx++) {
+                total += counts[idx];
+            }
+            return total;
+        }
+
+        void mergeFrom(GroupTable src) {
+            long[] encoded = new long[kinds.length];
+            for (int g = 0; g < src.size; g++) {
+                for (int k = 0; k < kinds.length; k++) {
+                    if (kinds[k] == KeyKind.STRING && (src.nullBits[g] & (1L << k)) == 0L) {
+                        src.dict.get((int) src.keys[k][g], src.spare);
+                        encoded[k] = intern(src.spare);
+                    } else {
+                        encoded[k] = src.keys[k][g];
+                    }
+                }
+                int idx = findOrAdd(encoded, src.nullBits[g]);
+                counts[idx] += src.counts[g];
+                metrics.merge(idx, src.metrics, g);
+            }
+        }
+
+        /** Key order of the first key column, ascending, the terms tie break. */
+        int compareKeys(int a, int b) {
+            return switch (kinds[0]) {
+                case LONG -> Long.compare(keys[0][a], keys[0][b]);
+                case DOUBLE -> Double.compare(Double.longBitsToDouble(keys[0][a]), Double.longBitsToDouble(keys[0][b]));
+                case STRING -> {
+                    dict.get((int) keys[0][a], spare);
+                    dict.get((int) keys[0][b], otherSpare);
+                    yield spare.compareTo(otherSpare);
+                }
+            };
+        }
+
+        /**
+         * The indices of the first {@code n} groups by {@code order},
+         * best first: a bounded heap over every group, the primitive
+         * counterpart of the terms selection queue.
+         */
+        int[] selectTop(int n, GroupOrder order) {
+            int keep = Math.min(n, size);
+            int[] heap = new int[keep];
+            int heapSize = 0;
+            for (int idx = 0; idx < size; idx++) {
+                if (heapSize < keep) {
+                    heap[heapSize] = idx;
+                    siftUp(heap, heapSize++, order);
+                } else if (keep > 0 && order.compare(idx, heap[0]) < 0) {
+                    heap[0] = idx;
+                    siftDown(heap, heapSize, 0, order);
+                }
+            }
+            int[] selected = new int[heapSize];
+            for (int i = heapSize - 1; i >= 0; i--) {
+                selected[i] = heap[0];
+                heap[0] = heap[--heapSize];
+                siftDown(heap, heapSize, 0, order);
+            }
+            return selected;
+        }
+
+        /** The heap's top is the worst retained group: a parent sorts after its children. */
+        private static void siftUp(int[] heap, int pos, GroupOrder order) {
+            while (pos > 0) {
+                int parent = (pos - 1) / 2;
+                if (order.compare(heap[pos], heap[parent]) <= 0) {
+                    return;
+                }
+                int swap = heap[pos];
+                heap[pos] = heap[parent];
+                heap[parent] = swap;
+                pos = parent;
+            }
+        }
+
+        private static void siftDown(int[] heap, int heapSize, int pos, GroupOrder order) {
+            while (true) {
+                int worst = pos;
+                int left = pos * 2 + 1;
+                int right = left + 1;
+                if (left < heapSize && order.compare(heap[left], heap[worst]) > 0) {
+                    worst = left;
+                }
+                if (right < heapSize && order.compare(heap[right], heap[worst]) > 0) {
+                    worst = right;
+                }
+                if (worst == pos) {
+                    return;
+                }
+                int swap = heap[pos];
+                heap[pos] = heap[worst];
+                heap[worst] = swap;
+                pos = worst;
+            }
+        }
+
+        /** One group's key at position {@code k} as the object the bucket types expect. */
+        Object boxKey(int k, int idx) {
+            if ((nullBits[idx] & (1L << k)) != 0L) {
+                return null;
+            }
+            return switch (kinds[k]) {
+                case LONG -> keys[k][idx];
+                case DOUBLE -> Double.longBitsToDouble(keys[k][idx]);
+                case STRING -> {
+                    dict.get((int) keys[k][idx], spare);
+                    yield BytesRef.deepCopyOf(spare);
+                }
+            };
+        }
+
+        /** Every group as the boxed form the nested and composite assembly reads. */
+        List<Group> box() {
+            List<Group> groups = new ArrayList<>(size);
+            for (int idx = 0; idx < size; idx++) {
+                Object[] boxedKeys = new Object[kinds.length];
+                for (int k = 0; k < kinds.length; k++) {
+                    boxedKeys[k] = boxKey(k, idx);
+                }
+                groups.add(new Group(Arrays.asList(boxedKeys), new GroupState(counts[idx], metrics.boxAll(idx))));
+            }
+            return groups;
+        }
+    }
+
+    /**
+     * The bounded selection of one scan of the single level
+     * {@code terms} shape ordered by {@code _count} or by one single
+     * value metric: at most {@code limit} groups ({@code shard_size}
+     * times {@code lance.aggregation.pushdown_topk_slack}) are kept in
+     * a primitive heap whose top is the weakest retained group under
+     * the request order (count descending or the metric in its
+     * direction, key ascending as the tie breaker); a row that does not
+     * beat it only adds its count to {@code keyedCount}, which
+     * {@code sum_other_doc_count} is later computed from, so the scan's
+     * memory and allocations stop growing at {@code limit} groups
+     * however many groups Lance returns.
+     *
+     * <p>Entries are not coalesced here: Lance runs the aggregate to
+     * completion before emitting rows, so one scan returns each group
+     * at most once. The same key retained by several fragment group
+     * scans is summed when {@link Plan#mergePartials} folds the
+     * per scan selections into one {@link GroupTable} and the final
+     * {@code shard_size} cut re-evaluates the summed counts. A key a
+     * scan dropped loses that scan's rows the way a term a shard did
+     * not return loses that shard's: the doc count error the reduce
+     * derives from the smallest returned bucket keeps its meaning, and
+     * a slack large enough to retain every group makes the result
+     * exact.
+     */
+    private static final class TopKGroups {
+        private final KeyKind keyKind;
+        private final int sortSlot;
+        private final boolean sortAsc;
+        private final int limit;
+        final MetricStore metrics;
+        private long[] keys;
+        private long[] counts;
+        private double[] sortValues;
+        private BytesRefHash dict;
+        private final BytesRef spare = new BytesRef();
+        private final BytesRef otherSpare = new BytesRef();
+        private int[] heap;
+        private int size;
+        private long keyedCount;
+
+        TopKGroups(TopKSpec spec, List<Metric> allMetrics) {
+            this.keyKind = spec.keyKind();
+            this.sortSlot = spec.sortSlot();
+            this.sortAsc = spec.sortAsc();
+            this.limit = spec.perScanLimit();
+            int initial = Math.min(limit, 16);
+            this.keys = new long[initial];
+            this.counts = new long[initial];
+            this.sortValues = sortSlot >= 0 ? new double[initial] : null;
+            this.metrics = new MetricStore(allMetrics, initial);
+            this.heap = new int[initial];
+        }
+
+        long keyedCount() {
+            return keyedCount;
+        }
+
+        /**
+         * One group row: retained when the selection has room or the
+         * row beats the weakest retained group. Returns the entry index
+         * the caller writes the row's metrics into, or -1 when the row
+         * only counts toward {@code keyedCount}.
+         */
+        int offer(long numericKey, BytesRef stringKey, long count, double sortValue) {
+            keyedCount += count;
+            if (size < limit) {
+                if (size == counts.length) {
+                    int grown = (int) Math.min((long) counts.length * 2, limit);
+                    keys = Arrays.copyOf(keys, grown);
+                    counts = Arrays.copyOf(counts, grown);
+                    if (sortValues != null) {
+                        sortValues = Arrays.copyOf(sortValues, grown);
+                    }
+                    metrics.ensureCapacity(grown);
+                    heap = Arrays.copyOf(heap, grown);
+                }
+                int idx = size;
+                write(idx, numericKey, stringKey, count, sortValue);
+                heap[size] = idx;
+                siftUp(size++);
+                return idx;
+            }
+            int worst = heap[0];
+            if (compareCandidate(numericKey, stringKey, count, sortValue, worst) >= 0) {
+                return -1;
+            }
+            write(worst, numericKey, stringKey, count, sortValue);
+            metrics.reset(worst);
+            siftDown(0);
+            return worst;
+        }
+
+        private void write(int idx, long numericKey, BytesRef stringKey, long count, double sortValue) {
+            if (keyKind == KeyKind.STRING) {
+                if (dict == null) {
+                    dict = new BytesRefHash();
+                }
+                int id = dict.add(stringKey);
+                keys[idx] = id < 0 ? -id - 1 : id;
+            } else {
+                keys[idx] = numericKey;
+            }
+            counts[idx] = count;
+            if (sortValues != null) {
+                sortValues[idx] = sortValue;
+            }
+        }
+
+        /** Negative when the candidate sorts before (better than) entry {@code idx}. */
+        private int compareCandidate(long numericKey, BytesRef stringKey, long count, double sortValue, int idx) {
+            int byValue = sortSlot < 0
+                ? Long.compare(counts[idx], count)
+                : Comparators.compareDiscardNaN(sortValue, sortValues[idx], sortAsc);
+            if (byValue != 0) {
+                return byValue;
+            }
+            if (keyKind == KeyKind.STRING) {
+                dict.get((int) keys[idx], spare);
+                return stringKey.compareTo(spare);
+            }
+            if (keyKind == KeyKind.DOUBLE) {
+                return Double.compare(Double.longBitsToDouble(numericKey), Double.longBitsToDouble(keys[idx]));
+            }
+            return Long.compare(numericKey, keys[idx]);
+        }
+
+        /** Negative when entry {@code a} sorts before entry {@code b} in the selection order. */
+        private int compare(int a, int b) {
+            int byValue = sortSlot < 0
+                ? Long.compare(counts[b], counts[a])
+                : Comparators.compareDiscardNaN(sortValues[a], sortValues[b], sortAsc);
+            if (byValue != 0) {
+                return byValue;
+            }
+            if (keyKind == KeyKind.STRING) {
+                dict.get((int) keys[a], spare);
+                dict.get((int) keys[b], otherSpare);
+                return spare.compareTo(otherSpare);
+            }
+            if (keyKind == KeyKind.DOUBLE) {
+                return Double.compare(Double.longBitsToDouble(keys[a]), Double.longBitsToDouble(keys[b]));
+            }
+            return Long.compare(keys[a], keys[b]);
+        }
+
+        /** The heap's top is the weakest retained entry: a parent sorts after its children. */
+        private void siftUp(int pos) {
+            while (pos > 0) {
+                int parent = (pos - 1) / 2;
+                if (compare(heap[pos], heap[parent]) <= 0) {
+                    return;
+                }
+                int swap = heap[pos];
+                heap[pos] = heap[parent];
+                heap[parent] = swap;
+                pos = parent;
+            }
+        }
+
+        private void siftDown(int pos) {
+            while (true) {
+                int worst = pos;
+                int left = pos * 2 + 1;
+                int right = left + 1;
+                if (left < size && compare(heap[left], heap[worst]) > 0) {
+                    worst = left;
+                }
+                if (right < size && compare(heap[right], heap[worst]) > 0) {
+                    worst = right;
+                }
+                if (worst == pos) {
+                    return;
+                }
+                int swap = heap[pos];
+                heap[pos] = heap[worst];
+                heap[worst] = swap;
+                pos = worst;
+            }
+        }
+
+        /** Folds the retained entries into {@code dest}, summing the counts and metrics of a key another scan also kept. */
+        void mergeInto(GroupTable dest) {
+            long[] encoded = new long[1];
+            for (int e = 0; e < size; e++) {
+                if (keyKind == KeyKind.STRING) {
+                    dict.get((int) keys[e], spare);
+                    encoded[0] = dest.intern(spare);
+                } else {
+                    encoded[0] = keys[e];
+                }
+                int idx = dest.findOrAdd(encoded, 0L);
+                dest.addCount(idx, counts[e]);
+                dest.metrics.merge(idx, metrics, e);
+            }
+        }
+    }
+
+    /**
+     * The single level {@code terms} shape whose scans keep a bounded
+     * top-k instead of every group: {@code sortSlot} is the metric the
+     * order names (-1 for {@code _count} descending), {@code sortAsc}
+     * its direction, and {@code perScanLimit} is {@code shard_size}
+     * times {@code lance.aggregation.pushdown_topk_slack}, the groups
+     * each scan retains. Only set when every metric of the plan is a
+     * plain measure: a {@code cardinality} spreads a group over its
+     * distinct values and a {@code percentiles} needs the bounds of
+     * every group for its bin scan, so those shapes keep every group.
+     */
+    private record TopKSpec(KeyKind keyKind, int sortSlot, boolean sortAsc, int perScanLimit) {
     }
 
     /**
@@ -862,6 +1820,7 @@ public final class LanceAggregatePushdown {
         private final List<Metric> topMetrics;
         private final List<Metric> allMetrics;
         private final int percentilesBins;
+        private final TopKSpec topK;
 
         private Plan(
             ByteBuffer substrait,
@@ -870,7 +1829,8 @@ public final class LanceAggregatePushdown {
             Composite composite,
             List<Metric> topMetrics,
             List<Metric> allMetrics,
-            int percentilesBins
+            int percentilesBins,
+            TopKSpec topK
         ) {
             this.substrait = substrait;
             this.keyExpressions = keyExpressions;
@@ -879,6 +1839,7 @@ public final class LanceAggregatePushdown {
             this.topMetrics = topMetrics;
             this.allMetrics = allMetrics;
             this.percentilesBins = percentilesBins;
+            this.topK = topK;
         }
 
         private int keyCount() {
@@ -887,6 +1848,18 @@ public final class LanceAggregatePushdown {
 
         private long dateInterval(int key) {
             return composite != null ? composite.sources().get(key).dateInterval() : levels.get(key).dateInterval();
+        }
+
+        private KeyKind keyKind(int key) {
+            return composite != null ? composite.sources().get(key).keyKind() : levels.get(key).keyKind();
+        }
+
+        private KeyKind[] keyKinds() {
+            KeyKind[] kinds = new KeyKind[keyCount()];
+            for (int key = 0; key < kinds.length; key++) {
+                kinds[key] = keyKind(key);
+            }
+            return kinds;
         }
 
         /**
@@ -984,7 +1957,25 @@ public final class LanceAggregatePushdown {
             return assemble(merged, scanCount, dateHistogramPrototype);
         }
 
-        private static Partial mergePartials(List<Partial> partials) {
+        /**
+         * Merges the per fragment group partials. The top-k partials of
+         * the single level terms shape are folded into one
+         * {@link GroupTable}, so a key several scans retained has its
+         * counts and metrics summed before the final {@code shard_size}
+         * selection re-evaluates it.
+         */
+        private Partial mergePartials(List<Partial> partials) {
+            if (topK != null && partials.get(0).topK != null) {
+                Partial merged = new Partial();
+                GroupTable table = new GroupTable(keyKinds(), allMetrics);
+                merged.groups = table;
+                for (Partial partial : partials) {
+                    merged.total += partial.total;
+                    merged.keyedCount += partial.topK.keyedCount();
+                    partial.topK.mergeInto(table);
+                }
+                return merged;
+            }
             if (partials.size() == 1) {
                 return partials.get(0);
             }
@@ -1007,9 +1998,9 @@ public final class LanceAggregatePushdown {
                 min = Math.min(min, merged.metricsOnly.metrics[metric.slot()].min);
                 max = Math.max(max, merged.metricsOnly.metrics[metric.slot()].max);
             }
-            for (GroupState group : merged.groups.values()) {
-                min = Math.min(min, group.metrics[metric.slot()].min);
-                max = Math.max(max, group.metrics[metric.slot()].max);
+            if (merged.groups != null) {
+                min = Math.min(min, merged.groups.metrics.minOf(metric.slot(), merged.groups.size()));
+                max = Math.max(max, merged.groups.metrics.maxOf(metric.slot(), merged.groups.size()));
             }
             if (min == Double.POSITIVE_INFINITY) {
                 return null;
@@ -1030,11 +2021,17 @@ public final class LanceAggregatePushdown {
 
         /**
          * One scan of {@code plan} over {@code fragmentIds} (null: every
-         * fragment), read into a {@link Partial} keyed by the full key
-         * list of every row that opens a bucket. The row count and the
-         * metrics' partial values are read from a main scan row; a bin
-         * scan row carries only its metric's bin, and adds nothing to
-         * the totals.
+         * fragment). The rows are read column-wise: the key and measure
+         * vectors are resolved once per batch, every key is encoded
+         * into a {@code long} (the value itself, the bits of a double,
+         * or a dictionary id for a string) and the counts and metric
+         * values go into the primitive columns of the partial's group
+         * table, so the row loop allocates no objects however many
+         * groups Lance returns. The single level terms shape with a
+         * top-k order keeps only the bounded selection instead. A main
+         * scan row carries the row count and the metrics' partial
+         * values; a bin scan row carries only its metric's bin, and
+         * adds nothing to the totals.
          */
         private Partial scan(Dataset dataset, List<Integer> fragmentIds, String filterSql, ScanPlan plan, LanceCancellation cancellation)
             throws Exception {
@@ -1045,65 +2042,160 @@ public final class LanceAggregatePushdown {
             if (filterSql != null) {
                 options.filter(filterSql);
             }
-            int keyCount = keyCount();
             Partial partial = new Partial();
             try (LanceScanner scanner = dataset.newScan(options.build()); ArrowReader reader = scanner.scanBatches()) {
-                while (reader.loadNextBatch()) {
-                    cancellation.checkCancelled();
-                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                    FieldVector counts = plan.isMain() ? root.getVector(COUNT_COLUMN) : null;
-                    FieldVector[] keyVectors = new FieldVector[keyCount];
-                    for (int key = 0; key < keyCount; key++) {
-                        keyVectors[key] = root.getVector(KEY_COLUMN_PREFIX + key);
-                    }
-                    for (int row = 0; row < root.getRowCount(); row++) {
-                        MetricState[] states = new MetricState[allMetrics.size()];
-                        for (int i = 0; i < states.length; i++) {
-                            Metric metric = allMetrics.get(i);
-                            if (plan.isMain()) {
-                                states[i] = metric.read(root, row);
-                            } else if (metric == plan.percentiles()) {
-                                states[i] = metric.readBin(root, row, plan.min(), plan.max(), plan.width(), percentilesBins);
-                            } else {
-                                states[i] = new MetricState();
-                            }
-                        }
-                        GroupState state = new GroupState(counts != null ? longOrZero(counts, row) : 0L, states);
-                        partial.total += state.count;
-                        if (keyCount == 0) {
-                            partial.metricsOnly = partial.metricsOnly == null ? state : partial.metricsOnly.merge(state);
-                            continue;
-                        }
-                        Object[] keys = new Object[keyCount];
-                        boolean opensBucket = true;
-                        for (int key = 0; key < keyCount && opensBucket; key++) {
-                            if (keyVectors[key].isNull(row)) {
-                                // Documents without a value open no bucket at
-                                // that level; without the outermost value
-                                // (or any composite source value) they open
-                                // no bucket at all.
-                                opensBucket = key > 0 && composite == null;
-                            } else {
-                                keys[key] = key(keyVectors[key], row, dateInterval(key));
-                                // A mask of 0 at the outermost level with no
-                                // other bucket to hold it is the same: the
-                                // row is in no bucket of the tree.
-                                opensBucket = key > 0 || composite != null || inSomeBucket(levels.get(0), keys[key]);
-                            }
-                        }
-                        if (!opensBucket) {
-                            continue;
-                        }
-                        partial.groups.merge(Arrays.asList(keys), state, GroupState::merge);
-                    }
+                if (keyCount() == 0) {
+                    scanMetricsOnly(reader, plan, partial, cancellation);
+                } else if (topK != null) {
+                    scanTopK(reader, partial, cancellation);
+                } else {
+                    scanGrouped(reader, plan, partial, cancellation);
                 }
             }
             return partial;
         }
 
-        /** Whether a key at {@code level} puts its row into at least one bucket; every key of a non mask level does. */
-        private static boolean inSomeBucket(Level level, Object key) {
-            return !level.kind().isMask() || (Long) key != 0L || level.otherBucketKey() != null;
+        /** A plan without groupings: Lance returns one row per scan, read into a {@link GroupState} as before. */
+        private void scanMetricsOnly(ArrowReader reader, ScanPlan plan, Partial partial, LanceCancellation cancellation) throws Exception {
+            while (reader.loadNextBatch()) {
+                cancellation.checkCancelled();
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                FieldVector counts = plan.isMain() ? root.getVector(COUNT_COLUMN) : null;
+                for (int row = 0; row < root.getRowCount(); row++) {
+                    MetricState[] states = new MetricState[allMetrics.size()];
+                    for (int i = 0; i < states.length; i++) {
+                        Metric metric = allMetrics.get(i);
+                        if (plan.isMain()) {
+                            states[i] = metric.read(root, row);
+                        } else if (metric == plan.percentiles()) {
+                            states[i] = metric.readBin(root, row, plan.min(), plan.max(), plan.width(), percentilesBins);
+                        } else {
+                            states[i] = new MetricState();
+                        }
+                    }
+                    GroupState state = new GroupState(counts != null ? longOrZero(counts, row) : 0L, states);
+                    partial.total += state.count;
+                    partial.metricsOnly = partial.metricsOnly == null ? state : partial.metricsOnly.merge(state);
+                }
+            }
+        }
+
+        /** The single level terms shape: every row is offered to the bounded top-k selection. */
+        private void scanTopK(ArrowReader reader, Partial partial, LanceCancellation cancellation) throws Exception {
+            TopKGroups groups = new TopKGroups(topK, allMetrics);
+            partial.topK = groups;
+            BytesRefBuilder scratch = new BytesRefBuilder();
+            while (reader.loadNextBatch()) {
+                cancellation.checkCancelled();
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                FieldVector counts = root.getVector(COUNT_COLUMN);
+                FieldVector keyVector = root.getVector(KEY_COLUMN_PREFIX + 0);
+                MetricBatch[] batches = MetricBatch.resolve(allMetrics, root);
+                MetricBatch orderBatch = topK.sortSlot() >= 0 ? batches[topK.sortSlot()] : null;
+                for (int row = 0; row < root.getRowCount(); row++) {
+                    long count = longOrZero(counts, row);
+                    partial.total += count;
+                    if (keyVector.isNull(row)) {
+                        // Documents without a value open no bucket.
+                        continue;
+                    }
+                    long numericKey = 0L;
+                    BytesRef stringKey = null;
+                    switch (topK.keyKind()) {
+                        case STRING -> stringKey = readUtf8((VarCharVector) keyVector, row, scratch);
+                        case DOUBLE -> numericKey = Double.doubleToLongBits(doubleKeyOf(keyVector, row));
+                        case LONG -> numericKey = asLong(keyVector, row);
+                    }
+                    double sortValue = orderBatch != null ? orderBatch.rowSortValue(row) : 0d;
+                    int idx = groups.offer(numericKey, stringKey, count, sortValue);
+                    if (idx >= 0) {
+                        for (MetricBatch batch : batches) {
+                            batch.add(groups.metrics, idx, row);
+                        }
+                    }
+                }
+            }
+        }
+
+        /** Every other keyed shape: the full key list is encoded and merged into the partial's group table. */
+        private void scanGrouped(ArrowReader reader, ScanPlan plan, Partial partial, LanceCancellation cancellation) throws Exception {
+            int keyCount = keyCount();
+            GroupTable table = new GroupTable(keyKinds(), allMetrics);
+            partial.groups = table;
+            long[] encoded = new long[keyCount];
+            BytesRefBuilder scratch = new BytesRefBuilder();
+            Metric percentiles = plan.percentiles();
+            double compression = percentiles != null ? percentiles.compression() : 0d;
+            while (reader.loadNextBatch()) {
+                cancellation.checkCancelled();
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                FieldVector counts = plan.isMain() ? root.getVector(COUNT_COLUMN) : null;
+                FieldVector[] keyVectors = new FieldVector[keyCount];
+                for (int key = 0; key < keyCount; key++) {
+                    keyVectors[key] = root.getVector(KEY_COLUMN_PREFIX + key);
+                }
+                MetricBatch[] batches = plan.isMain() ? MetricBatch.resolve(allMetrics, root) : null;
+                FieldVector bin = percentiles != null ? root.getVector(percentiles.binColumn()) : null;
+                FieldVector binCount = percentiles != null ? root.getVector(percentiles.binCountColumn()) : null;
+                for (int row = 0; row < root.getRowCount(); row++) {
+                    if (counts != null) {
+                        partial.total += longOrZero(counts, row);
+                    }
+                    long nullBits = 0L;
+                    boolean opensBucket = true;
+                    for (int key = 0; key < keyCount && opensBucket; key++) {
+                        if (keyVectors[key].isNull(row)) {
+                            // Documents without a value open no bucket at
+                            // that level; without the outermost value
+                            // (or any composite source value) they open
+                            // no bucket at all.
+                            nullBits |= 1L << key;
+                            encoded[key] = 0L;
+                            opensBucket = key > 0 && composite == null;
+                        } else {
+                            encoded[key] = encodeKey(keyVectors[key], keyKind(key), row, dateInterval(key), table, scratch);
+                            // A mask of 0 at the outermost level with no
+                            // other bucket to hold it is the same: the
+                            // row is in no bucket of the tree.
+                            opensBucket = key > 0 || composite != null || inSomeBucket(levels.get(0), encoded[key]);
+                        }
+                    }
+                    if (!opensBucket) {
+                        continue;
+                    }
+                    int idx = table.findOrAdd(encoded, nullBits);
+                    if (counts != null) {
+                        table.addCount(idx, longOrZero(counts, row));
+                    }
+                    if (batches != null) {
+                        for (MetricBatch batch : batches) {
+                            batch.add(table.metrics, idx, row);
+                        }
+                    } else if (bin != null && !bin.isNull(row)) {
+                        long binRows = longOrZero(binCount, row);
+                        if (binRows > 0L) {
+                            // count(field), not count(*), in the bin scan:
+                            // a row without a value has a null bin.
+                            table.metrics.addBin(
+                                percentiles.slot(),
+                                idx,
+                                compression,
+                                plan.min(),
+                                plan.max(),
+                                plan.width(),
+                                percentilesBins,
+                                asLong(bin, row),
+                                binRows
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /** Whether an encoded key at level 0 puts its row into at least one bucket; every key of a non mask level does. */
+        private static boolean inSomeBucket(Level level, long encodedKey) {
+            return !level.kind().isMask() || encodedKey != 0L || level.otherBucketKey() != null;
         }
 
         /** Builds the node's aggregations from the merged partials. */
@@ -1117,12 +2209,103 @@ public final class LanceAggregatePushdown {
                 GroupState state = merged.metricsOnly != null ? merged.metricsOnly : GroupState.empty(allMetrics.size());
                 return new Result(toAggregations(topMetrics, state), merged.total, scans);
             }
-            List<Group> groups = new ArrayList<>(merged.groups.size());
-            for (Map.Entry<List<Object>, GroupState> entry : merged.groups.entrySet()) {
-                groups.add(new Group(entry.getKey(), entry.getValue()));
+            GroupTable table = merged.groups != null ? merged.groups : new GroupTable(keyKinds(), allMetrics);
+            InternalAggregation aggregation;
+            if (topK != null) {
+                aggregation = assembleTopTerms(table, merged.keyedCount, dateHistogramPrototype);
+            } else if (composite == null && levels.size() == 1 && isKeyOrderedTerms(levels.get(0))) {
+                aggregation = assembleKeyedTerms(table, dateHistogramPrototype);
+            } else {
+                List<Group> groups = table.box();
+                aggregation = composite != null ? buildComposite(groups) : buildLevel(0, groups, dateHistogramPrototype);
             }
-            InternalAggregation aggregation = composite != null ? buildComposite(groups) : buildLevel(0, groups, dateHistogramPrototype);
             return new Result(InternalAggregations.from(Collections.singletonList(aggregation)), merged.total, scans);
+        }
+
+        private static boolean isKeyOrderedTerms(Level level) {
+            return level.kind() == LevelKind.TERMS && InternalOrder.isKeyOrder(((TermsAggregationBuilder) level.builder()).order());
+        }
+
+        /**
+         * The terms result of the merged top-k candidates: the best
+         * {@code shard_size} under the request order become the
+         * buckets, every other retained or dropped group's count goes
+         * to {@code sum_other_doc_count} (the scans counted every keyed
+         * row, retained or not), and the doc count error is left at 0
+         * for the reduce to derive from the smallest returned bucket,
+         * exactly as it does for an aggregator shard result.
+         */
+        private InternalAggregation assembleTopTerms(GroupTable table, long keyedCount, Function<String, InternalAggregation> prototype) {
+            Level level = levels.get(0);
+            TermsAggregationBuilder terms = (TermsAggregationBuilder) level.builder();
+            TermsAggregator.BucketCountThresholds thresholds = thresholds(terms);
+            int[] selected = table.selectTop(thresholds.getShardSize(), topOrder(table));
+            List<Candidate> candidates = boxSelection(table, selected);
+            long otherDocCount = keyedCount;
+            for (Candidate candidate : candidates) {
+                otherDocCount -= candidate.count();
+            }
+            // Shards hand the reduce key sorted buckets when the request
+            // order is not itself a key order, and a top-k order never is.
+            BucketOrder reduceOrder = BucketOrder.key(true);
+            candidates.sort(candidateComparator(reduceOrder, level.keyKind()));
+            List<InternalAggregations> subAggregations = new ArrayList<>(candidates.size());
+            for (Candidate candidate : candidates) {
+                subAggregations.add(subAggregations(0, candidate, prototype));
+            }
+            return termsAggregation(level, terms, reduceOrder, thresholds, otherDocCount, candidates, subAggregations);
+        }
+
+        /** The selection order of the top-k shape over the merged group table. */
+        private GroupTable.GroupOrder topOrder(GroupTable table) {
+            if (topK.sortSlot() < 0) {
+                return (a, b) -> {
+                    int byCount = Long.compare(table.countAt(b), table.countAt(a));
+                    return byCount != 0 ? byCount : table.compareKeys(a, b);
+                };
+            }
+            int slot = topK.sortSlot();
+            boolean asc = topK.sortAsc();
+            return (a, b) -> {
+                int byValue = Comparators.compareDiscardNaN(table.metrics.sortValue(slot, a), table.metrics.sortValue(slot, b), asc);
+                return byValue != 0 ? byValue : table.compareKeys(a, b);
+            };
+        }
+
+        /**
+         * A single {@code terms} level ordered by {@code _key}: the
+         * groups are sorted and cut in their primitive columns and only
+         * the first {@code shard_size} are boxed into buckets, the same
+         * selection {@link #buildTerms} makes over boxed candidates.
+         */
+        private InternalAggregation assembleKeyedTerms(GroupTable table, Function<String, InternalAggregation> prototype) {
+            Level level = levels.get(0);
+            TermsAggregationBuilder terms = (TermsAggregationBuilder) level.builder();
+            TermsAggregator.BucketCountThresholds thresholds = thresholds(terms);
+            boolean ascending = InternalOrder.isKeyAsc(terms.order());
+            GroupTable.GroupOrder order = ascending ? table::compareKeys : (a, b) -> table.compareKeys(b, a);
+            int[] selected = table.selectTop(thresholds.getShardSize(), order);
+            List<Candidate> candidates = boxSelection(table, selected);
+            long otherDocCount = table.totalCount();
+            for (Candidate candidate : candidates) {
+                otherDocCount -= candidate.count();
+            }
+            List<InternalAggregations> subAggregations = new ArrayList<>(candidates.size());
+            for (Candidate candidate : candidates) {
+                subAggregations.add(subAggregations(0, candidate, prototype));
+            }
+            return termsAggregation(level, terms, terms.order(), thresholds, otherDocCount, candidates, subAggregations);
+        }
+
+        /** The selected single key groups as boxed candidates, in selection order. */
+        private List<Candidate> boxSelection(GroupTable table, int[] selected) {
+            List<Candidate> candidates = new ArrayList<>(selected.length);
+            for (int idx : selected) {
+                Object key = table.boxKey(0, idx);
+                GroupState state = new GroupState(table.countAt(idx), table.metrics.boxAll(idx));
+                candidates.add(new Candidate(key, state.count, List.of(new Group(Collections.singletonList(key), state))));
+            }
+            return candidates;
         }
 
         /**
@@ -1779,6 +2962,19 @@ public final class LanceAggregatePushdown {
         int maxGroups,
         int bins
     ) {
+        return plan(aggregations, schema, multiFields, qsc, maxGroups, bins, topkSlack);
+    }
+
+    /** As above with an explicit top-k slack. */
+    static Plan plan(
+        AggregatorFactories.Builder aggregations,
+        Schema schema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        QueryShardContext qsc,
+        int maxGroups,
+        int bins,
+        int slack
+    ) {
         if (!LanceAggregationSupport.isPushdownCandidate(aggregations)) {
             return null;
         }
@@ -1790,7 +2986,7 @@ public final class LanceAggregatePushdown {
             if (metrics == null) {
                 return null;
             }
-            return new Plan(finish(builder, List.of(), allMetrics), List.of(), List.of(), null, metrics, allMetrics, bins);
+            return new Plan(finish(builder, List.of(), allMetrics), List.of(), List.of(), null, metrics, allMetrics, bins, null);
         }
         if (top.get(0) instanceof CompositeAggregationBuilder compositeBuilder) {
             List<Expression> keyExpressions = new ArrayList<>();
@@ -1798,7 +2994,16 @@ public final class LanceAggregatePushdown {
             if (composite == null) {
                 return null;
             }
-            return new Plan(finish(builder, keyExpressions, allMetrics), keyExpressions, List.of(), composite, List.of(), allMetrics, bins);
+            return new Plan(
+                finish(builder, keyExpressions, allMetrics),
+                keyExpressions,
+                List.of(),
+                composite,
+                List.of(),
+                allMetrics,
+                bins,
+                null
+            );
         }
         List<Level> levels = new ArrayList<>();
         List<Expression> keyExpressions = new ArrayList<>();
@@ -1979,7 +3184,81 @@ public final class LanceAggregatePushdown {
             );
             current = nested;
         }
-        return new Plan(finish(builder, keyExpressions, allMetrics), keyExpressions, levels, null, List.of(), allMetrics, bins);
+        TopKSpec topK = resolveTopK(levels, allMetrics, slack);
+        // A terms order that is neither a count nor a key order is
+        // honoured by the top-k selection of the single level shape
+        // only; a tree it did not resolve for takes the aggregators.
+        for (Level level : levels) {
+            if (level.builder() instanceof TermsAggregationBuilder termsBuilder
+                && !InternalOrder.isCountDesc(termsBuilder.order())
+                && !InternalOrder.isKeyOrder(termsBuilder.order())
+                && (topK == null || topK.sortSlot() < 0)) {
+                return null;
+            }
+        }
+        return new Plan(finish(builder, keyExpressions, allMetrics), keyExpressions, levels, null, List.of(), allMetrics, bins, topK);
+    }
+
+    /**
+     * The top-k selection of a single {@code terms} level ordered by
+     * {@code _count} descending or by one of its own single value
+     * metric children ({@code sum}, {@code avg}, {@code min},
+     * {@code max}, {@code value_count}, named as {@code m} or
+     * {@code m.value}); null for every other tree, which keeps every
+     * group. Plans with a {@code cardinality} or {@code percentiles}
+     * anywhere keep every group too: the first spreads a group over
+     * its distinct values, the second needs every group's bounds for
+     * its bin scan.
+     */
+    private static TopKSpec resolveTopK(List<Level> levels, List<Metric> allMetrics, int slack) {
+        if (levels.size() != 1 || levels.get(0).kind() != LevelKind.TERMS) {
+            return null;
+        }
+        for (Metric metric : allMetrics) {
+            if (metric.kind() == MetricKind.CARDINALITY || metric.isPercentiles()) {
+                return null;
+            }
+        }
+        Level level = levels.get(0);
+        TermsAggregationBuilder terms = (TermsAggregationBuilder) level.builder();
+        BucketOrder order = terms.order();
+        int shardSize = thresholds(terms).getShardSize();
+        int limit = (int) Math.min((long) shardSize * slack, Integer.MAX_VALUE - 8);
+        if (InternalOrder.isCountDesc(order)) {
+            return new TopKSpec(level.keyKind(), -1, false, limit);
+        }
+        if (!(order instanceof InternalOrder.Aggregation aggregation)) {
+            return null;
+        }
+        String path = aggregation.path().toString();
+        for (Metric metric : level.metrics()) {
+            boolean singleValue = switch (metric.kind()) {
+                case SUM, AVG, MIN, MAX, VALUE_COUNT -> true;
+                default -> false;
+            };
+            if (singleValue && (metric.name().equals(path) || (metric.name() + ".value").equals(path))) {
+                Boolean ascending = orderAscending(order);
+                return ascending == null ? null : new TopKSpec(level.keyKind(), metric.slot(), ascending, limit);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The direction of an aggregation order, read back from its wire
+     * form ({@code InternalOrder.Aggregation} exposes its path but not
+     * its direction).
+     */
+    private static Boolean orderAscending(BucketOrder order) {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            order.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                in.readByte();
+                return in.readBoolean();
+            }
+        } catch (IOException impossible) {
+            return null;
+        }
     }
 
     /**
@@ -2721,23 +4000,49 @@ public final class LanceAggregatePushdown {
     }
 
     /**
-     * The group key as the object the bucket type expects: {@link BytesRef},
-     * {@link Long} or {@link Double}. A fixed interval {@code date_histogram}
-     * key comes back as the interval quotient and is multiplied back to
-     * millis ({@code dateInterval} 0 leaves the value as read).
+     * The group key encoded as one {@code long}: the (interval
+     * multiplied) value of an integer or date key, the
+     * {@link Double#doubleToLongBits} of a floating point key (whose
+     * bit equality is {@link Double#equals} equality), or the id of a
+     * string key in the table's dictionary. The encoding allocates
+     * nothing: string bytes go through the reused {@code scratch}.
      */
-    private static Object key(FieldVector vector, int row, long dateInterval) {
-        if (vector instanceof VarCharVector v) {
-            return new BytesRef(v.get(row));
-        }
+    private static long encodeKey(FieldVector vector, KeyKind kind, int row, long dateInterval, GroupTable table, BytesRefBuilder scratch) {
+        return switch (kind) {
+            case STRING -> table.intern(readUtf8((VarCharVector) vector, row, scratch));
+            case DOUBLE -> Double.doubleToLongBits(doubleKeyOf(vector, row));
+            case LONG -> {
+                long value = asLong(vector, row);
+                yield dateInterval > 0L ? value * dateInterval : value;
+            }
+        };
+    }
+
+    private static double doubleKeyOf(FieldVector vector, int row) {
         if (vector instanceof Float4Vector v) {
-            return (double) v.get(row);
+            return v.get(row);
         }
         if (vector instanceof Float8Vector v) {
             return v.get(row);
         }
-        long value = asLong(vector, row);
-        return dateInterval > 0L ? value * dateInterval : value;
+        throw new IllegalStateException(
+            "unexpected Arrow vector " + vector.getClass().getSimpleName() + " for a floating point key " + vector.getName()
+        );
+    }
+
+    /**
+     * The row's UTF-8 bytes read into {@code scratch} through the
+     * vector's offset and data buffers, so the row loop copies bytes
+     * instead of allocating an array per row as {@code VarCharVector#get}
+     * does.
+     */
+    private static BytesRef readUtf8(VarCharVector vector, int row, BytesRefBuilder scratch) {
+        long start = vector.getOffsetBuffer().getInt(row * 4L);
+        int length = vector.getOffsetBuffer().getInt((row + 1) * 4L) - (int) start;
+        scratch.grow(length);
+        vector.getDataBuffer().getBytes(start, scratch.bytes(), 0, length);
+        scratch.setLength(length);
+        return scratch.get();
     }
 
     private static long longOrZero(FieldVector vector, int row) {
