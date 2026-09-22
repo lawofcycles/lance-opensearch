@@ -24,6 +24,7 @@ import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.mapper.Mapper;
@@ -44,6 +45,7 @@ import org.opensearch.lance.namespace.AllowedTableRoots;
 import org.opensearch.lance.namespace.LanceNamespaceListAction;
 import org.opensearch.lance.namespace.LanceNamespaceService;
 import org.opensearch.lance.namespace.TransportLanceNamespaceListAction;
+import org.opensearch.lance.query.FtsAdmission;
 import org.opensearch.lance.query.LanceFtsBoolQueryBuilder;
 import org.opensearch.lance.query.LanceFtsBoostQueryBuilder;
 import org.opensearch.lance.query.LanceFtsQuery;
@@ -395,6 +397,53 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
 
     /**
+     * Whether an unbounded full-text shape (sort by a field,
+     * aggregations, {@code size 0}, {@code _count},
+     * {@code track_total_hits: true}) is admitted only when the node's
+     * free physical memory can hold the estimated native rebuild of the
+     * inverted index document set. {@code false} admits every shape,
+     * restoring the behaviour that let a large enough scan end the node
+     * with a kernel OOM kill. Dynamic. See {@link FtsAdmission}.
+     */
+    public static final Setting<Boolean> FTS_ADMISSION_ENABLED_SETTING = Setting.boolSetting(
+        "lance.fts.admission.enabled",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Free physical memory the admission gate keeps out of reach of an
+     * unbounded full-text scan: the scan is admitted when its document
+     * set estimate fits {@code MemAvailable - headroom}. Dynamic.
+     */
+    public static final Setting<ByteSizeValue> FTS_ADMISSION_HEADROOM_SETTING = Setting.byteSizeSetting(
+        "lance.fts.admission.headroom",
+        FtsAdmission.DEFAULT_HEADROOM,
+        ByteSizeValue.ZERO,
+        new ByteSizeValue(Long.MAX_VALUE),
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Test override of the index cache shard share the full-text
+     * admission gate compares its estimate with. Zero (the default)
+     * reads the installed Session's sizing. It exists so the
+     * integration tests can declare a small fixture table's inverted
+     * index as not fitting the cache; do not change it on a real node.
+     * Dynamic.
+     */
+    public static final Setting<ByteSizeValue> TEST_INDEX_CACHE_SHARD_SHARE_SETTING = Setting.byteSizeSetting(
+        "lance.test.index_cache_shard_share",
+        ByteSizeValue.ZERO,
+        ByteSizeValue.ZERO,
+        new ByteSizeValue(Long.MAX_VALUE),
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * Whether a {@code size: 0} aggregation request whose shape the
      * scan can compute (metrics including stats, cardinality and tdigest
      * percentiles; {@code terms} / {@code histogram} / {@code date_histogram}
@@ -626,6 +675,9 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             FTS_SUBSET_PROBE_LIMIT_SETTING,
             FTS_SUBSET_PROBE_RATIO_SETTING,
             FTS_SUBSET_PROBE_MIN_ROWS_SETTING,
+            FTS_ADMISSION_ENABLED_SETTING,
+            FTS_ADMISSION_HEADROOM_SETTING,
+            TEST_INDEX_CACHE_SHARD_SHARE_SETTING,
             AGGREGATION_PUSHDOWN_SETTING,
             AGGREGATION_PUSHDOWN_PARALLELISM_SETTING,
             AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING,
@@ -932,6 +984,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LanceFtsQuery.setSubsetProbeMinRows(FTS_SUBSET_PROBE_MIN_ROWS_SETTING.get(environment.settings()));
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(FTS_SUBSET_PROBE_MIN_ROWS_SETTING, LanceFtsQuery::setSubsetProbeMinRows);
+
+        // The full-text admission gate reads its parameters from the
+        // same kind of static holder.
+        FtsAdmission.setEnabled(FTS_ADMISSION_ENABLED_SETTING.get(environment.settings()));
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(FTS_ADMISSION_ENABLED_SETTING, FtsAdmission::setEnabled);
+        FtsAdmission.setHeadroom(FTS_ADMISSION_HEADROOM_SETTING.get(environment.settings()));
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(FTS_ADMISSION_HEADROOM_SETTING, FtsAdmission::setHeadroom);
+        FtsAdmission.setIndexCacheShardShareOverride(TEST_INDEX_CACHE_SHARD_SHARE_SETTING.get(environment.settings()));
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(TEST_INDEX_CACHE_SHARD_SHARE_SETTING, FtsAdmission::setIndexCacheShardShareOverride);
 
         // The percentiles bin count and the terms top-k slack are read
         // by the aggregation pushdown when it plans a request, from the
