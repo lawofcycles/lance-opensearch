@@ -62,6 +62,7 @@ import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
@@ -389,7 +390,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
     // ordinals fielddata, a DLS/FLS reader wrapper) get the same bridge for
     // the life of the leaf. Guarded by `this` and published through the
     // volatile field; helpers may be requested from any slice thread.
+    // `closed` (also guarded by `this`) keeps a helper request that races
+    // with close from building a bridge doClose has already read as
+    // absent, which nothing would ever close.
     private volatile DirectoryReader cacheLifetimeBridge;
+    private boolean closed;
 
     /**
      * Resolve which Utf8 columns of {@code dataset} carry an FTS
@@ -526,6 +531,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * field comment for why it is not built in the constructor). The
      * instance is stable for the life of this leaf, as the cache
      * helper contract requires.
+     *
+     * @throws AlreadyClosedException when the
+     *         leaf was closed before any helper was requested; building
+     *         a bridge then would leak it, because {@link #doClose()}
+     *         has already read the field as absent
      */
     private DirectoryReader cacheLifetimeBridge() {
         DirectoryReader bridge = cacheLifetimeBridge;
@@ -536,6 +546,9 @@ public final class LanceFragmentLeafReader extends LeafReader {
             bridge = cacheLifetimeBridge;
             if (bridge != null) {
                 return bridge;
+            }
+            if (closed) {
+                throw new AlreadyClosedException("this LanceFragmentLeafReader was closed before a cache helper was requested");
             }
             try {
                 ByteBuffersDirectory bridgeDir = new ByteBuffersDirectory();
@@ -553,6 +566,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
             cacheLifetimeBridge = bridge;
             return bridge;
         }
+    }
+
+    /** Whether the cache lifetime bridge has been built. Test observability only. */
+    boolean cacheLifetimeBridgeExists() {
+        return cacheLifetimeBridge != null;
     }
 
     private Object columnLock(String name) {
@@ -2654,8 +2672,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
     protected void doClose() throws IOException {
         DirectoryReader bridge;
         synchronized (this) {
+            closed = true;
             bridge = cacheLifetimeBridge;
         }
+        // Close outside the monitor so the bridge's closed listeners
+        // (cache invalidation callbacks) do not run while holding it.
         if (bridge != null) {
             bridge.close();
         }
