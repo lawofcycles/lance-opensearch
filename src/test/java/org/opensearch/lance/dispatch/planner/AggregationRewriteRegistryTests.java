@@ -4,10 +4,17 @@
  */
 package org.opensearch.lance.dispatch.planner;
 
+import static org.mockito.Mockito.mock;
+
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.opensearch.index.query.QueryShardContext;
+import org.opensearch.lance.dispatch.PlannerTestPlans;
+import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -16,7 +23,7 @@ import org.opensearch.test.OpenSearchTestCase;
  * empty registry always answers empty (the dispatcher's fall through
  * to the legacy shape dispatcher) and the first matching rule wins
  * when several would match. The registry itself never reads the
- * context, so these tests hand every rule the same null-heavy one.
+ * context, so these tests hand every rule the same minimal one.
  */
 public class AggregationRewriteRegistryTests extends OpenSearchTestCase {
 
@@ -28,8 +35,20 @@ public class AggregationRewriteRegistryTests extends OpenSearchTestCase {
         }
     }
 
+    private static PushdownPlan plan() {
+        return PushdownPlan.of(PlannerTestPlans.emptyPlan());
+    }
+
     private static AggregationRewriteContext context() {
-        return new AggregationRewriteContext(null, null, null, null, 0, 0, 0);
+        return new AggregationRewriteContext(
+            new AggregatorFactories.Builder(),
+            new Schema(List.of()),
+            Map.of(),
+            mock(QueryShardContext.class),
+            0,
+            0,
+            0
+        );
     }
 
     public void testEmptyRegistryReturnsEmpty() {
@@ -40,7 +59,7 @@ public class AggregationRewriteRegistryTests extends OpenSearchTestCase {
     }
 
     public void testSingleMatchingRuleReturnsItsPlan() {
-        PushdownPlan plan = PushdownPlan.of(null);
+        PushdownPlan plan = plan();
         AggregationRewriteRegistry registry = new AggregationRewriteRegistry(List.of(new TestRule("match", Optional.of(plan))));
 
         Optional<PushdownPlan> out = registry.rewrite(context());
@@ -56,7 +75,7 @@ public class AggregationRewriteRegistryTests extends OpenSearchTestCase {
     }
 
     public void testSecondRuleMatchesAfterFirstReturnsEmpty() {
-        PushdownPlan plan = PushdownPlan.of(null);
+        PushdownPlan plan = plan();
         AggregationRewriteRegistry registry = new AggregationRewriteRegistry(
             List.of(new TestRule("miss", Optional.empty()), new TestRule("match", Optional.of(plan)))
         );
@@ -68,8 +87,8 @@ public class AggregationRewriteRegistryTests extends OpenSearchTestCase {
     }
 
     public void testFirstMatchWins() {
-        PushdownPlan first = PushdownPlan.of(null);
-        PushdownPlan second = PushdownPlan.of(null);
+        PushdownPlan first = plan();
+        PushdownPlan second = plan();
         AggregationRewriteRegistry registry = new AggregationRewriteRegistry(
             List.of(new TestRule("first", Optional.of(first)), new TestRule("second", Optional.of(second)))
         );
@@ -81,20 +100,39 @@ public class AggregationRewriteRegistryTests extends OpenSearchTestCase {
     }
 
     public void testRulesListIsImmutable() {
-        PushdownPlan plan = PushdownPlan.of(null);
-        TestRule original = new TestRule("original", Optional.of(plan));
         List<AggregationRewriteRule> input = new ArrayList<>();
-        input.add(original);
+        input.add(new TestRule("miss", Optional.empty()));
         AggregationRewriteRegistry registry = new AggregationRewriteRegistry(input);
 
-        // Mutating the handed-in list after construction does not
-        // reach the registry's own copy.
-        input.clear();
+        // A rule appended to the handed-in list after construction is
+        // not seen by the registry: the dispatch answer stays empty and
+        // the rule list keeps its size. Would fail if the constructor
+        // stopped copying.
+        input.add(new TestRule("appended, matches everything", Optional.of(plan())));
+        assertTrue(registry.rewrite(context()).isEmpty());
         assertEquals(1, registry.rules().size());
-        assertSame(original, registry.rules().get(0));
-        assertSame(plan, registry.rewrite(context()).orElseThrow());
+        assertEquals("miss", registry.rules().get(0).name());
 
         // And the accessor's view refuses mutation.
         expectThrows(UnsupportedOperationException.class, () -> registry.rules().add(new TestRule("late", Optional.empty())));
+    }
+
+    public void testRuleNameIsExposedNonEmpty() {
+        AggregationRewriteRegistry registry = new AggregationRewriteRegistry(List.of(new TestRule("match", Optional.of(plan()))));
+
+        String name = registry.rules().get(0).name();
+
+        assertNotNull(name);
+        assertFalse(name.isEmpty());
+    }
+
+    public void testNullRejection() {
+        // No match is Optional.empty(), never a null plan.
+        expectThrows(NullPointerException.class, () -> PushdownPlan.of(null));
+        // Every reference field of the context is required.
+        expectThrows(
+            NullPointerException.class,
+            () -> new AggregationRewriteContext(null, new Schema(List.of()), Map.of(), mock(QueryShardContext.class), 0, 0, 0)
+        );
     }
 }
