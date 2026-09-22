@@ -1343,11 +1343,14 @@ public final class LanceNamespaceService {
      *   <li>Drop (id gone from Lance): log once and mark the stale name as
      *       {@code lance_dropped}.</li>
      * </ul>
-     * {@code lance_dropped} is stored in the field's {@code meta} so
-     * {@link LanceTextFieldMapper}, {@link LanceVectorFieldMapper}, and any
-     * future custom type can reject queries against it up front. Standard
-     * scalar mappers (integer / keyword / date / boolean) do not honour it
-     * yet — they still accept queries silently.
+     * {@code lance_dropped} is stored in the field's {@code meta} so the
+     * read paths can hide the stale name: {@link LanceTextFieldMapper},
+     * {@link LanceVectorFieldMapper} and the Lance query builders reject
+     * queries against it up front, the coordinator's field type lookup
+     * treats it as unmapped (no Lance SQL ever names the stale column,
+     * scalar queries fold to 0 hits), and the explain endpoint's field
+     * resolution names the rename. {@code GET _mapping} still lists the
+     * stale name because PutMapping cannot remove properties.
      */
     private void warnOnLanceFieldRename(String indexName, LanceSchema lanceSchema) {
         Map<Integer, MappingFieldInfo> mappingFieldIds;
@@ -1394,15 +1397,14 @@ public final class LanceNamespaceService {
                 if (warnedRenamed.add(key)) {
                     LOG.warn(
                         "Lance table for {} reset field id {}: dropped '{}' ({}), added '{}' ({}). "
-                            + "The mapping still exposes '{}'; marking it lance_dropped so lance_text / lance_vector queries fail. "
-                            + "Standard scalar queries against '{}' still succeed silently — recreate the index to drop it.",
+                            + "The mapping still exposes '{}' marked lance_dropped: queries against it return no hits and "
+                            + "lance_text / lance_vector queries fail. Recreate the index to drop it from the mapping.",
                         indexName,
                         field.getId(),
                         mapped.name,
                         mapped.arrowType,
                         field.getName(),
                         currentArrowType,
-                        mapped.name,
                         mapped.name
                     );
                 }
@@ -1413,14 +1415,15 @@ public final class LanceNamespaceService {
             if (warnedRenamed.add(key)) {
                 LOG.warn(
                     "Lance table for {} renamed field id {} from '{}' to '{}'. "
-                        + "The mapping still exposes both names; marking the old name lance_dropped so lance_text / lance_vector "
-                        + "queries against it fail. Standard scalar queries against '{}' still succeed silently. Recreate the "
-                        + "index to drop the stale mapping.",
+                        + "The mapping keeps the old name marked lance_dropped (PutMapping cannot remove properties): queries "
+                        + "against '{}' return no hits, and GET /_lance/stats lists the rename under renamed_fields. "
+                        + "Mapping overrides keyed by the old name follow the column to '{}'.",
                     indexName,
                     field.getId(),
                     mapped.name,
                     field.getName(),
-                    mapped.name
+                    mapped.name,
+                    field.getName()
                 );
             }
             droppedFieldNames.add(mapped.name);
@@ -1441,8 +1444,8 @@ public final class LanceNamespaceService {
             if (warnedRenamed.add(key)) {
                 LOG.warn(
                     "Lance table for {} no longer contains field id {} ('{}'). "
-                        + "Marking the mapping field lance_dropped so lance_text / lance_vector queries against it fail. "
-                        + "Standard scalar queries against '{}' still succeed silently; recreate the index to drop it.",
+                        + "The mapping keeps the name marked lance_dropped (PutMapping cannot remove properties): queries "
+                        + "against '{}' return no hits. Recreate the index to drop it from the mapping.",
                     indexName,
                     id,
                     staleName,

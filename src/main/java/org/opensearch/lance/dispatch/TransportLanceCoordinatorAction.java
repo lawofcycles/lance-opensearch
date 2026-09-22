@@ -51,6 +51,7 @@ import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.core.tasks.TaskId;
+import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
@@ -1175,6 +1176,14 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 return null;
             }
             Map<String, Object> fieldMap = (Map<String, Object>) field;
+            if (LanceMappingMeta.isDropped(fieldMap)) {
+                // The Lance table renamed, reset or dropped the column
+                // behind this name. Answering null makes the translator
+                // treat it as unmapped, so no Lance SQL names a column
+                // the table no longer has (which would fail the scan)
+                // and the query folds to the unmapped behaviour: 0 hits.
+                return null;
+            }
             Object type = fieldMap.get("type");
             if (!(type instanceof String typeName)) {
                 return null;
