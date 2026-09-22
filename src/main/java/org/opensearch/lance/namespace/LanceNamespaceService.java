@@ -379,7 +379,7 @@ public final class LanceNamespaceService {
      * or to spot tables the poller failed to surface due to a name
      * clash with an existing OpenSearch index.
      */
-    public Optional<java.util.Set<String>> listTables(String identifier) throws Exception {
+    public Optional<Set<String>> listTables(String identifier) throws Exception {
         LanceNamespaceMetadata.Entry entry = currentMetadata(clusterService.state()).findByIdentifier(identifier);
         if (entry == null) {
             return Optional.empty();
