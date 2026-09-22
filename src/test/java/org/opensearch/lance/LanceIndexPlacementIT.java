@@ -48,7 +48,10 @@ public class LanceIndexPlacementIT extends LanceRestTestCase {
             ensureGreen(indexName);
 
             String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
-            assertTrue("expected label in the merged fts built list: " + build, build.contains("\"fts\":[\"label\"]"));
+            assertTrue(
+                "expected label in the merged fts built list: " + build,
+                build.contains("\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]")
+            );
             assertTrue("at least one node must report label under its own built.fts: " + build, anyNodeBuiltFts(build, "label"));
 
             // The keyword -> lance_text flip lands through the rebuild the
@@ -172,9 +175,12 @@ public class LanceIndexPlacementIT extends LanceRestTestCase {
         for (Object entry : nodeMap.values()) {
             if (entry instanceof Map<?, ?> node
                 && node.get("built") instanceof Map<?, ?> built
-                && built.get("fts") instanceof List<?> fts
-                && fts.contains(column)) {
-                return true;
+                && built.get("fts") instanceof List<?> fts) {
+                for (Object builtEntry : fts) {
+                    if (builtEntry instanceof Map<?, ?> builtMap && column.equals(builtMap.get("column"))) {
+                        return true;
+                    }
+                }
             }
         }
         return false;

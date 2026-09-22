@@ -71,7 +71,7 @@ public class FragmentExecutorInvalidInputTests extends OpenSearchSingleNodeTestC
                 /* withPosition */ false
             );
             assertEquals("fts build failures: " + built.failed(), 0, built.failed().size());
-            assertEquals(List.of("category"), built.built());
+            assertEquals(List.of(new LanceIndexBuilder.Built("category", "INVERTED")), built.built());
         }
         LanceAttachResponse attached = client().execute(
             LanceAttachAction.INSTANCE,

@@ -12,6 +12,7 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.lance.index.LanceBuildIndexesResponse.BuiltResult;
 import org.opensearch.lance.index.LanceBuildIndexesResponse.ColumnResult;
 import org.opensearch.lance.index.LanceBuildIndexesResponse.KindResult;
 import org.opensearch.test.OpenSearchTestCase;
@@ -32,7 +33,8 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
             false,
             false,
             "lindera/ipadic",
-            true
+            true,
+            "{\"rating\":{\"scalar\":\"bitmap\"}}"
         );
 
         LanceBuildIndexesRequest restored = roundTrip(original);
@@ -46,6 +48,7 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
         assertFalse(restored.retrain());
         assertEquals("lindera/ipadic", restored.tokenizer());
         assertTrue(restored.withPosition());
+        assertEquals("{\"rating\":{\"scalar\":\"bitmap\"}}", restored.indexesJson());
         assertNull(restored.validate());
     }
 
@@ -54,18 +57,19 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
         // transport action applies LanceIndexBuilder.DEFAULT_FTS_TOKENIZER
         // itself and derives the FTS targets from the table; with_position
         // defaults to false like Lance's own default.
-        LanceBuildIndexesRequest original = new LanceBuildIndexesRequest("demo", null, null, null, false, false, null, false);
+        LanceBuildIndexesRequest original = new LanceBuildIndexesRequest("demo", null, null, null, false, false, null, false, null);
 
         LanceBuildIndexesRequest restored = roundTrip(original);
 
         assertNull(restored.ftsColumns());
         assertNull(restored.tokenizer());
         assertFalse(restored.withPosition());
+        assertNull(restored.indexesJson());
         assertNull(restored.validate());
     }
 
     public void testOptimizeRequestWithNullFiltersRoundTrip() throws Exception {
-        LanceBuildIndexesRequest original = new LanceBuildIndexesRequest("demo", null, null, null, true, true, null, false);
+        LanceBuildIndexesRequest original = new LanceBuildIndexesRequest("demo", null, null, null, true, true, null, false, null);
 
         LanceBuildIndexesRequest restored = roundTrip(original);
 
@@ -79,45 +83,57 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
     }
 
     public void testRequestValidation() {
-        assertNotNull(new LanceBuildIndexesRequest("", null, null, null, false, false, null, false).validate());
+        assertNotNull(new LanceBuildIndexesRequest("", null, null, null, false, false, null, false, null).validate());
         // fragment_ids only scopes an initial build; optimize covers every
         // uncovered fragment on its own.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, List.of(1), true, false, null, false).validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, List.of(1), true, false, null, false, null).validate());
         // retrain is an optimize option.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, null, false, true, null, false).validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, null, false, true, null, false, null).validate());
         // fts_columns creates indexes; optimize creates none.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, true, false, null, false).validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, true, false, null, false, null).validate());
         // An empty fts_columns list is a caller mistake.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of(), null, false, false, null, false).validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of(), null, false, false, null, false, null).validate());
         // tokenizer only applies to indexes this request creates, which
         // are the fts_columns ones.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, null, false, false, "simple", false).validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, null, false, false, "simple", false, null).validate());
         // An empty tokenizer is a caller mistake, not a request for the
         // default.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, "", false).validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, "", false, null).validate());
         // Any non-empty name passes plugin validation; Lance decides
         // whether it exists.
-        assertNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, "no-such-tokenizer", false).validate());
+        assertNull(
+            new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, "no-such-tokenizer", false, null).validate()
+        );
         // fts_columns without a tokenizer builds with the default.
-        assertNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, null, false).validate());
+        assertNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, null, false, null).validate());
         // with_position, like tokenizer, only shapes the indexes this
         // request creates.
-        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, null, false, false, null, true).validate());
-        assertNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, null, true).validate());
+        assertNotNull(new LanceBuildIndexesRequest("demo", null, null, null, false, false, null, true, null).validate());
+        assertNull(new LanceBuildIndexesRequest("demo", null, List.of("body"), null, false, false, null, true, null).validate());
+        // The one-shot indexes preference steers index creation; optimize
+        // creates none.
+        assertNotNull(
+            new LanceBuildIndexesRequest("demo", null, null, null, true, false, null, false, "{\"rating\":{\"scalar\":\"bitmap\"}}")
+                .validate()
+        );
+        assertNull(
+            new LanceBuildIndexesRequest("demo", null, null, null, false, false, null, false, "{\"rating\":{\"scalar\":\"bitmap\"}}")
+                .validate()
+        );
     }
 
     public void testResponseRoundTrip() throws Exception {
         LanceBuildIndexesResponse original = new LanceBuildIndexesResponse(
             "demo",
-            new KindResult(List.of("body"), List.of(), List.of()),
+            new KindResult(List.of(new BuiltResult("body", "INVERTED")), List.of(), List.of()),
             new KindResult(
-                List.of("id", "category"),
+                List.of(new BuiltResult("id", "BTREE"), new BuiltResult("category", "BITMAP")),
                 List.of(new ColumnResult("rating", "scalar index already exists; use optimize=true to extend it over new fragments")),
                 List.of(new ColumnResult("price", "LanceError(IO): Permission denied (os error 13)"))
             ),
             new KindResult(
                 List.of(),
-                List.of(new ColumnResult("embedding", "table has 5 rows, below the IVF_PQ training minimum of 256")),
+                List.of(new ColumnResult("embedding", "table has 5 rows, below the ivf_pq training minimum of 256")),
                 List.of()
             ),
             List.of("body", "id", "category", "rating", "price", "embedding"),
@@ -128,8 +144,8 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
         LanceBuildIndexesResponse restored = roundTrip(original);
 
         assertEquals("demo", restored.index());
-        assertEquals(List.of("body"), restored.ftsBuilt());
-        assertEquals(List.of("id", "category"), restored.scalarBuilt());
+        assertEquals(List.of(new BuiltResult("body", "INVERTED")), restored.ftsBuilt());
+        assertEquals(List.of(new BuiltResult("id", "BTREE"), new BuiltResult("category", "BITMAP")), restored.scalarBuilt());
         assertTrue(restored.vectorBuilt().isEmpty());
         assertEquals(original.scalar().skipped(), restored.scalar().skipped());
         assertEquals(original.scalar().failed(), restored.scalar().failed());
@@ -147,8 +163,8 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
         LanceBuildIndexesResponse original = new LanceBuildIndexesResponse(
             "demo",
             new KindResult(List.of(), List.of(), List.of()),
-            new KindResult(List.of("id"), List.of(), List.of()),
-            new KindResult(List.of("vec"), List.of(), List.of()),
+            new KindResult(List.of(new BuiltResult("id", "BTREE")), List.of(), List.of()),
+            new KindResult(List.of(new BuiltResult("vec", "IVF_PQ")), List.of(), List.of()),
             null,
             null,
             RestStatus.OK
@@ -158,7 +174,7 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
 
         assertNull(restored.columnsFilter());
         assertNull(restored.fragmentIds());
-        assertEquals(List.of("vec"), restored.vectorBuilt());
+        assertEquals(List.of(new BuiltResult("vec", "IVF_PQ")), restored.vectorBuilt());
         assertFalse(restored.hasFailures());
         assertEquals(RestStatus.OK, restored.status());
     }
@@ -167,7 +183,7 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
         LanceBuildIndexesResponse response = new LanceBuildIndexesResponse(
             "demo",
             new KindResult(List.of(), List.of(), List.of(new ColumnResult("text", "unknown base tokenizer no-such-tokenizer"))),
-            new KindResult(List.of("id"), List.of(new ColumnResult("category", "already")), List.of()),
+            new KindResult(List.of(new BuiltResult("id", "BTREE")), List.of(new ColumnResult("category", "already")), List.of()),
             new KindResult(List.of(), List.of(), List.of()),
             null,
             null,
@@ -176,9 +192,10 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
 
         String json = Strings.toString(MediaTypeRegistry.JSON, response);
 
-        // The pre-existing built shape is unchanged; skipped and failed
-        // sit next to it with one {column, reason} object per column.
-        assertTrue(json, json.contains("\"built\":{\"fts\":[],\"scalar\":[\"id\"],\"vector\":[]}"));
+        // Built entries carry the column and the index type that was
+        // built; skipped and failed sit next to them with one
+        // {column, reason} object per column.
+        assertTrue(json, json.contains("\"built\":{\"fts\":[],\"scalar\":[{\"column\":\"id\",\"type\":\"BTREE\"}],\"vector\":[]}"));
         assertTrue(
             json,
             json.contains("\"skipped\":{\"fts\":[],\"scalar\":[{\"column\":\"category\",\"reason\":\"already\"}],\"vector\":[]}")

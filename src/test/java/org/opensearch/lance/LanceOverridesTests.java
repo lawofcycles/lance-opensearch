@@ -176,4 +176,167 @@ public class LanceOverridesTests extends OpenSearchTestCase {
         );
         assertTrue(e.getMessage(), e.getMessage().contains("fields.raw.type] is required"));
     }
+
+    public void testIndexesClauseAcceptsEveryScalarAndVectorType() {
+        for (String scalar : LanceOverrides.SCALAR_INDEX_TYPES.keySet()) {
+            LanceOverrides overrides = LanceOverrides.parseAttachClauses(null, null, Map.of("col", Map.of("scalar", scalar)));
+            assertEquals(scalar, overrides.indexPreferences().get("col").scalar());
+            assertNull(overrides.indexPreferences().get("col").vector());
+        }
+        for (String vector : LanceOverrides.VECTOR_INDEX_TYPES.keySet()) {
+            LanceOverrides overrides = LanceOverrides.parseAttachClauses(null, null, Map.of("vec", Map.of("vector", vector)));
+            assertEquals(vector, overrides.indexPreferences().get("vec").vector());
+            assertNull(overrides.indexPreferences().get("vec").scalar());
+        }
+        LanceOverrides scalarNone = LanceOverrides.parseAttachClauses(null, null, Map.of("col", Map.of("scalar", "none")));
+        assertEquals("none", scalarNone.indexPreferences().get("col").scalar());
+        LanceOverrides vectorNone = LanceOverrides.parseAttachClauses(null, null, Map.of("vec", Map.of("vector", "none")));
+        assertEquals("none", vectorNone.indexPreferences().get("vec").vector());
+    }
+
+    public void testIndexesClauseAcceptsParamsOfTheChosenType() {
+        LanceOverrides overrides = LanceOverrides.parseAttachClauses(
+            null,
+            null,
+            Map.of(
+                "flags",
+                Map.of("scalar", "bloomfilter", "params", Map.of("number_of_items", 100_000, "probability", 0.01)),
+                "vec",
+                Map.of("vector", "ivf_hnsw_sq", "params", Map.of("num_partitions", 4, "m", 16, "ef_construction", 100))
+            )
+        );
+        LanceOverrides.IndexPreference flags = overrides.indexPreferences().get("flags");
+        assertEquals(100_000, flags.params().get("number_of_items").intValue());
+        assertEquals(0.01, flags.params().get("probability").doubleValue(), 0.0);
+        LanceOverrides.IndexPreference vec = overrides.indexPreferences().get("vec");
+        assertEquals(4, vec.params().get("num_partitions").intValue());
+        assertEquals(16, vec.params().get("m").intValue());
+        assertEquals(100, vec.params().get("ef_construction").intValue());
+    }
+
+    public void testIndexesClauseUnknownTypeRejected() {
+        IllegalArgumentException scalar = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseIndexesClause(Map.of("col", Map.of("scalar", "hash")))
+        );
+        assertTrue(scalar.getMessage(), scalar.getMessage().contains("scalar=hash] is not supported"));
+        assertTrue(scalar.getMessage(), scalar.getMessage().contains("btree"));
+        IllegalArgumentException vector = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseIndexesClause(Map.of("col", Map.of("vector", "hnsw")))
+        );
+        assertTrue(vector.getMessage(), vector.getMessage().contains("vector=hnsw] is not supported"));
+        assertTrue(vector.getMessage(), vector.getMessage().contains("ivf_pq"));
+    }
+
+    public void testIndexesClauseUnknownKeyRejected() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseIndexesClause(Map.of("col", Map.of("scalar", "btree", "replace", true)))
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("unknown key [replace]"));
+    }
+
+    public void testIndexesClauseUnknownParamRejectedNamingAcceptedKeys() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseIndexesClause(Map.of("col", Map.of("scalar", "zonemap", "params", Map.of("zone_size", 1024))))
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("unknown key [zone_size]"));
+        assertTrue(e.getMessage(), e.getMessage().contains("rows_per_zone"));
+        IllegalArgumentException noParams = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseIndexesClause(Map.of("col", Map.of("scalar", "bitmap", "params", Map.of("shard_id", 1))))
+        );
+        assertTrue(noParams.getMessage(), noParams.getMessage().contains("[bitmap] accepts no params"));
+    }
+
+    public void testIndexesClauseNonNumericParamRejected() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseIndexesClause(Map.of("col", Map.of("scalar", "zonemap", "params", Map.of("rows_per_zone", "many"))))
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("must be a number"));
+    }
+
+    public void testIndexesClauseBothKindsRejected() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseIndexesClause(Map.of("col", Map.of("scalar", "btree", "vector", "ivf_pq")))
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("declares both [scalar] and [vector]"));
+    }
+
+    public void testIndexesClauseNeitherKindRejected() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseIndexesClause(Map.of("col", Map.of("params", Map.of("num_partitions", 2))))
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("must declare one of [scalar], [vector]"));
+    }
+
+    public void testIndexesClauseParamsWithNoneRejected() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseIndexesClause(Map.of("col", Map.of("scalar", "none", "params", Map.of("zone_size", 1))))
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("not accepted together with [none]"));
+    }
+
+    public void testIndexesClauseNonObjectRejected() {
+        IllegalArgumentException clause = expectThrows(IllegalArgumentException.class, () -> LanceOverrides.parseIndexesClause("btree"));
+        assertTrue(clause.getMessage(), clause.getMessage().contains("[indexes] must be an object"));
+        IllegalArgumentException entry = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseIndexesClause(Map.of("col", "btree"))
+        );
+        assertTrue(entry.getMessage(), entry.getMessage().contains("[indexes.col] must be an object"));
+    }
+
+    public void testOverridesColumnNamedIndexesRejected() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(Map.of("indexes", Map.of("type", "keyword")), null, null)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("[indexes] is reserved"));
+    }
+
+    public void testJsonRoundTripKeepsIndexPreferences() {
+        LinkedHashMap<String, Object> indexes = new LinkedHashMap<>();
+        indexes.put("rating", Map.of("scalar", "zonemap", "params", Map.of("rows_per_zone", 4096)));
+        indexes.put("category", Map.of("scalar", "bitmap"));
+        indexes.put("flag", Map.of("scalar", "none"));
+        indexes.put("embedding", Map.of("vector", "ivf_flat", "params", Map.of("num_partitions", 2)));
+        LanceOverrides original = LanceOverrides.parseAttachClauses(Map.of("label", Map.of("type", "keyword")), null, indexes);
+        LanceOverrides restored = LanceOverrides.parse(original.toJson());
+        assertEquals(original, restored);
+        assertEquals(List.of("rating", "category", "flag", "embedding"), List.copyOf(restored.indexPreferences().keySet()));
+        assertEquals("zonemap", restored.indexPreferences().get("rating").scalar());
+        assertEquals(4096L, restored.indexPreferences().get("rating").params().get("rows_per_zone").longValue());
+        assertEquals("none", restored.indexPreferences().get("flag").scalar());
+        assertEquals("ivf_flat", restored.indexPreferences().get("embedding").vector());
+        assertEquals(Set.of("label"), restored.keywordColumns());
+    }
+
+    public void testIndexPreferencesAloneRoundTripThroughTheSetting() {
+        LanceOverrides original = LanceOverrides.parseAttachClauses(null, null, Map.of("rating", Map.of("scalar", "bitmap")));
+        assertFalse(original.isEmpty());
+        Settings settings = Settings.builder().put(LanceEngineFactory.OVERRIDES_SETTING, original.toJson()).build();
+        LanceOverrides restored = LanceOverrides.of(settings);
+        assertEquals(original, restored);
+        assertEquals("bitmap", restored.indexPreferences().get("rating").scalar());
+        assertTrue(restored.columns().isEmpty());
+    }
+
+    public void testIndexPreferencesJsonHelpersRoundTrip() {
+        LinkedHashMap<String, LanceOverrides.IndexPreference> preferences = LanceOverrides.parseIndexesClause(
+            Map.of("rating", Map.of("scalar", "bloomfilter", "params", Map.of("number_of_items", 10, "probability", 0.05)))
+        );
+        String json = LanceOverrides.indexPreferencesToJson(preferences);
+        Map<String, LanceOverrides.IndexPreference> restored = LanceOverrides.indexPreferencesFromJson(json);
+        assertEquals(preferences, restored);
+        assertEquals("", LanceOverrides.indexPreferencesToJson(Map.of()));
+        assertTrue(LanceOverrides.indexPreferencesFromJson("").isEmpty());
+        assertTrue(LanceOverrides.indexPreferencesFromJson(null).isEmpty());
+    }
 }

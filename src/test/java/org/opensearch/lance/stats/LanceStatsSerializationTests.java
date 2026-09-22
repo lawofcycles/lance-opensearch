@@ -7,6 +7,7 @@ package org.opensearch.lance.stats;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import org.apache.arrow.memory.RootAllocator;
@@ -82,8 +83,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 )
             ),
             List.of(
-                new LanceNodeStats.IndexReaderStats("big", 3_000_000_000L, 2_000_000_000L, 0L, true),
-                new LanceNodeStats.IndexReaderStats("small", 120L, 120L, 14L, false)
+                new LanceNodeStats.IndexReaderStats("big", 3_000_000_000L, 2_000_000_000L, 0L, true, Map.of()),
+                new LanceNodeStats.IndexReaderStats("small", 120L, 120L, 14L, false, Map.of("rating", List.of("BTree", "Bitmap")))
             ),
             List.of(new LanceNodeStats.LocalCloneStats("cloned", 4321L, 9L))
         );
@@ -124,8 +125,9 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "{\"name\":\"body_idx\",\"type\":\"Inverted\",\"column\":\"body\",\"state\":\"failed\",\"seconds\":1.25,"
                     + "\"detail\":\"boom\"}]}]},"
                     + "\"indices\":{\"big\":{\"rows\":3000000000,\"shard_reader_rows\":2000000000,\"nested_docs\":0,"
-                    + "\"lucene_bound_exceeded\":true},"
-                    + "\"small\":{\"rows\":120,\"shard_reader_rows\":120,\"nested_docs\":14,\"lucene_bound_exceeded\":false}},"
+                    + "\"lucene_bound_exceeded\":true,\"index_types\":{}},"
+                    + "\"small\":{\"rows\":120,\"shard_reader_rows\":120,\"nested_docs\":14,\"lucene_bound_exceeded\":false,"
+                    + "\"index_types\":{\"rating\":[\"BTree\",\"Bitmap\"]}}},"
                     + "\"local_clones\":{\"cloned\":{\"local_clone_bytes\":4321,\"source_version\":9}}}",
                 builder.toString()
             );

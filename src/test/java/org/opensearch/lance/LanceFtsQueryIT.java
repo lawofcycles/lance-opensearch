@@ -1390,7 +1390,10 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             String indexName = fixture.indexName();
             String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{}"));
             assertTrue("expected no FTS index built: " + build, build.contains("\"fts\":[]"));
-            assertTrue("expected text among the scalar builds: " + build, build.contains("\"scalar\":[\"id\",\"text\"]"));
+            assertTrue(
+                "expected text among the scalar builds: " + build,
+                build.contains("\"scalar\":[{\"column\":\"id\",\"type\":\"BTREE\"},{\"column\":\"text\",\"type\":\"BTREE\"}]")
+            );
 
             String mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
             assertTrue("text must stay keyword: " + mapping, mapping.contains("\"text\":{\"type\":\"keyword\""));
@@ -1405,8 +1408,14 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         try (SurfacedIndex fixture = SurfacedIndex.japanese("jasimple")) {
             String indexName = fixture.indexName();
             String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"]}"));
-            assertTrue("expected text in fts built list: " + build, build.contains("\"fts\":[\"text\"]"));
-            assertTrue("text must not also get a BTree index: " + build, build.contains("\"scalar\":[\"id\"]"));
+            assertTrue(
+                "expected text in fts built list: " + build,
+                build.contains("\"fts\":[{\"column\":\"text\",\"type\":\"INVERTED\"}]")
+            );
+            assertTrue(
+                "text must not also get a BTree index: " + build,
+                build.contains("\"scalar\":[{\"column\":\"id\",\"type\":\"BTREE\"}]")
+            );
             awaitLanceTextMapping(indexName);
 
             assertEquals("simple tokenizer must not find 天気 inside a sentence", 0, lanceMatchHits(indexName, "天気"));
@@ -1422,7 +1431,10 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         try (SurfacedIndex fixture = SurfacedIndex.japanese("jaicu")) {
             String indexName = fixture.indexName();
             String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"icu\"}"));
-            assertTrue("expected text in fts built list: " + build, build.contains("\"fts\":[\"text\"]"));
+            assertTrue(
+                "expected text in fts built list: " + build,
+                build.contains("\"fts\":[{\"column\":\"text\",\"type\":\"INVERTED\"}]")
+            );
             awaitLanceTextMapping(indexName);
 
             assertEquals("icu must split 天気 out of the sentences", 2, lanceMatchHits(indexName, "天気"));
@@ -1462,7 +1474,10 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             String build = readAll(
                 postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"lindera/ipadic\"}")
             );
-            assertTrue("expected text in fts built list: " + build, build.contains("\"fts\":[\"text\"]"));
+            assertTrue(
+                "expected text in fts built list: " + build,
+                build.contains("\"fts\":[{\"column\":\"text\",\"type\":\"INVERTED\"}]")
+            );
             awaitLanceTextMapping(indexName);
 
             assertEquals("lindera/ipadic must split 天気 out of the sentences", 2, lanceMatchHits(indexName, "天気"));
@@ -1541,14 +1556,20 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         try (SurfacedIndex fixture = SurfacedIndex.japanese("jaskipped")) {
             String indexName = fixture.indexName();
             String first = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}"));
-            assertTrue("expected id built: " + first, first.contains("\"built\":{\"fts\":[],\"scalar\":[\"id\"],\"vector\":[]}"));
+            assertTrue(
+                "expected id built: " + first,
+                first.contains("\"built\":{\"fts\":[],\"scalar\":[{\"column\":\"id\",\"type\":\"BTREE\"}],\"vector\":[]}")
+            );
             assertTrue("expected nothing skipped: " + first, first.contains("\"skipped\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
             assertTrue("expected nothing failed: " + first, first.contains("\"failed\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
 
             Response second = postJson("/_lance/build_indexes/" + indexName, "{}");
             assertEquals(200, second.getStatusLine().getStatusCode());
             String body = readAll(second);
-            assertTrue("expected text built: " + body, body.contains("\"built\":{\"fts\":[],\"scalar\":[\"text\"],\"vector\":[]}"));
+            assertTrue(
+                "expected text built: " + body,
+                body.contains("\"built\":{\"fts\":[],\"scalar\":[{\"column\":\"text\",\"type\":\"BTREE\"}],\"vector\":[]}")
+            );
             assertTrue(
                 "expected id skipped with the reason: " + body,
                 body.contains(
@@ -1568,7 +1589,10 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         try (SurfacedIndex fixture = SurfacedIndex.keywordOnly("withpos", 5)) {
             String indexName = fixture.indexName();
             String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"],\"with_position\":true}"));
-            assertTrue("expected label in fts built list: " + build, build.contains("\"fts\":[\"label\"]"));
+            assertTrue(
+                "expected label in fts built list: " + build,
+                build.contains("\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]")
+            );
             awaitLanceTextMapping(indexName, "label");
 
             String ordered = readAll(
@@ -1594,7 +1618,10 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         try (SurfacedIndex fixture = SurfacedIndex.keywordOnly("nopos", 5)) {
             String indexName = fixture.indexName();
             String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
-            assertTrue("expected label in fts built list: " + build, build.contains("\"fts\":[\"label\"]"));
+            assertTrue(
+                "expected label in fts built list: " + build,
+                build.contains("\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]")
+            );
             awaitLanceTextMapping(indexName, "label");
 
             String term = readAll(

@@ -40,8 +40,8 @@ Distribution over the cluster is automatic: fragments are spread over every data
 - `GET /_lance/namespace` lists the registrations: one object per entry with `name`, `type`, `path` (directory only), the redacted `config`, and `status` (`available`, or `unavailable` with `error`).
 - `POST /_lance/namespace/tables {"name": "..."}` returns the table names the poll would surface from a registered namespace (`path` still works as the identifier for directory registrations). Read-only preview, useful for spotting a table the poll skipped due to a name clash. Unknown identifiers return 404.
 - `DELETE /_lance/namespace {"name": "..."}` stops polling that namespace (`path` also identifies a directory registration). Already-surfaced indexes stay in place; delete them separately if the tables should disappear.
-- `POST /_lance/build_indexes/{index}` triggers Lance-side FTS / scalar / vector index builds from OpenSearch. Automatic builds happen for tables at or under `lance.builder.max_rows` (default 1,000,000 rows); larger tables use this explicit endpoint. `fts_columns`, `tokenizer` and `with_position` create inverted indexes on Utf8 columns that have none yet (see [Full-text search](#full-text-search)).
-  - The response reports every target column under one of three keys, each split by index kind: `built` (`{"fts": [...], "scalar": [...], "vector": [...]}`, column names, or Lance index names with `optimize: true`), `skipped` (`{"fts": [{"column": "...", "reason": "..."}], ...}`, an index already exists, the table has fewer than 256 rows for IVF_PQ, or with `optimize: true` the column has no index to extend) and `failed` (same shape, `reason` is the message Lance threw, for example `LanceError(IO): Permission denied (os error 13)` when the OpenSearch process cannot write into the table).
+- `POST /_lance/build_indexes/{index}` triggers Lance-side FTS / scalar / vector index builds from OpenSearch. Automatic builds happen for tables at or under `lance.builder.max_rows` (default 1,000,000 rows); larger tables use this explicit endpoint. `fts_columns`, `tokenizer` and `with_position` create inverted indexes on Utf8 columns that have none yet (see [Full-text search](#full-text-search)). Without a preference a scalar column gets a BTree index and a vector column an IVF_PQ index; an `indexes` object on the attach body or on this endpoint's body selects other types per column (see [Index type selection](#index-type-selection)).
+  - The response reports every target column under one of three keys, each split by index kind: `built` (`{"fts": [{"column": "...", "type": "INVERTED"}], "scalar": [...], "vector": [...]}`, the column and the index type that was committed; with `optimize: true` the Lance index name and the type Lance reports), `skipped` (`{"fts": [{"column": "...", "reason": "..."}], ...}`, an index already exists, the preference is `none`, the table has fewer rows than the chosen vector type's training minimum, or with `optimize: true` the column has no index to extend) and `failed` (same shape, `reason` is the message Lance threw, for example `LanceError(IO): Permission denied (os error 13)` when the OpenSearch process cannot write into the table).
   - Status: 200 when `failed` is empty (skips are not failures), 400 when every failure is Lance rejecting the input (unknown `tokenizer`, malformed index parameters), 500 for anything else Lance threw. The body carries `built`, `skipped` and `failed` in all three cases, so a build that landed on some columns and failed on others shows both. A build that stops before Lance runs (unknown index 404, a `columns` entry that is not indexable 400, `fts_columns` naming a non-Utf8 column 400) returns the usual error body instead.
 - `index.lance.index_placement` (index setting, written by attach from the body key `"index_placement"`, values `in_table` / `node_local`, default `in_table`, final) chooses where those builds commit. The default commits into the source table's own manifest chain. `node_local` keeps the source read-only: every data node shallow-clones the table into `<data path>/lance-local/<index name>/` (`Dataset.shallowClone`, metadata only, the data files stay in the source), builds the indexes into its clone, and serves all of its reads (search, GET, aggregations) from the clone. Use it for tables on read-only mounts or object-store prefixes the OpenSearch process cannot write to.
   - The build fans out to every data node; the response carries the merged `built` / `skipped` / `failed` lists plus a `nodes` object with each node's own outcome under its node id (`{"error": "..."}` when a node's leg failed outright). The security action name of the fan-out leg is `indices:admin/lance/build_indexes[nodes]`; grant `indices:admin/lance/build_indexes*` to cover both.
@@ -168,6 +168,47 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 - The legacy `multi_fields` clause (`{"body": {"raw": {"type": "keyword"}}}`) is still accepted for one release as an alias: it folds into `overrides.[col].fields` at parse time, and a body declaring sub-fields for the same column through both clauses returns 400.
 - `POST /_lance/namespace` accepts the same `overrides` object and applies it to every table it surfaces under the root. A column a table lacks is skipped for that table (logged at debug) while the full list is persisted, so the override applies once a later manifest adds the column.
 - Persisted as canonical JSON in the `index.lance.overrides` index setting. Namespace poll re-derivation reads the setting back and re-applies it on every manifest version advance, so overrides survive schema changes; an override whose column disappears is kept in the setting and skipped until the column returns. Indexes created before this setting existed keep resolving their sub-fields from the legacy `index.lance.multi_fields` setting.
+
+### Index type selection
+
+- Attach body and namespace-register body accept an `indexes` clause next to `overrides`, selecting the Lance index type the build creates per column. Without it a scalar column gets a BTree index and a vector column an IVF_PQ index, as before:
+
+  ```json
+  POST /_lance/attach
+  {
+    "table": "s3://bucket/tables/demo.lance",
+    "indexes": {
+      "category": { "scalar": "bitmap" },
+      "price":    { "scalar": "zonemap", "params": { "rows_per_zone": 8192 } },
+      "flag":     { "scalar": "none" },
+      "embedding":{ "vector": "ivf_hnsw_sq", "params": { "num_partitions": 256, "m": 16, "ef_construction": 100 } }
+    }
+  }
+  ```
+
+- Accepted types per kind, with the `params` keys each takes (values are numbers; unknown keys return 400 naming the accepted keys). `none` builds no index on the column, even where the automatic build would:
+
+  | kind | type | params | prefer it when |
+  |---|---|---|---|
+  | scalar | `btree` (default) | `zone_size` | general-purpose equality and range |
+  | scalar | `bitmap` | | low-cardinality columns (categories, flags) |
+  | scalar | `zonemap` | `rows_per_zone` | range scans over data sorted or clustered on the column |
+  | scalar | `bloomfilter` | `number_of_items`, `probability` | equality probes on high-cardinality columns |
+  | scalar | `ngram` | | substring matching on Utf8 columns |
+  | scalar | `labellist` | | membership tests on List&lt;Utf8&gt; columns |
+  | vector | `ivf_pq` (default) | `num_partitions`, `num_sub_vectors`, `num_bits`, `sample_rate` | large tables, memory-bounded search |
+  | vector | `ivf_flat` | `num_partitions`, `sample_rate` | small tables, exact distances within a partition |
+  | vector | `ivf_sq` | `num_partitions`, `num_bits`, `sample_rate` | scalar-quantised compromise between size and recall |
+  | vector | `ivf_rq` | `num_partitions`, `num_bits` | RaBitQ-style quantisation |
+  | vector | `ivf_hnsw_pq` | `num_partitions`, `m`, `ef_construction`, `num_sub_vectors`, `num_bits`, `sample_rate` | graph search over PQ codes |
+  | vector | `ivf_hnsw_sq` | `num_partitions`, `m`, `ef_construction`, `num_bits`, `sample_rate` | recall-leaning graph search |
+
+- `scalar` is accepted on scalar columns (signed integers, floats, booleans, Date / Timestamp, Utf8, List&lt;Utf8&gt;), `vector` on FixedSizeList&lt;Float32&gt; columns; the wrong kind returns 400 naming the column and its Arrow type. One column declares one kind. Whether the column's data type suits the chosen index (for example `bloomfilter` takes no boolean columns) is Lance's decision at build time and surfaces under `failed` with Lance's message.
+- Vector training minimums: the product-quantised types (`ivf_pq`, `ivf_hnsw_pq`) need `2^num_bits` rows to train the codebook (256 with the default 8 bits), and every IVF type needs at least `num_partitions` rows for k-means to form its partitions (the plugin's default is one partition). A table below the minimum reports the column under `skipped` with the type and the bound.
+- The distance type is L2. `num_partitions` defaults to 1 for every vector type, matching the IVF_PQ build the plugin has always performed; `ivf_pq` keeps its previous defaults (`num_sub_vectors` 8, `num_bits` 8).
+- The preference persists inside the `index.lance.overrides` setting (under a top-level `indexes` key), so the re-derivation on manifest version advance carries it like the mapping overrides, and the namespace register applies it leniently per table (a table without the column skips it). FTS (inverted) indexes are not selected here; their options stay `fts_columns` / `tokenizer` / `with_position` on `build_indexes`.
+- `POST /_lance/build_indexes/{index}` accepts the same `indexes` object in its body as a one-shot override of the persisted preference for that build only; nothing is persisted. `optimize: true` merges whatever index exists regardless of its type.
+- `GET /_lance/stats` reports, per index, the Lance index types present per column under `indices.<index>.index_types` (`{"rating": ["ZoneMap"], "embedding": ["IVF_FLAT"]}`, read from `describeIndices` once per stats call), so an operator can verify the preference took effect.
 
 ## Aggregations
 
