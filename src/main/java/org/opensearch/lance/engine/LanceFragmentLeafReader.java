@@ -90,6 +90,7 @@ import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.opensearch.common.lucene.index.OpenSearchLeafReader;
 import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.lance.engine.LanceFragmentSchema.ColumnKind;
 import org.opensearch.lance.engine.LanceFragmentSchema.NumericPrecision;
@@ -3349,7 +3350,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             // columnKind), so _source keys land in the same order every
             // time. Values come from the per-hit take; no whole-column
             // load happens here.
-            try (org.opensearch.core.xcontent.XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+            try (XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
                 builder.startObject();
                 int limit = Math.min(sourceColumnCount, row.length);
                 for (int c = 0; c < limit; c++) {
@@ -3380,8 +3381,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * {@code null} — the top-level loop skips absent columns, keeping
      * their keys out of {@code _source} as before).
      */
-    private void writeSourceField(org.opensearch.core.xcontent.XContentBuilder builder, String path, String key, Object value)
-        throws IOException {
+    private void writeSourceField(XContentBuilder builder, String path, String key, Object value) throws IOException {
         if (value == null) {
             builder.nullField(key);
             return;
@@ -3441,7 +3441,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     /** Render the children of one decoded struct (or nested element) under {@code path}. */
-    private void writeStructBody(org.opensearch.core.xcontent.XContentBuilder builder, String path, Map<?, ?> struct) throws IOException {
+    private void writeStructBody(XContentBuilder builder, String path, Map<?, ?> struct) throws IOException {
         for (Map.Entry<?, ?> entry : struct.entrySet()) {
             String childName = (String) entry.getKey();
             writeSourceField(builder, path + "." + childName, childName, entry.getValue());
