@@ -8,6 +8,7 @@ package org.opensearch.lance.rest;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -643,86 +644,7 @@ public class RestAttachAction extends BaseRestHandler {
                 if (field == null) {
                     throw new IllegalArgumentException("[overrides] references unknown column [" + baseName + "]");
                 }
-                if (field.getMetadata() != null && field.getMetadata().containsKey(PK_METADATA_KEY)) {
-                    throw new IllegalArgumentException(
-                        "[overrides." + baseName + "] targets the primary key column; the primary key mapping cannot be overridden"
-                    );
-                }
-                ArrowType type = field.getType();
-                if (LanceOverrides.TYPE_DATE.equals(column.type())) {
-                    boolean signedInt = type instanceof ArrowType.Int intType
-                        && intType.getIsSigned()
-                        && (intType.getBitWidth() == 32 || intType.getBitWidth() == 64);
-                    boolean alreadyDate = type instanceof ArrowType.Date || type instanceof ArrowType.Timestamp;
-                    if (!signedInt && !alreadyDate) {
-                        throw new IllegalArgumentException(
-                            "[overrides."
-                                + baseName
-                                + ".type=date] needs a signed 32 or 64 bit integer column holding epoch millis, or a "
-                                + "Date / Timestamp column; ["
-                                + baseName
-                                + "] is "
-                                + type
-                                + " (unsigned integer columns are not surfaced by the reader)"
-                        );
-                    }
-                }
-                if (LanceOverrides.TYPE_KEYWORD.equals(column.type())) {
-                    boolean utf8 = type instanceof ArrowType.Utf8;
-                    boolean listOfUtf8 = type instanceof ArrowType.List
-                        && field.getChildren().size() == 1
-                        && field.getChildren().get(0).getType() instanceof ArrowType.Utf8;
-                    if (!utf8 && !listOfUtf8) {
-                        throw new IllegalArgumentException(
-                            "[overrides." + baseName + ".type=keyword] needs a Utf8 or List<Utf8> column; [" + baseName + "] is " + type
-                        );
-                    }
-                }
-                if (LanceOverrides.TYPE_IP.equals(column.type())) {
-                    boolean utf8 = type instanceof ArrowType.Utf8;
-                    boolean listOfUtf8 = type instanceof ArrowType.List
-                        && field.getChildren().size() == 1
-                        && field.getChildren().get(0).getType() instanceof ArrowType.Utf8;
-                    if (!utf8 && !listOfUtf8) {
-                        throw new IllegalArgumentException(
-                            "[overrides."
-                                + baseName
-                                + ".type=ip] needs a Utf8 or List<Utf8> column holding IP address strings; ["
-                                + baseName
-                                + "] is "
-                                + type
-                        );
-                    }
-                }
-                if (LanceOverrides.TYPE_WILDCARD.equals(column.type()) && !(type instanceof ArrowType.Utf8)) {
-                    throw new IllegalArgumentException(
-                        "[overrides." + baseName + ".type=wildcard] needs a Utf8 column; [" + baseName + "] is " + type
-                    );
-                }
-                if (!column.subFields().isEmpty()) {
-                    if (!(type instanceof ArrowType.Utf8)) {
-                        throw new IllegalArgumentException(
-                            "[overrides."
-                                + baseName
-                                + ".fields] column must be Utf8; other Arrow types cannot host a keyword sub-field, ["
-                                + baseName
-                                + "] is "
-                                + type
-                        );
-                    }
-                    for (Map.Entry<String, String> sub : column.subFields().entrySet()) {
-                        if (!"keyword".equals(sub.getValue())) {
-                            throw new IllegalArgumentException(
-                                "sub-field [" + baseName + "." + sub.getKey() + "] type must be [keyword], got [" + sub.getValue() + "]"
-                            );
-                        }
-                        if (fieldsByName.containsKey(baseName + "." + sub.getKey())) {
-                            throw new IllegalArgumentException(
-                                "sub-field [" + baseName + "." + sub.getKey() + "] collides with an existing schema column"
-                            );
-                        }
-                    }
-                }
+                validateColumnOverride(baseName, column, field, fieldsByName.keySet());
                 accepted.put(baseName, column);
             } catch (IllegalArgumentException e) {
                 if (!lenient) {
@@ -732,6 +654,108 @@ public class RestAttachAction extends BaseRestHandler {
             }
         }
         return LanceOverrides.fromColumns(accepted);
+    }
+
+    /**
+     * Validate one column's override against the Lance field that
+     * currently carries the column name. Shared by attach-time
+     * validation and by the namespace poll, which re-checks a stored
+     * override after a schema reset changed the column's Arrow type.
+     *
+     * @param baseName the column name the override is keyed by
+     * @param column the override's rules
+     * @param field the Lance field of that name in the current schema
+     * @param schemaColumnNames every top-level column name of the
+     *     current schema, for the sub-field collision check
+     * @throws IllegalArgumentException naming the column and the reason
+     *     when the field's type or metadata does not admit the override
+     */
+    public static void validateColumnOverride(
+        String baseName,
+        LanceOverrides.Column column,
+        LanceField field,
+        Set<String> schemaColumnNames
+    ) {
+        if (field.getMetadata() != null && field.getMetadata().containsKey(PK_METADATA_KEY)) {
+            throw new IllegalArgumentException(
+                "[overrides." + baseName + "] targets the primary key column; the primary key mapping cannot be overridden"
+            );
+        }
+        ArrowType type = field.getType();
+        if (LanceOverrides.TYPE_DATE.equals(column.type())) {
+            boolean signedInt = type instanceof ArrowType.Int intType
+                && intType.getIsSigned()
+                && (intType.getBitWidth() == 32 || intType.getBitWidth() == 64);
+            boolean alreadyDate = type instanceof ArrowType.Date || type instanceof ArrowType.Timestamp;
+            if (!signedInt && !alreadyDate) {
+                throw new IllegalArgumentException(
+                    "[overrides."
+                        + baseName
+                        + ".type=date] needs a signed 32 or 64 bit integer column holding epoch millis, or a "
+                        + "Date / Timestamp column; ["
+                        + baseName
+                        + "] is "
+                        + type
+                        + " (unsigned integer columns are not surfaced by the reader)"
+                );
+            }
+        }
+        if (LanceOverrides.TYPE_KEYWORD.equals(column.type())) {
+            boolean utf8 = type instanceof ArrowType.Utf8;
+            boolean listOfUtf8 = type instanceof ArrowType.List
+                && field.getChildren().size() == 1
+                && field.getChildren().get(0).getType() instanceof ArrowType.Utf8;
+            if (!utf8 && !listOfUtf8) {
+                throw new IllegalArgumentException(
+                    "[overrides." + baseName + ".type=keyword] needs a Utf8 or List<Utf8> column; [" + baseName + "] is " + type
+                );
+            }
+        }
+        if (LanceOverrides.TYPE_IP.equals(column.type())) {
+            boolean utf8 = type instanceof ArrowType.Utf8;
+            boolean listOfUtf8 = type instanceof ArrowType.List
+                && field.getChildren().size() == 1
+                && field.getChildren().get(0).getType() instanceof ArrowType.Utf8;
+            if (!utf8 && !listOfUtf8) {
+                throw new IllegalArgumentException(
+                    "[overrides."
+                        + baseName
+                        + ".type=ip] needs a Utf8 or List<Utf8> column holding IP address strings; ["
+                        + baseName
+                        + "] is "
+                        + type
+                );
+            }
+        }
+        if (LanceOverrides.TYPE_WILDCARD.equals(column.type()) && !(type instanceof ArrowType.Utf8)) {
+            throw new IllegalArgumentException(
+                "[overrides." + baseName + ".type=wildcard] needs a Utf8 column; [" + baseName + "] is " + type
+            );
+        }
+        if (!column.subFields().isEmpty()) {
+            if (!(type instanceof ArrowType.Utf8)) {
+                throw new IllegalArgumentException(
+                    "[overrides."
+                        + baseName
+                        + ".fields] column must be Utf8; other Arrow types cannot host a keyword sub-field, ["
+                        + baseName
+                        + "] is "
+                        + type
+                );
+            }
+            for (Map.Entry<String, String> sub : column.subFields().entrySet()) {
+                if (!"keyword".equals(sub.getValue())) {
+                    throw new IllegalArgumentException(
+                        "sub-field [" + baseName + "." + sub.getKey() + "] type must be [keyword], got [" + sub.getValue() + "]"
+                    );
+                }
+                if (schemaColumnNames.contains(baseName + "." + sub.getKey())) {
+                    throw new IllegalArgumentException(
+                        "sub-field [" + baseName + "." + sub.getKey() + "] collides with an existing schema column"
+                    );
+                }
+            }
+        }
     }
 
     /**
