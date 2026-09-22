@@ -504,8 +504,13 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * @param schema    column kinds, primary key and field infos
      * @param filterSql predicate for request scoped heap column loads, or {@code null}
      */
-    LanceFragmentLeafReader(Dataset dataset, int fragmentId, LanceWarmCache.FragmentMeta meta, LanceFragmentSchema schema, String filterSql)
-        throws IOException {
+    LanceFragmentLeafReader(
+        Dataset dataset,
+        int fragmentId,
+        LanceWarmCache.FragmentMeta meta,
+        LanceFragmentSchema schema,
+        String filterSql
+    ) {
         this.dataset = dataset;
         this.fragmentId = fragmentId;
         this.schema = schema;
