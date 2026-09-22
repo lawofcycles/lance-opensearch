@@ -31,6 +31,14 @@ public class LanceKnnFilterTranslatorTests extends OpenSearchTestCase {
         assertEquals(LanceKnnFilterTranslator.IP_ON_UTF8, LanceKnnFilterTranslator.sentinelFor("ip", null));
     }
 
+    public void testSentinelForGeoPointIgnoresMeta() {
+        // Either Arrow shape maps to the same sentinel; the fragment
+        // reader is the one that switches on the meta.
+        assertEquals(LanceKnnFilterTranslator.GEO_POINT_ON_LANCE, LanceKnnFilterTranslator.sentinelFor("geo_point", "struct"));
+        assertEquals(LanceKnnFilterTranslator.GEO_POINT_ON_LANCE, LanceKnnFilterTranslator.sentinelFor("geo_point", "fsl2f64"));
+        assertEquals(LanceKnnFilterTranslator.GEO_POINT_ON_LANCE, LanceKnnFilterTranslator.sentinelFor("geo_point", null));
+    }
+
     public void testSentinelForPlainTypeNamePassesThrough() {
         assertEquals("long", LanceKnnFilterTranslator.sentinelFor("long", "Int(64, true)"));
         assertEquals("keyword", LanceKnnFilterTranslator.sentinelFor("keyword", "Utf8"));

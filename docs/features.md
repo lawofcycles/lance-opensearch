@@ -154,7 +154,7 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 
 ### Mapping overrides
 
-- Attach body accepts an `overrides` clause with per-column mapping rules. Five kinds are supported: a `date` type override, a `keyword` type override, an `ip` type override, a `wildcard` type override, and keyword sub-fields (`fields`). `type` and `fields` may appear together on one column:
+- Attach body accepts an `overrides` clause with per-column mapping rules. Six kinds are supported: a `date` type override, a `keyword` type override, an `ip` type override, a `wildcard` type override, a `geo_point` type override, and keyword sub-fields (`fields`). `type` and `fields` may appear together on one column:
 
   ```json
   POST /_lance/attach
@@ -163,7 +163,8 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
     "overrides": {
       "ts": { "type": "date", "format": "epoch_millis" },
       "body": { "type": "keyword", "fields": { "raw": { "type": "keyword" } } },
-      "client_addr": { "type": "ip" }
+      "client_addr": { "type": "ip" },
+      "location": { "type": "geo_point" }
     }
   }
   ```
@@ -172,19 +173,22 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 - `type: keyword` on a Utf8 column maps it to `keyword` even when the column carries a Lance inverted index, for operators that prefer exact matches and terms aggregations over `lance_text`. The column leaves the FTS build targets, so `build_indexes` neither creates nor optimises an FTS index for it; an inverted index the table already has stays untouched on the Lance side. On a List&lt;Utf8&gt; column the override pins the derived type. `lance_match` and friends on such a column are refused like on any other keyword field.
 - `type: ip` on a Utf8 column of IP address strings (or a List&lt;Utf8&gt; for the multi-valued shape) maps it to `ip`. The fragment reader parses each string and serves the 16 byte `InetAddressPoint` encoding through doc values, so `term` (exact or CIDR notation like `10.0.0.0/8`), `terms`, `range`, `exists`, sort and `terms` aggregations behave as on a stock `ip` field, with sort order and aggregation keys following address order rather than string order (an IPv4-mapped IPv6 form like `::ffff:10.0.0.2` matches and buckets as `10.0.0.2`). `_source` renders the original strings. A string that does not parse as an IP address is served as missing (absent from `exists` and every bucket, present in `_source`); the count of such values is logged once per fragment. A keyword sub-field (`fields`) on the ip column serves the raw strings for exact string match. Predicates on an ip field never push down to Lance SQL: a range over the encoded form is not a lexical string range, and even a term equality only matches when the stored strings are canonical, which the plugin cannot know, so the scan runs unfiltered and Lucene evaluates the predicate over the encoded doc values.
 - `type: wildcard` on a Utf8 column declares that the operator wants wildcard-style access to the column. On this plugin it is served by the keyword doc values path: the emitted mapping is `keyword` with `meta.lance_override_type: wildcard` recording the declared type, and `wildcard`, `prefix`, `regexp` and `term` queries evaluate against SortedSetDocValues per hit, exactly as on a `keyword` column (including the Lance SQL pushdown of those patterns to `LIKE` / `regexp_like` / `starts_with` over the stored Utf8). The n-gram-accelerated `wildcard` field type of OpenSearch core is not used because the fragment reader has no postings: in the 3.7 tree, `WildcardFieldType.wildcardQuery` always builds its first phase from `matchAllTermsQuery` over the pattern's required trigram terms with `isSearchable` hardcoded, so without an inverted index every query on that field type would match nothing. Like the `keyword` override, the column leaves the FTS build and optimise targets.
+- `type: geo_point` opts a column into OpenSearch's stock `geo_point` mapping. Two Lance shapes are accepted: a `Struct` with exactly two `Float64` children named as one of `(lat, lon)`, `(latitude, longitude)` or `(y, x)` in either order (the child names fix the storage order — the operator declares no `order`); or a `FixedSizeList<Float64>[2]`, where `overrides.<col>.order` selects `lat_lon` (default) or `lon_lat`. The derived mapping is `{ "type": "geo_point" }` with `meta.lance_arrow_type` set to `struct` or `fsl2f64` and `meta.lance_geo_order` recording the resolved order. Struct child columns are not surfaced separately: the geo mapping replaces the object mapping the derivation would emit for the Struct, so the column appears once in `_mapping` and once in `_source`. Predicates on a `geo_point` field never push down to Lance SQL: DataFusion cannot address a struct child or a list element in a filter, so the scan runs unfiltered and Lucene evaluates the geo predicate over the doc values the fragment reader publishes. The doc-values-only implementation trades a BKD point scan (which the fragment reader has no way to build) for a per-hit distance / bounding-box check; correctness is unchanged.
 - `fields` declares `keyword` sub-fields on a Utf8 base column (`lance_text` or `keyword`), so a single Lance column serves both full-text and exact-match / aggregation without duplicating source. Sub-field query resolution goes through Lucene doc values on the base column.
 - Validation answers 400 naming the column and the reason:
 
   | rule | accepted |
   |---|---|
-  | `type` values | `date`, `keyword`, `ip`, `wildcard` |
+  | `type` values | `date`, `keyword`, `ip`, `wildcard`, `geo_point` |
   | `type: date` column | signed Int32 / Int64, Date, Timestamp |
   | `type: keyword` column | Utf8 (with or without inverted index), List&lt;Utf8&gt; |
   | `type: ip` column | Utf8, List&lt;Utf8&gt; (holding IP address strings) |
   | `type: wildcard` column | Utf8 |
+  | `type: geo_point` column | Struct&lt;Float64, Float64&gt; named (lat/lon), (latitude/longitude) or (y/x); or FixedSizeList&lt;Float64&gt;[2] |
   | `fields` column | Utf8 (resolves to `lance_text`, `keyword` or `ip`) |
   | `format` | only with `type: date`, validated as a date format pattern |
-  | keys under a column | `type`, `format`, `fields` |
+  | `order` | only with `type: geo_point` on a FixedSizeList column; `lat_lon` (default) or `lon_lat` |
+  | keys under a column | `type`, `format`, `order`, `fields` |
   | column | must exist in the table and must not be the primary key |
 
 - The legacy `multi_fields` clause (`{"body": {"raw": {"type": "keyword"}}}`) is still accepted for one release as an alias: it folds into `overrides.[col].fields` at parse time, and a body declaring sub-fields for the same column through both clauses returns 400.
