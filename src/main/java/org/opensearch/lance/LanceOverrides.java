@@ -155,6 +155,14 @@ public final class LanceOverrides {
         return new LanceOverrides(columns);
     }
 
+    /** Overrides from already-validated column entries, for callers that filter an existing instance. */
+    public static LanceOverrides fromColumns(Map<String, Column> columns) {
+        if (columns == null || columns.isEmpty()) {
+            return EMPTY;
+        }
+        return new LanceOverrides(new LinkedHashMap<>(columns));
+    }
+
     /**
      * Compact canonical JSON for the {@code index.lance.overrides}
      * setting; empty string on empty overrides so the caller can skip

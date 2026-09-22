@@ -40,6 +40,7 @@ import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceInternalHeaders;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -565,18 +566,21 @@ public final class LanceNamespaceService {
                     // every checkout. We derive first so the builder only touches
                     // columns that derived to lance_text; keyword columns stay untouched.
                     // Re-apply any attach-body overrides captured on shard creation
-                    // so the re-derived mapping preserves multi-field
-                    // declarations across manifest version advance; without this the
-                    // mapping would drop back to the default derivation and a caller
-                    // querying body.raw would suddenly see 400 no-such-field errors.
+                    // so the re-derived mapping preserves type overrides and
+                    // multi-field declarations across manifest version advance;
+                    // without this the mapping would drop back to the default
+                    // derivation and a caller querying body.raw would suddenly
+                    // see 400 no-such-field errors. Lenient: a column an
+                    // override names may have been dropped or retyped by the
+                    // writer; its override is skipped this cycle but stays in
+                    // the setting, so it applies again if a later manifest
+                    // restores the column.
                     IndexMetadata rederivationMetadata = clusterService.state().metadata().index(indexName);
-                    String storedMultiFieldsJson = rederivationMetadata == null
-                        ? ""
-                        : rederivationMetadata.getSettings().get(LanceEngineFactory.MULTI_FIELDS_SETTING, "");
-                    java.util.Map<String, java.util.LinkedHashMap<String, String>> storedMultiFields = RestAttachAction
-                        .deserialiseMultiFields(storedMultiFieldsJson);
+                    LanceOverrides storedOverrides = rederivationMetadata == null
+                        ? LanceOverrides.EMPTY
+                        : LanceOverrides.of(rederivationMetadata.getSettings());
                     if (target == latest) {
-                        RestAttachAction.Derivation derivation = RestAttachAction.derive(latestDataset, storedMultiFields);
+                        RestAttachAction.Derivation derivation = RestAttachAction.derive(latestDataset, storedOverrides, true);
                         rederivedMappingJson = derivation.mappingJson();
                         warnOnLanceFieldRename(indexName, latestDataset.getLanceSchema());
                     } else {
@@ -584,7 +588,7 @@ public final class LanceNamespaceService {
                         // that snapshot so the mapping matches the schema
                         // the shard is about to read.
                         try (Dataset tagged = LanceRegistry.openDataset(table, storageOptions, Optional.of(target))) {
-                            RestAttachAction.Derivation derivation = RestAttachAction.derive(tagged, storedMultiFields);
+                            RestAttachAction.Derivation derivation = RestAttachAction.derive(tagged, storedOverrides, true);
                             rederivedMappingJson = derivation.mappingJson();
                             warnOnLanceFieldRename(indexName, tagged.getLanceSchema());
                         }

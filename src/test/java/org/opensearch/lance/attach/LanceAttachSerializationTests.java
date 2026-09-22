@@ -14,6 +14,7 @@ import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -25,21 +26,20 @@ import org.opensearch.test.OpenSearchTestCase;
 public class LanceAttachSerializationTests extends OpenSearchTestCase {
 
     public void testRequestRoundTrip() throws Exception {
-        LinkedHashMap<String, String> bodySubs = new LinkedHashMap<>();
-        bodySubs.put("raw", "keyword");
-        bodySubs.put("alt", "keyword");
-        LinkedHashMap<String, String> titleSubs = new LinkedHashMap<>();
-        titleSubs.put("exact", "keyword");
-        LinkedHashMap<String, LinkedHashMap<String, String>> multiFields = new LinkedHashMap<>();
-        multiFields.put("body", bodySubs);
-        multiFields.put("title", titleSubs);
+        LinkedHashMap<String, Object> overridesBody = new LinkedHashMap<>();
+        overridesBody.put("ts", Map.of("type", "date", "format", "epoch_millis"));
+        overridesBody.put("body", Map.of("type", "keyword", "fields", Map.of("raw", Map.of("type", "keyword"))));
+        LanceOverrides overrides = LanceOverrides.parseAttachClauses(
+            overridesBody,
+            Map.of("title", Map.of("exact", Map.of("type", "keyword")))
+        );
         LanceAttachRequest original = new LanceAttachRequest(
             "s3://bucket/tables/demo.lance",
             "demo-index",
             7L,
             null,
             StorageOptions.of(Map.of("aws_region", "eu-west-1")),
-            multiFields
+            overrides
         );
         original.clusterManagerNodeTimeout(TimeValue.timeValueSeconds(75));
 
@@ -50,14 +50,16 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
         assertEquals(original.pinnedVersion(), restored.pinnedVersion());
         assertTrue(restored.tag().isEmpty());
         assertEquals(original.storageOptions().asMap(), restored.storageOptions().asMap());
-        assertEquals(original.multiFields(), restored.multiFields());
+        assertEquals(original.overrides(), restored.overrides());
         // The request is forwarded to the cluster manager, so the
         // manager-node timeout has to travel with it.
         assertEquals(TimeValue.timeValueSeconds(75), restored.clusterManagerNodeTimeout());
-        // Sub-field order drives the order of the emitted mapping, so it
-        // has to survive the wire as declared.
-        assertEquals(List.of("body", "title"), List.copyOf(restored.multiFields().keySet()));
-        assertEquals(List.of("raw", "alt"), List.copyOf(restored.multiFields().get("body").keySet()));
+        // Declaration order drives the order of the emitted mapping, so
+        // it has to survive the wire as declared.
+        assertEquals(List.of("ts", "body", "title"), List.copyOf(restored.overrides().columns().keySet()));
+        assertEquals("date", restored.overrides().columns().get("ts").type());
+        assertEquals("epoch_millis", restored.overrides().columns().get("ts").format());
+        assertEquals(List.of("raw"), List.copyOf(restored.overrides().subFields().get("body").keySet()));
         assertNull(restored.validate());
     }
 
@@ -71,7 +73,7 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
         assertTrue(restored.pinnedVersion().isEmpty());
         assertTrue(restored.tag().isEmpty());
         assertTrue(restored.storageOptions().isEmpty());
-        assertTrue(restored.multiFields().isEmpty());
+        assertTrue(restored.overrides().isEmpty());
         assertEquals(ClusterManagerNodeRequest.DEFAULT_CLUSTER_MANAGER_NODE_TIMEOUT, restored.clusterManagerNodeTimeout());
         assertNull(restored.validate());
     }
