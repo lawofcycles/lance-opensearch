@@ -42,7 +42,9 @@ public class LanceNamespaceIT extends LanceRestTestCase {
 
         Response listing = client().performRequest(new Request("GET", "/_lance/namespace"));
         String body = readAll(listing);
-        int occurrences = countOccurrences(body, path);
+        // A directory entry emits the path as both its name and its path
+        // field, so count registrations by the name field.
+        int occurrences = countOccurrences(body, "\"name\":\"" + path + "\"");
         assertEquals("registered path should appear exactly once, saw: " + body, 1, occurrences);
     }
 
@@ -133,7 +135,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             Response listing = postJson("/_lance/namespace/tables", "{\"path\":\"" + scratchDir.toString() + "\"}");
             assertEquals(RestStatus.OK.getStatus(), listing.getStatusLine().getStatusCode());
             String body = readAll(listing);
-            assertTrue("expected path echo: " + body, body.contains("\"path\":\"" + scratchDir.toString() + "\""));
+            assertTrue("expected name echo: " + body, body.contains("\"name\":\"" + scratchDir.toString() + "\""));
             assertTrue("expected table alpha in list: " + body, body.contains("\"alpha\""));
             assertTrue("expected table bravo in list: " + body, body.contains("\"bravo\""));
         } finally {
@@ -161,7 +163,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/namespace/tables", "{}"));
         assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
         String body = readAll(failure.getResponse());
-        assertTrue("expected [path] is required message: " + body, body.contains("[path] is required"));
+        assertTrue("expected [name] required message: " + body, body.contains("[name]"));
     }
 
     public void testResurfaceGuardHoldsDeletedIndexDuringGrace() throws Exception {
@@ -290,6 +292,148 @@ public class LanceNamespaceIT extends LanceRestTestCase {
                 deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             } catch (Exception ignored) {}
         }
+    }
+
+    public void testRegisterNamespaceRejectsUnknownType() throws IOException {
+        ResponseException failure = expectThrows(
+            ResponseException.class,
+            () -> postJson("/_lance/namespace", "{\"type\":\"hive\",\"name\":\"h\"}")
+        );
+        assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
+        String body = readAll(failure.getResponse());
+        assertTrue("expected the accepted values in the message: " + body, body.contains("directory"));
+        assertTrue("expected the accepted values in the message: " + body, body.contains("rest"));
+        assertTrue("expected the accepted values in the message: " + body, body.contains("glue"));
+    }
+
+    public void testRegisterRestNamespaceRequiresNameAndUri() throws IOException {
+        ResponseException noName = expectThrows(
+            ResponseException.class,
+            () -> postJson("/_lance/namespace", "{\"type\":\"rest\",\"config\":{\"uri\":\"http://127.0.0.1:1\"}}")
+        );
+        assertEquals(400, noName.getResponse().getStatusLine().getStatusCode());
+        assertTrue(readAll(noName.getResponse()).contains("[name]"));
+
+        ResponseException noUri = expectThrows(
+            ResponseException.class,
+            () -> postJson("/_lance/namespace", "{\"type\":\"rest\",\"name\":\"cat\"}")
+        );
+        assertEquals(400, noUri.getResponse().getStatusLine().getStatusCode());
+        assertTrue(readAll(noUri.getResponse()).contains("[config.uri]"));
+
+        ResponseException withPath = expectThrows(
+            ResponseException.class,
+            () -> postJson(
+                "/_lance/namespace",
+                "{\"type\":\"rest\",\"name\":\"cat\",\"path\":\"/tmp\",\"config\":{\"uri\":\"http://127.0.0.1:1\"}}"
+            )
+        );
+        assertEquals(400, withPath.getResponse().getStatusLine().getStatusCode());
+        assertTrue(readAll(withPath.getResponse()).contains("[path]"));
+    }
+
+    public void testRestNamespaceSurfacesTableAndAnswersSearch() throws Exception {
+        // End-to-end rest catalog: an in-test HTTP server speaks the Lance
+        // Namespace REST protocol for one fixture table; the cluster's
+        // RestNamespace client polls it, the table surfaces as an index,
+        // and a search answers from the Lance data the location points at.
+        String suffix = "restcat-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 4);
+        String tableLocation = scratchDir.resolve(tableName + ".lance").toString();
+
+        com.sun.net.httpserver.HttpServer server = com.sun.net.httpserver.HttpServer.create(
+            new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0),
+            0
+        );
+        server.createContext("/", restCatalogHandler(tableName, tableLocation));
+        server.start();
+        String namespaceName = "cat-" + suffix;
+        try {
+            Response register = postJson(
+                "/_lance/namespace",
+                "{\"type\":\"rest\",\"name\":\""
+                    + namespaceName
+                    + "\",\"config\":{\"uri\":\"http://127.0.0.1:"
+                    + server.getAddress().getPort()
+                    + "\",\"header.Authorization\":\"Bearer test-token\"}}"
+            );
+            assertEquals("register failed: " + readAll(register), RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
+
+            // The poll surfaces the table named by the catalog listing.
+            client().performRequest(new Request("GET", "/_cluster/health/" + tableName + "?wait_for_status=yellow&timeout=60s"));
+
+            assertBusy(() -> {
+                Response search = client().performRequest(new Request("GET", "/" + tableName + "/_search?q=*:*"));
+                String body = readAll(search);
+                assertTrue("expected 4 hits from the rest-surfaced index: " + body, body.contains("\"value\":4"));
+            });
+
+            // The listing names the registration, its type, and redacts
+            // the credential-bearing config key.
+            Response listing = client().performRequest(new Request("GET", "/_lance/namespace"));
+            String listingBody = readAll(listing);
+            assertTrue(
+                "expected the rest namespace in the listing: " + listingBody,
+                listingBody.contains("\"name\":\"" + namespaceName + "\"")
+            );
+            assertTrue("expected type rest: " + listingBody, listingBody.contains("\"type\":\"rest\""));
+            assertTrue("expected available status: " + listingBody, listingBody.contains("\"status\":\"available\""));
+            assertFalse("bearer token must not appear in the listing: " + listingBody, listingBody.contains("test-token"));
+
+            // The tables preview goes through the registration name.
+            Response tables = postJson("/_lance/namespace/tables", "{\"name\":\"" + namespaceName + "\"}");
+            String tablesBody = readAll(tables);
+            assertTrue("expected the fixture table in the preview: " + tablesBody, tablesBody.contains("\"" + tableName + "\""));
+        } finally {
+            server.stop(0);
+            try {
+                client().performRequest(new Request("DELETE", "/" + tableName));
+            } catch (Exception ignored) {}
+            try {
+                deleteJson("/_lance/namespace", "{\"name\":\"" + namespaceName + "\"}");
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Answers the three calls the poll makes against a REST catalog:
+     * the root table listing, the table description (location points at
+     * the fixture written on shared storage), and the child namespace
+     * listing some client versions probe first. The response JSON is
+     * produced by serialising the client's own model classes so the
+     * shape tracks the bundled lance-namespace version.
+     */
+    private static com.sun.net.httpserver.HttpHandler restCatalogHandler(String tableName, String tableLocation) {
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        return exchange -> {
+            String path = java.net.URLDecoder.decode(exchange.getRequestURI().getPath(), java.nio.charset.StandardCharsets.UTF_8);
+            // Consume the request body (describe is a POST) before responding.
+            exchange.getRequestBody().readAllBytes();
+            String json;
+            if (path.matches("/v1/namespace/[^/]*/table/list")) {
+                json = mapper.writeValueAsString(new org.lance.namespace.model.ListTablesResponse().tables(java.util.Set.of(tableName)));
+            } else if (path.equals("/v1/table/" + tableName + "/describe")) {
+                org.lance.namespace.model.DescribeTableResponse response = new org.lance.namespace.model.DescribeTableResponse();
+                response.setLocation(tableLocation);
+                json = mapper.writeValueAsString(response);
+            } else if (path.matches("/v1/namespace/[^/]*/list")) {
+                json = mapper.writeValueAsString(new org.lance.namespace.model.ListNamespacesResponse().namespaces(java.util.Set.of()));
+            } else {
+                byte[] notFound = "{\"error\":\"unsupported test endpoint\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().add("Content-Type", "application/json");
+                exchange.sendResponseHeaders(404, notFound.length);
+                exchange.getResponseBody().write(notFound);
+                exchange.close();
+                return;
+            }
+            byte[] bytes = json.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        };
     }
 
     static void updateClusterSetting(String key, String value) throws IOException {

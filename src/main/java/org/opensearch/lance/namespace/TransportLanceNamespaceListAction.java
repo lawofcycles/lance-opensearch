@@ -53,30 +53,30 @@ public final class TransportLanceNamespaceListAction extends HandledTransportAct
 
     @Override
     protected void doExecute(Task task, LanceNamespaceListRequest request, ActionListener<LanceNamespaceListResponse> listener) {
-        String path = request.path();
-        if (path == null) {
-            listener.onResponse(LanceNamespaceListResponse.namespaces(namespaceService.namespaces()));
+        String identifier = request.path();
+        if (identifier == null) {
+            listener.onResponse(LanceNamespaceListResponse.namespaces(namespaceService.namespaceInfos()));
             return;
         }
-        threadPool.executor(ThreadPool.Names.GENERIC).execute(ActionRunnable.wrap(listener, l -> l.onResponse(listTables(path))));
+        threadPool.executor(ThreadPool.Names.GENERIC).execute(ActionRunnable.wrap(listener, l -> l.onResponse(listTables(identifier))));
     }
 
-    private LanceNamespaceListResponse listTables(String path) {
+    private LanceNamespaceListResponse listTables(String identifier) {
         Optional<Set<String>> tables;
         try {
-            tables = namespaceService.listTables(path);
+            tables = namespaceService.listTables(identifier);
         } catch (Exception e) {
             throw new OpenSearchStatusException(
-                "list tables for [" + path + "] failed: " + e.getMessage(),
+                "list tables for [" + identifier + "] failed: " + e.getMessage(),
                 RestStatus.INTERNAL_SERVER_ERROR,
                 e
             );
         }
         if (tables.isEmpty()) {
-            return LanceNamespaceListResponse.unregistered(path);
+            return LanceNamespaceListResponse.unregistered(identifier);
         }
         List<String> sorted = new ArrayList<>(tables.get());
         Collections.sort(sorted);
-        return LanceNamespaceListResponse.tables(path, sorted);
+        return LanceNamespaceListResponse.tables(identifier, sorted);
     }
 }
