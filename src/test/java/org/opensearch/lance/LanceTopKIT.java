@@ -182,11 +182,16 @@ public class LanceTopKIT extends LanceRestTestCase {
             List<Map<String, Object>> directHits = hitsOf(readAll(postJson("/" + indexName + "/_search", direct)));
             List<Map<String, Object>> controlHits = hitsOf(readAll(postJson("/" + indexName + "/_search", control)));
             assertEquals(idsOf(controlHits), idsOf(directHits));
-            assertEquals(List.of("0-0", "0-6", "0-2", "0-1"), idsOf(directHits));
+            // The geo fixture declares id as its primary key, so _id is
+            // the key value itself.
+            assertEquals(List.of("0", "6", "2", "1"), idsOf(directHits));
 
             ResponseException refused = expectThrows(ResponseException.class, () -> {
                 Request request = new Request("GET", "/" + indexName + "/_lance/explain");
-                request.setJsonEntity(direct);
+                // match_all instead of the exists query: the geo struct
+                // column refuses scalar predicate translation first and
+                // would name the query, not the sort.
+                request.setJsonEntity("{\"size\":4," + sort + "}");
                 client().performRequest(request);
             });
             assertEquals(RestStatus.BAD_REQUEST.getStatus(), refused.getResponse().getStatusLine().getStatusCode());
