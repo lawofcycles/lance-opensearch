@@ -223,12 +223,12 @@ public final class LanceNamespaceService {
     }
 
     /**
-     * Reconcile the per-node {@link #directoryCache} against the
+     * Reconcile the per-node {@link #namespaceCache} against the
      * cluster's {@link LanceNamespaceMetadata}. Called from the
      * cluster state applier on every state that touches metadata, so
      * new registrations propagated from another node reach the
      * cache in time for the next poll cycle. Failures to initialise
-     * a DirectoryNamespace surface as warnings.
+     * a {@link LanceNamespace} surface as warnings.
      */
     private void onClusterStateChanged(ClusterChangedEvent event) {
         if (!event.metadataChanged()) {
