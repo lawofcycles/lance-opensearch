@@ -217,10 +217,11 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
 
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, org.opensearch.core.xcontent.ToXContent.Params params) throws IOException {
-        // Gateway persistence must keep the raw config values so a full
-        // cluster restart can re-initialise the catalogs; every other
-        // context (the cluster state API in particular) gets the
-        // redacted view so credential-bearing keys never leave the node.
+        // Gateway persistence must keep the raw config and storage option
+        // values so a full cluster restart can re-initialise the catalogs
+        // and reopen their tables; every other context (the cluster state
+        // API in particular) gets the redacted view so credential-bearing
+        // keys never leave the node.
         boolean redact = !Metadata.CONTEXT_MODE_GATEWAY.equals(params.param(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_API));
         builder.startArray(ENTRIES.getPreferredName());
         for (Entry entry : entries) {
@@ -407,6 +408,7 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
             return rootUri;
         }
 
+        /** Raw storage options, credentials included. Use {@link #redactedStorageOptions()} for anything user-facing. */
         public StorageOptions storageOptions() {
             return storageOptions;
         }
@@ -449,11 +451,27 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
 
         /** The config map with every sensitive value replaced by {@code ***}. */
         public Map<String, String> redactedConfig() {
-            if (config.isEmpty()) {
-                return config;
+            return redacted(config);
+        }
+
+        /**
+         * The storage options with every sensitive value replaced by
+         * {@code ***}, judged by the same {@link #isSensitiveConfigKey}
+         * rule as {@link #redactedConfig()}. Object store credentials
+         * ({@code aws_access_key_id}, {@code aws_secret_access_key},
+         * {@code aws_session_token}, ...) all match; region and
+         * endpoint keys stay visible.
+         */
+        public Map<String, String> redactedStorageOptions() {
+            return redacted(storageOptions.asMap());
+        }
+
+        private static Map<String, String> redacted(Map<String, String> raw) {
+            if (raw.isEmpty()) {
+                return raw;
             }
-            Map<String, String> redacted = new LinkedHashMap<>(config.size());
-            for (Map.Entry<String, String> entry : config.entrySet()) {
+            Map<String, String> redacted = new LinkedHashMap<>(raw.size());
+            for (Map.Entry<String, String> entry : raw.entrySet()) {
                 redacted.put(entry.getKey(), isSensitiveConfigKey(entry.getKey()) ? "***" : entry.getValue());
             }
             return Collections.unmodifiableMap(redacted);
@@ -476,7 +494,7 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
             if (rootUri != null) {
                 builder.field(ROOT_URI.getPreferredName(), rootUri);
             }
-            builder.field(STORAGE_OPTIONS.getPreferredName(), storageOptions.asMap());
+            builder.field(STORAGE_OPTIONS.getPreferredName(), redact ? redactedStorageOptions() : storageOptions.asMap());
             if (!overridesJson.isEmpty()) {
                 builder.field(OVERRIDES.getPreferredName(), overridesJson);
             }
@@ -515,7 +533,7 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
                 + ", rootUri="
                 + rootUri
                 + ", storageOptions="
-                + storageOptions
+                + redactedStorageOptions()
                 + ", config="
                 + redactedConfig()
                 + ", overrides="

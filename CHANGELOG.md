@@ -51,6 +51,7 @@ Inspired by [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `storage_options` values of registered namespaces follow the same redaction rule as `config`: in the cluster state API (`GET _cluster/state/metadata`, custom `lance.namespaces`) and in log lines, values whose key contains `secret`, `password`, `token`, `key`, `authorization` or `credential` render as `***`. Only the gateway-persisted state keeps the raw values so a full cluster restart reopens the tables with working credentials. Previously the raw object store credentials passed at registration were readable by any caller with `cluster:monitor/state`.
 - A plain sorted page (`sort` without aggregations) on a dotted field name no longer answers 400. The sort pushdown's column resolution used Arrow's `Schema.findField`, which throws for any non-top-level name instead of returning null, so a sort on a multi-field sub-field (`body.raw`) never reached its base-column fallback and a sort on a struct child (`meta.score`) could not fall back to the Lucene collector.
 
 - The Lance scan behind a full-text or knn query returns `_rowaddr` and `_score` (`_distance` for knn) only. Without a projection Lance materialised every column of every matching row into the Arrow batches, so an unbounded full-text shape (sort by a field, aggregation, `size 0`) over a large match set held native memory proportional to matches times row width and the kernel killed the node, and past 2 GiB of text in one take the Utf8 offsets overflowed into a 500.

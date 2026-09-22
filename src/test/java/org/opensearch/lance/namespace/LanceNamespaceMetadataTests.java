@@ -31,7 +31,7 @@ public class LanceNamespaceMetadataTests extends OpenSearchTestCase {
     private static LanceNamespaceMetadata sample() {
         LanceNamespaceMetadata.Entry directory = new LanceNamespaceMetadata.Entry(
             "/data/lance",
-            StorageOptions.of(Map.of("aws_region", "us-west-2"))
+            StorageOptions.of(Map.of("aws_region", "us-west-2", "aws_secret_access_key", "s3cr3t"))
         );
         LanceNamespaceMetadata.Entry rest = new LanceNamespaceMetadata.Entry(
             "cat",
@@ -94,11 +94,34 @@ public class LanceNamespaceMetadataTests extends OpenSearchTestCase {
         builder.endObject();
         String json = builder.toString();
         assertTrue("gateway persistence must keep raw secrets: " + json, json.contains("sekrit"));
+        assertTrue("gateway persistence must keep raw storage credentials: " + json, json.contains("s3cr3t"));
         try (XContentParser parser = createParser(JsonXContent.jsonXContent, json)) {
             parser.nextToken();
             LanceNamespaceMetadata restored = LanceNamespaceMetadata.fromXContent(parser);
             assertEquals(original, restored);
+            assertEquals("s3cr3t", restored.entries().get(0).storageOptions().asMap().get("aws_secret_access_key"));
         }
+    }
+
+    public void testApiXContentRedactsSensitiveStorageOptionKeys() throws Exception {
+        LanceNamespaceMetadata original = sample();
+        XContentBuilder builder = JsonXContent.contentBuilder();
+        builder.startObject();
+        original.toXContent(builder, ToXContent.EMPTY_PARAMS);
+        builder.endObject();
+        String json = builder.toString();
+        assertFalse("storage credential must not appear in API output: " + json, json.contains("s3cr3t"));
+        assertTrue("storage credential key stays listed: " + json, json.contains("\"aws_secret_access_key\":\"***\""));
+        assertTrue("non-sensitive storage option stays readable: " + json, json.contains("\"aws_region\":\"us-west-2\""));
+    }
+
+    public void testRedactedStorageOptions() {
+        LanceNamespaceMetadata.Entry entry = sample().entries().get(0);
+        Map<String, String> redacted = entry.redactedStorageOptions();
+        assertEquals("***", redacted.get("aws_secret_access_key"));
+        assertEquals("us-west-2", redacted.get("aws_region"));
+        // The raw accessor is untouched.
+        assertEquals("s3cr3t", entry.storageOptions().asMap().get("aws_secret_access_key"));
     }
 
     public void testApiXContentRedactsSensitiveConfigKeys() throws Exception {
@@ -136,6 +159,8 @@ public class LanceNamespaceMetadataTests extends OpenSearchTestCase {
         String rendered = metadata.toString();
         assertFalse("toString must not leak secrets: " + rendered, rendered.contains("sekrit"));
         assertFalse("toString must not leak tokens: " + rendered, rendered.contains("hunter2"));
+        assertFalse("toString must not leak storage credentials: " + rendered, rendered.contains("s3cr3t"));
+        assertTrue("toString keeps non-sensitive storage options: " + rendered, rendered.contains("aws_region=us-west-2"));
     }
 
     public void testSensitiveKeyMatching() {
