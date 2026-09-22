@@ -107,10 +107,7 @@ public class LanceRenameIT extends LanceRestTestCase {
             ResponseException refused = expectThrows(ResponseException.class, () -> client().performRequest(explain));
             assertEquals(400, refused.getResponse().getStatusLine().getStatusCode());
             String reason = readAll(refused.getResponse());
-            assertTrue(
-                "explain must name the rename: " + reason,
-                reason.contains("field [label] was renamed to [tag] in the Lance table")
-            );
+            assertTrue("explain must name the rename: " + reason, reason.contains("field [label] was renamed to [tag] in the Lance table"));
 
             // The stats list what to update in clients.
             String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
@@ -167,7 +164,11 @@ public class LanceRenameIT extends LanceRestTestCase {
                     "{\"size\":10,\"query\":{\"range\":{\"ts\":{\"gte\":\"2024-03-01\",\"lt\":\"2024-04-01\"}}}}"
                 )
             );
-            assertEquals("ISO range on the recast ts must hit the March rows: " + range, 2, extractIntPath(range, "hits", "total", "value"));
+            assertEquals(
+                "ISO range on the recast ts must hit the March rows: " + range,
+                2,
+                extractIntPath(range, "hits", "total", "value")
+            );
             // The dropped column answers 0 hits, not an error.
             String stale = readAll(postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"term\":{\"category\":\"even\"}}}"));
             assertEquals(0, extractIntPath(stale, "hits", "total", "value"));

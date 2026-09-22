@@ -333,20 +333,7 @@ public final class LanceEngineFactory implements EngineFactory {
             String indexUuid,
             LongSupplier maxDocsPerReader
         ) {
-            this(
-                config,
-                table,
-                field,
-                pkType,
-                shardId,
-                pinnedVersion,
-                tag,
-                storageOptions,
-                warmCache,
-                indexUuid,
-                maxDocsPerReader,
-                false
-            );
+            this(config, table, field, pkType, shardId, pinnedVersion, tag, storageOptions, warmCache, indexUuid, maxDocsPerReader, false);
         }
 
         LanceReadOnlyEngine(
@@ -604,7 +591,15 @@ public final class LanceEngineFactory implements EngineFactory {
 
         private OpenSearchDirectoryReader openSnapshotReader(Directory directory, IndexCommit commit, Optional<Long> version)
             throws IOException {
-            LanceWarmCache.Lease lease = warmCache.acquire(indexUuid, tablePath, storageOptions, version, field, pkType, currentOverrides());
+            LanceWarmCache.Lease lease = warmCache.acquire(
+                indexUuid,
+                tablePath,
+                storageOptions,
+                version,
+                field,
+                pkType,
+                currentOverrides()
+            );
             // openForSnapshot releases the lease itself when it fails; from
             // its return on the reader owns the lease and releases it in
             // doClose, so only the wrap step needs the reader closed here.

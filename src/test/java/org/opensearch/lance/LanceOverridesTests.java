@@ -372,8 +372,7 @@ public class LanceOverridesTests extends OpenSearchTestCase {
 
     public void testWithRenamedColumnsMovesIndexPreferenceKeys() {
         LanceOverrides overrides = LanceOverrides.parse(
-            "{\"label\":{\"type\":\"keyword\"},"
-                + "\"indexes\":{\"label\":{\"scalar\":\"bitmap\"},\"rating\":{\"scalar\":\"btree\"}}}"
+            "{\"label\":{\"type\":\"keyword\"}," + "\"indexes\":{\"label\":{\"scalar\":\"bitmap\"},\"rating\":{\"scalar\":\"btree\"}}}"
         );
         LanceOverrides renamed = overrides.withRenamedColumns(Map.of("label", "tag"));
         assertEquals(List.of("tag"), List.copyOf(renamed.columns().keySet()));

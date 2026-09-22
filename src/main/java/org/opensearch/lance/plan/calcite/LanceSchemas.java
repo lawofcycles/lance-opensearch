@@ -56,7 +56,8 @@ public final class LanceSchemas {
      * ({@code body -> {raw: keyword}}), empty when the attach declared
      * none.
      */
-    public record IndexModel(String indexName, Schema arrowSchema, Map<String, LinkedHashMap<String, String>> multiFields, Map<String,
+    public record IndexModel(String indexName, Schema arrowSchema, Map<String, LinkedHashMap<String, String>> multiFields, Map<
+        String,
         String> renamedFields, LanceTable table, LanceSchema schema) {
     }
 
