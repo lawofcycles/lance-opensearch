@@ -11,6 +11,8 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import org.apache.lucene.util.automaton.RegExp;
+import org.opensearch.common.time.DateFormatter;
+import org.opensearch.common.time.DateFormatters;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
@@ -82,6 +84,28 @@ public final class LanceKnnFilterTranslator {
      * work with the known false-positive risk documented on the pattern.
      */
     public static final Function<String, String> NO_MAPPING = name -> null;
+
+    /**
+     * Sentinel a field-type lookup returns for a {@code date}-mapped
+     * field whose Lance column is a signed integer (the attach body's
+     * {@code type: date} override on an epoch-millis column). The
+     * literal encoder keeps the SQL numeric for such a column: a bare
+     * millis value for numeric input, and the parsed epoch millis for
+     * an ISO-8601 string. Wrapping either in {@code timestamp '...'}
+     * or {@code to_timestamp_millis(...)}, as it does for a real
+     * Date / Timestamp column, would hand DataFusion a Timestamp
+     * literal to compare against an Int64 column and fail the scan.
+     */
+    public static final String DATE_ON_INTEGER = "date_on_integer";
+
+    /**
+     * Parses the ISO-8601 shapes {@link #ISO_DATE_LIKE} recognises so a
+     * string bound on a {@link #DATE_ON_INTEGER} column becomes epoch
+     * millis. The same default format the {@code date} field type uses
+     * for query-time parsing; missing time components default to
+     * midnight UTC, matching OpenSearch semantics.
+     */
+    private static final DateFormatter ISO_DATE_PARSER = DateFormatter.forPattern("strict_date_optional_time");
 
     /**
      * Return {@code true} when any leaf in {@code builder} names a
@@ -455,7 +479,9 @@ public final class LanceKnnFilterTranslator {
                 // 'Timestamp(...)'"), so lift the value into a
                 // Timestamp of millisecond precision. Coercion to
                 // whatever unit / TZ the Lance column carries happens
-                // during comparison.
+                // during comparison. A date-overridden integer column
+                // ({@link #DATE_ON_INTEGER}) skips the lift: its Lance
+                // column holds the millis as a plain integer.
                 return "to_timestamp_millis(" + n.longValue() + ")";
             }
             return n.toString();
@@ -464,6 +490,13 @@ public final class LanceKnnFilterTranslator {
             if (ISO_DATE_LIKE.matcher(s).matches()) {
                 if ("date".equals(fieldType)) {
                     return "timestamp '" + s + "'";
+                }
+                if (DATE_ON_INTEGER.equals(fieldType)) {
+                    // The column stores epoch millis as an integer, so
+                    // the ISO literal is parsed here and compared as a
+                    // number; a timestamp literal would not coerce
+                    // against an Int64 column.
+                    return Long.toString(DateFormatters.from(ISO_DATE_PARSER.parse(s)).toInstant().toEpochMilli());
                 }
                 if (fieldType == null) {
                     // No mapping context: fall back to the shape

@@ -204,30 +204,52 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
 
         private static final ParseField ROOT_URI = new ParseField("root_uri");
         private static final ParseField STORAGE_OPTIONS = new ParseField("storage_options");
+        private static final ParseField OVERRIDES = new ParseField("overrides");
 
         @SuppressWarnings("unchecked")
         private static final ConstructingObjectParser<Entry, Void> ENTRY_PARSER = new ConstructingObjectParser<>(
             "lance_namespace_entry",
             false,
-            args -> new Entry((String) args[0], StorageOptions.of((java.util.Map<String, String>) args[1]))
+            args -> new Entry(
+                (String) args[0],
+                StorageOptions.of((java.util.Map<String, String>) args[1]),
+                args[2] == null ? "" : (String) args[2]
+            )
         );
 
         static {
             ENTRY_PARSER.declareString(ConstructingObjectParser.constructorArg(), ROOT_URI);
             ENTRY_PARSER.declareObject(ConstructingObjectParser.constructorArg(), (parser, ctx) -> parser.mapStrings(), STORAGE_OPTIONS);
+            // Optional so gateway state written before the field existed
+            // still parses.
+            ENTRY_PARSER.declareString(ConstructingObjectParser.optionalConstructorArg(), OVERRIDES);
         }
 
         private final String rootUri;
         private final StorageOptions storageOptions;
+        /**
+         * Canonical JSON of the per-column mapping overrides the
+         * register call declared (see
+         * {@link org.opensearch.lance.LanceOverrides}), applied to
+         * every table the poll surfaces under this root. Empty when
+         * none were declared.
+         */
+        private final String overridesJson;
 
         public Entry(String rootUri, StorageOptions storageOptions) {
+            this(rootUri, storageOptions, "");
+        }
+
+        public Entry(String rootUri, StorageOptions storageOptions, String overridesJson) {
             this.rootUri = Objects.requireNonNull(rootUri, "rootUri");
             this.storageOptions = Objects.requireNonNull(storageOptions, "storageOptions");
+            this.overridesJson = overridesJson == null ? "" : overridesJson;
         }
 
         public Entry(StreamInput in) throws IOException {
             this.rootUri = in.readString();
             this.storageOptions = StorageOptions.readFromStream(in);
+            this.overridesJson = in.readString();
         }
 
         public String rootUri() {
@@ -238,10 +260,15 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
             return storageOptions;
         }
 
+        public String overridesJson() {
+            return overridesJson;
+        }
+
         @Override
         public void writeTo(StreamOutput out) throws IOException {
             out.writeString(rootUri);
             storageOptions.writeTo(out);
+            out.writeString(overridesJson);
         }
 
         public XContentBuilder toXContent(XContentBuilder builder, org.opensearch.core.xcontent.ToXContent.Params params)
@@ -249,6 +276,9 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
             builder.startObject();
             builder.field(ROOT_URI.getPreferredName(), rootUri);
             builder.field(STORAGE_OPTIONS.getPreferredName(), storageOptions.asMap());
+            if (!overridesJson.isEmpty()) {
+                builder.field(OVERRIDES.getPreferredName(), overridesJson);
+            }
             builder.endObject();
             return builder;
         }
@@ -261,17 +291,19 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
         public boolean equals(Object o) {
             if (this == o) return true;
             if (!(o instanceof Entry other)) return false;
-            return rootUri.equals(other.rootUri) && storageOptions.equals(other.storageOptions);
+            return rootUri.equals(other.rootUri)
+                && storageOptions.equals(other.storageOptions)
+                && overridesJson.equals(other.overridesJson);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(rootUri, storageOptions);
+            return Objects.hash(rootUri, storageOptions, overridesJson);
         }
 
         @Override
         public String toString() {
-            return "Entry{rootUri=" + rootUri + ", storageOptions=" + storageOptions + "}";
+            return "Entry{rootUri=" + rootUri + ", storageOptions=" + storageOptions + ", overrides=" + overridesJson + "}";
         }
     }
 

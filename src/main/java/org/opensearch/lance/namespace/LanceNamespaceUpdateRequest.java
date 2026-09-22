@@ -33,17 +33,20 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
     private final Operation operation;
     private final String rootUri;
     private final StorageOptions storageOptions;
+    /** Canonical JSON of the per-column mapping overrides, empty when none were declared. */
+    private final String overridesJson;
 
     /**
      * Register a namespace at {@code rootUri} with the given storage
-     * options. Unused fields for unregister are ignored on the wire.
+     * options and per-column mapping overrides. Unused fields for
+     * unregister are ignored on the wire.
      */
-    public static LanceNamespaceUpdateRequest register(String rootUri, StorageOptions storageOptions) {
-        return applyLongTimeout(new LanceNamespaceUpdateRequest(Operation.REGISTER, rootUri, storageOptions));
+    public static LanceNamespaceUpdateRequest register(String rootUri, StorageOptions storageOptions, String overridesJson) {
+        return applyLongTimeout(new LanceNamespaceUpdateRequest(Operation.REGISTER, rootUri, storageOptions, overridesJson));
     }
 
     public static LanceNamespaceUpdateRequest unregister(String rootUri) {
-        return applyLongTimeout(new LanceNamespaceUpdateRequest(Operation.UNREGISTER, rootUri, StorageOptions.empty()));
+        return applyLongTimeout(new LanceNamespaceUpdateRequest(Operation.UNREGISTER, rootUri, StorageOptions.empty(), ""));
     }
 
     private static LanceNamespaceUpdateRequest applyLongTimeout(LanceNamespaceUpdateRequest request) {
@@ -55,10 +58,11 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
         return request;
     }
 
-    private LanceNamespaceUpdateRequest(Operation operation, String rootUri, StorageOptions storageOptions) {
+    private LanceNamespaceUpdateRequest(Operation operation, String rootUri, StorageOptions storageOptions, String overridesJson) {
         this.operation = operation;
         this.rootUri = rootUri;
         this.storageOptions = storageOptions;
+        this.overridesJson = overridesJson == null ? "" : overridesJson;
     }
 
     public LanceNamespaceUpdateRequest(StreamInput in) throws IOException {
@@ -66,6 +70,7 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
         this.operation = Operation.values()[in.readVInt()];
         this.rootUri = in.readString();
         this.storageOptions = StorageOptions.readFromStream(in);
+        this.overridesJson = in.readString();
     }
 
     @Override
@@ -74,6 +79,7 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
         out.writeVInt(operation.ordinal());
         out.writeString(rootUri);
         storageOptions.writeTo(out);
+        out.writeString(overridesJson);
     }
 
     @Override
@@ -99,6 +105,10 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
 
     public StorageOptions storageOptions() {
         return storageOptions;
+    }
+
+    public String overridesJson() {
+        return overridesJson;
     }
 
     @Override
