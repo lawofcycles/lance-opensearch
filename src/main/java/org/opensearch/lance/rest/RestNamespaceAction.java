@@ -34,9 +34,10 @@ import org.opensearch.transport.client.node.NodeClient;
  * <ul>
  *   <li>{@code POST /_lance/namespace} registers a catalog through
  *       {@link LanceNamespaceUpdateAction}. The body takes {@code type}
- *       ({@code directory} when absent, {@code rest}, or {@code glue}),
- *       a registration {@code name} (required for {@code rest} and
- *       {@code glue}, defaulting to the path for {@code directory}),
+ *       ({@code directory} when absent; any value of
+ *       {@link LanceNamespaceMetadata.Entry#ACCEPTED_TYPES}), a
+ *       registration {@code name} (required for every type except
+ *       {@code directory}, where it defaults to the path),
  *       {@code path} (directory only), and a {@code config} object of
  *       string values passed to the implementation's initialize.</li>
  *   <li>{@code DELETE /_lance/namespace} unregisters by {@code name}

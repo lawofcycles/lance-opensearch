@@ -411,11 +411,13 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
                 assertEquals(1, infos.size());
                 assertEquals(type, infos.get(0).type());
                 assertEquals("401 from " + type, infos.get(0).error());
-                assertFalse("credential must be redacted: " + infos.get(0).config(), infos.get(0).config().containsValue("sekrit"));
-                assertFalse("credential must be redacted: " + infos.get(0).config(), infos.get(0).config().containsValue("id:sekrit"));
+                for (String value : infos.get(0).config().values()) {
+                    assertFalse("credential must be redacted: " + infos.get(0).config(), value.contains("sekrit"));
+                }
                 // The implementation still received the raw value.
                 assertTrue(
-                    recording.initializeCalls.get(0).containsValue("sekrit") || recording.initializeCalls.get(0).containsValue("id:sekrit")
+                    "initialize must see the raw credential: " + recording.initializeCalls.get(0),
+                    recording.initializeCalls.get(0).values().stream().anyMatch(value -> value.contains("sekrit"))
                 );
             } finally {
                 LanceNamespaceFactory.resetInstantiatorForTests();
