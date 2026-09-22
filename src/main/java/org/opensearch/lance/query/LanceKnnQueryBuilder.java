@@ -17,6 +17,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.lance.mapper.LanceVectorFieldMapper;
@@ -401,7 +402,7 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
             // field access); a multi-field sub-field (body.raw)
             // returns null so the translator's dotted-path guard
             // keeps it off the Lance SQL path.
-            org.opensearch.index.mapper.MappedFieldType mft = context.fieldMapper(name);
+            MappedFieldType mft = context.fieldMapper(name);
             if (mft == null) {
                 return null;
             }

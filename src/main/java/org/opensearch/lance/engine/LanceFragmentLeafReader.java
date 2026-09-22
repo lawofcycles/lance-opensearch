@@ -8,9 +8,12 @@ package org.opensearch.lance.engine;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.arrow.vector.BigIntVector;
@@ -195,7 +198,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * top-level columns (Lance projects a dotted path as a flat column
      * aliased to it).
      */
-    private final java.util.Set<String> structColumns;
+    private final Set<String> structColumns;
     private final Bits liveDocs;
     private final FieldInfos fieldInfos;
     private final Dataset dataset;
@@ -2440,7 +2443,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
         if (vector.isNull(i)) {
             return null;
         }
-        java.util.LinkedHashMap<String, Object> out = new java.util.LinkedHashMap<>();
+        LinkedHashMap<String, Object> out = new LinkedHashMap<>();
         for (FieldVector child : vector.getChildrenFromFields()) {
             String childPath = path + "." + child.getName();
             if (child instanceof StructVector nested) {
@@ -2572,9 +2575,9 @@ public final class LanceFragmentLeafReader extends LeafReader {
             builder.nullField(key);
             return;
         }
-        if (value instanceof java.util.Map<?, ?> struct) {
+        if (value instanceof Map<?, ?> struct) {
             builder.startObject(key);
-            for (java.util.Map.Entry<?, ?> entry : struct.entrySet()) {
+            for (Map.Entry<?, ?> entry : struct.entrySet()) {
                 String childName = (String) entry.getKey();
                 writeSourceField(builder, path + "." + childName, childName, entry.getValue());
             }
@@ -2607,7 +2610,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             case BOOLEAN -> builder.field(key, (Boolean) value);
             case TEXT_FTS, TEXT_KEYWORD -> builder.field(key, (String) value);
             case KEYWORD_ARRAY -> builder.field(key, (String[]) value);
-            case BINARY -> builder.field(key, java.util.Base64.getEncoder().encodeToString((byte[]) value));
+            case BINARY -> builder.field(key, Base64.getEncoder().encodeToString((byte[]) value));
         }
     }
 

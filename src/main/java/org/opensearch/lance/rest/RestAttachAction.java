@@ -463,10 +463,18 @@ public class RestAttachAction extends BaseRestHandler {
                     // the children instead; each Lance child field carries
                     // its own field id. Children the derivation does not
                     // support are noted and left out while the parent
-                    // object is still emitted.
-                    mapping.startObject(name).field("type", "object").startObject("properties");
-                    writeStructProperties(mapping, field, name, notes);
-                    mapping.endObject().endObject();
+                    // object is still emitted, unless no descendant is
+                    // supported at all, in which case the whole column is
+                    // skipped with a note (the reader keeps such a struct
+                    // out of the row take, so an empty object mapping
+                    // would never show up in _source).
+                    if (structHasSupportedProperty(field)) {
+                        mapping.startObject(name).field("type", "object").startObject("properties");
+                        writeStructProperties(mapping, field, name, notes);
+                        mapping.endObject().endObject();
+                    } else {
+                        notes.add(name + ": Struct with no supported children, not surfaced");
+                    }
                 } else {
                     notes.add(name + ": " + type + ", stored only");
                 }
@@ -829,7 +837,11 @@ public class RestAttachAction extends BaseRestHandler {
      * skipped with a note ({@code lance_knn} does not reach struct
      * children). Any other child type the derivation does not support
      * is noted with its dotted path and left out; the parent object is
-     * still emitted.
+     * still emitted as long as at least one descendant is supported. A
+     * struct child with no supported descendants is skipped whole with
+     * one note, matching the reader, which keeps such a struct out of
+     * the row take (an empty {@code properties} object would put a key
+     * in the mapping that {@code _source} never renders).
      *
      * <p>The caller has already opened the {@code properties} object
      * and closes it after this returns.
@@ -841,49 +853,86 @@ public class RestAttachAction extends BaseRestHandler {
             ArrowType childType = child.getType();
             int childId = child.getId();
             if (childType instanceof ArrowType.Struct) {
+                if (!structHasSupportedProperty(child)) {
+                    notes.add(childPath + ": Struct with no supported children, not surfaced");
+                    continue;
+                }
                 mapping.startObject(child.getName()).field("type", "object").startObject("properties");
                 writeStructProperties(mapping, child, childPath, notes);
                 mapping.endObject().endObject();
                 continue;
             }
-            String osType = null;
-            String identity = arrowTypeIdentity(childType);
-            if (childType instanceof ArrowType.Int intType && intType.getIsSigned()) {
-                osType = switch (intType.getBitWidth()) {
-                    case 8 -> "byte";
-                    case 16 -> "short";
-                    case 32 -> "integer";
-                    case 64 -> "long";
-                    default -> null;
-                };
-            } else if (childType instanceof ArrowType.Bool) {
-                osType = "boolean";
-            } else if (childType instanceof ArrowType.FloatingPoint fp) {
-                osType = switch (fp.getPrecision()) {
-                    case SINGLE -> "float";
-                    case DOUBLE -> "double";
-                    default -> null;
-                };
-            } else if (childType instanceof ArrowType.Date || childType instanceof ArrowType.Timestamp) {
-                osType = "date";
-            } else if (childType instanceof ArrowType.Utf8) {
-                osType = "keyword";
-            } else if (childType instanceof ArrowType.List
-                && child.getChildren().size() == 1
-                && child.getChildren().get(0).getType() instanceof ArrowType.Utf8) {
-                    osType = "keyword";
-                    identity = "list<utf8>";
-                } else if (childType instanceof ArrowType.FixedSizeList) {
-                    notes.add(childPath + ": vector column inside a struct, not surfaced (lance_knn does not reach struct children)");
-                    continue;
-                }
+            String osType = structChildMappingType(child);
             if (osType == null) {
-                notes.add(childPath + ": " + childType + ", not surfaced inside a struct");
+                if (childType instanceof ArrowType.FixedSizeList) {
+                    notes.add(childPath + ": vector column inside a struct, not surfaced (lance_knn does not reach struct children)");
+                } else {
+                    notes.add(childPath + ": " + childType + ", not surfaced inside a struct");
+                }
                 continue;
             }
+            String identity = childType instanceof ArrowType.List ? "list<utf8>" : arrowTypeIdentity(childType);
             startFieldWithId(mapping, child.getName(), childId, osType, identity);
             mapping.field("index", false).field("doc_values", true).endObject();
         }
+    }
+
+    /**
+     * The OpenSearch mapping type of a non-struct struct child, or
+     * {@code null} when the derivation does not support it inside a
+     * struct. Shared by {@link #writeStructProperties} and
+     * {@link #structHasSupportedProperty} so the two agree on what
+     * counts as supported.
+     */
+    private static String structChildMappingType(LanceField child) {
+        ArrowType childType = child.getType();
+        if (childType instanceof ArrowType.Int intType && intType.getIsSigned()) {
+            return switch (intType.getBitWidth()) {
+                case 8 -> "byte";
+                case 16 -> "short";
+                case 32 -> "integer";
+                case 64 -> "long";
+                default -> null;
+            };
+        }
+        if (childType instanceof ArrowType.Bool) {
+            return "boolean";
+        }
+        if (childType instanceof ArrowType.FloatingPoint fp) {
+            return switch (fp.getPrecision()) {
+                case SINGLE -> "float";
+                case DOUBLE -> "double";
+                default -> null;
+            };
+        }
+        if (childType instanceof ArrowType.Date || childType instanceof ArrowType.Timestamp) {
+            return "date";
+        }
+        if (childType instanceof ArrowType.Utf8) {
+            return "keyword";
+        }
+        if (childType instanceof ArrowType.List
+            && child.getChildren().size() == 1
+            && child.getChildren().get(0).getType() instanceof ArrowType.Utf8) {
+            return "keyword";
+        }
+        return null;
+    }
+
+    /** Whether {@code structField} has at least one supported descendant, recursing into nested structs. */
+    private static boolean structHasSupportedProperty(LanceField structField) {
+        for (LanceField child : structField.getChildren()) {
+            if (child.getType() instanceof ArrowType.Struct) {
+                if (structHasSupportedProperty(child)) {
+                    return true;
+                }
+                continue;
+            }
+            if (structChildMappingType(child) != null) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void startFieldWithId(XContentBuilder mapping, String name, int fieldId, String type, String arrowType)

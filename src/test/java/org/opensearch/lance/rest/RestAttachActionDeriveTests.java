@@ -51,6 +51,16 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
                 "expected a skip note for meta.raw, saw: " + derivation.notes(),
                 derivation.notes().stream().anyMatch(note -> note.startsWith("meta.raw:"))
             );
+            // A nested struct with no supported descendants is skipped
+            // whole with one note instead of surfacing as an empty
+            // object, matching the reader, which keeps such a struct out
+            // of the row take and therefore out of _source.
+            assertFalse("all-unsupported nested struct must not be mapped: " + mapping, mapping.contains("\"audit\""));
+            assertFalse("no empty properties object may be emitted: " + mapping, mapping.contains("\"properties\":{}"));
+            assertTrue(
+                "expected a skip note for meta.audit, saw: " + derivation.notes(),
+                derivation.notes().contains("meta.audit: Struct with no supported children, not surfaced")
+            );
 
             assertEquals("id", derivation.keyField());
             // Struct children are not index-eligible columns: build_indexes
