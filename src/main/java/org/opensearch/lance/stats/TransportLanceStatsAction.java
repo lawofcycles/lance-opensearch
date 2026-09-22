@@ -6,6 +6,7 @@
 package org.opensearch.lance.stats;
 
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -17,6 +18,7 @@ import org.opensearch.action.FailedNodeException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.nodes.TransportNodesAction;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.lucene.search.Queries;
 import org.opensearch.core.common.io.stream.StreamInput;
@@ -48,6 +50,49 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
     LanceStatsNodeResponse> {
 
     private static final Logger LOGGER = LogManager.getLogger(TransportLanceStatsAction.class);
+
+    /**
+     * Reflective handle on {@code IndexService.getReaderWrapper()}, the
+     * same accessor the fragment query action resolves, held separately
+     * so this action does not depend on the dispatch package's
+     * internals. A DLS/FLS reader wrapper hides columns from the
+     * request; Lance's {@code describeIndices} metadata does not pass
+     * through the wrapper, so the per-column index type report is
+     * skipped whenever a wrapper is installed. Unlike the query path,
+     * stats must not refuse to load when the accessor is missing:
+     * {@code null} here just means "cannot tell", which is treated as
+     * "wrapper present" and omits the report.
+     */
+    private static final Method INDEX_SERVICE_GET_READER_WRAPPER = resolveReaderWrapperAccessor();
+
+    @SuppressForbidden(reason = "IndexService#getReaderWrapper() is package-private in core; reflection is required to tell "
+        + "whether a DLS/FLS wrapper is installed so the stats report does not reveal column names the wrapper hides")
+    private static Method resolveReaderWrapperAccessor() {
+        try {
+            Method m = IndexService.class.getDeclaredMethod("getReaderWrapper");
+            m.setAccessible(true);
+            return m;
+        } catch (NoSuchMethodException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Whether {@code indexService} has a reader wrapper installed (a
+     * security plugin's DLS/FLS wrapper). Answers {@code true} when the
+     * accessor is unavailable or throws, so the caller errs on the side
+     * of not revealing column metadata.
+     */
+    private static boolean hasReaderWrapper(IndexService indexService) {
+        if (INDEX_SERVICE_GET_READER_WRAPPER == null) {
+            return true;
+        }
+        try {
+            return INDEX_SERVICE_GET_READER_WRAPPER.invoke(indexService) != null;
+        } catch (Exception e) {
+            return true;
+        }
+    }
 
     private final LanceStatsCollector collector;
     private final IndicesService indicesService;
@@ -152,15 +197,23 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
                     long rows = reader.luceneBoundExceeded() ? reader.tableRows() : shardReaderRows;
                     // One describeIndices on the reader's already-open
                     // dataset per index per stats call (indexes are
-                    // single-shard, so per shard is per index); a failure
+                    // single-shard, so per shard is per index). Skipped
+                    // when a DLS/FLS reader wrapper is installed: the
+                    // Lance metadata does not pass through the wrapper,
+                    // and the report must not reveal column names the
+                    // wrapper hides. A describeIndices failure likewise
                     // leaves the map empty rather than dropping the
                     // reader's row figures.
                     Map<String, List<String>> indexTypes;
-                    try {
-                        indexTypes = reader.columnIndexTypes();
-                    } catch (Exception e) {
-                        LOGGER.debug("lance.stats: describeIndices failed for {}: {}", shard.shardId(), e.toString());
+                    if (hasReaderWrapper(indexService)) {
                         indexTypes = Map.of();
+                    } else {
+                        try {
+                            indexTypes = reader.columnIndexTypes();
+                        } catch (Exception e) {
+                            LOGGER.debug("lance.stats: describeIndices failed for {}: {}", shard.shardId(), e.toString());
+                            indexTypes = Map.of();
+                        }
                     }
                     stats.add(
                         new LanceNodeStats.IndexReaderStats(
