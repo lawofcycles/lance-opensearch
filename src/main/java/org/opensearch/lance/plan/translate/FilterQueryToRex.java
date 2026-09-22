@@ -65,17 +65,18 @@ final class FilterQueryToRex {
         String aggregationName,
         Schema schema,
         Map<String, LinkedHashMap<String, String>> multiFields,
+        Map<String, String> renamedFields,
         RelBuilder relBuilder
     ) {
         if (query == null || query instanceof MatchAllQueryBuilder) {
             return relBuilder.literal(true);
         }
         if (query instanceof TermQueryBuilder term) {
-            Column column = resolveColumn(term.fieldName(), schema, multiFields);
+            Column column = resolveColumn(term.fieldName(), schema, multiFields, renamedFields);
             return equalTo(column, term.value(), aggregationName, relBuilder);
         }
         if (query instanceof TermsQueryBuilder terms) {
-            Column column = resolveColumn(terms.fieldName(), schema, multiFields);
+            Column column = resolveColumn(terms.fieldName(), schema, multiFields, renamedFields);
             if (terms.values() == null || terms.values().isEmpty()) {
                 return relBuilder.literal(false);
             }
@@ -87,15 +88,15 @@ final class FilterQueryToRex {
             return any;
         }
         if (query instanceof ExistsQueryBuilder exists) {
-            Column column = resolveColumn(exists.fieldName(), schema, multiFields);
+            Column column = resolveColumn(exists.fieldName(), schema, multiFields, renamedFields);
             return relBuilder.isNotNull(relBuilder.field(column.index()));
         }
         if (query instanceof RangeQueryBuilder range) {
-            Column column = resolveColumn(range.fieldName(), schema, multiFields);
+            Column column = resolveColumn(range.fieldName(), schema, multiFields, renamedFields);
             return rangeOf(column, range, aggregationName, relBuilder);
         }
         if (query instanceof BoolQueryBuilder bool) {
-            return boolOf(bool, aggregationName, schema, multiFields, relBuilder);
+            return boolOf(bool, aggregationName, schema, multiFields, renamedFields, relBuilder);
         }
         throw unsupported("query type [" + query.getName() + "] in filter of aggregation [" + aggregationName + "]");
     }
@@ -105,6 +106,7 @@ final class FilterQueryToRex {
         String aggregationName,
         Schema schema,
         Map<String, LinkedHashMap<String, String>> multiFields,
+        Map<String, String> renamedFields,
         RelBuilder relBuilder
     ) {
         if (bool.minimumShouldMatch() != null) {
@@ -112,16 +114,16 @@ final class FilterQueryToRex {
         }
         RexNode all = null;
         for (QueryBuilder clause : bool.must()) {
-            all = conjoin(all, predicate(clause, aggregationName, schema, multiFields, relBuilder), relBuilder);
+            all = conjoin(all, predicate(clause, aggregationName, schema, multiFields, renamedFields, relBuilder), relBuilder);
         }
         for (QueryBuilder clause : bool.filter()) {
-            all = conjoin(all, predicate(clause, aggregationName, schema, multiFields, relBuilder), relBuilder);
+            all = conjoin(all, predicate(clause, aggregationName, schema, multiFields, renamedFields, relBuilder), relBuilder);
         }
         boolean required = bool.must().isEmpty() && bool.filter().isEmpty();
         if (required && !bool.should().isEmpty()) {
             RexNode any = null;
             for (QueryBuilder clause : bool.should()) {
-                RexNode one = predicate(clause, aggregationName, schema, multiFields, relBuilder);
+                RexNode one = predicate(clause, aggregationName, schema, multiFields, renamedFields, relBuilder);
                 any = any == null ? one : relBuilder.call(SqlStdOperatorTable.OR, any, one);
             }
             all = any;
@@ -132,7 +134,7 @@ final class FilterQueryToRex {
             throw unsupported("adjust_pure_negative false in filter of aggregation [" + aggregationName + "]");
         }
         for (QueryBuilder clause : bool.mustNot()) {
-            RexNode excluded = predicate(clause, aggregationName, schema, multiFields, relBuilder);
+            RexNode excluded = predicate(clause, aggregationName, schema, multiFields, renamedFields, relBuilder);
             RexNode negated = relBuilder.call(SqlStdOperatorTable.NOT, relBuilder.call(SqlStdOperatorTable.IS_TRUE, excluded));
             all = conjoin(all, negated, relBuilder);
         }

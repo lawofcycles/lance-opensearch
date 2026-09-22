@@ -9,6 +9,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.lance.Dataset;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
@@ -46,14 +47,17 @@ public final class LanceSchemas {
 
     /**
      * The planner inputs for one index: the name plans scan by, the
-     * Arrow schema and multi-fields spec field resolution reads, and
+     * Arrow schema and multi-fields spec field resolution reads, the
+     * renames the mapping records (stale column name to the name the
+     * Lance table uses now, so field resolution can refuse a stale name
+     * with the rename instead of a generic unknown-field message), and
      * the table / schema pair the {@code RelBuilder} resolves against.
      * {@code multiFields} maps a base column to its declared sub-fields
      * ({@code body -> {raw: keyword}}), empty when the attach declared
      * none.
      */
-    public record IndexModel(String indexName, Schema arrowSchema, Map<String, LinkedHashMap<String, String>> multiFields, LanceTable table,
-        LanceSchema schema) {
+    public record IndexModel(String indexName, Schema arrowSchema, Map<String, LinkedHashMap<String, String>> multiFields, Map<String,
+        String> renamedFields, LanceTable table, LanceSchema schema) {
     }
 
     /**
@@ -66,8 +70,19 @@ public final class LanceSchemas {
         Map<String, LinkedHashMap<String, String>> multiFields,
         LongSupplier rowCount
     ) {
+        return model(indexName, arrowSchema, multiFields, Map.of(), rowCount);
+    }
+
+    /** The model with the mapping's recorded renames (stale name to live name). */
+    public static IndexModel model(
+        String indexName,
+        Schema arrowSchema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        Map<String, String> renamedFields,
+        LongSupplier rowCount
+    ) {
         LanceTable table = new LanceTable(indexName, arrowSchema, rowCount);
-        return new IndexModel(indexName, arrowSchema, multiFields, table, new LanceSchema(Map.of(indexName, table)));
+        return new IndexModel(indexName, arrowSchema, multiFields, renamedFields, table, new LanceSchema(Map.of(indexName, table)));
     }
 
     /**
@@ -103,6 +118,10 @@ public final class LanceSchemas {
             : LancePrimaryKeyType.fromSetting(settings.get(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, "long"));
         LanceOverrides overrides = LanceOverrides.of(settings);
         Map<String, LinkedHashMap<String, String>> multiFields = overrides.subFields();
+        Map<String, String> renamedFields = new LinkedHashMap<>();
+        for (LanceMappingMeta.RenamedField renamed : LanceMappingMeta.renamedFields(indexMetadata.mapping())) {
+            renamedFields.put(renamed.from(), renamed.to());
+        }
         try (
             LanceWarmCache.Lease lease = warmCache.acquire(
                 indexMetadata.getIndexUUID(),
@@ -121,7 +140,7 @@ public final class LanceSchemas {
                 rows += fragmentRows;
             }
             final long total = rows;
-            return model(indexName, arrowSchema, multiFields, () -> total);
+            return model(indexName, arrowSchema, multiFields, renamedFields, () -> total);
         }
     }
 }

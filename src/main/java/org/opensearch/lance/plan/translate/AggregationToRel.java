@@ -131,7 +131,7 @@ final class AggregationToRel {
      */
     static RelNode translate(AggregatorFactories.Builder aggregations, LanceSchemas.IndexModel model, RelBuilder relBuilder) {
         List<AggregationBuilder> top = new ArrayList<>(aggregations.getAggregatorFactories());
-        Translation translation = new Translation(model.arrowSchema(), model.multiFields(), relBuilder);
+        Translation translation = new Translation(model.arrowSchema(), model.multiFields(), model.renamedFields(), relBuilder);
         boolean allMetrics = top.stream().allMatch(AggregationToRel::isMetricShaped);
         if (allMetrics) {
             return translation.metricOnly(top);
@@ -190,15 +190,22 @@ final class AggregationToRel {
 
         private final Schema schema;
         private final Map<String, LinkedHashMap<String, String>> multiFields;
+        private final Map<String, String> renamedFields;
         private final RelBuilder relBuilder;
         private final List<RexNode> keyExpressions = new ArrayList<>();
         private final List<BucketSpec> bucketSpecs = new ArrayList<>();
         private final List<List<RexNode>> filterPredicates = new ArrayList<>();
         private final List<MetricIntent> metrics = new ArrayList<>();
 
-        Translation(Schema schema, Map<String, LinkedHashMap<String, String>> multiFields, RelBuilder relBuilder) {
+        Translation(
+            Schema schema,
+            Map<String, LinkedHashMap<String, String>> multiFields,
+            Map<String, String> renamedFields,
+            RelBuilder relBuilder
+        ) {
             this.schema = schema;
             this.multiFields = multiFields;
+            this.renamedFields = renamedFields;
             this.relBuilder = relBuilder;
         }
 
@@ -359,7 +366,7 @@ final class AggregationToRel {
                 throw unsupported("aggregation type [" + builder.getType() + "]");
             }
             checkPlainFieldSource(valuesSource);
-            Column column = resolveColumn(valuesSource.field(), schema, multiFields);
+            Column column = resolveColumn(valuesSource.field(), schema, multiFields, renamedFields);
             if (builder instanceof TermsAggregationBuilder terms) {
                 addTermsLevel(terms, column);
             } else if (builder instanceof HistogramAggregationBuilder histogram) {
@@ -542,7 +549,7 @@ final class AggregationToRel {
             BucketSpec.Kind kind;
             if (builder instanceof FilterAggregationBuilder filter) {
                 kind = BucketSpec.Kind.FILTER;
-                predicates.add(FilterQueryToRex.predicate(filter.getFilter(), filter.getName(), schema, multiFields, relBuilder));
+                predicates.add(FilterQueryToRex.predicate(filter.getFilter(), filter.getName(), schema, multiFields, renamedFields, relBuilder));
                 keys.add(filter.getName());
             } else {
                 FiltersAggregationBuilder filters = (FiltersAggregationBuilder) builder;
@@ -554,7 +561,7 @@ final class AggregationToRel {
                     throw unsupported("more than " + MAX_MASK_CONDITIONS + " filters on aggregation [" + filters.getName() + "]");
                 }
                 for (FiltersAggregator.KeyedFilter keyed : filters.filters()) {
-                    predicates.add(FilterQueryToRex.predicate(keyed.filter(), filters.getName(), schema, multiFields, relBuilder));
+                    predicates.add(FilterQueryToRex.predicate(keyed.filter(), filters.getName(), schema, multiFields, renamedFields, relBuilder));
                     keys.add(keyed.key());
                 }
                 otherBucketKey = filters.otherBucket() ? filters.otherBucketKey() : null;
@@ -580,7 +587,7 @@ final class AggregationToRel {
             if (source.field() == null || source.field().isEmpty()) {
                 throw unsupported("composite source [" + source.name() + "] without a field");
             }
-            Column column = resolveColumn(source.field(), schema, multiFields);
+            Column column = resolveColumn(source.field(), schema, multiFields, renamedFields);
             String sourceOrder = source.order() == SortOrder.ASC ? "ASC" : "DESC";
             if (source instanceof TermsValuesSourceBuilder) {
                 RexNode key = column.isUtf8() || column.isFloating() ? relBuilder.field(column.index()) : numericKey(column);
@@ -631,7 +638,7 @@ final class AggregationToRel {
             }
             ValuesSourceAggregationBuilder<?> source = (ValuesSourceAggregationBuilder<?>) builder;
             checkPlainFieldSource(source);
-            Column column = resolveColumn(source.field(), schema, multiFields);
+            Column column = resolveColumn(source.field(), schema, multiFields, renamedFields);
             MetricSpec.Kind kind = metricKindOf(builder);
             if (kind == MetricSpec.Kind.CARDINALITY) {
                 for (MetricIntent other : metrics) {
@@ -945,11 +952,20 @@ final class AggregationToRel {
     /**
      * Maps an aggregation field to a Lance column: the field names a
      * top level column, or a keyword sub-field declared in the attach's
-     * multi fields resolves to its base column. The column has to be a
-     * scalar the pushdown reads (utf8, signed integer, single or double
-     * float, boolean, date, timestamp).
+     * multi fields resolves to its base column. A field the mapping
+     * records as renamed (the Lance table moved the column to a new
+     * name; the stale mapping entry carries {@code lance_dropped}) is
+     * refused naming the new name, so the caller learns what to query
+     * instead of a generic unknown-field message. The column has to be
+     * a scalar the pushdown reads (utf8, signed integer, single or
+     * double float, boolean, date, timestamp).
      */
-    static Column resolveColumn(String field, Schema schema, Map<String, LinkedHashMap<String, String>> multiFields) {
+    static Column resolveColumn(
+        String field,
+        Schema schema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        Map<String, String> renamedFields
+    ) {
         String columnName = field;
         if (indexOf(schema, columnName) < 0) {
             int dot = field.lastIndexOf('.');
@@ -964,6 +980,10 @@ final class AggregationToRel {
         }
         int index = indexOf(schema, columnName);
         if (index < 0) {
+            String renamedTo = renamedFields == null ? null : renamedFields.get(columnName);
+            if (renamedTo != null) {
+                throw unsupported("field [" + field + "] was renamed to [" + renamedTo + "] in the Lance table");
+            }
             throw unsupported("field [" + field + "] does not map to a Lance column");
         }
         ArrowType type = schema.getFields().get(index).getType();
