@@ -48,10 +48,13 @@ public class LanceFragmentSchemaStructTests extends OpenSearchTestCase {
             assertEquals(ColumnKind.NUMERIC, schema.columnKind().get("meta.score"));
             assertEquals(ColumnKind.BOOLEAN, schema.columnKind().get("meta.flags.active"));
             // The unsupported uint32 child and the struct parents carry no
-            // column kind of their own.
+            // column kind of their own, and a nested struct with no
+            // supported descendants contributes nothing at all.
             assertNull(schema.columnKind().get("meta.raw"));
             assertNull(schema.columnKind().get("meta"));
             assertNull(schema.columnKind().get("meta.flags"));
+            assertNull(schema.columnKind().get("meta.audit"));
+            assertNull(schema.columnKind().get("meta.audit.checksum"));
 
             assertEquals(NumericPrecision.DOUBLE, schema.numericPrecision().get("meta.score"));
 

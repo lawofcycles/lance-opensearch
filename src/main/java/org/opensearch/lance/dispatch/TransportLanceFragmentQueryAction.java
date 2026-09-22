@@ -25,6 +25,8 @@ import java.util.function.Function;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DirectoryReader;
@@ -1737,7 +1739,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         org.apache.arrow.vector.types.pojo.Schema schema,
         java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
     ) {
-        org.apache.arrow.vector.types.pojo.Field field = topLevelField(schema, name);
+        Field field = topLevelField(schema, name);
         if (field == null) {
             int dot = name.lastIndexOf('.');
             if (dot <= 0 || multiFields == null) {
@@ -1771,8 +1773,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /** The top level Arrow field named {@code name}, or {@code null} when the schema has none (never throws). */
-    private static org.apache.arrow.vector.types.pojo.Field topLevelField(org.apache.arrow.vector.types.pojo.Schema schema, String name) {
-        for (org.apache.arrow.vector.types.pojo.Field candidate : schema.getFields()) {
+    private static Field topLevelField(Schema schema, String name) {
+        for (Field candidate : schema.getFields()) {
             if (candidate.getName().equals(name)) {
                 return candidate;
             }

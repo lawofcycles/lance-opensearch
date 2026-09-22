@@ -1190,19 +1190,19 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * stay on the Lucene doc value path.
      */
     @SuppressWarnings("unchecked")
-    private static Object resolveObjectPath(java.util.Map<String, Object> propertyMap, String name) {
-        java.util.Map<String, Object> current = propertyMap;
+    private static Object resolveObjectPath(Map<String, Object> propertyMap, String name) {
+        Map<String, Object> current = propertyMap;
         String[] segments = name.split("\\.");
         for (int s = 0; s < segments.length - 1; s++) {
             Object entry = current.get(segments[s]);
-            if (!(entry instanceof java.util.Map)) {
+            if (!(entry instanceof Map)) {
                 return null;
             }
-            Object nested = ((java.util.Map<String, Object>) entry).get("properties");
-            if (!(nested instanceof java.util.Map)) {
+            Object nested = ((Map<String, Object>) entry).get("properties");
+            if (!(nested instanceof Map)) {
                 return null;
             }
-            current = (java.util.Map<String, Object>) nested;
+            current = (Map<String, Object>) nested;
         }
         return current.get(segments[segments.length - 1]);
     }

@@ -443,18 +443,23 @@ public final class LanceTableFactory {
      * {@code meta} nullable struct with children {@code region} Utf8,
      * {@code score} Float64, {@code raw} UInt32 (deliberately a type the
      * derivation does not support inside a struct, so the skip note and
-     * the "parent object still emitted" behaviour are exercised), and
+     * the "parent object still emitted" behaviour are exercised),
      * {@code flags}, itself a nullable struct with one {@code active}
-     * Bool child.
+     * Bool child, and {@code audit}, a nullable struct whose only child
+     * {@code checksum} is UInt32 (no supported descendant, so the whole
+     * nested struct must be skipped with a note and stay out of the
+     * mapping and {@code _source}).
      *
      * <p>Six rows ({@code i = 0..5}):
      * <ul>
      *   <li>{@code id = i}</li>
      *   <li>{@code meta.region}: east, west, east, east, south, west</li>
-     *   <li>{@code meta.score = i * 1.5}</li>
+     *   <li>{@code meta.score = i * 1.5}, except row 3 where it is
+     *       Arrow null (a null scalar leaf inside a present struct)</li>
      *   <li>{@code meta.raw = i}</li>
      *   <li>{@code meta.flags.active = (i % 2 == 0)}, except row 3 where
-     *       {@code meta.flags} is Arrow null (the one nested null)</li>
+     *       {@code meta.flags} is Arrow null (a null nested struct)</li>
+     *   <li>{@code meta.audit.checksum = i}</li>
      * </ul>
      *
      * @param maxRowsPerFile 0 writes one fragment; a positive value
@@ -474,6 +479,11 @@ public final class LanceTableFactory {
             FieldType.nullable(new ArrowType.Struct()),
             Arrays.asList(new Field("active", FieldType.nullable(new ArrowType.Bool()), null))
         );
+        Field auditField = new Field(
+            "audit",
+            FieldType.nullable(new ArrowType.Struct()),
+            Arrays.asList(new Field("checksum", FieldType.nullable(new ArrowType.Int(32, false)), null))
+        );
         Field metaField = new Field(
             "meta",
             FieldType.nullable(new ArrowType.Struct()),
@@ -481,7 +491,8 @@ public final class LanceTableFactory {
                 new Field("region", FieldType.nullable(new ArrowType.Utf8()), null),
                 new Field("score", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null),
                 new Field("raw", FieldType.nullable(new ArrowType.Int(32, false)), null),
-                flagsField
+                flagsField,
+                auditField
             )
         );
         Schema schema = new Schema(
@@ -505,17 +516,22 @@ public final class LanceTableFactory {
                 UInt4Vector raw = (UInt4Vector) meta.getChild("raw");
                 StructVector flags = (StructVector) meta.getChild("flags");
                 BitVector active = (BitVector) flags.getChild("active");
+                StructVector audit = (StructVector) meta.getChild("audit");
+                UInt4Vector checksum = (UInt4Vector) audit.getChild("checksum");
 
                 root.allocateNew();
                 for (int i = 0; i < rowCount; i++) {
                     idVector.setSafe(i, i);
                     meta.setIndexDefined(i);
                     region.setSafe(i, regions[i].getBytes(StandardCharsets.UTF_8));
-                    score.setSafe(i, i * 1.5d);
                     raw.setSafe(i, i);
+                    audit.setIndexDefined(i);
+                    checksum.setSafe(i, i);
                     if (i == 3) {
+                        score.setNull(i);
                         flags.setNull(i);
                     } else {
+                        score.setSafe(i, i * 1.5d);
                         flags.setIndexDefined(i);
                         active.setSafe(i, (i % 2 == 0) ? 1 : 0);
                     }

@@ -25,9 +25,11 @@ import org.opensearch.core.rest.RestStatus;
  * <p>Fixture ({@link LanceTableFactory#writeStructTable}): six rows,
  * {@code id} int32 PK, {@code meta} struct of {@code region} Utf8,
  * {@code score} Float64, {@code raw} UInt32 (unsupported inside a
- * struct, so it must stay out of the mapping and {@code _source}) and
- * {@code flags} struct of {@code active} Bool; {@code meta.flags} is
- * Arrow null on row 3.
+ * struct, so it must stay out of the mapping and {@code _source}),
+ * {@code flags} struct of {@code active} Bool, and {@code audit}, a
+ * struct with no supported children (skipped whole); on row 3
+ * {@code meta.flags} is Arrow null and {@code meta.score} is a null
+ * scalar leaf inside the present struct.
  */
 public class LanceStructIT extends LanceRestTestCase {
 
@@ -55,6 +57,7 @@ public class LanceStructIT extends LanceRestTestCase {
             assertTrue("meta.flags must nest an object: " + mappingBody, mappingBody.contains("\"flags\":{\"properties\":{"));
             assertTrue("meta.flags.active must map as boolean: " + mappingBody, mappingBody.contains("\"active\":{\"type\":\"boolean\""));
             assertFalse("uint32 child must stay unmapped: " + mappingBody, mappingBody.contains("\"raw\""));
+            assertFalse("all-unsupported nested struct must stay unmapped: " + mappingBody, mappingBody.contains("\"audit\""));
 
             // term on a struct child: region == east on rows 0, 2, 3.
             String termBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"term\":{\"meta.region\":\"east\"}}}"));
@@ -66,9 +69,10 @@ public class LanceStructIT extends LanceRestTestCase {
             );
             assertEquals("terms meta.region east,south: " + termsBody, 4, extractIntPath(termsBody, "hits", "total", "value"));
 
-            // range on the double child: score >= 3.0 keeps rows 2..5.
+            // range on the double child: scores 3.0, 6.0, 7.5 (rows 2, 4,
+            // 5) pass; row 3's null score never matches.
             String rangeBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"meta.score\":{\"gte\":3.0}}}}"));
-            assertEquals("range meta.score gte 3.0: " + rangeBody, 4, extractIntPath(rangeBody, "hits", "total", "value"));
+            assertEquals("range meta.score gte 3.0: " + rangeBody, 3, extractIntPath(rangeBody, "hits", "total", "value"));
 
             // exists on the nested boolean: flags is null on row 3, so
             // active exists on five rows.
@@ -82,8 +86,9 @@ public class LanceStructIT extends LanceRestTestCase {
             // resolution must return null for a dotted name (instead of
             // throwing, as Arrow's Schema.findField does) so the request
             // falls back to the Lucene comparator over the child's doc
-            // values. Descending puts row 5 first; the sort values echo
-            // the decoded doubles.
+            // values. Descending: 7.5, 6.0, 3.0, 1.5, 0.0, then row 3
+            // whose null score sorts last; the sort values echo the
+            // decoded doubles.
             String sortBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}},\"sort\":[{\"meta.score\":\"desc\"}],\"size\":6}")
             );
@@ -94,10 +99,11 @@ public class LanceStructIT extends LanceRestTestCase {
                 extractIntPath(sortBody, "hits", "hits", "0", "_source", "id")
             );
             assertEquals(
-                "sort meta.score desc last hit must be id=0: " + sortBody,
+                "sort meta.score desc fifth hit must be id=0: " + sortBody,
                 0,
-                extractIntPath(sortBody, "hits", "hits", "5", "_source", "id")
+                extractIntPath(sortBody, "hits", "hits", "4", "_source", "id")
             );
+            assertEquals("null score must sort last: " + sortBody, 3, extractIntPath(sortBody, "hits", "hits", "5", "_source", "id"));
             assertEquals(
                 "first sort value must be 7.5: " + sortBody,
                 7.5d,
@@ -105,9 +111,9 @@ public class LanceStructIT extends LanceRestTestCase {
                 1e-9
             );
             assertEquals(
-                "last sort value must be 0.0: " + sortBody,
+                "fifth sort value must be 0.0: " + sortBody,
                 0.0d,
-                extractDoublePath(sortBody, "hits", "hits", "5", "sort", "0"),
+                extractDoublePath(sortBody, "hits", "hits", "4", "sort", "0"),
                 1e-9
             );
 
@@ -145,9 +151,10 @@ public class LanceStructIT extends LanceRestTestCase {
             assertTrue("bucket keys must include east/south/west: " + aggBody, aggBody.contains("\"key\":\"east\""));
             assertTrue("bucket keys must include south: " + aggBody, aggBody.contains("\"key\":\"south\""));
             assertTrue("bucket keys must include west: " + aggBody, aggBody.contains("\"key\":\"west\""));
-            // avg(score) = (0 + 1.5 + 3 + 4.5 + 6 + 7.5) / 6 = 3.75.
-            assertEquals("avg meta.score", 3.75d, extractDoublePath(aggBody, "aggregations", "avg_score", "value"), 1e-9);
-            assertEquals("sum meta.score", 22.5d, extractDoublePath(aggBody, "aggregations", "sum_score", "value"), 1e-9);
+            // avg(score) = (0 + 1.5 + 3 + 6 + 7.5) / 5 = 3.6; row 3's
+            // null score contributes to neither the sum nor the count.
+            assertEquals("avg meta.score", 3.6d, extractDoublePath(aggBody, "aggregations", "avg_score", "value"), 1e-9);
+            assertEquals("sum meta.score", 18.0d, extractDoublePath(aggBody, "aggregations", "sum_score", "value"), 1e-9);
 
             // A struct-child filter combined with a struct-child metric:
             // exercises the Lance SQL path expression for dotted fields
@@ -160,23 +167,27 @@ public class LanceStructIT extends LanceRestTestCase {
                 )
             );
             assertEquals("filtered total: " + filteredAgg, 3, extractIntPath(filteredAgg, "hits", "total", "value"));
-            // rows 0, 2, 3: 0 + 3 + 4.5 = 7.5.
-            assertEquals("sum over east rows", 7.5d, extractDoublePath(filteredAgg, "aggregations", "s", "value"), 1e-9);
+            // rows 0, 2, 3: 0 + 3 + null = 3.0.
+            assertEquals("sum over east rows", 3.0d, extractDoublePath(filteredAgg, "aggregations", "s", "value"), 1e-9);
 
-            // GET by id renders the struct as a nested JSON object.
+            // GET by id renders the struct as a nested JSON object; the
+            // all-unsupported audit struct stays out.
             String getBody = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_doc/0")));
             assertTrue(
                 "GET _source must nest the struct: " + getBody,
                 getBody.contains("\"meta\":{\"region\":\"east\",\"score\":0.0,\"flags\":{\"active\":true}}")
             );
             assertFalse("uint32 child must stay out of _source: " + getBody, getBody.contains("\"raw\""));
+            assertFalse("all-unsupported nested struct must stay out of _source: " + getBody, getBody.contains("\"audit\""));
 
-            // Row 3 carries the nested null: flags renders as JSON null.
+            // Row 3 carries the nested nulls: the null flags struct and
+            // the null score leaf inside the present struct both render
+            // as JSON null.
             String nullBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"term\":{\"id\":3}},\"size\":1}"));
             assertEquals("term id=3 total: " + nullBody, 1, extractIntPath(nullBody, "hits", "total", "value"));
             assertTrue(
-                "null nested struct must render as JSON null: " + nullBody,
-                nullBody.contains("\"meta\":{\"region\":\"east\",\"score\":4.5,\"flags\":null}")
+                "null score leaf and null nested struct must render as JSON null: " + nullBody,
+                nullBody.contains("\"meta\":{\"region\":\"east\",\"score\":null,\"flags\":null}")
             );
         } finally {
             try {
