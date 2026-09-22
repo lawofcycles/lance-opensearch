@@ -29,7 +29,7 @@ Every `/_lance/*` endpoint runs through a transport action, so a security plugin
 - `cluster:admin/lance/namespace/update` for `POST` / `DELETE /_lance/namespace` (the same operator roles).
 - `indices:admin/lance/build_indexes` as an index-level permission for `POST /_lance/build_indexes/{index}` (roles that own the Lance table behind that index; the build writes into the table). The refresh that follows the build runs as the caller, so the role also needs `indices:admin/refresh` on the index.
 - `indices:monitor/lance/refs` as an index-level permission for `GET /_lance/refs/{index}` (read-only roles; it reveals tag and branch names).
-- `indices:monitor/lance/explain` as an index-level permission for `GET /{index}/_lance/explain` (read-only roles; it reveals column names and the row count).
+- `indices:monitor/lance/explain` as an index-level permission for `GET /{index}/_lance/explain`. The response carries the index name, the aggregation aliases from the request body, and the operator tree over the table scan. Grant it like `indices:admin/mappings/get`: like `GET _mapping`, the endpoint resolves field names against the index's full schema and does not apply field level security.
 - `cluster:monitor/lance/namespace` for `GET /_lance/namespace` and `POST /_lance/namespace/tables` (read-only roles; it reveals registered paths and table names).
 - `cluster:monitor/lance/stats` for `GET /_lance/stats` (read-only roles; it reveals cache counters and byte totals, no table content).
 
