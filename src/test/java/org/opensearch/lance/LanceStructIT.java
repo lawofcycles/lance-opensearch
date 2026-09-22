@@ -77,21 +77,15 @@ public class LanceStructIT extends LanceRestTestCase {
             );
             assertEquals("exists meta.flags.active: " + existsBody, 5, extractIntPath(existsBody, "hits", "total", "value"));
 
-            // sort by the double child; descending puts row 5 first.
-            // The aggregation clause routes the request through the
-            // Lucene comparator over the child's doc values: the plain
-            // sorted-page shape (sort without aggregations) currently
-            // answers 400 because the sort pushdown's column resolution
-            // in TransportLanceFragmentQueryAction (a file owned by
-            // another in-flight change) resolves names with Arrow's
-            // Schema.findField, which throws for any non-top-level
-            // name instead of returning null. See the PR description.
+            // Plain sorted page (sort without aggregations) by the double
+            // child: routes through resolvePushdownOrderings, whose column
+            // resolution must return null for a dotted name (instead of
+            // throwing, as Arrow's Schema.findField does) so the request
+            // falls back to the Lucene comparator over the child's doc
+            // values. Descending puts row 5 first; the sort values echo
+            // the decoded doubles.
             String sortBody = readAll(
-                postJson(
-                    "/" + indexName + "/_search",
-                    "{\"query\":{\"match_all\":{}},\"sort\":[{\"meta.score\":\"desc\"}],\"size\":6,"
-                        + "\"aggs\":{\"ids\":{\"sum\":{\"field\":\"id\"}}}}"
-                )
+                postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}},\"sort\":[{\"meta.score\":\"desc\"}],\"size\":6}")
             );
             assertEquals("sort meta.score total: " + sortBody, 6, extractIntPath(sortBody, "hits", "total", "value"));
             assertEquals(
@@ -103,6 +97,35 @@ public class LanceStructIT extends LanceRestTestCase {
                 "sort meta.score desc last hit must be id=0: " + sortBody,
                 0,
                 extractIntPath(sortBody, "hits", "hits", "5", "_source", "id")
+            );
+            assertEquals(
+                "first sort value must be 7.5: " + sortBody,
+                7.5d,
+                extractDoublePath(sortBody, "hits", "hits", "0", "sort", "0"),
+                1e-9
+            );
+            assertEquals(
+                "last sort value must be 0.0: " + sortBody,
+                0.0d,
+                extractDoublePath(sortBody, "hits", "hits", "5", "sort", "0"),
+                1e-9
+            );
+
+            // The same sort combined with an aggregation takes the shape
+            // that skips the sort pushdown probe entirely; order must not
+            // change.
+            String sortAggBody = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"match_all\":{}},\"sort\":[{\"meta.score\":\"desc\"}],\"size\":6,"
+                        + "\"aggs\":{\"ids\":{\"sum\":{\"field\":\"id\"}}}}"
+                )
+            );
+            assertEquals("sort+agg total: " + sortAggBody, 6, extractIntPath(sortAggBody, "hits", "total", "value"));
+            assertEquals(
+                "sort+agg first hit must be id=5: " + sortAggBody,
+                5,
+                extractIntPath(sortAggBody, "hits", "hits", "0", "_source", "id")
             );
 
             // terms aggregation on the keyword child: east 3, west 2, south 1.
