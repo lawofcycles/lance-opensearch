@@ -22,6 +22,8 @@ import org.apache.calcite.rel.metadata.DefaultRelMetadataProvider;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.apache.calcite.tools.RelBuilder;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.rules.PushAggregateIntoLanceScan;
 
@@ -36,6 +38,8 @@ import org.opensearch.lance.plan.rules.PushAggregateIntoLanceScan;
  * builds fresh planner objects.
  */
 public final class LancePlannerFactory {
+
+    private static final Logger LOGGER = LogManager.getLogger(LancePlannerFactory.class);
 
     /** Name the {@link LanceSchema} is registered under in the root schema. */
     public static final String SCHEMA_NAME = "lance";
@@ -75,9 +79,12 @@ public final class LancePlannerFactory {
      * Runs the Volcano planner over {@code logical} demanding
      * {@link LanceConvention} at the root and returns the best physical
      * plan. When no physical form exists (the Substrait producer
-     * refused every candidate, so no rule fired), the logical plan
-     * itself is returned: the caller reads the root's type to see
-     * whether anything was pushed.
+     * refused every candidate, so no rule fired), or when the planner
+     * fails for any other reason, the logical plan itself is returned:
+     * the caller reads the root's type to see whether anything was
+     * pushed, and the fragment routing promises a Lucene aggregator
+     * fallback for every plan it does not push, so a planner failure
+     * must not surface as a request error.
      */
     public RelNode plan(RelNode logical) {
         VolcanoPlanner planner = (VolcanoPlanner) logical.getCluster().getPlanner();
@@ -86,6 +93,13 @@ public final class LancePlannerFactory {
         try {
             return planner.findBestExp();
         } catch (RelOptPlanner.CannotPlanException nothingPushed) {
+            return logical;
+        } catch (RuntimeException plannerFailure) {
+            LOGGER.debug(
+                "lance.plan: Volcano planning failed, keeping the logical plan: {}: {}",
+                plannerFailure.getClass().getName(),
+                plannerFailure.getMessage()
+            );
             return logical;
         }
     }

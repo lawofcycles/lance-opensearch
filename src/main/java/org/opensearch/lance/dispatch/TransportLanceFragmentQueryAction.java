@@ -990,10 +990,19 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         QueryShardContext qsc,
         IndexReader reader
     ) {
+        if (hasSecurityWrapper) {
+            // This gate must stay first and must not be folded into the
+            // combined condition below: the planner model built further
+            // down reads reader::numDocs from the raw reader, which a
+            // DLS / FLS wrapper has not filtered, and the pushed scan
+            // itself never sees the wrapper. Nothing wrapper sensitive
+            // may run past this point.
+            return null;
+        }
         if (!clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_SETTING)) {
             return null;
         }
-        if (request.size() != 0 || hasSecurityWrapper || request.postFilter() != null || request.aggregations() == null) {
+        if (request.size() != 0 || request.postFilter() != null || request.aggregations() == null) {
             return null;
         }
         boolean scalarQuery = request.query() == null || request.query() instanceof MatchAllQueryBuilder || request.filterSql() != null;
