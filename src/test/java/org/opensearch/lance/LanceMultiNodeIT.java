@@ -129,6 +129,42 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testExplainAnswersTheSameFromEveryNode() throws Exception {
+        // The explain endpoint builds its schema from cluster state and
+        // the shared Lance registry, not from the local shard, so a node
+        // that does not host the single shard copy answers the same
+        // logical plan as the one that does.
+        String suffix = "mn-explain-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            Set<String> answers = new HashSet<>();
+            for (HttpHost host : getClusterHosts()) {
+                try (var pinned = buildClient(restClientSettings(), new HttpHost[] { host })) {
+                    Request explain = new Request("GET", "/" + indexName + "/_lance/explain");
+                    explain.setJsonEntity("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}");
+                    Response response = pinned.performRequest(explain);
+                    assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
+                    String body = readAll(response);
+                    assertTrue("logical plan carries the aggregate on " + host + ": " + body, body.contains("LogicalAggregate"));
+                    assertTrue("logical plan carries the scan on " + host + ": " + body, body.contains("LanceTableScan"));
+                    answers.add(body);
+                }
+            }
+            assertEquals("every node answers the same explain body, saw " + answers, 1, answers.size());
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFtsAcrossFragmentsOnThreeNodeCluster() throws Exception {
         // 12 rows written 4 per file give fragments 0, 1 and 2. The
         // coordinator sends one fragment to each of the three data

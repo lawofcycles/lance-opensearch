@@ -1,0 +1,100 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package org.opensearch.lance;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Locale;
+
+import org.opensearch.client.Request;
+import org.opensearch.client.Response;
+import org.opensearch.client.ResponseException;
+import org.opensearch.core.rest.RestStatus;
+
+/**
+ * The explain endpoint: a supported body answers the logical plan, an
+ * unsupported body answers 400 with the translator's message, an
+ * unknown index 404, and a non Lance index 400. Nothing here executes
+ * a search through the planner.
+ */
+public class LanceExplainIT extends LanceRestTestCase {
+
+    private static Response explain(String indexName, String body) throws IOException {
+        Request request = new Request("GET", "/" + indexName + "/_lance/explain");
+        request.setJsonEntity(body);
+        return client().performRequest(request);
+    }
+
+    public void testExplainAnswersLogicalPlanAndRejectsUnsupportedShapes() throws Exception {
+        String suffix = "explain-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            Response ok = explain(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}");
+            assertEquals(RestStatus.OK.getStatus(), ok.getStatusLine().getStatusCode());
+            String body = readAll(ok);
+            assertEquals(indexName, stringPath(body, "index"));
+            String logical = stringPath(body, "logical");
+            assertTrue("logical plan carries the aggregate: " + logical, logical.contains("LogicalAggregate"));
+            assertTrue("logical plan carries the scan: " + logical, logical.contains("LanceTableScan"));
+            assertTrue("the aggregation name is the output alias: " + logical, logical.contains("s=[SUM("));
+
+            ResponseException terms = expectThrows(
+                ResponseException.class,
+                () -> explain(indexName, "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"rating\"}}}}")
+            );
+            assertEquals(RestStatus.BAD_REQUEST.getStatus(), terms.getResponse().getStatusLine().getStatusCode());
+            String reason = readAll(terms.getResponse());
+            assertTrue("400 body names the aggregation type: " + reason, reason.contains("aggregation type [terms]"));
+            assertTrue("400 body is an illegal_argument_exception: " + reason, reason.contains("illegal_argument_exception"));
+
+            ResponseException hits = expectThrows(
+                ResponseException.class,
+                () -> explain(indexName, "{\"size\":5,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}")
+            );
+            assertEquals(RestStatus.BAD_REQUEST.getStatus(), hits.getResponse().getStatusLine().getStatusCode());
+            assertTrue(readAll(hits.getResponse()).contains("size [5] (only 0)"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testExplainUnknownIndexIs404() {
+        ResponseException failure = expectThrows(
+            ResponseException.class,
+            () -> explain("no-such-index", "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}")
+        );
+        assertEquals(RestStatus.NOT_FOUND.getStatus(), failure.getResponse().getStatusLine().getStatusCode());
+    }
+
+    public void testExplainNonLanceIndexIs400() throws Exception {
+        String indexName = "plain-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Request create = new Request("PUT", "/" + indexName);
+        create.setJsonEntity("{}");
+        assertEquals(RestStatus.OK.getStatus(), client().performRequest(create).getStatusLine().getStatusCode());
+        try {
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> explain(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}")
+            );
+            assertEquals(RestStatus.BAD_REQUEST.getStatus(), failure.getResponse().getStatusLine().getStatusCode());
+            assertTrue(readAll(failure.getResponse()).contains("is not a Lance index"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+}
