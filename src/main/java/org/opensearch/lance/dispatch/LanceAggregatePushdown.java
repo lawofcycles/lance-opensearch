@@ -1864,6 +1864,25 @@ public final class LanceAggregatePushdown {
             return substrait.asReadOnlyBuffer();
         }
 
+        /**
+         * The parsed {@code after} value of every composite source, in
+         * source order; null when the plan has no composite, all null
+         * entries when the request carried no {@code after}. Package
+         * private for the test sources' assertions on the composite
+         * paging state, which the wire form does not carry (the
+         * executor applies {@code after} to the sorted group rows).
+         */
+        List<Comparable<?>> compositeAfterValues() {
+            if (composite == null) {
+                return null;
+            }
+            List<Comparable<?>> values = new ArrayList<>(composite.sources().size());
+            for (Source source : composite.sources()) {
+                values.add(source.after());
+            }
+            return values;
+        }
+
         private long dateInterval(int key) {
             return composite != null ? composite.sources().get(key).dateInterval() : levels.get(key).dateInterval();
         }
@@ -3045,25 +3064,11 @@ public final class LanceAggregatePushdown {
         if (LanceAggregationSupport.isPushdownMetric(top.get(0))) {
             return resolveMetricOnly(top, schema, multiFields, qsc, bins);
         }
+        if (top.get(0) instanceof CompositeAggregationBuilder) {
+            return resolveCompositeShape(top, schema, multiFields, qsc, bins);
+        }
         SubstraitAggregatePlan.Builder builder = new SubstraitAggregatePlan.Builder();
         List<Metric> allMetrics = new ArrayList<>();
-        if (top.get(0) instanceof CompositeAggregationBuilder compositeBuilder) {
-            List<Expression> keyExpressions = new ArrayList<>();
-            Composite composite = resolveComposite(compositeBuilder, schema, multiFields, qsc, keyExpressions, allMetrics);
-            if (composite == null) {
-                return null;
-            }
-            return new Plan(
-                finish(builder, keyExpressions, allMetrics),
-                keyExpressions,
-                List.of(),
-                composite,
-                List.of(),
-                allMetrics,
-                bins,
-                null
-            );
-        }
         List<Level> levels = new ArrayList<>();
         List<Expression> keyExpressions = new ArrayList<>();
         long estimatedGroups = 1L;
@@ -3291,6 +3296,60 @@ public final class LanceAggregatePushdown {
             return null;
         }
         return new Plan(finish(builder, List.of(), allMetrics), List.of(), List.of(), null, metrics, allMetrics, bins, null);
+    }
+
+    /**
+     * The plan of a composite tree: the single top level aggregation is
+     * a {@code composite} over {@code terms} and fixed interval
+     * {@code date_histogram} sources whose children are all metrics, so
+     * the scan groups by one expression per source and the executor
+     * applies {@code size} and {@code after} to the sorted group rows.
+     * Null when the tree is not this shape (more than one top level
+     * entry, a non composite top, or a composite whose structure
+     * {@link LanceAggregationSupport#isPushdownComposite} refuses, a
+     * {@code missing_bucket} source among them) or when a source or a
+     * metric fails to resolve against the schema and the mapping, in
+     * which case the aggregators answer. The structural check repeats
+     * the composite half of the candidate gate so this method decides
+     * the shape on its own; the gate already accepted the tree on both
+     * production paths, so the repeat cannot change what pushes down.
+     * Public because the planner package's composite rule is the
+     * production caller; the shape dispatcher above delegates here too,
+     * so the rule path and the fall through path are one code path.
+     *
+     * @param top  the request's top level aggregation builders, in
+     *             request order
+     * @param bins bins of a pushed down percentiles histogram
+     */
+    public static Plan resolveCompositeShape(
+        List<AggregationBuilder> top,
+        Schema schema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        QueryShardContext qsc,
+        int bins
+    ) {
+        if (top.size() != 1
+            || !(top.get(0) instanceof CompositeAggregationBuilder compositeBuilder)
+            || !LanceAggregationSupport.isPushdownComposite(compositeBuilder)) {
+            return null;
+        }
+        SubstraitAggregatePlan.Builder builder = new SubstraitAggregatePlan.Builder();
+        List<Metric> allMetrics = new ArrayList<>();
+        List<Expression> keyExpressions = new ArrayList<>();
+        Composite composite = resolveComposite(compositeBuilder, schema, multiFields, qsc, keyExpressions, allMetrics);
+        if (composite == null) {
+            return null;
+        }
+        return new Plan(
+            finish(builder, keyExpressions, allMetrics),
+            keyExpressions,
+            List.of(),
+            composite,
+            List.of(),
+            allMetrics,
+            bins,
+            null
+        );
     }
 
     /**

@@ -63,4 +63,9 @@ public final class PlannerTestPlans {
     public static ByteBuffer substraitBytes(LanceAggregatePushdown.Plan plan) {
         return plan.substraitPlan();
     }
+
+    /** The plan's parsed composite after values in source order, for the composite paging assertions. */
+    public static List<Comparable<?>> compositeAfterValues(LanceAggregatePushdown.Plan plan) {
+        return plan.compositeAfterValues();
+    }
 }

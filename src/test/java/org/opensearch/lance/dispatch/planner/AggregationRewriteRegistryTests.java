@@ -118,13 +118,17 @@ public class AggregationRewriteRegistryTests extends OpenSearchTestCase {
         expectThrows(UnsupportedOperationException.class, () -> registry.rules().add(new TestRule("late", Optional.empty())));
     }
 
-    public void testProductionInstanceCarriesTheMetricOnlyRuleOnly() {
+    public void testProductionInstanceCarriesTheExtractedRulesOnly() {
         // The production rule set grows only by deliberate extraction
         // from the legacy dispatcher; a rule accidentally registered on
-        // the singleton in a later change must trip this.
+        // the singleton in a later change must trip this. The order is
+        // part of the contract: the registry answers with the first
+        // match, so the metric only rule is consulted before the
+        // composite rule.
         List<AggregationRewriteRule> rules = AggregationRewriteRegistry.instance().rules();
-        assertEquals(1, rules.size());
+        assertEquals(2, rules.size());
         assertEquals(MetricOnlyRule.NAME, rules.get(0).name());
+        assertEquals(CompositeRule.NAME, rules.get(1).name());
     }
 
     public void testRejectsEmptyAndDuplicateRuleNames() {

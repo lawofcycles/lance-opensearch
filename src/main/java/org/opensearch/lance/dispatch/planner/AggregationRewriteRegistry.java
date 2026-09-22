@@ -16,12 +16,15 @@ import java.util.Set;
  * registration order and returns the first match; an empty answer
  * means no rule owns the request's shape and the caller falls through.
  * The production set is the {@link #instance() singleton}, currently
- * the metric only rule; the remaining shapes are registered here as
- * they are extracted from the legacy dispatcher.
+ * the metric only rule then the composite rule (disjoint: a composite
+ * top is never a pushdown metric); the remaining shapes are registered
+ * here as they are extracted from the legacy dispatcher.
  */
 public final class AggregationRewriteRegistry {
 
-    private static final AggregationRewriteRegistry INSTANCE = new AggregationRewriteRegistry(List.of(new MetricOnlyRule()));
+    private static final AggregationRewriteRegistry INSTANCE = new AggregationRewriteRegistry(
+        List.of(new MetricOnlyRule(), new CompositeRule())
+    );
 
     /** The production rule set. */
     public static AggregationRewriteRegistry instance() {
