@@ -7,6 +7,7 @@ package org.opensearch.lance;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
@@ -95,7 +96,7 @@ public class LanceRenameIT extends LanceRestTestCase {
             // The old date name keeps its epoch_millis format, so a
             // numeric bound parses; the doc values behind it are gone,
             // so the range matches nothing.
-            long march1 = java.time.Instant.parse("2024-03-01T00:00:00Z").toEpochMilli();
+            long march1 = Instant.parse("2024-03-01T00:00:00Z").toEpochMilli();
             String staleRange = readAll(
                 postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"range\":{\"ts\":{\"gte\":" + march1 + "}}}}")
             );
