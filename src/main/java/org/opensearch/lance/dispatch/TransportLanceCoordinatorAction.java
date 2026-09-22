@@ -1174,7 +1174,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             if (!(field instanceof java.util.Map)) {
                 return null;
             }
-            java.util.Map<String, Object> fieldMap = (java.util.Map<String, Object>) field;
+            Map<String, Object> fieldMap = (Map<String, Object>) field;
             Object type = fieldMap.get("type");
             if (!(type instanceof String typeName)) {
                 return null;
