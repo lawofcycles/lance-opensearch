@@ -1547,13 +1547,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * this transport action is content with the top-k (or when there
      * are no consumers at all):
      * <ul>
-     *   <li>No sort clause, or a sort that is only {@code _score}
-     *       descending — Lance's row-address ordering matches what
-     *       {@link org.apache.lucene.search.IndexSearcher#search(Query, int)}
-     *       returns for a scalar query, and a descending score sort is
-     *       the order that overload already collects (an FTS or knn
-     *       scan produces it natively), so spelling it out changes
-     *       nothing.</li>
+     *   <li>No sort clause — Lance's row-address ordering matches
+     *       what {@link org.apache.lucene.search.IndexSearcher#search(Query, int)}
+     *       returns for a scalar query. An explicit {@code _score}
+     *       sort also keeps the scan unbounded on purpose: the
+     *       bounded FTS scan decides ties inside Lance, and the
+     *       documented way to a stable tie order is spelling the
+     *       score sort out.</li>
      *   <li>No aggregations — aggregators need every matched doc to
      *       accumulate bucket counts and metric state.</li>
      *   <li>No post_filter — post_filter narrows below the scan and
@@ -1579,7 +1579,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * when top-k pushdown is not safe.
      */
     private int resolveScanFilterTopK(LanceFragmentQueryRequest request) {
-        if (!request.sorts().isEmpty() && !scoreOnlySort(request.sorts())) {
+        if (!request.sorts().isEmpty()) {
             return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
         }
         if (request.aggregations() != null && !request.aggregations().getAggregatorFactories().isEmpty()) {
@@ -1597,24 +1597,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
         }
         return size;
-    }
-
-    /**
-     * Whether every sort clause is {@code _score} descending, the
-     * order a request without a {@code sort} clause gets:
-     * {@link org.opensearch.search.sort.SortBuilder#buildSort} folds
-     * that shape away (no {@code SortAndFormats}), so the executor
-     * treats it like an absent sort everywhere, including the scan
-     * top-k above.
-     */
-    private static boolean scoreOnlySort(List<org.opensearch.search.sort.SortBuilder<?>> sorts) {
-        for (org.opensearch.search.sort.SortBuilder<?> sort : sorts) {
-            if (!(sort instanceof org.opensearch.search.sort.ScoreSortBuilder score)
-                || score.order() == org.opensearch.search.sort.SortOrder.ASC) {
-                return false;
-            }
-        }
-        return true;
     }
 
     /**

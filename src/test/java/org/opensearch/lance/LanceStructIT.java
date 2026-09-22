@@ -82,13 +82,12 @@ public class LanceStructIT extends LanceRestTestCase {
             assertEquals("exists meta.flags.active: " + existsBody, 5, extractIntPath(existsBody, "hits", "total", "value"));
 
             // Plain sorted page (sort without aggregations) by the double
-            // child: routes through resolvePushdownOrderings, whose column
-            // resolution must return null for a dotted name (instead of
-            // throwing, as Arrow's Schema.findField does) so the request
-            // falls back to the Lucene comparator over the child's doc
-            // values. Descending: 7.5, 6.0, 3.0, 1.5, 0.0, then row 3
-            // whose null score sorts last; the sort values echo the
-            // decoded doubles.
+            // child: the planner's sort resolution refuses the dotted
+            // name (a struct child has no top level Lance column to
+            // order by) so the request falls back to the Lucene
+            // comparator over the child's doc values. Descending: 7.5,
+            // 6.0, 3.0, 1.5, 0.0, then row 3 whose null score sorts
+            // last; the sort values echo the decoded doubles.
             String sortBody = readAll(
                 postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}},\"sort\":[{\"meta.score\":\"desc\"}],\"size\":6}")
             );

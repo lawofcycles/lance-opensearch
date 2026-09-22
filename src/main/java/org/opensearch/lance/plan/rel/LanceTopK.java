@@ -13,6 +13,8 @@ import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.SingleRel;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
@@ -75,7 +77,9 @@ public final class LanceTopK extends SingleRel {
         }
         this.fetch = fetch;
         this.offset = offset;
-        this.searchAfter = searchAfter == null ? null : List.copyOf(searchAfter);
+        // Not List.copyOf: a search_after array may carry a JSON null,
+        // which the rule answers by keeping the shape on Lucene.
+        this.searchAfter = searchAfter == null ? null : Collections.unmodifiableList(new ArrayList<>(searchAfter));
     }
 
     /** The sort order over the input row type; empty for a score / row address ordered page. */

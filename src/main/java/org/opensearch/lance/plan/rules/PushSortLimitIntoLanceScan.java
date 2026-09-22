@@ -61,9 +61,9 @@ public final class PushSortLimitIntoLanceScan extends RelRule<PushSortLimitIntoL
         super(config);
     }
 
-    /** The two rules to register, one per operand shape. */
+    /** The two rules to register: the hit shape pattern first, so a sequential (Hep) run folds the taller shape before the bare one. */
     public static List<PushSortLimitIntoLanceScan> rules() {
-        return List.of(Config.DIRECT.toRule(), Config.HIT_SHAPE.toRule());
+        return List.of(Config.HIT_SHAPE.toRule(), Config.DIRECT.toRule());
     }
 
     @Override

@@ -191,15 +191,66 @@ public class SearchRequestToRelTests extends OpenSearchTestCase {
         assertEquals("query type [match]", messageOf(source));
     }
 
-    public void testNonZeroSizeThrows() {
+    public void testNonZeroSizeWithAggregationsThrows() {
         SearchSourceBuilder source = new SearchSourceBuilder().size(3).aggregation(AggregationBuilders.sum("s").field("price"));
-        assertEquals("size [3] (only 0)", messageOf(source));
+        assertEquals("size [3] (only 0 with aggregations)", messageOf(source));
     }
 
-    public void testDefaultSizeThrows() {
+    public void testDefaultSizeWithAggregationsThrows() {
         // A body without size asks for the default ten hits.
         SearchSourceBuilder source = new SearchSourceBuilder().aggregation(AggregationBuilders.sum("s").field("price"));
-        assertEquals("size [10] (only 0)", messageOf(source));
+        assertEquals("size [10] (only 0 with aggregations)", messageOf(source));
+    }
+
+    public void testHitsRequestTranslatesToHitShapeOverTopK() {
+        // A page without a sort clause: empty collations, the envelope
+        // renders a score.
+        String plan = translate(new SearchSourceBuilder().size(5));
+        assertTrue(plan, plan.startsWith("LanceHitShape("));
+        assertTrue(plan, plan.contains("source=[true], id=[true], score=[true], sortValues=[false]"));
+        assertTrue(plan, plan.contains("LanceTopK"));
+        assertTrue(plan, plan.contains("collations=[[]], fetch=[5], offset=[0]"));
+        assertTrue(plan, plan.contains("LanceTableScan"));
+    }
+
+    public void testSortedHitsRequestCarriesCollationsAndCursor() {
+        SearchSourceBuilder source = new SearchSourceBuilder().size(5)
+            .query(QueryBuilders.rangeQuery("id").gte(3))
+            .sort("price", SortOrder.DESC)
+            .searchAfter(new Object[] { 4.5d });
+        String plan = translate(source);
+        assertTrue(plan, plan.startsWith("LanceHitShape("));
+        assertTrue(plan, plan.contains("score=[false], sortValues=[true]"));
+        assertTrue(plan, plan.contains("collations=[[1 DESC LAST]]"));
+        assertTrue(plan, plan.contains("searchAfter=[[4.5]]"));
+        assertTrue(plan, plan.contains("LogicalFilter"));
+    }
+
+    public void testSearchAfterWithoutSortThrows() {
+        SearchSourceBuilder source = new SearchSourceBuilder().size(5).searchAfter(new Object[] { 1 });
+        assertEquals("search_after without sort", messageOf(source));
+    }
+
+    public void testScriptSortNamesTheSortType() {
+        SearchSourceBuilder source = new SearchSourceBuilder().size(5)
+            .sort(
+                new org.opensearch.search.sort.ScriptSortBuilder(
+                    new org.opensearch.script.Script("doc['id'].value"),
+                    org.opensearch.search.sort.ScriptSortBuilder.ScriptSortType.NUMBER
+                )
+            );
+        assertEquals("sort type [_script]", messageOf(source));
+    }
+
+    public void testLiteralMissingNamesTheField() {
+        SearchSourceBuilder source = new SearchSourceBuilder().size(5)
+            .sort(new org.opensearch.search.sort.FieldSortBuilder("id").missing(250));
+        assertEquals("sort on field [id] with missing [250]", messageOf(source));
+    }
+
+    public void testScoreSortOnAScalarQueryThrows() {
+        SearchSourceBuilder source = new SearchSourceBuilder().size(5).sort(new org.opensearch.search.sort.ScoreSortBuilder());
+        assertEquals("sort by [_score] without a full text or knn query", messageOf(source));
     }
 
     public void testFromThrows() {
