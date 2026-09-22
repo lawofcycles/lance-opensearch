@@ -37,7 +37,7 @@ public class AggregationRewriteRegistryTests extends OpenSearchTestCase {
     }
 
     private static PushdownPlan plan() {
-        return PushdownPlan.of(PlannerTestPlans.emptyPlan());
+        return PushdownPlan.of(PlannerTestPlans.identityMarkerPlan());
     }
 
     private static AggregationRewriteContext context() {
@@ -122,6 +122,14 @@ public class AggregationRewriteRegistryTests extends OpenSearchTestCase {
         // No rule is registered yet; a rule accidentally registered on
         // the production singleton in a later change must trip this.
         assertTrue(AggregationRewriteRegistry.instance().rules().isEmpty());
+    }
+
+    public void testRejectsEmptyAndDuplicateRuleNames() {
+        expectThrows(IllegalArgumentException.class, () -> new AggregationRewriteRegistry(List.of(new TestRule("", Optional.empty()))));
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> new AggregationRewriteRegistry(List.of(new TestRule("twin", Optional.empty()), new TestRule("twin", Optional.empty())))
+        );
     }
 
     public void testNullRejection() {
