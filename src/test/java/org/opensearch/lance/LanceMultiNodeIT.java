@@ -217,10 +217,16 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
-            assertTrue("merged fts built list must carry label: " + build, build.contains("\"fts\":[\"label\"]"));
+            assertTrue(
+                "merged fts built list must carry label: " + build,
+                build.contains("\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]")
+            );
             int nodesStart = build.indexOf("\"nodes\":{");
             assertTrue("per-node nodes block expected: " + build, nodesStart >= 0);
-            int nodeEntries = countOccurrences(build.substring(nodesStart), "\"built\":{\"fts\":[\"label\"]");
+            int nodeEntries = countOccurrences(
+                build.substring(nodesStart),
+                "\"built\":{\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]"
+            );
             assertEquals("every data node must report its own build: " + build, 3, nodeEntries);
 
             assertBusy(() -> {
@@ -256,6 +262,45 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                     countOccurrences(after, "\"" + indexName + "\":{\"local_clone_bytes\"")
                 );
             });
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+            LanceRestTestCase.deleteRecursively(scratchDir);
+        }
+    }
+
+    public void testNodeLocalBuildHonoursIndexesPreferenceOnEveryNode() throws Exception {
+        // node_local placement with an attach-time `indexes` preference:
+        // every data node builds the requested type into its own clone
+        // and reports it under its node id.
+        String suffix = "mn-idxtypes-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String indexName = "demo-" + suffix;
+        String tableUri = LanceTableFactory.writeKeywordOnlyTable(scratchDir, indexName, 6);
+        try {
+            Response attach = postJson(
+                "/_lance/attach",
+                "{\"table\":\""
+                    + tableUri
+                    + "\",\"name\":\""
+                    + indexName
+                    + "\",\"index_placement\":\"node_local\",\"indexes\":{\"label\":{\"scalar\":\"bitmap\"}}}"
+            );
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            ensureGreen(indexName);
+
+            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"columns\":[\"label\"]}"));
+            assertTrue(
+                "merged scalar built list must carry the bitmap on label: " + build,
+                build.contains("{\"column\":\"label\",\"type\":\"BITMAP\"}")
+            );
+            int nodesStart = build.indexOf("\"nodes\":{");
+            assertTrue("per-node nodes block expected: " + build, nodesStart >= 0);
+            int nodeEntries = countOccurrences(build.substring(nodesStart), "\"scalar\":[{\"column\":\"label\",\"type\":\"BITMAP\"}]");
+            assertEquals("every data node must report the type it built: " + build, 3, nodeEntries);
+
+            client().performRequest(new Request("DELETE", "/" + indexName));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
