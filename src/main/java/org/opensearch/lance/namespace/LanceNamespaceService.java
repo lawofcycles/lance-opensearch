@@ -50,6 +50,7 @@ import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
+import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.threadpool.ThreadPool;
@@ -848,7 +849,17 @@ public final class LanceNamespaceService {
                     storedOverrides = rederivationMetadata == null
                         ? LanceOverrides.EMPTY
                         : LanceOverrides.of(rederivationMetadata.getSettings());
-                    if (target == latest) {
+                    boolean nodeLocal = rederivationMetadata != null && LanceLocalClones.isNodeLocal(rederivationMetadata.getSettings());
+                    if (nodeLocal) {
+                        // node_local: the search structures live in per-node
+                        // clones the source never carries, so a derivation
+                        // from the source would flip every clone-built
+                        // lance_text column back to keyword (and trigger the
+                        // rebuild loop below on every cycle). The build
+                        // action maintains the mapping from the clones; the
+                        // poll only advances the reader.
+                        rederivedMappingJson = null;
+                    } else if (target == latest) {
                         RestAttachAction.Derivation derivation = RestAttachAction.derive(latestDataset, storedOverrides, true);
                         rederivedMappingJson = derivation.mappingJson();
                         warnOnLanceFieldRename(indexName, latestDataset.getLanceSchema());

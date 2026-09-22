@@ -184,6 +184,16 @@ public final class LanceEngineFactory implements EngineFactory {
     public static final String OVERRIDES_SETTING = "index.lance.overrides";
 
     /**
+     * Where the search structures of the index live: {@code in_table}
+     * (default) commits index builds into the source table's own manifest
+     * chain; {@code node_local} keeps the source untouched and gives every
+     * data node a shallow clone under its data path (see
+     * {@link LanceLocalClones}) that receives the builds and serves the
+     * node's reads. Registered and validated in {@code LancePlugin}.
+     */
+    public static final String INDEX_PLACEMENT_SETTING = "index.lance.index_placement";
+
+    /**
      * Arrow type kinds a Lance primary key column can take. Kept small on
      * purpose: {@link #LONG} covers signed integer PKs (any bit width up to
      * 64), {@link #KEYWORD} covers Utf8 PKs, and {@link #NONE} is the
@@ -253,6 +263,7 @@ public final class LanceEngineFactory implements EngineFactory {
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(config.getIndexSettings().getSettings());
         LanceOverrides overrides = LanceOverrides.of(config.getIndexSettings().getSettings());
         String indexUuid = config.getIndexSettings().getIndex().getUUID();
+        boolean nodeLocal = LanceLocalClones.isNodeLocal(config.getIndexSettings().getSettings());
         return new LanceReadOnlyEngine(
             config,
             table,
@@ -265,7 +276,8 @@ public final class LanceEngineFactory implements EngineFactory {
             overrides,
             warmCache,
             indexUuid,
-            maxDocsPerReader
+            maxDocsPerReader,
+            nodeLocal
         );
     }
 
@@ -309,6 +321,13 @@ public final class LanceEngineFactory implements EngineFactory {
         final String indexUuid;
         /** Bound on the physical rows a reader of this shard may hold; see {@link LanceEngineFactory#LanceEngineFactory(LanceWarmCache, LongSupplier)}. */
         final LongSupplier maxDocsPerReader;
+        /**
+         * True when {@code index.lance.index_placement} is
+         * {@code node_local}: reads open this node's shallow clone (see
+         * {@link LanceLocalClones}) and the refresh probe compares the
+         * source's version against the clone's recorded base version.
+         */
+        final boolean nodeLocal;
         private final LanceReaderManager lanceReaderManager;
 
         LanceReadOnlyEngine(
@@ -325,6 +344,38 @@ public final class LanceEngineFactory implements EngineFactory {
             String indexUuid,
             LongSupplier maxDocsPerReader
         ) {
+            this(
+                config,
+                table,
+                field,
+                pkType,
+                shardId,
+                pinnedVersion,
+                tag,
+                storageOptions,
+                multiFields,
+                warmCache,
+                indexUuid,
+                maxDocsPerReader,
+                false
+            );
+        }
+
+        LanceReadOnlyEngine(
+            EngineConfig config,
+            String table,
+            String field,
+            LancePrimaryKeyType pkType,
+            int shardId,
+            Optional<Long> pinnedVersion,
+            String tag,
+            StorageOptions storageOptions,
+            java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+            LanceWarmCache warmCache,
+            String indexUuid,
+            LongSupplier maxDocsPerReader,
+            boolean nodeLocal
+        ) {
             super(config, null, null, true, Function.identity(), true);
             this.tablePath = table;
             this.field = field;
@@ -337,6 +388,7 @@ public final class LanceEngineFactory implements EngineFactory {
             this.warmCache = warmCache;
             this.indexUuid = indexUuid;
             this.maxDocsPerReader = maxDocsPerReader;
+            this.nodeLocal = nodeLocal;
             // The super constructor has already taken store.incRef(), the
             // IndexWriter write lock, and a DirectoryReader on the empty
             // commit. If the Lance side fails to open (table missing,
@@ -350,12 +402,22 @@ public final class LanceEngineFactory implements EngineFactory {
             LanceReaderManager manager = null;
             try {
                 Optional<Long> target = resolveVersion();
+                // node_local: make sure this node's shallow clone exists at
+                // the source version the shard is about to serve, before any
+                // reader open resolves to it.
+                Long nodeLocalBase = nodeLocal ? ensureLocalClone(target) : null;
                 initial = openLanceReader(target);
                 long initialVersion;
                 if (target.isPresent()) {
                     // Pinned or tag-resolved: the version is known, no
                     // probe open needed.
                     initialVersion = target.get();
+                } else if (nodeLocalBase != null) {
+                    // The reader serves the clone, whose own manifest chain
+                    // advances with every index build; the version the
+                    // refresh probe compares against the source is the
+                    // clone's recorded base version.
+                    initialVersion = nodeLocalBase;
                 } else if (LanceDirectoryReader.snapshotVersionOf(initial) >= 0) {
                     // The cache resolved the latest version when it built
                     // or found the snapshot; the reader serves exactly that.
@@ -425,6 +487,39 @@ public final class LanceEngineFactory implements EngineFactory {
         }
 
         /**
+         * Make this node's shallow clone current at the source version the
+         * shard serves. {@code target} is the pinned or tag-resolved
+         * version, or empty for a latest-following shard, in which case an
+         * existing clone's recorded version is kept (a version advance is
+         * the refresh path's job) and a first contact resolves the
+         * source's latest version. Returns the clone's base source
+         * version, or {@code null} when no clone service is installed
+         * (test harness), in which case reads keep opening the source.
+         */
+        private Long ensureLocalClone(Optional<Long> target) throws IOException {
+            LanceLocalClones clones = LanceLocalClones.instance();
+            if (clones == null) {
+                return null;
+            }
+            String indexName = config().getShardId().getIndexName();
+            long version;
+            if (target.isPresent()) {
+                version = target.get();
+            } else {
+                Optional<LanceLocalClones.Marker> marker = clones.current(indexName);
+                if (marker.isPresent()) {
+                    version = marker.get().sourceVersion();
+                } else {
+                    try (Dataset probe = LanceRegistry.openDataset(tablePath, storageOptions)) {
+                        version = probe.version();
+                    }
+                }
+            }
+            clones.ensure(indexName, tablePath, storageOptions, version, false);
+            return version;
+        }
+
+        /**
          * Open the shard's whole-table reader at {@code version} (empty
          * for the latest manifest). With a {@link LanceWarmCache} the
          * reader is a view over the node's snapshot of that version, the
@@ -441,7 +536,22 @@ public final class LanceEngineFactory implements EngineFactory {
             if (warmCache != null) {
                 return openSnapshotReader(directory, commit, version);
             }
-            Dataset dataset = LanceRegistry.openDataset(tablePath, storageOptions, version);
+            String openUri = tablePath;
+            StorageOptions openOptions = storageOptions;
+            Optional<Long> openVersion = version;
+            if (nodeLocal) {
+                LanceTableLocation location = LanceTableLocation.forNode(config().getIndexSettings());
+                if (!location.uri().equals(tablePath)) {
+                    // The clone is opened at its own latest version: the
+                    // requested version numbers the source's manifest chain,
+                    // and the clone's chain has moved past it with every
+                    // index build.
+                    openUri = location.uri();
+                    openOptions = location.storageOptions();
+                    openVersion = Optional.empty();
+                }
+            }
+            Dataset dataset = LanceRegistry.openDataset(openUri, openOptions, openVersion);
             // If wrapping the dataset in a directory reader fails, close it
             // here — otherwise the JNI-owned Dataset handle leaks and
             // eventually starves the native allocator. `LanceDirectoryReader`
@@ -932,6 +1042,9 @@ public final class LanceEngineFactory implements EngineFactory {
             try (Dataset latest = LanceRegistry.openDataset(engine.tablePath, engine.storageOptions)) {
                 target = engine.tag != null ? latest.tags().getVersion(engine.tag) : latest.version();
             }
+            if (engine.nodeLocal && LanceLocalClones.instance() != null) {
+                return refreshNodeLocal(referenceToRefresh, target);
+            }
             if (target == servedVersion) {
                 return null;
             }
@@ -945,6 +1058,53 @@ public final class LanceEngineFactory implements EngineFactory {
             OpenSearchDirectoryReader newReader = engine.openLanceReader(openAt);
             servedVersion = target;
             return newReader;
+        }
+
+        /**
+         * The {@code node_local} refresh: the reader serves this node's
+         * clone, so two advances can require a swap. A source advance
+         * ({@code sourceTarget} differs from the served base version)
+         * re-creates the clone at the new version and rebuilds the reader
+         * over it; the clone inherits whatever indexes the source carries,
+         * and indexes that were built into the previous clone only exist
+         * again after the next {@code POST /_lance/build_indexes}. A build
+         * commit into the current clone (the clone's own latest version
+         * moved past the version the reader holds) swaps the reader so GET
+         * and the shard-path shapes see the new indexes; the served base
+         * version does not change in that case.
+         */
+        private OpenSearchDirectoryReader refreshNodeLocal(OpenSearchDirectoryReader referenceToRefresh, long sourceTarget)
+            throws IOException {
+            LanceLocalClones clones = LanceLocalClones.instance();
+            String indexName = engine.config().getShardId().getIndexName();
+            if (sourceTarget != servedVersion) {
+                clones.ensure(indexName, engine.tablePath, engine.storageOptions, sourceTarget, true);
+                if (engine.warmCache != null) {
+                    engine.warmCache.retireAll(engine.indexUuid);
+                }
+                LanceReadOnlyEngine.LOG.info(
+                    "lance.index_placement: source of [{}] moved to version {} (serving {}); re-cloned on this node and rebuilding the reader",
+                    engine.config().getShardId().getIndexName(),
+                    sourceTarget,
+                    servedVersion
+                );
+                OpenSearchDirectoryReader newReader = engine.openLanceReader(Optional.of(sourceTarget));
+                servedVersion = sourceTarget;
+                return newReader;
+            }
+            Optional<LanceLocalClones.Marker> marker = clones.current(indexName);
+            if (marker.isEmpty()) {
+                return null;
+            }
+            long cloneLatest;
+            try (Dataset clone = LanceRegistry.openDataset(marker.get().cloneUri(), StorageOptions.empty())) {
+                cloneLatest = clone.version();
+            }
+            long readerVersion = LanceDirectoryReader.snapshotVersionOf(referenceToRefresh);
+            if (readerVersion >= 0 && cloneLatest != readerVersion) {
+                return engine.openLanceReader(Optional.empty());
+            }
+            return null;
         }
 
         @Override
