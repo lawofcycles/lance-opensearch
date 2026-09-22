@@ -1723,7 +1723,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *       sort, no {@code mode}, no {@code numeric_type} cast, and a
      *       {@code missing} of {@code _first} / {@code _last} / unset
      *       (a literal missing value has no ColumnOrdering
-     *       equivalent).</li>
+     *       equivalent). An {@code ip} mapped column is excluded even
+     *       though its storage is Utf8, because address order is not
+     *       the column's string order.</li>
      * </ul>
      *
      * <p>The caller additionally refuses the pushdown when a reader
@@ -1761,6 +1763,18 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     }
                 }
             } else if (!(sortField instanceof org.apache.lucene.search.SortedSetSortField)) {
+                return null;
+            }
+        }
+        // An ip mapped column sits on a plain Utf8 Lance column whose
+        // lexical string order is not address order, and the response
+        // formats sort values with DocValueFormat.IP, which only decodes
+        // the 16 byte encoded form the Lucene doc values serve. A Lance
+        // ordering over the raw strings would return the wrong order and
+        // fail formatting the sort values, so such a clause stays on the
+        // Lucene collector.
+        for (org.opensearch.search.DocValueFormat format : sortAndFormats.formats) {
+            if (format == org.opensearch.search.DocValueFormat.IP) {
                 return null;
             }
         }
