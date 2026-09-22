@@ -22,6 +22,8 @@ import org.opensearch.lance.plan.calcite.LanceRel;
 import org.apache.calcite.rex.RexNode;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedAggregate;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedFilter;
+import org.opensearch.lance.plan.rel.PushedOperation.PushedFts;
+import org.opensearch.lance.plan.rel.PushedOperation.PushedKnn;
 
 import java.nio.ByteBuffer;
 import java.util.List;
@@ -74,6 +76,26 @@ public class LanceTableScan extends TableScan implements LanceRel {
         return Optional.empty();
     }
 
+    /** The pushed full text match, when the scan carries one. */
+    public Optional<PushedFts> pushedFts() {
+        for (PushedOperation operation : pushedOperations) {
+            if (operation instanceof PushedFts fts) {
+                return Optional.of(fts);
+            }
+        }
+        return Optional.empty();
+    }
+
+    /** The pushed knn search, when the scan carries one. */
+    public Optional<PushedKnn> pushedKnn() {
+        for (PushedOperation operation : pushedOperations) {
+            if (operation instanceof PushedKnn knn) {
+                return Optional.of(knn);
+            }
+        }
+        return Optional.empty();
+    }
+
     /**
      * The same scan with {@code aggregate} pushed into it: the scan's
      * row type becomes the aggregate's and the plan above no longer
@@ -108,18 +130,58 @@ public class LanceTableScan extends TableScan implements LanceRel {
         return new LanceTableScan(getCluster(), getTraitSet(), table, pushed);
     }
 
+    /**
+     * The same scan with {@code fts} pushed into it: the Lance dataset
+     * scan runs the inverted-index lookup with {@code filterSql} as a
+     * prefilter (none when null), the scan's row type becomes the FTS
+     * node's, and the plan above no longer contains the node. Only one
+     * operation may be pushed: the fuse rule matches bare scans.
+     */
+    public LanceTableScan withPushedFts(LanceFtsMatch fts, String filterSql) {
+        if (!pushedOperations.isEmpty()) {
+            throw new IllegalStateException("the scan already carries a pushed operation: " + pushedOperations);
+        }
+        return new LanceTableScan(getCluster(), getTraitSet(), table, ImmutableList.of(new PushedFts(fts, filterSql)));
+    }
+
+    /**
+     * The same scan with {@code knn} pushed into it: the Lance dataset
+     * scan runs the nearest lookup with {@code filterSql} as a
+     * prefilter evaluated before the top-k cutoff (none when null), the
+     * scan's row type becomes the knn node's, and the plan above no
+     * longer contains the node. Only one operation may be pushed: the
+     * fuse rule matches bare scans.
+     */
+    public LanceTableScan withPushedKnn(LanceKnnSearch knn, String filterSql) {
+        if (!pushedOperations.isEmpty()) {
+            throw new IllegalStateException("the scan already carries a pushed operation: " + pushedOperations);
+        }
+        return new LanceTableScan(getCluster(), getTraitSet(), table, ImmutableList.of(new PushedKnn(knn, filterSql)));
+    }
+
     @Override
     public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
         assert inputs.isEmpty();
         return new LanceTableScan(getCluster(), traitSet, table, pushedOperations);
     }
 
-    /** The aggregate's row type when one is pushed, the table row type otherwise. */
+    /**
+     * The aggregate's, FTS node's or knn node's row type when one is
+     * pushed, the table row type otherwise.
+     */
     @Override
     public RelDataType deriveRowType() {
         Optional<PushedAggregate> pushed = pushedAggregate();
         if (pushed.isPresent()) {
             return pushed.get().aggregate().getRowType();
+        }
+        Optional<PushedFts> fts = pushedFts();
+        if (fts.isPresent()) {
+            return fts.get().fts().getRowType();
+        }
+        Optional<PushedKnn> knn = pushedKnn();
+        if (knn.isPresent()) {
+            return knn.get().knn().getRowType();
         }
         return super.deriveRowType();
     }
@@ -128,13 +190,22 @@ public class LanceTableScan extends TableScan implements LanceRel {
      * Row count from the table's statistic (the Lance fragment row
      * counts) for a bare scan, scaled by the pushed filter's guessed
      * selectivity when one is pushed; a pushed aggregate returns one
-     * row per group, so its own estimate stands.
+     * row per group, a pushed FTS its match estimate and a pushed knn
+     * at most {@code k} rows, so their own estimates stand.
      */
     @Override
     public double estimateRowCount(RelMetadataQuery mq) {
         Optional<PushedAggregate> pushed = pushedAggregate();
         if (pushed.isPresent()) {
             return pushed.get().aggregate().estimateRowCount(mq);
+        }
+        Optional<PushedFts> fts = pushedFts();
+        if (fts.isPresent()) {
+            return fts.get().fts().estimateRowCount(mq);
+        }
+        Optional<PushedKnn> knn = pushedKnn();
+        if (knn.isPresent()) {
+            return knn.get().knn().estimateRowCount(mq);
         }
         double rows = table.getRowCount();
         Optional<PushedFilter> filter = pushedFilter();

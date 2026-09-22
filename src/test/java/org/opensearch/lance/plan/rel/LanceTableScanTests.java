@@ -17,6 +17,8 @@ import org.opensearch.lance.plan.calcite.LanceSchema;
 import org.opensearch.lance.plan.calcite.LanceTable;
 import org.opensearch.lance.plan.substrait.LanceSubstraitProducer;
 import org.opensearch.lance.plan.translate.PlanTestFixtures;
+import org.opensearch.lance.query.LanceKnnQueryBuilder;
+import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.List;
@@ -83,6 +85,70 @@ public class LanceTableScanTests extends OpenSearchTestCase {
         assertEquals(pushed.getRowType(), copy.getRowType());
 
         IllegalStateException second = expectThrows(IllegalStateException.class, () -> pushed.withPushedAggregate(aggregate, bytes));
+        assertTrue(second.getMessage().contains("already carries"));
+    }
+
+    public void testPushedFtsChangesRowTypeCostAndDigest() {
+        LanceTableScan bare = (LanceTableScan) PlanTestFixtures.factory()
+            .relBuilder(PlanTestFixtures.model().schema())
+            .scan(LancePlannerFactory.SCHEMA_NAME, "idx")
+            .build();
+        LanceFtsMatch fts = new LanceFtsMatch(
+            bare.getCluster(),
+            bare.getCluster().traitSetOf(org.apache.calcite.plan.Convention.NONE),
+            bare,
+            LanceFtsMatch.Kind.MATCH,
+            List.of("body"),
+            new LanceMatchQueryBuilder("body", "hello")
+        );
+        LanceTableScan pushed = bare.withPushedFts(fts, "category = 'c0'");
+
+        assertEquals(fts.getRowType(), pushed.getRowType());
+        assertEquals(LanceFtsMatch.SCORE_FIELD, pushed.getRowType().getFieldList().get(pushed.getRowType().getFieldCount() - 1).getName());
+        assertTrue(pushed.pushedFts().isPresent());
+        assertEquals("category = 'c0'", pushed.pushedFts().orElseThrow().filterSql());
+        assertNotEquals("the pushed operation is part of the digest", bare.getDigest(), pushed.getDigest());
+        assertTrue("the digest names the FTS parameters: " + pushed.getDigest(), pushed.getDigest().contains("lance_match"));
+
+        RelOptCost cost = pushed.computeSelfCost(pushed.getCluster().getPlanner(), pushed.getCluster().getMetadataQuery());
+        assertEquals("one pushed operation costs one constant", 1.0, cost.getCpu(), 0.0);
+
+        RelNode copy = pushed.copy(pushed.getTraitSet(), List.of());
+        assertTrue(((LanceTableScan) copy).pushedFts().isPresent());
+        assertEquals(pushed.getRowType(), copy.getRowType());
+
+        IllegalStateException second = expectThrows(IllegalStateException.class, () -> pushed.withPushedFts(fts, null));
+        assertTrue(second.getMessage().contains("already carries"));
+    }
+
+    public void testPushedKnnChangesRowTypeCostAndDigest() {
+        LanceTableScan bare = (LanceTableScan) PlanTestFixtures.factory()
+            .relBuilder(PlanTestFixtures.model().schema())
+            .scan(LancePlannerFactory.SCHEMA_NAME, "idx")
+            .build();
+        LanceKnnSearch knn = new LanceKnnSearch(
+            bare.getCluster(),
+            bare.getCluster().traitSetOf(org.apache.calcite.plan.Convention.NONE),
+            bare,
+            new LanceKnnQueryBuilder("embedding", new float[] { 0.1f, 0.2f }, 3)
+        );
+        LanceTableScan pushed = bare.withPushedKnn(knn, "rating = 5");
+
+        assertEquals(knn.getRowType(), pushed.getRowType());
+        assertEquals(
+            LanceKnnSearch.DISTANCE_FIELD,
+            pushed.getRowType().getFieldList().get(pushed.getRowType().getFieldCount() - 1).getName()
+        );
+        assertTrue(pushed.pushedKnn().isPresent());
+        assertEquals("rating = 5", pushed.pushedKnn().orElseThrow().filterSql());
+        assertNotEquals("the pushed operation is part of the digest", bare.getDigest(), pushed.getDigest());
+        assertEquals("a pushed knn returns at most k rows", 3.0, pushed.estimateRowCount(pushed.getCluster().getMetadataQuery()), 0.0);
+
+        RelNode copy = pushed.copy(pushed.getTraitSet(), List.of());
+        assertTrue(((LanceTableScan) copy).pushedKnn().isPresent());
+        assertEquals(pushed.getRowType(), copy.getRowType());
+
+        IllegalStateException second = expectThrows(IllegalStateException.class, () -> pushed.withPushedKnn(knn, null));
         assertTrue(second.getMessage().contains("already carries"));
     }
 }

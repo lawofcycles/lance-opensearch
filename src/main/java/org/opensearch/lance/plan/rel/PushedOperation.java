@@ -13,11 +13,69 @@ import java.util.Objects;
 /**
  * One operation pushed into a {@link LanceTableScan}: the Lance dataset
  * scan computes it, so the plan above the scan no longer contains the
- * node it replaced. The kinds today are {@link PushedAggregate} and
- * {@link PushedFilter}; project and sort kinds join when their pushdown
- * rules land.
+ * node it replaced. The kinds today are {@link PushedAggregate},
+ * {@link PushedFilter}, {@link PushedFts} and {@link PushedKnn};
+ * project and sort kinds join when their pushdown rules land.
  */
-public sealed interface PushedOperation permits PushedOperation.PushedAggregate, PushedOperation.PushedFilter {
+public sealed interface PushedOperation permits PushedOperation.PushedAggregate, PushedOperation.PushedFilter, PushedOperation.PushedFts,
+    PushedOperation.PushedKnn {
+
+    /**
+     * A full text match pushed into the scan: the {@link LanceFtsMatch}
+     * the scan replaced (whose builder the executor turns into the
+     * Lance {@code FullTextQuery}) and the SQL of the scalar filter the
+     * scan evaluates as a Lance prefilter before the inverted-index
+     * lookup, or null when the shape carries no filter. The row type
+     * gains the {@code _score} column.
+     */
+    record PushedFts(LanceFtsMatch fts, String filterSql) implements PushedOperation {
+
+        public PushedFts {
+            Objects.requireNonNull(fts, "fts");
+        }
+
+        /**
+         * Prints every FTS parameter and the filter SQL, so the digest
+         * of two scans with different pushed operations differs and
+         * the explain output names what was pushed.
+         */
+        @Override
+        public String toString() {
+            return "fts{kind="
+                + fts.kind()
+                + ", columns="
+                + fts.columns()
+                + ", query="
+                + fts.queryJson()
+                + (filterSql == null ? "" : ", filter=" + filterSql)
+                + "}";
+        }
+    }
+
+    /**
+     * A vector nearest search pushed into the scan: the
+     * {@link LanceKnnSearch} the scan replaced (whose builder the
+     * executor turns into the Lance nearest query) and the SQL of the
+     * inner filter the scan evaluates as a Lance prefilter before the
+     * top-k cutoff, or null when the clause carries none. The row type
+     * gains the {@code _distance} column.
+     */
+    record PushedKnn(LanceKnnSearch knn, String filterSql) implements PushedOperation {
+
+        public PushedKnn {
+            Objects.requireNonNull(knn, "knn");
+        }
+
+        /**
+         * Prints every knn parameter and the filter SQL, so the digest
+         * of two scans with different pushed operations differs and
+         * the explain output names what was pushed.
+         */
+        @Override
+        public String toString() {
+            return "knn{query=" + knn.queryJson() + (filterSql == null ? "" : ", filter=" + filterSql) + "}";
+        }
+    }
 
     /**
      * A filter pushed into the scan: the predicate over the scan row

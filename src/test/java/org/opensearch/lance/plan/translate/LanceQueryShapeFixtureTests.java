@@ -9,9 +9,11 @@ import com.carrotsearch.randomizedtesting.annotations.Name;
 import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.rel.RelNode;
+import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.rel.LanceFtsMatch;
 import org.opensearch.lance.plan.rel.LanceKnnSearch;
+import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -111,6 +113,37 @@ public class LanceQueryShapeFixtureTests extends OpenSearchTestCase {
             );
         }
         assertEquals("plan of fixture [" + directory + "/" + fixture + "]", expected, actual);
+    }
+
+    /**
+     * Every supported fixture plans through the Volcano run and
+     * terminates in a {@link LanceTableScan} carrying the pushed FTS or
+     * knn operation, with the filter's SQL exactly when the fixture has
+     * a scalar filter; a refusal fixture refuses at translation.
+     */
+    public void testVolcanoFusesEveryFixtureShape() throws IOException {
+        SearchSourceBuilder source = PlanTestFixtures.parse(resource(directory, fixture + ".json"));
+        boolean refusalFixture = resource(directory, fixture + ".plan").startsWith("error: ");
+        LancePlannerFactory factory = PlanTestFixtures.factory();
+        RelNode logical;
+        try {
+            logical = SearchRequestToRel.translateQuery(source.query(), PlanTestFixtures.queryModel(), factory);
+        } catch (UnsupportedOperationException refusal) {
+            assertTrue("only a refusal fixture may throw: " + refusal.getMessage(), refusalFixture);
+            return;
+        }
+        assertFalse("a refusal fixture must throw at translation", refusalFixture);
+        RelNode physical = factory.plan(logical);
+        assertTrue("the fuse rule reaches a scan: " + RelOptUtil.toString(physical), physical instanceof LanceTableScan);
+        LanceTableScan scan = (LanceTableScan) physical;
+        boolean filtered = fixture.contains("filtered") || fixture.contains("must_not_only");
+        if (directory.equals("fts")) {
+            assertTrue("the scan carries the pushed FTS: " + scan.pushedOperations(), scan.pushedFts().isPresent());
+            assertEquals("the filter's SQL travels with the pushed FTS", filtered, scan.pushedFts().get().filterSql() != null);
+        } else {
+            assertTrue("the scan carries the pushed knn: " + scan.pushedOperations(), scan.pushedKnn().isPresent());
+            assertEquals("the filter's SQL travels with the pushed knn", filtered, scan.pushedKnn().get().filterSql() != null);
+        }
     }
 
     /** Translates a fixture body and asserts it becomes the FTS or knn node. */
