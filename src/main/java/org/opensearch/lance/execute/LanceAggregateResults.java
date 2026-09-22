@@ -51,7 +51,14 @@ import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.index.mapper.MappedFieldType;
+import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.ExistsQueryBuilder;
+import org.opensearch.index.query.MatchAllQueryBuilder;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
+import org.opensearch.index.query.RangeQueryBuilder;
+import org.opensearch.index.query.TermQueryBuilder;
+import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.dispatch.LanceAggregationSupport;
 import org.opensearch.lance.engine.FragmentGroupScan;
@@ -3399,12 +3406,18 @@ public final class LanceAggregateResults {
             String otherBucketKey = null;
             if (current instanceof FilterAggregationBuilder filter) {
                 kind = LevelKind.FILTER;
+                if (!FilterChecks.supported(filter.getFilter(), schema, multiFields, qsc)) {
+                    return null;
+                }
                 branchKeys = List.of(filter.getName());
                 estimatedGroups = saturatingMultiply(estimatedGroups, 2L);
             } else if (current instanceof FiltersAggregationBuilder filters) {
                 kind = LevelKind.FILTERS;
                 List<String> keys = new ArrayList<>(filters.filters().size());
                 for (FiltersAggregator.KeyedFilter keyed : filters.filters()) {
+                    if (!FilterChecks.supported(keyed.filter(), schema, multiFields, qsc)) {
+                        return null;
+                    }
                     keys.add(keyed.key());
                 }
                 branchKeys = keys;
@@ -3522,6 +3535,207 @@ public final class LanceAggregateResults {
             }
         }
         return new LanceAggregateResults(aggregate, substrait, levels, null, List.of(), allMetrics, bins, topK);
+    }
+
+    /**
+     * Validation-only mirror of the mask predicates the translator
+     * spelled into the pushed aggregate: whether the query of a
+     * {@code filter} / {@code filters} bucket resolves against the
+     * mapping the way the hand written pushdown resolved it. The
+     * translator resolves fields against the Arrow schema alone (the
+     * coordinating node has no mapping), so a query it accepted may
+     * still name a field the mapping types differently, a {@code text}
+     * column being the case the Arrow type cannot show; the executor
+     * refuses those here and the request stays on the aggregators, as
+     * before.
+     */
+    private static final class FilterChecks {
+
+        private FilterChecks() {}
+
+        static boolean supported(
+            QueryBuilder query,
+            Schema schema,
+            Map<String, LinkedHashMap<String, String>> multiFields,
+            QueryShardContext qsc
+        ) {
+            if (query == null || query instanceof MatchAllQueryBuilder) {
+                return true;
+            }
+            if (query instanceof TermQueryBuilder term) {
+                Column column = resolveColumn(term.fieldName(), schema, multiFields, qsc);
+                return column != null && valueComparable(column, term.value(), qsc);
+            }
+            if (query instanceof TermsQueryBuilder terms) {
+                Column column = resolveColumn(terms.fieldName(), schema, multiFields, qsc);
+                if (column == null) {
+                    return false;
+                }
+                if (terms.values() == null || terms.values().isEmpty()) {
+                    return true;
+                }
+                for (Object value : terms.values()) {
+                    if (!valueComparable(column, value, qsc)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            if (query instanceof ExistsQueryBuilder exists) {
+                return resolveColumn(exists.fieldName(), schema, multiFields, qsc) != null;
+            }
+            if (query instanceof RangeQueryBuilder range) {
+                Column column = resolveColumn(range.fieldName(), schema, multiFields, qsc);
+                return column != null && rangeComparable(column, range, qsc);
+            }
+            if (query instanceof BoolQueryBuilder bool) {
+                if (bool.minimumShouldMatch() != null) {
+                    return false;
+                }
+                boolean positive = !bool.must().isEmpty() || !bool.filter().isEmpty();
+                if (!positive && bool.should().isEmpty() && !bool.mustNot().isEmpty() && !bool.adjustPureNegative()) {
+                    // A purely negative BooleanQuery matches nothing
+                    // unless the builder adds the match_all it does by
+                    // default; the pushdown never spells that.
+                    return false;
+                }
+                for (QueryBuilder clause : bool.must()) {
+                    if (!supported(clause, schema, multiFields, qsc)) {
+                        return false;
+                    }
+                }
+                for (QueryBuilder clause : bool.filter()) {
+                    if (!supported(clause, schema, multiFields, qsc)) {
+                        return false;
+                    }
+                }
+                if (!positive) {
+                    for (QueryBuilder clause : bool.should()) {
+                        if (!supported(clause, schema, multiFields, qsc)) {
+                            return false;
+                        }
+                    }
+                }
+                for (QueryBuilder clause : bool.mustNot()) {
+                    if (!supported(clause, schema, multiFields, qsc)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+
+        /** Whether {@code column = value} resolves in the column's type, as the pushdown's term predicate required. */
+        private static boolean valueComparable(Column column, Object value, QueryShardContext qsc) {
+            if (value == null) {
+                return false;
+            }
+            if (column.isUtf8()) {
+                return true;
+            }
+            if (column.isDate()) {
+                return parseDate(column, null, value, false, qsc) != null && parseDate(column, null, value, true, qsc) != null;
+            }
+            if (column.isBoolean()) {
+                return bool(value) != null;
+            }
+            if (column.isFloating()) {
+                return floating(value) != null;
+            }
+            return integral(value) != null;
+        }
+
+        /** Whether the range query's bounds resolve, as the pushdown's range predicate required. */
+        private static boolean rangeComparable(Column column, RangeQueryBuilder range, QueryShardContext qsc) {
+            if (column.isUtf8() || column.isBoolean() || (range.from() == null && range.to() == null)) {
+                return false;
+            }
+            if (column.isDate()) {
+                if (range.from() != null && parseDate(column, range, range.from(), !range.includeLower(), qsc) == null) {
+                    return false;
+                }
+                return range.to() == null || parseDate(column, range, range.to(), range.includeUpper(), qsc) != null;
+            }
+            if (column.isFloating()) {
+                if (range.from() != null && floating(range.from()) == null) {
+                    return false;
+                }
+                return range.to() == null || floating(range.to()) != null;
+            }
+            if (range.from() != null && integral(range.from()) == null) {
+                return false;
+            }
+            return range.to() == null || integral(range.to()) != null;
+        }
+
+        /**
+         * Epoch millis of a date bound through the field's date format
+         * (the range query's {@code format} and {@code time_zone} when
+         * it names them), null when the text does not parse.
+         */
+        private static Long parseDate(Column column, RangeQueryBuilder range, Object value, boolean roundUp, QueryShardContext qsc) {
+            try {
+                String pattern = range == null ? null : range.format();
+                java.time.ZoneId zone = range == null || range.timeZone() == null ? null : java.time.ZoneId.of(range.timeZone());
+                DocValueFormat format = column.fieldType().docValueFormat(pattern, zone);
+                return format.parseLong(text(value), roundUp, qsc::nowInMillis);
+            } catch (RuntimeException unparseable) {
+                return null;
+            }
+        }
+
+        private static String text(Object value) {
+            return value instanceof BytesRef bytes ? bytes.utf8ToString() : String.valueOf(value);
+        }
+
+        private static Boolean bool(Object value) {
+            if (value instanceof Boolean flag) {
+                return flag;
+            }
+            String text = text(value);
+            if (text.equals("true")) {
+                return true;
+            }
+            return text.equals("false") ? false : null;
+        }
+
+        /** A whole number, or null: a fractional value on an integer column has rounding rules the pushdown does not replicate. */
+        private static Long integral(Object value) {
+            if (value instanceof Boolean) {
+                return null;
+            }
+            double number;
+            if (value instanceof Number n) {
+                number = n.doubleValue();
+            } else {
+                try {
+                    number = Double.parseDouble(text(value));
+                } catch (NumberFormatException unparseable) {
+                    return null;
+                }
+            }
+            if (!Double.isFinite(number) || number != Math.rint(number) || Math.abs(number) > 9.007199254740992E15d) {
+                return null;
+            }
+            return (long) number;
+        }
+
+        /** The value as a double, or null when it is not a number. */
+        private static Double floating(Object value) {
+            if (value instanceof Boolean) {
+                return null;
+            }
+            if (value instanceof Number n) {
+                return Double.isNaN(n.doubleValue()) ? null : n.doubleValue();
+            }
+            try {
+                double number = Double.parseDouble(text(value));
+                return Double.isNaN(number) ? null : number;
+            } catch (NumberFormatException unparseable) {
+                return null;
+            }
+        }
     }
 
     /**
