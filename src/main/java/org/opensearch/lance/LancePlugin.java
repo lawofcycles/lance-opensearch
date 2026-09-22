@@ -45,6 +45,8 @@ import org.opensearch.lance.namespace.AllowedTableRoots;
 import org.opensearch.lance.namespace.LanceNamespaceListAction;
 import org.opensearch.lance.namespace.LanceNamespaceService;
 import org.opensearch.lance.namespace.TransportLanceNamespaceListAction;
+import org.opensearch.lance.plan.explain.LanceExplainAction;
+import org.opensearch.lance.plan.explain.TransportLanceExplainAction;
 import org.opensearch.lance.query.FtsAdmission;
 import org.opensearch.lance.query.LanceFtsBoolQueryBuilder;
 import org.opensearch.lance.query.LanceFtsBoostQueryBuilder;
@@ -57,6 +59,7 @@ import org.opensearch.lance.refs.LanceRefsAction;
 import org.opensearch.lance.refs.TransportLanceRefsAction;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.lance.rest.RestBuildIndexesAction;
+import org.opensearch.lance.rest.RestLanceExplainAction;
 import org.opensearch.lance.rest.RestNamespaceAction;
 import org.opensearch.lance.rest.RestLanceStatsAction;
 import org.opensearch.lance.rest.RestRefsAction;
@@ -1152,7 +1155,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             new ActionHandler<>(LanceAttachAction.INSTANCE, TransportLanceAttachAction.class),
             new ActionHandler<>(LanceBuildIndexesAction.INSTANCE, TransportLanceBuildIndexesAction.class),
             new ActionHandler<>(LanceRefsAction.INSTANCE, TransportLanceRefsAction.class),
-            new ActionHandler<>(LanceStatsAction.INSTANCE, TransportLanceStatsAction.class)
+            new ActionHandler<>(LanceStatsAction.INSTANCE, TransportLanceStatsAction.class),
+            new ActionHandler<>(LanceExplainAction.INSTANCE, TransportLanceExplainAction.class)
         );
     }
 
@@ -1198,7 +1202,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             new RestNamespaceAction(),
             new RestBuildIndexesAction(),
             new RestRefsAction(),
-            new RestLanceStatsAction()
+            new RestLanceStatsAction(),
+            new RestLanceExplainAction()
         );
     }
 }
