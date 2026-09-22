@@ -50,7 +50,11 @@ import java.io.IOException;
  * arrives; the model build and the translation are handed to the
  * plugin's {@code lance_coordinator} pool because building the model on
  * a cold node opens the Lance table (metadata I/O) and the translation
- * is CPU work that does not belong on a transport thread.
+ * is CPU work that does not belong on a transport thread. The transport
+ * handler registers on {@code SAME} so a remote request is not bounced
+ * through the pool once for the handler and again for the explicit
+ * fork; the fork inside {@link #doExecute} is the single hop for local
+ * and remote callers alike.
  *
  * <p>The cost budgets handed to {@link LancePlannerFactory} (the node's
  * {@code lance.native_memory.limit} and the JVM's max heap) do not
@@ -74,13 +78,7 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
         LanceWarmCache warmCache,
         Settings settings
     ) {
-        super(
-            LanceExplainAction.NAME,
-            transportService,
-            actionFilters,
-            LanceExplainRequest::new,
-            LancePlugin.LANCE_COORDINATOR_THREAD_POOL
-        );
+        super(LanceExplainAction.NAME, transportService, actionFilters, LanceExplainRequest::new, ThreadPool.Names.SAME);
         this.threadPool = threadPool;
         this.clusterService = clusterService;
         this.warmCache = warmCache;
