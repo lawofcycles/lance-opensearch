@@ -42,8 +42,9 @@ import java.util.StringJoiner;
  * @param format the request's key format pattern
  * @param ranges range / date_range bounds, in the sorted order the
  *     aggregator prepares them
- * @param filterKeys the bucket keys of a filter / filters aggregation,
- *     or the aggregation name for {@code missing}
+ * @param filterKeys the bucket keys of a filter / filters aggregation;
+ *     empty for {@code missing}, whose one branch is named by
+ *     {@code aggregationName}
  * @param otherBucketKey the filters other bucket key, null when the
  *     request asked for none
  * @param compositeAfter the request's raw {@code after} key, carried on
@@ -274,7 +275,7 @@ public record BucketSpec(Kind kind, String aggregationName, Integer size, Intege
         );
     }
 
-    /** A missing bucket. */
+    /** A missing bucket; its one branch is named by {@link #aggregationName()}, so {@code filterKeys} stays empty. */
     public static BucketSpec missing(String name) {
         return new BucketSpec(
             Kind.MISSING,
@@ -290,7 +291,7 @@ public record BucketSpec(Kind kind, String aggregationName, Integer size, Intege
             null,
             null,
             null,
-            List.of(name),
+            List.of(),
             null,
             null,
             null,
@@ -397,7 +398,7 @@ public record BucketSpec(Kind kind, String aggregationName, Integer size, Intege
         if (ranges != null) {
             fields.add("ranges=" + ranges);
         }
-        if (filterKeys != null) {
+        if (filterKeys != null && !filterKeys.isEmpty()) {
             fields.add("keys=" + filterKeys);
         }
         if (otherBucketKey != null) {
