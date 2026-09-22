@@ -50,15 +50,17 @@ public final class LanceSchemas {
      * Arrow schema and multi-fields spec field resolution reads, the
      * renames the mapping records (stale column name to the name the
      * Lance table uses now, so field resolution can refuse a stale name
-     * with the rename instead of a generic unknown-field message), and
-     * the table / schema pair the {@code RelBuilder} resolves against.
-     * {@code multiFields} maps a base column to its declared sub-fields
+     * with the rename instead of a generic unknown-field message), the
+     * primary key column {@code ids} queries resolve against (empty
+     * when the index declared none), and the table / schema pair the
+     * {@code RelBuilder} resolves against. {@code multiFields} maps a
+     * base column to its declared sub-fields
      * ({@code body -> {raw: keyword}}), empty when the attach declared
      * none.
      */
     public record IndexModel(String indexName, Schema arrowSchema, Map<String, LinkedHashMap<String, String>> multiFields, Map<
         String,
-        String> renamedFields, LanceTable table, LanceSchema schema) {
+        String> renamedFields, String primaryKeyField, LanceTable table, LanceSchema schema) {
     }
 
     /**
@@ -71,7 +73,7 @@ public final class LanceSchemas {
         Map<String, LinkedHashMap<String, String>> multiFields,
         LongSupplier rowCount
     ) {
-        return model(indexName, arrowSchema, multiFields, Map.of(), rowCount);
+        return model(indexName, arrowSchema, multiFields, Map.of(), "", rowCount);
     }
 
     /** The model with the mapping's recorded renames (stale name to live name). */
@@ -82,8 +84,42 @@ public final class LanceSchemas {
         Map<String, String> renamedFields,
         LongSupplier rowCount
     ) {
+        return model(indexName, arrowSchema, multiFields, renamedFields, "", rowCount);
+    }
+
+    /**
+     * The {@link #model(String, Schema, Map, LongSupplier)} shape with a
+     * primary key column, for indexes whose attach declared one.
+     */
+    public static IndexModel model(
+        String indexName,
+        Schema arrowSchema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        String primaryKeyField,
+        LongSupplier rowCount
+    ) {
+        return model(indexName, arrowSchema, multiFields, Map.of(), primaryKeyField, rowCount);
+    }
+
+    /** The model with both the recorded renames and the primary key column, as {@link #build} reads them. */
+    public static IndexModel model(
+        String indexName,
+        Schema arrowSchema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        Map<String, String> renamedFields,
+        String primaryKeyField,
+        LongSupplier rowCount
+    ) {
         LanceTable table = new LanceTable(indexName, arrowSchema, rowCount);
-        return new IndexModel(indexName, arrowSchema, multiFields, renamedFields, table, new LanceSchema(Map.of(indexName, table)));
+        return new IndexModel(
+            indexName,
+            arrowSchema,
+            multiFields,
+            renamedFields,
+            primaryKeyField,
+            table,
+            new LanceSchema(Map.of(indexName, table))
+        );
     }
 
     /**
@@ -141,7 +177,7 @@ public final class LanceSchemas {
                 rows += fragmentRows;
             }
             final long total = rows;
-            return model(indexName, arrowSchema, multiFields, renamedFields, () -> total);
+            return model(indexName, arrowSchema, multiFields, renamedFields, pkField, () -> total);
         }
     }
 }

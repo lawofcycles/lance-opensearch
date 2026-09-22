@@ -1,0 +1,1 @@
+{"query":{"range":{"ts":{"gte":"01/2024","format":"MM/yyyy","time_zone":"+09:00"}}}}

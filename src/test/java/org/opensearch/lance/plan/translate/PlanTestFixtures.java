@@ -27,6 +27,7 @@ import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 /**
  * The shared translation fixture of the plan tests: an index model over
@@ -58,6 +59,30 @@ public final class PlanTestFixtures {
         )
     );
 
+    /**
+     * The columns of {@link #SCHEMA} plus a {@code meta} struct with a
+     * {@code region} utf8 child and a {@code score} float64 child, for
+     * the query translation fixtures that exercise struct paths. Kept
+     * apart from {@link #SCHEMA} so the aggregation plan fixtures,
+     * whose projections print every scan column, stay as B-1 pinned
+     * them.
+     */
+    static final Schema QUERY_SCHEMA = new Schema(
+        Stream.concat(
+            SCHEMA.getFields().stream(),
+            Stream.of(
+                new Field(
+                    "meta",
+                    new FieldType(true, new ArrowType.Struct(), null),
+                    List.of(
+                        field("region", new ArrowType.Utf8(), true),
+                        field("score", new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE), true)
+                    )
+                )
+            )
+        ).toList()
+    );
+
     private static final NamedXContentRegistry REGISTRY = new NamedXContentRegistry(
         new SearchModule(Settings.EMPTY, List.of()).getNamedXContents()
     );
@@ -70,6 +95,13 @@ public final class PlanTestFixtures {
         LinkedHashMap<String, String> bodySubs = new LinkedHashMap<>();
         bodySubs.put("raw", "keyword");
         return LanceSchemas.model("idx", SCHEMA, Map.of("body", bodySubs), () -> 512L);
+    }
+
+    /** The {@link #QUERY_SCHEMA} model with {@code id} as primary key, for the query translation fixtures. */
+    static LanceSchemas.IndexModel queryModel() {
+        LinkedHashMap<String, String> bodySubs = new LinkedHashMap<>();
+        bodySubs.put("raw", "keyword");
+        return LanceSchemas.model("idx", QUERY_SCHEMA, Map.of("body", bodySubs), "id", () -> 512L);
     }
 
     public static LancePlannerFactory factory() {

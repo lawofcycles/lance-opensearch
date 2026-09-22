@@ -1,0 +1,1 @@
+{"query":{"bool":{"should":[{"term":{"category":"a"}}],"minimum_should_match":2}}}

@@ -1,0 +1,1 @@
+error: wildcard on column [rating] behind field [rating] is not a string column

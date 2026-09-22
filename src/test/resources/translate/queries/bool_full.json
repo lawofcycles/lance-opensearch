@@ -1,0 +1,1 @@
+{"query":{"bool":{"must":[{"term":{"category":"c0"}}],"filter":[{"range":{"rating":{"gte":10}}}],"must_not":[{"term":{"flag":true}}],"should":[{"term":{"rating":1}}]}}}

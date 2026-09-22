@@ -1,0 +1,1 @@
+{"query":{"prefix":{"category":{"value":"AB","case_insensitive":true}}}}

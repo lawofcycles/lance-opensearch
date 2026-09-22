@@ -262,10 +262,10 @@ public class AggregationToRelRefusalTests extends OpenSearchTestCase {
         );
     }
 
-    public void testFilterWildcardQueryThrows() throws IOException {
+    public void testFilterMatchQueryThrows() throws IOException {
         assertEquals(
-            "query type [wildcard] in filter of aggregation [f]",
-            messageOf("{\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"wildcard\":{\"category\":\"a*\"}}}}}")
+            "query type [match] in filter of aggregation [f]",
+            messageOf("{\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"match\":{\"category\":\"a\"}}}}}")
         );
     }
 

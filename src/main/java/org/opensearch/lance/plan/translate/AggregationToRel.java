@@ -550,7 +550,7 @@ final class AggregationToRel {
             if (builder instanceof FilterAggregationBuilder filter) {
                 kind = BucketSpec.Kind.FILTER;
                 predicates.add(
-                    FilterQueryToRex.predicate(filter.getFilter(), filter.getName(), schema, multiFields, renamedFields, relBuilder)
+                    QueryToRex.predicate(filter.getFilter(), filter.getName(), schema, multiFields, renamedFields, relBuilder)
                 );
                 keys.add(filter.getName());
             } else {
@@ -564,7 +564,7 @@ final class AggregationToRel {
                 }
                 for (FiltersAggregator.KeyedFilter keyed : filters.filters()) {
                     predicates.add(
-                        FilterQueryToRex.predicate(keyed.filter(), filters.getName(), schema, multiFields, renamedFields, relBuilder)
+                        QueryToRex.predicate(keyed.filter(), filters.getName(), schema, multiFields, renamedFields, relBuilder)
                     );
                     keys.add(keyed.key());
                 }
