@@ -244,10 +244,10 @@ public class LanceOverridesIT extends LanceRestTestCase {
         // Unknown type value: refused at parse time, naming the accepted set.
         ResponseException badType = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"label\":{\"type\":\"ip\"}}}")
+            () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"label\":{\"type\":\"geo_point\"}}}")
         );
         assertEquals(400, badType.getResponse().getStatusLine().getStatusCode());
-        assertTrue(readAll(badType.getResponse()).contains("[date], [keyword]"));
+        assertTrue(readAll(badType.getResponse()).contains("[date], [keyword], [ip]"));
 
         // Arrow type outside the accepted set: refused at derive time.
         ResponseException dateOnUtf8 = expectThrows(

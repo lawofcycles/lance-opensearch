@@ -1179,7 +1179,18 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             if (!(type instanceof String typeName)) {
                 return null;
             }
-            return "date".equals(typeName) && isIntegerArrowType(fieldMap) ? LanceKnnFilterTranslator.DATE_ON_INTEGER : typeName;
+            if ("date".equals(typeName) && isIntegerArrowType(fieldMap)) {
+                return LanceKnnFilterTranslator.DATE_ON_INTEGER;
+            }
+            if ("ip".equals(typeName)) {
+                // The only way a field maps as `ip` in this plugin is the
+                // attach body's override on a Utf8 (or List<Utf8>)
+                // column, so no meta check is needed: the storage is
+                // always plain strings and no predicate may push as a
+                // string comparison.
+                return LanceKnnFilterTranslator.IP_ON_UTF8;
+            }
+            return typeName;
         };
     }
 

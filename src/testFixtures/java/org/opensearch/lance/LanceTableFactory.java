@@ -1127,6 +1127,99 @@ public final class LanceTableFactory {
         });
     }
 
+    /**
+     * Writes a Lance table for the {@code type: ip} override tests: a
+     * Utf8 column of IP address strings (IPv4, IPv6, an IPv4-mapped
+     * IPv6 form and one invalid string) next to a {@code List<Utf8>}
+     * column of the multi-valued shape.
+     *
+     * <p>Row layout (fixed six-row table):
+     * <ul>
+     *   <li>id (int32, nullable, no PK metadata): {@code i}</li>
+     *   <li>ip (utf8, nullable): "10.0.0.4", "10.0.0.30", "192.168.1.7",
+     *       "2001:db8::1", "::ffff:10.0.0.2", "not-an-ip". The pair
+     *       (10.0.0.4, 10.0.0.30) sorts one way as strings and the other
+     *       way as addresses, so order-sensitive assertions prove the
+     *       encoded doc values are in use; the IPv4-mapped row proves
+     *       canonicalisation (it equals 10.0.0.2); the last row proves
+     *       the invalid-value handling.</li>
+     *   <li>addrs (list&lt;utf8&gt;, nullable): per-row address lists,
+     *       row 2 carrying one invalid element ("bogus") next to a valid
+     *       one and row 4 an empty list</li>
+     * </ul>
+     */
+    public static String writeIpTable(Path parent, String name) throws Exception {
+        return withLocaleRoot(() -> writeIpTableOnce(parent, name));
+    }
+
+    /** The {@code ip} column values {@link #writeIpTable} writes, by row. */
+    public static String[] ipFixtureValues() {
+        return new String[] { "10.0.0.4", "10.0.0.30", "192.168.1.7", "2001:db8::1", "::ffff:10.0.0.2", "not-an-ip" };
+    }
+
+    private static String writeIpTableOnce(Path parent, String name) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        String[] ips = ipFixtureValues();
+        String[][] addrs = {
+            { "10.0.0.4", "2001:db8::1" },
+            { "10.0.0.30" },
+            { "192.168.1.7", "bogus" },
+            { "2001:db8::1" },
+            {},
+            { "10.0.0.9" } };
+        int rowCount = ips.length;
+        Field addrsElement = new Field("item", FieldType.nullable(new ArrowType.Utf8()), null);
+        Schema schema = new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("ip", FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("addrs", FieldType.nullable(new ArrowType.List()), Collections.singletonList(addrsElement))
+            ),
+            Map.of()
+        );
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            byte[] ipcBytes;
+            try (
+                VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                ByteArrayOutputStream out = new ByteArrayOutputStream()
+            ) {
+                IntVector idVector = (IntVector) root.getVector("id");
+                VarCharVector ipVector = (VarCharVector) root.getVector("ip");
+                ListVector addrsVector = (ListVector) root.getVector("addrs");
+                VarCharVector element = (VarCharVector) addrsVector.getDataVector();
+                root.allocateNew();
+                int elem = 0;
+                for (int i = 0; i < rowCount; i++) {
+                    idVector.setSafe(i, i);
+                    ipVector.setSafe(i, ips[i].getBytes(StandardCharsets.UTF_8));
+                    addrsVector.startNewValue(i);
+                    for (String addr : addrs[i]) {
+                        element.setSafe(elem++, addr.getBytes(StandardCharsets.UTF_8));
+                    }
+                    addrsVector.endValue(i, addrs[i].length);
+                }
+                root.setRowCount(rowCount);
+                try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                }
+                ipcBytes = out.toByteArray();
+            }
+            try (
+                ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+            ) {
+                Data.exportArrayStream(allocator, reader, stream);
+                WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
+                Dataset.create(allocator, stream, uri, writeParams).close();
+            }
+        }
+        return uri;
+    }
+
     private static byte[] epochMillisBatch(RootAllocator allocator, int startId, int rowCount, long[] millis) throws Exception {
         Schema schema = new Schema(
             Arrays.asList(

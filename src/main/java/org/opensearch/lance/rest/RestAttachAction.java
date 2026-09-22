@@ -231,6 +231,7 @@ public class RestAttachAction extends BaseRestHandler {
         multiFields = effective.subFields();
         Map<String, String> dateOverrides = effective.dateColumns();
         java.util.Set<String> keywordOverrides = effective.keywordColumns();
+        java.util.Set<String> ipOverrides = effective.ipColumns();
         for (LanceField field : lanceSchema.fields()) {
             ArrowType type = field.getType();
             String name = field.getName();
@@ -420,7 +421,22 @@ public class RestAttachAction extends BaseRestHandler {
             } else if (type instanceof ArrowType.Utf8) {
                 boolean hasFts = !dataset.describeIndices(new IndexCriteria.Builder().forColumn(name).mustSupportFts(true).build())
                     .isEmpty();
-                if (hasFts && !keywordOverrides.contains(name)) {
+                if (ipOverrides.contains(name)) {
+                    // Utf8 column holding IP address strings. The mapping
+                    // becomes `ip` over doc values: the fragment reader
+                    // parses each string with InetAddresses.forString and
+                    // serves the 16 byte InetAddressPoint encoding through
+                    // SortedSetDocValues, which is exactly the doc-values
+                    // shape IpFieldType queries, sorts and aggregates
+                    // over. The meta keeps the real Arrow type. Like a
+                    // keyword override, the column leaves the FTS build
+                    // and optimise targets.
+                    startFieldWithId(mapping, name, fieldId, "ip", arrowTypeIdentity(type));
+                    mapping.field("index", false).field("doc_values", true);
+                    writeMultiFieldsBlock(mapping, name, multiFields);
+                    mapping.endObject();
+                    scalarColumns.add(name);
+                } else if (hasFts && !keywordOverrides.contains(name)) {
                     startFieldWithId(mapping, name, fieldId, "lance_text", arrowTypeIdentity(type));
                     writeMultiFieldsBlock(mapping, name, multiFields);
                     mapping.endObject();
@@ -484,7 +500,10 @@ public class RestAttachAction extends BaseRestHandler {
                     // List<Utf8> maps to keyword. OpenSearch's keyword is multi-valued
                     // through SortedSetDocValues, and Lance stores the element list per
                     // row in a ListVector, so no additional mapping option is needed.
-                    startFieldWithId(mapping, name, fieldId, "keyword", "list<utf8>");
+                    // An `ip` override maps the multi-valued column to `ip` instead;
+                    // the reader encodes each element like a scalar ip column.
+                    String listType = ipOverrides.contains(name) ? "ip" : "keyword";
+                    startFieldWithId(mapping, name, fieldId, listType, "list<utf8>");
                     mapping.field("index", false).field("doc_values", true).endObject();
                     scalarColumns.add(name);
                 } else if (type instanceof ArrowType.List
@@ -581,9 +600,10 @@ public class RestAttachAction extends BaseRestHandler {
      * 64 bit integer column (read as epoch millis) or a Date / Timestamp
      * column (a pin of the derived type); {@code type: keyword} needs a
      * Utf8 column (with or without an inverted index) or a List&lt;Utf8&gt;
-     * column (a pin); {@code fields} needs a Utf8 column, sub-field types
-     * must be {@code keyword}, and a sub-field path must not collide with
-     * an existing schema column.
+     * column (a pin); {@code type: ip} needs a Utf8 or List&lt;Utf8&gt;
+     * column whose strings are IP addresses; {@code fields} needs a Utf8
+     * column, sub-field types must be {@code keyword}, and a sub-field
+     * path must not collide with an existing schema column.
      */
     private static LanceOverrides validateOverrides(
         LanceOverrides overrides,
@@ -639,6 +659,22 @@ public class RestAttachAction extends BaseRestHandler {
                     if (!utf8 && !listOfUtf8) {
                         throw new IllegalArgumentException(
                             "[overrides." + baseName + ".type=keyword] needs a Utf8 or List<Utf8> column; [" + baseName + "] is " + type
+                        );
+                    }
+                }
+                if (LanceOverrides.TYPE_IP.equals(column.type())) {
+                    boolean utf8 = type instanceof ArrowType.Utf8;
+                    boolean listOfUtf8 = type instanceof ArrowType.List
+                        && field.getChildren().size() == 1
+                        && field.getChildren().get(0).getType() instanceof ArrowType.Utf8;
+                    if (!utf8 && !listOfUtf8) {
+                        throw new IllegalArgumentException(
+                            "[overrides."
+                                + baseName
+                                + ".type=ip] needs a Utf8 or List<Utf8> column holding IP address strings; ["
+                                + baseName
+                                + "] is "
+                                + type
                         );
                     }
                 }

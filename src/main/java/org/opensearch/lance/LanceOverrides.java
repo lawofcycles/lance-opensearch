@@ -26,7 +26,8 @@ import org.opensearch.lance.rest.RestAttachAction;
  * or namespace-register body. One column may carry a base type override
  * ({@code type: date} on an integer column stored as epoch millis,
  * {@code type: keyword} on a Utf8 column that also has a Lance inverted
- * index), a {@code format} (with {@code type: date} only) and keyword
+ * index, {@code type: ip} on a Utf8 column holding IP address strings),
+ * a {@code format} (with {@code type: date} only) and keyword
  * sub-field declarations ({@code fields}).
  *
  * <p>The canonical JSON persisted in the {@code index.lance.overrides}
@@ -54,6 +55,7 @@ public final class LanceOverrides {
     /** Base column types an override may declare. */
     public static final String TYPE_DATE = "date";
     public static final String TYPE_KEYWORD = "keyword";
+    public static final String TYPE_IP = "ip";
 
     /** Default mapping format of a {@code type: date} override on an integer column. */
     public static final String DEFAULT_DATE_FORMAT = "epoch_millis";
@@ -120,6 +122,17 @@ public final class LanceOverrides {
         for (Map.Entry<String, Column> entry : columns.entrySet()) {
             if (TYPE_DATE.equals(entry.getValue().type())) {
                 out.put(entry.getKey(), entry.getValue().format());
+            }
+        }
+        return out;
+    }
+
+    /** Columns overridden to {@code ip}. */
+    public Set<String> ipColumns() {
+        Set<String> out = new LinkedHashSet<>();
+        for (Map.Entry<String, Column> entry : columns.entrySet()) {
+            if (TYPE_IP.equals(entry.getValue().type())) {
+                out.add(entry.getKey());
             }
         }
         return out;
@@ -231,8 +244,8 @@ public final class LanceOverrides {
      * <p>Structural validation only, everything a 400 without opening
      * the table: per-column values must be objects whose keys come from
      * {@code type} / {@code format} / {@code fields}, {@code type} must
-     * be {@code date} or {@code keyword}, {@code format} needs
-     * {@code type: date} and must parse through
+     * be {@code date}, {@code keyword} or {@code ip}, {@code format}
+     * needs {@code type: date} and must parse through
      * {@link DateFormatter#forPattern}, and sub-field entries must be
      * objects with a string {@code type}.
      *
@@ -293,9 +306,9 @@ public final class LanceOverrides {
             if (!(rawType instanceof String typeStr) || typeStr.isEmpty()) {
                 throw new IllegalArgumentException("[overrides." + baseName + ".type] must be a non-empty string");
             }
-            if (!TYPE_DATE.equals(typeStr) && !TYPE_KEYWORD.equals(typeStr)) {
+            if (!TYPE_DATE.equals(typeStr) && !TYPE_KEYWORD.equals(typeStr) && !TYPE_IP.equals(typeStr)) {
                 throw new IllegalArgumentException(
-                    "[overrides." + baseName + ".type=" + typeStr + "] is not supported; accepted types are [date], [keyword]"
+                    "[overrides." + baseName + ".type=" + typeStr + "] is not supported; accepted types are [date], [keyword], [ip]"
                 );
             }
             type = typeStr;

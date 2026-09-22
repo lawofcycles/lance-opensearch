@@ -222,6 +222,9 @@ public final class ColumnStore implements Closeable {
      * caller to publish as its request scoped heap columns. Fragments the
      * store already held are in {@link KeywordLoad#stored()} either way.
      *
+     * @param encoder per-column value encoder the dictionary interning
+     *        applies ({@code null} for raw UTF-8 terms); an
+     *        {@code ip}-overridden column passes {@link IpTermEncoder}
      * @return the stored and heap parts covering every requested
      *         fragment, or {@code null} when the scan itself failed on an
      *         allocator limit (the caller then loads into heap for
@@ -232,7 +235,8 @@ public final class ColumnStore implements Closeable {
         Dataset dataset,
         String column,
         Map<Integer, Integer> fragmentRows,
-        FragmentGroupScan groupScan
+        FragmentGroupScan groupScan,
+        KeywordDictionaryBuilder.TermEncoder encoder
     ) throws IOException {
         Loaded<CachedKeywordColumn, HeapKeyword> loaded = acquire(
             snapshot,
@@ -241,7 +245,7 @@ public final class ColumnStore implements Closeable {
             fragmentRows,
             CachedKeywordColumn.class,
             groupScan,
-            this::loadKeyword
+            (d, c, missing, scan) -> loadKeyword(d, c, missing, scan, encoder)
         );
         return loaded == null ? null : new KeywordLoad(loaded.stored(), loaded.heap());
     }
@@ -255,7 +259,8 @@ public final class ColumnStore implements Closeable {
         Dataset dataset,
         String column,
         Map<Integer, Integer> fragmentRows,
-        FragmentGroupScan groupScan
+        FragmentGroupScan groupScan,
+        KeywordDictionaryBuilder.TermEncoder encoder
     ) throws IOException {
         Loaded<CachedKeywordArrayColumn, HeapKeywordArray> loaded = acquire(
             snapshot,
@@ -264,7 +269,7 @@ public final class ColumnStore implements Closeable {
             fragmentRows,
             CachedKeywordArrayColumn.class,
             groupScan,
-            this::loadKeywordArray
+            (d, c, missing, scan) -> loadKeywordArray(d, c, missing, scan, encoder)
         );
         return loaded == null ? null : new KeywordArrayLoad(loaded.stored(), loaded.heap());
     }
@@ -573,7 +578,8 @@ public final class ColumnStore implements Closeable {
         Dataset dataset,
         String column,
         Map<Integer, Integer> missing,
-        FragmentGroupScan groupScan
+        FragmentGroupScan groupScan,
+        KeywordDictionaryBuilder.TermEncoder encoder
     ) throws IOException {
         Map<Integer, int[]> idsByFragment = new HashMap<>(missing.size() * 2);
         Map<Integer, KeywordDictionaryBuilder> builders = new HashMap<>(missing.size() * 2);
@@ -581,7 +587,7 @@ public final class ColumnStore implements Closeable {
             int[] ids = new int[entry.getValue()];
             Arrays.fill(ids, -1);
             idsByFragment.put(entry.getKey(), ids);
-            builders.put(entry.getKey(), new KeywordDictionaryBuilder());
+            builders.put(entry.getKey(), new KeywordDictionaryBuilder(encoder));
         }
         scan(dataset, column, missing.keySet(), groupScan, (fragmentId, offset, source, row) -> {
             int[] ids = idsByFragment.get(fragmentId);
@@ -589,6 +595,9 @@ public final class ColumnStore implements Closeable {
                 ids[offset] = builders.get(fragmentId).intern((VarCharVector) source, row);
             }
         });
+        for (Map.Entry<Integer, KeywordDictionaryBuilder> entry : builders.entrySet()) {
+            IpTermEncoder.logInvalid(column, entry.getKey(), entry.getValue().invalidCount());
+        }
         long needed = 0L;
         for (Map.Entry<Integer, Integer> entry : missing.entrySet()) {
             KeywordDictionaryBuilder builder = builders.get(entry.getKey());
@@ -672,13 +681,14 @@ public final class ColumnStore implements Closeable {
         Dataset dataset,
         String column,
         Map<Integer, Integer> missing,
-        FragmentGroupScan groupScan
+        FragmentGroupScan groupScan,
+        KeywordDictionaryBuilder.TermEncoder encoder
     ) throws IOException {
         Map<Integer, int[][]> rowsByFragment = new HashMap<>(missing.size() * 2);
         Map<Integer, KeywordDictionaryBuilder> builders = new HashMap<>(missing.size() * 2);
         for (Map.Entry<Integer, Integer> entry : missing.entrySet()) {
             rowsByFragment.put(entry.getKey(), new int[entry.getValue()][]);
-            builders.put(entry.getKey(), new KeywordDictionaryBuilder());
+            builders.put(entry.getKey(), new KeywordDictionaryBuilder(encoder));
         }
         scan(dataset, column, missing.keySet(), groupScan, (fragmentId, offset, source, row) -> {
             int[][] rows = rowsByFragment.get(fragmentId);
@@ -692,6 +702,9 @@ public final class ColumnStore implements Closeable {
                 );
             }
         });
+        for (Map.Entry<Integer, KeywordDictionaryBuilder> entry : builders.entrySet()) {
+            IpTermEncoder.logInvalid(column, entry.getKey(), entry.getValue().invalidCount());
+        }
         Map<Integer, Integer> totalOrdinals = new HashMap<>(missing.size() * 2);
         long needed = 0L;
         for (Map.Entry<Integer, Integer> entry : missing.entrySet()) {

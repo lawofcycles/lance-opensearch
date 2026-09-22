@@ -45,16 +45,47 @@ import org.apache.lucene.util.BytesRefHash;
  */
 final class KeywordDictionaryBuilder {
 
+    /**
+     * Optional per-column transformation applied to every cell before it
+     * enters the dictionary. An {@code ip}-overridden Utf8 column
+     * installs {@link IpTermEncoder} so the dictionary holds the 16 byte
+     * {@code InetAddressPoint} form OpenSearch's {@code IpFieldType}
+     * compares doc values against; plain keyword columns install none
+     * and intern the raw UTF-8 bytes.
+     */
+    @FunctionalInterface
+    interface TermEncoder {
+        /**
+         * Encode the {@code length}-byte UTF-8 value at the start of
+         * {@code utf8}. Returns the encoded term, or {@code null} when
+         * the value cannot be encoded; the row is then treated as
+         * missing and counted in {@link #invalidCount()}.
+         */
+        BytesRef encode(byte[] utf8, int length);
+    }
+
     private final BytesRefHash hash = new BytesRefHash();
     private final BytesRef scratch = new BytesRef();
+    private final TermEncoder encoder;
     private byte[] buffer = new byte[64];
     private long termBytes;
+    private int invalidCount;
     /** Interned ids in sorted order, set by {@link #sort}. */
     private int[] sortedIds;
 
+    KeywordDictionaryBuilder() {
+        this(null);
+    }
+
+    KeywordDictionaryBuilder(TermEncoder encoder) {
+        this.encoder = encoder;
+    }
+
     /**
      * Intern the value at {@code index} of {@code vector} and return
-     * its insertion-order id. The caller must have checked
+     * its insertion-order id, or {@code -1} when the column's
+     * {@link TermEncoder} rejects the value (counted in
+     * {@link #invalidCount()}). The caller must have checked
      * {@code vector.isNull(index)} first.
      */
     int intern(VarCharVector vector, int index) {
@@ -63,15 +94,30 @@ final class KeywordDictionaryBuilder {
             buffer = ArrayUtil.grow(buffer, length);
         }
         vector.getDataBuffer().getBytes(vector.getStartOffset(index), buffer, 0, length);
-        scratch.bytes = buffer;
-        scratch.offset = 0;
-        scratch.length = length;
-        int id = hash.add(scratch);
+        BytesRef value;
+        if (encoder != null) {
+            value = encoder.encode(buffer, length);
+            if (value == null) {
+                invalidCount++;
+                return -1;
+            }
+        } else {
+            scratch.bytes = buffer;
+            scratch.offset = 0;
+            scratch.length = length;
+            value = scratch;
+        }
+        int id = hash.add(value);
         if (id >= 0) {
-            termBytes += length;
+            termBytes += value.length;
             return id;
         }
         return -id - 1;
+    }
+
+    /** Number of values the {@link TermEncoder} rejected so far (rows served as missing). */
+    int invalidCount() {
+        return invalidCount;
     }
 
     /** Number of distinct terms interned so far. */

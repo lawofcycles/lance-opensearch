@@ -432,6 +432,17 @@ public final class LanceShardColumnCache {
     }
 
     /**
+     * The dictionary value encoder of {@code name}, read from the shared
+     * schema (every leaf of this reader carries the same one). Non-null
+     * only for {@code ip}-overridden columns, whose dictionary terms are
+     * the {@code InetAddressPoint} encoding of the stored strings.
+     */
+    private KeywordDictionaryBuilder.TermEncoder encoderFor(String name) {
+        java.util.Iterator<LanceFragmentLeafReader> leaves = leavesByFragmentId.values().iterator();
+        return leaves.hasNext() ? leaves.next().schema().termEncoder(name) : null;
+    }
+
+    /**
      * Keyword counterpart of {@link #publishFromStore}: serve the Utf8
      * column {@code name} to every leaf from the store's dictionaries and
      * ordinals, loading the missing fragments in one scan. Fragments the
@@ -444,7 +455,14 @@ public final class LanceShardColumnCache {
         if (!keywordStoreUsable()) {
             return false;
         }
-        ColumnStore.KeywordLoad load = columnStore.acquireKeyword(snapshotKey, dataset, name, allFragmentRows(), groupScan);
+        ColumnStore.KeywordLoad load = columnStore.acquireKeyword(
+            snapshotKey,
+            dataset,
+            name,
+            allFragmentRows(),
+            groupScan,
+            encoderFor(name)
+        );
         if (load == null) {
             LOGGER.debug(
                 "column cache could not scan [{}] of {}; building the dictionary in heap for this request ({} fragments)",
@@ -463,7 +481,14 @@ public final class LanceShardColumnCache {
         if (!keywordStoreUsable()) {
             return false;
         }
-        ColumnStore.KeywordArrayLoad load = columnStore.acquireKeywordArray(snapshotKey, dataset, name, allFragmentRows(), groupScan);
+        ColumnStore.KeywordArrayLoad load = columnStore.acquireKeywordArray(
+            snapshotKey,
+            dataset,
+            name,
+            allFragmentRows(),
+            groupScan,
+            encoderFor(name)
+        );
         if (load == null) {
             LOGGER.debug(
                 "column cache could not scan [{}] of {}; building the dictionary in heap for this request ({} fragments)",
@@ -493,7 +518,8 @@ public final class LanceShardColumnCache {
             dataset,
             name,
             Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc()),
-            groupScan.sequential()
+            groupScan.sequential(),
+            encoderFor(name)
         );
         if (load == null) {
             LOGGER.debug(
@@ -518,7 +544,8 @@ public final class LanceShardColumnCache {
             dataset,
             name,
             Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc()),
-            groupScan.sequential()
+            groupScan.sequential(),
+            encoderFor(name)
         );
         if (load == null) {
             LOGGER.debug(
@@ -878,15 +905,19 @@ public final class LanceShardColumnCache {
             try {
                 Map<Integer, int[]> idsByFragment = new HashMap<>(leavesByFragmentId.size() * 2);
                 Map<Integer, KeywordDictionaryBuilder> buildersByFragment = new HashMap<>(leavesByFragmentId.size() * 2);
+                KeywordDictionaryBuilder.TermEncoder encoder = encoderFor(name);
                 for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
                     int[] ids = new int[leaf.maxDoc()];
                     java.util.Arrays.fill(ids, -1);
                     idsByFragment.put(leaf.fragmentId(), ids);
-                    buildersByFragment.put(leaf.fragmentId(), new KeywordDictionaryBuilder());
+                    buildersByFragment.put(leaf.fragmentId(), new KeywordDictionaryBuilder(encoder));
                 }
                 scanHeap(name, (fragmentId, offset, vector, row) -> {
                     idsByFragment.get(fragmentId)[offset] = buildersByFragment.get(fragmentId).intern((VarCharVector) vector, row);
                 });
+                for (Map.Entry<Integer, KeywordDictionaryBuilder> entry : buildersByFragment.entrySet()) {
+                    IpTermEncoder.logInvalid(name, entry.getKey(), entry.getValue().invalidCount());
+                }
                 long termBytes = 0L;
                 for (KeywordDictionaryBuilder dictionaryBuilder : buildersByFragment.values()) {
                     termBytes += termsHeapBytes(dictionaryBuilder.size(), dictionaryBuilder.termBytes());
@@ -949,9 +980,10 @@ public final class LanceShardColumnCache {
             try {
                 Map<Integer, int[][]> rowsByFragment = new HashMap<>(leavesByFragmentId.size() * 2);
                 Map<Integer, KeywordDictionaryBuilder> buildersByFragment = new HashMap<>(leavesByFragmentId.size() * 2);
+                KeywordDictionaryBuilder.TermEncoder encoder = encoderFor(name);
                 for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
                     rowsByFragment.put(leaf.fragmentId(), new int[leaf.maxDoc()][]);
-                    buildersByFragment.put(leaf.fragmentId(), new KeywordDictionaryBuilder());
+                    buildersByFragment.put(leaf.fragmentId(), new KeywordDictionaryBuilder(encoder));
                 }
                 scanHeap(name, (fragmentId, offset, vector, row) -> {
                     ListVector list = (ListVector) vector;
@@ -962,6 +994,9 @@ public final class LanceShardColumnCache {
                         row
                     );
                 });
+                for (Map.Entry<Integer, KeywordDictionaryBuilder> entry : buildersByFragment.entrySet()) {
+                    IpTermEncoder.logInvalid(name, entry.getKey(), entry.getValue().invalidCount());
+                }
                 Map<Integer, KeywordDictionaryBuilder.Dictionary> dictionaries = new HashMap<>(leavesByFragmentId.size() * 2);
                 long rowAndTermBytes = 0L;
                 for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
