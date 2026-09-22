@@ -37,8 +37,9 @@ import java.io.IOException;
  * builds the planner's model of the index through
  * {@link LanceSchemas#build}, translates the search body with
  * {@link SearchRequestToRel}, runs the Hep planner over its still empty
- * program, and returns the logical plan text. No Lance scan is issued
- * and no request executes through the planner.
+ * program and the Volcano planner with the pushdown rules, and returns
+ * the logical and physical plan texts. No Lance scan is issued and no
+ * request executes through the planner.
  *
  * <p>A body outside the supported shape surfaces as
  * {@link UnsupportedOperationException} from the translator and is
@@ -57,9 +58,9 @@ import java.io.IOException;
  * and remote callers alike.
  *
  * <p>The cost budgets handed to {@link LancePlannerFactory} (the node's
- * {@code lance.native_memory.limit} and the JVM's max heap) do not
- * shape the output of this endpoint: nothing runs the Volcano planner
- * yet, so no cost comparison happens. They are placeholders until the
+ * {@code lance.native_memory.limit} and the JVM's max heap) feed the
+ * cost ordering the Volcano run compares candidates with; nothing
+ * predicts real byte usage yet, so they act as placeholders until the
  * cost model gets real inputs.
  */
 public final class TransportLanceExplainAction extends HandledTransportAction<LanceExplainRequest, LanceExplainResponse> {
@@ -117,6 +118,11 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
         HepPlanner hepPlanner = plannerFactory.newHepPlanner();
         hepPlanner.setRoot(logical);
         RelNode planned = hepPlanner.findBestExp();
-        return new LanceExplainResponse(metadata.getIndex().getName(), RelOptUtil.toString(planned));
+        // The logical text is rendered before the Volcano run: the
+        // planner registers the tree and the physical string comes from
+        // its own best expression.
+        String logicalText = RelOptUtil.toString(planned);
+        RelNode physical = plannerFactory.plan(planned);
+        return new LanceExplainResponse(metadata.getIndex().getName(), logicalText, RelOptUtil.toString(physical));
     }
 }

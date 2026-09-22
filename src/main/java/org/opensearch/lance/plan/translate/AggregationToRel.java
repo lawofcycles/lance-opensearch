@@ -521,7 +521,11 @@ final class AggregationToRel {
             RangeAggregator.Range[] resolved = resolveRanges(range, column, date);
             List<BucketSpec.RangeSpec> rangeSpecs = new ArrayList<>(resolved.length);
             List<RexNode> conditions = new ArrayList<>(resolved.length);
-            RexNode value = relBuilder.cast(date ? epochMillis(column) : relBuilder.field(column.index()), SqlTypeName.DOUBLE);
+            // The compared value is epoch millis whenever the column is
+            // a date, a plain `range` over a date field included: the
+            // aggregator compares the doc value millis, and the resolved
+            // bounds are millis.
+            RexNode value = relBuilder.cast(column.isDate() ? epochMillis(column) : relBuilder.field(column.index()), SqlTypeName.DOUBLE);
             for (RangeAggregator.Range one : resolved) {
                 rangeSpecs.add(new BucketSpec.RangeSpec(one.getKey(), boundOf(one.getFrom(), date), boundOf(one.getTo(), date)));
                 conditions.add(rangeCondition(value, one.getFrom(), one.getTo()));

@@ -11,6 +11,7 @@ import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
+import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
 /**
@@ -53,13 +54,35 @@ public final class SearchRequestToRel {
      */
     public static RelNode translate(SearchSourceBuilder source, LanceSchemas.IndexModel model, LancePlannerFactory factory) {
         validate(source);
+        return translateAggregations(source.aggregations(), model, factory);
+    }
+
+    /**
+     * Translates an aggregation tree alone, without the request body
+     * envelope checks: the fragment query routing has already gated the
+     * envelope (size 0, no post_filter, a scalar or absent query whose
+     * filter travels as Lance SQL outside the plan) and holds only the
+     * builders. Throws {@link UnsupportedOperationException} naming the
+     * first unsupported element, exactly as {@link #translate}.
+     */
+    public static RelNode translateAggregations(
+        AggregatorFactories.Builder aggregations,
+        LanceSchemas.IndexModel model,
+        LancePlannerFactory factory
+    ) {
+        if (aggregations == null || aggregations.getAggregatorFactories().isEmpty()) {
+            throw unsupported("no aggregations");
+        }
+        if (!aggregations.getPipelineAggregatorFactories().isEmpty()) {
+            throw unsupported("pipeline aggregation");
+        }
         // Simplification is off so the group key expressions keep the
         // shape the translator spells (a range condition stays
         // `>= AND <` instead of folding into a SEARCH / Sarg), which the
         // Substrait producer maps term by term.
         RelBuilder relBuilder = factory.relBuilder(model.schema()).transform(config -> config.withSimplify(false));
         relBuilder.scan(LancePlannerFactory.SCHEMA_NAME, model.indexName());
-        return AggregationToRel.translate(source.aggregations(), model, relBuilder);
+        return AggregationToRel.translate(aggregations, model, relBuilder);
     }
 
     /**

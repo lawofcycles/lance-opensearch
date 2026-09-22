@@ -31,7 +31,7 @@ import org.opensearch.index.mapper.Mapper;
 import org.opensearch.indices.breaker.BreakerSettings;
 import org.opensearch.lance.attach.LanceAttachAction;
 import org.opensearch.lance.attach.TransportLanceAttachAction;
-import org.opensearch.lance.dispatch.LanceAggregatePushdown;
+import org.opensearch.lance.execute.LanceAggregateResults;
 import org.opensearch.lance.dispatch.LanceDispatchActionFilter;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -489,7 +489,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * with metric children; {@code composite} over terms and fixed
      * interval date_histogram sources; over a {@code match_all} or
      * scalar filter query; see
-     * {@code LanceAggregatePushdown} in the dispatch package) runs
+     * {@code LanceAggregateResults} in the execute package) runs
      * as a Substrait group by inside the Lance scan. Off, every
      * aggregation goes through the Lucene aggregators over the fragment
      * leaf readers. Dynamic so the two paths can be compared without a
@@ -1054,12 +1054,12 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // The percentiles bin count and the terms top-k slack are read
         // by the aggregation pushdown when it plans a request, from the
         // same kind of static holder.
-        LanceAggregatePushdown.setPercentilesBins(AGGREGATION_PERCENTILES_BINS_SETTING.get(environment.settings()));
+        LanceAggregateResults.setPercentilesBins(AGGREGATION_PERCENTILES_BINS_SETTING.get(environment.settings()));
         clusterService.getClusterSettings()
-            .addSettingsUpdateConsumer(AGGREGATION_PERCENTILES_BINS_SETTING, LanceAggregatePushdown::setPercentilesBins);
-        LanceAggregatePushdown.setTopkSlack(AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.get(environment.settings()));
+            .addSettingsUpdateConsumer(AGGREGATION_PERCENTILES_BINS_SETTING, LanceAggregateResults::setPercentilesBins);
+        LanceAggregateResults.setTopkSlack(AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.get(environment.settings()));
         clusterService.getClusterSettings()
-            .addSettingsUpdateConsumer(AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING, LanceAggregatePushdown::setTopkSlack);
+            .addSettingsUpdateConsumer(AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING, LanceAggregateResults::setTopkSlack);
 
         // Register the shard-free dispatch ActionFilter. It
         // intercepts every _search request against Lance-backed

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package org.opensearch.lance.dispatch;
+package org.opensearch.lance.execute;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
@@ -42,7 +42,7 @@ import org.opensearch.search.aggregations.metrics.InternalCardinality;
  * version that changed these classes, and refusing to load is more
  * useful than a wrong answer at request time.
  */
-final class CoreAggregationResults {
+public final class CoreAggregationResults {
 
     private CoreAggregationResults() {}
 
@@ -118,24 +118,24 @@ final class CoreAggregationResults {
      * (bucket 0). Null counts is what the aggregator reports for a bucket
      * that saw no value.
      */
-    static InternalCardinality cardinality(String name, AbstractHyperLogLogPlusPlus counts, Map<String, Object> metadata) {
+    public static InternalCardinality cardinality(String name, AbstractHyperLogLogPlusPlus counts, Map<String, Object> metadata) {
         return newInstance(CARDINALITY, name, counts, metadata);
     }
 
-    static InternalMissing missing(String name, long docCount, InternalAggregations aggregations, Map<String, Object> metadata) {
+    public static InternalMissing missing(String name, long docCount, InternalAggregations aggregations, Map<String, Object> metadata) {
         return newInstance(MISSING, name, docCount, aggregations, metadata);
     }
 
-    static InternalFilter filter(String name, long docCount, InternalAggregations aggregations, Map<String, Object> metadata) {
+    public static InternalFilter filter(String name, long docCount, InternalAggregations aggregations, Map<String, Object> metadata) {
         return newInstance(FILTER, name, docCount, aggregations, metadata);
     }
 
     /** A composite key over the raw bucket values ({@code BytesRef}, {@code Long} or {@code Double} per source). */
-    static CompositeKey compositeKey(Comparable<?>[] values) {
+    public static CompositeKey compositeKey(Comparable<?>[] values) {
         return newInstance(COMPOSITE_KEY, (Object) values);
     }
 
-    static InternalComposite.InternalBucket compositeBucket(
+    public static InternalComposite.InternalBucket compositeBucket(
         List<String> sourceNames,
         List<DocValueFormat> formats,
         CompositeKey key,
@@ -147,7 +147,7 @@ final class CoreAggregationResults {
         return newInstance(COMPOSITE_BUCKET, sourceNames, formats, key, reverseMuls, missingOrders, docCount, aggregations);
     }
 
-    static InternalComposite composite(
+    public static InternalComposite composite(
         String name,
         int size,
         List<String> sourceNames,
@@ -168,7 +168,7 @@ final class CoreAggregationResults {
      * {@code emptySubAggregations} is only read when {@code minDocCount}
      * is 0: the reduce fills the empty buckets with it.
      */
-    static InternalDateHistogram dateHistogram(
+    public static InternalDateHistogram dateHistogram(
         String name,
         List<InternalDateHistogram.Bucket> buckets,
         BucketOrder order,
