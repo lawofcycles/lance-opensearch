@@ -8,6 +8,7 @@ package org.opensearch.lance.namespace;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.lance.namespace.LanceNamespace;
@@ -29,8 +30,8 @@ class RecordingLanceNamespace implements LanceNamespace {
 
     final List<Map<String, String>> initializeCalls = new ArrayList<>();
     RuntimeException initializeFailure;
-    java.util.Set<String> tables = java.util.Set.of();
-    java.util.Set<String> childNamespaces;
+    Set<String> tables = Set.of();
+    Set<String> childNamespaces;
     Map<String, String> tableLocations = Map.of();
 
     @Override
@@ -59,7 +60,7 @@ class RecordingLanceNamespace implements LanceNamespace {
     @Override
     public ListNamespacesResponse listNamespaces(ListNamespacesRequest request) {
         if (childNamespaces == null) {
-            return new ListNamespacesResponse().namespaces(java.util.Set.of());
+            return new ListNamespacesResponse().namespaces(Set.of());
         }
         return new ListNamespacesResponse().namespaces(childNamespaces);
     }

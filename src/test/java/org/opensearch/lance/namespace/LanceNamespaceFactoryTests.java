@@ -5,9 +5,12 @@
 
 package org.opensearch.lance.namespace;
 
+import java.io.Closeable;
+
 import java.util.Map;
 
 import org.lance.namespace.LanceNamespace;
+import org.lance.namespace.glue.GlueNamespace;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -123,10 +126,7 @@ public class LanceNamespaceFactoryTests extends OpenSearchTestCase {
             Map.of("region", "us-east-1", "access_key_id", "test-access-key", "secret_access_key", "test-secret")
         );
         LanceNamespace created = LanceNamespaceFactory.create(entry, null);
-        assertTrue(
-            "expected the bundled GlueNamespace, saw " + created.getClass().getName(),
-            created instanceof org.lance.namespace.glue.GlueNamespace
-        );
-        ((java.io.Closeable) created).close();
+        assertTrue("expected the bundled GlueNamespace, saw " + created.getClass().getName(), created instanceof GlueNamespace);
+        ((Closeable) created).close();
     }
 }

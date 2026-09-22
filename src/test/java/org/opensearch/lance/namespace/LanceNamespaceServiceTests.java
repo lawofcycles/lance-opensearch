@@ -8,7 +8,12 @@ package org.opensearch.lance.namespace;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+
+import org.lance.namespace.model.DescribeTableResponse;
 
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.Metadata;
@@ -66,7 +71,7 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
     public void tearDown() throws Exception {
         client.close();
         clusterService.close();
-        ThreadPool.terminate(threadPool, 30L, java.util.concurrent.TimeUnit.SECONDS);
+        ThreadPool.terminate(threadPool, 30L, TimeUnit.SECONDS);
         super.tearDown();
     }
 
@@ -176,7 +181,7 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
                     LanceNamespaceMetadata.Entry.TYPE_REST,
                     null,
                     StorageOptions.empty(),
-                    java.util.Map.of("uri", "http://catalog.example:8080", "header.Authorization", "Bearer hunter2")
+                    Map.of("uri", "http://catalog.example:8080", "header.Authorization", "Bearer hunter2")
                 )
             );
             ClusterState state = ClusterState.builder(clusterService.state())
@@ -185,7 +190,7 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
             // The applier callback drives ensureHandle; the failure is
             // recorded rather than thrown.
             ClusterServiceUtils.setState(clusterService, state);
-            java.util.List<org.opensearch.lance.namespace.LanceNamespaceListResponse.NamespaceInfo> infos = service.namespaceInfos();
+            List<LanceNamespaceListResponse.NamespaceInfo> infos = service.namespaceInfos();
             assertEquals(1, infos.size());
             assertEquals("cat", infos.get(0).name());
             assertEquals("rest", infos.get(0).type());
@@ -225,14 +230,14 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
                     LanceNamespaceMetadata.Entry.TYPE_GLUE,
                     null,
                     StorageOptions.empty(),
-                    java.util.Map.of("region", "ap-northeast-1")
+                    Map.of("region", "ap-northeast-1")
                 )
             );
             ClusterState state = ClusterState.builder(clusterService.state())
                 .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
                 .build();
             ClusterServiceUtils.setState(clusterService, state);
-            java.util.Optional<Set<String>> tables = service.listTables("glue-tokyo");
+            Optional<Set<String>> tables = service.listTables("glue-tokyo");
             assertTrue(tables.isPresent());
             assertEquals(Set.of("orders", "customers"), tables.get());
         } finally {
@@ -258,7 +263,7 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
                     LanceNamespaceMetadata.Entry.TYPE_GLUE,
                     null,
                     StorageOptions.empty(),
-                    java.util.Map.of(
+                    Map.of(
                         "region",
                         "ap-northeast-1",
                         "catalog_id",
@@ -276,11 +281,11 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
                 .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
                 .build();
             ClusterServiceUtils.setState(clusterService, state);
-            java.util.Map<String, String> received = recording.initializeCalls.get(0);
+            Map<String, String> received = recording.initializeCalls.get(0);
             assertEquals("sekrit", received.get("secret_access_key"));
             assertEquals("AKIA123", received.get("access_key_id"));
             assertEquals("ap-northeast-1", received.get("region"));
-            java.util.List<org.opensearch.lance.namespace.LanceNamespaceListResponse.NamespaceInfo> infos = service.namespaceInfos();
+            List<LanceNamespaceListResponse.NamespaceInfo> infos = service.namespaceInfos();
             assertEquals("glue", infos.get(0).type());
             assertTrue(infos.get(0).error(), infos.get(0).error().contains("security token"));
             assertEquals("***", infos.get(0).config().get("secret_access_key"));
@@ -292,7 +297,7 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
     }
 
     public void testTableLocationStripsTrailingSlashAndHandlesMissingLocation() {
-        org.lance.namespace.model.DescribeTableResponse response = new org.lance.namespace.model.DescribeTableResponse();
+        DescribeTableResponse response = new DescribeTableResponse();
         assertNull(LanceNamespaceService.tableLocation(response));
         response.setLocation("s3://bucket/prefix/orders.lance/");
         assertEquals("s3://bucket/prefix/orders.lance", LanceNamespaceService.tableLocation(response));
@@ -302,11 +307,11 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
     }
 
     public void testMergeStorageOptionsOverlaysEntryValuesOnCatalogValues() {
-        StorageOptions entryOptions = StorageOptions.of(java.util.Map.of("aws_region", "ap-northeast-1"));
+        StorageOptions entryOptions = StorageOptions.of(Map.of("aws_region", "ap-northeast-1"));
         assertEquals(entryOptions, LanceNamespaceService.mergeStorageOptions(null, entryOptions));
-        assertEquals(entryOptions, LanceNamespaceService.mergeStorageOptions(java.util.Map.of(), entryOptions));
+        assertEquals(entryOptions, LanceNamespaceService.mergeStorageOptions(Map.of(), entryOptions));
         StorageOptions merged = LanceNamespaceService.mergeStorageOptions(
-            java.util.Map.of("aws_region", "us-east-1", "allow_http", "true"),
+            Map.of("aws_region", "us-east-1", "allow_http", "true"),
             entryOptions
         );
         assertEquals("ap-northeast-1", merged.asMap().get("aws_region"));
