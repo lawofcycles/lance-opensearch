@@ -298,7 +298,11 @@ public final class LanceEngineFactory implements EngineFactory {
          * Lance tag the shard follows, or {@code null}. When set (and no
          * version is pinned), {@link #resolveVersion()} asks Lance which
          * version the tag currently points at, so a tag moved on the Lance
-         * side shows up on the next refresh.
+         * side shows up on the next refresh. Captured at engine open so
+         * the initial reader resolves the right version; the refresh path
+         * re-reads {@link LanceEngineFactory#TAG_SETTING} through
+         * {@link #currentTag()} because the tag is a Dynamic setting the
+         * operator can rewrite on a running index.
          */
         final String tag;
         final StorageOptions storageOptions;
@@ -457,6 +461,18 @@ public final class LanceEngineFactory implements EngineFactory {
                 return Optional.of(LanceRegistry.resolveTagVersion(tablePath, storageOptions, tag));
             }
             return Optional.empty();
+        }
+
+        /**
+         * Read the currently configured {@link LanceEngineFactory#TAG_SETTING}
+         * for this shard. The tag is a Dynamic setting: an operator can
+         * rewrite it with {@code PUT /{index}/_settings} on a running index,
+         * so the refresh path must consult cluster state rather than the
+         * value captured at engine open.
+         */
+        String currentTag() {
+            String tagSetting = config().getIndexSettings().getSettings().get(TAG_SETTING, "");
+            return tagSetting.isEmpty() ? null : tagSetting;
         }
 
         /**
@@ -1034,10 +1050,14 @@ public final class LanceEngineFactory implements EngineFactory {
             // live in the table's refs, so they are readable from any
             // checkout). A tag moved on the Lance side, forwards or
             // backwards, yields a version different from servedVersion and
-            // swaps the reader.
+            // swaps the reader. The tag itself is re-read from cluster
+            // state each refresh because it is a Dynamic setting: an
+            // operator repointing the tag with PUT /{index}/_settings must
+            // take effect on the next refresh without a shard reopen.
+            String currentTag = engine.currentTag();
             long target;
             try (Dataset latest = LanceRegistry.openDataset(engine.tablePath, engine.storageOptions)) {
-                target = engine.tag != null ? latest.tags().getVersion(engine.tag) : latest.version();
+                target = currentTag != null ? latest.tags().getVersion(currentTag) : latest.version();
             }
             if (engine.nodeLocal && LanceLocalClones.instance() != null) {
                 return refreshNodeLocal(referenceToRefresh, target);
@@ -1051,7 +1071,7 @@ public final class LanceEngineFactory implements EngineFactory {
             // latest-following table that advanced again between the probe
             // above and the acquire is caught by the next poll). Without a
             // cache a latest-following shard opens latest again, as before.
-            Optional<Long> openAt = engine.tag != null || engine.warmCache != null ? Optional.of(target) : Optional.empty();
+            Optional<Long> openAt = currentTag != null || engine.warmCache != null ? Optional.of(target) : Optional.empty();
             OpenSearchDirectoryReader newReader = engine.openLanceReader(openAt);
             servedVersion = target;
             return newReader;

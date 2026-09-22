@@ -157,13 +157,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     /**
      * Lance tag the index follows, written by attach when the body carries
      * {@code "tag"}. Empty means the index follows the latest manifest (or
-     * a pinned version when {@link #VERSION_SETTING} is set).
+     * a pinned version when {@link #VERSION_SETTING} is set). Dynamic
+     * because the tag is a moving pin the operator can rewrite with
+     * {@code PUT /{index}/_settings} on a running index; the namespace
+     * poll cycle re-resolves the tag from cluster state every cycle, so
+     * the next poll after the update refreshes the reader onto the
+     * version the new tag points at.
      */
     public static final Setting<String> TAG_SETTING = Setting.simpleString(
         LanceEngineFactory.TAG_SETTING,
         "",
         Setting.Property.IndexScope,
-        Setting.Property.Final
+        Setting.Property.Dynamic
     );
     /**
      * JSON stringified multi-fields spec, persisted by attach so the

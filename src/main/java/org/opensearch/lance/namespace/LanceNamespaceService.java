@@ -682,13 +682,28 @@ public final class LanceNamespaceService {
         // Sync attach-created indexes so append fragments surface on the
         // same schedule as namespace-registered tables. attach records the
         // (indexName -> tablePath) pair; the sync path is the same, just
-        // without the rootUri / tableName join namespace tables use.
+        // without the rootUri / tableName join namespace tables use. The
+        // tag is a Dynamic setting the operator can rewrite on a running
+        // index, so it is re-read from cluster state each cycle rather
+        // than taken from the value captured at attach time; the cached
+        // entry is refreshed too so a later restart replays the current
+        // tag through adoption.
         for (Map.Entry<String, AttachedIndex> entry : attachedIndexes.entrySet()) {
             AttachedIndex attached = entry.getValue();
+            String indexName = entry.getKey();
+            String currentTag = attached.tag;
+            IndexMetadata attachedMetadata = state.metadata().index(indexName);
+            if (attachedMetadata != null) {
+                String tagSetting = attachedMetadata.getSettings().get(LanceEngineFactory.TAG_SETTING, "");
+                currentTag = tagSetting.isEmpty() ? null : tagSetting;
+                if (!java.util.Objects.equals(currentTag, attached.tag)) {
+                    attachedIndexes.put(indexName, new AttachedIndex(attached.tablePath, attached.storageOptions, currentTag));
+                }
+            }
             try {
-                syncAttachedTable(entry.getKey(), attached.tablePath, attached.storageOptions, attached.tag);
+                syncAttachedTable(indexName, attached.tablePath, attached.storageOptions, currentTag);
             } catch (Exception e) {
-                LOG.warn("attach poll failed for index {} at {}", entry.getKey(), attached.tablePath, e);
+                LOG.warn("attach poll failed for index {} at {}", indexName, attached.tablePath, e);
             }
         }
     }
