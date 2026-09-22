@@ -178,7 +178,7 @@ public class RestAttachAction extends BaseRestHandler {
 
     public record Derivation(String mappingJson, String keyField, String keyFieldType, String multiFieldsJson, long version, long rows,
         int fragments, List<String> notes, java.util.Set<String> ftsColumns, java.util.Set<String> scalarColumns, java.util.Set<
-            String> vectorColumns) {
+            String> vectorColumns, java.util.Set<String> nestedColumns) {
     }
 
     public static Derivation derive(Dataset dataset) throws Exception {
@@ -214,6 +214,7 @@ public class RestAttachAction extends BaseRestHandler {
         java.util.Set<String> ftsColumns = new java.util.LinkedHashSet<>();
         java.util.Set<String> scalarColumns = new java.util.LinkedHashSet<>();
         java.util.Set<String> vectorColumns = new java.util.LinkedHashSet<>();
+        java.util.Set<String> nestedColumns = new java.util.LinkedHashSet<>();
 
         XContentBuilder mapping = XContentFactory.jsonBuilder();
         mapping.startObject().startObject("properties");
@@ -448,36 +449,59 @@ public class RestAttachAction extends BaseRestHandler {
                     startFieldWithId(mapping, name, fieldId, "keyword", "list<utf8>");
                     mapping.field("index", false).field("doc_values", true).endObject();
                     scalarColumns.add(name);
-                } else if (type instanceof ArrowType.Binary || type instanceof ArrowType.LargeBinary) {
-                    // Binary / LargeBinary map to OpenSearch's binary type: the value is
-                    // base64-encoded in _source and neither indexed nor loaded into doc
-                    // values. Users can still retrieve raw bytes through _source.
-                    startFieldWithId(mapping, name, fieldId, "binary", arrowTypeIdentity(type));
-                    mapping.endObject();
-                } else if (type instanceof ArrowType.Struct) {
-                    // A Struct column surfaces as an `object` field whose
-                    // properties derive from the struct's children,
-                    // recursing into nested structs. OpenSearch's object
-                    // mapper accepts no `meta` parameter, so the identity
-                    // metadata (lance_field_id / lance_arrow_type) rides on
-                    // the children instead; each Lance child field carries
-                    // its own field id. Children the derivation does not
-                    // support are noted and left out while the parent
-                    // object is still emitted, unless no descendant is
-                    // supported at all, in which case the whole column is
-                    // skipped with a note (the reader keeps such a struct
-                    // out of the row take, so an empty object mapping
-                    // would never show up in _source).
-                    if (structHasSupportedProperty(field)) {
-                        mapping.startObject(name).field("type", "object").startObject("properties");
-                        writeStructProperties(mapping, field, name, notes);
-                        mapping.endObject().endObject();
+                } else if (type instanceof ArrowType.List
+                    && field.getChildren().size() == 1
+                    && field.getChildren().get(0).getType() instanceof ArrowType.Struct) {
+                        // List<Struct> maps to the nested field type: each
+                        // element becomes a hidden child document of its
+                        // row, so a nested query can match several
+                        // attributes of the same element. Children follow
+                        // the struct child derivation (Utf8 → keyword, no
+                        // FTS / knn children, unsupported children noted);
+                        // multi-valued children (List<Utf8>) and nested in
+                        // nested (List<Struct> inside an element) are
+                        // skipped with a note. Like the object mapper, the
+                        // nested mapper accepts no `meta` parameter, so the
+                        // identity metadata rides on the children.
+                        LanceField element = field.getChildren().get(0);
+                        if (nestedHasSupportedProperty(element)) {
+                            mapping.startObject(name).field("type", "nested").startObject("properties");
+                            writeNestedProperties(mapping, element, name, notes);
+                            mapping.endObject().endObject();
+                            nestedColumns.add(name);
+                        } else {
+                            notes.add(name + ": List<Struct> with no supported children, not surfaced");
+                        }
+                    } else if (type instanceof ArrowType.Binary || type instanceof ArrowType.LargeBinary) {
+                        // Binary / LargeBinary map to OpenSearch's binary type: the value is
+                        // base64-encoded in _source and neither indexed nor loaded into doc
+                        // values. Users can still retrieve raw bytes through _source.
+                        startFieldWithId(mapping, name, fieldId, "binary", arrowTypeIdentity(type));
+                        mapping.endObject();
+                    } else if (type instanceof ArrowType.Struct) {
+                        // A Struct column surfaces as an `object` field whose
+                        // properties derive from the struct's children,
+                        // recursing into nested structs. OpenSearch's object
+                        // mapper accepts no `meta` parameter, so the identity
+                        // metadata (lance_field_id / lance_arrow_type) rides on
+                        // the children instead; each Lance child field carries
+                        // its own field id. Children the derivation does not
+                        // support are noted and left out while the parent
+                        // object is still emitted, unless no descendant is
+                        // supported at all, in which case the whole column is
+                        // skipped with a note (the reader keeps such a struct
+                        // out of the row take, so an empty object mapping
+                        // would never show up in _source).
+                        if (structHasSupportedProperty(field)) {
+                            mapping.startObject(name).field("type", "object").startObject("properties");
+                            writeStructProperties(mapping, field, name, notes);
+                            mapping.endObject().endObject();
+                        } else {
+                            notes.add(name + ": Struct with no supported children, not surfaced");
+                        }
                     } else {
-                        notes.add(name + ": Struct with no supported children, not surfaced");
+                        notes.add(name + ": " + type + ", stored only");
                     }
-                } else {
-                    notes.add(name + ": " + type + ", stored only");
-                }
         }
         mapping.endObject().endObject();
 
@@ -537,7 +561,8 @@ public class RestAttachAction extends BaseRestHandler {
             notes,
             ftsColumns,
             scalarColumns,
-            vectorColumns
+            vectorColumns,
+            nestedColumns
         );
     }
 
@@ -933,6 +958,107 @@ public class RestAttachAction extends BaseRestHandler {
             }
         }
         return false;
+    }
+
+    /**
+     * Emit the {@code properties} entries of a nested field's element
+     * struct, one per supported child, recursing into struct children
+     * (which map as {@code object} inside the nested field). The rules
+     * are the struct derivation's minus the multi-valued shapes: a
+     * {@code List<Utf8>} child would need multi-valued doc values per
+     * child doc, and a {@code List<Struct>} child would need nested in
+     * nested, so both are skipped with a note; {@code FixedSizeList}
+     * vector children and Binary children are skipped as in structs.
+     */
+    private static void writeNestedProperties(XContentBuilder mapping, LanceField element, String path, List<String> notes)
+        throws Exception {
+        for (LanceField child : element.getChildren()) {
+            String childPath = path + "." + child.getName();
+            ArrowType childType = child.getType();
+            if (childType instanceof ArrowType.Struct) {
+                if (!nestedHasSupportedProperty(child)) {
+                    notes.add(childPath + ": Struct with no supported children, not surfaced");
+                    continue;
+                }
+                mapping.startObject(child.getName()).field("type", "object").startObject("properties");
+                writeNestedProperties(mapping, child, childPath, notes);
+                mapping.endObject().endObject();
+                continue;
+            }
+            String osType = nestedChildMappingType(child);
+            if (osType == null) {
+                if (childType instanceof ArrowType.FixedSizeList) {
+                    notes.add(childPath + ": vector column inside a nested field, not surfaced (lance_knn does not reach it)");
+                } else if (isListOfStruct(child)) {
+                    notes.add(childPath + ": List<Struct> inside a nested field (nested in nested), not surfaced");
+                } else {
+                    notes.add(childPath + ": " + childType + ", not surfaced inside a nested field");
+                }
+                continue;
+            }
+            startFieldWithId(mapping, child.getName(), child.getId(), osType, arrowTypeIdentity(childType));
+            mapping.field("index", false).field("doc_values", true).endObject();
+        }
+    }
+
+    /**
+     * The OpenSearch mapping type of a non-struct child of a nested
+     * field's element, or {@code null} when the derivation does not
+     * support it there. Scalar-only: unlike a struct child, a nested
+     * child's values live on the element's own child doc, and the reader
+     * serves single-valued doc values per child doc.
+     */
+    private static String nestedChildMappingType(LanceField child) {
+        ArrowType childType = child.getType();
+        if (childType instanceof ArrowType.Int intType && intType.getIsSigned()) {
+            return switch (intType.getBitWidth()) {
+                case 8 -> "byte";
+                case 16 -> "short";
+                case 32 -> "integer";
+                case 64 -> "long";
+                default -> null;
+            };
+        }
+        if (childType instanceof ArrowType.Bool) {
+            return "boolean";
+        }
+        if (childType instanceof ArrowType.FloatingPoint fp) {
+            return switch (fp.getPrecision()) {
+                case SINGLE -> "float";
+                case DOUBLE -> "double";
+                default -> null;
+            };
+        }
+        if (childType instanceof ArrowType.Date || childType instanceof ArrowType.Timestamp) {
+            return "date";
+        }
+        if (childType instanceof ArrowType.Utf8) {
+            return "keyword";
+        }
+        return null;
+    }
+
+    /** Whether the nested element struct has at least one supported descendant, recursing into struct children. */
+    private static boolean nestedHasSupportedProperty(LanceField element) {
+        for (LanceField child : element.getChildren()) {
+            if (child.getType() instanceof ArrowType.Struct) {
+                if (nestedHasSupportedProperty(child)) {
+                    return true;
+                }
+                continue;
+            }
+            if (nestedChildMappingType(child) != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether {@code field} is a {@code List} whose single child is a {@code Struct}. */
+    private static boolean isListOfStruct(LanceField field) {
+        return field.getType() instanceof ArrowType.List
+            && field.getChildren().size() == 1
+            && field.getChildren().get(0).getType() instanceof ArrowType.Struct;
     }
 
     private static void startFieldWithId(XContentBuilder mapping, String name, int fieldId, String type, String arrowType)
