@@ -174,19 +174,21 @@ public final class LanceKnnFilterTranslator {
     }
 
     private static boolean isFieldUnmapped(String fieldName, Function<String, String> lookup) {
-        // rejectMultiFieldPath will fire inside toLanceSql for
-        // dotted names, so no need to guard against them here — the
-        // walker is a strict subset of the translator's shape gate.
+        // rejectUnresolvableDottedPath fires inside toLanceSql for
+        // dotted names the lookup cannot resolve, so no need to guard
+        // against them here — the walker is a strict subset of the
+        // translator's shape gate.
         if (fieldName == null) {
             return false;
         }
         if (fieldName.indexOf('.') >= 0) {
-            // multi_field sub-fields (body.raw) resolve at Lucene
-            // scan time even though the mapping only carries the
-            // base field. Do not treat them as unmapped; the
-            // translator itself will reject them with
-            // rejectMultiFieldPath and the coordinator's
-            // IllegalArgumentException catch will kick in.
+            // Struct children (meta.region) resolve through the lookup
+            // and translate; multi_field sub-fields (body.raw) resolve
+            // at Lucene scan time even though the mapping only carries
+            // the base field. Do not treat either as unmapped; the
+            // translator's rejectUnresolvableDottedPath and the
+            // coordinator's IllegalArgumentException catch handle the
+            // sub-field case.
             return false;
         }
         return lookup.apply(fieldName) == null;
@@ -236,11 +238,11 @@ public final class LanceKnnFilterTranslator {
             return "true";
         }
         if (builder instanceof TermQueryBuilder t) {
-            rejectMultiFieldPath(t.fieldName());
+            rejectUnresolvableDottedPath(t.fieldName(), lookup);
             return t.fieldName() + " = " + literal(t.value(), t.fieldName(), lookup);
         }
         if (builder instanceof TermsQueryBuilder t) {
-            rejectMultiFieldPath(t.fieldName());
+            rejectUnresolvableDottedPath(t.fieldName(), lookup);
             java.util.List<?> values = t.values();
             if (values == null || values.isEmpty()) {
                 // `terms {"col": []}` matches nothing; translate to `false`
@@ -252,20 +254,20 @@ public final class LanceKnnFilterTranslator {
             return t.fieldName() + " IN (" + elements + ")";
         }
         if (builder instanceof ExistsQueryBuilder e) {
-            rejectMultiFieldPath(e.fieldName());
+            rejectUnresolvableDottedPath(e.fieldName(), lookup);
             return e.fieldName() + " IS NOT NULL";
         }
         if (builder instanceof RangeQueryBuilder r) {
-            rejectMultiFieldPath(r.fieldName());
+            rejectUnresolvableDottedPath(r.fieldName(), lookup);
             return translateRange(r, lookup);
         }
         if (builder instanceof WildcardQueryBuilder w) {
-            rejectMultiFieldPath(w.fieldName());
+            rejectUnresolvableDottedPath(w.fieldName(), lookup);
             requireStringColumn(w.fieldName(), "wildcard", lookup);
             return LanceStringPatternSql.wildcard(w.fieldName(), w.value(), w.caseInsensitive());
         }
         if (builder instanceof RegexpQueryBuilder r) {
-            rejectMultiFieldPath(r.fieldName());
+            rejectUnresolvableDottedPath(r.fieldName(), lookup);
             requireStringColumn(r.fieldName(), "regexp", lookup);
             // Same flag handling as RegexpQueryBuilder.doToQuery, so the
             // field type and this translator agree on which Lucene
@@ -275,7 +277,7 @@ public final class LanceKnnFilterTranslator {
             return LanceStringPatternSql.regexp(r.fieldName(), r.value(), syntaxFlags, matchFlags);
         }
         if (builder instanceof PrefixQueryBuilder p) {
-            rejectMultiFieldPath(p.fieldName());
+            rejectUnresolvableDottedPath(p.fieldName(), lookup);
             requireStringColumn(p.fieldName(), "prefix", lookup);
             return LanceStringPatternSql.prefix(p.fieldName(), p.value(), p.caseInsensitive());
         }
@@ -311,28 +313,37 @@ public final class LanceKnnFilterTranslator {
     }
 
     /**
-     * Refuse a dotted field name so multi-field sub-fields
-     * ({@code body.raw}) do not fall through to the Lance SQL
-     * pre-filter path. Sub-fields share the base column's data but
-     * exist only as Lucene {@code FieldInfo} entries; Lance does not
-     * know about them and would interpret the dot as a struct field
-     * access, returning a 500 like "type Utf8 is not Struct, Map, or
-     * Null". Sub-field queries belong on the Lucene searcher path
-     * (SortedSetDocValues), which the coordinator picks when
-     * {@code filterSql} is null.
+     * Refuse a dotted field name the mapping does not resolve as a
+     * struct child, so multi-field sub-fields ({@code body.raw}) do not
+     * fall through to the Lance SQL pre-filter path. Sub-fields share
+     * the base column's data but exist only as Lucene {@code FieldInfo}
+     * entries; Lance does not know about them and would interpret the
+     * dot as a struct field access, returning a 500 like "type Utf8 is
+     * not Struct, Map, or Null". Sub-field queries belong on the Lucene
+     * searcher path (SortedSetDocValues), which the coordinator picks
+     * when {@code filterSql} is null.
      *
-     * <p>Nested Lance columns (Struct / List&lt;Struct&gt;) are not
-     * surfaced yet, so a dot in the mapping today means multi-field
-     * unambiguously. Revisit this guard when those shapes land.
+     * <p>A dotted name the lookup resolves passes: the two lookups the
+     * production callers hand in resolve dotted names through object
+     * {@code properties} only (a multi-field sub-field lives under
+     * {@code fields} and returns {@code null}), so a resolved path is a
+     * Struct child, which Lance's SQL parser reads as a nested field
+     * access ({@code parent.child}). Callers without mapping context
+     * ({@link #NO_MAPPING}) keep rejecting every dotted name as before.
      */
-    private static void rejectMultiFieldPath(String fieldName) {
-        if (fieldName != null && fieldName.indexOf('.') >= 0) {
-            throw new IllegalArgumentException(
-                "[lance_knn] filter cannot push down to Lance for dotted field ["
-                    + fieldName
-                    + "]; multi-field sub-fields resolve via Lucene doc values instead"
-            );
+    private static void rejectUnresolvableDottedPath(String fieldName, Function<String, String> lookup) {
+        if (fieldName == null || fieldName.indexOf('.') < 0) {
+            return;
         }
+        if (lookup.apply(fieldName) != null) {
+            return;
+        }
+        throw new IllegalArgumentException(
+            "[lance_knn] filter cannot push down to Lance for dotted field ["
+                + fieldName
+                + "]; only struct (object) children resolved by the mapping push down, multi-field sub-fields resolve via "
+                + "Lucene doc values instead"
+        );
     }
 
     private static String translateRange(RangeQueryBuilder r, Function<String, String> fieldTypeLookup) {

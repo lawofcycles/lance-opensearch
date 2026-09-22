@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -93,6 +94,7 @@ public final class LanceFragmentSchema {
     private final Map<String, NumericPrecision> numericPrecision;
     private final Map<String, String> keywordSubFields;
     private final Set<String> basesWithKeywordSub;
+    private final Set<String> structColumns;
     private final List<String> takeColumns;
     private final int sourceColumnCount;
     private final int pkTakeIndex;
@@ -105,6 +107,7 @@ public final class LanceFragmentSchema {
         Map<String, NumericPrecision> numericPrecision,
         Map<String, String> keywordSubFields,
         Set<String> basesWithKeywordSub,
+        Set<String> structColumns,
         List<String> takeColumns,
         int sourceColumnCount,
         int pkTakeIndex,
@@ -116,6 +119,7 @@ public final class LanceFragmentSchema {
         this.numericPrecision = numericPrecision;
         this.keywordSubFields = keywordSubFields;
         this.basesWithKeywordSub = basesWithKeywordSub;
+        this.structColumns = structColumns;
         this.takeColumns = takeColumns;
         this.sourceColumnCount = sourceColumnCount;
         this.pkTakeIndex = pkTakeIndex;
@@ -199,11 +203,28 @@ public final class LanceFragmentSchema {
 
         // Schema pass: classify every column we might surface. FTS
         // presence for Utf8 columns comes from the caller-resolved
-        // ftsColumns set rather than a per-leaf JNI call.
+        // ftsColumns set rather than a per-leaf JNI call. Struct columns
+        // contribute their supported children under dotted paths
+        // (parent.child), recursing into nested structs; the parent name
+        // itself carries no doc values but joins the row take so _source
+        // can render the object. topLevelOrder keeps the take projection
+        // in schema order: surfaced scalar columns by their own name,
+        // struct columns by the parent name.
         LinkedHashMap<String, ColumnKind> columnKind = new LinkedHashMap<>();
         Map<String, NumericPrecision> numericPrecision = new LinkedHashMap<>();
+        Set<String> structColumns = new LinkedHashSet<>();
+        List<String> topLevelOrder = new ArrayList<>();
         try {
             for (Field field : dataset.getSchema().getFields()) {
+                if (field.getType() instanceof ArrowType.Struct) {
+                    int before = columnKind.size();
+                    classifyStructChildren(field, field.getName(), columnKind, numericPrecision);
+                    if (columnKind.size() > before) {
+                        structColumns.add(field.getName());
+                        topLevelOrder.add(field.getName());
+                    }
+                    continue;
+                }
                 ColumnKind kind = classify(field);
                 if (kind == null) {
                     continue;
@@ -212,6 +233,7 @@ public final class LanceFragmentSchema {
                     kind = ftsColumns.contains(field.getName()) ? ColumnKind.TEXT_FTS : ColumnKind.TEXT_KEYWORD;
                 }
                 columnKind.put(field.getName(), kind);
+                topLevelOrder.add(field.getName());
                 // Remember the precision of Float32 / Float64 columns so
                 // _source and readAsLong can round trip them through the
                 // shared long representation. All other numeric columns
@@ -233,14 +255,17 @@ public final class LanceFragmentSchema {
         // NumericDocValues entry; readAsLong already returns the unsigned
         // bit pattern for UInt8Vector. Only this one column is elevated.
         if (effectivePkType == LancePrimaryKeyType.UNSIGNED_LONG && !intField.isEmpty()) {
-            columnKind.putIfAbsent(intField, ColumnKind.NUMERIC);
+            if (columnKind.putIfAbsent(intField, ColumnKind.NUMERIC) == null) {
+                topLevelOrder.add(intField);
+            }
         }
 
-        // Projection for the per-hit row take: every surfaced column in
-        // schema order so _source keys come out in a stable order, plus
-        // the PK column appended when its Arrow type is one classify()
-        // declines (the take still needs it for _id).
-        List<String> take = new ArrayList<>(columnKind.keySet());
+        // Projection for the per-hit row take: every surfaced top-level
+        // column in schema order (struct columns project the whole parent
+        // so _source renders the object with its children), plus the PK
+        // column appended when its Arrow type is one classify() declines
+        // (the take still needs it for _id).
+        List<String> take = new ArrayList<>(topLevelOrder);
         int sourceColumnCount = take.size();
         int pkIndex = -1;
         if (effectivePkType != LancePrimaryKeyType.NONE) {
@@ -256,8 +281,11 @@ public final class LanceFragmentSchema {
         // NUMERIC / BOOLEAN → NumericDocValues, TEXT_KEYWORD /
         // KEYWORD_ARRAY → SortedSet, TEXT_FTS / BINARY → no doc values but
         // the FieldInfo exists so the security plugin's FLS wrapper can
-        // drop them by name. Multi-fields append a synthetic SORTED_SET
-        // entry per keyword sub-field; the data lives on the base column.
+        // drop them by name. Struct children appear under their dotted
+        // path; the struct parent itself has no FieldInfo (an object
+        // field has no doc values of its own). Multi-fields append a
+        // synthetic SORTED_SET entry per keyword sub-field; the data
+        // lives on the base column.
         List<FieldInfo> infos = new ArrayList<>();
         int number = 10;
         for (Map.Entry<String, ColumnKind> entry : columnKind.entrySet()) {
@@ -279,11 +307,53 @@ public final class LanceFragmentSchema {
             Collections.unmodifiableMap(numericPrecision),
             Collections.unmodifiableMap(subToBase),
             Collections.unmodifiableSet(basesWithKeywordSub),
+            Collections.unmodifiableSet(structColumns),
             Collections.unmodifiableList(take),
             sourceColumnCount,
             pkIndex,
             new FieldInfos(infos.toArray(new FieldInfo[0]))
         );
+    }
+
+    /**
+     * Classify the children of a Struct column into {@code columnKind}
+     * under their dotted path ({@code parent.child}), recursing into
+     * nested structs. Children follow the top-level {@link #classify}
+     * rules with two exceptions that mirror the mapping derivation:
+     * Utf8 children are always {@link ColumnKind#TEXT_KEYWORD} (Lance
+     * FTS indexes target top-level columns only) and Binary children
+     * are skipped (the mapping does not surface them inside a struct).
+     * Unsupported children are simply absent, matching the mapping's
+     * "skipped with a note" behaviour.
+     */
+    private static void classifyStructChildren(
+        Field structField,
+        String path,
+        LinkedHashMap<String, ColumnKind> columnKind,
+        Map<String, NumericPrecision> numericPrecision
+    ) {
+        for (Field child : structField.getChildren()) {
+            String childPath = path + "." + child.getName();
+            if (child.getType() instanceof ArrowType.Struct) {
+                classifyStructChildren(child, childPath, columnKind, numericPrecision);
+                continue;
+            }
+            ColumnKind kind = classify(child);
+            if (kind == null || kind == ColumnKind.BINARY) {
+                continue;
+            }
+            if (kind == ColumnKind.TEXT_FTS) {
+                kind = ColumnKind.TEXT_KEYWORD;
+            }
+            columnKind.put(childPath, kind);
+            if (child.getType() instanceof ArrowType.FloatingPoint fp) {
+                if (fp.getPrecision() == FloatingPointPrecision.SINGLE) {
+                    numericPrecision.put(childPath, NumericPrecision.FLOAT);
+                } else if (fp.getPrecision() == FloatingPointPrecision.DOUBLE) {
+                    numericPrecision.put(childPath, NumericPrecision.DOUBLE);
+                }
+            }
+        }
     }
 
     private static FieldInfo fieldInfo(String name, int number, DocValuesType dvType) {
@@ -315,7 +385,9 @@ public final class LanceFragmentSchema {
      * structs, decimals etc.). {@code Utf8} columns are returned as
      * {@link ColumnKind#TEXT_FTS} here and refined to
      * {@link ColumnKind#TEXT_KEYWORD} by {@link #derive} once it knows
-     * whether the column carries an FTS index.
+     * whether the column carries an FTS index. Struct columns return
+     * {@code null} here because {@link #derive} routes them through
+     * {@link #classifyStructChildren} instead.
      */
     private static ColumnKind classify(Field field) {
         ArrowType type = field.getType();
@@ -390,6 +462,16 @@ public final class LanceFragmentSchema {
     /** Base column names that carry at least one keyword sub-field. */
     Set<String> basesWithKeywordSub() {
         return basesWithKeywordSub;
+    }
+
+    /**
+     * Top-level Struct column names with at least one surfaced child.
+     * These columns appear in {@link #takeColumns()} under the parent
+     * name (the take projects the whole struct) while their children
+     * appear in {@link #columnKind()} under dotted paths.
+     */
+    Set<String> structColumns() {
+        return structColumns;
     }
 
     /** Projection of the per-hit row take, in {@code _source} order. */

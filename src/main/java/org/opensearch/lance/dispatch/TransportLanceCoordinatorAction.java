@@ -1143,8 +1143,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * into a {@code Map<String, Object>} tree. The top-level
      * {@code properties} entry holds one entry per column, keyed by
      * the OpenSearch field name; the {@code type} field on each
-     * entry is what we need. Nested objects are not surfaced yet,
-     * so this shallow walk covers today's mappings.
+     * entry is what we need. A dotted name walks nested
+     * {@code properties} maps (a Struct column mapped as
+     * {@code object}), so {@code meta.region} resolves to its child
+     * type while a multi-field sub-field ({@code body.raw}, declared
+     * under {@code fields}) stays unresolved.
      *
      * <p>Package-private so the per-node executor can build the same
      * lookup from its own copy of the index metadata when it decides
@@ -1165,12 +1168,43 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         final java.util.Map<String, Object> propertyMap = (java.util.Map<String, Object>) properties;
         return name -> {
             Object field = propertyMap.get(name);
+            if (field == null && name != null && name.indexOf('.') >= 0) {
+                field = resolveObjectPath(propertyMap, name);
+            }
             if (!(field instanceof java.util.Map)) {
                 return null;
             }
             Object type = ((java.util.Map<String, Object>) field).get("type");
             return type instanceof String ? (String) type : null;
         };
+    }
+
+    /**
+     * Resolve a dotted field name through nested {@code properties}
+     * maps: each segment but the last must name an entry that itself
+     * carries a {@code properties} object (a struct child mapped as an
+     * {@code object}). A multi-field sub-field does not resolve here —
+     * its sub-entries live under {@code fields}, not {@code properties}
+     * — so the filter translator can tell the two dotted shapes apart:
+     * struct children print as Lance nested field accesses, sub-fields
+     * stay on the Lucene doc value path.
+     */
+    @SuppressWarnings("unchecked")
+    private static Object resolveObjectPath(java.util.Map<String, Object> propertyMap, String name) {
+        java.util.Map<String, Object> current = propertyMap;
+        String[] segments = name.split("\\.");
+        for (int s = 0; s < segments.length - 1; s++) {
+            Object entry = current.get(segments[s]);
+            if (!(entry instanceof java.util.Map)) {
+                return null;
+            }
+            Object nested = ((java.util.Map<String, Object>) entry).get("properties");
+            if (!(nested instanceof java.util.Map)) {
+                return null;
+            }
+            current = (java.util.Map<String, Object>) nested;
+        }
+        return current.get(segments[segments.length - 1]);
     }
 
     /**
