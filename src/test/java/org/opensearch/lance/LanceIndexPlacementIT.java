@@ -116,7 +116,9 @@ public class LanceIndexPlacementIT extends LanceRestTestCase {
                 500,
                 failure.getResponse().getStatusLine().getStatusCode()
             );
-            assertTrue("expected label under failed.fts: " + body, body.contains("\"failed\""));
+            assertEquals("expected label under failed.fts: " + body, "label", stringPath(body, "failed", "fts", "0", "column"));
+            String reason = stringPath(body, "failed", "fts", "0", "reason");
+            assertTrue("expected Lance's permission error as the reason: " + reason, reason.contains("Permission denied"));
             client().performRequest(new Request("DELETE", "/" + indexName));
         } finally {
             makeWritable(tableDir);
