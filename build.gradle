@@ -111,6 +111,36 @@ dependencies {
     }
     implementation "com.fasterxml.jackson.core:jackson-annotations:${jackson_annotations_version}"
 
+    // Apache Calcite is the query planner foundation and Substrait Java's
+    // isthmus module supplies the Calcite RelNode to Substrait plan bridge
+    // (SubstraitRelVisitor). The build resolves no transitive dependencies
+    // for third-party groups, so the closure is declared explicitly and
+    // "excluding" an artifact means not declaring it. The plugin does not
+    // use Calcite's SQL parser, JDBC driver, or Enumerable runtime, so
+    // Janino, calcite-server, and the Avatica remote metrics stay out; the
+    // geo (JTS / proj4j) and statistics (datasketches, uzaygezen,
+    // aggdesigner) paths are equally unused. calcite-linq4j must ship:
+    // creating any character type walks SqlCollation's static initializer
+    // into CalciteTrace, which loads linq4j's Functions class.
+    // protobuf-java and jackson-dataformat-yaml come from the OpenSearch
+    // core classpath.
+    // calcite-core 1.39.0 is the version isthmus 0.57.0 declares in its
+    // POM and was compiled against.
+    implementation "org.apache.calcite:calcite-core:${calcite_version}"
+    implementation "org.apache.calcite:calcite-linq4j:${calcite_version}"
+    implementation "org.apache.calcite.avatica:avatica-core:${avatica_version}"
+    implementation "com.google.guava:guava:${guava_version}"
+    implementation "com.google.guava:failureaccess:${failureaccess_version}"
+    implementation "io.substrait:core:${substrait_version}"
+    implementation "io.substrait:isthmus:${substrait_version}"
+    // Substrait's SimpleExtension loader deserialises extension YAML with
+    // the Jdk8Module (Optional fields on the model classes). Not shipped
+    // by OpenSearch core, so bundle it at the plugin's Jackson version.
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jdk8:${jackson_databind_version}") {
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-annotations'
+    }
+
     // lance-namespace-apache-client 0.11.1+ uses JavaTimeModule for
     // ISO-8601 handling on the request/response models (timestamp fields
     // added in namespace 0.11's REST spec). Not bundled by OpenSearch
@@ -174,10 +204,16 @@ dependencies {
     }
 }
 
-// Collapse the Apache Arrow and Jackson jars into single license/notice entries.
+// Collapse the Apache Arrow, Jackson, Calcite, Substrait, and Guava jars
+// into single license/notice entries.
 tasks.named("dependencyLicenses").configure {
     mapping from: /arrow-.*/, to: 'arrow'
     mapping from: /jackson-.*/, to: 'jackson'
+    mapping from: /calcite-.*/, to: 'calcite'
+    mapping from: /avatica-.*/, to: 'avatica'
+    mapping from: /guava|failureaccess/, to: 'guava'
+    // io.substrait's core artifact is named core-<version>.jar.
+    mapping from: /^(core|isthmus)$/, to: 'substrait'
 }
 
 // lance-core references API surface from libraries that are either provided
@@ -188,6 +224,112 @@ tasks.named("dependencyLicenses").configure {
 // explicitly here.
 tasks.named('thirdPartyAudit').configure {
     ignoreMissingClasses(
+
+        // Janino code generation backing the Enumerable convention and JaninoRelMetadataProvider. The plugin uses the reflective metadata provider, so Janino is not bundled.
+        'org.codehaus.commons.compiler.CompilerFactoryFactory',
+        'org.codehaus.commons.compiler.IClassBodyEvaluator',
+        'org.codehaus.commons.compiler.ICompilerFactory',
+        'org.codehaus.commons.compiler.ISimpleCompiler',
+        'org.codehaus.commons.compiler.util.resource.ResourceFinder',
+        'org.codehaus.janino.ClassBodyEvaluator',
+        'org.codehaus.janino.JavaSourceClassLoader',
+        'org.codehaus.janino.util.ClassFile',
+
+        // Calcite SQL DDL parser from calcite-server, referenced by isthmus's SQL entry points. The plugin converts RelNode plans only and never parses SQL, so calcite-server is not bundled.
+        'org.apache.calcite.sql.parser.ddl.SqlDdlParserImpl',
+
+        // Avatica remote JDBC metrics. The plugin never opens an Avatica connection, so avatica-metrics is not bundled.
+        'org.apache.calcite.avatica.metrics.MetricsSystem',
+        'org.apache.calcite.avatica.metrics.Timer',
+        'org.apache.calcite.avatica.metrics.Timer$Context',
+        'org.apache.calcite.avatica.metrics.noop.NoopMetricsSystem',
+
+        // Calcite geospatial functions (JTS 1.19 additions and proj4j). The plugin maps no geo types through Calcite, so the geo path is unreachable.
+        'org.locationtech.jts.algorithm.InteriorPoint',
+        'org.locationtech.jts.geom.util.GeometryFixer',
+        'org.locationtech.jts.io.geojson.GeoJsonReader',
+        'org.locationtech.jts.io.geojson.GeoJsonWriter',
+        'org.locationtech.jts.operation.buffer.OffsetCurve',
+        'org.locationtech.jts.triangulate.polygon.ConstrainedDelaunayTriangulator',
+        'org.locationtech.jts.triangulate.tri.Tri',
+        'org.locationtech.proj4j.CRSFactory',
+        'org.locationtech.proj4j.CoordinateReferenceSystem',
+        'org.locationtech.proj4j.CoordinateTransform',
+        'org.locationtech.proj4j.CoordinateTransformFactory',
+        'org.locationtech.proj4j.ProjCoordinate',
+        'org.locationtech.proj4j.proj.Projection',
+
+        // Calcite statistics and lattice tooling (datasketches HLL, uzaygezen space filling curves, Pentaho aggregate designer). Unreachable without lattices or the profiler.
+        'com.google.uzaygezen.core.BacktrackingQueryBuilder',
+        'com.google.uzaygezen.core.BitVector',
+        'com.google.uzaygezen.core.BitVectorFactories',
+        'com.google.uzaygezen.core.CompactHilbertCurve',
+        'com.google.uzaygezen.core.FilteredIndexRange',
+        'com.google.uzaygezen.core.Query',
+        'com.google.uzaygezen.core.SimpleRegionInspector',
+        'com.google.uzaygezen.core.ranges.LongRange',
+        'com.google.uzaygezen.core.ranges.LongRangeHome',
+        'com.yahoo.sketches.hll.HllSketch',
+        'com.yahoo.sketches.hll.HllSketchBuilder',
+        'org.pentaho.aggdes.algorithm.Algorithm',
+        'org.pentaho.aggdes.algorithm.Algorithm$ParameterEnum',
+        'org.pentaho.aggdes.algorithm.Result',
+        'org.pentaho.aggdes.model.Aggregate',
+        'org.pentaho.aggdes.model.Attribute',
+        'org.pentaho.aggdes.model.Dialect',
+        'org.pentaho.aggdes.model.Schema',
+        'org.pentaho.aggdes.model.StatisticsProvider',
+        'org.pentaho.aggdes.model.Table',
+
+        // Calcite JSON_* SQL functions (jayway json-path). The plugin does not evaluate SQL functions.
+        'com.jayway.jsonpath.Configuration',
+        'com.jayway.jsonpath.Configuration$ConfigurationBuilder',
+        'com.jayway.jsonpath.DocumentContext',
+        'com.jayway.jsonpath.InvalidPathException',
+        'com.jayway.jsonpath.JsonPath',
+        'com.jayway.jsonpath.Option',
+        'com.jayway.jsonpath.Predicate',
+        'com.jayway.jsonpath.spi.json.JacksonJsonProvider',
+        'com.jayway.jsonpath.spi.mapper.MappingProvider',
+
+        // Apache Commons utilities used by Calcite's SQL function library, DDL executors, and the Hilbert curve indexer. Unreachable from planning APIs.
+        'org.apache.commons.dbcp2.BasicDataSource',
+        'org.apache.commons.io.IOUtils',
+        'org.apache.commons.lang.StringEscapeUtils',
+        'org.apache.commons.lang3.StringUtils',
+        'org.apache.commons.lang3.mutable.MutableBoolean',
+        'org.apache.commons.math3.fraction.BigFraction',
+        'org.apache.commons.math3.util.CombinatoricsUtils',
+        'org.apache.commons.text.similarity.LevenshteinDistance',
+
+        // Avatica remote JDBC HTTP client. The plugin never opens an Avatica connection.
+        'org.apache.hc.client5.http.SystemDefaultDnsResolver',
+        'org.apache.hc.client5.http.auth.AuthScope',
+        'org.apache.hc.client5.http.auth.Credentials',
+        'org.apache.hc.client5.http.auth.CredentialsProvider',
+        'org.apache.hc.client5.http.auth.KerberosConfig',
+        'org.apache.hc.client5.http.auth.KerberosConfig$Builder',
+        'org.apache.hc.client5.http.auth.UsernamePasswordCredentials',
+        'org.apache.hc.client5.http.classic.methods.HttpPost',
+        'org.apache.hc.client5.http.config.RequestConfig',
+        'org.apache.hc.client5.http.config.RequestConfig$Builder',
+        'org.apache.hc.client5.http.impl.auth.BasicAuthCache',
+        'org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider',
+        'org.apache.hc.client5.http.impl.classic.HttpClientBuilder',
+        'org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager',
+        'org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder',
+        'org.apache.hc.client5.http.routing.RoutingSupport',
+        'org.apache.hc.client5.http.ssl.HttpsSupport',
+        'org.apache.hc.client5.http.ssl.NoopHostnameVerifier',
+        'org.apache.hc.client5.http.ssl.TlsSocketStrategy',
+        'org.apache.hc.core5.http.ClassicHttpResponse',
+        'org.apache.hc.core5.http.HttpHost',
+        'org.apache.hc.core5.http.config.Lookup',
+        'org.apache.hc.core5.http.config.RegistryBuilder',
+        'org.apache.hc.core5.ssl.SSLContextBuilder',
+        'org.apache.hc.core5.ssl.SSLContexts',
+        'org.apache.hc.core5.util.Timeout',
+
         // Optional OpenTelemetry metrics instrumentation in lance-core.
 
         // Optional OpenTelemetry metrics instrumentation in lance-core.
@@ -237,6 +379,21 @@ tasks.named('thirdPartyAudit').configure {
     )
 
     ignoreViolations(
+        // Guava's Unsafe-based optimizations (bundled for Calcite). Same
+        // classes as the shaded copies below that lance-core already carries.
+        'com.google.common.cache.Striped64',
+        'com.google.common.cache.Striped64$1',
+        'com.google.common.cache.Striped64$Cell',
+        'com.google.common.hash.LittleEndianByteArray$UnsafeByteArray',
+        'com.google.common.hash.LittleEndianByteArray$UnsafeByteArray$1',
+        'com.google.common.hash.LittleEndianByteArray$UnsafeByteArray$2',
+        'com.google.common.hash.Striped64',
+        'com.google.common.hash.Striped64$1',
+        'com.google.common.hash.Striped64$Cell',
+        'com.google.common.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator',
+        'com.google.common.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator$1',
+        'com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper',
+        'com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper$1',
         // arrow-memory-core's Unsafe-based MemoryUtil. Also enumerated as such
         // by sandbox/plugins/parquet-data-format.
         'org.apache.arrow.memory.util.MemoryUtil',

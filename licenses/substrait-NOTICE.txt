@@ -1,0 +1,4 @@
+Substrait Java
+
+This product includes software developed at the Substrait project
+(https://substrait.io/).

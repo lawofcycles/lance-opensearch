@@ -49,6 +49,7 @@ Inspired by [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Infrastructure
 
+- Bundle Apache Calcite (`calcite-core`, `calcite-linq4j`) and Substrait Java (`core`, `isthmus`) as the query planner foundation; not yet used by any request path.
 - Bundle Lance's runtime dependencies (Arrow, Netty, questdb JAR JNI loader, Lance native library for macOS/aarch64, linux/x86_64, and linux/aarch64).
 - opensearch-project standard build (`opensearch.opensearchplugin` + `opensearch.pluginzip`) with the full precommit chain (dependencyLicenses, thirdPartyAudit, licenseHeaders, testingConventions, forbiddenApis, jarHell, filepermissions, forbiddenPatterns, validatePluginZipPom, validatePom).
 - Full test / integTest / multiNodeIntegTest suite (200+ unit, 70+ integTest, 2 multi-node).
