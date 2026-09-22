@@ -118,6 +118,7 @@ import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.lance.query.LanceKnnQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.script.ScriptService;
+import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.aggregations.Aggregation;
 import org.opensearch.search.aggregations.Aggregator;
@@ -1773,8 +1774,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         // ordering over the raw strings would return the wrong order and
         // fail formatting the sort values, so such a clause stays on the
         // Lucene collector.
-        for (org.opensearch.search.DocValueFormat format : sortAndFormats.formats) {
-            if (format == org.opensearch.search.DocValueFormat.IP) {
+        for (DocValueFormat format : sortAndFormats.formats) {
+            if (format == DocValueFormat.IP) {
                 return null;
             }
         }
