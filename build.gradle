@@ -117,7 +117,7 @@ dependencies {
     // for third-party groups, so the closure is declared explicitly and
     // "excluding" an artifact means not declaring it. The plugin does not
     // use Calcite's SQL parser, JDBC driver, or Enumerable runtime, so
-    // Janino, calcite-server, and the Avatica remote metrics stay out; the
+    // calcite-server and the Avatica remote metrics stay out; the
     // geo (JTS / proj4j) and statistics (datasketches, uzaygezen,
     // aggdesigner) paths are equally unused. calcite-linq4j must ship:
     // creating any character type walks SqlCollation's static initializer
@@ -133,6 +133,19 @@ dependencies {
     implementation "com.google.guava:failureaccess:${failureaccess_version}"
     implementation "io.substrait:core:${substrait_version}"
     implementation "io.substrait:isthmus:${substrait_version}"
+    // Janino, commons-compiler, and json-path are needed the moment any
+    // RelOptCluster exists: the cluster constructor wraps the metadata
+    // provider in JaninoRelMetadataProvider (commons-compiler at class
+    // load, janino when the first metadata call compiles its handlers),
+    // and initializing DefaultRelMetadataProvider walks BuiltInMethod's
+    // static initializer over JsonFunctions, whose signatures reference
+    // json-path types. Versions are what calcite-core 1.39.0 declares.
+    // json-smart (json-path's own runtime dependency) is not bundled: the
+    // metadata path never touches it, only the JSON_* SQL function bodies
+    // do, and the plugin does not evaluate SQL functions.
+    implementation "org.codehaus.janino:janino:${janino_version}"
+    implementation "org.codehaus.janino:commons-compiler:${janino_version}"
+    implementation "com.jayway.jsonpath:json-path:${jsonpath_version}"
     // Substrait's SimpleExtension loader deserialises extension YAML with
     // the Jdk8Module (Optional fields on the model classes). Not shipped
     // by OpenSearch core, so bundle it at the plugin's Jackson version.
@@ -212,6 +225,8 @@ tasks.named("dependencyLicenses").configure {
     mapping from: /calcite-.*/, to: 'calcite'
     mapping from: /avatica-.*/, to: 'avatica'
     mapping from: /guava|failureaccess/, to: 'guava'
+    // janino and commons-compiler are both org.codehaus.janino artifacts.
+    mapping from: /janino|commons-compiler/, to: 'janino'
     // io.substrait's core artifact is named core-<version>.jar.
     mapping from: /^(core|isthmus)$/, to: 'substrait'
 }
@@ -224,16 +239,6 @@ tasks.named("dependencyLicenses").configure {
 // explicitly here.
 tasks.named('thirdPartyAudit').configure {
     ignoreMissingClasses(
-
-        // Janino code generation backing the Enumerable convention and JaninoRelMetadataProvider. The plugin uses the reflective metadata provider, so Janino is not bundled.
-        'org.codehaus.commons.compiler.CompilerFactoryFactory',
-        'org.codehaus.commons.compiler.IClassBodyEvaluator',
-        'org.codehaus.commons.compiler.ICompilerFactory',
-        'org.codehaus.commons.compiler.ISimpleCompiler',
-        'org.codehaus.commons.compiler.util.resource.ResourceFinder',
-        'org.codehaus.janino.ClassBodyEvaluator',
-        'org.codehaus.janino.JavaSourceClassLoader',
-        'org.codehaus.janino.util.ClassFile',
 
         // Calcite SQL DDL parser from calcite-server, referenced by isthmus's SQL entry points. The plugin converts RelNode plans only and never parses SQL, so calcite-server is not bundled.
         'org.apache.calcite.sql.parser.ddl.SqlDdlParserImpl',
@@ -281,17 +286,6 @@ tasks.named('thirdPartyAudit').configure {
         'org.pentaho.aggdes.model.StatisticsProvider',
         'org.pentaho.aggdes.model.Table',
 
-        // Calcite JSON_* SQL functions (jayway json-path). The plugin does not evaluate SQL functions.
-        'com.jayway.jsonpath.Configuration',
-        'com.jayway.jsonpath.Configuration$ConfigurationBuilder',
-        'com.jayway.jsonpath.DocumentContext',
-        'com.jayway.jsonpath.InvalidPathException',
-        'com.jayway.jsonpath.JsonPath',
-        'com.jayway.jsonpath.Option',
-        'com.jayway.jsonpath.Predicate',
-        'com.jayway.jsonpath.spi.json.JacksonJsonProvider',
-        'com.jayway.jsonpath.spi.mapper.MappingProvider',
-
         // Apache Commons utilities used by Calcite's SQL function library, DDL executors, and the Hilbert curve indexer. Unreachable from planning APIs.
         'org.apache.commons.dbcp2.BasicDataSource',
         'org.apache.commons.io.IOUtils',
@@ -301,6 +295,56 @@ tasks.named('thirdPartyAudit').configure {
         'org.apache.commons.math3.fraction.BigFraction',
         'org.apache.commons.math3.util.CombinatoricsUtils',
         'org.apache.commons.text.similarity.LevenshteinDistance',
+
+        // json-path's pluggable JSON providers (json-smart is its default, gson / jakarta.json / jettison / tapestry / org.json are alternatives). A provider is only instantiated when a json-path Configuration is built, which happens inside Calcite's JSON_* SQL function bodies; the plugin does not evaluate SQL functions.
+        'com.google.gson.Gson',
+        'com.google.gson.JsonArray',
+        'com.google.gson.JsonElement',
+        'com.google.gson.JsonObject',
+        'com.google.gson.JsonParser',
+        'com.google.gson.JsonPrimitive',
+        'com.google.gson.TypeAdapter',
+        'com.google.gson.reflect.TypeToken',
+        'jakarta.json.JsonArray',
+        'jakarta.json.JsonArrayBuilder',
+        'jakarta.json.JsonBuilderFactory',
+        'jakarta.json.JsonNumber',
+        'jakarta.json.JsonObject',
+        'jakarta.json.JsonObjectBuilder',
+        'jakarta.json.JsonReader',
+        'jakarta.json.JsonString',
+        'jakarta.json.JsonStructure',
+        'jakarta.json.JsonValue',
+        'jakarta.json.JsonValue$ValueType',
+        'jakarta.json.bind.Jsonb',
+        'jakarta.json.bind.JsonbBuilder',
+        'jakarta.json.bind.JsonbConfig',
+        'jakarta.json.spi.JsonProvider',
+        'jakarta.json.stream.JsonLocation',
+        'jakarta.json.stream.JsonParser',
+        'jakarta.json.stream.JsonParser$Event',
+        'net.minidev.json.JSONArray',
+        'net.minidev.json.JSONObject',
+        'net.minidev.json.JSONStyle',
+        'net.minidev.json.JSONValue',
+        'net.minidev.json.parser.JSONParser',
+        'net.minidev.json.writer.JsonReader',
+        'net.minidev.json.writer.JsonReaderI',
+        'org.apache.tapestry5.json.JSONArray',
+        'org.apache.tapestry5.json.JSONCollection',
+        'org.apache.tapestry5.json.JSONObject',
+        'org.codehaus.jettison.json.JSONArray',
+        'org.codehaus.jettison.json.JSONException',
+        'org.codehaus.jettison.json.JSONObject',
+        'org.codehaus.jettison.json.JSONTokener',
+        'org.json.JSONArray',
+        'org.json.JSONObject',
+        'org.json.JSONTokener',
+
+        // Janino's Ant build integration (AntCompilerAdapter). Janino is only invoked through JaninoRelMetadataProvider's in-memory compiler, never through Ant.
+        'org.apache.tools.ant.taskdefs.Javac',
+        'org.apache.tools.ant.taskdefs.compilers.DefaultCompilerAdapter',
+        'org.apache.tools.ant.types.Path',
 
         // Avatica remote JDBC HTTP client. The plugin never opens an Avatica connection.
         'org.apache.hc.client5.http.SystemDefaultDnsResolver',
