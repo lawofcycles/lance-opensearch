@@ -16,6 +16,33 @@ import org.opensearch.test.OpenSearchTestCase;
 
 public class LanceKnnFilterTranslatorTests extends OpenSearchTestCase {
 
+    public void testSentinelForDateOverIntegerMeta() {
+        assertEquals(LanceKnnFilterTranslator.DATE_ON_INTEGER, LanceKnnFilterTranslator.sentinelFor("date", "Int(64, true)"));
+        assertEquals(LanceKnnFilterTranslator.DATE_ON_INTEGER, LanceKnnFilterTranslator.sentinelFor("date", "Int(32, false)"));
+    }
+
+    public void testSentinelForDateOverTimestampMetaStaysDate() {
+        assertEquals("date", LanceKnnFilterTranslator.sentinelFor("date", "Timestamp(Millisecond, None)"));
+        assertEquals("date", LanceKnnFilterTranslator.sentinelFor("date", "Date64"));
+    }
+
+    public void testSentinelForIpIgnoresMeta() {
+        assertEquals(LanceKnnFilterTranslator.IP_ON_UTF8, LanceKnnFilterTranslator.sentinelFor("ip", "Utf8"));
+        assertEquals(LanceKnnFilterTranslator.IP_ON_UTF8, LanceKnnFilterTranslator.sentinelFor("ip", null));
+    }
+
+    public void testSentinelForPlainTypeNamePassesThrough() {
+        assertEquals("long", LanceKnnFilterTranslator.sentinelFor("long", "Int(64, true)"));
+        assertEquals("keyword", LanceKnnFilterTranslator.sentinelFor("keyword", "Utf8"));
+        assertEquals("keyword", LanceKnnFilterTranslator.sentinelFor("keyword", null));
+    }
+
+    public void testSentinelForNullOrMissingMeta() {
+        assertEquals("date", LanceKnnFilterTranslator.sentinelFor("date", null));
+        assertNull(LanceKnnFilterTranslator.sentinelFor(null, null));
+        assertNull(LanceKnnFilterTranslator.sentinelFor(null, "Int(64, true)"));
+    }
+
     public void testMatchAllTranslatesToTrue() {
         assertEquals("true", LanceKnnFilterTranslator.toLanceSql(QueryBuilders.matchAllQuery()));
     }

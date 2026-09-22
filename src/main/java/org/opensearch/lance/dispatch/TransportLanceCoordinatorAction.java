@@ -1188,37 +1188,25 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             if (!(type instanceof String typeName)) {
                 return null;
             }
-            if ("date".equals(typeName) && isIntegerArrowType(fieldMap)) {
-                return LanceKnnFilterTranslator.DATE_ON_INTEGER;
-            }
-            if ("ip".equals(typeName)) {
-                // The only way a field maps as `ip` in this plugin is the
-                // attach body's override on a Utf8 (or List<Utf8>)
-                // column, so no meta check is needed: the storage is
-                // always plain strings and no predicate may push as a
-                // string comparison.
-                return LanceKnnFilterTranslator.IP_ON_UTF8;
-            }
-            return typeName;
+            return LanceKnnFilterTranslator.sentinelFor(typeName, arrowTypeMeta(fieldMap));
         };
     }
 
     /**
-     * Whether the mapping entry's {@code meta.lance_arrow_type} names an
-     * integer Arrow column. True for a {@code date} field the attach
-     * body overrode onto an epoch-millis integer column, whose SQL
-     * literals must stay numeric (see
-     * {@link LanceKnnFilterTranslator#DATE_ON_INTEGER}); a real Date /
-     * Timestamp column keeps the plain {@code date} answer.
+     * The mapping entry's {@code meta.lance_arrow_type} string, or
+     * {@code null} when the entry carries no meta or no such key. Fed
+     * to {@link LanceKnnFilterTranslator#sentinelFor} so a {@code date}
+     * field the attach body overrode onto an epoch-millis integer
+     * column keeps numeric SQL literals.
      */
     @SuppressWarnings("unchecked")
-    static boolean isIntegerArrowType(Map<String, Object> fieldMap) {
+    static String arrowTypeMeta(Map<String, Object> fieldMap) {
         Object meta = fieldMap.get("meta");
         if (!(meta instanceof Map)) {
-            return false;
+            return null;
         }
         Object arrowType = ((Map<String, Object>) meta).get("lance_arrow_type");
-        return arrowType instanceof String s && s.startsWith("Int(");
+        return arrowType instanceof String s ? s : null;
     }
 
     /**

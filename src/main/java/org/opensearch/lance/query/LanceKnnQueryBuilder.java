@@ -416,23 +416,11 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
                     return null;
                 }
             }
-            String typeName = mft.typeName();
-            if ("date".equals(typeName)) {
-                // A date field the attach body overrode onto an integer
-                // column compares as a number on the Lance SQL side;
-                // the field meta carries the real Arrow type.
-                String arrowType = mft.meta() == null ? null : mft.meta().get("lance_arrow_type");
-                if (arrowType != null && arrowType.startsWith("Int(")) {
-                    return LanceKnnFilterTranslator.DATE_ON_INTEGER;
-                }
-            }
-            if ("ip".equals(typeName)) {
-                // An ip field always sits on a Utf8 column in this
-                // plugin; its predicates never push as string
-                // comparisons (see LanceKnnFilterTranslator.IP_ON_UTF8).
-                return LanceKnnFilterTranslator.IP_ON_UTF8;
-            }
-            return typeName;
+            // The field meta carries the real Arrow type; the translator
+            // decides whether the type name or a sentinel comes back
+            // (a date over an integer column, an ip over Utf8).
+            String arrowType = mft.meta() == null ? null : mft.meta().get("lance_arrow_type");
+            return LanceKnnFilterTranslator.sentinelFor(mft.typeName(), arrowType);
         });
         return new LanceKnnQuery(field, vector, k, nprobes, refineFactor, ef, parseDistance(metric), useIndex, filterSql);
     }

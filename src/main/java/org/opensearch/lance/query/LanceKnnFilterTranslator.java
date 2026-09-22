@@ -114,6 +114,44 @@ public final class LanceKnnFilterTranslator {
     public static final String IP_ON_UTF8 = "ip_on_utf8";
 
     /**
+     * The answer a field-type lookup gives for a resolved mapping entry:
+     * one of the sentinels above, or the plain OpenSearch type name.
+     * Both lookups this translator is handed (the coordinator's, built
+     * from the cluster-state mapping map, and {@code lance_knn}'s, built
+     * from the {@code QueryShardContext}) walk their own data structure
+     * to the mapping entry and then delegate the decision here, so the
+     * sentinel policy has one definition.
+     *
+     * <p>{@code openSearchTypeName} is the entry's {@code type}
+     * ({@code "date"}, {@code "ip"}, {@code "long"}, ...);
+     * {@code lanceArrowTypeMeta} is the entry's
+     * {@code meta.lance_arrow_type} value, or {@code null} when the
+     * entry has no meta. A {@code date} over an integer Arrow column
+     * ({@code Int(...)}) answers {@link #DATE_ON_INTEGER}; any
+     * {@code ip} answers {@link #IP_ON_UTF8} (the only way a field maps
+     * as {@code ip} in this plugin is the attach body's override on a
+     * Utf8 column, so no meta check is needed); everything else answers
+     * {@code openSearchTypeName} unchanged, including {@code null}.
+     *
+     * <p>Sentinels share the {@code String} namespace with real type
+     * names; the lookups never return a type name that collides because
+     * OpenSearch has no field type spelled {@code date_on_integer} or
+     * {@code ip_on_utf8}. Callers keep their own pre-checks: resolving
+     * a dotted path through object mappers, refusing multi-field
+     * sub-fields and {@code nested} children, and returning {@code null}
+     * for unmapped names before ever reaching this method.
+     */
+    public static String sentinelFor(String openSearchTypeName, String lanceArrowTypeMeta) {
+        if ("date".equals(openSearchTypeName) && lanceArrowTypeMeta != null && lanceArrowTypeMeta.startsWith("Int(")) {
+            return DATE_ON_INTEGER;
+        }
+        if ("ip".equals(openSearchTypeName)) {
+            return IP_ON_UTF8;
+        }
+        return openSearchTypeName;
+    }
+
+    /**
      * Parses the ISO-8601 shapes {@link #ISO_DATE_LIKE} recognises so a
      * string bound on a {@link #DATE_ON_INTEGER} column becomes epoch
      * millis. The same default format the {@code date} field type uses
