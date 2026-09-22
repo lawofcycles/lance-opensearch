@@ -7,7 +7,10 @@ package org.opensearch.lance.engine;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 
 import org.apache.lucene.document.Document;
@@ -23,6 +26,8 @@ import org.apache.lucene.store.Directory;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.fragment.DataFile;
+import org.lance.index.IndexDescription;
+import org.lance.schema.LanceField;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.lance.LanceOverrides;
@@ -685,6 +690,39 @@ public final class LanceDirectoryReader extends DirectoryReader {
      */
     public long tablePhysicalRows() {
         return totalRows;
+    }
+
+    /**
+     * The Lance index types present per column, from one
+     * {@code describeIndices} call on the dataset this reader was opened
+     * over (the warm cache snapshot's dataset on the fragment path, the
+     * engine's own dataset otherwise; no new {@code Dataset.open}
+     * happens). The type strings are what Lance reports
+     * ({@code BTree}, {@code Bitmap}, {@code ZoneMap}, {@code Inverted},
+     * {@code IVF_FLAT}, ...). Columns without an index are absent.
+     * {@code GET /_lance/stats} reports the result per index so an
+     * operator can see whether an {@code indexes} preference took
+     * effect.
+     */
+    public Map<String, List<String>> columnIndexTypes() throws IOException {
+        try {
+            Map<Integer, String> columnsByFieldId = new HashMap<>();
+            for (LanceField field : dataset.getLanceSchema().fields()) {
+                columnsByFieldId.put(field.getId(), field.getName());
+            }
+            Map<String, List<String>> types = new TreeMap<>();
+            for (IndexDescription description : dataset.describeIndices()) {
+                for (Integer fieldId : description.getFieldIds()) {
+                    String column = columnsByFieldId.get(fieldId);
+                    if (column != null) {
+                        types.computeIfAbsent(column, ignored -> new ArrayList<>()).add(description.getIndexType());
+                    }
+                }
+            }
+            return types;
+        } catch (RuntimeException e) {
+            throw new IOException(e);
+        }
     }
 
     /**

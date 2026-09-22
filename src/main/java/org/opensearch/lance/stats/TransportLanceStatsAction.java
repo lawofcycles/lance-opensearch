@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -149,13 +150,26 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
                         nestedDocs = 0L;
                     }
                     long rows = reader.luceneBoundExceeded() ? reader.tableRows() : shardReaderRows;
+                    // One describeIndices on the reader's already-open
+                    // dataset per index per stats call (indexes are
+                    // single-shard, so per shard is per index); a failure
+                    // leaves the map empty rather than dropping the
+                    // reader's row figures.
+                    Map<String, List<String>> indexTypes;
+                    try {
+                        indexTypes = reader.columnIndexTypes();
+                    } catch (Exception e) {
+                        LOGGER.debug("lance.stats: describeIndices failed for {}: {}", shard.shardId(), e.toString());
+                        indexTypes = Map.of();
+                    }
                     stats.add(
                         new LanceNodeStats.IndexReaderStats(
                             shard.shardId().getIndexName(),
                             rows,
                             shardReaderRows,
                             nestedDocs,
-                            reader.luceneBoundExceeded()
+                            reader.luceneBoundExceeded(),
+                            indexTypes
                         )
                     );
                 } catch (Exception e) {
