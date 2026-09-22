@@ -10,11 +10,16 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.calcite.plan.RelOptPlanner;
+import org.apache.calcite.plan.RelOptRule;
+import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.tools.RelBuilder;
+import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.LanceTableScan;
+import org.opensearch.lance.plan.translate.PlanTestFixtures;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.List;
@@ -73,5 +78,22 @@ public class LancePlannerFactoryTests extends OpenSearchTestCase {
         HepPlanner hepPlanner = new LancePlannerFactory(1L << 30, 1L << 30).newHepPlanner();
         hepPlanner.setRoot(scan);
         assertSame(scan, hepPlanner.findBestExp());
+    }
+
+    public void testPlanKeepsTheLogicalRootWhenARuleThrows() throws Exception {
+        // The fragment routing promises a Lucene aggregator fallback for
+        // every plan it does not push, so a planner failure has to come
+        // back as the logical root, not as an exception.
+        RelNode logical = PlanTestFixtures.translate(
+            PlanTestFixtures.parse("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}")
+        );
+        RelOptPlanner planner = logical.getCluster().getPlanner();
+        planner.addRule(new RelOptRule(RelOptRule.operand(LanceAggregate.class, RelOptRule.any()), "ThrowingRule") {
+            @Override
+            public void onMatch(RelOptRuleCall call) {
+                throw new IllegalStateException("boom");
+            }
+        });
+        assertSame(logical, PlanTestFixtures.factory().plan(logical));
     }
 }
