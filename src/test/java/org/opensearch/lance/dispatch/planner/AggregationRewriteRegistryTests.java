@@ -7,6 +7,7 @@ package org.opensearch.lance.dispatch.planner;
 import static org.mockito.Mockito.mock;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -117,22 +118,23 @@ public class AggregationRewriteRegistryTests extends OpenSearchTestCase {
         expectThrows(UnsupportedOperationException.class, () -> registry.rules().add(new TestRule("late", Optional.empty())));
     }
 
-    public void testRuleNameIsExposedNonEmpty() {
-        AggregationRewriteRegistry registry = new AggregationRewriteRegistry(List.of(new TestRule("match", Optional.of(plan()))));
-
-        String name = registry.rules().get(0).name();
-
-        assertNotNull(name);
-        assertFalse(name.isEmpty());
+    public void testProductionInstanceIsEmpty() {
+        // No rule is registered yet; a rule accidentally registered on
+        // the production singleton in a later change must trip this.
+        assertTrue(AggregationRewriteRegistry.instance().rules().isEmpty());
     }
 
     public void testNullRejection() {
         // No match is Optional.empty(), never a null plan.
         expectThrows(NullPointerException.class, () -> PushdownPlan.of(null));
         // Every reference field of the context is required.
-        expectThrows(
-            NullPointerException.class,
-            () -> new AggregationRewriteContext(null, new Schema(List.of()), Map.of(), mock(QueryShardContext.class), 0, 0, 0)
-        );
+        AggregatorFactories.Builder aggregations = new AggregatorFactories.Builder();
+        Schema schema = new Schema(List.of());
+        Map<String, LinkedHashMap<String, String>> multiFields = Map.of();
+        QueryShardContext qsc = mock(QueryShardContext.class);
+        expectThrows(NullPointerException.class, () -> new AggregationRewriteContext(null, schema, multiFields, qsc, 0, 0, 0));
+        expectThrows(NullPointerException.class, () -> new AggregationRewriteContext(aggregations, null, multiFields, qsc, 0, 0, 0));
+        expectThrows(NullPointerException.class, () -> new AggregationRewriteContext(aggregations, schema, null, qsc, 0, 0, 0));
+        expectThrows(NullPointerException.class, () -> new AggregationRewriteContext(aggregations, schema, multiFields, null, 0, 0, 0));
     }
 }
