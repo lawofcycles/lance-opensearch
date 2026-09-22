@@ -7,6 +7,8 @@ package org.opensearch.lance.query;
 
 import java.io.IOException;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 
 import org.apache.arrow.vector.UInt8Vector;
@@ -157,7 +159,7 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
      */
     private static final class LanceScanFilterWeight extends Weight {
 
-        private final java.util.concurrent.atomic.AtomicReference<java.util.Map<Integer, FixedBitSet>> shardMatches =
+        private final java.util.concurrent.atomic.AtomicReference<Map<Integer, FixedBitSet>> shardMatches =
             new java.util.concurrent.atomic.AtomicReference<>();
         // Checked at every batch boundary of the filter scan.
         private final LanceCancellation cancellation;
@@ -182,7 +184,7 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
             if (leaf == null) {
                 return null;
             }
-            java.util.Map<Integer, FixedBitSet> matchesByFragment = ensureShardScan(context, leaf);
+            Map<Integer, FixedBitSet> matchesByFragment = ensureShardScan(context, leaf);
             FixedBitSet matches = matchesByFragment.get(leaf.fragmentId());
             if (matches == null) {
                 return null;
@@ -216,9 +218,8 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
             return new Weight.DefaultScorerSupplier(scorer);
         }
 
-        private java.util.Map<Integer, FixedBitSet> ensureShardScan(LeafReaderContext context, LanceFragmentLeafReader leaf)
-            throws IOException {
-            java.util.Map<Integer, FixedBitSet> cached = shardMatches.get();
+        private Map<Integer, FixedBitSet> ensureShardScan(LeafReaderContext context, LanceFragmentLeafReader leaf) throws IOException {
+            Map<Integer, FixedBitSet> cached = shardMatches.get();
             if (cached != null) {
                 return cached;
             }
@@ -231,8 +232,8 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
             while (!topCtx.isTopLevel) {
                 topCtx = topCtx.parent;
             }
-            java.util.Map<Integer, FixedBitSet> matchesByFragment = new java.util.HashMap<>();
-            java.util.Map<Integer, LanceFragmentLeafReader> leavesByFragment = new java.util.HashMap<>();
+            Map<Integer, FixedBitSet> matchesByFragment = new HashMap<>();
+            Map<Integer, LanceFragmentLeafReader> leavesByFragment = new HashMap<>();
             java.util.List<Integer> fragmentIds = new java.util.ArrayList<>();
             for (LeafReaderContext sibling : topCtx.leaves()) {
                 LanceFragmentLeafReader sl = LanceFragmentLeafReader.unwrap(sibling.reader());

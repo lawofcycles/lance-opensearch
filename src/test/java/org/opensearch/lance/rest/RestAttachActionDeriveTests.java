@@ -8,6 +8,8 @@ package org.opensearch.lance.rest;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.nio.file.Path;
+import java.util.Locale;
+import java.util.Set;
 
 import org.lance.Dataset;
 import org.opensearch.lance.LanceRegistry;
@@ -28,7 +30,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testStructColumnDerivesObjectMapping() throws Exception {
         Path scratchDir = createTempDir();
-        String uri = LanceTableFactory.writeStructTable(scratchDir, "derive-" + getTestName().toLowerCase(java.util.Locale.ROOT), 0);
+        String uri = LanceTableFactory.writeStructTable(scratchDir, "derive-" + getTestName().toLowerCase(Locale.ROOT), 0);
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
             RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset);
 
@@ -66,18 +68,14 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
             // Struct children are not index-eligible columns: build_indexes
             // and the auto builder keep targeting top-level columns only.
             assertTrue("ftsColumns must be empty: " + derivation.ftsColumns(), derivation.ftsColumns().isEmpty());
-            assertEquals(
-                "scalarColumns must hold the PK only: " + derivation.scalarColumns(),
-                java.util.Set.of("id"),
-                derivation.scalarColumns()
-            );
+            assertEquals("scalarColumns must hold the PK only: " + derivation.scalarColumns(), Set.of("id"), derivation.scalarColumns());
             assertTrue("vectorColumns must be empty: " + derivation.vectorColumns(), derivation.vectorColumns().isEmpty());
         }
     }
 
     public void testListOfStructDerivesNestedMapping() throws Exception {
         Path scratchDir = createTempDir();
-        String uri = LanceTableFactory.writeNestedTable(scratchDir, "derive-" + getTestName().toLowerCase(java.util.Locale.ROOT), 0);
+        String uri = LanceTableFactory.writeNestedTable(scratchDir, "derive-" + getTestName().toLowerCase(Locale.ROOT), 0);
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
             RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset);
 
@@ -87,7 +85,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
             assertTrue("size must map as keyword: " + mapping, mapping.contains("\"size\":{\"type\":\"keyword\""));
             assertTrue("qty must map as integer: " + mapping, mapping.contains("\"qty\":{\"type\":\"integer\""));
             assertEquals("id", derivation.keyField());
-            assertEquals(java.util.Set.of("items"), derivation.nestedColumns());
+            assertEquals(Set.of("items"), derivation.nestedColumns());
             // Nested children stay out of the index-eligible column sets.
             assertTrue("ftsColumns must be empty: " + derivation.ftsColumns(), derivation.ftsColumns().isEmpty());
             assertFalse("children must not be scalar columns: " + derivation.scalarColumns(), derivation.scalarColumns().contains("items"));
