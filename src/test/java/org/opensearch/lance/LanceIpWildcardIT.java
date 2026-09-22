@@ -280,6 +280,47 @@ public class LanceIpWildcardIT extends LanceRestTestCase {
         }
     }
 
+    public void testWildcardOverrideOnInvertedIndexColumnAnswersPatternQueries() throws Exception {
+        // A wildcard override on a Utf8 column that carries a Lance
+        // inverted index: the column leaves the FTS path (keyword
+        // mapping, not lance_text) and pattern queries answer through
+        // the doc values, untouched by the index the table still has.
+        // The epoch-millis fixture's label column carries the inverted
+        // index; even rows hold "hello lance i", odd rows "quick brown
+        // fox i".
+        String suffix = "wcfts-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        String tableUri = LanceTableFactory.writeEpochMillisTable(scratchDir, tableName);
+        String indexName = tableName;
+        try {
+            Response attach = postJson(
+                "/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"overrides\":{\"label\":{\"type\":\"wildcard\"}}}"
+            );
+            assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            String mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+            assertTrue("label must map as keyword: " + mapping, mapping.contains("\"label\":{\"type\":\"keyword\""));
+            assertTrue("meta must record the declared type: " + mapping, mapping.contains("\"lance_override_type\":\"wildcard\""));
+            assertFalse("label must not map as lance_text: " + mapping, mapping.contains("lance_text"));
+
+            String wildcardBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"wildcard\":{\"label\":{\"value\":\"hello lance*\"}}}}")
+            );
+            assertEquals("the three even rows: " + wildcardBody, List.of(0, 2, 4), sortedSourceIds(wildcardBody));
+
+            String prefixBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"prefix\":{\"label\":{\"value\":\"quick\"}}}}")
+            );
+            assertEquals("the three odd rows: " + prefixBody, List.of(1, 3, 5), sortedSourceIds(prefixBody));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testNamespaceIpOverrideAppliesToTablesThatCarryTheColumn() throws Exception {
         // One override list for the whole namespace: the table with the
         // ip column gets the ip mapping and answers a CIDR term, the

@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -438,7 +439,7 @@ public final class LanceShardColumnCache {
      * the {@code InetAddressPoint} encoding of the stored strings.
      */
     private KeywordDictionaryBuilder.TermEncoder encoderFor(String name) {
-        java.util.Iterator<LanceFragmentLeafReader> leaves = leavesByFragmentId.values().iterator();
+        Iterator<LanceFragmentLeafReader> leaves = leavesByFragmentId.values().iterator();
         return leaves.hasNext() ? leaves.next().schema().termEncoder(name) : null;
     }
 
