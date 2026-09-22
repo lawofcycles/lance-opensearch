@@ -36,9 +36,12 @@ import org.opensearch.lance.dispatch.LanceDispatchActionFilter;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceIndexWarmer;
+import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.index.LanceBuildIndexesAction;
+import org.opensearch.lance.index.LanceBuildIndexesNodesAction;
 import org.opensearch.lance.index.TransportLanceBuildIndexesAction;
+import org.opensearch.lance.index.TransportLanceBuildIndexesNodesAction;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
 import org.opensearch.lance.mapper.LanceVectorFieldMapper;
 import org.opensearch.lance.namespace.AllowedTableRoots;
@@ -193,6 +196,23 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LancePlugin::validateUncoveredFragmentPolicy,
         Setting.Property.IndexScope,
         Setting.Property.Dynamic
+    );
+    /**
+     * Where index builds commit: {@code in_table} (default) writes into
+     * the source table's manifest chain; {@code node_local} keeps the
+     * source read-only and gives every data node a shallow clone under
+     * its data path that receives the builds and serves the node's
+     * reads. Written by attach when the body carries
+     * {@code "index_placement"}. Final because moving an existing
+     * index between placements would strand the structures already
+     * built in the other location.
+     */
+    public static final Setting<String> INDEX_PLACEMENT_SETTING = Setting.simpleString(
+        LanceEngineFactory.INDEX_PLACEMENT_SETTING,
+        LanceLocalClones.PLACEMENT_IN_TABLE,
+        LancePlugin::validateIndexPlacement,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
     );
     public static final Setting<TimeValue> NAMESPACE_POLL_CADENCE_SETTING = Setting.timeSetting(
         "lance.namespace.poll_cadence",
@@ -678,6 +698,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             MULTI_FIELDS_SETTING,
             OVERRIDES_SETTING,
             UNCOVERED_FRAGMENT_POLICY_SETTING,
+            INDEX_PLACEMENT_SETTING,
             NAMESPACE_POLL_CADENCE_SETTING,
             NAMESPACE_RESURFACE_GRACE_SETTING,
             BUILDER_MAX_ROWS_SETTING,
@@ -771,6 +792,12 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         }
     }
 
+    private static void validateIndexPlacement(String value) {
+        if (!LanceLocalClones.PLACEMENT_IN_TABLE.equals(value) && !LanceLocalClones.PLACEMENT_NODE_LOCAL.equals(value)) {
+            throw new IllegalArgumentException("index.lance.index_placement must be 'in_table' or 'node_local', got '" + value + "'");
+        }
+    }
+
     private static void validatePrimaryKeyType(String value) {
         // Empty is accepted so the setting can be omitted on indices that
         // do not declare a primary key (the runtime path treats the PK
@@ -833,6 +860,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     private LanceDispatchActionFilter dispatchActionFilter;
     private LanceCreateIndexActionFilter createIndexActionFilter;
     private volatile LanceWarmCache warmCache;
+    private volatile LanceLocalClones localClones;
     private volatile LanceIndexWarmer indexWarmer;
     /**
      * Current {@link #MAX_DOCS_PER_READER_SETTING}, handed to the engine
@@ -960,6 +988,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             CACHE_ENABLED_SETTING.get(environment.settings())
         );
         clusterService.getClusterSettings().addSettingsUpdateConsumer(CACHE_ENABLED_SETTING, warmCache::setEnabled);
+        // Node-local shallow clones for indexes attached with
+        // index.lance.index_placement = node_local. The service owns the
+        // clone directories under the node's first data path, resolves
+        // reads onto them (the warm cache and the engine consult the
+        // node-wide instance installed here), and deletes them when the
+        // index leaves the cluster state; the cluster listener also sweeps
+        // orphan directories a previous process left behind.
+        this.localClones = new LanceLocalClones(nodeEnvironment.nodeDataPaths()[0], clusterService, threadPool);
+        LanceLocalClones.setInstance(localClones);
+        clusterService.addListener(localClones);
         // Index warm-up: every Lance-backed index that appears in the
         // cluster state gets its indexes read into the Session cache on
         // this node, on the single threaded lance_warm_up pool.
@@ -978,7 +1016,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LanceStatsCollector statsCollector = new LanceStatsCollector(warmCache, () -> {
             Session session = LanceRegistry.currentSession();
             return session == null || session.isClosed() ? 0L : session.sizeBytes();
-        }, LanceRegistry::indexCacheSizing, indexWarmer);
+        }, LanceRegistry::indexCacheSizing, indexWarmer, localClones::cloneStats);
 
         // Prime the circuit-breaker helper with the current cluster
         // settings and start the polling loop that keeps its accounting
@@ -1049,7 +1087,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // The components are injected into the plugin's transport
         // actions (attach, build_indexes, namespace list / update,
         // fragment query).
-        return List.of(namespaceService, allowedTableRoots, warmCache, statsCollector);
+        return List.of(namespaceService, allowedTableRoots, warmCache, statsCollector, localClones);
     }
 
     /**
@@ -1108,6 +1146,13 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         if (warmer != null) {
             warmer.close();
             indexWarmer = null;
+        }
+        // Drop the node-wide clone resolution point so a test-framework
+        // restart within the same JVM does not resolve reads onto a
+        // previous node's clone directories.
+        if (localClones != null) {
+            LanceLocalClones.setInstance(null);
+            localClones = null;
         }
         // Close every cached snapshot (their datasets) and the column
         // cache allocator before the Session goes away.
@@ -1170,6 +1215,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             new ActionHandler<>(LanceNamespaceListAction.INSTANCE, TransportLanceNamespaceListAction.class),
             new ActionHandler<>(LanceAttachAction.INSTANCE, TransportLanceAttachAction.class),
             new ActionHandler<>(LanceBuildIndexesAction.INSTANCE, TransportLanceBuildIndexesAction.class),
+            new ActionHandler<>(LanceBuildIndexesNodesAction.INSTANCE, TransportLanceBuildIndexesNodesAction.class),
             new ActionHandler<>(LanceRefsAction.INSTANCE, TransportLanceRefsAction.class),
             new ActionHandler<>(LanceStatsAction.INSTANCE, TransportLanceStatsAction.class),
             new ActionHandler<>(LanceExplainAction.INSTANCE, TransportLanceExplainAction.class)

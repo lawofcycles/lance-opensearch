@@ -7,6 +7,7 @@ package org.opensearch.lance.stats;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -16,6 +17,7 @@ import org.opensearch.lance.NativeMemoryLimit.IndexCacheSizing;
 import org.opensearch.lance.engine.ColumnStore;
 import org.opensearch.lance.engine.HeapFallbackStats;
 import org.opensearch.lance.engine.LanceIndexWarmer;
+import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.query.FtsAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
@@ -45,6 +47,7 @@ public final class LanceStatsCollector {
     private final LongSupplier sessionBytes;
     private final Supplier<IndexCacheSizing> indexCacheSizing;
     private final LanceIndexWarmer indexWarmer;
+    private final Supplier<Map<String, LanceLocalClones.CloneStat>> localClones;
 
     /**
      * @param warmCache        the node's snapshot cache, or {@code null}
@@ -59,7 +62,7 @@ public final class LanceStatsCollector {
      *                         then zero)
      */
     public LanceStatsCollector(LanceWarmCache warmCache, LongSupplier sessionBytes, Supplier<IndexCacheSizing> indexCacheSizing) {
-        this(warmCache, sessionBytes, indexCacheSizing, null);
+        this(warmCache, sessionBytes, indexCacheSizing, null, null);
     }
 
     /**
@@ -73,10 +76,28 @@ public final class LanceStatsCollector {
         Supplier<IndexCacheSizing> indexCacheSizing,
         LanceIndexWarmer indexWarmer
     ) {
+        this(warmCache, sessionBytes, indexCacheSizing, indexWarmer, null);
+    }
+
+    /**
+     * @param localClones reads this node's {@code node_local} clone
+     *                    directories (bytes and recorded source version
+     *                    per index), or {@code null} when the plugin
+     *                    created no clone service (the {@code local_clones}
+     *                    block is then empty)
+     */
+    public LanceStatsCollector(
+        LanceWarmCache warmCache,
+        LongSupplier sessionBytes,
+        Supplier<IndexCacheSizing> indexCacheSizing,
+        LanceIndexWarmer indexWarmer,
+        Supplier<Map<String, LanceLocalClones.CloneStat>> localClones
+    ) {
         this.warmCache = warmCache;
         this.sessionBytes = sessionBytes;
         this.indexCacheSizing = indexCacheSizing;
         this.indexWarmer = indexWarmer;
+        this.localClones = localClones;
     }
 
     /** The node's cache figures with no index block; {@link #collect(List)} adds the shard readers. */
@@ -110,6 +131,15 @@ public final class LanceStatsCollector {
             }
             warmUps.sort((a, b) -> a.index().compareTo(b.index()));
         }
+        List<LanceNodeStats.LocalCloneStats> cloneStats = new ArrayList<>();
+        if (localClones != null) {
+            for (Map.Entry<String, LanceLocalClones.CloneStat> entry : localClones.get().entrySet()) {
+                cloneStats.add(
+                    new LanceNodeStats.LocalCloneStats(entry.getKey(), entry.getValue().bytes(), entry.getValue().sourceVersion())
+                );
+            }
+            cloneStats.sort((a, b) -> a.index().compareTo(b.index()));
+        }
         if (warmCache == null) {
             return new LanceNodeStats(
                 false,
@@ -137,7 +167,8 @@ public final class LanceStatsCollector {
                 admissionLastEstimate,
                 warmUpMode,
                 warmUps,
-                indices
+                indices,
+                cloneStats
             );
         }
         ColumnStore store = warmCache.columnStore();
@@ -167,7 +198,8 @@ public final class LanceStatsCollector {
             admissionLastEstimate,
             warmUpMode,
             warmUps,
-            indices
+            indices,
+            cloneStats
         );
     }
 }
