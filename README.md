@@ -2,7 +2,7 @@
 
 An OpenSearch plugin that surfaces [Lance](https://github.com/lancedb/lance) tables as searchable indexes. Implementation of [RFC #22643](https://github.com/opensearch-project/OpenSearch/issues/22643).
 
-Lance is an open columnar table format designed for machine learning workloads: multimodal columns, evolving embeddings, tables that receive concurrent writes from Ray or Spark, and time travel via manifest versions. This plugin registers a Lance table as a shardable OpenSearch index without copying data out of Lance: OpenSearch's engine treats each Lance fragment as a Lucene leaf, delegates full-text and vector work to the indexes stored inside the Lance table, and follows the table forward as new manifest versions land.
+Lance is an open columnar table format with multimodal columns, concurrent writers, and time travel via manifest versions. The format ships with vector and full text indexes, so vector search, full text search, and analytical aggregation can all run against the same table without extracting data or maintaining a parallel copy. This plugin registers a Lance table as a shardable OpenSearch index without copying data out of Lance: OpenSearch's engine treats each Lance fragment as a Lucene leaf, delegates full text and vector work to the indexes stored inside the Lance table, and follows the table forward as new manifest versions land.
 
 ## Status
 
@@ -13,7 +13,7 @@ Built against OpenSearch 3.8.0 with Lance 12.0.0.
 ## What it does
 
 - Registers a directory or a single Lance table URI and surfaces it as an OpenSearch index. Mapping derives from the Lance Arrow schema.
-- Runs full-text (`match`, `lance_match`, `lance_match_phrase`, `lance_multi_match`, `lance_fts_boost`, `lance_fts_bool`), vector (`lance_knn`), primary-key GET, and aggregation queries through a fragment fan-out that drives Lucene's stock aggregator machinery over per-fragment leaf readers.
+- Runs full text (`match`, `lance_match`, `lance_match_phrase`, `lance_multi_match`, `lance_fts_boost`, `lance_fts_bool`), vector (`lance_knn`), primary-key GET, and aggregation queries through a fragment fan-out that drives Lucene's stock aggregator machinery over per-fragment leaf readers.
 - Follows the Lance manifest forward automatically. `"version": N` on attach also pins a readonly snapshot.
 - Accepts per-table `storage_options` (S3, GCS, Azure) so a single JVM can address multiple buckets with different credentials.
 
