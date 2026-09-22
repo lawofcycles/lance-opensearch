@@ -24,9 +24,10 @@ import org.apache.lucene.util.FixedBitSet;
  * that reads the offsets, so a deleted row contributes no child docs and
  * only its parent doc is masked by the live-doc bitmap.
  *
- * <p>Memory per fragment: one {@code int} per doc ({@link #rowOfDoc}),
- * one {@code int} per row ({@link #parentDocOf}) and, per nested column,
- * one {@code int} per row plus one (the element-ordinal prefix sums).
+ * <p>Memory per fragment: 4 bytes per doc ({@link #rowOfDoc}), plus a
+ * fixed per row overhead of 4 bytes ({@link #parentDocOf}) and, per
+ * nested column, 4 bytes per row plus one entry (the element ordinal
+ * prefix sums in {@code elemStart}).
  */
 final class NestedDocLayout {
 
