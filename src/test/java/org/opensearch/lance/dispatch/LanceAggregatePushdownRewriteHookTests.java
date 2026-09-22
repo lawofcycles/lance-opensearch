@@ -4,7 +4,9 @@
  */
 package org.opensearch.lance.dispatch;
 
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.List;
@@ -102,5 +104,8 @@ public class LanceAggregatePushdownRewriteHookTests extends OpenSearchTestCase {
         );
 
         assertNull(out);
+        // The null alone would also come from a hollowed overload; the
+        // settings read proves the delegation ran.
+        verify(qsc, atLeastOnce()).getIndexSettings();
     }
 }

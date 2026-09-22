@@ -1827,9 +1827,9 @@ public final class LanceAggregatePushdown {
         private final TopKSpec topK;
 
         /**
-         * Package private (was private) so the test sources' same
-         * package fixture can build a minimal instance; production
-         * plans are still built only by {@link #plan}.
+         * Package private so the test sources' same package fixture
+         * can build a minimal instance; production plans are still
+         * built only by {@link #plan}.
          */
         Plan(
             ByteBuffer substrait,
