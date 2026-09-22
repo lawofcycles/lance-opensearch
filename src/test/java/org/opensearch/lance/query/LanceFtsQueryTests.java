@@ -124,26 +124,26 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
         assertEquals(a, b);
     }
 
-    public void testPrefilterSqlParticipatesInEqualsHashCodeAndToString() {
+    public void testScanFilterSqlParticipatesInEqualsHashCodeAndToString() {
         LanceFtsQuery plain = new LanceFtsQuery("body", "camera");
-        LanceFtsQuery filtered = plain.withPrefilterSql("rating = 5");
+        LanceFtsQuery filtered = plain.withScanFilterSql("rating = 5");
         LanceFtsQuery filteredAgain = new LanceFtsQuery(FullTextQuery.match("camera", "body"), Set.of("body"), 0, "rating = 5");
 
         assertNotEquals(plain, filtered);
         assertNotEquals(plain.hashCode(), filtered.hashCode());
         assertEquals(filtered, filteredAgain);
         assertEquals(filtered.hashCode(), filteredAgain.hashCode());
-        assertNotEquals(filtered, plain.withPrefilterSql("rating = 4"));
+        assertNotEquals(filtered, plain.withScanFilterSql("rating = 4"));
 
-        assertNull(plain.prefilterSql());
-        assertEquals("rating = 5", filtered.prefilterSql());
-        assertSame("same prefilter returns the same instance", filtered, filtered.withPrefilterSql("rating = 5"));
-        assertEquals("null removes the prefilter", plain, filtered.withPrefilterSql(null));
+        assertNull(plain.scanFilterSql());
+        assertEquals("rating = 5", filtered.scanFilterSql());
+        assertSame("same prefilter returns the same instance", filtered, filtered.withScanFilterSql("rating = 5"));
+        assertEquals("null removes the prefilter", plain, filtered.withScanFilterSql(null));
 
         // The scan limit copy keeps the prefilter, so the count-path
         // copy (withScanLimit(UNBOUNDED)) still filters the same rows.
         LanceFtsQuery limited = filtered.withScanLimit(10);
-        assertEquals("rating = 5", limited.prefilterSql());
+        assertEquals("rating = 5", limited.scanFilterSql());
         assertEquals(10, limited.scanLimit());
         assertEquals(filtered, limited.withScanLimit(LanceFtsQuery.SCAN_LIMIT_UNBOUNDED));
 

@@ -710,6 +710,72 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         }
     }
 
+    public void testPlannerPushdownMatchesLuceneCompositionForEveryFtsShape() throws Exception {
+        // Every FTS shape with a scalar filter runs twice: once as
+        // written, which the planner folds into one prefiltered Lance
+        // FTS scan, and once with the filter wrapped in constant_score,
+        // which the planner's translator refuses, so the bool stays a
+        // Lucene BooleanQuery over the unfiltered FTS scan. The helper
+        // asserts equal ids in score order, equal scores, and equal
+        // totals with and without size:0. Rows: 12 rows in three
+        // fragments of four; even rows carry body "hello lance i" and
+        // title "sunny morning i", odd rows share no tokens with them.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpMultiFragment(12, 4, "ftsplannershapes")) {
+            String indexName = fixture.indexName();
+            // range keeps rows 4..11; the even rows among them are 4, 6, 8, 10.
+            String rangeFilter = "{\"range\":{\"id\":{\"gte\":4}}}";
+            List<String> evenFrom4 = List.of("1-0", "1-2", "2-0", "2-2");
+
+            assertPushdownMatchesControl(
+                indexName,
+                "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}",
+                rangeFilter,
+                null,
+                evenFrom4
+            );
+            assertPushdownMatchesControl(
+                indexName,
+                "{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"hello lance\"}}",
+                rangeFilter,
+                null,
+                evenFrom4
+            );
+            assertPushdownMatchesControl(
+                indexName,
+                "{\"lance_multi_match\":{\"fields\":[\"body\",\"title\"],\"query\":\"hello sunny\"}}",
+                rangeFilter,
+                null,
+                evenFrom4
+            );
+            // Row 6's body carries the token "6", so the must_not drops it.
+            assertPushdownMatchesControl(
+                indexName,
+                "{\"lance_fts_bool\":{\"must\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}],"
+                    + "\"must_not\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"6\"}}]}}",
+                rangeFilter,
+                null,
+                List.of("1-0", "2-0", "2-2")
+            );
+            // The negative clause halves row 8's score; the hit set stays.
+            assertPushdownMatchesControl(
+                indexName,
+                "{\"lance_fts_boost\":{\"positive\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},"
+                    + "\"negative\":{\"lance_match\":{\"field\":\"body\",\"query\":\"8\"}},\"negative_boost\":0.5}}",
+                rangeFilter,
+                null,
+                evenFrom4
+            );
+            // A must_not scalar clause travels as part of the same prefilter.
+            assertPushdownMatchesControl(
+                indexName,
+                "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}",
+                rangeFilter,
+                "{\"term\":{\"id\":6}}",
+                List.of("1-0", "2-0", "2-2")
+            );
+        }
+    }
+
     public void testLanceMatchPhraseHonoursPhraseOrder() throws Exception {
         // The fixture's FTS index is built with positions, so phrase
         // order matters: "hello lance" hits the eight even rows and

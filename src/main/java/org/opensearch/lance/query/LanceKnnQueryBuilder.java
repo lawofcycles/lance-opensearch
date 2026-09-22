@@ -18,7 +18,6 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.mapper.MappedFieldType;
-import org.opensearch.index.mapper.ObjectMapper;
 import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.lance.mapper.LanceVectorFieldMapper;
@@ -365,7 +364,7 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
         // Without this check, a typo or a scalar field name reaches Lance
         // and comes back as a 500. `context.fieldMapper` is null when the
         // mapping has no entry for the requested field.
-        org.opensearch.index.mapper.MappedFieldType fieldType = context.fieldMapper(field);
+        MappedFieldType fieldType = context.fieldMapper(field);
         if (fieldType == null) {
             throw new IllegalArgumentException("[lance_knn] no such field [" + field + "]");
         }
@@ -390,39 +389,22 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
                     + ")"
             );
         }
-        String filterSql = filter == null ? null : LanceKnnFilterTranslator.toLanceSql(filter, name -> {
-            // Resolve the field's OpenSearch mapping type through
-            // the QueryShardContext. Returns null for unmapped
-            // fields (the translator falls back to shape heuristics
-            // there). This is what makes numeric-epoch-millis on
-            // date columns and ISO-8601 strings on non-date
-            // columns route through the correct SQL literal form
-            // for the pre-filter path. A dotted name only resolves
-            // when its parent path is a plain object mapper (a
-            // Struct child, which Lance's SQL parser reads as a
-            // nested field access); a multi-field sub-field
-            // (body.raw) and a nested (List<Struct>) child return
-            // null so the translator's dotted-path guard keeps both
-            // off the Lance SQL path (DataFusion cannot address a
-            // list element in a filter).
-            MappedFieldType mft = context.fieldMapper(name);
-            if (mft == null) {
-                return null;
-            }
-            int dot = name.lastIndexOf('.');
-            if (dot > 0) {
-                ObjectMapper parent = context.getObjectMapper(name.substring(0, dot));
-                if (parent == null || parent.nested().isNested()) {
-                    return null;
-                }
-            }
-            // The field meta carries the real Arrow type; the translator
-            // decides whether the type name or a sentinel comes back
-            // (a date over an integer column, an ip over Utf8).
-            String arrowType = mft.meta() == null ? null : mft.meta().get("lance_arrow_type");
-            return LanceKnnFilterTranslator.sentinelFor(mft.typeName(), arrowType);
-        });
-        return new LanceKnnQuery(field, vector, k, nprobes, refineFactor, ef, parseDistance(metric), useIndex, filterSql);
+        if (filter != null) {
+            // The inner filter is planned at the coordinator: the query
+            // planner translates it and hands the resulting Lance SQL to
+            // the nearest scan through LanceKnnQuery.withScanFilterSql.
+            // A toQuery call that still carries the filter means the
+            // request reached a path without the planner (the shard
+            // path, or a lance_knn nested below the top level), where
+            // the filter cannot be applied as a prefilter; refuse
+            // loudly instead of silently returning unfiltered nearest
+            // rows.
+            throw new IllegalArgumentException(
+                "[lance_knn] the filter clause is applied by the fragment dispatch path only; "
+                    + "this request shape cannot apply it and would return unfiltered nearest rows"
+            );
+        }
+        return new LanceKnnQuery(field, vector, k, nprobes, refineFactor, ef, parseDistance(metric), useIndex);
     }
 
     private static org.lance.index.DistanceType parseDistance(String metric) {

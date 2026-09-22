@@ -40,6 +40,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.opensearch.lance.plan.translate.AggregationToRel.dateDocValueFormat;
 import static org.opensearch.lance.plan.translate.AggregationToRel.unsupported;
@@ -754,5 +755,49 @@ public final class QueryToRex {
             return null;
         }
         return target.isSingleFloat() ? (double) (float) number : number;
+    }
+
+    /**
+     * Whether any leaf of {@code query} names a field in
+     * {@code columns}. The callers that turn a translated predicate
+     * into executable Lance SQL use this as a pre-flight for the
+     * {@code ip}-overridden columns: their Lance column stores the raw
+     * strings while the shard path compares 16 byte encoded forms, so
+     * no predicate on them may travel to Lance SQL and the caller keeps
+     * the query on the Lucene side. Only the leaf shapes this
+     * translator supports are inspected; anything else refuses at
+     * translation anyway.
+     */
+    public static boolean referencesAny(QueryBuilder query, Set<String> columns) {
+        if (query == null || columns.isEmpty()) {
+            return false;
+        }
+        if (query instanceof BoolQueryBuilder bool) {
+            for (List<QueryBuilder> clauses : List.of(bool.must(), bool.filter(), bool.mustNot(), bool.should())) {
+                for (QueryBuilder clause : clauses) {
+                    if (referencesAny(clause, columns)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        String field = null;
+        if (query instanceof TermQueryBuilder term) {
+            field = term.fieldName();
+        } else if (query instanceof TermsQueryBuilder terms) {
+            field = terms.fieldName();
+        } else if (query instanceof RangeQueryBuilder range) {
+            field = range.fieldName();
+        } else if (query instanceof ExistsQueryBuilder exists) {
+            field = exists.fieldName();
+        } else if (query instanceof WildcardQueryBuilder wildcard) {
+            field = wildcard.fieldName();
+        } else if (query instanceof RegexpQueryBuilder regexp) {
+            field = regexp.fieldName();
+        } else if (query instanceof PrefixQueryBuilder prefix) {
+            field = prefix.fieldName();
+        }
+        return field != null && columns.contains(field);
     }
 }
