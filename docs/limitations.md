@@ -97,7 +97,7 @@ The coordinator orders hits with equal scores or equal sort values by their Lanc
 
 - `storage_options` are stored in plain index settings (`index.lance.storage_options.<key>`), including any credentials the operator writes there. Keystore / `SecureSetting` integration and the lance-namespace vended-credentials flow (`vend_credentials`, `expires_at_millis`) are not wired yet.
 - Base-scoped options (`base_<url>.aws_access_key_id`) for nested Lance references are out of scope for now.
-- REST catalogs (Glue, Unity, Iceberg REST) are not wired to the namespace endpoint yet. Only the filesystem adapter is exercised today. Sub-directory tables (`root/sub/table.lance`) are not surfaced either: the poller lists top-level tables only.
+- Hive Metastore catalogs (Hive 2 / Hive 3) are not wired to the namespace endpoint: their client artifacts pull `hive-metastore` and `netty-all` trees that collide with what OpenSearch ships. The wired catalog clients (`glue`, `iceberg`, `polaris`, `unity`) are the 0.4.1 `lance-namespace-impls` artifacts, which build against lance-namespace 0.7.7 while the plugin bundles 0.11.1; the surface the plugin drives was verified by `javap` descriptor comparison and offline initialisation tests only, not against every catalog server version. Sub-directory tables of a directory namespace (`root/sub/table.lance`) are not surfaced: the directory poller lists top-level tables only. For the catalog types the poll walks nested namespaces down to `config.max_namespace_depth` levels (default 2).
 - Namespace registrations live in cluster state and survive full cluster restarts. Every node's poll cycle reads the same set. Multi-node runs no longer need each node to re-register the path independently.
 
 ## Mapping coverage gaps

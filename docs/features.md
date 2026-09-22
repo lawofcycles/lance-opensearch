@@ -8,7 +8,7 @@ Distribution over the cluster is automatic: fragments are spread over every data
 
 ## Attach and namespace surface
 
-- `POST /_lance/namespace` registers a Lance namespace catalog. The plugin polls it for tables and surfaces each as an OpenSearch index; mapping is derived from the Lance Arrow schema on every surface. The body takes a `type` (`directory` when absent, `rest`, or `glue`), a registration `name` that identifies the entry everywhere (required for `rest` and `glue`; defaults to the path for `directory`), and a `config` object of string values handed to the implementation's `initialize`. Unknown `type` returns 400 naming the accepted values; unknown `config` keys pass through to the implementation unvalidated.
+- `POST /_lance/namespace` registers a Lance namespace catalog. The plugin polls it for tables and surfaces each as an OpenSearch index; mapping is derived from the Lance Arrow schema on every surface. The body takes a `type` (`directory` when absent, `rest`, `glue`, `iceberg`, `polaris`, or `unity`), a registration `name` that identifies the entry everywhere (required for every type except `directory`, where it defaults to the path), and a `config` object of string values handed to the implementation's `initialize`. Unknown `type` returns 400 naming the accepted values; unknown `config` keys pass through to the implementation unvalidated.
 
   A directory namespace registers a filesystem or object-store prefix; `path` is required and is the catalog root:
 
@@ -31,9 +31,31 @@ Distribution over the cluster is automatic: fragments are spread over every data
   {"type": "glue", "name": "glue-tokyo", "config": {"region": "ap-northeast-1", "catalog_id": "123456789012", "root": "s3://bucket/prefix"}}
   ```
 
-- Config values whose key contains `secret`, `password`, `token`, `key`, or `authorization` (case-insensitive) are accepted and handed to the implementation intact, but never leave the node readable: `GET /_lance/namespace`, the cluster state API, and every log line show them as `***`. Only the gateway-persisted cluster state keeps the raw values, so the catalogs re-initialise after a full cluster restart.
+  An Iceberg namespace registers an Iceberg REST catalog holding Lance tables (tables whose `table_type` property is `lance`). `config` carries the property names the Iceberg implementation reads: `endpoint` (required), `auth_token` (a static bearer), `credential` (an OAuth client id and secret pair), `connect_timeout` / `read_timeout` / `max_retries`, plus the two keys the plugin itself reads for the poll, `warehouse` (required; the warehouse whose namespaces are listed, the first level of every table id) and `max_namespace_depth` (how many namespace levels below the warehouse the poll descends, default 2):
+
+  ```json
+  POST /_lance/namespace
+  {"type": "iceberg", "name": "ice-a", "config": {"endpoint": "https://catalog.example.com", "warehouse": "wh", "auth_token": "..."}}
+  ```
+
+  A Polaris namespace registers an Apache Polaris server's generic-table catalog, which speaks the Iceberg REST namespace protocol with Polaris's generic-tables endpoints. `config` carries `endpoint` (required; the server root, the client appends `/api/catalog`), `auth_token`, `connect_timeout` / `read_timeout` / `max_retries`, and the plugin's `warehouse` (required; the Polaris catalog name) and `max_namespace_depth`:
+
+  ```json
+  POST /_lance/namespace
+  {"type": "polaris", "name": "pol-a", "config": {"endpoint": "https://polaris.example.com", "warehouse": "mycatalog", "auth_token": "..."}}
+  ```
+
+  A Unity namespace registers a Unity Catalog. `config` carries the property names the Unity implementation reads: `endpoint` (required), `catalog` (required; Unity's namespace shape is the fixed two-level `catalog.schema` and the poll walks the catalog's schemas without extra config), `auth_token`, `api_path` (default `/api/2.1/unity-catalog`), `connect_timeout` / `read_timeout` / `max_retries`, and `storage.*` entries forwarded as storage properties. Tables whose `table_type` property is `lance` surface under their table name:
+
+  ```json
+  POST /_lance/namespace
+  {"type": "unity", "name": "uni-a", "config": {"endpoint": "https://unity.example.com", "catalog": "main", "auth_token": "..."}}
+  ```
+
+- For the catalog types whose tables live inside nested namespaces, the poll walks the namespace tree depth-first from the registration's root (the `warehouse` for `iceberg` and `polaris`, the catalog root otherwise), collecting the tables of every namespace that answers a table listing, down to `config.max_namespace_depth` levels (default 2 — enough for Glue databases, one namespace level under an Iceberg warehouse, and Unity's `catalog.schema`). Deeper trees need a higher `max_namespace_depth`. Tables with the same name in different namespaces collide on the index name; the first one surfaced wins and the poll logs the skip.
+- Config values whose key contains `secret`, `password`, `token`, `key`, `authorization`, or `credential` (case-insensitive) are accepted and handed to the implementation intact, but never leave the node readable: `GET /_lance/namespace`, the cluster state API, and every log line show them as `***`. Only the gateway-persisted cluster state keeps the raw values, so the catalogs re-initialise after a full cluster restart.
 - A catalog whose `initialize` or listing fails (bad credentials, unreachable endpoint) is kept as a registration, warned about once, and retried on every poll; `GET /_lance/namespace` shows it as `"status": "unavailable"` with the error message until a poll succeeds.
-- For `rest` and `glue`, each table's location comes from the catalog's `describeTable` and is checked against `lance.allowed_table_roots` before the table surfaces (the register call names no path the allowlist could gate up front); a directory registration checks its root at register time as before.
+- For every type except `directory`, each table's location comes from the catalog's `describeTable` and is checked against `lance.allowed_table_roots` before the table surfaces (the register call names no path the allowlist could gate up front); a directory registration checks its root at register time as before.
 - `POST /_lance/attach` attaches a single Lance table URI directly. Idempotent: a repeated call for the same URI returns `already_attached: true`; a name clash with a non-Lance index or a Lance index for a different table returns 409. The body takes either `"version": N` (fixed pin, see below) or `"tag": "name"` (follow a Lance tag); both together return 400, and an unknown tag returns 400 with Lance's message. The request can be sent to any node: it is forwarded to the elected cluster manager, which opens the table, creates the index and records the index for the poll.
 - A table with more physical rows than one Lucene reader may hold (`IndexWriter.MAX_DOCS`, 2,147,483,519) attaches too; the response then carries `lucene_bound_exceeded: true` and the manager logs one WARN naming the rows the shard reader holds and the fragment groups the fan-out cuts. Searches, `_count` and GET read every row (see [Tables above the Lucene document bound](#tables-above-the-lucene-document-bound)); only a table whose single fragment is above the bound is refused with 400, because no reader can hold that fragment.
 - `GET /_lance/refs/{index}` lists the tags (`name`, `version`) and branches (`name`) of the Lance table behind an index: `{"index": ..., "table": ..., "tags": [...], "branches": [...]}`. Unknown index returns 404, a non-Lance index 400.
