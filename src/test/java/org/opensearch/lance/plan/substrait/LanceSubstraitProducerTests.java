@@ -8,11 +8,13 @@ package org.opensearch.lance.plan.substrait;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 import io.substrait.proto.AggregateRel;
+import io.substrait.proto.Expression;
 import io.substrait.proto.Plan;
 import io.substrait.proto.Rel;
 import io.substrait.proto.SimpleExtensionDeclaration;
@@ -24,7 +26,9 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.AggregateCall;
+import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.JoinRelType;
+import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlAggFunction;
 import org.apache.calcite.sql.SqlFunction;
@@ -60,7 +64,9 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             field("price", new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)),
             field("category", new ArrowType.Utf8()),
             field("flag", new ArrowType.Bool()),
-            field("ts", new ArrowType.Timestamp(TimeUnit.MICROSECOND, null))
+            field("ts", new ArrowType.Timestamp(TimeUnit.MICROSECOND, null)),
+            field("ts_s", new ArrowType.Timestamp(TimeUnit.SECOND, null)),
+            field("ts_ns", new ArrowType.Timestamp(TimeUnit.NANOSECOND, null))
         )
     );
 
@@ -108,6 +114,26 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             }
         }
         return names;
+    }
+
+    private static Map<Integer, String> functionsByAnchor(Plan plan) {
+        Map<Integer, String> names = new HashMap<>();
+        for (SimpleExtensionDeclaration declaration : plan.getExtensionsList()) {
+            if (declaration.hasExtensionFunction()) {
+                names.put(
+                    declaration.getExtensionFunction().getFunctionAnchor(),
+                    declaration.getExtensionFunction().getName().split(":", 2)[0]
+                );
+            }
+        }
+        return names;
+    }
+
+    private static Expression onlyGrouping(Plan plan) {
+        AggregateRel rel = aggregateOf(plan);
+        assertEquals(1, rel.getGroupingsCount());
+        assertEquals(1, rel.getGroupings(0).getGroupingExpressionsCount());
+        return rel.getGroupings(0).getGroupingExpressions(0);
     }
 
     public void testNonAggregateRootIsEmpty() {
@@ -163,6 +189,68 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
         assertEquals(Optional.empty(), LanceSubstraitProducer.toLanceAggregate(aggregate));
     }
 
+    /**
+     * The same tree as the refusal above with an accepted function in
+     * the projected key: the refusal there comes from the function, not
+     * from the project under the aggregate.
+     */
+    public void testAcceptedProjectedKeyIsNotRefused() throws Exception {
+        RelBuilder builder = relBuilder();
+        builder.scan("lance", "t");
+        RexNode key = builder.call(
+            SqlStdOperatorTable.FLOOR,
+            builder.call(
+                SqlStdOperatorTable.DIVIDE,
+                builder.cast(builder.field("rating"), SqlTypeName.DOUBLE),
+                builder.getRexBuilder().makeApproxLiteral(BigDecimal.TEN)
+            )
+        );
+        builder.project(key, builder.field("rating"));
+        RelNode input = builder.build();
+        SpecAggregate aggregate = new SpecAggregate(
+            input,
+            ImmutableBitSet.of(0),
+            List.of(call(SqlStdOperatorTable.SUM, input, 1, 1, "m0")),
+            List.of(BucketSpec.of(BucketKind.HISTOGRAM, "k")),
+            List.of(MetricSpec.of(MetricKind.SUM, "m"))
+        );
+
+        Plan plan = parse(LanceSubstraitProducer.toLanceAggregate(aggregate).orElseThrow());
+        // The floor rewrite truncates on i64 and casts back to the
+        // operand's floating type, so the key's top node is that cast.
+        assertTrue(onlyGrouping(plan).hasCast());
+        assertEquals(List.of("k0", "n", "m0"), plan.getRelations(0).getRoot().getNamesList());
+    }
+
+    /**
+     * RelBuilder puts a filter over the projected keys when the
+     * condition is added after the projection, so the producer accepts
+     * that ordering too. The condition still never travels in the
+     * bytes.
+     */
+    public void testFilterAboveTheProjectedKeysIsAccepted() throws Exception {
+        RelBuilder builder = relBuilder();
+        builder.scan("lance", "t");
+        builder.project(builder.cast(builder.field("rating"), SqlTypeName.BIGINT), builder.field("rating"));
+        builder.filter(builder.call(SqlStdOperatorTable.GREATER_THAN, builder.field(0), builder.literal(0L)));
+        RelNode input = builder.build();
+        assertTrue("the fixture must be a filter over the project", input instanceof Filter);
+        assertTrue(((Filter) input).getInput() instanceof Project);
+        SpecAggregate aggregate = new SpecAggregate(
+            input,
+            ImmutableBitSet.of(0),
+            List.of(call(SqlStdOperatorTable.SUM, input, 1, 1, "m0")),
+            List.of(BucketSpec.of(BucketKind.TERMS, "k")),
+            List.of(MetricSpec.of(MetricKind.SUM, "m"))
+        );
+
+        Plan plan = parse(LanceSubstraitProducer.toLanceAggregate(aggregate).orElseThrow());
+        AggregateRel rel = aggregateOf(plan);
+        assertTrue("the aggregate input must be the scan, the filter travels out of band", rel.getInput().hasRead());
+        assertEquals(1, rel.getGroupingsCount());
+        assertEquals(List.of("k0", "n", "m0"), plan.getRelations(0).getRoot().getNamesList());
+    }
+
     public void testProjectFoldsIntoTheGroupingExpressions() throws Exception {
         RelBuilder builder = relBuilder();
         builder.scan("lance", "t");
@@ -211,19 +299,36 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
         );
 
         Plan plan = parse(LanceSubstraitProducer.toLanceAggregate(aggregate).orElseThrow());
-        List<String> functions = functionNames(plan);
-        assertTrue("date_trunc: " + functions, functions.contains("date_trunc"));
-        assertFalse("the Calcite operator name must not leak: " + functions, functions.contains("lance_date_trunc"));
+        Map<Integer, String> functions = functionsByAnchor(plan);
+        assertFalse("the Calcite operator name must not leak: " + functions, functions.containsValue("lance_date_trunc"));
         // The microsecond timestamp key is brought to epoch millis around
-        // the truncation.
-        assertTrue("epoch millis division: " + functions, functions.contains("divide"));
+        // the truncation: divide(cast_i64(date_trunc('month', ts)), 1000).
+        Expression grouping = onlyGrouping(plan);
+        assertTrue(grouping.hasScalarFunction());
+        assertEquals("divide", functions.get(grouping.getScalarFunction().getFunctionReference()));
+        Expression cast = grouping.getScalarFunction().getArguments(0).getValue();
+        assertTrue(cast.hasCast());
+        Expression truncation = cast.getCast().getInput();
+        assertTrue(truncation.hasScalarFunction());
+        assertEquals("date_trunc", functions.get(truncation.getScalarFunction().getFunctionReference()));
+        assertEquals(2, truncation.getScalarFunction().getArgumentsCount());
+        Expression unit = truncation.getScalarFunction().getArguments(0).getValue();
+        assertEquals("the unit rides first, as a plain string", "month", unit.getLiteral().getString());
+        Expression column = truncation.getScalarFunction().getArguments(1).getValue();
+        assertTrue("the value rides second, as a field reference", column.hasSelection());
+        assertEquals(5, column.getSelection().getDirectReference().getStructField().getField());
     }
 
     public void testTimestampCastBecomesUnitArithmetic() throws Exception {
+        assertEpochChain("ts", 5, "divide", 1000L);
+        assertEpochChain("ts_s", 6, "multiply", 1000L);
+        assertEpochChain("ts_ns", 7, "divide", 1_000_000L);
+    }
+
+    private void assertEpochChain(String column, int fieldIndex, String function, long factor) throws Exception {
         RelBuilder builder = relBuilder();
         builder.scan("lance", "t");
-        RexNode key = builder.cast(builder.field("ts"), SqlTypeName.BIGINT);
-        builder.project(key);
+        builder.project(builder.cast(builder.field(column), SqlTypeName.BIGINT));
         RelNode input = builder.build();
         SpecAggregate aggregate = new SpecAggregate(
             input,
@@ -234,7 +339,18 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
         );
 
         Plan plan = parse(LanceSubstraitProducer.toLanceAggregate(aggregate).orElseThrow());
-        assertTrue("micros divide to millis: " + functionNames(plan), functionNames(plan).contains("divide"));
+        Map<Integer, String> functions = functionsByAnchor(plan);
+        Expression grouping = onlyGrouping(plan);
+        assertTrue(column + ": the key is the unit arithmetic", grouping.hasScalarFunction());
+        assertEquals(column, function, functions.get(grouping.getScalarFunction().getFunctionReference()));
+        Expression rawTicks = grouping.getScalarFunction().getArguments(0).getValue();
+        assertTrue(column + ": the left argument is the raw tick cast", rawTicks.hasCast());
+        assertTrue(column, rawTicks.getCast().getType().hasI64());
+        assertTrue(column, rawTicks.getCast().getInput().hasSelection());
+        assertEquals(column, fieldIndex, rawTicks.getCast().getInput().getSelection().getDirectReference().getStructField().getField());
+        Expression unitFactor = grouping.getScalarFunction().getArguments(1).getValue();
+        assertEquals(column, Expression.Literal.LiteralTypeCase.I64, unitFactor.getLiteral().getLiteralTypeCase());
+        assertEquals(column, factor, unitFactor.getLiteral().getI64());
     }
 
     public void testCardinalityAddsTheDistinctGrouping() throws Exception {
