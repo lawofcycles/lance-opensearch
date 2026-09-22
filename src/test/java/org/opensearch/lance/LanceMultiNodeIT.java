@@ -1560,7 +1560,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         LanceTableFactory.writeHintFixtureTable(scratchDir, tableName, fragments, rowsPerFragment);
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
-        String sum = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+        String sum = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}";
         updateClusterSetting("lance.aggregation.pushdown", "false");
         updateClusterSetting("lance.cache.enabled", "false");
         updateClusterSetting("lance.fragment_path.slices", "1");
