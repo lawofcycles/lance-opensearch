@@ -57,10 +57,21 @@ public final class LanceKnnQuery extends Query {
     private final Integer ef;
     private final org.lance.index.DistanceType distanceType;
     private final Boolean useIndex;
-    private final String filter;
+    /**
+     * Optional Lance SQL predicate the nearest scan evaluates as a
+     * prefilter, before the top-k cutoff, or {@code null} for an
+     * unfiltered scan. The SQL comes from the query planner: the
+     * fragment executor plans a {@code lance_knn} with an inner
+     * {@code filter} into a scan with a pushed knn operation whose
+     * filter SQL lands here through {@link #withScanFilterSql}. Without
+     * the prefilter a post-filter would drop filter-mismatching hits
+     * from the top-k and could leave fewer than k results even when the
+     * table has plenty of matching rows.
+     */
+    private final String scanFilterSql;
 
     public LanceKnnQuery(String column, float[] vector, int k) {
-        this(column, vector, k, null, null, null, null, null, null);
+        this(column, vector, k, null, null, null, null, null);
     }
 
     public LanceKnnQuery(
@@ -71,8 +82,21 @@ public final class LanceKnnQuery extends Query {
         Integer refineFactor,
         Integer ef,
         org.lance.index.DistanceType distanceType,
+        Boolean useIndex
+    ) {
+        this(column, vector, k, nprobes, refineFactor, ef, distanceType, useIndex, null);
+    }
+
+    private LanceKnnQuery(
+        String column,
+        float[] vector,
+        int k,
+        Integer nprobes,
+        Integer refineFactor,
+        Integer ef,
+        org.lance.index.DistanceType distanceType,
         Boolean useIndex,
-        String filter
+        String scanFilterSql
     ) {
         this.column = column;
         this.vector = vector;
@@ -82,7 +106,19 @@ public final class LanceKnnQuery extends Query {
         this.ef = ef;
         this.distanceType = distanceType;
         this.useIndex = useIndex;
-        this.filter = filter;
+        this.scanFilterSql = scanFilterSql;
+    }
+
+    /**
+     * Return a copy of this query whose Lance nearest scan is
+     * prefiltered by {@code newScanFilterSql} ({@code null} removes the
+     * prefilter).
+     */
+    public LanceKnnQuery withScanFilterSql(String newScanFilterSql) {
+        if (Objects.equals(newScanFilterSql, scanFilterSql)) {
+            return this;
+        }
+        return new LanceKnnQuery(column, vector, k, nprobes, refineFactor, ef, distanceType, useIndex, newScanFilterSql);
     }
 
     @Override
@@ -239,13 +275,13 @@ public final class LanceKnnQuery extends Query {
             // vector column itself and every other data column stay in
             // Lance, the Weight reads none of them.
             ScanOptions.Builder options = new ScanOptions.Builder().nearest(qb.build()).columns(HITS_SCAN_COLUMNS).withRowAddress(true);
-            if (filter != null && !filter.isEmpty()) {
+            if (scanFilterSql != null && !scanFilterSql.isEmpty()) {
                 // Push the filter down as a pre-filter so Lance evaluates
                 // it BEFORE applying the k-nearest cutoff. Without this
                 // the post-filter path drops filter-mismatching hits from
                 // the top-K and can leave fewer than k results even when
                 // the table has plenty of matching rows.
-                options.filter(filter);
+                options.filter(scanFilterSql);
                 options.prefilter(true);
             }
             try (LanceScanner scanner = leaf.dataset().newScan(options.build()); ArrowReader reader = scanner.scanBatches()) {
@@ -304,11 +340,11 @@ public final class LanceKnnQuery extends Query {
             && Objects.equals(ef, q.ef)
             && Objects.equals(distanceType, q.distanceType)
             && Objects.equals(useIndex, q.useIndex)
-            && Objects.equals(filter, q.filter);
+            && Objects.equals(scanFilterSql, q.scanFilterSql);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(column, Arrays.hashCode(vector), k, nprobes, refineFactor, ef, distanceType, useIndex, filter);
+        return Objects.hash(column, Arrays.hashCode(vector), k, nprobes, refineFactor, ef, distanceType, useIndex, scanFilterSql);
     }
 }

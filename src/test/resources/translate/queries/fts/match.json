@@ -1,0 +1,1 @@
+{"query":{"lance_match":{"field":"body","query":"hello","operator":"and","fuzziness":1,"prefix_length":2,"max_expansions":20}}}

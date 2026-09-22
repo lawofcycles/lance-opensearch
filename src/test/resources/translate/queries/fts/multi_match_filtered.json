@@ -1,0 +1,1 @@
+{"query":{"bool":{"must":[{"lance_multi_match":{"fields":["body","category"],"query":"hello"}}],"filter":[{"exists":{"field":"rating"}}]}}}

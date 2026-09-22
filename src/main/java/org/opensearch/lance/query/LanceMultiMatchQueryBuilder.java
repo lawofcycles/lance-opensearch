@@ -283,6 +283,11 @@ public class LanceMultiMatchQueryBuilder extends AbstractQueryBuilder<LanceMulti
     }
 
     @Override
+    public Set<String> referencedFields() {
+        return new LinkedHashSet<>(fields);
+    }
+
+    @Override
     protected Query doToQuery(QueryShardContext context) {
         FullTextQuery ftq = toLanceFullTextQuery(context);
         return new LanceFtsQuery(ftq, new LinkedHashSet<>(fields));

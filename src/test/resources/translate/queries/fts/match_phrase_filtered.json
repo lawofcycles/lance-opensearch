@@ -1,0 +1,1 @@
+{"query":{"bool":{"must":[{"lance_match_phrase":{"field":"body","query":"hello world"}}],"filter":[{"term":{"flag":true}}]}}}

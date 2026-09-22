@@ -34,6 +34,7 @@ import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
@@ -43,13 +44,13 @@ import org.opensearch.lance.attach.LanceAttachRequest;
 import org.opensearch.lance.attach.LanceAttachResponse;
 import org.apache.calcite.rel.RelNode;
 import org.opensearch.lance.engine.LanceCancellation;
+import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.execute.LanceAggregateResults;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.rel.PushedOperation;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
-import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.script.Script;
@@ -2353,9 +2354,22 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
         List<Integer> fragmentIds
     ) {
         IndexMetadata metadata = getInstanceFromNode(ClusterService.class).state().metadata().index(indexName);
-        String filterSql = query instanceof MatchAllQueryBuilder
-            ? null
-            : LanceKnnFilterTranslator.toLanceSql(query, field -> fieldType(metadata, field));
+        String filterSql;
+        try {
+            LanceSchemas.IndexModel model = LanceSchemas.build(metadata, getInstanceFromNode(LanceWarmCache.class));
+            filterSql = TransportLanceCoordinatorAction.resolveScanFilterSql(
+                query,
+                model,
+                TransportLanceCoordinatorAction.sqlExcludedColumns(LanceOverrides.of(metadata.getSettings())),
+                new LancePlannerFactory(1L << 30, 1L << 30)
+            );
+        } catch (java.io.IOException e) {
+            throw new AssertionError(e);
+        }
+        assertTrue(
+            "the coordinator translates the routed query to Lance SQL: " + query,
+            query instanceof MatchAllQueryBuilder || filterSql != null
+        );
         return new LanceFragmentQueryRequest(
             tableUri,
             indexName,
@@ -2374,10 +2388,4 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
         );
     }
 
-    @SuppressWarnings("unchecked")
-    private static String fieldType(IndexMetadata metadata, String field) {
-        Map<String, Object> properties = (Map<String, Object>) metadata.mapping().sourceAsMap().get("properties");
-        Map<String, Object> definition = (Map<String, Object>) properties.get(field);
-        return definition == null ? null : (String) definition.get("type");
-    }
 }

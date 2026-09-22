@@ -8,6 +8,8 @@ package org.opensearch.lance.query;
 import org.lance.ipc.FullTextQuery;
 import org.opensearch.index.query.QueryShardContext;
 
+import java.util.Set;
+
 /**
  * A DSL query builder that translates into a Lance {@link FullTextQuery}
  * tree. Lets {@code lance_fts_boost} and {@code lance_fts_bool} compose
@@ -32,4 +34,12 @@ public interface LanceFtsQueryBuilder {
      *     underlying Lance table
      */
     FullTextQuery toLanceFullTextQuery(QueryShardContext context);
+
+    /**
+     * The field names the clause references, in declaration order and
+     * without consulting the mapping: what the query says, not what it
+     * resolves to. The query planner reads this to name the columns of
+     * a full-text plan node.
+     */
+    Set<String> referencedFields();
 }

@@ -1,0 +1,1 @@
+{"query":{"lance_match":{"field":"body","query":"hello","boost":2.0}}}

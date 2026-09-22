@@ -25,6 +25,8 @@ import org.apache.calcite.tools.RelBuilder;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.lance.plan.rel.LanceTableScan;
+import org.opensearch.lance.plan.rules.FuseFtsWithFilter;
+import org.opensearch.lance.plan.rules.FuseKnnWithFilter;
 import org.opensearch.lance.plan.rules.PushAggregateIntoLanceScan;
 import org.opensearch.lance.plan.rules.PushFilterIntoLanceScan;
 
@@ -72,6 +74,12 @@ public final class LancePlannerFactory {
             planner.addRule(rule);
         }
         for (PushFilterIntoLanceScan rule : PushFilterIntoLanceScan.rules()) {
+            planner.addRule(rule);
+        }
+        for (FuseFtsWithFilter rule : FuseFtsWithFilter.rules()) {
+            planner.addRule(rule);
+        }
+        for (FuseKnnWithFilter rule : FuseKnnWithFilter.rules()) {
             planner.addRule(rule);
         }
         RelOptCluster cluster = RelOptCluster.create(planner, new RexBuilder(new SqlTypeFactoryImpl(LanceTypeSystem.INSTANCE)));

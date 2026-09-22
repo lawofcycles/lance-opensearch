@@ -1,0 +1,2 @@
+LanceKnnSearch(column=[embedding], k=[5], query=[{"lance_knn":{"field":"embedding","vector":[0.1,0.2,0.3,0.4],"k":5,"nprobes":10,"refine_factor":4,"ef":64,"metric":"cosine","use_index":true,"boost":1.5}}])
+  LanceTableScan(table=[[lance, idx]])

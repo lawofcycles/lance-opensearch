@@ -12,7 +12,6 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Function;
 
 import org.lance.Dataset;
 import org.apache.calcite.rex.RexNode;
@@ -38,25 +37,19 @@ import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.lancesql.RexToLanceSql;
 import org.opensearch.lance.plan.translate.QueryToRex;
-import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
 
 /**
  * For every query shape the planner pushes, runs the request twice
- * against a real Lance table: once through the current execution path
- * ({@code _search}, whose count travels as the SQL the string
- * translator builds, or the Lucene fallback where it refuses), and once
- * by planning the request, reading the SQL out of the pushed filter and
- * executing {@code Dataset.countRows(sql)}. The two counts must be
- * equal. Where the old translator supports the shape and spells it the
- * same way, the pushed SQL must also equal
- * {@link LanceKnnFilterTranslator#toLanceSql} byte for byte; the shapes whose
- * spelling legitimately changed (date bounds as
- * {@code to_timestamp_millis}, {@code must_not} as
- * {@code NOT (... IS TRUE)}, an {@code OR} of equal terms as
- * {@code IN}) are asserted on the count only.
+ * against a real Lance table: once through the execution path
+ * ({@code _search}, whose count travels as the SQL the planner derives,
+ * or the Lucene fallback where it refuses), and once by translating and
+ * printing the query directly and executing
+ * {@code Dataset.countRows(sql)}. The two counts must be equal, so the
+ * SQL the planner emits selects exactly the rows the search path
+ * answers with.
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class QueryToRexEquivalenceIT extends OpenSearchSingleNodeTestCase {
@@ -81,26 +74,21 @@ public class QueryToRexEquivalenceIT extends OpenSearchSingleNodeTestCase {
 
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
             LanceSchemas.IndexModel model = modelOf(index, dataset);
-            Function<String, String> lookup = TransportLanceCoordinatorAction.buildFieldTypeLookup(metadataOf(index));
 
-            checkPinned(index, dataset, model, lookup, QueryBuilders.termQuery("category", "c0"));
-            checkPinned(index, dataset, model, lookup, QueryBuilders.termQuery("rating", 37));
-            checkPinned(index, dataset, model, lookup, QueryBuilders.termQuery("flag", true));
-            checkPinned(index, dataset, model, lookup, new TermsQueryBuilder("category", List.of("c0", "c2")));
-            checkPinned(index, dataset, model, lookup, new TermsQueryBuilder("rating", List.of(37, 74, 111)));
-            checkPinned(index, dataset, model, lookup, QueryBuilders.existsQuery("category"));
-            checkPinned(index, dataset, model, lookup, QueryBuilders.rangeQuery("rating").gte(100).lt(900));
-            checkPinned(index, dataset, model, lookup, QueryBuilders.rangeQuery("rating").gt(500));
-            checkPinned(
+            checkCount(index, dataset, model, QueryBuilders.termQuery("category", "c0"));
+            checkCount(index, dataset, model, QueryBuilders.termQuery("rating", 37));
+            checkCount(index, dataset, model, QueryBuilders.termQuery("flag", true));
+            checkCount(index, dataset, model, new TermsQueryBuilder("category", List.of("c0", "c2")));
+            checkCount(index, dataset, model, new TermsQueryBuilder("rating", List.of(37, 74, 111)));
+            checkCount(index, dataset, model, QueryBuilders.existsQuery("category"));
+            checkCount(index, dataset, model, QueryBuilders.rangeQuery("rating").gte(100).lt(900));
+            checkCount(index, dataset, model, QueryBuilders.rangeQuery("rating").gt(500));
+            checkCount(
                 index,
                 dataset,
                 model,
-                lookup,
                 QueryBuilders.boolQuery().must(QueryBuilders.termQuery("category", "c0")).must(QueryBuilders.termQuery("flag", true))
             );
-            // The old translator spells the filter clauses before the
-            // must clauses and keeps a nested range parenthesised where
-            // the printer flattens; the count is what must agree.
             checkCount(
                 index,
                 dataset,
@@ -109,16 +97,15 @@ public class QueryToRexEquivalenceIT extends OpenSearchSingleNodeTestCase {
                     .must(QueryBuilders.termQuery("category", "c0"))
                     .filter(QueryBuilders.rangeQuery("rating").gte(100))
             );
-            checkPinned(index, dataset, model, lookup, QueryBuilders.wildcardQuery("category", "c*"));
-            checkPinned(index, dataset, model, lookup, QueryBuilders.wildcardQuery("category", "C?").caseInsensitive(true));
-            checkPinned(index, dataset, model, lookup, QueryBuilders.regexpQuery("category", "c[02]"));
-            checkPinned(index, dataset, model, lookup, QueryBuilders.regexpQuery("category", "C.").caseInsensitive(true));
-            checkPinned(index, dataset, model, lookup, QueryBuilders.prefixQuery("category", "c"));
-            checkPinned(index, dataset, model, lookup, QueryBuilders.prefixQuery("category", "C").caseInsensitive(true));
+            checkCount(index, dataset, model, QueryBuilders.wildcardQuery("category", "c*"));
+            checkCount(index, dataset, model, QueryBuilders.wildcardQuery("category", "C?").caseInsensitive(true));
+            checkCount(index, dataset, model, QueryBuilders.regexpQuery("category", "c[02]"));
+            checkCount(index, dataset, model, QueryBuilders.regexpQuery("category", "C.").caseInsensitive(true));
+            checkCount(index, dataset, model, QueryBuilders.prefixQuery("category", "c"));
+            checkCount(index, dataset, model, QueryBuilders.prefixQuery("category", "C").caseInsensitive(true));
 
-            // must_not spells NOT (... IS TRUE) now; the count agrees on
-            // a column without nulls (id), where the two null semantics
-            // coincide.
+            // must_not spells NOT (... IS TRUE); the count agrees on a
+            // column without nulls (id).
             checkCount(index, dataset, model, QueryBuilders.boolQuery().mustNot(QueryBuilders.termQuery("id", 5)));
             // A pure should of terms on one column collapses to IN.
             checkCount(
@@ -129,8 +116,7 @@ public class QueryToRexEquivalenceIT extends OpenSearchSingleNodeTestCase {
                     .should(QueryBuilders.termQuery("category", "c0"))
                     .should(QueryBuilders.termQuery("category", "c1"))
             );
-            // The old translator refuses multi-field sub-fields; the
-            // planner resolves them to the base column.
+            // A multi-field sub-field resolves to the base column.
             checkCount(index, dataset, model, QueryBuilders.termQuery("body.raw", "hello tok0 grp0 sp0 lance"));
             checkCount(index, dataset, model, new MatchNoneQueryBuilder());
 
@@ -163,8 +149,7 @@ public class QueryToRexEquivalenceIT extends OpenSearchSingleNodeTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
             LanceSchemas.IndexModel model = modelOf(index, dataset);
 
-            // The date bounds print as to_timestamp_millis instead of
-            // the old timestamp '...' literal; counts must agree.
+            // Date bounds print as to_timestamp_millis.
             checkCount(index, dataset, model, QueryBuilders.termQuery("ts", "2024-01-15T00:00:00Z"));
             checkCount(index, dataset, model, QueryBuilders.rangeQuery("ts").gte("2024-02-01").lt("2024-04-01"));
             checkCount(index, dataset, model, QueryBuilders.rangeQuery("ts").gt("2024-03-10T00:00:00Z"));
@@ -185,12 +170,11 @@ public class QueryToRexEquivalenceIT extends OpenSearchSingleNodeTestCase {
 
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
             LanceSchemas.IndexModel model = modelOf(index, dataset);
-            Function<String, String> lookup = TransportLanceCoordinatorAction.buildFieldTypeLookup(metadataOf(index));
 
-            checkPinned(index, dataset, model, lookup, QueryBuilders.termQuery("meta.region", "east"));
-            checkPinned(index, dataset, model, lookup, QueryBuilders.rangeQuery("meta.score").gte(1.5));
-            checkPinned(index, dataset, model, lookup, QueryBuilders.termQuery("meta.flags.active", true));
-            checkPinned(index, dataset, model, lookup, QueryBuilders.existsQuery("meta.score"));
+            checkCount(index, dataset, model, QueryBuilders.termQuery("meta.region", "east"));
+            checkCount(index, dataset, model, QueryBuilders.rangeQuery("meta.score").gte(1.5));
+            checkCount(index, dataset, model, QueryBuilders.termQuery("meta.flags.active", true));
+            checkCount(index, dataset, model, QueryBuilders.existsQuery("meta.score"));
 
             // ids resolves the primary key column, the semantics GET by
             // id has. The current Lucene path finds no hits for an ids
@@ -206,30 +190,7 @@ public class QueryToRexEquivalenceIT extends OpenSearchSingleNodeTestCase {
     // The two comparisons
     // ---------------------------------------------------------------
 
-    /**
-     * Count equivalence plus the byte for byte SQL pin against the old
-     * translator. The one spelling difference tolerated here is the old
-     * path's outer parentheses around a whole range predicate, which
-     * the printer only emits around a conjunction; both sides are
-     * compared with one outer pair removed.
-     */
-    private void checkPinned(
-        String index,
-        Dataset dataset,
-        LanceSchemas.IndexModel model,
-        Function<String, String> lookup,
-        QueryBuilder query
-    ) {
-        String sql = pushedSql(model, query);
-        assertEquals("SQL of " + query, unwrapped(LanceKnnFilterTranslator.toLanceSql(query, lookup)), unwrapped(sql));
-        assertEquals("count of " + query, currentHits(index, query), dataset.countRows(sql));
-    }
-
-    private static String unwrapped(String sql) {
-        return sql.startsWith("(") && sql.endsWith(")") ? sql.substring(1, sql.length() - 1) : sql;
-    }
-
-    /** Count equivalence only, for the shapes whose SQL spelling legitimately changed or that the old translator refuses. */
+    /** The SQL of {@code query} counts the same rows the search path answers with. */
     private void checkCount(String index, Dataset dataset, LanceSchemas.IndexModel model, QueryBuilder query) {
         String sql = pushedSql(model, query);
         assertEquals("count of " + query + " via [" + sql + "]", currentHits(index, query), dataset.countRows(sql));

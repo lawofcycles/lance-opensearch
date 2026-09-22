@@ -1,0 +1,1 @@
+{"query":{"lance_multi_match":{"fields":["body","category"],"query":"hello","operator":"and","boosts":[1.0,2.0]}}}

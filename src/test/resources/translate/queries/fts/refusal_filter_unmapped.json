@@ -1,0 +1,1 @@
+{"query":{"bool":{"must":[{"lance_match":{"field":"body","query":"hello"}}],"filter":[{"term":{"nosuchfield":5}}]}}}

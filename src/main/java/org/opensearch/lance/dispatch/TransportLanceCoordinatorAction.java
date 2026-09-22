@@ -15,14 +15,18 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.Consumer;
-import java.util.function.Function;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.tools.RelBuilder;
 import org.apache.lucene.search.TotalHits;
 import org.lance.Dataset;
 import org.lance.Fragment;
@@ -51,13 +55,20 @@ import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.core.tasks.TaskId;
+import org.opensearch.index.query.MatchAllQueryBuilder;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.LanceMappingMeta;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
-import org.opensearch.lance.query.LanceKnnFilterTranslator;
+import org.opensearch.lance.plan.calcite.LancePlannerFactory;
+import org.opensearch.lance.plan.calcite.LanceSchemas;
+import org.opensearch.lance.plan.lancesql.RexToLanceSql;
+import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
@@ -137,6 +148,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     private final BigArrays bigArrays;
     private final ScriptService scriptService;
     private final NodeClient client;
+    /**
+     * Builds the translator and printer run that derives each target's
+     * filter SQL at plan time; the budgets mirror the explain action's.
+     */
+    private final LancePlannerFactory plannerFactory;
 
     /**
      * Requests that reach this action over the transport layer (a
@@ -164,6 +180,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         this.bigArrays = bigArrays;
         this.scriptService = scriptService;
         this.client = client;
+        long nativeBudgetBytes = NativeMemoryLimit.parse(
+            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.get(clusterService.getSettings()),
+            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.getKey()
+        );
+        this.plannerFactory = new LancePlannerFactory(nativeBudgetBytes, Runtime.getRuntime().maxMemory());
     }
 
     /**
@@ -386,26 +407,12 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             return;
         }
         IndexTarget target = targets.get(index);
-        // filterSql is re-derived per target because Lance SQL literal
-        // encoding depends on the target's mapping: two indices in the
-        // same request may map the same field name to different types
-        // (say `ts` as `date` on one and `long` on the other).
-        FragmentQuerySpec perTargetSpec = new FragmentQuerySpec(
-            resolveFilterSql(source, target.fieldTypeLookup()),
-            spec.query(),
-            spec.postFilter(),
-            spec.sorts(),
-            spec.searchAfter(),
-            spec.effectiveSize(),
-            spec.aggregations(),
-            spec.trackScores(),
-            spec.trackTotalHitsUpTo()
-        );
         try {
             fanOutForTarget(
                 target,
                 nodeList,
-                perTargetSpec,
+                spec,
+                source,
                 policy,
                 merged,
                 ActionListener.wrap(
@@ -423,14 +430,19 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * across the data-node list, and issue one
      * {@link LanceFragmentQueryAction} per node, or several per node
      * when the node's fragments hold more rows than one Lucene reader
-     * may (see {@link #splitByRows}). Completion signals
-     * through {@code done} once every response is merged into
-     * {@code merged}.
+     * may (see {@link #splitByRows}). The target's filter SQL is
+     * derived here, once per target while its dataset is open, because
+     * the planner's model needs the Arrow schema and the SQL literal
+     * encoding depends on the target's own columns: two indices in the
+     * same request may map the same field name to different types.
+     * Completion signals through {@code done} once every response is
+     * merged into {@code merged}.
      */
     private void fanOutForTarget(
         IndexTarget target,
         List<DiscoveryNode> nodeList,
-        FragmentQuerySpec spec,
+        FragmentQuerySpec baseSpec,
+        SearchSourceBuilder source,
         FanOutPolicy policy,
         MergeState merged,
         ActionListener<Void> done
@@ -446,15 +458,45 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // key their LanceWarmCache snapshot on it without asking Lance
         // for the latest version themselves.
         long observedVersion;
+        // The Arrow schema and total rows the planner model reads for
+        // the filter SQL derivation below, captured while the dataset
+        // is open.
+        Schema arrowSchema;
+        long tableRows = 0L;
         try (Dataset dataset = LanceRegistry.openDataset(target.tableUri(), target.storageOptions(), target.pinnedVersionOrEmpty())) {
             observedVersion = dataset.version();
+            arrowSchema = dataset.getSchema();
             allFragmentIds = new ArrayList<>(dataset.getFragments().size());
             allFragmentRows = new ArrayList<>(dataset.getFragments().size());
             dataset.getFragments().forEach(fragment -> {
                 allFragmentIds.add(fragment.getId());
                 allFragmentRows.add(fragment.metadata().getPhysicalRows());
             });
+            for (Long rows : allFragmentRows) {
+                tableRows += rows;
+            }
         }
+        final long totalRows = tableRows;
+        LanceSchemas.IndexModel model = LanceSchemas.model(
+            target.indexName(),
+            arrowSchema,
+            target.multiFields(),
+            target.renamedFields(),
+            target.primaryKeyField(),
+            target.dateOverrideColumns(),
+            () -> totalRows
+        );
+        FragmentQuerySpec spec = new FragmentQuerySpec(
+            resolveScanFilterSql(source == null ? null : source.query(), model, target.sqlExcludedColumns(), plannerFactory),
+            baseSpec.query(),
+            baseSpec.postFilter(),
+            baseSpec.sorts(),
+            baseSpec.searchAfter(),
+            baseSpec.effectiveSize(),
+            baseSpec.aggregations(),
+            baseSpec.trackScores(),
+            baseSpec.trackTotalHitsUpTo()
+        );
         if (allFragmentIds.isEmpty()) {
             if (spec.aggregations() == null) {
                 // Empty table with no aggregations requested: no
@@ -997,42 +1039,53 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     }
 
     /**
-     * Try to translate the top-level query to a Lance SQL filter for
-     * metadata-only row counting. Returns {@code null} when the
-     * query is match_all, absent, or cannot be expressed in Lance
-     * SQL (e.g. match, knn, or anything requiring a Lucene scoring
-     * pass). In those cases the per-node executor falls back to
+     * Derive the Lance SQL of the top-level query for metadata-only
+     * row counting and the scan-filter hits path, through the planner's
+     * translator and printer so the SQL spelling has one source.
+     * Returns {@code null} when the query is match_all, absent, cannot
+     * be expressed (match, knn, an unmapped field, a construct without
+     * a SQL spelling), or references an {@code ip} or {@code geo_point}
+     * override column, whose Lucene form (encoded doc values) differs
+     * from what the Lance column stores. In those cases the per-node
+     * executor falls back to the Lucene tree and
      * {@link org.apache.lucene.search.IndexSearcher#count}.
      */
-    private static String resolveFilterSql(SearchSourceBuilder source, java.util.function.Function<String, String> fieldTypeLookup) {
-        if (source == null) {
+    static String resolveScanFilterSql(
+        QueryBuilder query,
+        LanceSchemas.IndexModel model,
+        Set<String> sqlExcludedColumns,
+        LancePlannerFactory factory
+    ) {
+        if (query == null || query instanceof MatchAllQueryBuilder) {
             return null;
         }
-        Object query = source.query();
-        if (query == null || query instanceof org.opensearch.index.query.MatchAllQueryBuilder) {
-            return null;
-        }
-        org.opensearch.index.query.QueryBuilder qb = (org.opensearch.index.query.QueryBuilder) query;
-        // Refuse to emit SQL when any leaf in the tree names a
-        // field this target does not map. The translator itself
-        // would happily produce "unmapped >= 1" here, but Lance's
-        // Dataset.countRows(sql) evaluates that and rejects the
-        // scan with SchemaError. Falling back to filterSql=null
-        // lets the per-node executor use the rewritten Lucene
-        // query (RangeQueryBuilder.doRewrite folds an unmapped
-        // range to MatchNone) and count through the same
-        // IndexSearcher.count path shard search uses.
-        if (LanceKnnFilterTranslator.hasUnmappedField(qb, fieldTypeLookup)) {
+        if (QueryToRex.referencesAny(query, sqlExcludedColumns)) {
             return null;
         }
         try {
-            return LanceKnnFilterTranslator.toLanceSql(qb, fieldTypeLookup);
-        } catch (IllegalArgumentException ignored) {
-            // Query shape outside the translator's whitelist (match,
-            // knn, ...). No filter push-down; the per-node hits path
-            // and computeMatched fall back to Lucene.
+            RelBuilder relBuilder = factory.relBuilder(model.schema()).transform(config -> config.withSimplify(false));
+            relBuilder.scan(LancePlannerFactory.SCHEMA_NAME, model.indexName());
+            RelDataType rowType = relBuilder.peek().getRowType();
+            RexNode predicate = QueryToRex.translate(query, model, relBuilder);
+            return RexToLanceSql.print(predicate, rowType).orElse(null);
+        } catch (UnsupportedOperationException unsupported) {
+            // Query shape outside the translator's set (match, knn,
+            // an unmapped field, ...). No filter push-down; the
+            // per-node hits path and computeMatched fall back to
+            // Lucene.
             return null;
         }
+    }
+
+    /**
+     * The override columns whose predicates never travel to Lance SQL:
+     * {@code ip} (raw strings versus encoded doc values) and
+     * {@code geo_point} (children hidden by the mapping).
+     */
+    static Set<String> sqlExcludedColumns(LanceOverrides overrides) {
+        Set<String> excluded = new java.util.LinkedHashSet<>(overrides.ipColumns());
+        excluded.addAll(overrides.geoPointColumns().keySet());
+        return excluded;
     }
 
     private static int resolveSize(SearchSourceBuilder source) {
@@ -1063,7 +1116,25 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             }
             StorageOptions storageOptions = StorageOptions.fromIndexSettings(indexMetadata.getSettings());
             long pinnedVersion = resolvePinnedVersion(indexMetadata, tableUri, storageOptions);
-            targets.add(new IndexTarget(index.getName(), tableUri, storageOptions, pinnedVersion, buildFieldTypeLookup(indexMetadata)));
+            LanceOverrides overrides = LanceOverrides.of(indexMetadata.getSettings());
+            Map<String, String> renamedFields = new LinkedHashMap<>();
+            for (LanceMappingMeta.RenamedField renamed : LanceMappingMeta.renamedFields(indexMetadata.mapping())) {
+                renamedFields.put(renamed.from(), renamed.to());
+            }
+            String primaryKeyField = indexMetadata.getSettings().get("index.lance.primary_key_field", "");
+            targets.add(
+                new IndexTarget(
+                    index.getName(),
+                    tableUri,
+                    storageOptions,
+                    pinnedVersion,
+                    overrides.subFields(),
+                    renamedFields,
+                    primaryKeyField,
+                    sqlExcludedColumns(overrides),
+                    overrides.dateColumns().keySet()
+                )
+            );
         }
         return targets;
     }
@@ -1125,123 +1196,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         boolean exceeded() {
             return readerRows < tableRows;
         }
-    }
-
-    /**
-     * Build a field-type lookup for {@code indexMetadata} that reads
-     * the mapping straight out of cluster state so
-     * {@link LanceKnnFilterTranslator} can consult it while emitting
-     * SQL literals. The lookup returns the mapping's {@code type}
-     * string ({@code "date"}, {@code "long"}, {@code "keyword"}, ...)
-     * for a top-level field name and {@code null} for unmapped or
-     * sub-field names — the translator's
-     * {@link LanceKnnFilterTranslator#rejectMultiFieldPath} guard
-     * already refuses dotted paths, so multi-field paths never reach
-     * the literal encoder in the first place.
-     *
-     * <p>Cluster-state metadata carries the mapping as the same JSON
-     * the operator sent to {@code POST /_lance/attach}, deserialised
-     * into a {@code Map<String, Object>} tree. The top-level
-     * {@code properties} entry holds one entry per column, keyed by
-     * the OpenSearch field name; the {@code type} field on each
-     * entry is what we need. A dotted name walks nested
-     * {@code properties} maps (a Struct column mapped as
-     * {@code object}), so {@code meta.region} resolves to its child
-     * type while a multi-field sub-field ({@code body.raw}, declared
-     * under {@code fields}) stays unresolved.
-     *
-     * <p>Package-private so the per-node executor can build the same
-     * lookup from its own copy of the index metadata when it decides
-     * whether a bool query's scalar clauses can travel to Lance as an
-     * FTS prefilter.
-     */
-    @SuppressWarnings("unchecked")
-    static java.util.function.Function<String, String> buildFieldTypeLookup(IndexMetadata indexMetadata) {
-        org.opensearch.cluster.metadata.MappingMetadata mapping = indexMetadata.mapping();
-        if (mapping == null) {
-            return LanceKnnFilterTranslator.NO_MAPPING;
-        }
-        java.util.Map<String, Object> source = mapping.getSourceAsMap();
-        Object properties = source == null ? null : source.get("properties");
-        if (!(properties instanceof java.util.Map)) {
-            return LanceKnnFilterTranslator.NO_MAPPING;
-        }
-        final java.util.Map<String, Object> propertyMap = (java.util.Map<String, Object>) properties;
-        return name -> {
-            Object field = propertyMap.get(name);
-            if (field == null && name != null && name.indexOf('.') >= 0) {
-                field = resolveObjectPath(propertyMap, name);
-            }
-            if (!(field instanceof java.util.Map)) {
-                return null;
-            }
-            Map<String, Object> fieldMap = (Map<String, Object>) field;
-            if (LanceMappingMeta.isDropped(fieldMap)) {
-                // The Lance table renamed, reset or dropped the column
-                // behind this name. Answering null makes the translator
-                // treat it as unmapped, so no Lance SQL names a column
-                // the table no longer has (which would fail the scan)
-                // and the query folds to the unmapped behaviour: 0 hits.
-                return null;
-            }
-            Object type = fieldMap.get("type");
-            if (!(type instanceof String typeName)) {
-                return null;
-            }
-            return LanceKnnFilterTranslator.sentinelFor(typeName, arrowTypeMeta(fieldMap));
-        };
-    }
-
-    /**
-     * The mapping entry's {@code meta.lance_arrow_type} string, or
-     * {@code null} when the entry carries no meta or no such key. Fed
-     * to {@link LanceKnnFilterTranslator#sentinelFor} so a {@code date}
-     * field the attach body overrode onto an epoch-millis integer
-     * column keeps numeric SQL literals.
-     */
-    @SuppressWarnings("unchecked")
-    static String arrowTypeMeta(Map<String, Object> fieldMap) {
-        Object meta = fieldMap.get("meta");
-        if (!(meta instanceof Map)) {
-            return null;
-        }
-        Object arrowType = ((Map<String, Object>) meta).get("lance_arrow_type");
-        return arrowType instanceof String s ? s : null;
-    }
-
-    /**
-     * Resolve a dotted field name through nested {@code properties}
-     * maps: each segment but the last must name an entry that itself
-     * carries a {@code properties} object (a struct child mapped as an
-     * {@code object}). A multi-field sub-field does not resolve here —
-     * its sub-entries live under {@code fields}, not {@code properties}
-     * — so the filter translator can tell the two dotted shapes apart:
-     * struct children print as Lance nested field accesses, sub-fields
-     * stay on the Lucene doc value path. A path crossing an entry of
-     * type {@code nested} (a {@code List<Struct>} column) does not
-     * resolve either: DataFusion has no {@code UNNEST} in a filter, so a
-     * nested child predicate cannot travel to Lance SQL and belongs on
-     * the Lucene side.
-     */
-    @SuppressWarnings("unchecked")
-    private static Object resolveObjectPath(Map<String, Object> propertyMap, String name) {
-        Map<String, Object> current = propertyMap;
-        String[] segments = name.split("\\.");
-        for (int s = 0; s < segments.length - 1; s++) {
-            Object entry = current.get(segments[s]);
-            if (!(entry instanceof Map)) {
-                return null;
-            }
-            if ("nested".equals(((Map<String, Object>) entry).get("type"))) {
-                return null;
-            }
-            Object nested = ((Map<String, Object>) entry).get("properties");
-            if (!(nested instanceof Map)) {
-                return null;
-            }
-            current = (Map<String, Object>) nested;
-        }
-        return current.get(segments[segments.length - 1]);
     }
 
     /**
@@ -1433,10 +1387,16 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * manifest); it drives the coordinator's own fragment
      * enumeration, whose observed version then travels with every
      * per-node request so the executors read the same manifest.
+     * {@code multiFields}, {@code renamedFields},
+     * {@code primaryKeyField}, {@code sqlExcludedColumns} and
+     * {@code dateOverrideColumns} feed the planner model the per-target
+     * filter SQL derivation builds once the target's Arrow schema is
+     * known.
      */
-    private record IndexTarget(String indexName, String tableUri, StorageOptions storageOptions, long pinnedVersion, Function<
+    private record IndexTarget(String indexName, String tableUri, StorageOptions storageOptions, long pinnedVersion, Map<
         String,
-        String> fieldTypeLookup) {
+        LinkedHashMap<String, String>> multiFields, Map<String, String> renamedFields, String primaryKeyField, Set<
+            String> sqlExcludedColumns, Set<String> dateOverrideColumns) {
 
         Optional<Long> pinnedVersionOrEmpty() {
             return pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();

@@ -1,0 +1,1 @@
+{"query":{"lance_fts_bool":{"must":[{"lance_match":{"field":"body","query":"hello"}}],"should":[{"lance_match":{"field":"body","query":"sunny"}}],"must_not":[{"lance_match":{"field":"body","query":"stale"}}]}}}

@@ -710,6 +710,72 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         }
     }
 
+    public void testPlannerPushdownMatchesLuceneCompositionForEveryFtsShape() throws Exception {
+        // Every FTS shape with a scalar filter runs twice: once as
+        // written, which the planner folds into one prefiltered Lance
+        // FTS scan, and once with the filter wrapped in constant_score,
+        // which the planner's translator refuses, so the bool stays a
+        // Lucene BooleanQuery over the unfiltered FTS scan. The helper
+        // asserts equal ids in score order, equal scores, and equal
+        // totals with and without size:0. Rows: 12 rows in three
+        // fragments of four; even rows carry body "hello lance i" and
+        // title "sunny morning i", odd rows share no tokens with them.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpMultiFragment(12, 4, "ftsplannershapes")) {
+            String indexName = fixture.indexName();
+            // range keeps rows 4..11; the even rows among them are 4, 6, 8, 10.
+            String rangeFilter = "{\"range\":{\"id\":{\"gte\":4}}}";
+            List<String> evenFrom4 = List.of("1-0", "1-2", "2-0", "2-2");
+
+            assertPushdownMatchesControl(
+                indexName,
+                "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}",
+                rangeFilter,
+                null,
+                evenFrom4
+            );
+            assertPushdownMatchesControl(
+                indexName,
+                "{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"hello lance\"}}",
+                rangeFilter,
+                null,
+                evenFrom4
+            );
+            assertPushdownMatchesControl(
+                indexName,
+                "{\"lance_multi_match\":{\"fields\":[\"body\",\"title\"],\"query\":\"hello sunny\"}}",
+                rangeFilter,
+                null,
+                evenFrom4
+            );
+            // Row 6's body carries the token "6", so the must_not drops it.
+            assertPushdownMatchesControl(
+                indexName,
+                "{\"lance_fts_bool\":{\"must\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}],"
+                    + "\"must_not\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"6\"}}]}}",
+                rangeFilter,
+                null,
+                List.of("1-0", "2-0", "2-2")
+            );
+            // The negative clause halves row 8's score; the hit set stays.
+            assertPushdownMatchesControl(
+                indexName,
+                "{\"lance_fts_boost\":{\"positive\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},"
+                    + "\"negative\":{\"lance_match\":{\"field\":\"body\",\"query\":\"8\"}},\"negative_boost\":0.5}}",
+                rangeFilter,
+                null,
+                evenFrom4
+            );
+            // A must_not scalar clause travels as part of the same prefilter.
+            assertPushdownMatchesControl(
+                indexName,
+                "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}",
+                rangeFilter,
+                "{\"term\":{\"id\":6}}",
+                List.of("1-0", "2-0", "2-2")
+            );
+        }
+    }
+
     public void testLanceMatchPhraseHonoursPhraseOrder() throws Exception {
         // The fixture's FTS index is built with positions, so phrase
         // order matters: "hello lance" hits the eight even rows and
@@ -1112,15 +1178,18 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             assertEquals(400, numeric.getResponse().getStatusLine().getStatusCode());
             assertTrue(readAll(numeric.getResponse()).contains("Can only use wildcard queries on keyword and text fields"));
 
-            // A multi-valued keyword column (list<utf8>) has no common
-            // type with the LIKE pattern; Lance refuses the scan as
-            // invalid input, which is answered as 400.
-            ResponseException list = expectThrows(
-                ResponseException.class,
-                () -> postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"wildcard\":{\"tags\":{\"value\":\"t*\"}}}}")
+            // A multi-valued keyword column (list<utf8>) has no Lance
+            // SQL form (the planner refuses a pattern on a non-Utf8
+            // column), so the wildcard runs over the column's Lucene
+            // doc values instead. Every row with a non-null tags list
+            // carries "t"-prefixed elements, so the hit set is the
+            // exists set: 600 rows minus the 100 whose tags are null.
+            String listWildcard = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"wildcard\":{\"tags\":{\"value\":\"t*\"}}}}")
             );
-            assertEquals(400, list.getResponse().getStatusLine().getStatusCode());
-            assertTrue(readAll(list.getResponse()).contains("List(Utf8)"));
+            String tagsExist = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"exists\":{\"field\":\"tags\"}}}"));
+            assertEquals(500, extractIntPath(tagsExist, "hits", "total", "value"));
+            assertEquals(extractIntPath(tagsExist, "hits", "total", "value"), extractIntPath(listWildcard, "hits", "total", "value"));
         }
     }
 

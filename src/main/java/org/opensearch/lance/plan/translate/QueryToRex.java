@@ -17,6 +17,8 @@ import org.apache.calcite.tools.RelBuilder;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.RegExp;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.time.DateFormatter;
+import org.opensearch.common.time.DateFormatters;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
@@ -40,6 +42,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.opensearch.lance.plan.translate.AggregationToRel.dateDocValueFormat;
 import static org.opensearch.lance.plan.translate.AggregationToRel.unsupported;
@@ -95,7 +98,14 @@ public final class QueryToRex {
     public static RexNode translate(QueryBuilder query, LanceSchemas.IndexModel model, RelBuilder relBuilder) {
         return predicate(
             query,
-            new Context("", model.arrowSchema(), model.multiFields(), model.renamedFields(), model.primaryKeyField()),
+            new Context(
+                "",
+                model.arrowSchema(),
+                model.multiFields(),
+                model.renamedFields(),
+                model.primaryKeyField(),
+                model.dateOverrideColumns()
+            ),
             relBuilder
         );
     }
@@ -117,7 +127,7 @@ public final class QueryToRex {
     ) {
         return predicate(
             query,
-            new Context(" in filter of aggregation [" + aggregationName + "]", schema, multiFields, renamedFields, ""),
+            new Context(" in filter of aggregation [" + aggregationName + "]", schema, multiFields, renamedFields, "", Set.of()),
             relBuilder
         );
     }
@@ -125,7 +135,7 @@ public final class QueryToRex {
     /** Where a refusal happened ({@link #where} is empty for the request's query clause) and what fields resolve against. */
     private record Context(String where, Schema schema, Map<String, LinkedHashMap<String, String>> multiFields, Map<
         String,
-        String> renamedFields, String primaryKey) {
+        String> renamedFields, String primaryKey, Set<String> dateOverrides) {
     }
 
     private static RexNode predicate(QueryBuilder query, Context context, RelBuilder relBuilder) {
@@ -287,8 +297,14 @@ public final class QueryToRex {
     // Field resolution
     // ---------------------------------------------------------------
 
-    /** A field resolved to its Lance column or struct child: the reference expression and the Arrow type behind it. */
-    private record Target(String name, RexNode ref, ArrowType type) {
+    /**
+     * A field resolved to its Lance column or struct child: the
+     * reference expression, the Arrow type behind it, and whether the
+     * attach overrode the integer column as {@code date} (its
+     * epoch-millis literals then also accept the ISO-8601 strings the
+     * override serves).
+     */
+    private record Target(String name, RexNode ref, ArrowType type, boolean dateOnInteger) {
         boolean isDate() {
             return type instanceof ArrowType.Date || type instanceof ArrowType.Timestamp;
         }
@@ -337,7 +353,8 @@ public final class QueryToRex {
         if (index >= 0) {
             ArrowType type = schema.getFields().get(index).getType();
             requireSupportedScalar(type, columnName, field, context);
-            return new Target(columnName, relBuilder.field(index), type);
+            boolean dateOnInteger = type instanceof ArrowType.Int && context.dateOverrides().contains(columnName);
+            return new Target(columnName, relBuilder.field(index), type, dateOnInteger);
         }
         if (columnName.indexOf('.') >= 0) {
             Target nested = resolveStructPath(columnName, field, context, relBuilder);
@@ -381,7 +398,7 @@ public final class QueryToRex {
             current = child;
         }
         requireSupportedScalar(current.getType(), columnName, field, context);
-        return new Target(columnName, ref, current.getType());
+        return new Target(columnName, ref, current.getType(), false);
     }
 
     private static Field childOf(Field struct, String name) {
@@ -472,7 +489,7 @@ public final class QueryToRex {
             }
             return relBuilder.call(SqlStdOperatorTable.EQUALS, relBuilder.cast(reference, SqlTypeName.DOUBLE), relBuilder.literal(number));
         }
-        Long number = integral(value);
+        Long number = integral(target, value);
         if (number == null) {
             throw badValue(value, target, context);
         }
@@ -538,14 +555,14 @@ public final class QueryToRex {
         } else {
             value = relBuilder.cast(target.ref(), SqlTypeName.BIGINT);
             if (range.from() != null) {
-                Long from = integral(range.from());
+                Long from = integral(target, range.from());
                 if (from == null) {
                     throw badValue(range.from(), target, context);
                 }
                 lowerBound = relBuilder.literal(from);
             }
             if (range.to() != null) {
-                Long to = integral(range.to());
+                Long to = integral(target, range.to());
                 if (to == null) {
                     throw badValue(range.to(), target, context);
                 }
@@ -714,6 +731,36 @@ public final class QueryToRex {
         return text.equals("false") ? false : null;
     }
 
+    /**
+     * Parses the ISO-8601 shapes a {@code date} override on an integer
+     * column accepts, so a string bound becomes the epoch millis the
+     * column stores. The same default format the {@code date} field
+     * type uses for query-time parsing; missing time components
+     * default to midnight UTC.
+     */
+    private static final DateFormatter DATE_OVERRIDE_PARSER = DateFormatter.forPattern("strict_date_optional_time");
+
+    /**
+     * The value as the integer column stores it: a whole number as is;
+     * on a {@code date} override column an ISO-8601 string parses to
+     * its epoch millis, because the override's column holds the millis
+     * as a plain integer while callers query it with date strings.
+     */
+    private static Long integral(Target target, Object value) {
+        Long number = integral(value);
+        if (number != null) {
+            return number;
+        }
+        if (target.dateOnInteger() && (value instanceof String || value instanceof BytesRef)) {
+            try {
+                return DateFormatters.from(DATE_OVERRIDE_PARSER.parse(text(value))).toInstant().toEpochMilli();
+            } catch (RuntimeException unparseable) {
+                return null;
+            }
+        }
+        return null;
+    }
+
     /** A whole number, or null: a fractional value on an integer column has rounding rules the pushdown does not replicate. */
     private static Long integral(Object value) {
         if (value instanceof Boolean) {
@@ -754,5 +801,63 @@ public final class QueryToRex {
             return null;
         }
         return target.isSingleFloat() ? (double) (float) number : number;
+    }
+
+    /**
+     * Whether any leaf of {@code query} names a field in
+     * {@code columns}, or a dotted child of one. The callers that turn
+     * a translated predicate into executable Lance SQL use this as a
+     * pre-flight for the {@code ip} and {@code geo_point} override
+     * columns: an ip column stores raw strings while the shard path
+     * compares 16 byte encoded forms, and a geo column's children are
+     * hidden by the geo_point mapping, so no predicate on them may
+     * travel to Lance SQL and the caller keeps the query on the Lucene
+     * side. Only the leaf shapes this translator supports are
+     * inspected; anything else refuses at translation anyway.
+     */
+    public static boolean referencesAny(QueryBuilder query, Set<String> columns) {
+        if (query == null || columns.isEmpty()) {
+            return false;
+        }
+        if (query instanceof BoolQueryBuilder bool) {
+            for (List<QueryBuilder> clauses : List.of(bool.must(), bool.filter(), bool.mustNot(), bool.should())) {
+                for (QueryBuilder clause : clauses) {
+                    if (referencesAny(clause, columns)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        String field = null;
+        if (query instanceof TermQueryBuilder term) {
+            field = term.fieldName();
+        } else if (query instanceof TermsQueryBuilder terms) {
+            field = terms.fieldName();
+        } else if (query instanceof RangeQueryBuilder range) {
+            field = range.fieldName();
+        } else if (query instanceof ExistsQueryBuilder exists) {
+            field = exists.fieldName();
+        } else if (query instanceof WildcardQueryBuilder wildcard) {
+            field = wildcard.fieldName();
+        } else if (query instanceof RegexpQueryBuilder regexp) {
+            field = regexp.fieldName();
+        } else if (query instanceof PrefixQueryBuilder prefix) {
+            field = prefix.fieldName();
+        }
+        if (field == null) {
+            return false;
+        }
+        if (columns.contains(field)) {
+            return true;
+        }
+        int dot = field.indexOf('.');
+        while (dot > 0) {
+            if (columns.contains(field.substring(0, dot))) {
+                return true;
+            }
+            dot = field.indexOf('.', dot + 1);
+        }
+        return false;
     }
 }
