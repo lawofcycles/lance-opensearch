@@ -347,9 +347,9 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
         LanceBuildIndexesNodesResponse nodesResponse
     ) {
         Map<String, LanceBuildIndexesResponse.NodeResult> nodes = new LinkedHashMap<>();
-        LinkedHashSet<String> ftsBuilt = new LinkedHashSet<>();
-        LinkedHashSet<String> scalarBuilt = new LinkedHashSet<>();
-        LinkedHashSet<String> vectorBuilt = new LinkedHashSet<>();
+        LinkedHashSet<LanceBuildIndexesResponse.BuiltResult> ftsBuilt = new LinkedHashSet<>();
+        LinkedHashSet<LanceBuildIndexesResponse.BuiltResult> scalarBuilt = new LinkedHashSet<>();
+        LinkedHashSet<LanceBuildIndexesResponse.BuiltResult> vectorBuilt = new LinkedHashSet<>();
         LinkedHashSet<LanceBuildIndexesResponse.ColumnResult> ftsSkipped = new LinkedHashSet<>();
         LinkedHashSet<LanceBuildIndexesResponse.ColumnResult> scalarSkipped = new LinkedHashSet<>();
         LinkedHashSet<LanceBuildIndexesResponse.ColumnResult> vectorSkipped = new LinkedHashSet<>();
@@ -418,7 +418,13 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
      * into the source) and the node-local path (each data node commits
      * into its own clone). The stored overrides steer the derivation: a
      * column the operator overrode to keyword must not become an FTS
-     * build target even though it is Utf8.
+     * build target even though it is Utf8. The index type per column
+     * comes from the request's one-shot {@code indexes} object when
+     * present, else from the persisted preference in the overrides
+     * setting; the one-shot object is validated against the derived
+     * column kinds (unknown column or wrong kind is the caller's
+     * mistake), while a persisted preference whose column changed kind
+     * simply stops applying.
      */
     static BuildOutcome runBuilders(Dataset dataset, LanceBuildIndexesRequest request, LanceOverrides overrides) throws Exception {
         RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides, true);
@@ -475,10 +481,41 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
         }
         Optional<List<Integer>> fragmentIds = Optional.ofNullable(request.fragmentIds());
         String tokenizer = request.tokenizer() != null ? request.tokenizer() : LanceIndexBuilder.DEFAULT_FTS_TOKENIZER;
+        Map<String, LanceOverrides.IndexPreference> preferences;
+        if (request.indexesJson() != null) {
+            preferences = LanceOverrides.indexPreferencesFromJson(request.indexesJson());
+            // The one-shot object names its columns explicitly, so an
+            // unknown column or the wrong kind is the caller's mistake
+            // and answers 400, mirroring the columns filter above.
+            for (Map.Entry<String, LanceOverrides.IndexPreference> entry : preferences.entrySet()) {
+                String column = entry.getKey();
+                LanceOverrides.IndexPreference preference = entry.getValue();
+                if (preference.scalar() != null && !derivation.scalarColumns().contains(column)) {
+                    throw new IllegalArgumentException(
+                        "indexes entry ["
+                            + column
+                            + "] declares a scalar type but the column is not a scalar column of the table; "
+                            + "scalar columns are "
+                            + derivation.scalarColumns()
+                    );
+                }
+                if (preference.vector() != null && !derivation.vectorColumns().contains(column)) {
+                    throw new IllegalArgumentException(
+                        "indexes entry ["
+                            + column
+                            + "] declares a vector type but the column is not a FixedSizeList<Float32> column; "
+                            + "vector columns are "
+                            + derivation.vectorColumns()
+                    );
+                }
+            }
+        } else {
+            preferences = overrides.indexPreferences();
+        }
         return new BuildOutcome(
             LanceIndexBuilder.ensureFtsIndexes(dataset, ftsTarget, Long.MAX_VALUE, fragmentIds, tokenizer, request.withPosition()),
-            LanceIndexBuilder.ensureScalarIndexes(dataset, scalarTarget, Long.MAX_VALUE, fragmentIds),
-            LanceIndexBuilder.ensureVectorIndexes(dataset, vectorTarget, Long.MAX_VALUE, fragmentIds)
+            LanceIndexBuilder.ensureScalarIndexes(dataset, scalarTarget, Long.MAX_VALUE, fragmentIds, preferences),
+            LanceIndexBuilder.ensureVectorIndexes(dataset, vectorTarget, Long.MAX_VALUE, fragmentIds, preferences)
         );
     }
 
@@ -534,6 +571,10 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
     }
 
     static LanceBuildIndexesResponse.KindResult toKindResult(LanceIndexBuilder.BuildResult result) {
+        List<LanceBuildIndexesResponse.BuiltResult> built = new ArrayList<>(result.built().size());
+        for (LanceIndexBuilder.Built b : result.built()) {
+            built.add(new LanceBuildIndexesResponse.BuiltResult(b.column(), b.type()));
+        }
         List<LanceBuildIndexesResponse.ColumnResult> skipped = new ArrayList<>(result.skipped().size());
         for (LanceIndexBuilder.Skipped s : result.skipped()) {
             skipped.add(new LanceBuildIndexesResponse.ColumnResult(s.column(), s.reason()));
@@ -542,7 +583,7 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
         for (LanceIndexBuilder.Failed f : result.failed()) {
             failed.add(new LanceBuildIndexesResponse.ColumnResult(f.column(), f.reason()));
         }
-        return new LanceBuildIndexesResponse.KindResult(result.built(), skipped, failed);
+        return new LanceBuildIndexesResponse.KindResult(built, skipped, failed);
     }
 
     private static Set<String> utf8Columns(Dataset dataset) {

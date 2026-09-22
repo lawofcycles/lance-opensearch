@@ -11,6 +11,7 @@ import java.util.Map;
 
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.index.LanceBuildIndexesAction;
 import org.opensearch.lance.index.LanceBuildIndexesRequest;
 import org.opensearch.rest.BaseRestHandler;
@@ -20,7 +21,7 @@ import org.opensearch.rest.action.RestStatusToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
- * POST /_lance/build_indexes/{index} [{"columns": [...], "fts_columns": [...], "fragment_ids": [...], "optimize": bool, "retrain": bool, "tokenizer": "...", "with_position": bool}]
+ * POST /_lance/build_indexes/{index} [{"columns": [...], "fts_columns": [...], "fragment_ids": [...], "optimize": bool, "retrain": bool, "tokenizer": "...", "with_position": bool, "indexes": {...}}]
  *
  * Manual index build endpoint. The handler parses the body and hands a
  * {@link LanceBuildIndexesRequest} to {@link LanceBuildIndexesAction};
@@ -31,7 +32,10 @@ import org.opensearch.transport.client.node.NodeClient;
  * {@code tokenizer} is forwarded to Lance as that index's
  * {@code base_tokenizer} without an allowlist, so validation of the name
  * is Lance's; {@code with_position} (default false) makes Lance store
- * token positions in that index, which {@code lance_match_phrase} needs. The response status (200 / 400 / 500) is the one the
+ * token positions in that index, which {@code lance_match_phrase} needs.
+ * {@code indexes} takes the same per-column index type preferences as
+ * the attach body's {@code indexes} clause and applies them to this
+ * build only, without touching the persisted preference. The response status (200 / 400 / 500) is the one the
  * transport action put on the response; the body always lists
  * {@code built}, {@code skipped} and {@code failed} per index kind.
  */
@@ -62,6 +66,7 @@ public class RestBuildIndexesAction extends BaseRestHandler {
         Object ftsColumnsRaw = body.get("fts_columns");
         Object tokenizerRaw = body.get("tokenizer");
         Object withPositionRaw = body.get("with_position");
+        Object indexesRaw = body.get("indexes");
 
         if (optimize && fragmentIdsRaw != null) {
             return channel -> channel.sendResponse(
@@ -94,6 +99,18 @@ public class RestBuildIndexesAction extends BaseRestHandler {
                 new BytesRestResponse(RestStatus.BAD_REQUEST, "with_position must be a boolean, saw " + withPositionRaw)
             );
         }
+        // The one-shot `indexes` object goes through the same structural
+        // validation as the attach clause; the transport action validates
+        // the named columns against the table's schema.
+        String indexesJson = null;
+        if (indexesRaw != null) {
+            try {
+                indexesJson = LanceOverrides.indexPreferencesToJson(LanceOverrides.parseIndexesClause(indexesRaw));
+            } catch (IllegalArgumentException e) {
+                String message = e.getMessage();
+                return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
+            }
+        }
 
         List<Integer> fragmentIds = null;
         if (fragmentIdsRaw != null) {
@@ -112,7 +129,8 @@ public class RestBuildIndexesAction extends BaseRestHandler {
             optimize,
             retrain,
             (String) tokenizerRaw,
-            Boolean.TRUE.equals(withPositionRaw)
+            Boolean.TRUE.equals(withPositionRaw),
+            indexesJson
         );
         return channel -> client.execute(LanceBuildIndexesAction.INSTANCE, build, new RestStatusToXContentListener<>(channel));
     }

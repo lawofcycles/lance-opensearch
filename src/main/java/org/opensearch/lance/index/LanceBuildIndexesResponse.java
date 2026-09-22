@@ -31,7 +31,7 @@ import org.opensearch.core.xcontent.XContentBuilder;
  * <pre>
  * {
  *   "index": "demo",
- *   "built":   {"fts": ["body"], "scalar": ["id"], "vector": []},
+ *   "built":   {"fts": [{"column": "body", "type": "INVERTED"}], "scalar": [{"column": "id", "type": "BTREE"}], "vector": []},
  *   "skipped": {"fts": [], "scalar": [{"column": "category", "reason": "..."}], "vector": []},
  *   "failed":  {"fts": [], "scalar": [], "vector": [{"column": "embedding", "reason": "..."}]}
  * }
@@ -104,36 +104,92 @@ public final class LanceBuildIndexesResponse extends ActionResponse implements S
         }
     }
 
+    /** One built Lance index: the column (or optimized index name) and the index type. */
+    public static final class BuiltResult implements Writeable, ToXContentObject {
+        private final String column;
+        private final String type;
+
+        public BuiltResult(String column, String type) {
+            this.column = Objects.requireNonNull(column, "column");
+            this.type = Objects.requireNonNull(type, "type");
+        }
+
+        public BuiltResult(StreamInput in) throws IOException {
+            this.column = in.readString();
+            this.type = in.readString();
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeString(column);
+            out.writeString(type);
+        }
+
+        public String column() {
+            return column;
+        }
+
+        public String type() {
+            return type;
+        }
+
+        @Override
+        public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+            return builder.startObject().field("column", column).field("type", type).endObject();
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (!(o instanceof BuiltResult other)) {
+                return false;
+            }
+            return column.equals(other.column) && type.equals(other.type);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(column, type);
+        }
+
+        @Override
+        public String toString() {
+            return column + ": " + type;
+        }
+    }
+
     /**
-     * The three per-kind lists one build pass produces: names that
-     * received a commit, columns left alone with a reason, columns whose
-     * build threw with Lance's message.
+     * The three per-kind lists one build pass produces: indexes that
+     * received a commit with the type that was built, columns left alone
+     * with a reason, columns whose build threw with Lance's message.
      */
     public static final class KindResult implements Writeable {
-        private final List<String> built;
+        private final List<BuiltResult> built;
         private final List<ColumnResult> skipped;
         private final List<ColumnResult> failed;
 
-        public KindResult(List<String> built, List<ColumnResult> skipped, List<ColumnResult> failed) {
+        public KindResult(List<BuiltResult> built, List<ColumnResult> skipped, List<ColumnResult> failed) {
             this.built = List.copyOf(built);
             this.skipped = List.copyOf(skipped);
             this.failed = List.copyOf(failed);
         }
 
         public KindResult(StreamInput in) throws IOException {
-            this.built = List.copyOf(in.readStringList());
+            this.built = List.copyOf(in.readList(BuiltResult::new));
             this.skipped = List.copyOf(in.readList(ColumnResult::new));
             this.failed = List.copyOf(in.readList(ColumnResult::new));
         }
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
-            out.writeStringCollection(built);
+            out.writeList(built);
             out.writeList(skipped);
             out.writeList(failed);
         }
 
-        public List<String> built() {
+        public List<BuiltResult> built() {
             return built;
         }
 
@@ -317,15 +373,15 @@ public final class LanceBuildIndexesResponse extends ActionResponse implements S
         return vector;
     }
 
-    public List<String> ftsBuilt() {
+    public List<BuiltResult> ftsBuilt() {
         return fts.built();
     }
 
-    public List<String> scalarBuilt() {
+    public List<BuiltResult> scalarBuilt() {
         return scalar.built();
     }
 
-    public List<String> vectorBuilt() {
+    public List<BuiltResult> vectorBuilt() {
         return vector.built();
     }
 
@@ -359,9 +415,9 @@ public final class LanceBuildIndexesResponse extends ActionResponse implements S
         b.startObject();
         b.field("index", index);
         b.startObject("built");
-        b.field("fts", fts.built());
-        b.field("scalar", scalar.built());
-        b.field("vector", vector.built());
+        builtResults(b, "fts", fts.built(), params);
+        builtResults(b, "scalar", scalar.built(), params);
+        builtResults(b, "vector", vector.built(), params);
         b.endObject();
         b.startObject("skipped");
         columnResults(b, "fts", fts.skipped(), params);
@@ -382,9 +438,9 @@ public final class LanceBuildIndexesResponse extends ActionResponse implements S
                     b.field("error", node.error());
                 } else {
                     b.startObject("built");
-                    b.field("fts", node.fts().built());
-                    b.field("scalar", node.scalar().built());
-                    b.field("vector", node.vector().built());
+                    builtResults(b, "fts", node.fts().built(), params);
+                    builtResults(b, "scalar", node.scalar().built(), params);
+                    builtResults(b, "vector", node.vector().built(), params);
                     b.endObject();
                     b.startObject("skipped");
                     columnResults(b, "fts", node.fts().skipped(), params);
@@ -408,6 +464,14 @@ public final class LanceBuildIndexesResponse extends ActionResponse implements S
             b.field("fragment_ids", fragmentIds);
         }
         return b.endObject();
+    }
+
+    private static void builtResults(XContentBuilder b, String name, List<BuiltResult> results, Params params) throws IOException {
+        b.startArray(name);
+        for (BuiltResult result : results) {
+            result.toXContent(b, params);
+        }
+        b.endArray();
     }
 
     private static void columnResults(XContentBuilder b, String name, List<ColumnResult> results, Params params) throws IOException {

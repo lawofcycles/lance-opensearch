@@ -32,6 +32,7 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
     private final boolean retrain;
     private final String tokenizer;
     private final boolean withPosition;
+    private final String indexesJson;
 
     /**
      * @param index       OpenSearch index whose Lance table gets the indexes.
@@ -61,6 +62,13 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
      *                    default, and this one, is {@code false}. Requires
      *                    {@code ftsColumns} for the same reason as
      *                    {@code tokenizer}.
+     * @param indexesJson canonical JSON of the body's {@code indexes}
+     *                    object (per-column index type preferences applied
+     *                    to this build only, overriding the persisted
+     *                    preference without changing it), or {@code null}
+     *                    when the persisted preference applies. Not
+     *                    accepted together with {@code optimize}, which
+     *                    creates no index.
      */
     public LanceBuildIndexesRequest(
         String index,
@@ -70,7 +78,8 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
         boolean optimize,
         boolean retrain,
         String tokenizer,
-        boolean withPosition
+        boolean withPosition,
+        String indexesJson
     ) {
         this.index = index;
         this.columns = columns == null ? null : List.copyOf(columns);
@@ -80,6 +89,7 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
         this.retrain = retrain;
         this.tokenizer = tokenizer;
         this.withPosition = withPosition;
+        this.indexesJson = indexesJson;
     }
 
     public LanceBuildIndexesRequest(StreamInput in) throws IOException {
@@ -92,6 +102,7 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
         this.ftsColumns = in.readOptionalStringList();
         this.tokenizer = in.readOptionalString();
         this.withPosition = in.readBoolean();
+        this.indexesJson = in.readOptionalString();
     }
 
     @Override
@@ -110,6 +121,7 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
         out.writeOptionalStringCollection(ftsColumns);
         out.writeOptionalString(tokenizer);
         out.writeBoolean(withPosition);
+        out.writeOptionalString(indexesJson);
     }
 
     @Override
@@ -149,6 +161,9 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
                 "with_position applies to the FTS indexes this request creates; name them in fts_columns "
                     + "(an existing FTS index keeps the position setting it was built with)"
             );
+        }
+        if (indexesJson != null && optimize) {
+            ex = add(ex, "indexes is only valid with optimize=false (optimize extends existing indexes and creates none)");
         }
         return ex;
     }
@@ -215,5 +230,14 @@ public final class LanceBuildIndexesRequest extends ActionRequest implements Ind
      */
     public boolean withPosition() {
         return withPosition;
+    }
+
+    /**
+     * Canonical JSON of the body's {@code indexes} object, a one-shot
+     * per-column index type preference for this build only, or
+     * {@code null} when the persisted preference applies.
+     */
+    public String indexesJson() {
+        return indexesJson;
     }
 }
