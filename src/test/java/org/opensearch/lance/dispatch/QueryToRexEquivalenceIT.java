@@ -36,7 +36,7 @@ import org.opensearch.lance.attach.LanceAttachRequest;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
-import org.opensearch.lance.plan.substrait.RexToLanceSql;
+import org.opensearch.lance.plan.lancesql.RexToLanceSql;
 import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.plugins.Plugin;
