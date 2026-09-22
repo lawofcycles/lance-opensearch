@@ -8,6 +8,7 @@ package org.opensearch.lance;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -304,6 +305,39 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         assertTrue("expected the accepted values in the message: " + body, body.contains("directory"));
         assertTrue("expected the accepted values in the message: " + body, body.contains("rest"));
         assertTrue("expected the accepted values in the message: " + body, body.contains("glue"));
+        assertTrue("expected the accepted values in the message: " + body, body.contains("iceberg"));
+        assertTrue("expected the accepted values in the message: " + body, body.contains("polaris"));
+        assertTrue("expected the accepted values in the message: " + body, body.contains("unity"));
+    }
+
+    public void testRegisterCatalogTypesRequireTheirConfigKeys() throws IOException {
+        // iceberg and polaris need an endpoint and a warehouse; unity
+        // needs an endpoint and a catalog. Each miss answers 400 naming
+        // the key before anything reaches the cluster manager.
+        for (String type : List.of("iceberg", "polaris")) {
+            ResponseException noEndpoint = expectThrows(
+                ResponseException.class,
+                () -> postJson("/_lance/namespace", "{\"type\":\"" + type + "\",\"name\":\"c\",\"config\":{\"warehouse\":\"wh\"}}")
+            );
+            assertEquals(400, noEndpoint.getResponse().getStatusLine().getStatusCode());
+            assertTrue(readAll(noEndpoint.getResponse()).contains("[config.endpoint]"));
+
+            ResponseException noWarehouse = expectThrows(
+                ResponseException.class,
+                () -> postJson(
+                    "/_lance/namespace",
+                    "{\"type\":\"" + type + "\",\"name\":\"c\",\"config\":{\"endpoint\":\"http://127.0.0.1:1\"}}"
+                )
+            );
+            assertEquals(400, noWarehouse.getResponse().getStatusLine().getStatusCode());
+            assertTrue(readAll(noWarehouse.getResponse()).contains("[config.warehouse]"));
+        }
+        ResponseException noCatalog = expectThrows(
+            ResponseException.class,
+            () -> postJson("/_lance/namespace", "{\"type\":\"unity\",\"name\":\"c\",\"config\":{\"endpoint\":\"http://127.0.0.1:1\"}}")
+        );
+        assertEquals(400, noCatalog.getResponse().getStatusLine().getStatusCode());
+        assertTrue(readAll(noCatalog.getResponse()).contains("[config.catalog]"));
     }
 
     public void testRegisterRestNamespaceRequiresNameAndUri() throws IOException {
