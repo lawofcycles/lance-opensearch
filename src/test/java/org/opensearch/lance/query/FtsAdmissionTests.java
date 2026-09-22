@@ -127,12 +127,17 @@ public class FtsAdmissionTests extends OpenSearchTestCase {
     public void testFtsClauseNestedInABoolIsGated() {
         // A nested clause keeps the unbounded sentinel whatever the
         // request's size, including under must_not, which the default
-        // QueryVisitor would skip.
-        BooleanClause.Occur occur = randomFrom(BooleanClause.Occur.MUST, BooleanClause.Occur.SHOULD, BooleanClause.Occur.MUST_NOT);
-        BooleanQuery bool = new BooleanQuery.Builder().add(MatchAllDocsQuery.INSTANCE, BooleanClause.Occur.MUST)
-            .add(new LanceFtsQuery("body", "hello"), occur)
-            .build();
-        assertTrue(occur.toString(), FtsAdmission.runsUnboundedFtsScan(bool, false));
+        // QueryVisitor would skip. Every occur is asserted so a
+        // regression in one branch cannot hide behind the others.
+        for (BooleanClause.Occur occur : new BooleanClause.Occur[] {
+            BooleanClause.Occur.MUST,
+            BooleanClause.Occur.SHOULD,
+            BooleanClause.Occur.MUST_NOT }) {
+            BooleanQuery bool = new BooleanQuery.Builder().add(MatchAllDocsQuery.INSTANCE, BooleanClause.Occur.MUST)
+                .add(new LanceFtsQuery("body", "hello"), occur)
+                .build();
+            assertTrue(occur.toString(), FtsAdmission.runsUnboundedFtsScan(bool, false));
+        }
     }
 
     public void testBoostWrappedBoundedFtsQueryIsNotGated() {
