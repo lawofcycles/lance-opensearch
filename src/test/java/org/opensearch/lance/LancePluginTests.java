@@ -72,9 +72,27 @@ public class LancePluginTests extends OpenSearchTestCase {
         assertTrue(settingKeys.contains(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING));
         assertTrue(settingKeys.contains(LanceEngineFactory.MULTI_FIELDS_SETTING));
         assertTrue(settingKeys.contains("index.lance.uncovered_fragment_policy"));
+        assertTrue(settingKeys.contains(LanceEngineFactory.INDEX_PLACEMENT_SETTING));
         assertTrue(settingKeys.contains(LanceEngineFactory.TAG_SETTING));
         assertTrue(settingKeys.contains("lance.namespace.poll_cadence"));
         assertTrue(settingKeys.contains("lance.builder.max_rows"));
+    }
+
+    public void testIndexPlacementSettingAcceptsOnlyKnownValues() {
+        assertEquals("in_table", LancePlugin.INDEX_PLACEMENT_SETTING.getDefault(org.opensearch.common.settings.Settings.EMPTY));
+        assertEquals(
+            "node_local",
+            LancePlugin.INDEX_PLACEMENT_SETTING.get(
+                org.opensearch.common.settings.Settings.builder().put(LanceEngineFactory.INDEX_PLACEMENT_SETTING, "node_local").build()
+            )
+        );
+        IllegalArgumentException rejected = expectThrows(
+            IllegalArgumentException.class,
+            () -> LancePlugin.INDEX_PLACEMENT_SETTING.get(
+                org.opensearch.common.settings.Settings.builder().put(LanceEngineFactory.INDEX_PLACEMENT_SETTING, "sideways").build()
+            )
+        );
+        assertTrue(rejected.getMessage(), rejected.getMessage().contains("in_table"));
     }
 
     public void testNamespacePollCadenceHasSaneDefaults() {

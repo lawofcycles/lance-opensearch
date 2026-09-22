@@ -200,6 +200,80 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testNodeLocalPlacementBuildsAndCleansUpOnEveryNode() throws Exception {
+        // node_local placement: the build fans out to all three data
+        // nodes, each answers under its node id, every node can serve the
+        // FTS query, and deleting the index removes the clone directory
+        // on every node (observed through GET /_lance/stats).
+        String suffix = "mn-placement-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String indexName = "demo-" + suffix;
+        String tableUri = LanceTableFactory.writeKeywordOnlyTable(scratchDir, indexName, 6);
+        try {
+            Response attach = postJson(
+                "/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"name\":\"" + indexName + "\",\"index_placement\":\"node_local\"}"
+            );
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
+            assertTrue("merged fts built list must carry label: " + build, build.contains("\"fts\":[\"label\"]"));
+            int nodesStart = build.indexOf("\"nodes\":{");
+            assertTrue("per-node nodes block expected: " + build, nodesStart >= 0);
+            int nodeEntries = countOccurrences(build.substring(nodesStart), "\"built\":{\"fts\":[\"label\"]");
+            assertEquals("every data node must report its own build: " + build, 3, nodeEntries);
+
+            assertBusy(() -> {
+                String mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+                assertTrue("label must map to lance_text after the build: " + mapping, mapping.contains("\"type\":\"lance_text\""));
+            });
+            ensureGreen(indexName);
+
+            for (HttpHost host : getClusterHosts()) {
+                try (var pinned = buildClient(restClientSettings(), new HttpHost[] { host })) {
+                    Request search = new Request("POST", "/" + indexName + "/_search");
+                    search.setJsonEntity("{\"query\":{\"lance_match\":{\"field\":\"label\",\"query\":\"3\"}}}");
+                    assertBusy(() -> {
+                        String hits = readAll(pinned.performRequest(search));
+                        assertEquals("lance_match through " + host + ": " + hits, 1, extractIntPath(hits, "hits", "total", "value"));
+                    });
+                }
+            }
+
+            String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+            assertEquals(
+                "every data node must report the clone under local_clones: " + stats,
+                3,
+                countOccurrences(stats, "\"" + indexName + "\":{\"local_clone_bytes\"")
+            );
+
+            client().performRequest(new Request("DELETE", "/" + indexName));
+            assertBusy(() -> {
+                String after = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+                assertEquals(
+                    "the clone directories must be gone on every node: " + after,
+                    0,
+                    countOccurrences(after, "\"" + indexName + "\":{\"local_clone_bytes\"")
+                );
+            });
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+            LanceRestTestCase.deleteRecursively(scratchDir);
+        }
+    }
+
+    private static int countOccurrences(String haystack, String needle) {
+        int count = 0;
+        int index = 0;
+        while ((index = haystack.indexOf(needle, index)) >= 0) {
+            count++;
+            index += needle.length();
+        }
+        return count;
+    }
+
     public void testFtsAcrossFragmentsOnThreeNodeCluster() throws Exception {
         // 12 rows written 4 per file give fragments 0, 1 and 2. The
         // coordinator sends one fragment to each of the three data

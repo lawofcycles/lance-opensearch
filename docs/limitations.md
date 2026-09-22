@@ -114,6 +114,12 @@ The coordinator orders hits with equal scores or equal sort values by their Lanc
 - The engine is read-only. `_flush`, `_forcemerge`, `_settings` writes, `_close`, and `_open` on a Lance-backed index are either no-ops or unsupported; mutation happens on the Lance side.
 - Automatic index builds happen only for tables at or under `lance.builder.max_rows` (default 1,000,000). Larger tables need `POST /_lance/build_indexes/{index}` explicitly, or a Lance-side build (Python `dataset.create_index`, Ray, Spark, Java SDK). Indexes built by the plugin still block subsequent `alter_columns` on the indexed column, so drop the index before altering the type.
 - If an OpenSearch index already exists under the same name as a surfaced Lance table, the plugin logs one warning and leaves the table alone on every subsequent poll. Rename, delete, or attach explicitly to resolve.
+- `index.lance.index_placement: node_local` (per-node shallow clones, see [features.md](features.md#attach-and-namespace-surface)) has these edges:
+  - The setting is only writable through `POST /_lance/attach`; the namespace registration (`POST /_lance/namespace`) does not take it yet, so namespace-surfaced tables always use `in_table`.
+  - There is no cross-node build coordination. A data node that joins after the build (or whose clone was re-created by a source version advance) answers FTS queries with the same 400 a column without an inverted index gets, until the next `POST /_lance/build_indexes` run.
+  - A source version advance re-creates the clone; indexes that only existed in the previous clone are gone until rebuilt. In-flight readers on the previous clone directory can fail if they load a column after the directory was dropped; the window is one refresh.
+  - The coordinator resolves fragment lists and counts against the source. Between a source advance and the per-node re-clone, counts from the source and hits from the clones can briefly disagree, the same class of staleness the refresh window already has.
+  - Object-store sources for `node_local` are not exercised yet; only local filesystem sources are covered by tests.
 
 ## Stats and monitoring APIs
 
