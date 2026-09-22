@@ -35,7 +35,7 @@ import org.opensearch.search.aggregations.metrics.InternalCardinality;
  *
  * <p>The handles are resolved once at class load through
  * {@code getDeclaredConstructor} and {@code setAccessible}, the same
- * way {@link TransportLanceFragmentQueryAction} reaches
+ * way {@code TransportLanceFragmentQueryAction} reaches
  * {@code IndexService#getReaderWrapper()}; the plugin's security policy
  * already grants {@code ReflectPermission "suppressAccessChecks"}. A
  * missing constructor means the plugin was built against an OpenSearch
