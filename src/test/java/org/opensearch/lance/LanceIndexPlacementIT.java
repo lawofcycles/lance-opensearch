@@ -17,6 +17,7 @@ import java.util.stream.Stream;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
+import org.opensearch.common.io.PathUtils;
 
 /**
  * {@code index.lance.index_placement = node_local}: attach a table whose
@@ -189,7 +190,7 @@ public class LanceIndexPlacementIT extends LanceRestTestCase {
     private static void makeReadOnly(Path dir) throws IOException {
         assumeTrue(
             "POSIX permissions are required to make the source read-only",
-            Files.getFileStore(dir).supportsFileAttributeView("posix")
+            PathUtils.getDefaultFileSystem().supportedFileAttributeViews().contains("posix")
         );
         Set<PosixFilePermission> dirPerms = PosixFilePermissions.fromString("r-xr-xr-x");
         Set<PosixFilePermission> filePerms = PosixFilePermissions.fromString("r--r--r--");
