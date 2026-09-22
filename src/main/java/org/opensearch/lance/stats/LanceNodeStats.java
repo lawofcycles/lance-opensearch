@@ -8,6 +8,7 @@ package org.opensearch.lance.stats;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 import org.opensearch.core.common.io.stream.StreamInput;
@@ -93,15 +94,24 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * live rows of the table version it was opened over, the live rows
      * it holds, the hidden nested child docs its leaves carry beyond
      * those rows (0 unless the table has {@code List<Struct>} columns),
-     * and whether the rows differ because the table is above the Lucene
-     * document bound. {@code _stats} counts the reader's docs.
+     * whether the rows differ because the table is above the Lucene
+     * document bound, and the Lance index types present per column
+     * (from one {@code describeIndices} on the reader's dataset; empty
+     * when the read failed). {@code _stats} counts the reader's docs.
      */
-    public record IndexReaderStats(String index, long rows, long shardReaderRows, long nestedDocs, boolean luceneBoundExceeded)
-        implements
-            Writeable {
+    public record IndexReaderStats(String index, long rows, long shardReaderRows, long nestedDocs, boolean luceneBoundExceeded, Map<
+        String,
+        List<String>> indexTypes) implements Writeable {
 
         public IndexReaderStats(StreamInput in) throws IOException {
-            this(in.readString(), in.readVLong(), in.readVLong(), in.readVLong(), in.readBoolean());
+            this(
+                in.readString(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readBoolean(),
+                in.readMap(StreamInput::readString, StreamInput::readStringList)
+            );
         }
 
         @Override
@@ -111,6 +121,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             out.writeVLong(shardReaderRows);
             out.writeVLong(nestedDocs);
             out.writeBoolean(luceneBoundExceeded);
+            out.writeMap(indexTypes, StreamOutput::writeString, StreamOutput::writeStringCollection);
         }
     }
 
@@ -353,6 +364,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             builder.field("shard_reader_rows", index.shardReaderRows());
             builder.field("nested_docs", index.nestedDocs());
             builder.field("lucene_bound_exceeded", index.luceneBoundExceeded());
+            builder.startObject("index_types");
+            for (Map.Entry<String, List<String>> column : index.indexTypes().entrySet()) {
+                builder.field(column.getKey(), column.getValue());
+            }
+            builder.endObject();
             builder.endObject();
         }
         builder.endObject();
