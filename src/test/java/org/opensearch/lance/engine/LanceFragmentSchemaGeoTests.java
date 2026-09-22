@@ -40,9 +40,7 @@ import org.opensearch.test.OpenSearchTestCase;
 public class LanceFragmentSchemaGeoTests extends OpenSearchTestCase {
 
     private static LanceOverrides geoOverride(String order) {
-        Map<String, Object> spec = order == null
-            ? Map.of("type", "geo_point")
-            : Map.of("type", "geo_point", "order", order);
+        Map<String, Object> spec = order == null ? Map.of("type", "geo_point") : Map.of("type", "geo_point", "order", order);
         return LanceOverrides.parseAttachClauses(Map.of("location", spec), null);
     }
 

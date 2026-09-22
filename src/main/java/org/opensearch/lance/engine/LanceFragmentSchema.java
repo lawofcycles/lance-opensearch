@@ -58,7 +58,8 @@ public final class LanceFragmentSchema {
         TEXT_KEYWORD,  // Utf8 without an FTS index — SortedSetDocValues via ords
         KEYWORD_ARRAY, // List<Utf8> — multi-valued SortedSetDocValues
         BINARY,        // Binary / LargeBinary — FieldInfo only, values fetched for _source
-        GEO_POINT      // geo_point override on Struct<Float64,Float64> or FixedSizeList<Float64>[2] — SortedNumericDocValues of encoded lat|lon longs
+        GEO_POINT      // geo_point override on Struct<Float64,Float64> or FixedSizeList<Float64>[2] — SortedNumericDocValues of encoded
+                       // lat|lon longs
     }
 
     /**

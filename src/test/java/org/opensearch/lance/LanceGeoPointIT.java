@@ -60,9 +60,7 @@ public class LanceGeoPointIT extends LanceRestTestCase {
 
             // _source renders the point as a {lat, lon} object with the
             // original double values.
-            String pinned = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"term\":{\"id\":0}}}")
-            );
+            String pinned = readAll(postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"term\":{\"id\":0}}}"));
             assertEquals(35.6812, extractDoublePath(pinned, "hits", "hits", "0", "_source", "location", "lat"), 0.0);
             assertEquals(139.7671, extractDoublePath(pinned, "hits", "hits", "0", "_source", "location", "lon"), 0.0);
 
@@ -160,7 +158,9 @@ public class LanceGeoPointIT extends LanceRestTestCase {
             postJson(
                 "/" + indexName + "/_search",
                 "{\"size\":7,\"query\":{\"exists\":{\"field\":\"location\"}},"
-                    + "\"sort\":[{\"_geo_distance\":{\"location\":" + TOKYO + ",\"order\":\"asc\",\"unit\":\"m\"}}]}"
+                    + "\"sort\":[{\"_geo_distance\":{\"location\":"
+                    + TOKYO
+                    + ",\"order\":\"asc\",\"unit\":\"m\"}}]}"
             )
         );
         assertEquals(7, extractIntPath(sorted, "hits", "total", "value"));
@@ -173,10 +173,7 @@ public class LanceGeoPointIT extends LanceRestTestCase {
             );
         }
         assertTrue("row 0 sorts at (near) zero distance: " + sorted, extractDoublePath(sorted, "hits", "hits", "0", "sort", "0") < 1.0);
-        assertTrue(
-            "row 5 sorts hundreds of km out: " + sorted,
-            extractDoublePath(sorted, "hits", "hits", "6", "sort", "0") > 100_000.0
-        );
+        assertTrue("row 5 sorts hundreds of km out: " + sorted, extractDoublePath(sorted, "hits", "hits", "6", "sort", "0") > 100_000.0);
 
         // exists: 7 of 8 rows carry a location.
         String exists = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"exists\":{\"field\":\"location\"}}}"));
@@ -205,7 +202,9 @@ public class LanceGeoPointIT extends LanceRestTestCase {
         String rings = readAll(
             postJson(
                 "/" + indexName + "/_search",
-                "{\"size\":0,\"aggs\":{\"rings\":{\"geo_distance\":{\"field\":\"location\",\"origin\":" + TOKYO + ","
+                "{\"size\":0,\"aggs\":{\"rings\":{\"geo_distance\":{\"field\":\"location\",\"origin\":"
+                    + TOKYO
+                    + ","
                     + "\"unit\":\"km\",\"ranges\":[{\"to\":10},{\"from\":10,\"to\":50},{\"from\":50}]}}}}"
             )
         );
