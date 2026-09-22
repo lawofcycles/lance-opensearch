@@ -13,14 +13,21 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.rel.RelNode;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.json.JsonXContent;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
+import org.opensearch.search.SearchModule;
 import org.opensearch.search.aggregations.AggregationBuilders;
+import org.opensearch.search.aggregations.AggregationInitializationException;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.sort.SortOrder;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -199,5 +206,22 @@ public class SearchRequestToRelTests extends OpenSearchTestCase {
     public void testMetricWithoutFieldThrows() {
         SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.sum("s"));
         assertEquals("aggregation [s] without a field", messageOf(source));
+    }
+
+    public void testMetricWithSubAggregationFailsAtParseTime() throws IOException {
+        // The five supported metric builders are
+        // ValuesSourceAggregationBuilder.LeafOnly, whose subAggregations
+        // override rejects a nested aggs clause while the body is
+        // parsed, so a translated source can never carry one and the
+        // translator needs no check of its own.
+        String body = "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"},\"aggs\":{\"t\":{\"terms\":{\"field\":\"body\"}}}}}}";
+        NamedXContentRegistry registry = new NamedXContentRegistry(new SearchModule(Settings.EMPTY, List.of()).getNamedXContents());
+        try (XContentParser parser = JsonXContent.jsonXContent.createParser(registry, null, body)) {
+            AggregationInitializationException e = expectThrows(
+                AggregationInitializationException.class,
+                () -> SearchSourceBuilder.fromXContent(parser)
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("cannot accept sub-aggregations"));
+        }
     }
 }
