@@ -250,6 +250,179 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
         }
     }
 
+    /** Register a stub-backed entry and return the tables the preview lists. */
+    private Set<String> listThroughRegisteredStub(RecordingLanceNamespace recording, String type, Map<String, String> config)
+        throws Exception {
+        LanceNamespaceFactory.setInstantiatorForTests(seen -> recording);
+        LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
+            new LanceNamespaceMetadata.Entry("walk-cat", type, null, StorageOptions.empty(), config)
+        );
+        ClusterState state = ClusterState.builder(clusterService.state())
+            .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
+            .build();
+        ClusterServiceUtils.setState(clusterService, state);
+        Optional<Set<String>> tables = service.listTables("walk-cat");
+        assertTrue(tables.isPresent());
+        return tables.get();
+    }
+
+    public void testWalkReachesTablesOfTwoLevelTreeWithoutWarehouse() throws Exception {
+        // Unity's shape: the root listing is rejected, the first level
+        // (the catalog) holds no tables and answers bare child names,
+        // the second level (the schema) holds the tables. The default
+        // max_namespace_depth of 2 reaches them.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.namespaceTree = Map.of("", Set.of("main"), "main", Set.of("default"));
+        recording.tableTree = Map.of("main.default", Set.of("events"));
+        try {
+            assertEquals(Set.of("events"), listThroughRegisteredStub(recording, LanceNamespaceMetadata.Entry.TYPE_UNITY, Map.of()));
+            // The walk asked exactly the tree's levels, nothing deeper.
+            assertTrue(recording.listNamespacesIds.contains(List.of()));
+            assertTrue(recording.listNamespacesIds.contains(List.of("main")));
+            assertFalse(recording.listNamespacesIds.contains(List.of("main", "default")));
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+    }
+
+    public void testWalkStartsFromTheWarehouseConfigAndFollowsDotJoinedChildren() throws Exception {
+        // Iceberg / Polaris shape: every id is rooted at the warehouse
+        // named in config, and listNamespaces answers dot-joined full
+        // paths (wh.ns1) that the walk must split back into id levels.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.namespaceTree = Map.of("wh", Set.of("wh.ns1"));
+        recording.tableTree = Map.of("wh.ns1", Set.of("logs"));
+        try {
+            assertEquals(
+                Set.of("logs"),
+                listThroughRegisteredStub(
+                    recording,
+                    LanceNamespaceMetadata.Entry.TYPE_ICEBERG,
+                    Map.of("endpoint", "http://catalog.example:8181", "warehouse", "wh")
+                )
+            );
+            // The seed came from the warehouse config, not the root.
+            assertEquals(List.of("wh"), recording.listNamespacesIds.get(0));
+            assertTrue(recording.listTablesIds.contains(List.of("wh", "ns1")));
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+    }
+
+    public void testWalkDepthIsBoundedByMaxNamespaceDepthConfig() throws Exception {
+        // A third level exists but the default depth of 2 must not
+        // reach it; raising max_namespace_depth to 3 must.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.namespaceTree = Map.of("", Set.of("a"), "a", Set.of("a.b"), "a.b", Set.of("a.b.c"));
+        recording.tableTree = Map.of("a.b.c", Set.of("deep"));
+        try {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> listThroughRegisteredStub(recording, LanceNamespaceMetadata.Entry.TYPE_REST, Map.of("uri", "http://c.example"))
+            );
+            // Every reached namespace refused its table listing and no
+            // table surfaced, so the failure is reported instead of an
+            // empty result that would mask a misconfiguration.
+            assertTrue(e.getMessage(), e.getMessage().contains("no tables"));
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+        RecordingLanceNamespace deeper = new RecordingLanceNamespace();
+        deeper.namespaceTree = Map.of("", Set.of("a"), "a", Set.of("a.b"), "a.b", Set.of("a.b.c"));
+        deeper.tableTree = Map.of("a.b.c", Set.of("deep"));
+        try {
+            assertEquals(
+                Set.of("deep"),
+                listThroughRegisteredStub(
+                    deeper,
+                    LanceNamespaceMetadata.Entry.TYPE_REST,
+                    Map.of("uri", "http://c.example", "max_namespace_depth", "3")
+                )
+            );
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+    }
+
+    public void testWalkCollectsTablesFromEveryNamespaceThatAnswers() throws Exception {
+        // Tables can live at more than one level (Iceberg allows both);
+        // the walk collects them all instead of stopping at the first
+        // namespace that answers.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.namespaceTree = Map.of("wh", Set.of("wh.ns1", "wh.ns2"), "wh.ns1", Set.of("wh.ns1.sub"));
+        recording.tableTree = Map.of("wh.ns1", Set.of("top"), "wh.ns1.sub", Set.of("nested"), "wh.ns2", Set.of("side"));
+        try {
+            assertEquals(
+                Set.of("top", "nested", "side"),
+                listThroughRegisteredStub(
+                    recording,
+                    LanceNamespaceMetadata.Entry.TYPE_ICEBERG,
+                    Map.of("endpoint", "http://catalog.example:8181", "warehouse", "wh")
+                )
+            );
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+    }
+
+    public void testInvalidMaxNamespaceDepthSurfacesAsListingFailure() throws Exception {
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.namespaceTree = Map.of("", Set.of("main"));
+        recording.tableTree = Map.of();
+        try {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> listThroughRegisteredStub(recording, LanceNamespaceMetadata.Entry.TYPE_UNITY, Map.of("max_namespace_depth", "zero"))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("max_namespace_depth"));
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+    }
+
+    public void testCatalogTypesReportUnavailableOnInitializeFailure() throws Exception {
+        // The unavailable status and the retry loop for each of the
+        // three catalog types added after glue, and the redaction of
+        // their credential keys in the listing.
+        Map<String, Map<String, String>> configByType = Map.of(
+            LanceNamespaceMetadata.Entry.TYPE_ICEBERG,
+            Map.of("endpoint", "http://catalog.example:8181", "warehouse", "wh", "credential", "id:sekrit"),
+            LanceNamespaceMetadata.Entry.TYPE_POLARIS,
+            Map.of("endpoint", "http://polaris.example:8181", "warehouse", "cat", "auth_token", "sekrit"),
+            LanceNamespaceMetadata.Entry.TYPE_UNITY,
+            Map.of("endpoint", "http://unity.example:8080", "catalog", "main", "auth_token", "sekrit")
+        );
+        int slot = 0;
+        for (Map.Entry<String, Map<String, String>> typeAndConfig : configByType.entrySet()) {
+            String type = typeAndConfig.getKey();
+            RecordingLanceNamespace recording = new RecordingLanceNamespace();
+            recording.initializeFailure = new IllegalStateException("401 from " + type);
+            LanceNamespaceFactory.setInstantiatorForTests(seen -> recording);
+            try {
+                LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
+                    new LanceNamespaceMetadata.Entry(type + "-cat", type, null, StorageOptions.empty(), typeAndConfig.getValue())
+                );
+                ClusterState state = ClusterState.builder(clusterService.state())
+                    .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
+                    .version(clusterService.state().version() + ++slot)
+                    .build();
+                ClusterServiceUtils.setState(clusterService, state);
+                List<LanceNamespaceListResponse.NamespaceInfo> infos = service.namespaceInfos();
+                assertEquals(1, infos.size());
+                assertEquals(type, infos.get(0).type());
+                assertEquals("401 from " + type, infos.get(0).error());
+                assertFalse("credential must be redacted: " + infos.get(0).config(), infos.get(0).config().containsValue("sekrit"));
+                assertFalse("credential must be redacted: " + infos.get(0).config(), infos.get(0).config().containsValue("id:sekrit"));
+                // The implementation still received the raw value.
+                assertTrue(
+                    recording.initializeCalls.get(0).containsValue("sekrit") || recording.initializeCalls.get(0).containsValue("id:sekrit")
+                );
+            } finally {
+                LanceNamespaceFactory.resetInstantiatorForTests();
+            }
+        }
+    }
+
     public void testGlueEntryDrivesInitializeWithSecretsAndReportsUnavailableOnFailure() throws Exception {
         // The request path down to initialize for the glue type: the
         // stub receives the config with the credential keys intact, a

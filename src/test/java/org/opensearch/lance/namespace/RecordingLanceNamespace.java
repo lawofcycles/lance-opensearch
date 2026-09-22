@@ -25,6 +25,16 @@ import org.lance.namespace.model.ListTablesResponse;
  * the registration config through unredacted, and answers the listing
  * calls from canned data. An optional failure injected into
  * {@code initialize} exercises the service's unavailable handling.
+ *
+ * <p>Two listing modes. The flat mode ({@link #tables},
+ * {@link #childNamespaces}) mimics a Glue-style catalog: any non-empty
+ * id answers the same table set, a root listing is rejected when child
+ * namespaces exist. The tree mode ({@link #namespaceTree},
+ * {@link #tableTree}) pins the namespace walk: {@code listNamespaces}
+ * answers the children recorded for the exact parent id,
+ * {@code listTables} answers only ids present in the table tree and
+ * rejects every other id the way Iceberg and Unity reject listings at
+ * the wrong level.
  */
 class RecordingLanceNamespace implements LanceNamespace {
 
@@ -34,6 +44,13 @@ class RecordingLanceNamespace implements LanceNamespace {
     Set<String> childNamespaces;
     Map<String, String> tableLocations = Map.of();
     int describeTableCalls;
+
+    /** Tree mode: children per exact parent id (dot-joined; the root is the empty string). */
+    Map<String, Set<String>> namespaceTree;
+    /** Tree mode: tables per exact namespace id (dot-joined); other ids reject the listing. */
+    Map<String, Set<String>> tableTree;
+    final List<List<String>> listTablesIds = new ArrayList<>();
+    final List<List<String>> listNamespacesIds = new ArrayList<>();
 
     @Override
     public void initialize(Map<String, String> properties, BufferAllocator allocator) {
@@ -48,8 +65,20 @@ class RecordingLanceNamespace implements LanceNamespace {
         return "recording";
     }
 
+    private static String joined(List<String> id) {
+        return id == null ? "" : String.join(".", id);
+    }
+
     @Override
     public ListTablesResponse listTables(ListTablesRequest request) {
+        listTablesIds.add(request.getId() == null ? List.of() : List.copyOf(request.getId()));
+        if (tableTree != null) {
+            Set<String> found = tableTree.get(joined(request.getId()));
+            if (found == null) {
+                throw new IllegalArgumentException("no tables at namespace [" + joined(request.getId()) + "]");
+            }
+            return new ListTablesResponse().tables(found);
+        }
         if (childNamespaces != null && (request.getId() == null || request.getId().isEmpty())) {
             // Mimic a catalog (Glue) that rejects a root table listing
             // because tables live inside child namespaces.
@@ -60,6 +89,11 @@ class RecordingLanceNamespace implements LanceNamespace {
 
     @Override
     public ListNamespacesResponse listNamespaces(ListNamespacesRequest request) {
+        listNamespacesIds.add(request.getId() == null ? List.of() : List.copyOf(request.getId()));
+        if (namespaceTree != null) {
+            Set<String> children = namespaceTree.get(joined(request.getId()));
+            return new ListNamespacesResponse().namespaces(children == null ? Set.of() : children);
+        }
         if (childNamespaces == null) {
             return new ListNamespacesResponse().namespaces(Set.of());
         }

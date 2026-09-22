@@ -144,9 +144,16 @@ public class LanceNamespaceMetadataTests extends OpenSearchTestCase {
         assertTrue(LanceNamespaceMetadata.Entry.isSensitiveConfigKey("session_token"));
         assertTrue(LanceNamespaceMetadata.Entry.isSensitiveConfigKey("header.Authorization-Token"));
         assertTrue(LanceNamespaceMetadata.Entry.isSensitiveConfigKey("PASSWORD"));
+        // The Iceberg REST client's static bearer and OAuth pair.
+        assertTrue(LanceNamespaceMetadata.Entry.isSensitiveConfigKey("auth_token"));
+        assertTrue(LanceNamespaceMetadata.Entry.isSensitiveConfigKey("credential"));
         assertFalse(LanceNamespaceMetadata.Entry.isSensitiveConfigKey("region"));
         assertFalse(LanceNamespaceMetadata.Entry.isSensitiveConfigKey("uri"));
         assertFalse(LanceNamespaceMetadata.Entry.isSensitiveConfigKey("catalog_id"));
+        assertFalse(LanceNamespaceMetadata.Entry.isSensitiveConfigKey("endpoint"));
+        assertFalse(LanceNamespaceMetadata.Entry.isSensitiveConfigKey("warehouse"));
+        assertFalse(LanceNamespaceMetadata.Entry.isSensitiveConfigKey("catalog"));
+        assertFalse(LanceNamespaceMetadata.Entry.isSensitiveConfigKey("max_namespace_depth"));
     }
 
     public void testWithRegisteredIsNoOpForDuplicateName() {

@@ -167,6 +167,27 @@ public class RestNamespaceAction extends BaseRestHandler {
                 if (LanceNamespaceMetadata.Entry.TYPE_REST.equals(type) && isBlank(config.get("uri"))) {
                     return badRequest("[config.uri] is required for type [rest]");
                 }
+                boolean icebergProtocol = LanceNamespaceMetadata.Entry.TYPE_ICEBERG.equals(type)
+                    || LanceNamespaceMetadata.Entry.TYPE_POLARIS.equals(type);
+                if (icebergProtocol || LanceNamespaceMetadata.Entry.TYPE_UNITY.equals(type)) {
+                    if (isBlank(config.get("endpoint"))) {
+                        return badRequest("[config.endpoint] is required for type [" + type + "]");
+                    }
+                }
+                if (icebergProtocol && isBlank(config.get("warehouse"))) {
+                    // Without a warehouse the client rejects every listing
+                    // (the warehouse / catalog is the first level of each
+                    // table id), so the registration could never surface
+                    // a table. Refuse it up front with the reason.
+                    return badRequest(
+                        "[config.warehouse] is required for type ["
+                            + type
+                            + "]; it names the warehouse (catalog) whose namespaces are polled"
+                    );
+                }
+                if (LanceNamespaceMetadata.Entry.TYPE_UNITY.equals(type) && isBlank(config.get("catalog"))) {
+                    return badRequest("[config.catalog] is required for type [unity]");
+                }
             }
         } catch (IllegalArgumentException e) {
             return badRequest(e.getMessage());

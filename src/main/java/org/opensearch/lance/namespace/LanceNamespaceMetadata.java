@@ -266,9 +266,19 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
         public static final String TYPE_DIRECTORY = "directory";
         public static final String TYPE_REST = "rest";
         public static final String TYPE_GLUE = "glue";
+        public static final String TYPE_ICEBERG = "iceberg";
+        public static final String TYPE_POLARIS = "polaris";
+        public static final String TYPE_UNITY = "unity";
 
         /** Accepted values for {@link #type()}, in the order register error messages list them. */
-        public static final List<String> ACCEPTED_TYPES = List.of(TYPE_DIRECTORY, TYPE_REST, TYPE_GLUE);
+        public static final List<String> ACCEPTED_TYPES = List.of(
+            TYPE_DIRECTORY,
+            TYPE_REST,
+            TYPE_GLUE,
+            TYPE_ICEBERG,
+            TYPE_POLARIS,
+            TYPE_UNITY
+        );
 
         private static final ParseField NAME = new ParseField("name");
         private static final ParseField CATALOG_TYPE = new ParseField("type");
@@ -419,10 +429,13 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
         /**
          * True for config keys whose value must never appear in logs,
          * listings, or {@code toString}: anything whose name contains
-         * {@code secret}, {@code password}, {@code token}, {@code key}
-         * or {@code authorization} (case-insensitive). The last one
-         * covers the {@code header.Authorization} property the REST
-         * catalog client reads its bearer credential from.
+         * {@code secret}, {@code password}, {@code token}, {@code key},
+         * {@code authorization} or {@code credential} (case-insensitive).
+         * {@code authorization} covers the {@code header.Authorization}
+         * property the REST catalog client reads its bearer credential
+         * from; {@code credential} covers the Iceberg REST client's
+         * {@code credential} property (an OAuth client id and secret
+         * pair), which none of the other substrings match.
          */
         public static boolean isSensitiveConfigKey(String key) {
             String lower = key.toLowerCase(Locale.ROOT);
@@ -430,7 +443,8 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
                 || lower.contains("password")
                 || lower.contains("token")
                 || lower.contains("key")
-                || lower.contains("authorization");
+                || lower.contains("authorization")
+                || lower.contains("credential");
         }
 
         /** The config map with every sensitive value replaced by {@code ***}. */
