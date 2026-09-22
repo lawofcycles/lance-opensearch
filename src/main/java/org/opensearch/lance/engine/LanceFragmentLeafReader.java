@@ -35,6 +35,7 @@ import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.BinaryDocValues;
@@ -184,6 +185,17 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * TEXT_KEYWORD would build by default.
      */
     private final java.util.Set<String> basesWithKeywordSub;
+    /**
+     * Top-level Struct column names with at least one surfaced child.
+     * The row take projects the whole struct under the parent name;
+     * {@link #decodeTakeValue} turns it into a nested map so
+     * {@link #materialiseStoredFields} renders a JSON object, while the
+     * children's doc values live under dotted paths in
+     * {@link #columnKind} and load through the same per-column scans as
+     * top-level columns (Lance projects a dotted path as a flat column
+     * aliased to it).
+     */
+    private final java.util.Set<String> structColumns;
     private final Bits liveDocs;
     private final FieldInfos fieldInfos;
     private final Dataset dataset;
@@ -520,6 +532,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
         this.filterSql = filterSql;
         this.keywordSubFields = schema.keywordSubFields();
         this.basesWithKeywordSub = schema.basesWithKeywordSub();
+        this.structColumns = schema.structColumns();
         this.columnKind = schema.columnKind();
         this.numericPrecision = schema.numericPrecision();
         this.sourceColumnCount = schema.sourceColumnCount();
@@ -2371,6 +2384,9 @@ public final class LanceFragmentLeafReader extends LeafReader {
         }
         ColumnKind kind = columnKind.get(name);
         if (kind == null) {
+            if (vector instanceof StructVector struct && structColumns.contains(name)) {
+                return decodeStructValue(name, struct, i);
+            }
             if (vector instanceof VarCharVector vc) {
                 return new String(vc.get(i), java.nio.charset.StandardCharsets.UTF_8);
             }
@@ -2405,6 +2421,51 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 yield null;
             }
         };
+    }
+
+    /**
+     * Decode one struct cell of a take-scan batch into an ordered map of
+     * child name to decoded child value, recursing into nested structs.
+     * Only children the schema surfaced (present in {@link #columnKind}
+     * under their dotted path, or a nested struct with at least one such
+     * descendant) appear as keys, so an unsupported child is omitted
+     * from {@code _source} the same way its mapping entry is. A child
+     * that is Arrow null inside a present struct maps to a {@code null}
+     * value, which {@link #materialiseStoredFields} renders as an
+     * explicit JSON {@code null}; a struct that is itself null returns
+     * {@code null} here (an omitted top-level key, a {@code null} child
+     * inside an enclosing struct).
+     */
+    private Object decodeStructValue(String path, StructVector vector, int i) {
+        if (vector.isNull(i)) {
+            return null;
+        }
+        java.util.LinkedHashMap<String, Object> out = new java.util.LinkedHashMap<>();
+        for (FieldVector child : vector.getChildrenFromFields()) {
+            String childPath = path + "." + child.getName();
+            if (child instanceof StructVector nested) {
+                if (hasSurfacedDescendant(childPath)) {
+                    out.put(child.getName(), decodeStructValue(childPath, nested, i));
+                }
+                continue;
+            }
+            if (!columnKind.containsKey(childPath)) {
+                continue;
+            }
+            out.put(child.getName(), decodeTakeValue(childPath, child, i));
+        }
+        return out;
+    }
+
+    /** Whether any surfaced column sits under {@code path} (a nested struct with at least one supported leaf). */
+    private boolean hasSurfacedDescendant(String path) {
+        String prefix = path + ".";
+        for (String column : columnKind.keySet()) {
+            if (column.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -2483,37 +2544,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                         continue;
                     }
                     String name = takeColumns.get(c);
-                    switch (columnKind.get(name)) {
-                        case NUMERIC -> {
-                            long numericValue = (Long) value;
-                            NumericPrecision precision = numericPrecision.getOrDefault(name, NumericPrecision.INTEGER);
-                            switch (precision) {
-                                case FLOAT -> builder.field(
-                                    name,
-                                    org.apache.lucene.util.NumericUtils.sortableIntToFloat((int) numericValue)
-                                );
-                                case DOUBLE -> builder.field(name, org.apache.lucene.util.NumericUtils.sortableLongToDouble(numericValue));
-                                case INTEGER -> {
-                                    if (pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.UNSIGNED_LONG
-                                        && name.equals(fieldName)) {
-                                        // UInt64 PK column: emit as an unsigned
-                                        // decimal so the JSON number matches
-                                        // what the operator wrote. Other
-                                        // UInt64 columns are not surfaced by
-                                        // classify(), so this branch fires
-                                        // only for the PK.
-                                        builder.field(name, new java.math.BigInteger(Long.toUnsignedString(numericValue)));
-                                    } else {
-                                        builder.field(name, numericValue);
-                                    }
-                                }
-                            }
-                        }
-                        case BOOLEAN -> builder.field(name, (Boolean) value);
-                        case TEXT_FTS, TEXT_KEYWORD -> builder.field(name, (String) value);
-                        case KEYWORD_ARRAY -> builder.field(name, (String[]) value);
-                        case BINARY -> builder.field(name, java.util.Base64.getEncoder().encodeToString((byte[]) value));
-                    }
+                    writeSourceField(builder, name, name, value);
                 }
                 builder.endObject();
                 byte[] json = org.opensearch.core.common.bytes.BytesReference.toBytes(
@@ -2521,6 +2552,62 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 );
                 visitor.binaryField(sourceInfo, json);
             }
+        }
+    }
+
+    /**
+     * Render one {@code _source} value under {@code key}. {@code path}
+     * is the dotted column path ({@code key} for top-level columns, the
+     * full {@code parent.child} path inside a struct) so the
+     * {@link ColumnKind} and {@link NumericPrecision} lookups resolve.
+     * A {@link java.util.Map} value (a decoded struct) renders as a
+     * JSON object, recursing per child; a {@code null} value renders as
+     * an explicit JSON {@code null} (only struct children reach here as
+     * {@code null} — the top-level loop skips absent columns, keeping
+     * their keys out of {@code _source} as before).
+     */
+    private void writeSourceField(org.opensearch.core.xcontent.XContentBuilder builder, String path, String key, Object value)
+        throws IOException {
+        if (value == null) {
+            builder.nullField(key);
+            return;
+        }
+        if (value instanceof java.util.Map<?, ?> struct) {
+            builder.startObject(key);
+            for (java.util.Map.Entry<?, ?> entry : struct.entrySet()) {
+                String childName = (String) entry.getKey();
+                writeSourceField(builder, path + "." + childName, childName, entry.getValue());
+            }
+            builder.endObject();
+            return;
+        }
+        switch (columnKind.get(path)) {
+            case NUMERIC -> {
+                long numericValue = (Long) value;
+                NumericPrecision precision = numericPrecision.getOrDefault(path, NumericPrecision.INTEGER);
+                switch (precision) {
+                    case FLOAT -> builder.field(key, org.apache.lucene.util.NumericUtils.sortableIntToFloat((int) numericValue));
+                    case DOUBLE -> builder.field(key, org.apache.lucene.util.NumericUtils.sortableLongToDouble(numericValue));
+                    case INTEGER -> {
+                        if (pkType == org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType.UNSIGNED_LONG
+                            && path.equals(fieldName)) {
+                            // UInt64 PK column: emit as an unsigned
+                            // decimal so the JSON number matches
+                            // what the operator wrote. Other
+                            // UInt64 columns are not surfaced by
+                            // classify(), so this branch fires
+                            // only for the PK.
+                            builder.field(key, new java.math.BigInteger(Long.toUnsignedString(numericValue)));
+                        } else {
+                            builder.field(key, numericValue);
+                        }
+                    }
+                }
+            }
+            case BOOLEAN -> builder.field(key, (Boolean) value);
+            case TEXT_FTS, TEXT_KEYWORD -> builder.field(key, (String) value);
+            case KEYWORD_ARRAY -> builder.field(key, (String[]) value);
+            case BINARY -> builder.field(key, java.util.Base64.getEncoder().encodeToString((byte[]) value));
         }
     }
 

@@ -395,9 +395,21 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
             // there). This is what makes numeric-epoch-millis on
             // date columns and ISO-8601 strings on non-date
             // columns route through the correct SQL literal form
-            // for the pre-filter path.
+            // for the pre-filter path. A dotted name only resolves
+            // when its parent path is an object mapper (a Struct
+            // child, which Lance's SQL parser reads as a nested
+            // field access); a multi-field sub-field (body.raw)
+            // returns null so the translator's dotted-path guard
+            // keeps it off the Lance SQL path.
             org.opensearch.index.mapper.MappedFieldType mft = context.fieldMapper(name);
-            return mft == null ? null : mft.typeName();
+            if (mft == null) {
+                return null;
+            }
+            int dot = name.lastIndexOf('.');
+            if (dot > 0 && context.getObjectMapper(name.substring(0, dot)) == null) {
+                return null;
+            }
+            return mft.typeName();
         });
         return new LanceKnnQuery(field, vector, k, nprobes, refineFactor, ef, parseDistance(metric), useIndex, filterSql);
     }
