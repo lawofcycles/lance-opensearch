@@ -40,10 +40,14 @@ import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.document.Document;
+import org.apache.lucene.geo.GeoEncodingUtils;
 import org.apache.lucene.index.BaseTermsEnum;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.ByteVectorValues;
@@ -79,6 +83,7 @@ import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.AcceptDocs;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
@@ -122,6 +127,8 @@ import org.opensearch.lance.engine.LanceFragmentSchema.NumericPrecision;
  * {@link CachedKeywordArrayColumn}).
  */
 public final class LanceFragmentLeafReader extends LeafReader {
+
+    private static final Logger LOGGER = LogManager.getLogger(LanceFragmentLeafReader.class);
 
     private final String fieldName;
     /**
@@ -279,6 +286,28 @@ public final class LanceFragmentLeafReader extends LeafReader {
     private final Map<String, FixedBitSet> numericPresence = new ConcurrentHashMap<>();
     private final Map<String, long[]> booleanColumns = new ConcurrentHashMap<>();
     private final Map<String, FixedBitSet> booleanPresence = new ConcurrentHashMap<>();
+    /**
+     * geo_point-overridden columns of this fragment: one encoded long
+     * per row, {@code (encodeLatitude(lat) << 32) | (encodeLongitude(lon)
+     * & 0xFFFFFFFFL)} — the exact {@code LatLonDocValuesField} layout
+     * OpenSearch's geo queries, {@code _geo_distance} sort and geo
+     * aggregations decode. Loaded by {@link #ensureGeoPointLoaded} in
+     * one Lance scan of the Struct's two children (or the
+     * FixedSizeList's element vector); presence bit clear when the cell
+     * or either component is Arrow null or out of coordinate range.
+     */
+    private final Map<String, long[]> geoColumns = new ConcurrentHashMap<>();
+    private final Map<String, FixedBitSet> geoPresence = new ConcurrentHashMap<>();
+    /**
+     * Per geo column: encoded bounds and present-row count
+     * ({@code minLat, maxLat, minLon, maxLon, count} as
+     * {@code GeoEncodingUtils} ints), collected during the load so
+     * {@link #getPointValues} can answer the root cell of its flat
+     * point tree without rescanning the array.
+     */
+    private final Map<String, int[]> geoBounds = new ConcurrentHashMap<>();
+    /** How each geo_point column stores its point (Struct child names or FixedSizeList element order), from the schema. */
+    private final Map<String, LanceFragmentSchema.GeoPointColumn> geoPointColumns;
     /**
      * Numeric and boolean columns of this fragment served from the
      * off-heap {@link ColumnStore}, published by
@@ -592,6 +621,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
         }
         this.columnKind = schema.columnKind();
         this.numericPrecision = schema.numericPrecision();
+        this.geoPointColumns = schema.geoPointColumns();
         this.sourceColumnCount = schema.sourceColumnCount();
         this.pkTakeIndex = schema.pkTakeIndex();
         this.takeColumns = schema.takeColumns();
@@ -957,6 +987,122 @@ public final class LanceFragmentLeafReader extends LeafReader {
     void publishBooleanColumn(String name, long[] values, FixedBitSet presence) {
         booleanPresence.put(name, presence);
         booleanColumns.put(name, values);
+    }
+
+    /**
+     * Lance-scan a geo_point column into {@link #geoColumns} /
+     * {@link #geoPresence}: one scan of the single column (the whole
+     * Struct or FixedSizeList projects both components), each present
+     * pair encoded into the {@code LatLonDocValuesField} long layout
+     * ({@code encodeLatitude(lat) << 32 | encodeLongitude(lon) &
+     * 0xFFFFFFFFL}). A row whose cell or either component is Arrow
+     * null, or whose coordinates are outside the +/-90 / +/-180 bounds,
+     * is served as missing (presence bit clear); out-of-range rows are
+     * counted and logged once per fragment, mirroring the unparsable-ip
+     * handling. The load is per fragment and charged to the request
+     * breaker; the shard cache's consolidated scan does not carry geo
+     * columns today.
+     */
+    private void ensureGeoPointLoaded(String name) throws IOException {
+        if (geoColumns.containsKey(name)) {
+            return;
+        }
+        synchronized (columnLock(name)) {
+            if (geoColumns.containsKey(name)) {
+                return;
+            }
+            LanceShardColumnCache cache = shardColumnCache;
+            long heapBytes = LanceShardColumnCache.numericHeapBytes(maxDoc);
+            chargeHeap(cache, heapBytes, name);
+            boolean published = false;
+            try {
+                long[] col = new long[maxDoc];
+                FixedBitSet presence = new FixedBitSet(maxDoc);
+                LanceFragmentSchema.GeoPointColumn spec = geoPointColumns.get(name);
+                int outOfRange = 0;
+                int minLat = Integer.MAX_VALUE;
+                int maxLat = Integer.MIN_VALUE;
+                int minLon = Integer.MAX_VALUE;
+                int maxLon = Integer.MIN_VALUE;
+                int count = 0;
+                ScanOptions colOptions = singleColumnScan(name);
+                try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
+                    while (reader.loadNextBatch()) {
+                        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                        UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                        FieldVector vector = root.getVector(name);
+                        for (int i = 0; i < root.getRowCount(); i++) {
+                            int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
+                            double[] point = decodeGeoPoint(spec, vector, i);
+                            if (point == null) {
+                                continue;
+                            }
+                            try {
+                                int latEncoded = GeoEncodingUtils.encodeLatitude(point[0]);
+                                int lonEncoded = GeoEncodingUtils.encodeLongitude(point[1]);
+                                col[offset] = (((long) latEncoded) << 32) | (lonEncoded & 0xFFFFFFFFL);
+                                presence.set(offset);
+                                minLat = Math.min(minLat, latEncoded);
+                                maxLat = Math.max(maxLat, latEncoded);
+                                minLon = Math.min(minLon, lonEncoded);
+                                maxLon = Math.max(maxLon, lonEncoded);
+                                count++;
+                            } catch (IllegalArgumentException outOfBounds) {
+                                outOfRange++;
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    throw new IOException(e);
+                }
+                if (outOfRange > 0) {
+                    LOGGER.warn(
+                        "fragment {}: {} rows of geo_point column [{}] have coordinates outside +/-90 / +/-180 and are served as missing",
+                        fragmentId,
+                        outOfRange,
+                        name
+                    );
+                }
+                geoBounds.put(name, new int[] { minLat, maxLat, minLon, maxLon, count });
+                geoPresence.put(name, presence);
+                geoColumns.put(name, col);
+                published = true;
+            } finally {
+                if (!published) {
+                    releaseHeap(cache, heapBytes);
+                }
+            }
+        }
+    }
+
+    /**
+     * Decode one geo cell into {@code {lat, lon}}, or {@code null} when
+     * the cell or either component is Arrow null. Shared by the column
+     * load above and the per-hit take decode so {@code _source} and the
+     * doc values agree on what counts as missing.
+     */
+    private static double[] decodeGeoPoint(LanceFragmentSchema.GeoPointColumn spec, FieldVector vector, int i) {
+        if (vector == null || vector.isNull(i)) {
+            return null;
+        }
+        if (spec.isStruct()) {
+            StructVector struct = (StructVector) vector;
+            Float8Vector lat = (Float8Vector) struct.getChild(spec.latChild());
+            Float8Vector lon = (Float8Vector) struct.getChild(spec.lonChild());
+            if (lat == null || lon == null || lat.isNull(i) || lon.isNull(i)) {
+                return null;
+            }
+            return new double[] { lat.get(i), lon.get(i) };
+        }
+        FixedSizeListVector list = (FixedSizeListVector) vector;
+        Float8Vector element = (Float8Vector) list.getDataVector();
+        int base = i * 2;
+        if (element.isNull(base) || element.isNull(base + 1)) {
+            return null;
+        }
+        double first = element.get(base);
+        double second = element.get(base + 1);
+        return spec.latFirst() ? new double[] { first, second } : new double[] { second, first };
     }
 
     /**
@@ -1864,8 +2010,102 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
     @Override
     public SortedNumericDocValues getSortedNumericDocValues(String field) {
+        if (columnKind.get(field) == ColumnKind.GEO_POINT) {
+            // One point per row (multi-valued geo points are refused at
+            // attach), so the multi-valued interface geo queries, the
+            // _geo_distance sort and geo aggregations read is a
+            // singleton over the encoded-long column.
+            return DocValues.singleton(new GeoPointNumericDocValues(field));
+        }
         NumericDocValues numeric = getNumericDocValues(field);
         return numeric == null ? null : DocValues.singleton(numeric);
+    }
+
+    /**
+     * Doc values of a geo_point column: the encoded {@code lat|lon}
+     * long per present row. Loads the column on first use (Lucene asks
+     * for doc values while building scorers, before any doc is
+     * consumed) and answers presence from the load's bitmap so
+     * {@code exists} and the two-phase geo iterators skip Arrow-null
+     * locations. No hint path: geo predicates never push to Lance, so
+     * the scan that produced the hits ran unfiltered and every doc of
+     * the leaf may be asked.
+     */
+    private final class GeoPointNumericDocValues extends NumericDocValues {
+        private final String name;
+        private long[] column;
+        private FixedBitSet presence;
+        private int doc = -1;
+        /** Row behind {@link #doc}; what the column and presence are indexed by. */
+        private int row = -1;
+
+        GeoPointNumericDocValues(String name) {
+            this.name = name;
+        }
+
+        private void resolve() throws IOException {
+            if (column != null) {
+                return;
+            }
+            ensureGeoPointLoaded(name);
+            column = geoColumns.get(name);
+            presence = geoPresence.get(name);
+        }
+
+        @Override
+        public long longValue() {
+            return column[row];
+        }
+
+        @Override
+        public boolean advanceExact(int target) throws IOException {
+            doc = target;
+            if (liveDocs != null && !liveDocs.get(target)) {
+                return false;
+            }
+            row = rowIfParent(target);
+            if (row < 0) {
+                return false;
+            }
+            resolve();
+            return presence.get(row);
+        }
+
+        @Override
+        public int docID() {
+            return doc;
+        }
+
+        @Override
+        public int nextDoc() throws IOException {
+            return advance(doc + 1);
+        }
+
+        @Override
+        public int advance(int target) throws IOException {
+            resolve();
+            for (int candidate = target; candidate < maxDoc; candidate++) {
+                if (liveDocs != null && !liveDocs.get(candidate)) {
+                    continue;
+                }
+                int candidateRow = rowIfParent(candidate);
+                if (candidateRow < 0) {
+                    continue;
+                }
+                if (presence.get(candidateRow)) {
+                    doc = candidate;
+                    row = candidateRow;
+                    return doc;
+                }
+            }
+            doc = NO_MORE_DOCS;
+            return doc;
+        }
+
+        @Override
+        public long cost() {
+            return maxDoc;
+        }
     }
 
     @Override
@@ -3054,8 +3294,154 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     @Override
-    public PointValues getPointValues(String field) {
-        return null;
+    public PointValues getPointValues(String field) throws IOException {
+        if (columnKind.get(field) != ColumnKind.GEO_POINT) {
+            return null;
+        }
+        // The stock geo queries (LatLonPoint.newDistanceQuery and
+        // friends, wrapped in IndexOrDocValuesQuery by the geo_point
+        // field type) require the points side: IndexOrDocValuesQuery's
+        // scorerSupplier answers null — no matches — when either leg is
+        // missing, and GeoPolygonQueryBuilder builds the LatLonPoint
+        // query directly. Serve them a flat, single-cell point tree
+        // over the same encoded array the doc values read: the default
+        // PointValues.intersect / estimate walk visits every present
+        // row against the query's IntersectVisitor, which is exactly
+        // the per-hit doc values check with the points API's shape.
+        ensureGeoPointLoaded(field);
+        int[] bounds = geoBounds.get(field);
+        if (bounds[4] == 0) {
+            // No present rows: same answer as a segment without points.
+            return null;
+        }
+        return new GeoPointPointValues(geoColumns.get(field), geoPresence.get(field), bounds);
+    }
+
+    /** Pack an encoded (lat, lon) pair into the {@code LatLonPoint} 2x4-byte comparable form. */
+    private static byte[] packGeo(int latEncoded, int lonEncoded) {
+        byte[] packed = new byte[2 * Integer.BYTES];
+        org.apache.lucene.util.NumericUtils.intToSortableBytes(latEncoded, packed, 0);
+        org.apache.lucene.util.NumericUtils.intToSortableBytes(lonEncoded, packed, Integer.BYTES);
+        return packed;
+    }
+
+    /**
+     * Point values of a geo column: one root cell holding every present
+     * row, no children. {@code PointValues.intersect} and the estimate
+     * methods drive the visits; a cell relation of
+     * {@code CELL_INSIDE_QUERY} takes {@link PointTree#visitDocIDs} and
+     * {@code CELL_CROSSES_QUERY} falls to
+     * {@link PointTree#visitDocValues} because the tree has no children
+     * to descend into.
+     */
+    private final class GeoPointPointValues extends PointValues {
+        private final long[] column;
+        private final FixedBitSet presence;
+        private final int[] bounds;
+
+        GeoPointPointValues(long[] column, FixedBitSet presence, int[] bounds) {
+            this.column = column;
+            this.presence = presence;
+            this.bounds = bounds;
+        }
+
+        @Override
+        public PointTree getPointTree() {
+            return new GeoPointTree();
+        }
+
+        @Override
+        public byte[] getMinPackedValue() {
+            return packGeo(bounds[0], bounds[2]);
+        }
+
+        @Override
+        public byte[] getMaxPackedValue() {
+            return packGeo(bounds[1], bounds[3]);
+        }
+
+        @Override
+        public int getNumDimensions() {
+            return 2;
+        }
+
+        @Override
+        public int getNumIndexDimensions() {
+            return 2;
+        }
+
+        @Override
+        public int getBytesPerDimension() {
+            return Integer.BYTES;
+        }
+
+        @Override
+        public long size() {
+            return bounds[4];
+        }
+
+        @Override
+        public int getDocCount() {
+            return bounds[4];
+        }
+
+        private final class GeoPointTree implements PointTree {
+            @Override
+            public PointTree clone() {
+                return new GeoPointTree();
+            }
+
+            @Override
+            public boolean moveToChild() {
+                return false;
+            }
+
+            @Override
+            public boolean moveToSibling() {
+                return false;
+            }
+
+            @Override
+            public boolean moveToParent() {
+                return false;
+            }
+
+            @Override
+            public byte[] getMinPackedValue() {
+                return GeoPointPointValues.this.getMinPackedValue();
+            }
+
+            @Override
+            public byte[] getMaxPackedValue() {
+                return GeoPointPointValues.this.getMaxPackedValue();
+            }
+
+            @Override
+            public long size() {
+                return bounds[4];
+            }
+
+            @Override
+            public void visitDocIDs(IntersectVisitor visitor) throws IOException {
+                visitor.grow(bounds[4]);
+                for (int row = presence.nextSetBit(0); row != DocIdSetIterator.NO_MORE_DOCS; row = row + 1 < presence.length()
+                    ? presence.nextSetBit(row + 1)
+                    : DocIdSetIterator.NO_MORE_DOCS) {
+                    visitor.visit(docOfRow(row));
+                }
+            }
+
+            @Override
+            public void visitDocValues(IntersectVisitor visitor) throws IOException {
+                visitor.grow(bounds[4]);
+                for (int row = presence.nextSetBit(0); row != DocIdSetIterator.NO_MORE_DOCS; row = row + 1 < presence.length()
+                    ? presence.nextSetBit(row + 1)
+                    : DocIdSetIterator.NO_MORE_DOCS) {
+                    long value = column[row];
+                    visitor.visit(docOfRow(row), packGeo((int) (value >>> 32), (int) value));
+                }
+            }
+        }
     }
 
     @Override
@@ -3225,6 +3611,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             case NUMERIC -> readAsLong(vector, i);
             case BOOLEAN -> ((BitVector) vector).get(i) == 1;
             case TEXT_FTS, TEXT_KEYWORD -> new String(((VarCharVector) vector).get(i), java.nio.charset.StandardCharsets.UTF_8);
+            case GEO_POINT -> decodeGeoPoint(geoPointColumns.get(name), vector, i);
             case KEYWORD_ARRAY -> {
                 ListVector list = (ListVector) vector;
                 VarCharVector elements = (VarCharVector) list.getDataVector();
@@ -3471,6 +3858,15 @@ public final class LanceFragmentLeafReader extends LeafReader {
             case BOOLEAN -> builder.field(key, (Boolean) value);
             case TEXT_FTS, TEXT_KEYWORD -> builder.field(key, (String) value);
             case KEYWORD_ARRAY -> builder.field(key, (String[]) value);
+            case GEO_POINT -> {
+                // Render canonically as {"lat": .., "lon": ..} with the
+                // original double values regardless of the Arrow storage
+                // (Struct child names or FixedSizeList order): the field
+                // maps as geo_point, so the object shape every geo_point
+                // consumer understands is the faithful projection.
+                double[] point = (double[]) value;
+                builder.startObject(key).field("lat", point[0]).field("lon", point[1]).endObject();
+            }
             case BINARY -> builder.field(key, Base64.getEncoder().encodeToString((byte[]) value));
         }
     }

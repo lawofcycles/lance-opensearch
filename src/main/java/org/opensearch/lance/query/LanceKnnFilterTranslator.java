@@ -114,6 +114,20 @@ public final class LanceKnnFilterTranslator {
     public static final String IP_ON_UTF8 = "ip_on_utf8";
 
     /**
+     * Sentinel a field-type lookup returns for a {@code geo_point}-mapped
+     * field whose Lance column is a Struct or a FixedSizeList (the
+     * attach body's {@code type: geo_point} override). No geo predicate
+     * pushes down to Lance SQL: DataFusion cannot address a struct
+     * child or a list element in a filter, and there is no SQL form
+     * for a bounding-box or geo-distance check over the two Float64
+     * columns behind the field. The translator refuses the clause, the
+     * caller keeps {@code filterSql} null, and the scan runs unfiltered
+     * with Lucene evaluating the geo predicate over the doc values the
+     * fragment reader publishes.
+     */
+    public static final String GEO_POINT_ON_LANCE = "geo_point_on_lance";
+
+    /**
      * The answer a field-type lookup gives for a resolved mapping entry:
      * one of the sentinels above, or the plain OpenSearch type name.
      * Both lookups this translator is handed (the coordinator's, built
@@ -147,6 +161,9 @@ public final class LanceKnnFilterTranslator {
         }
         if ("ip".equals(openSearchTypeName)) {
             return IP_ON_UTF8;
+        }
+        if ("geo_point".equals(openSearchTypeName)) {
+            return GEO_POINT_ON_LANCE;
         }
         return openSearchTypeName;
     }

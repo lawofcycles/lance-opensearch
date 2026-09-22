@@ -363,4 +363,108 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
             assertTrue(onList.getMessage(), onList.getMessage().contains("needs a Utf8 column"));
         }
     }
+
+    private String geoStructTable() throws Exception {
+        Path scratchDir = createTempDir();
+        return LanceTableFactory.writeGeoStructTable(scratchDir, "derive-" + getTestName().toLowerCase(Locale.ROOT));
+    }
+
+    private String geoFslTable(boolean latLonOrder) throws Exception {
+        Path scratchDir = createTempDir();
+        return LanceTableFactory.writeGeoFslTable(scratchDir, "derive-" + getTestName().toLowerCase(Locale.ROOT), latLonOrder);
+    }
+
+    public void testGeoPointOverrideOnStructDerivesGeoPointMapping() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(geoStructTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("location", Map.of("type", "geo_point")))
+            );
+            String mapping = derivation.mappingJson();
+            assertTrue("location must map as geo_point: " + mapping, mapping.contains("\"location\":{\"type\":\"geo_point\""));
+            assertTrue("meta must record the Arrow shape: " + mapping, mapping.contains("\"lance_arrow_type\":\"struct\""));
+            assertTrue("meta must record the derived order: " + mapping, mapping.contains("\"lance_geo_order\":\"lat_lon\""));
+            assertFalse(
+                "children must not surface as an object mapping: " + mapping,
+                mapping.contains("\"location\":{\"type\":\"object\"")
+            );
+            assertTrue("location joins scalarColumns: " + derivation.scalarColumns(), derivation.scalarColumns().contains("location"));
+            assertTrue(
+                "overrides JSON must persist: " + derivation.overridesJson(),
+                derivation.overridesJson().contains("\"location\"") && derivation.overridesJson().contains("\"geo_point\"")
+            );
+        }
+    }
+
+    public void testGeoPointOverrideOnFslDerivesGeoPointMapping() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(geoFslTable(true), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("location", Map.of("type", "geo_point")))
+            );
+            String mapping = derivation.mappingJson();
+            assertTrue("location must map as geo_point: " + mapping, mapping.contains("\"location\":{\"type\":\"geo_point\""));
+            assertTrue("meta must record the Arrow shape: " + mapping, mapping.contains("\"lance_arrow_type\":\"fsl2f64\""));
+            // Default order is lat_lon when the operator declares none.
+            assertTrue("default order must be lat_lon: " + mapping, mapping.contains("\"lance_geo_order\":\"lat_lon\""));
+            assertFalse("must not map as lance_vector: " + mapping, mapping.contains("lance_vector"));
+            assertTrue("location joins scalarColumns: " + derivation.scalarColumns(), derivation.scalarColumns().contains("location"));
+            assertFalse("must not join vectorColumns: " + derivation.vectorColumns(), derivation.vectorColumns().contains("location"));
+        }
+    }
+
+    public void testGeoPointOverrideOnFslWithLonLatOrder() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(geoFslTable(false), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("location", Map.of("type", "geo_point", "order", "lon_lat")))
+            );
+            String mapping = derivation.mappingJson();
+            assertTrue("meta must record the declared order: " + mapping, mapping.contains("\"lance_geo_order\":\"lon_lat\""));
+        }
+    }
+
+    public void testGeoPointOverrideOrderOnStructRejected() throws Exception {
+        // Struct child names fix the order — the operator cannot declare one.
+        try (Dataset dataset = LanceRegistry.openDataset(geoStructTable(), StorageOptions.empty())) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("location", Map.of("type", "geo_point", "order", "lat_lon"))))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("only accepted on a FixedSizeList"));
+        }
+    }
+
+    public void testGeoPointOverrideOnUnsupportedShapeRejected() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            // A signed integer column is not a valid geo_point shape.
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("ts", Map.of("type", "geo_point"))))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("geo_point"));
+            assertTrue(e.getMessage(), e.getMessage().contains("Struct with two Float64 children"));
+        }
+    }
+
+    public void testGeoPointOverrideOrderRejectedForNonGeoType() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("ts", Map.of("type", "date", "order", "lat_lon"))))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("only accepted together with [type: geo_point]"));
+        }
+    }
+
+    public void testGeoPointOverrideOrderMustBeKnownValue() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(geoFslTable(true), StorageOptions.empty())) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("location", Map.of("type", "geo_point", "order", "xy"))))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("order=xy"));
+            assertTrue(e.getMessage(), e.getMessage().contains("lat_lon"));
+        }
+    }
 }

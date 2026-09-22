@@ -95,16 +95,16 @@ public class LanceOverridesTests extends OpenSearchTestCase {
             () -> LanceOverrides.parseAttachClauses(Map.of("ts", Map.of("analyzer", "kuromoji")), null)
         );
         assertTrue(e.getMessage(), e.getMessage().contains("unknown key [analyzer]"));
-        assertTrue(e.getMessage(), e.getMessage().contains("[type], [format], [fields]"));
+        assertTrue(e.getMessage(), e.getMessage().contains("[type], [format], [order], [fields]"));
     }
 
     public void testUnknownTypeRejected() {
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> LanceOverrides.parseAttachClauses(Map.of("col", Map.of("type", "geo_point")), null)
+            () -> LanceOverrides.parseAttachClauses(Map.of("col", Map.of("type", "text")), null)
         );
-        assertTrue(e.getMessage(), e.getMessage().contains("type=geo_point"));
-        assertTrue(e.getMessage(), e.getMessage().contains("[date], [keyword], [ip], [wildcard]"));
+        assertTrue(e.getMessage(), e.getMessage().contains("type=text"));
+        assertTrue(e.getMessage(), e.getMessage().contains("[date], [keyword], [ip], [wildcard], [geo_point]"));
     }
 
     public void testIpTypeParsesAndReportsThroughIpColumns() {
@@ -119,6 +119,36 @@ public class LanceOverridesTests extends OpenSearchTestCase {
         assertEquals(java.util.Set.of("path"), overrides.wildcardColumns());
         assertTrue(overrides.keywordColumns().isEmpty());
         assertEquals(overrides, LanceOverrides.parse(overrides.toJson()));
+    }
+
+    public void testGeoPointTypeParsesAndReportsThroughGeoPointColumns() {
+        LanceOverrides overrides = LanceOverrides.parseAttachClauses(Map.of("loc", Map.of("type", "geo_point")), null);
+        assertEquals(java.util.Set.of("loc"), overrides.geoPointColumns().keySet());
+        assertNull("no order declared", overrides.geoPointColumns().get("loc"));
+        assertEquals(overrides, LanceOverrides.parse(overrides.toJson()));
+    }
+
+    public void testGeoPointOrderParsesAndRoundTrips() {
+        LanceOverrides overrides = LanceOverrides.parseAttachClauses(Map.of("loc", Map.of("type", "geo_point", "order", "lon_lat")), null);
+        assertEquals("lon_lat", overrides.geoPointColumns().get("loc"));
+        // Persist and re-read; the order must survive the round trip.
+        assertEquals(overrides, LanceOverrides.parse(overrides.toJson()));
+    }
+
+    public void testGeoPointOrderMustBeKnown() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(Map.of("loc", Map.of("type", "geo_point", "order", "xy")), null)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("order=xy"));
+    }
+
+    public void testOrderWithoutGeoPointTypeRejected() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(Map.of("col", Map.of("type", "date", "order", "lat_lon")), null)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("only accepted together with [type: geo_point]"));
     }
 
     public void testFormatWithWildcardTypeRejected() {

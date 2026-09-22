@@ -240,6 +240,7 @@ public class RestAttachAction extends BaseRestHandler {
         java.util.Set<String> keywordOverrides = effective.keywordColumns();
         java.util.Set<String> ipOverrides = effective.ipColumns();
         java.util.Set<String> wildcardOverrides = effective.wildcardColumns();
+        Map<String, String> geoPointOverrides = effective.geoPointColumns();
         for (LanceField field : lanceSchema.fields()) {
             ArrowType type = field.getType();
             String name = field.getName();
@@ -479,7 +480,25 @@ public class RestAttachAction extends BaseRestHandler {
                 ArrowType childType = arrow.getChildren().isEmpty() ? null : arrow.getChildren().get(0).getType();
                 boolean float32 = childType instanceof ArrowType.FloatingPoint fp
                     && fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE;
-                if (float32) {
+                boolean float64 = childType instanceof ArrowType.FloatingPoint fp
+                    && fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE;
+                if (geoPointOverrides.containsKey(name) && fsl.getListSize() == 2 && float64) {
+                    // FixedSizeList<Float64>[2] declared as a geo_point.
+                    // The operator names the storage order through
+                    // `overrides.<col>.order`; default is lat_lon.
+                    String order = geoPointOverrides.get(name);
+                    if (order == null) {
+                        order = LanceOverrides.ORDER_LAT_LON;
+                    }
+                    mapping.startObject(name).field("type", "geo_point");
+                    mapping.startObject("meta");
+                    mapping.field("lance_field_id", Integer.toString(fieldId));
+                    mapping.field("lance_arrow_type", "fsl2f64");
+                    mapping.field("lance_geo_order", order);
+                    mapping.endObject();
+                    mapping.endObject();
+                    scalarColumns.add(name);
+                } else if (float32) {
                     // Surface the column through the `lance_vector` field type
                     // so `LanceKnnQueryBuilder` can validate the field name
                     // and dimension against the mapping. The `dimension`
@@ -551,20 +570,26 @@ public class RestAttachAction extends BaseRestHandler {
                         startFieldWithId(mapping, name, fieldId, "binary", arrowTypeIdentity(type));
                         mapping.endObject();
                     } else if (type instanceof ArrowType.Struct) {
-                        // A Struct column surfaces as an `object` field whose
-                        // properties derive from the struct's children,
-                        // recursing into nested structs. OpenSearch's object
-                        // mapper accepts no `meta` parameter, so the identity
-                        // metadata (lance_field_id / lance_arrow_type) rides on
-                        // the children instead; each Lance child field carries
-                        // its own field id. Children the derivation does not
-                        // support are noted and left out while the parent
-                        // object is still emitted, unless no descendant is
-                        // supported at all, in which case the whole column is
-                        // skipped with a note (the reader keeps such a struct
-                        // out of the row take, so an empty object mapping
-                        // would never show up in _source).
-                        if (structHasSupportedProperty(field)) {
+                        if (geoPointOverrides.containsKey(name)) {
+                            // Struct<lat, lon> (or one of the accepted name
+                            // pairs) declared as a geo_point. The child
+                            // names fix the order and the operator declares
+                            // no `order`; validation already refused the
+                            // shape if the children are not two Float64s.
+                            LanceField c0 = field.getChildren().get(0);
+                            String n0 = c0.getName().toLowerCase(java.util.Locale.ROOT);
+                            String storedOrder = (n0.equals("lat") || n0.equals("latitude") || n0.equals("y"))
+                                ? LanceOverrides.ORDER_LAT_LON
+                                : LanceOverrides.ORDER_LON_LAT;
+                            mapping.startObject(name).field("type", "geo_point");
+                            mapping.startObject("meta");
+                            mapping.field("lance_field_id", Integer.toString(fieldId));
+                            mapping.field("lance_arrow_type", "struct");
+                            mapping.field("lance_geo_order", storedOrder);
+                            mapping.endObject();
+                            mapping.endObject();
+                            scalarColumns.add(name);
+                        } else if (structHasSupportedProperty(field)) {
                             mapping.startObject(name).field("type", "object").startObject("properties");
                             writeStructProperties(mapping, field, name, notes);
                             mapping.endObject().endObject();
@@ -731,6 +756,58 @@ public class RestAttachAction extends BaseRestHandler {
             throw new IllegalArgumentException(
                 "[overrides." + baseName + ".type=wildcard] needs a Utf8 column; [" + baseName + "] is " + type
             );
+        }
+        if (LanceOverrides.TYPE_GEO_POINT.equals(column.type())) {
+            boolean structShape = false;
+            boolean fslShape = false;
+            if (type instanceof ArrowType.Struct) {
+                // Struct<Float64, Float64> whose two child names match one of
+                // the accepted pairs, in either order. The name pair fixes
+                // the order — the operator does not need to declare one.
+                if (field.getChildren().size() == 2) {
+                    LanceField c0 = field.getChildren().get(0);
+                    LanceField c1 = field.getChildren().get(1);
+                    boolean bothFloat64 = c0.getType() instanceof ArrowType.FloatingPoint fp0
+                        && fp0.getPrecision() == FloatingPointPrecision.DOUBLE
+                        && c1.getType() instanceof ArrowType.FloatingPoint fp1
+                        && fp1.getPrecision() == FloatingPointPrecision.DOUBLE;
+                    if (bothFloat64) {
+                        String n0 = c0.getName().toLowerCase(java.util.Locale.ROOT);
+                        String n1 = c1.getName().toLowerCase(java.util.Locale.ROOT);
+                        structShape = (n0.equals("lat") && n1.equals("lon"))
+                            || (n0.equals("lon") && n1.equals("lat"))
+                            || (n0.equals("latitude") && n1.equals("longitude"))
+                            || (n0.equals("longitude") && n1.equals("latitude"))
+                            || (n0.equals("y") && n1.equals("x"))
+                            || (n0.equals("x") && n1.equals("y"));
+                    }
+                }
+            } else if (type instanceof ArrowType.FixedSizeList fsl && fsl.getListSize() == 2) {
+                // LanceField.getChildren() is empty for FixedSizeList; the
+                // element type only materialises through the Arrow
+                // representation.
+                Field arrow = field.asArrowField();
+                ArrowType childType = arrow.getChildren().isEmpty() ? null : arrow.getChildren().get(0).getType();
+                fslShape = childType instanceof ArrowType.FloatingPoint fp && fp.getPrecision() == FloatingPointPrecision.DOUBLE;
+            }
+            if (!structShape && !fslShape) {
+                throw new IllegalArgumentException(
+                    "[overrides."
+                        + baseName
+                        + ".type=geo_point] needs a Struct with two Float64 children named "
+                        + "(lat, lon) / (latitude, longitude) / (y, x) in either order, or a FixedSizeList<Float64>[2]; ["
+                        + baseName
+                        + "] is "
+                        + type
+                );
+            }
+            if (structShape && column.order() != null) {
+                throw new IllegalArgumentException(
+                    "[overrides."
+                        + baseName
+                        + ".order] is only accepted on a FixedSizeList<Float64>[2] column; the child names of a Struct fix the order"
+                );
+            }
         }
         if (!column.subFields().isEmpty()) {
             if (!(type instanceof ArrowType.Utf8)) {

@@ -1910,6 +1910,178 @@ public final class LanceTableFactory {
     }
 
     /**
+     * Writes a Lance table for the geo_point override tests: an
+     * {@code id} Int32 PK and a Struct&lt;lat: Float64, lon: Float64&gt;
+     * column named {@code location} that carries eight rows of points
+     * with one Arrow null. Row 0 is exactly {@code (35.6812, 139.7671)},
+     * a Tokyo landmark, so the geo_distance IT can assert on a
+     * deterministic ordering; the remaining rows spread through Kanto
+     * and one point sits in Osaka.
+     *
+     * @return absolute URI of the table
+     */
+    public static String writeGeoStructTable(Path parent, String name) throws Exception {
+        return withLocaleRoot(() -> writeGeoStructTableOnce(parent, name));
+    }
+
+    /** The {@code (lat, lon)} pairs {@link #writeGeoStructTable} writes, by row; {@code null} means Arrow null. */
+    public static double[][] geoStructFixtureValues() {
+        return new double[][] {
+            { 35.6812, 139.7671 },   // 0: Tokyo landmark (pin)
+            { 35.6595, 139.7005 },   // 1: Shibuya, ~5 km from row 0
+            { 35.6586, 139.7454 },   // 2: Roppongi, ~3 km
+            { 35.4437, 139.6380 },   // 3: Yokohama, ~30 km
+            { 36.5613, 139.8836 },   // 4: Nikko area, ~100 km
+            { 34.6937, 135.5023 },   // 5: Osaka, ~400 km
+            { 35.6900, 139.7500 },   // 6: near Tokyo row 0 (~2 km)
+            null                      // 7: Arrow null
+        };
+    }
+
+    private static String writeGeoStructTableOnce(Path parent, String name) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        Map<String, String> pkMeta = Map.of("lance-schema:unenforced-primary-key", "true");
+        Field locationField = new Field(
+            "location",
+            FieldType.nullable(new ArrowType.Struct()),
+            Arrays.asList(
+                new Field("lat", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null),
+                new Field("lon", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null)
+            )
+        );
+        Schema schema = new Schema(
+            Arrays.asList(new Field("id", new FieldType(false, new ArrowType.Int(32, true), null, pkMeta), null), locationField),
+            Map.of()
+        );
+
+        double[][] values = geoStructFixtureValues();
+        int rowCount = values.length;
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            byte[] ipcBytes;
+            try (
+                VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                ByteArrayOutputStream out = new ByteArrayOutputStream()
+            ) {
+                IntVector idVector = (IntVector) root.getVector("id");
+                StructVector location = (StructVector) root.getVector("location");
+                Float8Vector lat = (Float8Vector) location.getChild("lat");
+                Float8Vector lon = (Float8Vector) location.getChild("lon");
+                root.allocateNew();
+                for (int i = 0; i < rowCount; i++) {
+                    idVector.setSafe(i, i);
+                    double[] row = values[i];
+                    if (row == null) {
+                        location.setNull(i);
+                    } else {
+                        location.setIndexDefined(i);
+                        lat.setSafe(i, row[0]);
+                        lon.setSafe(i, row[1]);
+                    }
+                }
+                root.setRowCount(rowCount);
+                try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                }
+                ipcBytes = out.toByteArray();
+            }
+            try (
+                ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+            ) {
+                Data.exportArrayStream(allocator, reader, stream);
+                WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
+                Dataset.create(allocator, stream, uri, writeParams).close();
+            }
+        }
+        return uri;
+    }
+
+    /**
+     * Writes a Lance table for the geo_point override tests' FixedSizeList
+     * variant: an {@code id} Int32 PK and a
+     * FixedSizeList&lt;Float64&gt;[2] column named {@code location}. The
+     * order argument decides whether the two elements are stored as
+     * {@code (lat, lon)} or {@code (lon, lat)}, so the IT can pin the
+     * {@code overrides.<col>.order} value against the same source
+     * coordinates. Values mirror {@link #geoStructFixtureValues}.
+     *
+     * @return absolute URI of the table
+     */
+    public static String writeGeoFslTable(Path parent, String name, boolean latLonOrder) throws Exception {
+        return withLocaleRoot(() -> writeGeoFslTableOnce(parent, name, latLonOrder));
+    }
+
+    private static String writeGeoFslTableOnce(Path parent, String name, boolean latLonOrder) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        Map<String, String> pkMeta = Map.of("lance-schema:unenforced-primary-key", "true");
+        Field locationField = new Field(
+            "location",
+            FieldType.nullable(new ArrowType.FixedSizeList(2)),
+            Collections.singletonList(
+                new Field("item", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null)
+            )
+        );
+        Schema schema = new Schema(
+            Arrays.asList(new Field("id", new FieldType(false, new ArrowType.Int(32, true), null, pkMeta), null), locationField),
+            Map.of()
+        );
+
+        double[][] values = geoStructFixtureValues();
+        int rowCount = values.length;
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            byte[] ipcBytes;
+            try (
+                VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                ByteArrayOutputStream out = new ByteArrayOutputStream()
+            ) {
+                IntVector idVector = (IntVector) root.getVector("id");
+                FixedSizeListVector location = (FixedSizeListVector) root.getVector("location");
+                Float8Vector element = (Float8Vector) location.getDataVector();
+                root.allocateNew();
+                int elem = 0;
+                for (int i = 0; i < rowCount; i++) {
+                    idVector.setSafe(i, i);
+                    double[] row = values[i];
+                    if (row == null) {
+                        location.setNull(i);
+                        // FixedSizeList still consumes two element slots per row.
+                        element.setNull(elem++);
+                        element.setNull(elem++);
+                    } else {
+                        location.setNotNull(i);
+                        double first = latLonOrder ? row[0] : row[1];
+                        double second = latLonOrder ? row[1] : row[0];
+                        element.setSafe(elem++, first);
+                        element.setSafe(elem++, second);
+                    }
+                }
+                root.setRowCount(rowCount);
+                try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                }
+                ipcBytes = out.toByteArray();
+            }
+            try (
+                ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+            ) {
+                Data.exportArrayStream(allocator, reader, stream);
+                WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
+                Dataset.create(allocator, stream, uri, writeParams).close();
+            }
+        }
+        return uri;
+    }
+
+    /**
      * Pins the JVM's default {@link Locale} to {@link Locale#ROOT} for the
      * duration of a Lance write, restoring the previous default afterwards.
      *
