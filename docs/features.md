@@ -132,7 +132,7 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 
 ### Mapping overrides
 
-- Attach body accepts an `overrides` clause with per-column mapping rules. Four kinds are supported: a `date` type override, a `keyword` type override, an `ip` type override, and keyword sub-fields (`fields`). `type` and `fields` may appear together on one column:
+- Attach body accepts an `overrides` clause with per-column mapping rules. Five kinds are supported: a `date` type override, a `keyword` type override, an `ip` type override, a `wildcard` type override, and keyword sub-fields (`fields`). `type` and `fields` may appear together on one column:
 
   ```json
   POST /_lance/attach
@@ -149,15 +149,17 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 - `type: date` on a signed 32 or 64 bit integer column reads the stored value as epoch millis: the mapping becomes `date` with the declared `format` (default `epoch_millis`), so range queries with ISO dates, `date_histogram`, and sort behave as on a real date column. An Int32 column is accepted and its values are read as millis too (which places them near 1970; useful only when that is what the writer stored). On a Date / Timestamp column the override is a no-op pin of the type the derivation picks anyway, so one override list can be applied uniformly to several tables. `_source` renders the raw integer, not a formatted date.
 - `type: keyword` on a Utf8 column maps it to `keyword` even when the column carries a Lance inverted index, for operators that prefer exact matches and terms aggregations over `lance_text`. The column leaves the FTS build targets, so `build_indexes` neither creates nor optimises an FTS index for it; an inverted index the table already has stays untouched on the Lance side. On a List&lt;Utf8&gt; column the override pins the derived type. `lance_match` and friends on such a column are refused like on any other keyword field.
 - `type: ip` on a Utf8 column of IP address strings (or a List&lt;Utf8&gt; for the multi-valued shape) maps it to `ip`. The fragment reader parses each string and serves the 16 byte `InetAddressPoint` encoding through doc values, so `term` (exact or CIDR notation like `10.0.0.0/8`), `terms`, `range`, `exists`, sort and `terms` aggregations behave as on a stock `ip` field, with sort order and aggregation keys following address order rather than string order (an IPv4-mapped IPv6 form like `::ffff:10.0.0.2` matches and buckets as `10.0.0.2`). `_source` renders the original strings. A string that does not parse as an IP address is served as missing (absent from `exists` and every bucket, present in `_source`); the count of such values is logged once per fragment. A keyword sub-field (`fields`) on the ip column serves the raw strings for exact string match. Predicates on an ip field never push down to Lance SQL: a range over the encoded form is not a lexical string range, and even a term equality only matches when the stored strings are canonical, which the plugin cannot know, so the scan runs unfiltered and Lucene evaluates the predicate over the encoded doc values.
+- `type: wildcard` on a Utf8 column declares that the operator wants wildcard-style access to the column. On this plugin it is served by the keyword doc values path: the emitted mapping is `keyword` with `meta.lance_override_type: wildcard` recording the declared type, and `wildcard`, `prefix`, `regexp` and `term` queries evaluate against SortedSetDocValues per hit, exactly as on a `keyword` column (including the Lance SQL pushdown of those patterns to `LIKE` / `regexp_like` / `starts_with` over the stored Utf8). The n-gram-accelerated `wildcard` field type of OpenSearch core is not used because the fragment reader has no postings: in the 3.7 tree, `WildcardFieldType.wildcardQuery` always builds its first phase from `matchAllTermsQuery` over the pattern's required trigram terms with `isSearchable` hardcoded, so without an inverted index every query on that field type would match nothing. Like the `keyword` override, the column leaves the FTS build and optimise targets.
 - `fields` declares `keyword` sub-fields on a Utf8 base column (`lance_text` or `keyword`), so a single Lance column serves both full-text and exact-match / aggregation without duplicating source. Sub-field query resolution goes through Lucene doc values on the base column.
 - Validation answers 400 naming the column and the reason:
 
   | rule | accepted |
   |---|---|
-  | `type` values | `date`, `keyword`, `ip` |
+  | `type` values | `date`, `keyword`, `ip`, `wildcard` |
   | `type: date` column | signed Int32 / Int64, Date, Timestamp |
   | `type: keyword` column | Utf8 (with or without inverted index), List&lt;Utf8&gt; |
   | `type: ip` column | Utf8, List&lt;Utf8&gt; (holding IP address strings) |
+  | `type: wildcard` column | Utf8 |
   | `fields` column | Utf8 (resolves to `lance_text`, `keyword` or `ip`) |
   | `format` | only with `type: date`, validated as a date format pattern |
   | keys under a column | `type`, `format`, `fields` |
@@ -293,9 +295,9 @@ Types listed here map to real OpenSearch field types with doc values or FTS back
 | `fixed_size_list<float32>` | `knn_vector` | Dimension carried through the mapping; `lance_knn` validates it. |
 | `binary` / `large_binary` | `binary` | Base64 in `_source`, no doc values. |
 
-Multi-fields (`fields.raw: keyword` on a Utf8 base column), a `date` override on an epoch-millis integer column, a `keyword` override on an inverted-index Utf8 column, and an `ip` override on a Utf8 column of address strings are supported through the `overrides` attach clause above.
+Multi-fields (`fields.raw: keyword` on a Utf8 base column), a `date` override on an epoch-millis integer column, a `keyword` override on an inverted-index Utf8 column, an `ip` override on a Utf8 column of address strings, and a `wildcard` override served by the keyword path are supported through the `overrides` attach clause above.
 
-Types not yet surfaced: `wildcard` and the geo family. `Utf8` list, `Decimal`, and `FloatingPoint(HALF)` are stored in the table but excluded from the mapping today; the attach response notes them.
+Types not yet surfaced: the geo family. `Utf8` list, `Decimal`, and `FloatingPoint(HALF)` are stored in the table but excluded from the mapping today; the attach response notes them.
 
 ### Nested (`list<struct>`)
 

@@ -201,11 +201,17 @@ public final class LanceFragmentSchema {
         // reader must serve it through SortedSetDocValues like any other
         // keyword column; drop it from the FTS set before classification
         // refines TEXT_FTS. The Lance inverted index on the column stays
-        // in place, it is just not consulted by this index. An `ip`
-        // override does the same and additionally marks the column so
-        // the dictionary loaders encode every value into the 16 byte
-        // InetAddressPoint form the `ip` field type reads.
-        Set<String> keywordOverridden = overrides == null ? Set.of() : overrides.keywordColumns();
+        // in place, it is just not consulted by this index. A `wildcard`
+        // override is served by the same keyword path (only the mapping
+        // meta differs), so it joins the same set. An `ip` override does
+        // the same and additionally marks the column so the dictionary
+        // loaders encode every value into the 16 byte InetAddressPoint
+        // form the `ip` field type reads.
+        Set<String> keywordOverridden = new HashSet<>();
+        if (overrides != null) {
+            keywordOverridden.addAll(overrides.keywordColumns());
+            keywordOverridden.addAll(overrides.wildcardColumns());
+        }
         Set<String> ipOverridden = overrides == null ? Set.of() : overrides.ipColumns();
 
         // Flatten the multi-fields spec into "<sub>" → "<base>" lookup so

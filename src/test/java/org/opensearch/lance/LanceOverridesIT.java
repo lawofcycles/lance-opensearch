@@ -247,7 +247,7 @@ public class LanceOverridesIT extends LanceRestTestCase {
             () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"label\":{\"type\":\"geo_point\"}}}")
         );
         assertEquals(400, badType.getResponse().getStatusLine().getStatusCode());
-        assertTrue(readAll(badType.getResponse()).contains("[date], [keyword], [ip]"));
+        assertTrue(readAll(badType.getResponse()).contains("[date], [keyword], [ip], [wildcard]"));
 
         // Arrow type outside the accepted set: refused at derive time.
         ResponseException dateOnUtf8 = expectThrows(

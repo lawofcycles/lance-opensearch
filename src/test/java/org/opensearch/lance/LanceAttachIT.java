@@ -816,7 +816,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     }
 
     public void testOverridesRejectsUnknownColumnType() throws Exception {
-        // Type values outside the accepted set (date, keyword, ip) are
+        // Type values outside the accepted set are
         // refused at parse time, naming the accepted set.
         String suffix = "overrides-type-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
@@ -829,7 +829,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         );
         assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
         String body = readAll(failure.getResponse());
-        assertTrue("expected message naming the accepted types: " + body, body.contains("[date], [keyword], [ip]"));
+        assertTrue("expected message naming the accepted types: " + body, body.contains("[date], [keyword], [ip], [wildcard]"));
     }
 
     public void testOverridesConflictsWithMultiFieldsRejected() throws Exception {

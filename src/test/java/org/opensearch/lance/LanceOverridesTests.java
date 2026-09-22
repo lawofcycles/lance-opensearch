@@ -104,7 +104,7 @@ public class LanceOverridesTests extends OpenSearchTestCase {
             () -> LanceOverrides.parseAttachClauses(Map.of("col", Map.of("type", "geo_point")), null)
         );
         assertTrue(e.getMessage(), e.getMessage().contains("type=geo_point"));
-        assertTrue(e.getMessage(), e.getMessage().contains("[date], [keyword], [ip]"));
+        assertTrue(e.getMessage(), e.getMessage().contains("[date], [keyword], [ip], [wildcard]"));
     }
 
     public void testIpTypeParsesAndReportsThroughIpColumns() {
@@ -112,6 +112,21 @@ public class LanceOverridesTests extends OpenSearchTestCase {
         assertEquals(java.util.Set.of("addr"), overrides.ipColumns());
         assertTrue(overrides.keywordColumns().isEmpty());
         assertEquals(overrides, LanceOverrides.parse(overrides.toJson()));
+    }
+
+    public void testWildcardTypeParsesAndReportsThroughWildcardColumns() {
+        LanceOverrides overrides = LanceOverrides.parseAttachClauses(Map.of("path", Map.of("type", "wildcard")), null);
+        assertEquals(java.util.Set.of("path"), overrides.wildcardColumns());
+        assertTrue(overrides.keywordColumns().isEmpty());
+        assertEquals(overrides, LanceOverrides.parse(overrides.toJson()));
+    }
+
+    public void testFormatWithWildcardTypeRejected() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(Map.of("path", Map.of("type", "wildcard", "format", "epoch_millis")), null)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("only accepted together with [type: date]"));
     }
 
     public void testFormatWithIpTypeRejected() {
