@@ -19,7 +19,7 @@ import java.io.IOException;
  * Request for {@link LanceExplainAction}: the index named in
  * {@code GET /<index>/_lance/explain} and the parsed search body whose
  * plan is explained. The body is optional on the wire; an absent body
- * is rejected by the translator the way a body without aggregations is.
+ * is rejected by the translator as {@code empty body}.
  *
  * <p>Implements {@link IndicesRequest} so a security plugin can apply
  * index-level permissions to the one index named in the path.
