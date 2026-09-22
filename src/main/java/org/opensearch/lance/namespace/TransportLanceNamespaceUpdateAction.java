@@ -106,7 +106,7 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
         if (request.operation() == LanceNamespaceUpdateRequest.Operation.REGISTER) {
             RegisterDecision decision;
             try {
-                decision = decideRegister(allowedRoots, state.metadata().custom(LanceNamespaceMetadata.TYPE), request.rootUri());
+                decision = decideRegister(allowedRoots, state.metadata().custom(LanceNamespaceMetadata.TYPE), request.toEntry());
             } catch (Exception e) {
                 listener.onFailure(e);
                 return;
@@ -145,6 +145,13 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
      * existence check runs last so a repeated register of a known root
      * stays a no-op even if the directory has gone away.
      *
+     * <p>The allowlist and the existence check apply to directory
+     * registrations, whose root the request itself names. A rest or
+     * glue registration has no root to check here — its tables come
+     * from the catalog at poll time — so the poll validates every
+     * table location the catalog returns against the same allowlist
+     * before surfacing it.
+     *
      * <p>These checks live here rather than in the REST handler so they
      * sit behind the {@link ActionFilters} chain: a caller without the
      * privilege gets the security plugin's response regardless of whether
@@ -153,20 +160,25 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
      * from here; Lance surfaces a missing root on the first list-tables
      * call.
      */
-    static RegisterDecision decideRegister(AllowedTableRoots allowedRoots, LanceNamespaceMetadata current, String path) {
-        if (!allowedRoots.allows(path)) {
+    static RegisterDecision decideRegister(
+        AllowedTableRoots allowedRoots,
+        LanceNamespaceMetadata current,
+        LanceNamespaceMetadata.Entry entry
+    ) {
+        boolean directory = LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(entry.type());
+        if (directory && !allowedRoots.allows(entry.rootUri())) {
             throw new OpenSearchStatusException(
-                "path [" + path + "] is not under any of the configured lance.allowed_table_roots",
+                "path [" + entry.rootUri() + "] is not under any of the configured lance.allowed_table_roots",
                 RestStatus.FORBIDDEN
             );
         }
-        if (current != null) {
-            for (LanceNamespaceMetadata.Entry entry : current.entries()) {
-                if (entry.rootUri().equals(path)) {
-                    return RegisterDecision.ALREADY_REGISTERED;
-                }
-            }
+        if (current != null && current.withRegistered(entry) == current) {
+            return RegisterDecision.ALREADY_REGISTERED;
         }
+        if (!directory) {
+            return RegisterDecision.PROCEED;
+        }
+        String path = entry.rootUri();
         if (path.contains("://")) {
             return RegisterDecision.PROCEED;
         }
@@ -194,7 +206,7 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
         // authoritative decision has to happen here on the manager.
         AtomicBoolean changed = new AtomicBoolean(false);
         clusterService.submitStateUpdateTask(
-            "lance-namespace-" + request.operation().name().toLowerCase(Locale.ROOT) + " [" + request.rootUri() + "]",
+            "lance-namespace-" + request.operation().name().toLowerCase(Locale.ROOT) + " [" + request.name() + "]",
             new AckedClusterStateUpdateTask<LanceNamespaceUpdateResponse>(Priority.NORMAL, request, ActionListener.wrap(response -> {
                 listener.onResponse(new LanceNamespaceUpdateResponse(response.isAcknowledged(), changed.get()));
             }, listener::onFailure)) {
@@ -205,10 +217,8 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
                         existing = LanceNamespaceMetadata.EMPTY;
                     }
                     LanceNamespaceMetadata next = switch (request.operation()) {
-                        case REGISTER -> existing.withRegistered(
-                            new LanceNamespaceMetadata.Entry(request.rootUri(), request.storageOptions(), request.overridesJson())
-                        );
-                        case UNREGISTER -> existing.withUnregistered(request.rootUri());
+                        case REGISTER -> existing.withRegistered(request.toEntry());
+                        case UNREGISTER -> existing.withUnregistered(request.name());
                     };
                     if (next == existing) {
                         // No-op: leave the changed flag at false so
@@ -228,7 +238,7 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
 
                 @Override
                 public void onFailure(String source, Exception e) {
-                    LOG.warn("lance namespace update [{}] failed: {}", request.rootUri(), e.toString());
+                    LOG.warn("lance namespace update [{}] failed: {}", request.name(), e.toString());
                     super.onFailure(source, e);
                 }
             }

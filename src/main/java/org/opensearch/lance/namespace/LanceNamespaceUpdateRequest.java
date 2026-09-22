@@ -6,6 +6,7 @@
 package org.opensearch.lance.namespace;
 
 import java.io.IOException;
+import java.util.Map;
 
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
@@ -31,22 +32,49 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
     }
 
     private final Operation operation;
+    private final String name;
+    private final String type;
     private final String rootUri;
     private final StorageOptions storageOptions;
+    private final Map<String, String> config;
     /** Canonical JSON of the per-column mapping overrides, empty when none were declared. */
     private final String overridesJson;
 
     /**
-     * Register a namespace at {@code rootUri} with the given storage
-     * options and per-column mapping overrides. Unused fields for
-     * unregister are ignored on the wire.
+     * Register a directory namespace at {@code rootUri}, named after
+     * the root, with the given storage options and mapping overrides.
      */
     public static LanceNamespaceUpdateRequest register(String rootUri, StorageOptions storageOptions, String overridesJson) {
-        return applyLongTimeout(new LanceNamespaceUpdateRequest(Operation.REGISTER, rootUri, storageOptions, overridesJson));
+        return register(rootUri, LanceNamespaceMetadata.Entry.TYPE_DIRECTORY, rootUri, storageOptions, Map.of(), overridesJson);
     }
 
-    public static LanceNamespaceUpdateRequest unregister(String rootUri) {
-        return applyLongTimeout(new LanceNamespaceUpdateRequest(Operation.UNREGISTER, rootUri, StorageOptions.empty(), ""));
+    /**
+     * Register a namespace of any type. {@code rootUri} is the
+     * directory root and null for catalog types whose root lives in
+     * {@code config}; {@code config} carries the implementation's
+     * initialize properties as-is, secrets included.
+     */
+    public static LanceNamespaceUpdateRequest register(
+        String name,
+        String type,
+        String rootUri,
+        StorageOptions storageOptions,
+        Map<String, String> config,
+        String overridesJson
+    ) {
+        return applyLongTimeout(
+            new LanceNamespaceUpdateRequest(Operation.REGISTER, name, type, rootUri, storageOptions, config, overridesJson)
+        );
+    }
+
+    /**
+     * Remove the entry whose name is {@code identifier}, or, for
+     * directory entries, whose root path is {@code identifier}.
+     */
+    public static LanceNamespaceUpdateRequest unregister(String identifier) {
+        return applyLongTimeout(
+            new LanceNamespaceUpdateRequest(Operation.UNREGISTER, identifier, null, null, StorageOptions.empty(), Map.of(), "")
+        );
     }
 
     private static LanceNamespaceUpdateRequest applyLongTimeout(LanceNamespaceUpdateRequest request) {
@@ -58,18 +86,32 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
         return request;
     }
 
-    private LanceNamespaceUpdateRequest(Operation operation, String rootUri, StorageOptions storageOptions, String overridesJson) {
+    private LanceNamespaceUpdateRequest(
+        Operation operation,
+        String name,
+        String type,
+        String rootUri,
+        StorageOptions storageOptions,
+        Map<String, String> config,
+        String overridesJson
+    ) {
         this.operation = operation;
+        this.name = name;
+        this.type = type;
         this.rootUri = rootUri;
         this.storageOptions = storageOptions;
+        this.config = config;
         this.overridesJson = overridesJson == null ? "" : overridesJson;
     }
 
     public LanceNamespaceUpdateRequest(StreamInput in) throws IOException {
         super(in);
         this.operation = Operation.values()[in.readVInt()];
-        this.rootUri = in.readString();
+        this.name = in.readString();
+        this.type = in.readOptionalString();
+        this.rootUri = in.readOptionalString();
         this.storageOptions = StorageOptions.readFromStream(in);
+        this.config = in.readMap(StreamInput::readString, StreamInput::readString);
         this.overridesJson = in.readString();
     }
 
@@ -77,26 +119,51 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
         out.writeVInt(operation.ordinal());
-        out.writeString(rootUri);
+        out.writeString(name);
+        out.writeOptionalString(type);
+        out.writeOptionalString(rootUri);
         storageOptions.writeTo(out);
+        out.writeMap(config, StreamOutput::writeString, StreamOutput::writeString);
         out.writeString(overridesJson);
     }
 
     @Override
     public ActionRequestValidationException validate() {
-        // Register / unregister both need a non-empty rootUri. Empty
-        // rootUri would silently succeed against the empty-string
-        // sentinel; explicit validation surfaces the bug early.
-        if (rootUri == null || rootUri.isEmpty()) {
-            ActionRequestValidationException ex = new ActionRequestValidationException();
-            ex.addValidationError("rootUri must not be empty");
-            return ex;
+        ActionRequestValidationException ex = null;
+        if (name == null || name.isEmpty()) {
+            ex = new ActionRequestValidationException();
+            ex.addValidationError("name must not be empty");
         }
-        return null;
+        if (operation == Operation.REGISTER) {
+            if (type == null || !LanceNamespaceMetadata.Entry.ACCEPTED_TYPES.contains(type)) {
+                if (ex == null) {
+                    ex = new ActionRequestValidationException();
+                }
+                ex.addValidationError(
+                    "unknown namespace type [" + type + "]; accepted values are " + LanceNamespaceMetadata.Entry.ACCEPTED_TYPES
+                );
+            }
+            if (LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(type) && (rootUri == null || rootUri.isEmpty())) {
+                if (ex == null) {
+                    ex = new ActionRequestValidationException();
+                }
+                ex.addValidationError("a directory namespace requires a path");
+            }
+        }
+        return ex;
     }
 
     public Operation operation() {
         return operation;
+    }
+
+    /** Registration name for register; the identifier (name or directory root) for unregister. */
+    public String name() {
+        return name;
+    }
+
+    public String type() {
+        return type;
     }
 
     public String rootUri() {
@@ -107,8 +174,18 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
         return storageOptions;
     }
 
+    public Map<String, String> config() {
+        return config;
+    }
+
+    /** Canonical overrides JSON, empty when the register call declared none. */
     public String overridesJson() {
         return overridesJson;
+    }
+
+    /** The metadata entry a register request describes. */
+    public LanceNamespaceMetadata.Entry toEntry() {
+        return new LanceNamespaceMetadata.Entry(name, type, rootUri, storageOptions, config, overridesJson);
     }
 
     @Override
