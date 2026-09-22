@@ -10,6 +10,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.time.DateFormatter;
@@ -61,7 +62,67 @@ public final class LanceOverrides {
     /** Default mapping format of a {@code type: date} override on an integer column. */
     public static final String DEFAULT_DATE_FORMAT = "epoch_millis";
 
-    public static final LanceOverrides EMPTY = new LanceOverrides(Collections.emptyMap());
+    /**
+     * The {@code indexes} value that suppresses the automatic index on a
+     * column: no scalar or vector index is built for it even when the
+     * auto-build would have created one.
+     */
+    public static final String INDEX_NONE = "none";
+
+    /**
+     * Scalar Lance index types the {@code indexes} clause accepts, each
+     * mapped to the {@code params} keys its Lance option class takes.
+     * The names are the ones Lance's scalar index plugin registry
+     * resolves ({@code ScalarIndexParams.create(name, json)}).
+     */
+    public static final Map<String, Set<String>> SCALAR_INDEX_TYPES = Map.of(
+        "btree",
+        Set.of("zone_size"),
+        "bitmap",
+        Set.of(),
+        "zonemap",
+        Set.of("rows_per_zone"),
+        "bloomfilter",
+        Set.of("number_of_items", "probability"),
+        "ngram",
+        Set.of(),
+        "labellist",
+        Set.of()
+    );
+
+    /**
+     * Vector Lance index types the {@code indexes} clause accepts, each
+     * mapped to the {@code params} keys the corresponding
+     * {@code VectorIndexParams} build accepts. {@code num_partitions}
+     * and {@code sample_rate} steer the IVF training, {@code num_bits}
+     * the quantizer ({@code PQ} / {@code SQ} / {@code RQ}),
+     * {@code num_sub_vectors} the product quantizer, {@code m} and
+     * {@code ef_construction} the HNSW graph.
+     */
+    public static final Map<String, Set<String>> VECTOR_INDEX_TYPES = Map.of(
+        "ivf_flat",
+        Set.of("num_partitions", "sample_rate"),
+        "ivf_pq",
+        Set.of("num_partitions", "num_sub_vectors", "num_bits", "sample_rate"),
+        "ivf_sq",
+        Set.of("num_partitions", "num_bits", "sample_rate"),
+        "ivf_rq",
+        Set.of("num_partitions", "num_bits"),
+        "ivf_hnsw_pq",
+        Set.of("num_partitions", "m", "ef_construction", "num_sub_vectors", "num_bits", "sample_rate"),
+        "ivf_hnsw_sq",
+        Set.of("num_partitions", "m", "ef_construction", "num_bits", "sample_rate")
+    );
+
+    /**
+     * Key the persisted {@code index.lance.overrides} JSON stores the
+     * index type preferences under, next to the per-column mapping
+     * override objects. Reserved: a mapping override cannot target a
+     * column with this name (see {@link #parseAttachClauses}).
+     */
+    static final String INDEXES_KEY = "indexes";
+
+    public static final LanceOverrides EMPTY = new LanceOverrides(Collections.emptyMap(), Collections.emptyMap());
 
     /**
      * The override of one column. {@code type} and {@code format} are
@@ -74,10 +135,32 @@ public final class LanceOverrides {
         }
     }
 
-    private final Map<String, Column> columns;
+    /**
+     * The index type preference of one column, from the attach or
+     * namespace body's {@code indexes} clause. Exactly one of
+     * {@code scalar} and {@code vector} is non-null (the clause parser
+     * enforces it); {@code params} maps the option keys of the chosen
+     * type to their numeric values and is empty when none were given.
+     * The value {@link #INDEX_NONE} means "build no index on this
+     * column".
+     */
+    public record IndexPreference(String scalar, String vector, LinkedHashMap<String, Number> params) {
+        public IndexPreference {
+            params = params == null ? new LinkedHashMap<>() : params;
+        }
 
-    private LanceOverrides(Map<String, Column> columns) {
+        /** The declared type name ({@code scalar} or {@code vector}, whichever is set). */
+        public String typeName() {
+            return scalar != null ? scalar : vector;
+        }
+    }
+
+    private final Map<String, Column> columns;
+    private final Map<String, IndexPreference> indexPreferences;
+
+    private LanceOverrides(Map<String, Column> columns, Map<String, IndexPreference> indexPreferences) {
         this.columns = Collections.unmodifiableMap(columns);
+        this.indexPreferences = Collections.unmodifiableMap(indexPreferences);
     }
 
     /** Column name to its override, in declaration order. */
@@ -85,8 +168,16 @@ public final class LanceOverrides {
         return columns;
     }
 
+    /**
+     * Column name to its index type preference from the {@code indexes}
+     * clause, in declaration order. Empty when the body declared none.
+     */
+    public Map<String, IndexPreference> indexPreferences() {
+        return indexPreferences;
+    }
+
     public boolean isEmpty() {
-        return columns.isEmpty();
+        return columns.isEmpty() && indexPreferences.isEmpty();
     }
 
     /**
@@ -184,7 +275,7 @@ public final class LanceOverrides {
         for (Map.Entry<String, LinkedHashMap<String, String>> entry : subFields.entrySet()) {
             columns.put(entry.getKey(), new Column(null, null, new LinkedHashMap<>(entry.getValue())));
         }
-        return new LanceOverrides(columns);
+        return new LanceOverrides(columns, Collections.emptyMap());
     }
 
     /** Overrides from already-validated column entries, for callers that filter an existing instance. */
@@ -192,7 +283,7 @@ public final class LanceOverrides {
         if (columns == null || columns.isEmpty()) {
             return EMPTY;
         }
-        return new LanceOverrides(new LinkedHashMap<>(columns));
+        return new LanceOverrides(new LinkedHashMap<>(columns), Collections.emptyMap());
     }
 
     /**
@@ -201,7 +292,7 @@ public final class LanceOverrides {
      * writing the setting at all.
      */
     public String toJson() {
-        if (columns.isEmpty()) {
+        if (isEmpty()) {
             return "";
         }
         try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
@@ -224,10 +315,70 @@ public final class LanceOverrides {
                 }
                 builder.endObject();
             }
+            if (!indexPreferences.isEmpty()) {
+                builder.startObject(INDEXES_KEY);
+                writeIndexPreferences(builder, indexPreferences);
+                builder.endObject();
+            }
             builder.endObject();
             return builder.toString();
         } catch (Exception e) {
             throw new IllegalStateException("failed to serialise lance overrides", e);
+        }
+    }
+
+    private static void writeIndexPreferences(XContentBuilder builder, Map<String, IndexPreference> preferences) throws Exception {
+        for (Map.Entry<String, IndexPreference> entry : preferences.entrySet()) {
+            builder.startObject(entry.getKey());
+            IndexPreference preference = entry.getValue();
+            if (preference.scalar() != null) {
+                builder.field("scalar", preference.scalar());
+            }
+            if (preference.vector() != null) {
+                builder.field("vector", preference.vector());
+            }
+            if (!preference.params().isEmpty()) {
+                builder.startObject("params");
+                for (Map.Entry<String, Number> param : preference.params().entrySet()) {
+                    builder.field(param.getKey(), param.getValue());
+                }
+                builder.endObject();
+            }
+            builder.endObject();
+        }
+    }
+
+    /**
+     * Compact canonical JSON of one preference map alone, the shape the
+     * {@code indexes} object has on the attach body. Carries a one-shot
+     * {@code build_indexes} preference over the wire; empty string on an
+     * empty map.
+     */
+    public static String indexPreferencesToJson(Map<String, IndexPreference> preferences) {
+        if (preferences == null || preferences.isEmpty()) {
+            return "";
+        }
+        try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
+            builder.startObject();
+            writeIndexPreferences(builder, preferences);
+            builder.endObject();
+            return builder.toString();
+        } catch (Exception e) {
+            throw new IllegalStateException("failed to serialise lance index preferences", e);
+        }
+    }
+
+    /** Parse {@link #indexPreferencesToJson} back. Empty map on empty or null input. */
+    public static Map<String, IndexPreference> indexPreferencesFromJson(String json) {
+        if (json == null || json.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
+            return parseIndexesClause(parser.mapOrdered());
+        } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalArgumentException("failed to parse lance index preferences JSON: " + e.getMessage(), e);
         }
     }
 
@@ -243,7 +394,9 @@ public final class LanceOverrides {
         try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
             // mapOrdered keeps the declaration order, which drives the
             // order of the emitted mapping fields.
-            return parseAttachClauses(parser.mapOrdered(), null);
+            Map<String, Object> raw = parser.mapOrdered();
+            Object indexesRaw = raw.remove(INDEXES_KEY);
+            return parseAttachClauses(raw, null, indexesRaw);
         } catch (IllegalArgumentException e) {
             throw e;
         } catch (Exception e) {
@@ -272,6 +425,20 @@ public final class LanceOverrides {
      *     REST layer surfaces it as a 400
      */
     public static LanceOverrides parseAttachClauses(Object overridesRaw, Object multiFieldsRaw) {
+        return parseAttachClauses(overridesRaw, multiFieldsRaw, null);
+    }
+
+    /**
+     * Same as {@link #parseAttachClauses(Object, Object)} with the
+     * body's {@code indexes} clause: per-column Lance index type
+     * preferences ({@code scalar} / {@code vector} / {@code params}),
+     * parsed through {@link #parseIndexesClause}. Because the
+     * preferences persist inside the same {@code index.lance.overrides}
+     * JSON under a top-level {@code indexes} key, a mapping override
+     * cannot target a column literally named {@code indexes}; declaring
+     * one is rejected here.
+     */
+    public static LanceOverrides parseAttachClauses(Object overridesRaw, Object multiFieldsRaw, Object indexesRaw) {
         LinkedHashMap<String, Column> columns = new LinkedHashMap<>();
         if (overridesRaw != null) {
             if (!(overridesRaw instanceof Map<?, ?> rawMap)) {
@@ -280,6 +447,12 @@ public final class LanceOverrides {
             for (Map.Entry<?, ?> entry : rawMap.entrySet()) {
                 if (!(entry.getKey() instanceof String baseName) || baseName.isEmpty()) {
                     throw new IllegalArgumentException("[overrides] keys must be non-empty column names");
+                }
+                if (INDEXES_KEY.equals(baseName)) {
+                    throw new IllegalArgumentException(
+                        "[overrides.indexes] is not accepted: [indexes] is reserved for the index type preferences "
+                            + "persisted next to the overrides; a mapping override cannot target a column with that name"
+                    );
                 }
                 columns.put(baseName, parseColumn(baseName, entry.getValue()));
             }
@@ -305,7 +478,119 @@ public final class LanceOverrides {
                 }
             }
         }
-        return columns.isEmpty() ? EMPTY : new LanceOverrides(columns);
+        Map<String, IndexPreference> preferences = indexesRaw == null ? Collections.emptyMap() : parseIndexesClause(indexesRaw);
+        return columns.isEmpty() && preferences.isEmpty() ? EMPTY : new LanceOverrides(columns, preferences);
+    }
+
+    /**
+     * Parse the {@code indexes} clause of an attach, namespace-register
+     * or {@code build_indexes} body into per-column preferences.
+     * Structural validation only, everything a 400 without opening the
+     * table: each column entry must be an object whose keys come from
+     * {@code scalar} / {@code vector} / {@code params}; exactly one of
+     * {@code scalar} and {@code vector} must be declared, its value one
+     * of the type names Lance's Java SDK can build for that kind (or
+     * {@link #INDEX_NONE}); {@code params} keys are checked against the
+     * chosen type's option class and values must be numbers.
+     * Schema-dependent validation (does the column exist, is it a
+     * scalar or vector column) happens where the dataset is open.
+     *
+     * @throws IllegalArgumentException on any structural violation; the
+     *     REST layer surfaces it as a 400
+     */
+    public static LinkedHashMap<String, IndexPreference> parseIndexesClause(Object raw) {
+        if (!(raw instanceof Map<?, ?> rawMap)) {
+            throw new IllegalArgumentException("[indexes] must be an object; per-column Lance index type preferences");
+        }
+        LinkedHashMap<String, IndexPreference> preferences = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : rawMap.entrySet()) {
+            if (!(entry.getKey() instanceof String column) || column.isEmpty()) {
+                throw new IllegalArgumentException("[indexes] keys must be non-empty column names");
+            }
+            preferences.put(column, parseIndexPreference(column, entry.getValue()));
+        }
+        return preferences;
+    }
+
+    private static IndexPreference parseIndexPreference(String column, Object rawSpec) {
+        if (!(rawSpec instanceof Map<?, ?> spec)) {
+            throw new IllegalArgumentException("[indexes." + column + "] must be an object");
+        }
+        for (Object key : spec.keySet()) {
+            if (!"scalar".equals(key) && !"vector".equals(key) && !"params".equals(key)) {
+                throw new IllegalArgumentException(
+                    "[indexes." + column + "] has unknown key [" + key + "]; accepted keys are [scalar], [vector], [params]"
+                );
+            }
+        }
+        String scalar = indexTypeName(column, "scalar", spec.get("scalar"), SCALAR_INDEX_TYPES.keySet());
+        String vector = indexTypeName(column, "vector", spec.get("vector"), VECTOR_INDEX_TYPES.keySet());
+        if (scalar != null && vector != null) {
+            throw new IllegalArgumentException(
+                "[indexes." + column + "] declares both [scalar] and [vector]; a column carries one index kind"
+            );
+        }
+        if (scalar == null && vector == null) {
+            throw new IllegalArgumentException("[indexes." + column + "] must declare one of [scalar], [vector]");
+        }
+        String typeName = scalar != null ? scalar : vector;
+        LinkedHashMap<String, Number> params = new LinkedHashMap<>();
+        Object rawParams = spec.get("params");
+        if (rawParams != null) {
+            if (INDEX_NONE.equals(typeName)) {
+                throw new IllegalArgumentException("[indexes." + column + ".params] is not accepted together with [" + INDEX_NONE + "]");
+            }
+            if (!(rawParams instanceof Map<?, ?> paramsMap)) {
+                throw new IllegalArgumentException("[indexes." + column + ".params] must be an object of numeric values");
+            }
+            Set<String> accepted = scalar != null ? SCALAR_INDEX_TYPES.get(scalar) : VECTOR_INDEX_TYPES.get(vector);
+            for (Map.Entry<?, ?> param : paramsMap.entrySet()) {
+                if (!(param.getKey() instanceof String key) || !accepted.contains(key)) {
+                    throw new IllegalArgumentException(
+                        "[indexes."
+                            + column
+                            + ".params] has unknown key ["
+                            + param.getKey()
+                            + "] for ["
+                            + typeName
+                            + "]; "
+                            + (accepted.isEmpty() ? "[" + typeName + "] accepts no params" : "accepted keys are " + new TreeSet<>(accepted))
+                    );
+                }
+                if (!(param.getValue() instanceof Number value)) {
+                    throw new IllegalArgumentException(
+                        "[indexes." + column + ".params." + param.getKey() + "] must be a number, got " + param.getValue()
+                    );
+                }
+                params.put(key, value);
+            }
+        }
+        return new IndexPreference(scalar, vector, params);
+    }
+
+    private static String indexTypeName(String column, String kind, Object raw, Set<String> accepted) {
+        if (raw == null) {
+            return null;
+        }
+        if (!(raw instanceof String name) || name.isEmpty()) {
+            throw new IllegalArgumentException("[indexes." + column + "." + kind + "] must be a non-empty string");
+        }
+        if (!INDEX_NONE.equals(name) && !accepted.contains(name)) {
+            throw new IllegalArgumentException(
+                "[indexes."
+                    + column
+                    + "."
+                    + kind
+                    + "="
+                    + name
+                    + "] is not supported; accepted values are "
+                    + new TreeSet<>(accepted)
+                    + " or ["
+                    + INDEX_NONE
+                    + "]"
+            );
+        }
+        return name;
     }
 
     private static Column parseColumn(String baseName, Object rawSpec) {
@@ -391,16 +676,16 @@ public final class LanceOverrides {
         if (!(o instanceof LanceOverrides other)) {
             return false;
         }
-        return columns.equals(other.columns);
+        return columns.equals(other.columns) && indexPreferences.equals(other.indexPreferences);
     }
 
     @Override
     public int hashCode() {
-        return columns.hashCode();
+        return columns.hashCode() * 31 + indexPreferences.hashCode();
     }
 
     @Override
     public String toString() {
-        return "LanceOverrides" + columns;
+        return "LanceOverrides" + columns + (indexPreferences.isEmpty() ? "" : " indexes" + indexPreferences);
     }
 }
