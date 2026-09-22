@@ -43,10 +43,8 @@ import org.apache.calcite.util.ImmutableBitSet;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchema;
 import org.opensearch.lance.plan.calcite.LanceTable;
-import org.opensearch.lance.plan.substrait.LanceAggregateSpecs.BucketKind;
-import org.opensearch.lance.plan.substrait.LanceAggregateSpecs.BucketSpec;
-import org.opensearch.lance.plan.substrait.LanceAggregateSpecs.MetricKind;
-import org.opensearch.lance.plan.substrait.LanceAggregateSpecs.MetricSpec;
+import org.opensearch.lance.plan.rel.BucketSpec;
+import org.opensearch.lance.plan.rel.MetricSpec;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -155,7 +153,7 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             ImmutableBitSet.of(),
             List.of(call(SqlStdOperatorTable.SUM, join, 0, 1, "m0")),
             List.of(),
-            List.of(MetricSpec.of(MetricKind.SUM, "m"))
+            List.of(MetricSpec.of(MetricSpec.Kind.SUM, "m"))
         );
         assertEquals(Optional.empty(), LanceSubstraitProducer.toLanceAggregate(aggregate));
     }
@@ -168,7 +166,7 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             ImmutableBitSet.of(),
             List.of(distinct),
             List.of(),
-            List.of(MetricSpec.of(MetricKind.SUM, "m"))
+            List.of(MetricSpec.of(MetricSpec.Kind.SUM, "m"))
         );
         assertEquals(Optional.empty(), LanceSubstraitProducer.toLanceAggregate(aggregate));
     }
@@ -183,8 +181,8 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             input,
             ImmutableBitSet.of(0),
             List.of(call(SqlStdOperatorTable.SUM, input, 1, 1, "m0")),
-            List.of(BucketSpec.of(BucketKind.TERMS, "k")),
-            List.of(MetricSpec.of(MetricKind.SUM, "m"))
+            List.of(BucketSpec.of(BucketSpec.Kind.TERMS, "k")),
+            List.of(MetricSpec.of(MetricSpec.Kind.SUM, "m"))
         );
         assertEquals(Optional.empty(), LanceSubstraitProducer.toLanceAggregate(aggregate));
     }
@@ -211,8 +209,8 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             input,
             ImmutableBitSet.of(0),
             List.of(call(SqlStdOperatorTable.SUM, input, 1, 1, "m0")),
-            List.of(BucketSpec.of(BucketKind.HISTOGRAM, "k")),
-            List.of(MetricSpec.of(MetricKind.SUM, "m"))
+            List.of(BucketSpec.of(BucketSpec.Kind.HISTOGRAM, "k")),
+            List.of(MetricSpec.of(MetricSpec.Kind.SUM, "m"))
         );
 
         Plan plan = parse(LanceSubstraitProducer.toLanceAggregate(aggregate).orElseThrow());
@@ -240,8 +238,8 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             input,
             ImmutableBitSet.of(0),
             List.of(call(SqlStdOperatorTable.SUM, input, 1, 1, "m0")),
-            List.of(BucketSpec.of(BucketKind.TERMS, "k")),
-            List.of(MetricSpec.of(MetricKind.SUM, "m"))
+            List.of(BucketSpec.of(BucketSpec.Kind.TERMS, "k")),
+            List.of(MetricSpec.of(MetricSpec.Kind.SUM, "m"))
         );
 
         Plan plan = parse(LanceSubstraitProducer.toLanceAggregate(aggregate).orElseThrow());
@@ -264,8 +262,8 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             input,
             ImmutableBitSet.of(0),
             List.of(call(SqlStdOperatorTable.SUM, input, 1, 1, "m0")),
-            List.of(BucketSpec.of(BucketKind.HISTOGRAM, "h")),
-            List.of(MetricSpec.of(MetricKind.SUM, "s"))
+            List.of(BucketSpec.of(BucketSpec.Kind.HISTOGRAM, "h")),
+            List.of(MetricSpec.of(MetricSpec.Kind.SUM, "s"))
         );
 
         ByteBuffer buffer = LanceSubstraitProducer.toLanceAggregate(aggregate).orElseThrow();
@@ -294,7 +292,7 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             input,
             ImmutableBitSet.of(0),
             List.of(),
-            List.of(BucketSpec.of(BucketKind.DATE_HISTOGRAM_CALENDAR, "d")),
+            List.of(BucketSpec.of(BucketSpec.Kind.DATE_HISTOGRAM_CALENDAR, "d")),
             List.of()
         );
 
@@ -334,7 +332,7 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             input,
             ImmutableBitSet.of(0),
             List.of(),
-            List.of(BucketSpec.of(BucketKind.TERMS, "t")),
+            List.of(BucketSpec.of(BucketSpec.Kind.TERMS, "t")),
             List.of()
         );
 
@@ -360,7 +358,7 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             ImmutableBitSet.of(),
             List.of(call(SqlStdOperatorTable.COUNT, scan, 0, 3, "m0")),
             List.of(),
-            List.of(MetricSpec.of(MetricKind.CARDINALITY, "c"))
+            List.of(MetricSpec.of(MetricSpec.Kind.CARDINALITY, "c"))
         );
 
         Plan plan = parse(LanceSubstraitProducer.toLanceAggregate(aggregate).orElseThrow());
@@ -378,7 +376,7 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             ImmutableBitSet.of(),
             List.of(call(SqlStdOperatorTable.COUNT, scan, 0, 1, "m0")),
             List.of(),
-            List.of(MetricSpec.of(MetricKind.PERCENTILES, "p"))
+            List.of(MetricSpec.of(MetricSpec.Kind.PERCENTILES, "p"))
         );
 
         Plan main = parse(LanceSubstraitProducer.toLanceAggregate(aggregate).orElseThrow());
@@ -399,7 +397,7 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             ImmutableBitSet.of(),
             List.of(call(SqlStdOperatorTable.SUM, scan, 0, 1, "m0")),
             List.of(),
-            List.of(MetricSpec.of(MetricKind.SUM, "s"))
+            List.of(MetricSpec.of(MetricSpec.Kind.SUM, "s"))
         );
         assertEquals(Optional.empty(), LanceSubstraitProducer.toLancePercentilesBins(aggregate, 0, 0d, 100d, 10));
         assertEquals(Optional.empty(), LanceSubstraitProducer.toLancePercentilesBins(aggregate, 5, 0d, 100d, 10));
@@ -412,7 +410,7 @@ public class LanceSubstraitProducerTests extends OpenSearchTestCase {
             ImmutableBitSet.of(),
             List.of(call(SqlStdOperatorTable.SUM, scan, 0, 1, "m0")),
             List.of(),
-            List.of(MetricSpec.of(MetricKind.EXTENDED_STATS, "e"))
+            List.of(MetricSpec.of(MetricSpec.Kind.EXTENDED_STATS, "e"))
         );
 
         Plan plan = parse(LanceSubstraitProducer.toLanceAggregate(aggregate).orElseThrow());

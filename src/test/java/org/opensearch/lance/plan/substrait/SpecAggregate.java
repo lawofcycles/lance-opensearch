@@ -11,17 +11,20 @@ import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.util.ImmutableBitSet;
+import org.opensearch.lance.plan.rel.BucketSpec;
+import org.opensearch.lance.plan.rel.MetricSpec;
 
 import java.util.List;
 
 /**
  * Test-only {@link Aggregate} subclass implementing
- * {@link LanceAggregateSpecs}: the stand-in for the planner's aggregate
- * node, which lands in a parallel change. The producer keys every
- * expansion decision on the {@link LanceAggregateSpecs.MetricSpec}
- * kinds, not on the Calcite aggregate functions, so tests build the
- * calls with whichever standard function types correctly and attach
- * the OpenSearch kind through the spec.
+ * {@link LanceAggregateSpecs}: a stand-in for the planner's
+ * {@code LanceAggregate} that lets the producer tests attach the
+ * OpenSearch kinds to hand built trees. The producer keys every
+ * expansion decision on the {@link MetricSpec} kinds, not on the
+ * Calcite aggregate functions, so tests build the calls with whichever
+ * standard function types correctly and attach the OpenSearch kind
+ * through the spec.
  */
 public final class SpecAggregate extends Aggregate implements LanceAggregateSpecs {
 

@@ -54,10 +54,8 @@ import org.opensearch.lance.attach.LanceAttachResponse;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchema;
 import org.opensearch.lance.plan.calcite.LanceTable;
-import org.opensearch.lance.plan.substrait.LanceAggregateSpecs.BucketKind;
-import org.opensearch.lance.plan.substrait.LanceAggregateSpecs.BucketSpec;
-import org.opensearch.lance.plan.substrait.LanceAggregateSpecs.MetricKind;
-import org.opensearch.lance.plan.substrait.LanceAggregateSpecs.MetricSpec;
+import org.opensearch.lance.plan.rel.BucketSpec;
+import org.opensearch.lance.plan.rel.MetricSpec;
 import org.opensearch.lance.plan.substrait.LanceSubstraitProducer;
 import org.opensearch.lance.plan.substrait.SpecAggregate;
 import org.opensearch.lance.query.substrait.SubstraitAggregatePlan;
@@ -147,11 +145,11 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
                         ),
                         List.of(),
                         List.of(
-                            MetricSpec.of(MetricKind.SUM, "s"),
-                            MetricSpec.of(MetricKind.AVG, "a"),
-                            MetricSpec.of(MetricKind.MIN, "mn"),
-                            MetricSpec.of(MetricKind.MAX, "mx"),
-                            MetricSpec.of(MetricKind.VALUE_COUNT, "vc")
+                            MetricSpec.of(MetricSpec.Kind.SUM, "s"),
+                            MetricSpec.of(MetricSpec.Kind.AVG, "a"),
+                            MetricSpec.of(MetricSpec.Kind.MIN, "mn"),
+                            MetricSpec.of(MetricSpec.Kind.MAX, "mx"),
+                            MetricSpec.of(MetricSpec.Kind.VALUE_COUNT, "vc")
                         )
                     )
                 )
@@ -162,13 +160,13 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
                 "stats",
                 dataset,
                 legacy(dataset, qsc, AggregationBuilders.stats("s").field("rating")),
-                produced(metricOnly(scan, rating, MetricKind.STATS))
+                produced(metricOnly(scan, rating, MetricSpec.Kind.STATS))
             );
             compare(
                 "extended_stats",
                 dataset,
                 legacy(dataset, qsc, AggregationBuilders.extendedStats("e").field("rating").sigma(3)),
-                produced(metricOnly(scan, rating, MetricKind.EXTENDED_STATS))
+                produced(metricOnly(scan, rating, MetricSpec.Kind.EXTENDED_STATS))
             );
 
             // cardinality groups the scan by the distinct values.
@@ -176,7 +174,7 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
                 "cardinality",
                 dataset,
                 legacy(dataset, qsc, AggregationBuilders.cardinality("c").field("category")),
-                produced(metricOnly(scan, category, MetricKind.CARDINALITY))
+                produced(metricOnly(scan, category, MetricSpec.Kind.CARDINALITY))
             );
 
             // terms with an avg child.
@@ -193,8 +191,8 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
                         scan,
                         ImmutableBitSet.of(category),
                         List.of(call(SqlStdOperatorTable.AVG, scan, 1, rating, "m0")),
-                        List.of(BucketSpec.of(BucketKind.TERMS, "t")),
-                        List.of(MetricSpec.of(MetricKind.AVG, "a"))
+                        List.of(BucketSpec.of(BucketSpec.Kind.TERMS, "t")),
+                        List.of(MetricSpec.of(MetricSpec.Kind.AVG, "a"))
                     )
                 )
             );
@@ -217,8 +215,8 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
                         scan,
                         ImmutableBitSet.of(category, flag),
                         List.of(call(SqlStdOperatorTable.AVG, scan, 2, rating, "m0")),
-                        List.of(BucketSpec.of(BucketKind.TERMS, "c"), BucketSpec.of(BucketKind.TERMS, "f")),
-                        List.of(MetricSpec.of(MetricKind.AVG, "a"))
+                        List.of(BucketSpec.of(BucketSpec.Kind.TERMS, "c"), BucketSpec.of(BucketSpec.Kind.TERMS, "f")),
+                        List.of(MetricSpec.of(MetricSpec.Kind.AVG, "a"))
                     )
                 )
             );
@@ -249,7 +247,7 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
                         histogramInput,
                         ImmutableBitSet.of(0),
                         List.of(),
-                        List.of(BucketSpec.of(BucketKind.HISTOGRAM, "h")),
+                        List.of(BucketSpec.of(BucketSpec.Kind.HISTOGRAM, "h")),
                         List.of()
                     )
                 )
@@ -280,7 +278,7 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
                         range.build(),
                         ImmutableBitSet.of(0),
                         List.of(),
-                        List.of(BucketSpec.of(BucketKind.RANGE, "r")),
+                        List.of(BucketSpec.of(BucketSpec.Kind.RANGE, "r")),
                         List.of()
                     )
                 )
@@ -322,7 +320,7 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
                         filters.build(),
                         ImmutableBitSet.of(0),
                         List.of(),
-                        List.of(BucketSpec.of(BucketKind.FILTERS, "fs")),
+                        List.of(BucketSpec.of(BucketSpec.Kind.FILTERS, "fs")),
                         List.of()
                     )
                 )
@@ -341,7 +339,7 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
                         missing.build(),
                         ImmutableBitSet.of(0),
                         List.of(),
-                        List.of(BucketSpec.of(BucketKind.MISSING, "m")),
+                        List.of(BucketSpec.of(BucketSpec.Kind.MISSING, "m")),
                         List.of()
                     )
                 )
@@ -376,7 +374,7 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
                         fixed.build(),
                         ImmutableBitSet.of(0),
                         List.of(),
-                        List.of(BucketSpec.of(BucketKind.DATE_HISTOGRAM_FIXED, "d")),
+                        List.of(BucketSpec.of(BucketSpec.Kind.DATE_HISTOGRAM_FIXED, "d")),
                         List.of()
                     )
                 )
@@ -395,7 +393,7 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
                         calendar.build(),
                         ImmutableBitSet.of(0),
                         List.of(),
-                        List.of(BucketSpec.of(BucketKind.DATE_HISTOGRAM_CALENDAR, "d")),
+                        List.of(BucketSpec.of(BucketSpec.Kind.DATE_HISTOGRAM_CALENDAR, "d")),
                         List.of()
                     )
                 )
@@ -424,7 +422,10 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
                         composite.build(),
                         ImmutableBitSet.of(0, 1),
                         List.of(),
-                        List.of(BucketSpec.of(BucketKind.COMPOSITE_TERMS, "c"), BucketSpec.of(BucketKind.COMPOSITE_DATE_HISTOGRAM, "d")),
+                        List.of(
+                            BucketSpec.of(BucketSpec.Kind.COMPOSITE_TERMS, "c"),
+                            BucketSpec.of(BucketSpec.Kind.COMPOSITE_DATE_HISTOGRAM, "d")
+                        ),
                         List.of()
                     )
                 )
@@ -444,7 +445,7 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
             RelNode scan = relBuilder(index, dataset).scan("lance", index).build();
             int rating = 2;
-            SpecAggregate aggregate = metricOnly(scan, rating, MetricKind.PERCENTILES);
+            SpecAggregate aggregate = metricOnly(scan, rating, MetricSpec.Kind.PERCENTILES);
 
             ByteBuffer legacyMain = legacy(dataset, qsc, AggregationBuilders.percentiles("p").field("rating"));
             ByteBuffer producedMain = produced(aggregate);
@@ -484,7 +485,7 @@ public class LanceSubstraitProducerEquivalenceIT extends OpenSearchSingleNodeTes
     }
 
     /** A metric-only aggregate whose single call carries {@code kind}; the Calcite function is a typing stand-in. */
-    private static SpecAggregate metricOnly(RelNode scan, int argument, MetricKind kind) {
+    private static SpecAggregate metricOnly(RelNode scan, int argument, MetricSpec.Kind kind) {
         return new SpecAggregate(
             scan,
             ImmutableBitSet.of(),

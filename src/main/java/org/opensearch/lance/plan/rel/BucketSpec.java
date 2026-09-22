@@ -125,6 +125,31 @@ public record BucketSpec(Kind kind, String aggregationName, Integer size, Intege
         }
     }
 
+    /** A spec carrying the kind and name only, for tests and for kinds without extra request fields. */
+    public static BucketSpec of(Kind kind, String aggregationName) {
+        return new BucketSpec(
+            kind,
+            aggregationName,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            false
+        );
+    }
+
     /** A terms bucket. */
     public static BucketSpec terms(String name, int size, int shardSize, long minDocCount, OrderSpec order, String format) {
         return new BucketSpec(

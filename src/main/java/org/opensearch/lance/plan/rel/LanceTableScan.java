@@ -12,50 +12,121 @@ import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
+import org.apache.calcite.rel.type.RelDataType;
 import org.opensearch.lance.plan.calcite.LanceConvention;
 import org.opensearch.lance.plan.calcite.LanceRel;
+import org.opensearch.lance.plan.rel.PushedOperation.PushedAggregate;
 
+import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Scan of a Lance backed index, the leaf every plan over a Lance table
- * starts from. A plain scan for now: pushdown state (filters, projections,
- * aggregations pushed into the dataset scan) is not modelled yet.
+ * starts from. The scan carries an immutable list of
+ * {@link PushedOperation}s the Lance dataset scan computes; a scan with
+ * a pushed aggregate stands in for the whole aggregate it replaced, so
+ * its row type is the aggregate's row type and its row estimate is the
+ * aggregate's group estimate.
  */
 public class LanceTableScan extends TableScan implements LanceRel {
 
-    /** Creates the scan with the {@link LanceConvention} trait. */
+    private final ImmutableList<PushedOperation> pushedOperations;
+
+    /** Creates the bare scan with the {@link LanceConvention} trait. */
     public LanceTableScan(RelOptCluster cluster, RelOptTable table) {
-        this(cluster, cluster.traitSetOf(LanceConvention.INSTANCE), table);
+        this(cluster, cluster.traitSetOf(LanceConvention.INSTANCE), table, ImmutableList.of());
     }
 
-    private LanceTableScan(RelOptCluster cluster, RelTraitSet traitSet, RelOptTable table) {
+    private LanceTableScan(RelOptCluster cluster, RelTraitSet traitSet, RelOptTable table, ImmutableList<PushedOperation> pushed) {
         super(cluster, traitSet, ImmutableList.of(), table);
+        this.pushedOperations = pushed;
+    }
+
+    /** The pushed operations, in push order; empty for a bare scan. */
+    public List<PushedOperation> pushedOperations() {
+        return pushedOperations;
+    }
+
+    /** The pushed aggregate, when the scan carries one. */
+    public Optional<PushedAggregate> pushedAggregate() {
+        for (PushedOperation operation : pushedOperations) {
+            if (operation instanceof PushedAggregate aggregate) {
+                return Optional.of(aggregate);
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * The same scan with {@code aggregate} pushed into it: the scan's
+     * row type becomes the aggregate's and the plan above no longer
+     * contains the aggregate. {@code aggregate} is the node the rule
+     * matched with its input rebuilt to the concrete tree; {@code bytes}
+     * is what the Substrait producer encoded for it.
+     */
+    public LanceTableScan withPushedAggregate(LanceAggregate aggregate, ByteBuffer bytes) {
+        if (pushedAggregate().isPresent()) {
+            throw new IllegalStateException("the scan already carries a pushed aggregate");
+        }
+        ImmutableList<PushedOperation> pushed = ImmutableList.<PushedOperation>builder()
+            .addAll(pushedOperations)
+            .add(new PushedAggregate(aggregate, bytes))
+            .build();
+        return new LanceTableScan(getCluster(), getTraitSet(), table, pushed);
     }
 
     @Override
     public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
         assert inputs.isEmpty();
-        return new LanceTableScan(getCluster(), traitSet, table);
+        return new LanceTableScan(getCluster(), traitSet, table, pushedOperations);
     }
 
-    /** Row count from the table's statistic (the Lance fragment row counts). */
+    /** The aggregate's row type when one is pushed, the table row type otherwise. */
+    @Override
+    public RelDataType deriveRowType() {
+        Optional<PushedAggregate> pushed = pushedAggregate();
+        if (pushed.isPresent()) {
+            return pushed.get().aggregate().getRowType();
+        }
+        return super.deriveRowType();
+    }
+
+    /**
+     * Row count from the table's statistic (the Lance fragment row
+     * counts) for a bare scan; a pushed aggregate returns one row per
+     * group, so its own estimate stands.
+     */
     @Override
     public double estimateRowCount(RelMetadataQuery mq) {
+        Optional<PushedAggregate> pushed = pushedAggregate();
+        if (pushed.isPresent()) {
+            return pushed.get().aggregate().estimateRowCount(mq);
+        }
         return table.getRowCount();
     }
 
     /**
-     * Rows read stand in for predicted milliseconds until the cost model
-     * gets real coefficients; native and heap bytes are not modelled yet,
-     * so both byte slots stay zero and the budget check in the cost
-     * ordering cannot fire on a bare scan.
+     * Rows read (a bare scan) or groups returned (a pushed aggregate)
+     * stand in for predicted milliseconds until the cost model gets
+     * real coefficients, with a constant per pushed operation in the
+     * second slot so two scans over the same table order by how much
+     * work was pushed. Native and heap bytes are not modelled yet, so
+     * the byte slots stay at the constant model and the budget check in
+     * the cost ordering cannot fire on a scan.
      */
     @Override
     public RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
         double rows = estimateRowCount(mq);
-        return planner.getCostFactory().makeCost(rows, 0, 0);
+        return planner.getCostFactory().makeCost(rows, pushedOperations.size(), 0);
+    }
+
+    /** Prints the pushed operations, so the digest and the explain output carry them. */
+    @Override
+    public RelWriter explainTerms(RelWriter pw) {
+        return super.explainTerms(pw).itemIf("pushed", pushedOperations, !pushedOperations.isEmpty());
     }
 }
