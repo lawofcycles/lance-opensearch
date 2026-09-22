@@ -58,9 +58,14 @@ public final class LanceOverrides {
     public static final String TYPE_KEYWORD = "keyword";
     public static final String TYPE_IP = "ip";
     public static final String TYPE_WILDCARD = "wildcard";
+    public static final String TYPE_GEO_POINT = "geo_point";
 
     /** Default mapping format of a {@code type: date} override on an integer column. */
     public static final String DEFAULT_DATE_FORMAT = "epoch_millis";
+
+    /** Order values a {@code type: geo_point} override on a FixedSizeList&lt;Float64&gt;[2] column may declare. */
+    public static final String ORDER_LAT_LON = "lat_lon";
+    public static final String ORDER_LON_LAT = "lon_lat";
 
     /**
      * The {@code indexes} value that suppresses the automatic index on a
@@ -126,12 +131,20 @@ public final class LanceOverrides {
 
     /**
      * The override of one column. {@code type} and {@code format} are
-     * {@code null} when not declared; {@code subFields} is empty when
-     * the column declares no sub-fields.
+     * {@code null} when not declared; {@code order} is {@code null}
+     * unless the column declares a {@code type: geo_point} override on
+     * a FixedSizeList&lt;Float64&gt;[2] column (where the operator picks
+     * the storage order); {@code subFields} is empty when the column
+     * declares no sub-fields.
      */
-    public record Column(String type, String format, LinkedHashMap<String, String> subFields) {
+    public record Column(String type, String format, String order, LinkedHashMap<String, String> subFields) {
         public Column {
             subFields = subFields == null ? new LinkedHashMap<>() : subFields;
+        }
+
+        /** Back-compat constructor: no {@code order}. */
+        public Column(String type, String format, LinkedHashMap<String, String> subFields) {
+            this(type, format, null, subFields);
         }
     }
 
@@ -249,6 +262,22 @@ public final class LanceOverrides {
     }
 
     /**
+     * Columns overridden to {@code geo_point}, mapped to their declared
+     * order ({@link #ORDER_LAT_LON} or {@link #ORDER_LON_LAT}). A Struct
+     * column carries {@code null} — the order comes from the child
+     * names, not the operator.
+     */
+    public Map<String, String> geoPointColumns() {
+        LinkedHashMap<String, String> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Column> entry : columns.entrySet()) {
+            if (TYPE_GEO_POINT.equals(entry.getValue().type())) {
+                out.put(entry.getKey(), entry.getValue().order());
+            }
+        }
+        return out;
+    }
+
+    /**
      * Resolve the overrides of an index from its settings:
      * {@code index.lance.overrides} when present, else the legacy
      * {@code index.lance.multi_fields} setting folded into sub-field
@@ -273,7 +302,7 @@ public final class LanceOverrides {
         }
         LinkedHashMap<String, Column> columns = new LinkedHashMap<>();
         for (Map.Entry<String, LinkedHashMap<String, String>> entry : subFields.entrySet()) {
-            columns.put(entry.getKey(), new Column(null, null, new LinkedHashMap<>(entry.getValue())));
+            columns.put(entry.getKey(), new Column(null, null, null, new LinkedHashMap<>(entry.getValue())));
         }
         return new LanceOverrides(columns, Collections.emptyMap());
     }
@@ -372,6 +401,9 @@ public final class LanceOverrides {
                 }
                 if (column.format() != null) {
                     builder.field("format", column.format());
+                }
+                if (column.order() != null) {
+                    builder.field("order", column.order());
                 }
                 if (!column.subFields().isEmpty()) {
                     builder.startObject("fields");
@@ -539,9 +571,9 @@ public final class LanceOverrides {
                     );
                 }
                 if (existing != null) {
-                    columns.put(baseName, new Column(existing.type(), existing.format(), new LinkedHashMap<>(entry.getValue())));
+                    columns.put(baseName, new Column(existing.type(), existing.format(), existing.order(), new LinkedHashMap<>(entry.getValue())));
                 } else {
-                    columns.put(baseName, new Column(null, null, new LinkedHashMap<>(entry.getValue())));
+                    columns.put(baseName, new Column(null, null, null, new LinkedHashMap<>(entry.getValue())));
                 }
             }
         }
@@ -665,9 +697,9 @@ public final class LanceOverrides {
             throw new IllegalArgumentException("[overrides." + baseName + "] must be an object");
         }
         for (Object key : spec.keySet()) {
-            if (!"type".equals(key) && !"format".equals(key) && !"fields".equals(key)) {
+            if (!"type".equals(key) && !"format".equals(key) && !"order".equals(key) && !"fields".equals(key)) {
                 throw new IllegalArgumentException(
-                    "[overrides." + baseName + "] has unknown key [" + key + "]; accepted keys are [type], [format], [fields]"
+                    "[overrides." + baseName + "] has unknown key [" + key + "]; accepted keys are [type], [format], [order], [fields]"
                 );
             }
         }
@@ -677,13 +709,17 @@ public final class LanceOverrides {
             if (!(rawType instanceof String typeStr) || typeStr.isEmpty()) {
                 throw new IllegalArgumentException("[overrides." + baseName + ".type] must be a non-empty string");
             }
-            if (!TYPE_DATE.equals(typeStr) && !TYPE_KEYWORD.equals(typeStr) && !TYPE_IP.equals(typeStr) && !TYPE_WILDCARD.equals(typeStr)) {
+            if (!TYPE_DATE.equals(typeStr)
+                && !TYPE_KEYWORD.equals(typeStr)
+                && !TYPE_IP.equals(typeStr)
+                && !TYPE_WILDCARD.equals(typeStr)
+                && !TYPE_GEO_POINT.equals(typeStr)) {
                 throw new IllegalArgumentException(
                     "[overrides."
                         + baseName
                         + ".type="
                         + typeStr
-                        + "] is not supported; accepted types are [date], [keyword], [ip], [wildcard]"
+                        + "] is not supported; accepted types are [date], [keyword], [ip], [wildcard], [geo_point]"
                 );
             }
             type = typeStr;
@@ -706,6 +742,32 @@ public final class LanceOverrides {
                 );
             }
             format = formatStr;
+        }
+        String order = null;
+        Object rawOrder = spec.get("order");
+        if (rawOrder != null) {
+            if (!(rawOrder instanceof String orderStr) || orderStr.isEmpty()) {
+                throw new IllegalArgumentException("[overrides." + baseName + ".order] must be a non-empty string");
+            }
+            if (!TYPE_GEO_POINT.equals(type)) {
+                throw new IllegalArgumentException(
+                    "[overrides." + baseName + ".order] is only accepted together with [type: geo_point]"
+                );
+            }
+            if (!ORDER_LAT_LON.equals(orderStr) && !ORDER_LON_LAT.equals(orderStr)) {
+                throw new IllegalArgumentException(
+                    "[overrides."
+                        + baseName
+                        + ".order="
+                        + orderStr
+                        + "] is not supported; accepted values are ["
+                        + ORDER_LAT_LON
+                        + "], ["
+                        + ORDER_LON_LAT
+                        + "]"
+                );
+            }
+            order = orderStr;
         }
         LinkedHashMap<String, String> subFields = new LinkedHashMap<>();
         Object rawFields = spec.get("fields");
@@ -732,7 +794,7 @@ public final class LanceOverrides {
         if (type == null && subFields.isEmpty()) {
             throw new IllegalArgumentException("[overrides." + baseName + "] must declare at least one of [type], [fields]");
         }
-        return new Column(type, format, subFields);
+        return new Column(type, format, order, subFields);
     }
 
     @Override
