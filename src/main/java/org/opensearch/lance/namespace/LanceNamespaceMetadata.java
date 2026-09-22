@@ -41,7 +41,7 @@ import org.opensearch.lance.StorageOptions;
  *
  * <p>The entry payload carries the registration {@code name} (the key
  * every mutation identifies an entry by), the catalog {@code type}
- * ({@code directory}, {@code rest} or {@code glue}), the
+ * (one of {@link Entry#ACCEPTED_TYPES}), the
  * {@code rootUri} for directory catalogs, the {@code config}
  * properties handed to the implementation's {@code initialize}, and
  * the {@link StorageOptions} the poll needs to open the Lance tables
@@ -397,7 +397,7 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
             return name;
         }
 
-        /** One of {@link #TYPE_DIRECTORY}, {@link #TYPE_REST}, {@link #TYPE_GLUE}. */
+        /** The catalog type, one of {@link #ACCEPTED_TYPES}. */
         public String type() {
             return type;
         }
