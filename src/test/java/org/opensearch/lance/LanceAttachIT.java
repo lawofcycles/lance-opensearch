@@ -693,6 +693,29 @@ public class LanceAttachIT extends LanceRestTestCase {
             }
             assertEquals("body.raw terms agg must produce 6 unique buckets: " + aggBody, 6, bucketCount);
 
+            // A plain sorted page on the sub-field orders by the base
+            // Utf8 column (the sort pushdown routes base.sub to base).
+            // This shape answered 400 before the pushdown's column
+            // resolution returned null for dotted names: Arrow's
+            // Schema.findField throws for any non-top-level name, so
+            // the base-column fallback below it never ran.
+            String sortBody = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}},\"sort\":[{\"body.raw\":\"desc\"}],\"size\":6}")
+            );
+            assertEquals("sort body.raw total: " + sortBody, 6, extractIntPath(sortBody, "hits", "total", "value"));
+            // "quick brown fox 5" sorts last lexicographically, so it
+            // leads the descending page; "hello lance 0" closes it.
+            assertEquals(
+                "sort body.raw desc first hit must be id=5: " + sortBody,
+                5,
+                extractIntPath(sortBody, "hits", "hits", "0", "_source", "id")
+            );
+            assertEquals(
+                "sort body.raw desc last hit must be id=0: " + sortBody,
+                0,
+                extractIntPath(sortBody, "hits", "hits", "5", "_source", "id")
+            );
+
             // The parent field still serves FTS.
             String matchBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}}}"));
             assertEquals(3, extractIntPath(matchBody, "hits", "total", "value"));

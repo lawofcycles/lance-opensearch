@@ -1720,14 +1720,24 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * name is accepted when {@code multiFields} declares {@code sub}
      * as a keyword sub-field of {@code base}; the ordering then runs
      * on the base Utf8 column, which is exactly what the reader's
-     * {@code getSortedDocValues(base.sub)} resolves to.
+     * {@code getSortedDocValues(base.sub)} resolves to. Any other
+     * dotted name (a struct child, an undeclared sub-field) returns
+     * {@code null} so the caller falls back to the Lucene collector,
+     * which serves the sort through the reader's doc values.
+     *
+     * <p>Names are resolved with {@link #topLevelField} rather than
+     * Arrow's {@code Schema.findField}: that method throws
+     * {@link IllegalArgumentException} for any name that is not a top
+     * level column instead of returning {@code null}, which used to
+     * turn a plain sorted page on a dotted field into a 400 before the
+     * fallback below could run.
      */
     private static String resolveSortColumn(
         String name,
         org.apache.arrow.vector.types.pojo.Schema schema,
         java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
     ) {
-        org.apache.arrow.vector.types.pojo.Field field = schema.findField(name);
+        org.apache.arrow.vector.types.pojo.Field field = topLevelField(schema, name);
         if (field == null) {
             int dot = name.lastIndexOf('.');
             if (dot <= 0 || multiFields == null) {
@@ -1739,7 +1749,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             if (subs == null || !"keyword".equals(subs.get(sub))) {
                 return null;
             }
-            field = schema.findField(base);
+            field = topLevelField(schema, base);
             if (field == null || !(field.getType() instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8)) {
                 return null;
             }
@@ -1756,6 +1766,16 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.FloatingPoint fp) {
             return fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE
                 || fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE ? name : null;
+        }
+        return null;
+    }
+
+    /** The top level Arrow field named {@code name}, or {@code null} when the schema has none (never throws). */
+    private static org.apache.arrow.vector.types.pojo.Field topLevelField(org.apache.arrow.vector.types.pojo.Schema schema, String name) {
+        for (org.apache.arrow.vector.types.pojo.Field candidate : schema.getFields()) {
+            if (candidate.getName().equals(name)) {
+                return candidate;
+            }
         }
         return null;
     }
