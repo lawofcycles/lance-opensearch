@@ -21,6 +21,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.NativeMemoryLimit;
@@ -83,7 +84,15 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 )
             ),
             List.of(
-                new LanceNodeStats.IndexReaderStats("big", 3_000_000_000L, 2_000_000_000L, 0L, true, Map.of()),
+                new LanceNodeStats.IndexReaderStats(
+                    "big",
+                    3_000_000_000L,
+                    2_000_000_000L,
+                    0L,
+                    true,
+                    Map.of(),
+                    List.of(new LanceMappingMeta.RenamedField("ts", "event_ts", 1))
+                ),
                 new LanceNodeStats.IndexReaderStats("small", 120L, 120L, 14L, false, Map.of("rating", List.of("BTree", "Bitmap")))
             ),
             List.of(new LanceNodeStats.LocalCloneStats("cloned", 4321L, 9L))
@@ -125,7 +134,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "{\"name\":\"body_idx\",\"type\":\"Inverted\",\"column\":\"body\",\"state\":\"failed\",\"seconds\":1.25,"
                     + "\"detail\":\"boom\"}]}]},"
                     + "\"indices\":{\"big\":{\"rows\":3000000000,\"shard_reader_rows\":2000000000,\"nested_docs\":0,"
-                    + "\"lucene_bound_exceeded\":true,\"index_types\":{}},"
+                    + "\"lucene_bound_exceeded\":true,\"index_types\":{},"
+                    + "\"renamed_fields\":[{\"from\":\"ts\",\"to\":\"event_ts\",\"lance_field_id\":1}]},"
                     + "\"small\":{\"rows\":120,\"shard_reader_rows\":120,\"nested_docs\":14,\"lucene_bound_exceeded\":false,"
                     + "\"index_types\":{\"rating\":[\"BTree\",\"Bitmap\"]}}},"
                     + "\"local_clones\":{\"cloned\":{\"local_clone_bytes\":4321,\"source_version\":9}}}",

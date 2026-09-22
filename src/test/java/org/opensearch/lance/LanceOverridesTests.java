@@ -339,4 +339,63 @@ public class LanceOverridesTests extends OpenSearchTestCase {
         assertTrue(LanceOverrides.indexPreferencesFromJson("").isEmpty());
         assertTrue(LanceOverrides.indexPreferencesFromJson(null).isEmpty());
     }
+
+    public void testWithRenamedColumnsMovesKeyAndKeepsOthers() {
+        LanceOverrides overrides = LanceOverrides.parse(
+            "{\"ts\":{\"type\":\"date\",\"format\":\"epoch_millis\"},"
+                + "\"label\":{\"type\":\"keyword\",\"fields\":{\"raw\":{\"type\":\"keyword\"}}},"
+                + "\"other\":{\"type\":\"keyword\"}}"
+        );
+        LanceOverrides renamed = overrides.withRenamedColumns(Map.of("ts", "event_ts", "label", "tag"));
+        assertEquals(List.of("event_ts", "tag", "other"), List.copyOf(renamed.columns().keySet()));
+        // The rules travel with the key untouched.
+        assertEquals("epoch_millis", renamed.columns().get("event_ts").format());
+        assertEquals("keyword", renamed.columns().get("tag").subFields().get("raw"));
+        assertEquals("keyword", renamed.columns().get("other").type());
+    }
+
+    public void testWithRenamedColumnsUnmatchedRenamesAreNoOp() {
+        LanceOverrides overrides = LanceOverrides.parse("{\"ts\":{\"type\":\"date\"}}");
+        assertSame(overrides, overrides.withRenamedColumns(Map.of("absent", "elsewhere")));
+        assertSame(overrides, overrides.withRenamedColumns(Map.of()));
+        assertSame(LanceOverrides.EMPTY, LanceOverrides.EMPTY.withRenamedColumns(Map.of("a", "b")));
+    }
+
+    public void testWithRenamedColumnsKeepsExplicitTargetDeclaration() {
+        // The operator declared rules for both names; the renamed entry
+        // folds away instead of clobbering the explicit target.
+        LanceOverrides overrides = LanceOverrides.parse("{\"ts\":{\"type\":\"date\"},\"event_ts\":{\"type\":\"keyword\"}}");
+        LanceOverrides renamed = overrides.withRenamedColumns(Map.of("ts", "event_ts"));
+        assertEquals(List.of("event_ts"), List.copyOf(renamed.columns().keySet()));
+        assertEquals("keyword", renamed.columns().get("event_ts").type());
+    }
+
+    public void testWithRenamedColumnsMovesIndexPreferenceKeys() {
+        LanceOverrides overrides = LanceOverrides.parse(
+            "{\"label\":{\"type\":\"keyword\"},"
+                + "\"indexes\":{\"label\":{\"scalar\":\"bitmap\"},\"rating\":{\"scalar\":\"btree\"}}}"
+        );
+        LanceOverrides renamed = overrides.withRenamedColumns(Map.of("label", "tag"));
+        assertEquals(List.of("tag"), List.copyOf(renamed.columns().keySet()));
+        assertEquals(List.of("tag", "rating"), List.copyOf(renamed.indexPreferences().keySet()));
+        assertEquals("bitmap", renamed.indexPreferences().get("tag").scalar());
+        assertEquals("btree", renamed.indexPreferences().get("rating").scalar());
+    }
+
+    public void testWithoutColumnDropsOnlyTheNamedEntry() {
+        LanceOverrides overrides = LanceOverrides.parse("{\"ts\":{\"type\":\"date\"},\"label\":{\"type\":\"keyword\"}}");
+        LanceOverrides pruned = overrides.withoutColumn("ts");
+        assertEquals(List.of("label"), List.copyOf(pruned.columns().keySet()));
+        assertSame(overrides, overrides.withoutColumn("absent"));
+        assertSame(LanceOverrides.EMPTY, pruned.withoutColumn("label"));
+    }
+
+    public void testWithoutColumnKeepsTheIndexPreference() {
+        LanceOverrides overrides = LanceOverrides.parse(
+            "{\"label\":{\"type\":\"keyword\"},\"indexes\":{\"label\":{\"scalar\":\"bitmap\"}}}"
+        );
+        LanceOverrides pruned = overrides.withoutColumn("label");
+        assertTrue(pruned.columns().isEmpty());
+        assertEquals("bitmap", pruned.indexPreferences().get("label").scalar());
+    }
 }

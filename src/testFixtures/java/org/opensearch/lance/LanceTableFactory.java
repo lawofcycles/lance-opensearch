@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -49,6 +50,7 @@ import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.index.vector.VectorIndexParams;
+import org.lance.schema.ColumnAlteration;
 
 /**
  * Test-only helper that writes a small Lance table onto the local
@@ -675,6 +677,43 @@ public final class LanceTableFactory {
             }
         }
         return uri;
+    }
+
+    /**
+     * Rename a column of an existing Lance table through
+     * {@code Dataset.alterColumns}. The column keeps its immutable
+     * field id, which is the property the mapping-drift integration
+     * tests exercise: the plugin matches the id in the mapping meta
+     * against the new name.
+     */
+    public static void renameColumn(String tableUri, String oldName, String newName) throws Exception {
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
+        ) {
+            dataset.alterColumns(List.of(new ColumnAlteration.Builder(oldName).rename(newName).build()));
+        }
+    }
+
+    /**
+     * Cast a column of an existing Lance table to a new Arrow type
+     * through {@code Dataset.alterColumns}. The cast rides the Arrow C
+     * Data interface, whose schema format string is Locale sensitive on
+     * arrow-java 18 (see {@link #withLocaleRoot}), so the write region
+     * is pinned to {@code Locale.ROOT}. Used by the schema-reset
+     * integration tests: the column's data is rewritten in the new type
+     * under a new manifest version.
+     */
+    public static void castColumn(String tableUri, String column, ArrowType newType) throws Exception {
+        withLocaleRoot(() -> {
+            try (
+                RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+                Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
+            ) {
+                dataset.alterColumns(List.of(new ColumnAlteration.Builder(column).castTo(newType).build()));
+            }
+            return tableUri;
+        });
     }
 
     /**
