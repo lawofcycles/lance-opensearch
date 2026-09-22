@@ -377,7 +377,19 @@ public final class LanceFragmentLeafReader extends LeafReader {
     // tiny one-doc Lucene reader whose lifetime is bound to this fragment reader:
     // its CacheHelper is exposed as ours, and closing this reader closes the
     // bridge, which fires the listeners registered by the OpenSearch caches.
-    private final DirectoryReader cacheLifetimeBridge;
+    //
+    // Built on the first getCoreCacheHelper / getReaderCacheHelper call rather
+    // than in the constructor: the bridge costs an IndexWriter, a commit and a
+    // DirectoryReader.open, and the fragment path opens one leaf per fragment
+    // per request, so an aggregation over hundreds of fragments would pay that
+    // per leaf although nothing on its path asks for a leaf-level cache key
+    // (the query cache is disabled, the request cache keys off the composite
+    // reader, and numeric doc values fielddata is built without the cache).
+    // Consumers that do ask (the bitset filter cache for nested docs, global
+    // ordinals fielddata, a DLS/FLS reader wrapper) get the same bridge for
+    // the life of the leaf. Guarded by `this` and published through the
+    // volatile field; helpers may be requested from any slice thread.
+    private volatile DirectoryReader cacheLifetimeBridge;
 
     /**
      * Resolve which Utf8 columns of {@code dataset} carry an FTS
@@ -506,13 +518,41 @@ public final class LanceFragmentLeafReader extends LeafReader {
         this.numDocs = meta.numDocs();
         this.liveDocs = meta.liveDocs();
         this.fieldInfos = schema.fieldInfos();
+    }
 
-        ByteBuffersDirectory bridgeDir = new ByteBuffersDirectory();
-        try (IndexWriter writer = new IndexWriter(bridgeDir, new IndexWriterConfig())) {
-            writer.addDocument(new Document());
-            writer.commit();
+    /**
+     * The one-doc Lucene reader backing {@link #getCoreCacheHelper()}
+     * and {@link #getReaderCacheHelper()}, built on first use (see the
+     * field comment for why it is not built in the constructor). The
+     * instance is stable for the life of this leaf, as the cache
+     * helper contract requires.
+     */
+    private DirectoryReader cacheLifetimeBridge() {
+        DirectoryReader bridge = cacheLifetimeBridge;
+        if (bridge != null) {
+            return bridge;
         }
-        this.cacheLifetimeBridge = DirectoryReader.open(bridgeDir);
+        synchronized (this) {
+            bridge = cacheLifetimeBridge;
+            if (bridge != null) {
+                return bridge;
+            }
+            try {
+                ByteBuffersDirectory bridgeDir = new ByteBuffersDirectory();
+                try (IndexWriter writer = new IndexWriter(bridgeDir, new IndexWriterConfig())) {
+                    writer.addDocument(new Document());
+                    writer.commit();
+                }
+                bridge = DirectoryReader.open(bridgeDir);
+            } catch (IOException e) {
+                // getCoreCacheHelper / getReaderCacheHelper cannot
+                // throw a checked exception; an in-heap one-doc index
+                // only fails when the JVM is already in trouble.
+                throw new UncheckedIOException("could not build the cache lifetime bridge", e);
+            }
+            cacheLifetimeBridge = bridge;
+            return bridge;
+        }
     }
 
     private Object columnLock(String name) {
@@ -2612,16 +2652,22 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
     @Override
     protected void doClose() throws IOException {
-        cacheLifetimeBridge.close();
+        DirectoryReader bridge;
+        synchronized (this) {
+            bridge = cacheLifetimeBridge;
+        }
+        if (bridge != null) {
+            bridge.close();
+        }
     }
 
     @Override
     public CacheHelper getCoreCacheHelper() {
-        return cacheLifetimeBridge.leaves().get(0).reader().getCoreCacheHelper();
+        return cacheLifetimeBridge().leaves().get(0).reader().getCoreCacheHelper();
     }
 
     @Override
     public CacheHelper getReaderCacheHelper() {
-        return cacheLifetimeBridge.getReaderCacheHelper();
+        return cacheLifetimeBridge().getReaderCacheHelper();
     }
 }
