@@ -56,20 +56,8 @@ public final class PushAggregateIntoLanceScan extends RelRule<PushAggregateIntoL
     public void onMatch(RelOptRuleCall call) {
         LanceAggregate aggregate = call.rel(0);
         LanceTableScan scan = call.rel(call.rels.length - 1);
-        if (scan.pushedAggregate().isPresent()) {
+        if (!scan.pushedOperations().isEmpty()) {
             return;
-        }
-        // A filter the SQL printer can spell belongs inside the scan,
-        // not inside the aggregate bytes: defer to the filter pushdown,
-        // whose rewrite re-registers this aggregate over the filtered
-        // scan and lets the direct or project shape push it there. Only
-        // a filter the printer refuses stays in the rebuilt input.
-        for (int i = 1; i < call.rels.length - 1; i++) {
-            if (call.rel(i) instanceof Filter filter
-                && scan.pushedFilter().isEmpty()
-                && RexToLanceSql.print(filter.getCondition(), scan.getRowType()).isPresent()) {
-                return;
-            }
         }
         // Rebuild the matched chain with concrete inputs: under the
         // Volcano planner the matched rels hold RelSubset children, and

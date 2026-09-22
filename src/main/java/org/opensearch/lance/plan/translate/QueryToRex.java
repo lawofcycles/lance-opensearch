@@ -5,6 +5,7 @@
 
 package org.opensearch.lance.plan.translate;
 
+import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -32,8 +33,10 @@ import org.opensearch.index.query.WildcardQueryBuilder;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.search.DocValueFormat;
 
+import java.math.BigDecimal;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -70,7 +73,7 @@ import static org.opensearch.lance.plan.translate.AggregationToRel.unsupported;
  * struct columns to a nested field access. A dotted path that crosses
  * a list (the {@code nested} mapping) or names nothing throws.
  */
-final class QueryToRex {
+public final class QueryToRex {
 
     /**
      * Most values a {@code terms} query hands to the scan filter, the
@@ -164,9 +167,24 @@ final class QueryToRex {
                 return relBuilder.literal(false);
             }
             // The builder keeps the ids in a hash set; sort them so the
-            // predicate (and the SQL printed from it) is deterministic.
-            List<Object> values = new ArrayList<>(ids.ids());
-            values.sort(null);
+            // predicate (and the SQL printed from it) is deterministic:
+            // by the coerced value on a numeric primary key (so 2 sorts
+            // before 10), lexicographically on a keyword key.
+            List<String> values = new ArrayList<>();
+            for (String id : ids.ids()) {
+                values.add(id);
+            }
+            if (target.isUtf8()) {
+                values.sort(null);
+            } else {
+                try {
+                    values.sort(Comparator.comparing(BigDecimal::new));
+                } catch (NumberFormatException unparseable) {
+                    // A value the key cannot parse fails in equalTo with
+                    // the value named; the order no longer matters.
+                    values.sort(null);
+                }
+            }
             return anyOf(target, values, context, relBuilder);
         }
         if (query instanceof ExistsQueryBuilder exists) {
@@ -284,8 +302,7 @@ final class QueryToRex {
         }
 
         boolean isSingleFloat() {
-            return type instanceof ArrowType.FloatingPoint fp
-                && fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE;
+            return type instanceof ArrowType.FloatingPoint fp && fp.getPrecision() == FloatingPointPrecision.SINGLE;
         }
 
         boolean isUtf8() {
@@ -394,8 +411,7 @@ final class QueryToRex {
             || type instanceof ArrowType.Timestamp
             || (type instanceof ArrowType.Int intType && intType.getIsSigned())
             || (type instanceof ArrowType.FloatingPoint fp
-                && (fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE
-                    || fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE));
+                && (fp.getPrecision() == FloatingPointPrecision.SINGLE || fp.getPrecision() == FloatingPointPrecision.DOUBLE));
         if (!supported) {
             throw unsupported(
                 "column [" + columnName + "] behind field [" + field + "]" + context.where() + " is not a supported scalar column"

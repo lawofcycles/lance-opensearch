@@ -189,6 +189,11 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                     String body = readAll(response);
                     assertTrue("logical plan carries the aggregate on " + host + ": " + body, body.contains("LanceAggregate"));
                     assertTrue("logical plan carries the scan on " + host + ": " + body, body.contains("LanceTableScan"));
+                    assertTrue("body carries the physical section on " + host + ": " + body, body.contains("\"physical\""));
+                    assertTrue(
+                        "physical plan carries the pushed aggregate root on " + host + ": " + body,
+                        body.contains("pushed=[[aggregate{")
+                    );
                     answers.add(body);
                 }
             }

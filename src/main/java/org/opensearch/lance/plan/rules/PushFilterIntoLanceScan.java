@@ -7,7 +7,9 @@ package org.opensearch.lance.plan.rules;
 
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelRule;
+import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Filter;
+import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.tools.RelBuilderFactory;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.substrait.RexToLanceSql;
@@ -22,14 +24,24 @@ import java.util.Optional;
  * {@link RexToLanceSql} can spell the whole predicate; otherwise the
  * {@code Filter} stays in place for the Lucene side.
  *
- * <p>The aggregate pushdown composes with this rule through the
- * planner's memo: the filtered scan joins the {@code Filter}'s
- * equivalence set, so {@link PushAggregateIntoLanceScan}'s scan operand
- * also binds it and the aggregate lands on the scan that already
- * carries the filter.
+ * <p>Two operand shapes are registered. The plain {@code Filter(scan)}
+ * shape rewrites the filter's own equivalence set; the
+ * {@code Project(Filter(scan))} shape additionally copies the project
+ * over the pushed scan, because the Volcano planner matches a rule's
+ * child operands against the trait subset the parent registered with
+ * and the pushed scan carries the Lance convention.
  *
- * <p>The rule terminates: it only matches a scan with no pushed filter,
- * and its rewrite has the filter inside the scan.
+ * <p>{@code LanceAggregate(Filter(scan))} is not a shape here.
+ * {@link PushAggregateIntoLanceScan} already matches that tree,
+ * rebuilds the concrete input (including the filter) into the pushed
+ * aggregate, and produces the LANCE convention scan at the root, so
+ * the aggregate path continues to absorb the filter as it did on main.
+ * A filter without an aggregate above it becomes a
+ * {@link org.opensearch.lance.plan.rel.PushedOperation.PushedFilter}
+ * on the scan and shows up in the explain output.
+ *
+ * <p>The rules terminate: every shape matches only a scan with nothing
+ * pushed, and every rewrite has the filter inside the scan.
  */
 public final class PushFilterIntoLanceScan extends RelRule<PushFilterIntoLanceScan.Config> {
 
@@ -37,20 +49,30 @@ public final class PushFilterIntoLanceScan extends RelRule<PushFilterIntoLanceSc
         super(config);
     }
 
-    /** The rules to register; one shape today, the filter directly over the scan. */
+    /** The two rules to register, one per operand shape. */
     public static List<PushFilterIntoLanceScan> rules() {
-        return List.of(Config.DIRECT.toRule());
+        return List.of(Config.DIRECT.toRule(), Config.PROJECT.toRule());
     }
 
     @Override
     public void onMatch(RelOptRuleCall call) {
-        Filter filter = call.rel(0);
-        LanceTableScan scan = call.rel(1);
+        Filter filter = call.rel(call.rels.length - 2);
+        LanceTableScan scan = call.rel(call.rels.length - 1);
         Optional<String> sql = RexToLanceSql.print(filter.getCondition(), scan.getRowType());
         if (sql.isEmpty()) {
             return;
         }
-        call.transformTo(scan.withPushedFilter(filter.getCondition(), sql.get()));
+        LanceTableScan pushed = scan.withPushedFilter(filter.getCondition(), sql.get());
+        if (call.rels.length == 2) {
+            call.transformTo(pushed);
+            return;
+        }
+        RelNode parent = call.rel(0);
+        call.transformTo(parent.copy(parent.getTraitSet(), List.of(pushed)));
+    }
+
+    private static RelRule.Done bareScan(RelRule.OperandBuilder builder) {
+        return builder.operand(LanceTableScan.class).predicate(scan -> scan.pushedOperations().isEmpty()).noInputs();
     }
 
     /**
@@ -64,8 +86,13 @@ public final class PushFilterIntoLanceScan extends RelRule<PushFilterIntoLanceSc
         /** The filter directly over a scan with nothing pushed. */
         public static final Config DIRECT = new Config(
             "PushFilterIntoLanceScan",
-            b0 -> b0.operand(Filter.class)
-                .oneInput(b1 -> b1.operand(LanceTableScan.class).predicate(scan -> scan.pushedOperations().isEmpty()).noInputs())
+            b0 -> b0.operand(Filter.class).oneInput(PushFilterIntoLanceScan::bareScan)
+        );
+
+        /** A projection over the filter over the scan, rewritten together so the project's set gains the pushed form. */
+        public static final Config PROJECT = new Config(
+            "PushFilterIntoLanceScan(Project)",
+            b0 -> b0.operand(Project.class).oneInput(b1 -> b1.operand(Filter.class).oneInput(PushFilterIntoLanceScan::bareScan))
         );
 
         private final String description;

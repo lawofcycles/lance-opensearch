@@ -12,7 +12,6 @@ import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.tools.RelBuilder;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
-import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchTestCase;
@@ -109,8 +108,10 @@ public class QueryToRexFixtureTests extends OpenSearchTestCase {
 
     /**
      * Every fixture query plans through the Volcano run and terminates:
-     * a supported query's filter is pushed into the scan (match_all
-     * pushes nothing), a refusal fixture refuses at translation.
+     * a supported fixture produces a physical scan with a pushed
+     * aggregate (main's aggregate rule fires whether or not the filter
+     * is separately pushable, absorbing the filter into the aggregate's
+     * rebuilt input), and a refusal fixture refuses at translation.
      */
     public void testVolcanoPushesEveryFixturePredicate() throws IOException {
         String query = resource(fixture + ".json");
@@ -128,14 +129,9 @@ public class QueryToRexFixtureTests extends OpenSearchTestCase {
         }
         assertFalse("a refusal fixture must throw at translation", refusalFixture);
         RelNode physical = factory.plan(logical);
-        assertTrue("the aggregate stays the root: " + physical, physical.stripped() instanceof LanceAggregate);
         LanceTableScan scan = findScan(physical);
         assertNotNull("the physical plan scans the table: " + physical, scan);
-        if (fixture.equals("match_all")) {
-            assertTrue("match_all pushes nothing: " + physical, scan.pushedFilter().isEmpty());
-        } else {
-            assertTrue("the filter must be pushed: " + physical, scan.pushedFilter().isPresent());
-        }
+        assertTrue("the aggregate is pushed: " + physical, scan.pushedAggregate().isPresent());
     }
 
     private static LanceTableScan findScan(RelNode node) {

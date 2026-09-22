@@ -62,6 +62,15 @@ public class QueryToRexTests extends OpenSearchTestCase {
         assertEquals("false", predicateOf(new IdsQueryBuilder(), PlanTestFixtures.queryModel()).toString());
     }
 
+    public void testIdsOnANumericPrimaryKeySortByTheCoercedValue() {
+        // 2 sorts before 10 on the integer key; a lexicographic sort
+        // would put "10" first.
+        assertEquals(
+            "OR(=(CAST($0):BIGINT NOT NULL, 2), =(CAST($0):BIGINT NOT NULL, 10))",
+            predicateOf(new IdsQueryBuilder().addIds("10", "2"), PlanTestFixtures.queryModel()).toString()
+        );
+    }
+
     public void testIdsUnparseableOnIntegerPrimaryKeyThrows() {
         assertEquals("value [abc] on column [id]", messageOf(new IdsQueryBuilder().addIds("abc"), PlanTestFixtures.queryModel()));
     }

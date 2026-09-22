@@ -63,9 +63,9 @@ public final class PlanTestFixtures {
      * The columns of {@link #SCHEMA} plus a {@code meta} struct with a
      * {@code region} utf8 child and a {@code score} float64 child, for
      * the query translation fixtures that exercise struct paths. Kept
-     * apart from {@link #SCHEMA} so the aggregation plan fixtures,
-     * whose projections print every scan column, stay as B-1 pinned
-     * them.
+     * apart from {@link #SCHEMA} because the aggregation plan fixtures
+     * print every scan column in their projections, so an extra column
+     * would change every pinned aggregation plan.
      */
     static final Schema QUERY_SCHEMA = new Schema(
         Stream.concat(
