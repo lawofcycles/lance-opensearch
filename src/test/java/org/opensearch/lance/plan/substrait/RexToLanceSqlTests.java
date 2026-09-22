@@ -76,15 +76,17 @@ public class RexToLanceSqlTests extends OpenSearchTestCase {
     }
 
     public void testEqualsOnAStringColumn() {
-        assertEquals("\"category\" = 'c0'", printed(eq("category", "c0")));
+        assertEquals("category = 'c0'", printed(eq("category", "c0")));
     }
 
     public void testSingleQuoteInLiteralDoubles() {
-        assertEquals("\"category\" = 'it''s'", printed(eq("category", "it's")));
+        assertEquals("category = 'it''s'", printed(eq("category", "it's")));
     }
 
-    public void testDoubleQuoteInIdentifierDoubles() {
-        assertEquals("\"we\"\"ird\" = 'x'", printed(eq("we\"ird", "x")));
+    public void testIdentifierPrintsBare() {
+        // Lance's filter parser reads a double quoted token as a string
+        // literal, so identifiers print unquoted, as on the old path.
+        assertEquals("we\"ird = 'x'", printed(eq("we\"ird", "x")));
     }
 
     public void testCastsAroundTheColumnUnwrap() {
@@ -93,23 +95,20 @@ public class RexToLanceSqlTests extends OpenSearchTestCase {
             builder.cast(builder.field("rating"), SqlTypeName.BIGINT),
             builder.literal(100L)
         );
-        assertEquals("\"rating\" = 100", printed(compared));
+        assertEquals("rating = 100", printed(compared));
     }
 
     public void testComparisonOperators() {
+        assertEquals("price > 1.5", printed(builder.call(SqlStdOperatorTable.GREATER_THAN, builder.field("price"), builder.literal(1.5d))));
+        assertEquals("rating <> 3", printed(builder.call(SqlStdOperatorTable.NOT_EQUALS, builder.field("rating"), builder.literal(3))));
         assertEquals(
-            "\"price\" > 1.5",
-            printed(builder.call(SqlStdOperatorTable.GREATER_THAN, builder.field("price"), builder.literal(1.5d)))
-        );
-        assertEquals("\"rating\" <> 3", printed(builder.call(SqlStdOperatorTable.NOT_EQUALS, builder.field("rating"), builder.literal(3))));
-        assertEquals(
-            "\"rating\" <= 3",
+            "rating <= 3",
             printed(builder.call(SqlStdOperatorTable.LESS_THAN_OR_EQUAL, builder.field("rating"), builder.literal(3)))
         );
     }
 
     public void testBooleanLiterals() {
-        assertEquals("\"flag\" = true", printed(eq("flag", true)));
+        assertEquals("flag = true", printed(eq("flag", true)));
         assertEquals("true", printed(builder.literal(true)));
         assertEquals("false", printed(builder.literal(false)));
     }
@@ -120,7 +119,7 @@ public class RexToLanceSqlTests extends OpenSearchTestCase {
             builder.call(SqlStdOperatorTable.AND, eq("category", "a"), eq("flag", true)),
             eq("body", "b")
         );
-        assertEquals("(\"category\" = 'a' AND \"flag\" = true AND \"body\" = 'b')", printed(and));
+        assertEquals("(category = 'a' AND flag = true AND body = 'b')", printed(and));
     }
 
     public void testDisjunctionOfMixedComparisonsKeepsOr() {
@@ -129,7 +128,7 @@ public class RexToLanceSqlTests extends OpenSearchTestCase {
             eq("category", "a"),
             builder.call(SqlStdOperatorTable.GREATER_THAN, builder.field("rating"), builder.literal(1))
         );
-        assertEquals("(\"category\" = 'a' OR \"rating\" > 1)", printed(or));
+        assertEquals("(category = 'a' OR rating > 1)", printed(or));
     }
 
     public void testDisjunctionOfEqualitiesOnOneColumnCollapsesToIn() {
@@ -138,27 +137,27 @@ public class RexToLanceSqlTests extends OpenSearchTestCase {
             builder.call(SqlStdOperatorTable.OR, eq("category", "a"), eq("category", "b")),
             eq("category", "c")
         );
-        assertEquals("\"category\" IN ('a', 'b', 'c')", printed(or));
+        assertEquals("category IN ('a', 'b', 'c')", printed(or));
     }
 
     public void testDisjunctionAcrossColumnsDoesNotCollapse() {
         RexNode or = builder.call(SqlStdOperatorTable.OR, eq("category", "a"), eq("body", "b"));
-        assertEquals("(\"category\" = 'a' OR \"body\" = 'b')", printed(or));
+        assertEquals("(category = 'a' OR body = 'b')", printed(or));
     }
 
     public void testNotOverIsTruePrintsOnePairOfParentheses() {
         RexNode negated = builder.call(SqlStdOperatorTable.NOT, builder.call(SqlStdOperatorTable.IS_TRUE, eq("category", "a")));
-        assertEquals("NOT ((\"category\" = 'a') IS TRUE)", printed(negated));
+        assertEquals("NOT ((category = 'a') IS TRUE)", printed(negated));
     }
 
     public void testIsNullAndIsNotNull() {
-        assertEquals("\"category\" IS NULL", printed(builder.isNull(builder.field("category"))));
-        assertEquals("\"category\" IS NOT NULL", printed(builder.isNotNull(builder.field("category"))));
+        assertEquals("category IS NULL", printed(builder.isNull(builder.field("category"))));
+        assertEquals("category IS NOT NULL", printed(builder.isNotNull(builder.field("category"))));
     }
 
     public void testLikeWithEscapeClause() {
         RexNode like = builder.call(SqlStdOperatorTable.LIKE, builder.field("body"), builder.literal("a%c_"), builder.literal("\\"));
-        assertEquals("\"body\" LIKE 'a%c_' ESCAPE '\\'", printed(like));
+        assertEquals("body LIKE 'a%c_' ESCAPE '\\'", printed(like));
     }
 
     public void testLikePatternWithEscapedMetacharacters() {
@@ -168,27 +167,27 @@ public class RexToLanceSqlTests extends OpenSearchTestCase {
             builder.literal("50\\%\\_%\\\\"),
             builder.literal("\\")
         );
-        assertEquals("\"body\" LIKE '50\\%\\_%\\\\' ESCAPE '\\'", printed(like));
+        assertEquals("body LIKE '50\\%\\_%\\\\' ESCAPE '\\'", printed(like));
     }
 
     public void testIlike() {
         RexNode ilike = builder.call(SqlLibraryOperators.ILIKE, builder.field("body"), builder.literal("A%"), builder.literal("\\"));
-        assertEquals("\"body\" ILIKE 'A%' ESCAPE '\\'", printed(ilike));
+        assertEquals("body ILIKE 'A%' ESCAPE '\\'", printed(ilike));
     }
 
     public void testRlikePrintsAsRegexpLike() {
         RexNode rlike = builder.call(SqlLibraryOperators.RLIKE, builder.field("body"), builder.literal("^(?:a.*)$"));
-        assertEquals("regexp_like(\"body\", '^(?:a.*)$')", printed(rlike));
+        assertEquals("regexp_like(body, '^(?:a.*)$')", printed(rlike));
     }
 
     public void testRegexpPatternWithItsOwnAnchorPassesThrough() {
         RexNode rlike = builder.call(SqlLibraryOperators.RLIKE, builder.field("body"), builder.literal("^(?:^abc$)$"));
-        assertEquals("regexp_like(\"body\", '^(?:^abc$)$')", printed(rlike));
+        assertEquals("regexp_like(body, '^(?:^abc$)$')", printed(rlike));
     }
 
     public void testStartsWith() {
         RexNode call = builder.call(SqlLibraryOperators.STARTS_WITH, builder.field("body"), builder.literal("ab"));
-        assertEquals("starts_with(\"body\", 'ab')", printed(call));
+        assertEquals("starts_with(body, 'ab')", printed(call));
     }
 
     public void testCaseInsensitivePrefixLowersBothSides() {
@@ -197,7 +196,7 @@ public class RexToLanceSqlTests extends OpenSearchTestCase {
             builder.call(SqlStdOperatorTable.LOWER, builder.field("body")),
             builder.call(SqlStdOperatorTable.LOWER, builder.literal("AB"))
         );
-        assertEquals("starts_with(lower(\"body\"), lower('AB'))", printed(call));
+        assertEquals("starts_with(lower(body), lower('AB'))", printed(call));
     }
 
     public void testUnixMillisComparisonPrintsToTimestampMillis() {
@@ -206,7 +205,7 @@ public class RexToLanceSqlTests extends OpenSearchTestCase {
             builder.call(SqlLibraryOperators.UNIX_MILLIS, builder.field("ts")),
             builder.literal(1706745600000L)
         );
-        assertEquals("\"ts\" >= to_timestamp_millis(1706745600000)", printed(bound));
+        assertEquals("ts >= to_timestamp_millis(1706745600000)", printed(bound));
     }
 
     public void testUnixMillisOverTheDateCastUnwrapsToTheColumn() {
@@ -215,13 +214,13 @@ public class RexToLanceSqlTests extends OpenSearchTestCase {
             builder.call(SqlLibraryOperators.UNIX_MILLIS, builder.cast(builder.field("day"), SqlTypeName.TIMESTAMP)),
             builder.literal(1709337599999L)
         );
-        assertEquals("\"day\" <= to_timestamp_millis(1709337599999)", printed(bound));
+        assertEquals("day <= to_timestamp_millis(1709337599999)", printed(bound));
     }
 
     public void testStructChildPrintsAsDottedQuotedPath() {
         RexNode access = builder.getRexBuilder().makeFieldAccess(builder.field("meta"), "region", true);
         RexNode compared = builder.call(SqlStdOperatorTable.EQUALS, access, builder.literal("east"));
-        assertEquals("\"meta\".\"region\" = 'east'", printed(compared));
+        assertEquals("meta.region = 'east'", printed(compared));
     }
 
     public void testArithmeticIsUnprintable() {

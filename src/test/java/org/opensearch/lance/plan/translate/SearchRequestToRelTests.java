@@ -17,6 +17,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
@@ -149,11 +150,45 @@ public class SearchRequestToRelTests extends OpenSearchTestCase {
         );
     }
 
-    public void testNonMatchAllQueryThrows() {
+    public void testTermQueryBecomesAFilterAboveTheScan() {
         SearchSourceBuilder source = new SearchSourceBuilder().size(0)
             .query(QueryBuilders.termQuery("id", 1))
             .aggregation(AggregationBuilders.sum("s").field("price"));
-        assertEquals("query type [term]", messageOf(source));
+        assertEquals(
+            "LanceAggregate(group=[{}], s=[SUM($1)], metrics=[[SUM{name=s}]])\n"
+                + "  LogicalFilter(condition=[=(CAST($0):BIGINT NOT NULL, 1)])\n"
+                + "    LanceTableScan(table=[[lance, idx]])\n",
+            translate(source)
+        );
+    }
+
+    public void testMatchNoneQueryKeepsAConstantFilter() {
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0)
+            .query(new MatchNoneQueryBuilder())
+            .aggregation(AggregationBuilders.sum("s").field("price"));
+        assertEquals(
+            "LanceAggregate(group=[{}], s=[SUM($1)], metrics=[[SUM{name=s}]])\n"
+                + "  LogicalFilter(condition=[false])\n"
+                + "    LanceTableScan(table=[[lance, idx]])\n",
+            translate(source)
+        );
+    }
+
+    public void testMatchAllQueryAddsNoFilter() {
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0)
+            .query(QueryBuilders.matchAllQuery())
+            .aggregation(AggregationBuilders.sum("s").field("price"));
+        assertEquals(
+            "LanceAggregate(group=[{}], s=[SUM($1)], metrics=[[SUM{name=s}]])\n  LanceTableScan(table=[[lance, idx]])\n",
+            translate(source)
+        );
+    }
+
+    public void testUnsupportedQueryTypeThrows() {
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0)
+            .query(QueryBuilders.matchQuery("body", "hello"))
+            .aggregation(AggregationBuilders.sum("s").field("price"));
+        assertEquals("query type [match]", messageOf(source));
     }
 
     public void testNonZeroSizeThrows() {

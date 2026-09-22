@@ -27,8 +27,9 @@ import java.util.Optional;
  * SQL spelling; each construct is pinned by a unit test:
  *
  * <ul>
- *   <li>identifiers double quoted, a struct child as
- *       {@code "parent"."child"}</li>
+ *   <li>identifiers bare (Lance's filter parser reads a double quoted
+ *       token as a string literal, so quoting is not available), a
+ *       struct child as {@code parent.child}</li>
  *   <li>string literals single quoted with embedded quotes doubled
  *       (DataFusion's dialect has no backslash escapes in literals)</li>
  *   <li>{@code =} / {@code <>} / {@code <} / {@code <=} / {@code >} /
@@ -306,9 +307,17 @@ public final class RexToLanceSql extends RexVisitorImpl<String> {
         throw new Unprintable();
     }
 
-    /** Double quoted identifier with embedded double quotes doubled. */
+    /**
+     * Bare identifier, as the translator this printer replaces emits.
+     * Lance's filter parser reads a double quoted token as a string
+     * literal, not as a quoted identifier (a quoted column name
+     * compares as a constant and a quoted struct path is refused), so
+     * quoting is not available; a column whose name collides with a SQL
+     * keyword or contains a dot cannot be addressed, exactly as on the
+     * old path.
+     */
     private static String identifier(String name) {
-        return "\"" + name.replace("\"", "\"\"") + "\"";
+        return name;
     }
 
     /**
