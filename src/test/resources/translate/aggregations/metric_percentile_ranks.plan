@@ -1,0 +1,2 @@
+LanceAggregate(group=[{}], pr=[LANCE_PERCENTILE_RANKS($2)], metrics=[[PERCENTILE_RANKS{name=pr, values=[10.0, 100.0], keyed=true}]])
+  LanceTableScan(table=[[lance, idx]])

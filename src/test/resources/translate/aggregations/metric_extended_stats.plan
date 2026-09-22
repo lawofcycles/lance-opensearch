@@ -1,0 +1,2 @@
+LanceAggregate(group=[{}], es=[LANCE_EXTENDED_STATS($2)], metrics=[[EXTENDED_STATS{name=es, sigma=3.0}]])
+  LanceTableScan(table=[[lance, idx]])

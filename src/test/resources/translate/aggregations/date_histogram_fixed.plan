@@ -1,0 +1,3 @@
+LanceAggregate(group=[{0}], buckets=[[DATE_HISTOGRAM_FIXED{name=d, minDocCount=0, intervalMillis=86400000}]])
+  LogicalProject(d=[*(FLOOR(/(UNIX_MILLIS($7), 86400000)), 86400000)])
+    LanceTableScan(table=[[lance, idx]])

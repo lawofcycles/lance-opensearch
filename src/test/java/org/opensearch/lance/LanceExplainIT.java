@@ -45,17 +45,27 @@ public class LanceExplainIT extends LanceRestTestCase {
             String body = readAll(ok);
             assertEquals(indexName, stringPath(body, "index"));
             String logical = stringPath(body, "logical");
-            assertTrue("logical plan carries the aggregate: " + logical, logical.contains("LogicalAggregate"));
+            assertTrue("logical plan carries the aggregate: " + logical, logical.contains("LanceAggregate"));
             assertTrue("logical plan carries the scan: " + logical, logical.contains("LanceTableScan"));
             assertTrue("the aggregation name is the output alias: " + logical, logical.contains("s=[SUM("));
 
+            Response bucket = explain(
+                indexName,
+                "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\"},\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}}"
+            );
+            assertEquals(RestStatus.OK.getStatus(), bucket.getStatusLine().getStatusCode());
+            String bucketLogical = stringPath(readAll(bucket), "logical");
+            assertTrue("bucket plan carries the aggregate: " + bucketLogical, bucketLogical.contains("LanceAggregate"));
+            assertTrue("bucket plan carries the bucket spec: " + bucketLogical, bucketLogical.contains("TERMS{name=by_id"));
+            assertTrue("bucket plan carries the metric spec: " + bucketLogical, bucketLogical.contains("AVG{name=a}"));
+
             ResponseException terms = expectThrows(
                 ResponseException.class,
-                () -> explain(indexName, "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"id\"}}}}")
+                () -> explain(indexName, "{\"size\":0,\"aggs\":{\"t\":{\"top_hits\":{\"size\":1}}}}")
             );
             assertEquals(RestStatus.BAD_REQUEST.getStatus(), terms.getResponse().getStatusLine().getStatusCode());
             String reason = readAll(terms.getResponse());
-            assertTrue("400 body names the aggregation type: " + reason, reason.contains("aggregation type [terms]"));
+            assertTrue("400 body names the aggregation type: " + reason, reason.contains("aggregation type [top_hits]"));
             assertTrue("400 body is an illegal_argument_exception: " + reason, reason.contains("illegal_argument_exception"));
 
             ResponseException hits = expectThrows(

@@ -1,0 +1,3 @@
+LanceAggregate(group=[{0, 1}], s=[SUM($2)], buckets=[[COMPOSITE_TERMS{name=cat, sourceOrder=ASC, compositeSize=10}, COMPOSITE_DATE_HISTOGRAM{name=d, intervalMillis=86400000, sourceOrder=ASC, compositeSize=10}]], metrics=[[SUM{name=s}]])
+  LogicalProject(cat=[$4], d=[*(FLOOR(/(UNIX_MILLIS($7), 86400000)), 86400000)], price=[$2])
+    LanceTableScan(table=[[lance, idx]])

@@ -1,0 +1,2 @@
+LanceAggregate(group=[{}], s=[SUM($2)], metrics=[[SUM{name=s}]])
+  LanceTableScan(table=[[lance, idx]])

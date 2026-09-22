@@ -1,0 +1,3 @@
+LanceAggregate(group=[{0}], s=[SUM($1)], buckets=[[FILTER{name=f, keys=[f]}]], metrics=[[SUM{name=s}]], filters=[[[=($4, 'a')]]])
+  LogicalProject(f=[CASE(=($4, 'a'), 1, 0)], price=[$2])
+    LanceTableScan(table=[[lance, idx]])

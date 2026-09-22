@@ -1,0 +1,1 @@
+{"size": 0, "aggs": {"by_cat": {"terms": {"field": "category"}, "aggs": {"by_hour": {"date_histogram": {"field": "ts", "fixed_interval": "1h"}, "aggs": {"s": {"sum": {"field": "price"}}}}}}}}

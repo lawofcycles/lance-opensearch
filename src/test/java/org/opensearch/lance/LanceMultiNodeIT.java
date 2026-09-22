@@ -187,7 +187,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                     Response response = pinned.performRequest(explain);
                     assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
                     String body = readAll(response);
-                    assertTrue("logical plan carries the aggregate on " + host + ": " + body, body.contains("LogicalAggregate"));
+                    assertTrue("logical plan carries the aggregate on " + host + ": " + body, body.contains("LanceAggregate"));
                     assertTrue("logical plan carries the scan on " + host + ": " + body, body.contains("LanceTableScan"));
                     answers.add(body);
                 }

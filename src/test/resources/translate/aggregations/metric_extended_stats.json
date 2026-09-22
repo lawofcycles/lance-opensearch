@@ -1,0 +1,1 @@
+{"size": 0, "aggs": {"es": {"extended_stats": {"field": "price", "sigma": 3.0}}}}

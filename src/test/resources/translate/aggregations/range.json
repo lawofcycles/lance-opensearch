@@ -1,0 +1,1 @@
+{"size": 0, "aggs": {"r": {"range": {"field": "price", "ranges": [{"key": "cheap", "to": 10}, {"key": "mid", "from": 10, "to": 100}, {"key": "dear", "from": 100}]}}}}

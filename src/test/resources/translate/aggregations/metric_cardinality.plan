@@ -1,0 +1,2 @@
+LanceAggregate(group=[{}], c=[COUNT(DISTINCT $4)], metrics=[[CARDINALITY{name=c, precisionThreshold=1000}]])
+  LanceTableScan(table=[[lance, idx]])

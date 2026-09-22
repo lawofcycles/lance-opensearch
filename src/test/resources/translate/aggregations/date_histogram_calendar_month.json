@@ -1,0 +1,1 @@
+{"size": 0, "aggs": {"d": {"date_histogram": {"field": "ts", "calendar_interval": "month"}}}}

@@ -1,0 +1,3 @@
+LanceAggregate(group=[{0}], buckets=[[FILTERS{name=fs, keys=[high, low], otherBucketKey=rest}]], filters=[[[>=(CAST($1):BIGINT NOT NULL, 100), <(CAST($1):BIGINT NOT NULL, 100)]]])
+  LogicalProject(fs=[+(CASE(>=(CAST($1):BIGINT NOT NULL, 100), 1, 0), CASE(<(CAST($1):BIGINT NOT NULL, 100), 2, 0))])
+    LanceTableScan(table=[[lance, idx]])

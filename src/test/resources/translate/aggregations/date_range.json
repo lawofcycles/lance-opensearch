@@ -1,0 +1,1 @@
+{"size": 0, "aggs": {"dr": {"date_range": {"field": "ts", "ranges": [{"key": "old", "to": "2024-01-01"}, {"key": "new", "from": "2024-01-01"}]}}}}
