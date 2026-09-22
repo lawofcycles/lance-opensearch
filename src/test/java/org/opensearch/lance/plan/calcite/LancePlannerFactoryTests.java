@@ -11,6 +11,7 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.calcite.plan.RelOptUtil;
+import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.tools.RelBuilder;
 import org.opensearch.lance.plan.rel.LanceTableScan;
@@ -21,8 +22,8 @@ import java.util.Map;
 
 /**
  * Pins what the builder produces over a Lance backed table: the scan node
- * class, its convention, and the plan strings the later translator phases
- * will produce for scan, scan with filter, and scan with an aggregate.
+ * class, its convention, and the plan strings the translator will produce
+ * for scan, scan with filter, and scan with an aggregate.
  */
 public class LancePlannerFactoryTests extends OpenSearchTestCase {
 
@@ -67,7 +68,10 @@ public class LancePlannerFactoryTests extends OpenSearchTestCase {
         assertEquals("LogicalAggregate(group=[{}], cnt=[COUNT()])\n  LanceTableScan(table=[[lance, t]])\n", RelOptUtil.toString(rel));
     }
 
-    public void testHepPlannerBuilds() {
-        assertNotNull(new LancePlannerFactory(1L << 30, 1L << 30).newHepPlanner());
+    public void testHepPlannerRunsEmptyProgramUnchanged() {
+        RelNode scan = relBuilder().scan("lance", "t").build();
+        HepPlanner hepPlanner = new LancePlannerFactory(1L << 30, 1L << 30).newHepPlanner();
+        hepPlanner.setRoot(scan);
+        assertSame(scan, hepPlanner.findBestExp());
     }
 }

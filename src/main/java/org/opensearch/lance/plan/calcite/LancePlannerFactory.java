@@ -20,6 +20,7 @@ import org.apache.calcite.rel.metadata.DefaultRelMetadataProvider;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.apache.calcite.tools.RelBuilder;
+import org.opensearch.lance.plan.rel.LanceTableScan;
 
 /**
  * Assembles the Calcite planner objects for Lance backed indexes: a Volcano
@@ -53,8 +54,8 @@ public final class LancePlannerFactory {
      * {@code DECIMAL(20, 0)} survive. Registering the convention trait def
      * is what makes conventions available to the planner; the individual
      * conventions need no explicit registration. The metadata provider is
-     * Calcite's default for now; Lance statistics replace it in a later
-     * phase.
+     * Calcite's default for now; wiring Lance statistics into it is later
+     * work.
      */
     public RelOptCluster newCluster() {
         VolcanoPlanner planner = new VolcanoPlanner(costFactory, Contexts.empty());
@@ -64,7 +65,7 @@ public final class LancePlannerFactory {
         return cluster;
     }
 
-    /** A fresh Hep planner over an empty program; rules come in later phases. */
+    /** A fresh Hep planner over an empty program; no rules exist to run yet. */
     public HepPlanner newHepPlanner() {
         return new HepPlanner(new HepProgramBuilder().build());
     }
@@ -72,7 +73,7 @@ public final class LancePlannerFactory {
     /**
      * A builder whose {@code scan(SCHEMA_NAME, index)} resolves the index
      * name against the given schema and yields a
-     * {@link org.opensearch.lance.plan.rel.LanceTableScan}, because
+     * {@link LanceTableScan}, because
      * {@link LanceTable} is a {@code TranslatableTable}.
      */
     public RelBuilder relBuilder(LanceSchema schema) {
