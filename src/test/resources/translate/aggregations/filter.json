@@ -1,0 +1,1 @@
+{"size": 0, "aggs": {"f": {"filter": {"term": {"category": "a"}}, "aggs": {"s": {"sum": {"field": "price"}}}}}}

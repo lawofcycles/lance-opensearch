@@ -1,0 +1,1 @@
+{"size": 0, "aggs": {"fs": {"filters": {"filters": {"low": {"range": {"rating": {"lt": 100}}}, "high": {"range": {"rating": {"gte": 100}}}}, "other_bucket_key": "rest"}}}}

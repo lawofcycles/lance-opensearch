@@ -1,0 +1,3 @@
+LanceAggregate(group=[{0}], buckets=[[DATE_HISTOGRAM_CALENDAR{name=d, minDocCount=0, unit=month}]])
+  LogicalProject(d=[LANCE_DATE_TRUNC('month', $7)])
+    LanceTableScan(table=[[lance, idx]])

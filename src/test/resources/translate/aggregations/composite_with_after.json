@@ -1,0 +1,1 @@
+{"size": 0, "aggs": {"c": {"composite": {"size": 5, "sources": [{"cat": {"terms": {"field": "category", "order": "desc"}}}], "after": {"cat": "m"}}}}}

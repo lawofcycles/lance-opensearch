@@ -33,10 +33,11 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Pins the translation of the supported shape (match_all, size 0, one
- * metric aggregation) to its plan string, and the message of every
- * unsupported element, because the explain endpoint returns those
- * messages in its 400 body.
+ * Pins the translation of the metric shapes to their plan strings, and
+ * the message of every unsupported envelope element, because the
+ * explain endpoint returns those messages in its 400 body. The bucket
+ * shapes are pinned fixture by fixture in
+ * {@link AggregationToRelFixtureTests}.
  */
 public class SearchRequestToRelTests extends OpenSearchTestCase {
 
@@ -78,41 +79,74 @@ public class SearchRequestToRelTests extends OpenSearchTestCase {
 
     public void testSumTranslates() {
         SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.sum("s").field("price"));
-        assertEquals("LogicalAggregate(group=[{}], s=[SUM($1)])\n  LanceTableScan(table=[[lance, idx]])\n", translate(source));
+        assertEquals(
+            "LanceAggregate(group=[{}], s=[SUM($1)], metrics=[[SUM{name=s}]])\n  LanceTableScan(table=[[lance, idx]])\n",
+            translate(source)
+        );
     }
 
     public void testAvgTranslates() {
         SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.avg("a").field("price"));
-        assertEquals("LogicalAggregate(group=[{}], a=[AVG($1)])\n  LanceTableScan(table=[[lance, idx]])\n", translate(source));
+        assertEquals(
+            "LanceAggregate(group=[{}], a=[AVG($1)], metrics=[[AVG{name=a}]])\n  LanceTableScan(table=[[lance, idx]])\n",
+            translate(source)
+        );
     }
 
     public void testMinTranslates() {
         SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.min("m").field("id"));
-        assertEquals("LogicalAggregate(group=[{}], m=[MIN($0)])\n  LanceTableScan(table=[[lance, idx]])\n", translate(source));
+        assertEquals(
+            "LanceAggregate(group=[{}], m=[MIN($0)], metrics=[[MIN{name=m}]])\n  LanceTableScan(table=[[lance, idx]])\n",
+            translate(source)
+        );
     }
 
     public void testMaxTranslatesOnTimestampColumn() {
         SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.max("M").field("ts"));
-        assertEquals("LogicalAggregate(group=[{}], M=[MAX($3)])\n  LanceTableScan(table=[[lance, idx]])\n", translate(source));
+        assertEquals(
+            "LanceAggregate(group=[{}], M=[MAX($3)], metrics=[[MAX{name=M}]])\n  LanceTableScan(table=[[lance, idx]])\n",
+            translate(source)
+        );
     }
 
     public void testValueCountTranslates() {
         SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.count("c").field("price"));
-        assertEquals("LogicalAggregate(group=[{}], c=[COUNT($1)])\n  LanceTableScan(table=[[lance, idx]])\n", translate(source));
+        assertEquals(
+            "LanceAggregate(group=[{}], c=[COUNT($1)], metrics=[[VALUE_COUNT{name=c}]])\n  LanceTableScan(table=[[lance, idx]])\n",
+            translate(source)
+        );
     }
 
-    public void testValueCountOnNonNullableColumnSimplifiesToCountStar() {
-        // Calcite's RelBuilder folds COUNT of a non nullable column to
-        // COUNT(*), which counts the same rows.
+    public void testValueCountOnNonNullableColumnStaysAColumnCount() {
+        // The calls are built directly (not through RelBuilder), so a
+        // count of a non nullable column is not folded to COUNT(*);
+        // the spec kind names the OpenSearch semantics either way.
         SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.count("c").field("id"));
-        assertEquals("LogicalAggregate(group=[{}], c=[COUNT()])\n  LanceTableScan(table=[[lance, idx]])\n", translate(source));
+        assertEquals(
+            "LanceAggregate(group=[{}], c=[COUNT($0)], metrics=[[VALUE_COUNT{name=c}]])\n  LanceTableScan(table=[[lance, idx]])\n",
+            translate(source)
+        );
     }
 
     public void testExplicitMatchAllTranslates() {
         SearchSourceBuilder source = new SearchSourceBuilder().size(0)
             .query(QueryBuilders.matchAllQuery())
             .aggregation(AggregationBuilders.sum("s").field("id"));
-        assertEquals("LogicalAggregate(group=[{}], s=[SUM($0)])\n  LanceTableScan(table=[[lance, idx]])\n", translate(source));
+        assertEquals(
+            "LanceAggregate(group=[{}], s=[SUM($0)], metrics=[[SUM{name=s}]])\n  LanceTableScan(table=[[lance, idx]])\n",
+            translate(source)
+        );
+    }
+
+    public void testTwoMetricAggregationsTranslate() {
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0)
+            .aggregation(AggregationBuilders.sum("s").field("price"))
+            .aggregation(AggregationBuilders.avg("a").field("price"));
+        assertEquals(
+            "LanceAggregate(group=[{}], s=[SUM($1)], a=[AVG($1)], metrics=[[SUM{name=s}, AVG{name=a}]])\n"
+                + "  LanceTableScan(table=[[lance, idx]])\n",
+            translate(source)
+        );
     }
 
     public void testNonMatchAllQueryThrows() {
@@ -167,7 +201,7 @@ public class SearchRequestToRelTests extends OpenSearchTestCase {
     }
 
     public void testNoAggregationsThrows() {
-        assertEquals("no aggregations (exactly one metric aggregation)", messageOf(new SearchSourceBuilder().size(0)));
+        assertEquals("no aggregations", messageOf(new SearchSourceBuilder().size(0)));
     }
 
     public void testEmptyBodyThrows() {
@@ -176,16 +210,9 @@ public class SearchRequestToRelTests extends OpenSearchTestCase {
         assertEquals("empty body", messageOf(null));
     }
 
-    public void testTwoTopLevelAggregationsThrow() {
-        SearchSourceBuilder source = new SearchSourceBuilder().size(0)
-            .aggregation(AggregationBuilders.sum("s").field("price"))
-            .aggregation(AggregationBuilders.avg("a").field("price"));
-        assertEquals("two top level aggregations", messageOf(source));
-    }
-
-    public void testBucketAggregationThrows() {
-        SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.terms("t").field("id"));
-        assertEquals("aggregation type [terms]", messageOf(source));
+    public void testUnsupportedAggregationTypeThrows() {
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.topHits("t"));
+        assertEquals("aggregation type [top_hits]", messageOf(source));
     }
 
     public void testMetricOnKeywordColumnNamesTheColumn() {

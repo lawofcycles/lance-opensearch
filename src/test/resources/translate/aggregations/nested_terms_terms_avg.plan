@@ -1,0 +1,3 @@
+LanceAggregate(group=[{0, 1}], a=[AVG($2)], buckets=[[TERMS{name=by_cat, size=10, shardSize=25, minDocCount=1, order=COUNT_DESC}, TERMS{name=by_raw, size=10, shardSize=25, minDocCount=1, order=COUNT_DESC}]], metrics=[[AVG{name=a}]])
+  LogicalProject(by_cat=[$4], by_raw=[$5], price=[$2])
+    LanceTableScan(table=[[lance, idx]])

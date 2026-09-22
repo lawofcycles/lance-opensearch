@@ -1,0 +1,3 @@
+LanceAggregate(group=[{0}], buckets=[[MISSING{name=no_rating, keys=[no_rating]}]])
+  LogicalProject(no_rating=[CASE(IS NULL($1), 1, 0)])
+    LanceTableScan(table=[[lance, idx]])
