@@ -272,12 +272,21 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
         assertFalse("script", candidate(AggregationBuilders.sum("s").script(new Script("doc['rating'].value"))));
         assertFalse("missing", candidate(AggregationBuilders.sum("s").field("rating").missing(0)));
         assertFalse("count asc", candidate(AggregationBuilders.terms("c").field("category").order(BucketOrder.count(true))));
-        assertFalse(
+        assertTrue(
             "order by sub aggregation",
             candidate(
                 AggregationBuilders.terms("c")
                     .field("category")
                     .order(BucketOrder.aggregation("a", false))
+                    .subAggregation(AggregationBuilders.avg("a").field("rating"))
+            )
+        );
+        assertFalse(
+            "compound order beyond the key tie breaker",
+            candidate(
+                AggregationBuilders.terms("c")
+                    .field("category")
+                    .order(List.of(BucketOrder.aggregation("a", false), BucketOrder.count(false)))
                     .subAggregation(AggregationBuilders.avg("a").field("rating"))
             )
         );
@@ -1403,6 +1412,221 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
         assertEquals(480L, histogramRows);
     }
 
+    public void testMetricOrderedTermsPlanForTheSingleLevelShapeOnly() throws Exception {
+        String indexName = "pushdown-metric-order-plan";
+        String tableUri = attach(indexName);
+        IndexService indexService = getInstanceFromNode(IndicesService.class).indexService(resolveIndex(indexName));
+        QueryShardContext qsc = indexService.newQueryShardContext(0, null, () -> 0L, null);
+        try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
+            Map<String, LinkedHashMap<String, String>> none = Map.of();
+            assertNotNull(
+                "order by a sum child",
+                plan(
+                    dataset,
+                    none,
+                    qsc,
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .order(BucketOrder.aggregation("s", false))
+                        .subAggregation(AggregationBuilders.sum("s").field("rating"))
+                )
+            );
+            assertNotNull(
+                "order by an avg child through its value path",
+                plan(
+                    dataset,
+                    none,
+                    qsc,
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .order(BucketOrder.aggregation("a.value", true))
+                        .subAggregation(AggregationBuilders.avg("a").field("rating"))
+                )
+            );
+            assertNull(
+                "order by a child the level does not have",
+                plan(
+                    dataset,
+                    none,
+                    qsc,
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .order(BucketOrder.aggregation("x", false))
+                        .subAggregation(AggregationBuilders.sum("s").field("rating"))
+                )
+            );
+            assertNull(
+                "order by a cardinality child",
+                plan(
+                    dataset,
+                    none,
+                    qsc,
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .order(BucketOrder.aggregation("k", false))
+                        .subAggregation(AggregationBuilders.cardinality("k").field("rating"))
+                )
+            );
+            assertNull(
+                "order by a stats child",
+                plan(
+                    dataset,
+                    none,
+                    qsc,
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .order(BucketOrder.aggregation("st.avg", false))
+                        .subAggregation(AggregationBuilders.stats("st").field("rating"))
+                )
+            );
+            assertNull(
+                "metric order on a nested terms level",
+                plan(
+                    dataset,
+                    none,
+                    qsc,
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .subAggregation(
+                            AggregationBuilders.terms("r")
+                                .field("rating")
+                                .order(BucketOrder.aggregation("m", false))
+                                .subAggregation(AggregationBuilders.max("m").field("id"))
+                        )
+                )
+            );
+            assertNull(
+                "metric order on an outer terms with a nested level",
+                plan(
+                    dataset,
+                    none,
+                    qsc,
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .order(BucketOrder.aggregation("s", false))
+                        .subAggregation(AggregationBuilders.sum("s").field("rating"))
+                        .subAggregation(AggregationBuilders.terms("r").field("rating"))
+                )
+            );
+        }
+    }
+
+    public void testMetricOrderedTermsEqualAggregatorResults() throws Exception {
+        String indexName = "pushdown-metric-order";
+        String tableUri = attach(indexName);
+        // Sums over distinct ids and ratings keep the order values tie
+        // free, so the selection is deterministic on both paths.
+        List<AggregatorFactories.Builder> trees = List.of(
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .order(BucketOrder.aggregation("s", false))
+                        .subAggregation(AggregationBuilders.sum("s").field("rating"))
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.terms("c")
+                        .field("category")
+                        .order(BucketOrder.aggregation("a", true))
+                        .subAggregation(AggregationBuilders.avg("a").field("rating"))
+                ),
+            // 480 one row rating groups: shard_size 16 cuts the merged
+            // selection by the metric, not by the count
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.terms("r")
+                        .field("rating")
+                        .size(4)
+                        .order(BucketOrder.aggregation("m", false))
+                        .subAggregation(AggregationBuilders.max("m").field("id"))
+                ),
+            AggregatorFactories.builder()
+                .addAggregator(
+                    AggregationBuilders.terms("r")
+                        .field("rating")
+                        .size(4)
+                        .order(BucketOrder.aggregation("s.value", true))
+                        .subAggregation(AggregationBuilders.sum("s").field("id"))
+                        .subAggregation(AggregationBuilders.avg("a").field("id"))
+                )
+        );
+        for (AggregatorFactories.Builder tree : trees) {
+            compare(tableUri, indexName, new MatchAllQueryBuilder(), tree, List.of());
+        }
+        compare(tableUri, indexName, new RangeQueryBuilder("rating").gte(300), trees.get(0), List.of());
+        for (int parallelism : new int[] { 1, 8 }) {
+            setParallelism(parallelism);
+            try {
+                compare(tableUri, indexName, new MatchAllQueryBuilder(), trees.get(2), List.of());
+            } finally {
+                setParallelism(null);
+            }
+        }
+    }
+
+    public void testTopKSlackKeepsTheShardResultRules() throws Exception {
+        // 8 fragments of 200 rows: rating r appears at i and i + 1000
+        // (different fragments), so about 600 ratings have their count
+        // split over two of the 8 per fragment scans. With slack 64
+        // every scan retains all of its groups and the result is bit
+        // identical to the aggregators; with slack 1 each scan keeps
+        // only shard_size groups, and the shard result still obeys the
+        // aggregator's rules: shard_size buckets, key sorted, every doc
+        // count at most the true count, the counts of everything else
+        // in sum_other_doc_count, the error field left for the reduce.
+        String indexName = "pushdown-topk-slack";
+        String tableUri = attach(indexName, 8, 200);
+        AggregatorFactories.Builder tree = AggregatorFactories.builder()
+            .addAggregator(AggregationBuilders.terms("r").field("rating").size(3));
+        setParallelism(8);
+        try {
+            setSlack(64);
+            try {
+                compare(tableUri, indexName, new MatchAllQueryBuilder(), tree, List.of());
+            } finally {
+                setSlack(null);
+            }
+
+            Map<Long, Long> expected = new TreeMap<>();
+            long keyedRows = 0;
+            for (int i = 0; i < 1600; i++) {
+                if (i % 5 == 4) {
+                    continue;
+                }
+                keyedRows++;
+                expected.merge((i * 37L) % 1000L, 1L, Long::sum);
+            }
+            setSlack(1);
+            try {
+                LongTerms terms = execute(request(tableUri, indexName, new MatchAllQueryBuilder(), tree, List.of())).aggregations()
+                    .get("r");
+                assertEquals(14, terms.getBuckets().size());
+                assertEquals(0L, terms.getDocCountError());
+                long selected = 0;
+                long previous = Long.MIN_VALUE;
+                for (LongTerms.Bucket bucket : terms.getBuckets()) {
+                    long key = ((Number) bucket.getKey()).longValue();
+                    assertTrue("buckets sorted by key: " + terms.getBuckets(), key > previous);
+                    previous = key;
+                    long docCount = bucket.getDocCount();
+                    assertTrue("a bucket cannot exceed its true count", docCount <= expected.get(key));
+                    assertTrue("a bucket needs at least one row", docCount >= 1L);
+                    selected += docCount;
+                }
+                assertEquals(
+                    "every keyed row is a bucket row or in sum_other_doc_count",
+                    keyedRows,
+                    selected + terms.getSumOfOtherDocCounts()
+                );
+            } finally {
+                setSlack(null);
+            }
+        } finally {
+            setParallelism(null);
+        }
+    }
+
     public void testParallelGroupScansAgreeWithOneScan() throws Exception {
         // 8 fragments of 100 rows: 640 one row rating groups, 3
         // category groups, so shard_size cuts the rating terms and
@@ -2013,6 +2237,16 @@ public class LanceAggregatePushdownTests extends OpenSearchSingleNodeTestCase {
             settings.putNull(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING.getKey());
         } else {
             settings.put(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING.getKey(), value);
+        }
+        client().admin().cluster().updateSettings(new ClusterUpdateSettingsRequest().transientSettings(settings)).actionGet();
+    }
+
+    private void setSlack(Integer value) {
+        Settings.Builder settings = Settings.builder();
+        if (value == null) {
+            settings.putNull(LancePlugin.AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.getKey());
+        } else {
+            settings.put(LancePlugin.AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.getKey(), value);
         }
         client().admin().cluster().updateSettings(new ClusterUpdateSettingsRequest().transientSettings(settings)).actionGet();
     }

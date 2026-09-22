@@ -581,17 +581,20 @@ The effective probe limit is `min(subset_probe_limit, max(subset_probe_min_rows,
 
 ### Aggregations computed inside the scan
 
-A `size: 0` request over `match_all` or a scalar filter whose aggregations are metrics only (`stats`, `cardinality` and tdigest `percentiles` included), or a chain of `terms` / `histogram` / `date_histogram` / `range` / `date_range` / `filter` / `filters` / `missing` levels with metric children, is answered by a group by inside the Lance scan instead of the Lucene aggregators (the shapes are listed in [features.md](features.md#aggregation-pushdown)). Three dynamic cluster settings control it:
+A `size: 0` request over `match_all` or a scalar filter whose aggregations are metrics only (`stats`, `cardinality` and tdigest `percentiles` included), or a chain of `terms` / `histogram` / `date_histogram` / `range` / `date_range` / `filter` / `filters` / `missing` levels with metric children, is answered by a group by inside the Lance scan instead of the Lucene aggregators (the shapes are listed in [features.md](features.md#aggregation-pushdown)). Four dynamic cluster settings control it:
 
 ```
 lance.aggregation.pushdown: true              # default; false answers every aggregation through the aggregators
 lance.aggregation.pushdown_parallelism: 4     # default: half the CPUs the JVM sees (at least 1, at most 32)
 lance.aggregation.percentiles_bins: 4096      # default; bins of a pushed down tdigest percentiles histogram (16 to 1000000)
+lance.aggregation.pushdown_topk_slack: 4      # default; per scan retention of a top-k ordered terms, in multiples of shard_size (1 to 64)
 ```
 
 Lance aggregates one scan on a single thread, so a node that holds many fragments cuts them into `pushdown_parallelism` contiguous groups, scans the groups at once on the `search` thread pool and merges the group rows before it builds its buckets. Set it to `1` to compare against a single scan; raise it up to the node's core count when a `terms` over many rows is slower than the same request with the setting off.
 
 A tdigest `percentiles` is sketched from a histogram of `percentiles_bins` equal width bins over the field's range instead of from every document: the histogram is accurate to one bin width, and the TDigest built from it interpolates a little less accurately than one built from every document (see [limitations.md](limitations.md)). Raise the bin count when a percentile needs to be closer than `(max - min) / 4096`; every bin the data fills is one row the executor reads per bucket.
+
+A single `terms` level ordered by `_count` (the default) or by one of its own single value metric children keeps only the best `shard_size * pushdown_topk_slack` groups per scan; every other group's rows stay counted in `sum_other_doc_count`, and `doc_count_error_upper_bound` keeps the meaning it has across shards. A slack that retains every distinct key gives the exact answer; raise it when high cardinality terms need tighter counts.
 
 ### Aggregations and hit pages collected on several threads
 

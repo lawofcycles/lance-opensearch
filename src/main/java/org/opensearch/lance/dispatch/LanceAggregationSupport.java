@@ -5,11 +5,14 @@
 
 package org.opensearch.lance.dispatch;
 
+import java.io.IOException;
 import java.util.Collection;
 
 import org.opensearch.common.Rounding;
+import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.Strings;
+import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
@@ -20,6 +23,7 @@ import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.lance.query.substrait.SubstraitExpressions;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
+import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalOrder;
 import org.opensearch.search.aggregations.bucket.composite.CompositeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.composite.CompositeValuesSourceBuilder;
@@ -480,7 +484,7 @@ final class LanceAggregationSupport {
         if (builder instanceof TermsAggregationBuilder terms) {
             return (InternalOrder.isCountDesc(terms.order())
                 || InternalOrder.isKeyOrder(terms.order())
-                || terms.order() instanceof InternalOrder.Aggregation)
+                || aggregationOrder(terms.order()) != null)
                 && terms.minDocCount() == 1L
                 && terms.shardMinDocCount() == 0L
                 && terms.includeExclude() == null;
@@ -507,6 +511,50 @@ final class LanceAggregationSupport {
             return !range.ranges().isEmpty() && range.ranges().size() <= SubstraitExpressions.MAX_MASK_CONDITIONS;
         }
         return builder instanceof MissingAggregationBuilder;
+    }
+
+    /** A terms order on one sub aggregation: its path and direction. */
+    record AggregationOrder(String path, boolean ascending) {
+    }
+
+    /**
+     * The sub aggregation order of a {@code terms}, or null when the
+     * order is not one: the order itself, or the compound of the order
+     * and the {@code _key} ascending tie breaker the builder wraps
+     * every non key order in (any other compound answers null).
+     * {@code InternalOrder.Aggregation} exposes its path but not its
+     * direction, and a compound does not expose its elements, so both
+     * are read back from the order's wire form
+     * ({@code InternalOrder.Streams}: compound is -1 followed by the
+     * element count, an aggregation order is 0 followed by the
+     * direction and the path, {@code _key} ascending is 4).
+     */
+    static AggregationOrder aggregationOrder(BucketOrder order) {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            order.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                byte id = in.readByte();
+                if (id == -1) {
+                    if (in.readVInt() != 2) {
+                        return null;
+                    }
+                    id = in.readByte();
+                    if (id != 0) {
+                        return null;
+                    }
+                    boolean ascending = in.readBoolean();
+                    String path = in.readString();
+                    return in.readByte() == 4 ? new AggregationOrder(path, ascending) : null;
+                }
+                if (id == 0) {
+                    boolean ascending = in.readBoolean();
+                    return new AggregationOrder(in.readString(), ascending);
+                }
+                return null;
+            }
+        } catch (IOException impossible) {
+            return null;
+        }
     }
 
     /**

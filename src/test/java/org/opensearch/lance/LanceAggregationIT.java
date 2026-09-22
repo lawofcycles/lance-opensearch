@@ -662,6 +662,8 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "{\"size\":0,\"aggs\":{\"fs\":{\"filters\":{\"filters\":[{\"terms\":{\"category\":[\"c0\",\"c2\"]}},{\"match_all\":{}}]}}}}",
                 "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":500,\"min_doc_count\":0},\"aggs\":{\"fs\":{\"filters\":{\"other_bucket\":true,"
                     + "\"filters\":{\"on\":{\"term\":{\"flag\":true}},\"off\":{\"term\":{\"flag\":false}}}}}}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"order\":{\"a\":\"desc\"}},\"aggs\":{\"a\":{\"avg\":{\"field\":\"rating\"}}}}}}",
+                "{\"size\":0,\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":4,\"order\":{\"s\":\"asc\"}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}}",
                 // track_total_hits variants
                 "{\"size\":0,\"track_total_hits\":true,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
                 "{\"size\":0,\"track_total_hits\":false,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
@@ -682,7 +684,11 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"missing\":\"none\"}}}}",
                 "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"include\":\"c[01]\"}}}}",
                 "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"min_doc_count\":0}}}}",
-                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"order\":{\"a\":\"desc\"}},\"aggs\":{\"a\":{\"avg\":{\"field\":\"rating\"}}}}}}",
+                // an order by a metric of a nested terms level stays on
+                // the aggregators (the top-k selection honours it for
+                // the single level shape only)
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"order\":{\"m\":\"desc\"}},\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"order\":{\"k\":\"desc\"}},\"aggs\":{\"k\":{\"cardinality\":{\"field\":\"rating\"}}}}}}",
                 "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":100,\"offset\":10}}}}",
                 "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":100,\"extended_bounds\":{\"min\":-200,\"max\":1200}}}}}",
                 "{\"size\":0,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}",

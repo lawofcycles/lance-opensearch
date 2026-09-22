@@ -557,6 +557,129 @@ public class SubstraitAggregatePlanTests extends OpenSearchTestCase {
         return counts;
     }
 
+    public void testTopKEncodesFetchAndSortAboveTheAggregate() {
+        ByteBuffer plan = new SubstraitAggregatePlan.Builder().groupBy(new FieldReference(2), "k")
+            .measure("count", List.of(), ScalarType.I64, "n")
+            .topK(new FieldReference(1), false, 25L)
+            .build();
+        byte[] bytes = new byte[plan.remaining()];
+        plan.duplicate().get(bytes);
+        // Plan: relations = 3. PlanRel: root = 2. RelRoot: input = 1.
+        byte[] relRoot = message(message(bytes, 3), 2);
+        byte[] rel = message(relRoot, 1);
+        // Rel: fetch = 3. FetchRel: input = 2, count = 4.
+        byte[] fetch = message(rel, 3);
+        assertEquals(25L, varint(fetch, 4));
+        // FetchRel.input is Rel { sort = 5 }; SortRel: input = 2, sorts = 3.
+        byte[] sort = message(message(fetch, 2), 5);
+        byte[] sortField = message(sort, 3);
+        // SortField: expr = 1 (present), direction = 2
+        // (SORT_DIRECTION_DESC_NULLS_LAST = 4).
+        assertNotNull(message(sortField, 1));
+        assertEquals(4L, varint(sortField, 2));
+        // SortRel.input is Rel { aggregate = 4 } with the groupings (3)
+        // and measures (4) of the plain plan.
+        byte[] aggregate = message(message(sort, 2), 4);
+        assertNotNull(message(aggregate, 3));
+        assertNotNull(message(aggregate, 4));
+
+        ByteBuffer ascending = new SubstraitAggregatePlan.Builder().measure("count", List.of(), ScalarType.I64, "n")
+            .topK(new FieldReference(0), true, 7L)
+            .build();
+        byte[] ascendingBytes = new byte[ascending.remaining()];
+        ascending.duplicate().get(ascendingBytes);
+        byte[] ascendingFetch = message(message(message(message(ascendingBytes, 3), 2), 1), 3);
+        assertEquals(7L, varint(ascendingFetch, 4));
+        byte[] ascendingSort = message(message(ascendingFetch, 2), 5);
+        // SORT_DIRECTION_ASC_NULLS_LAST = 2.
+        assertEquals(2L, varint(message(ascendingSort, 3), 2));
+    }
+
+    public void testLanceRejectsATopKPlan() throws Exception {
+        // Lance 12's Substrait consumer takes an AggregateRel root only;
+        // the executor therefore never sends a topK plan today, and this
+        // pins the rejection that keeps it that way.
+        Path dir = createTempDir();
+        String uri = LanceTableFactory.writeHintFixtureTable(dir, "topk-reject", 1, 100);
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            ByteBuffer plan = new SubstraitAggregatePlan.Builder().groupBy(new FieldReference(fieldIndex(dataset, "category")), "k")
+                .measure("count", List.of(), ScalarType.I64, "n")
+                .topK(new FieldReference(1), false, 10L)
+                .build();
+            Exception rejected = expectThrows(Exception.class, () -> scan(dataset, plan, null, null));
+            assertTrue(rejected.getMessage(), rejected.getMessage().contains("Expected Substrait AggregateRel"));
+        }
+    }
+
+    /** The first {@code fieldNumber} length delimited field of {@code bytes}, or null. */
+    private static byte[] message(byte[] bytes, int fieldNumber) {
+        int i = 0;
+        while (i < bytes.length) {
+            long[] tag = readVarint(bytes, i);
+            i = (int) tag[1];
+            int field = (int) (tag[0] >>> 3);
+            int wire = (int) (tag[0] & 7);
+            if (wire == 2) {
+                long[] length = readVarint(bytes, i);
+                i = (int) length[1];
+                if (field == fieldNumber) {
+                    byte[] value = new byte[(int) length[0]];
+                    System.arraycopy(bytes, i, value, 0, value.length);
+                    return value;
+                }
+                i += (int) length[0];
+            } else if (wire == 0) {
+                i = (int) readVarint(bytes, i)[1];
+            } else if (wire == 1) {
+                i += 8;
+            } else {
+                fail("unexpected wire type " + wire);
+            }
+        }
+        return null;
+    }
+
+    /** The first {@code fieldNumber} varint field of {@code bytes}, or -1. */
+    private static long varint(byte[] bytes, int fieldNumber) {
+        int i = 0;
+        while (i < bytes.length) {
+            long[] tag = readVarint(bytes, i);
+            i = (int) tag[1];
+            int field = (int) (tag[0] >>> 3);
+            int wire = (int) (tag[0] & 7);
+            if (wire == 0) {
+                long[] value = readVarint(bytes, i);
+                i = (int) value[1];
+                if (field == fieldNumber) {
+                    return value[0];
+                }
+            } else if (wire == 2) {
+                long[] length = readVarint(bytes, i);
+                i = (int) (length[1] + length[0]);
+            } else if (wire == 1) {
+                i += 8;
+            } else {
+                fail("unexpected wire type " + wire);
+            }
+        }
+        return -1L;
+    }
+
+    /** Reads a varint at {@code offset}: {value, next offset}. */
+    private static long[] readVarint(byte[] bytes, int offset) {
+        long value = 0L;
+        int shift = 0;
+        int i = offset;
+        while (true) {
+            byte b = bytes[i++];
+            value |= (long) (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) {
+                return new long[] { value, i };
+            }
+            shift += 7;
+        }
+    }
+
     static int fieldIndex(Dataset dataset, String column) {
         List<Field> fields = dataset.getSchema().getFields();
         for (int i = 0; i < fields.size(); i++) {
