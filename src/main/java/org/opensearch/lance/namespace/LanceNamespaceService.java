@@ -244,6 +244,12 @@ public final class LanceNamespaceService {
         LanceNamespaceMetadata metadata = currentMetadata(event.state());
         Set<String> desired = new java.util.HashSet<>(metadata.entries().size());
         for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
+            if (!LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(entry.type())) {
+                // Non-directory catalogs are initialised through the
+                // LanceNamespace interface on the poll path; the
+                // directory cache only ever holds directory handles.
+                continue;
+            }
             desired.add(entry.rootUri());
             directoryCache.computeIfAbsent(entry.rootUri(), uri -> {
                 try {
@@ -274,11 +280,11 @@ public final class LanceNamespaceService {
 
     public List<String> namespaces() {
         LanceNamespaceMetadata metadata = currentMetadata(clusterService.state());
-        List<String> uris = new ArrayList<>(metadata.entries().size());
+        List<String> names = new ArrayList<>(metadata.entries().size());
         for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
-            uris.add(entry.rootUri());
+            names.add(entry.name());
         }
-        return List.copyOf(uris);
+        return List.copyOf(names);
     }
 
     /**
@@ -333,6 +339,9 @@ public final class LanceNamespaceService {
         adoptUntrackedIndexes(state);
         LanceNamespaceMetadata metadata = currentMetadata(state);
         for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
+            if (!LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(entry.type())) {
+                continue;
+            }
             DirectoryNamespace directory = directoryCache.get(entry.rootUri());
             if (directory == null) {
                 // Cluster state carries the registration but the
@@ -434,7 +443,9 @@ public final class LanceNamespaceService {
     private void adoptUntrackedIndexes(ClusterState state) {
         Set<String> roots = new HashSet<>();
         for (LanceNamespaceMetadata.Entry entry : currentMetadata(state).entries()) {
-            roots.add(entry.rootUri());
+            if (entry.rootUri() != null) {
+                roots.add(entry.rootUri());
+            }
         }
         for (IndexMetadata indexMetadata : state.metadata().indices().values()) {
             String indexName = indexMetadata.getIndex().getName();
