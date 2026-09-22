@@ -97,7 +97,7 @@ import org.opensearch.search.builder.SearchSourceBuilder;
  * executor's sketch is fed from the groups Lance returns (the distinct
  * values for {@code cardinality}, a bin histogram for
  * {@code percentiles}) instead of from every document; see
- * {@link LanceAggregatePushdown} for the error that adds.
+ * {@code LanceAggregateResults} for the error that adds.
  */
 public final class LanceAggregationSupport {
 
@@ -294,7 +294,7 @@ public final class LanceAggregationSupport {
      * Substrait group by inside the Lance scan instead of through the
      * Lucene aggregators. Field types are not known here; the executor
      * checks them against the table schema in
-     * {@link LanceAggregatePushdown}. The tree qualifies when it is one
+     * {@code LanceAggregateResults}. The tree qualifies when it is one
      * of the following, with no pipeline aggregations anywhere:
      * <ul>
      *   <li>metric aggregations only ({@link #isPushdownMetric});</li>
