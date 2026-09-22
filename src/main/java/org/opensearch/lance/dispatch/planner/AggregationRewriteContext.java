@@ -7,6 +7,7 @@ package org.opensearch.lance.dispatch.planner;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.opensearch.index.query.QueryShardContext;
@@ -17,7 +18,9 @@ import org.opensearch.search.aggregations.AggregatorFactories;
  * its plan: the request's aggregation builders, the table's Arrow
  * schema, the index's keyword sub-field spec, the mapping context, and
  * the node's planning bounds. Immutable; built once per request by the
- * dispatcher and handed to every rule in turn.
+ * dispatcher and handed to every rule in turn. Every reference field
+ * is required, so a rule never sees a null and a missing input fails
+ * at construction, close to its source.
  */
 public final class AggregationRewriteContext {
 
@@ -38,10 +41,10 @@ public final class AggregationRewriteContext {
         int percentilesBins,
         int topKSlack
     ) {
-        this.aggregations = aggregations;
-        this.schema = schema;
-        this.multiFields = multiFields;
-        this.queryShardContext = queryShardContext;
+        this.aggregations = Objects.requireNonNull(aggregations, "aggregations");
+        this.schema = Objects.requireNonNull(schema, "schema");
+        this.multiFields = Objects.requireNonNull(multiFields, "multiFields");
+        this.queryShardContext = Objects.requireNonNull(queryShardContext, "queryShardContext");
         this.maxGroups = maxGroups;
         this.percentilesBins = percentilesBins;
         this.topKSlack = topKSlack;

@@ -1813,7 +1813,8 @@ public final class LanceAggregatePushdown {
      * {@code keyExpressions} are the bucket key groupings in key order,
      * kept so the percentiles bin scans can group by the same keys.
      * Public so the planner package's rule engine can carry it; the
-     * constructor stays private, so only this class builds plans.
+     * constructor stays package private, so production plans are built
+     * only inside this package.
      */
     public static final class Plan {
         private final ByteBuffer substrait;
@@ -1825,7 +1826,12 @@ public final class LanceAggregatePushdown {
         private final int percentilesBins;
         private final TopKSpec topK;
 
-        private Plan(
+        /**
+         * Package private (was private) so the test sources' same
+         * package fixture can build a minimal instance; production
+         * plans are still built only by {@link #plan}.
+         */
+        Plan(
             ByteBuffer substrait,
             List<Expression> keyExpressions,
             List<Level> levels,
@@ -2935,18 +2941,21 @@ public final class LanceAggregatePushdown {
         QueryShardContext qsc
     ) {
         int maxGroups = LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
-        AggregationRewriteContext ctx = new AggregationRewriteContext(
-            aggregations,
-            schema,
-            multiFields,
-            qsc,
-            maxGroups,
-            percentilesBins,
-            topkSlack
-        );
-        Optional<PushdownPlan> rewritten = AggregationRewriteRegistry.instance().rewrite(ctx);
-        if (rewritten.isPresent()) {
-            return rewritten.get().asLegacyPlan();
+        AggregationRewriteRegistry registry = AggregationRewriteRegistry.instance();
+        if (!registry.rules().isEmpty()) {
+            AggregationRewriteContext ctx = new AggregationRewriteContext(
+                aggregations,
+                schema,
+                multiFields,
+                qsc,
+                maxGroups,
+                percentilesBins,
+                topkSlack
+            );
+            Optional<PushdownPlan> rewritten = registry.rewrite(ctx);
+            if (rewritten.isPresent()) {
+                return rewritten.get().asLegacyPlan();
+            }
         }
         return plan(aggregations, schema, multiFields, qsc, maxGroups, percentilesBins);
     }
