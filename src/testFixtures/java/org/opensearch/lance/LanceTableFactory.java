@@ -208,9 +208,10 @@ public final class LanceTableFactory {
      * Append {@code rowCount} more rows with the same layout as
      * {@link #writeTable} to an existing table, with ids starting at
      * {@code startId}. Produces a new manifest version, which is what
-     * tests of tag following and manifest advance need.
+     * tests of tag following and manifest advance need. Public because
+     * the engine package's clone tests advance a source table with it.
      */
-    static void appendRows(String tableUri, int startId, int rowCount) throws Exception {
+    public static void appendRows(String tableUri, int startId, int rowCount) throws Exception {
         withLocaleRoot(() -> {
             Schema schema = new Schema(
                 Arrays.asList(
