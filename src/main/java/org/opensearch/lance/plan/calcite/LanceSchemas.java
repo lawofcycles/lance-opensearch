@@ -9,12 +9,12 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.lance.Dataset;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceWarmCache;
-import org.opensearch.lance.rest.RestAttachAction;
 
 import java.io.IOException;
 import java.util.LinkedHashMap;
@@ -101,9 +101,8 @@ public final class LanceSchemas {
         LancePrimaryKeyType pkType = pkField.isEmpty()
             ? LancePrimaryKeyType.NONE
             : LancePrimaryKeyType.fromSetting(settings.get(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, "long"));
-        Map<String, LinkedHashMap<String, String>> multiFields = RestAttachAction.deserialiseMultiFields(
-            settings.get(LanceEngineFactory.MULTI_FIELDS_SETTING, "")
-        );
+        LanceOverrides overrides = LanceOverrides.of(settings);
+        Map<String, LinkedHashMap<String, String>> multiFields = overrides.subFields();
         try (
             LanceWarmCache.Lease lease = warmCache.acquire(
                 indexMetadata.getIndexUUID(),
@@ -112,7 +111,7 @@ public final class LanceSchemas {
                 version,
                 pkField,
                 pkType,
-                multiFields
+                overrides
             )
         ) {
             Dataset dataset = lease.snapshot().dataset();

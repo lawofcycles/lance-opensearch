@@ -10,7 +10,6 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +32,7 @@ import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.lance.LanceCircuitBreaker;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -92,7 +92,7 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
     }
 
     private Lease acquire() throws Exception {
-        return cache.acquire(UUID, uri, StorageOptions.empty(), Optional.empty(), "", LancePrimaryKeyType.NONE, Collections.emptyMap());
+        return cache.acquire(UUID, uri, StorageOptions.empty(), Optional.empty(), "", LancePrimaryKeyType.NONE, LanceOverrides.EMPTY);
     }
 
     private LanceDirectoryReader openCached(Snapshot snapshot, List<Integer> fragmentIds) throws IOException {
@@ -751,7 +751,17 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
         raw.put("raw", "keyword");
         Map<String, LinkedHashMap<String, String>> multiFields = Map.of("body", raw);
         ColumnStore store = cache.columnStore();
-        try (Lease lease = cache.acquire(UUID, uri, StorageOptions.empty(), Optional.empty(), "", LancePrimaryKeyType.NONE, multiFields)) {
+        try (
+            Lease lease = cache.acquire(
+                UUID,
+                uri,
+                StorageOptions.empty(),
+                Optional.empty(),
+                "",
+                LancePrimaryKeyType.NONE,
+                LanceOverrides.fromSubFields(multiFields)
+            )
+        ) {
             Snapshot snapshot = lease.snapshot();
             try (
                 LanceDirectoryReader offHeap = openCached(snapshot, allFragments);

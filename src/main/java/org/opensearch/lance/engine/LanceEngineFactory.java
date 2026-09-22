@@ -48,6 +48,7 @@ import org.opensearch.index.engine.ReadOnlyEngine;
 import org.opensearch.index.engine.Segment;
 import org.opensearch.index.engine.SegmentsStats;
 import org.opensearch.index.shard.DocsStats;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 
@@ -171,6 +172,18 @@ public final class LanceEngineFactory implements EngineFactory {
     public static final String MULTI_FIELDS_SETTING = "index.lance.multi_fields";
 
     /**
+     * Compact JSON stringified form of the per-column mapping overrides
+     * captured at attach or namespace-register time (base type
+     * overrides, date formats and keyword sub-fields; see
+     * {@link org.opensearch.lance.LanceOverrides}). Empty when the
+     * operator declared none. New attaches write this setting only;
+     * {@link org.opensearch.lance.LanceOverrides#of} falls back to
+     * {@link #MULTI_FIELDS_SETTING} for indexes created before this
+     * setting existed.
+     */
+    public static final String OVERRIDES_SETTING = "index.lance.overrides";
+
+    /**
      * Arrow type kinds a Lance primary key column can take. Kept small on
      * purpose: {@link #LONG} covers signed integer PKs (any bit width up to
      * 64), {@link #KEYWORD} covers Utf8 PKs, and {@link #NONE} is the
@@ -238,9 +251,7 @@ public final class LanceEngineFactory implements EngineFactory {
         String tagSetting = config.getIndexSettings().getSettings().get(TAG_SETTING, "");
         String tag = tagSetting.isEmpty() ? null : tagSetting;
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(config.getIndexSettings().getSettings());
-        String multiFieldsJson = config.getIndexSettings().getSettings().get(MULTI_FIELDS_SETTING, "");
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields = org.opensearch.lance.rest.RestAttachAction
-            .deserialiseMultiFields(multiFieldsJson);
+        LanceOverrides overrides = LanceOverrides.of(config.getIndexSettings().getSettings());
         String indexUuid = config.getIndexSettings().getIndex().getUUID();
         return new LanceReadOnlyEngine(
             config,
@@ -251,7 +262,7 @@ public final class LanceEngineFactory implements EngineFactory {
             pinnedVersion,
             tag,
             storageOptions,
-            multiFields,
+            overrides,
             warmCache,
             indexUuid,
             maxDocsPerReader
@@ -282,11 +293,13 @@ public final class LanceEngineFactory implements EngineFactory {
         final String tag;
         final StorageOptions storageOptions;
         /**
-         * Multi-fields spec captured at attach time. Empty when the operator
-         * did not declare any sub-fields. Forwarded verbatim to the reader
-         * so keyword sub-fields become queryable through doc values.
+         * Per-column mapping overrides captured at attach time (base type
+         * overrides and keyword sub-fields). Empty when the operator
+         * declared none. Forwarded to the reader so keyword sub-fields
+         * become queryable through doc values and a keyword-overridden
+         * FTS column is served through SortedSetDocValues.
          */
-        final java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields;
+        final LanceOverrides overrides;
         /**
          * Snapshot cache the readers are built over, or {@code null} to open
          * a dataset per reader.
@@ -307,7 +320,7 @@ public final class LanceEngineFactory implements EngineFactory {
             Optional<Long> pinnedVersion,
             String tag,
             StorageOptions storageOptions,
-            java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+            LanceOverrides overrides,
             LanceWarmCache warmCache,
             String indexUuid,
             LongSupplier maxDocsPerReader
@@ -320,7 +333,7 @@ public final class LanceEngineFactory implements EngineFactory {
             this.pinnedVersion = pinnedVersion;
             this.tag = tag;
             this.storageOptions = storageOptions;
-            this.multiFields = multiFields;
+            this.overrides = overrides;
             this.warmCache = warmCache;
             this.indexUuid = indexUuid;
             this.maxDocsPerReader = maxDocsPerReader;
@@ -443,7 +456,7 @@ public final class LanceEngineFactory implements EngineFactory {
                     dataset,
                     field,
                     pkType,
-                    multiFields,
+                    overrides,
                     requestBreaker(),
                     maxDocsPerReader.getAsLong()
                 );
@@ -479,7 +492,7 @@ public final class LanceEngineFactory implements EngineFactory {
 
         private OpenSearchDirectoryReader openSnapshotReader(Directory directory, IndexCommit commit, Optional<Long> version)
             throws IOException {
-            LanceWarmCache.Lease lease = warmCache.acquire(indexUuid, tablePath, storageOptions, version, field, pkType, multiFields);
+            LanceWarmCache.Lease lease = warmCache.acquire(indexUuid, tablePath, storageOptions, version, field, pkType, overrides);
             // openForSnapshot releases the lease itself when it fails; from
             // its return on the reader owns the lease and releases it in
             // doClose, so only the wrap step needs the reader closed here.
@@ -840,7 +853,7 @@ public final class LanceEngineFactory implements EngineFactory {
                         own,
                         field,
                         pkType,
-                        multiFields,
+                        overrides,
                         Collections.singletonList(fragmentId)
                     );
                 } catch (Throwable t) {

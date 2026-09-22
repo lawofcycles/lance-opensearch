@@ -6,7 +6,6 @@
 package org.opensearch.lance.engine;
 
 import java.nio.file.Path;
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
@@ -28,6 +27,7 @@ import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.shard.DocsStats;
 import org.opensearch.index.store.Store;
 import org.opensearch.index.translog.Translog;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
@@ -215,7 +215,7 @@ public class LanceEngineFactoryTests extends EngineTestCase {
                         Optional.of(version),
                         "id",
                         LanceEngineFactory.LancePrimaryKeyType.LONG,
-                        Collections.emptyMap()
+                        LanceOverrides.EMPTY
                     )
                 ) {
                     assertSame(initial, fragmentPath.snapshot());

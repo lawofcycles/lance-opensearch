@@ -7,9 +7,7 @@ package org.opensearch.lance.engine;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ExecutorService;
 
 import org.apache.lucene.document.Document;
@@ -27,6 +25,7 @@ import org.lance.Fragment;
 import org.lance.fragment.DataFile;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 
 /** DirectoryReader whose leaves are Lance fragments. */
@@ -197,15 +196,15 @@ public final class LanceDirectoryReader extends DirectoryReader {
         Dataset dataset,
         String intField,
         LancePrimaryKeyType pkType,
-        Map<String, LinkedHashMap<String, String>> multiFields,
+        LanceOverrides overrides,
         CircuitBreaker requestBreaker
     ) throws IOException {
-        return open(directory, commit, dataset, intField, pkType, multiFields, requestBreaker, IndexWriter.MAX_DOCS);
+        return open(directory, commit, dataset, intField, pkType, overrides, requestBreaker, IndexWriter.MAX_DOCS);
     }
 
     /**
      * Same as {@link #open(Directory, IndexCommit, Dataset, String,
-     * LancePrimaryKeyType, Map, CircuitBreaker)} with the row bound of the reader
+     * LancePrimaryKeyType, LanceOverrides, CircuitBreaker)} with the row bound of the reader
      * given: when the table's fragments hold more physical rows than
      * {@code maxDocs} together, only the leading fragments that fit
      * become leaves and the reader reports {@link #luceneBoundExceeded()}.
@@ -218,7 +217,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         Dataset dataset,
         String intField,
         LancePrimaryKeyType pkType,
-        Map<String, LinkedHashMap<String, String>> multiFields,
+        LanceOverrides overrides,
         CircuitBreaker requestBreaker,
         long maxDocs
     ) throws IOException {
@@ -242,7 +241,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
                 fragment.metadata().getDeletionFile() != null,
                 intField,
                 pkType,
-                multiFields,
+                overrides,
                 ftsColumns,
                 null
             );
@@ -339,16 +338,16 @@ public final class LanceDirectoryReader extends DirectoryReader {
         Dataset dataset,
         String intField,
         LancePrimaryKeyType pkType,
-        Map<String, LinkedHashMap<String, String>> multiFields,
+        LanceOverrides overrides,
         List<Integer> fragmentIds
     ) throws IOException {
-        return openForFragments(directory, commit, dataset, intField, pkType, multiFields, fragmentIds, null);
+        return openForFragments(directory, commit, dataset, intField, pkType, overrides, fragmentIds, null);
     }
 
     /**
      * Same as
      * {@link #openForFragments(Directory, IndexCommit, Dataset, String,
-     * LancePrimaryKeyType, Map, List)}, plus a Lance SQL predicate the caller
+     * LancePrimaryKeyType, LanceOverrides, List)}, plus a Lance SQL predicate the caller
      * wants attached to every per-column Lance scan the resulting
      * leaves issue. See {@link LanceFragmentLeafReader#filterSql} for
      * the rationale and semantics; {@code filterSql} is nullable and
@@ -366,7 +365,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         Dataset dataset,
         String intField,
         LancePrimaryKeyType pkType,
-        Map<String, LinkedHashMap<String, String>> multiFields,
+        LanceOverrides overrides,
         List<Integer> fragmentIds,
         String filterSql
     ) throws IOException {
@@ -377,7 +376,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         // reader; every leaf shares the result instead of calling into
         // Lance per (leaf, Utf8 column).
         java.util.Set<String> ftsColumns = LanceFragmentSchema.resolveFtsColumns(dataset);
-        LanceFragmentSchema schema = LanceFragmentSchema.derive(dataset, intField, pkType, multiFields, ftsColumns);
+        LanceFragmentSchema schema = LanceFragmentSchema.derive(dataset, intField, pkType, overrides, ftsColumns);
         for (Fragment fragment : dataset.getFragments()) {
             if (!wanted.contains(fragment.getId())) {
                 continue;
@@ -540,7 +539,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
      * Same as {@link #openForSnapshot(Directory, IndexCommit,
      * LanceWarmCache.Lease, ColumnStore, CircuitBreaker)} with the row
      * bound of the reader given, as for {@link #open(Directory,
-     * IndexCommit, Dataset, String, LancePrimaryKeyType, Map,
+     * IndexCommit, Dataset, String, LancePrimaryKeyType, LanceOverrides,
      * CircuitBreaker, long)}: the reader holds the leading
      * fragments of the snapshot whose physical rows fit in
      * {@code maxDocs} and reports {@link #luceneBoundExceeded()} when

@@ -9,7 +9,6 @@ import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -40,11 +39,11 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.lance.LanceCircuitBreaker;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
-import org.opensearch.lance.rest.RestAttachAction;
 
 /**
  * Reads the indexes of a Lance table into this node's shared Lance
@@ -178,7 +177,7 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
         final String tag;
         final String pkField;
         final LancePrimaryKeyType pkType;
-        final Map<String, LinkedHashMap<String, String>> multiFields;
+        final LanceOverrides overrides;
         final Mode mode;
         final AtomicBoolean cancelled = new AtomicBoolean();
         /** Guarded by {@code this}. */
@@ -203,7 +202,7 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
             this.pkType = pkField.isEmpty()
                 ? LancePrimaryKeyType.NONE
                 : LancePrimaryKeyType.fromSetting(settings.get(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, "long"));
-            this.multiFields = RestAttachAction.deserialiseMultiFields(settings.get(LanceEngineFactory.MULTI_FIELDS_SETTING, ""));
+            this.overrides = LanceOverrides.of(settings);
             this.mode = mode;
         }
 
@@ -371,15 +370,7 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
             if (version.isEmpty() && task.tag != null) {
                 version = Optional.of(LanceRegistry.resolveTagVersion(task.table, task.storageOptions, task.tag));
             }
-            lease = warmCache.acquire(
-                task.indexUuid,
-                task.table,
-                task.storageOptions,
-                version,
-                task.pkField,
-                task.pkType,
-                task.multiFields
-            );
+            lease = warmCache.acquire(task.indexUuid, task.table, task.storageOptions, version, task.pkField, task.pkType, task.overrides);
         } catch (Exception e) {
             task.start(-1L);
             task.record(new IndexStatus("", "", "", State.FAILED, 0d, "could not open the table: " + e.getMessage()));

@@ -40,6 +40,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.indices.breaker.HierarchyCircuitBreakerService;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -345,7 +346,7 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
                 dataset,
                 "",
                 LanceEngineFactory.LancePrimaryKeyType.NONE,
-                Collections.emptyMap(),
+                LanceOverrides.EMPTY,
                 fragmentIdsOf(dataset)
             )
         ) {
@@ -404,7 +405,7 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
             dataset,
             "",
             LanceEngineFactory.LancePrimaryKeyType.NONE,
-            Collections.emptyMap(),
+            LanceOverrides.EMPTY,
             fragmentIds == null ? fragmentIdsOf(dataset) : fragmentIds
         );
     }

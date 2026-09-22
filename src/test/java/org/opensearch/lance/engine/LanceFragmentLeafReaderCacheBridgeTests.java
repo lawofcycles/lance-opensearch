@@ -19,6 +19,7 @@ import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.lance.Dataset;
 import org.lance.Fragment;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -53,7 +54,7 @@ public class LanceFragmentLeafReaderCacheBridgeTests extends OpenSearchTestCase 
             dataset,
             "",
             LanceEngineFactory.LancePrimaryKeyType.NONE,
-            Collections.emptyMap(),
+            LanceOverrides.EMPTY,
             fragmentIds
         );
     }
@@ -107,7 +108,7 @@ public class LanceFragmentLeafReaderCacheBridgeTests extends OpenSearchTestCase 
                 fragment.metadata().getDeletionFile() != null,
                 "",
                 LanceEngineFactory.LancePrimaryKeyType.NONE,
-                Collections.emptyMap(),
+                LanceOverrides.EMPTY,
                 Collections.emptySet(),
                 null
             );
@@ -152,7 +153,7 @@ public class LanceFragmentLeafReaderCacheBridgeTests extends OpenSearchTestCase 
                 fragment.metadata().getDeletionFile() != null,
                 "",
                 LanceEngineFactory.LancePrimaryKeyType.NONE,
-                Collections.emptyMap(),
+                LanceOverrides.EMPTY,
                 Collections.emptySet(),
                 null
             );
