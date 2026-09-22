@@ -454,6 +454,19 @@ public class RestAttachAction extends BaseRestHandler {
                     // values. Users can still retrieve raw bytes through _source.
                     startFieldWithId(mapping, name, fieldId, "binary", arrowTypeIdentity(type));
                     mapping.endObject();
+                } else if (type instanceof ArrowType.Struct) {
+                    // A Struct column surfaces as an `object` field whose
+                    // properties derive from the struct's children,
+                    // recursing into nested structs. OpenSearch's object
+                    // mapper accepts no `meta` parameter, so the identity
+                    // metadata (lance_field_id / lance_arrow_type) rides on
+                    // the children instead; each Lance child field carries
+                    // its own field id. Children the derivation does not
+                    // support are noted and left out while the parent
+                    // object is still emitted.
+                    mapping.startObject(name).field("type", "object").startObject("properties");
+                    writeStructProperties(mapping, field, name, notes);
+                    mapping.endObject().endObject();
                 } else {
                     notes.add(name + ": " + type + ", stored only");
                 }
@@ -804,6 +817,73 @@ public class RestAttachAction extends BaseRestHandler {
 
     private static void startFieldWithId(XContentBuilder mapping, String name, int fieldId, String type) throws Exception {
         startFieldWithId(mapping, name, fieldId, type, null);
+    }
+
+    /**
+     * Emit the {@code properties} entries of a Struct column, one per
+     * supported child, recursing into nested structs. Children follow
+     * the scalar derivation of the top-level loop with two deliberate
+     * differences: Utf8 children always map to {@code keyword} (Lance
+     * FTS indexes target top-level columns, so no {@code lance_text}
+     * inside a struct), and {@code FixedSizeList} vector children are
+     * skipped with a note ({@code lance_knn} does not reach struct
+     * children). Any other child type the derivation does not support
+     * is noted with its dotted path and left out; the parent object is
+     * still emitted.
+     *
+     * <p>The caller has already opened the {@code properties} object
+     * and closes it after this returns.
+     */
+    private static void writeStructProperties(XContentBuilder mapping, LanceField structField, String path, List<String> notes)
+        throws Exception {
+        for (LanceField child : structField.getChildren()) {
+            String childPath = path + "." + child.getName();
+            ArrowType childType = child.getType();
+            int childId = child.getId();
+            if (childType instanceof ArrowType.Struct) {
+                mapping.startObject(child.getName()).field("type", "object").startObject("properties");
+                writeStructProperties(mapping, child, childPath, notes);
+                mapping.endObject().endObject();
+                continue;
+            }
+            String osType = null;
+            String identity = arrowTypeIdentity(childType);
+            if (childType instanceof ArrowType.Int intType && intType.getIsSigned()) {
+                osType = switch (intType.getBitWidth()) {
+                    case 8 -> "byte";
+                    case 16 -> "short";
+                    case 32 -> "integer";
+                    case 64 -> "long";
+                    default -> null;
+                };
+            } else if (childType instanceof ArrowType.Bool) {
+                osType = "boolean";
+            } else if (childType instanceof ArrowType.FloatingPoint fp) {
+                osType = switch (fp.getPrecision()) {
+                    case SINGLE -> "float";
+                    case DOUBLE -> "double";
+                    default -> null;
+                };
+            } else if (childType instanceof ArrowType.Date || childType instanceof ArrowType.Timestamp) {
+                osType = "date";
+            } else if (childType instanceof ArrowType.Utf8) {
+                osType = "keyword";
+            } else if (childType instanceof ArrowType.List
+                && child.getChildren().size() == 1
+                && child.getChildren().get(0).getType() instanceof ArrowType.Utf8) {
+                    osType = "keyword";
+                    identity = "list<utf8>";
+                } else if (childType instanceof ArrowType.FixedSizeList) {
+                    notes.add(childPath + ": vector column inside a struct, not surfaced (lance_knn does not reach struct children)");
+                    continue;
+                }
+            if (osType == null) {
+                notes.add(childPath + ": " + childType + ", not surfaced inside a struct");
+                continue;
+            }
+            startFieldWithId(mapping, child.getName(), childId, osType, identity);
+            mapping.field("index", false).field("doc_values", true).endObject();
+        }
     }
 
     private static void startFieldWithId(XContentBuilder mapping, String name, int fieldId, String type, String arrowType)
