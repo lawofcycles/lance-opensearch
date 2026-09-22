@@ -125,8 +125,12 @@ dependencies {
     // with the bundled 0.11.1 (method descriptors verified against both
     // jars, plus offline initialisation tests through the factory).
     // All three are thin REST clients over impls-core's RestClient,
-    // which runs on Apache HttpClient 5 — bundled below at the version
-    // impls-core pins, together with its httpcore5 runtime.
+    // which runs on Apache HttpClient 5. Bundled below at 5.6.1 / core
+    // 5.4, the versions OpenSearch 3.7's own REST client pins, because
+    // the test framework brings those onto the test classpath and the
+    // build fails on version conflicts. impls-core compiles against
+    // 5.2.1; every HttpClient method it references resolves against
+    // 5.6.1 / 5.4 (javap descriptor comparison, four via inheritance).
     implementation "org.lance:lance-namespace-iceberg:${lance_namespace_impls_version}"
     implementation "org.lance:lance-namespace-polaris:${lance_namespace_impls_version}"
     implementation "org.lance:lance-namespace-unity:${lance_namespace_impls_version}"
@@ -416,12 +420,6 @@ tasks.named('thirdPartyAudit').configure {
         'org.apache.tools.ant.taskdefs.compilers.DefaultCompilerAdapter',
         'org.apache.tools.ant.types.Path',
 
-        // Avatica's remote JDBC HTTP client was compiled against a newer
-        // Apache HttpClient 5 than the 5.2.1 bundled for the catalog
-        // clients; this one class does not exist there. The plugin never
-        // opens an Avatica connection, so the reference never loads.
-        'org.apache.hc.client5.http.ssl.TlsSocketStrategy',
-
         // Optional OpenTelemetry metrics instrumentation in lance-core.
         'io.opentelemetry.api.GlobalOpenTelemetry',
         'io.opentelemetry.api.OpenTelemetry',
@@ -448,12 +446,17 @@ tasks.named('thirdPartyAudit').configure {
         // JsonNullable field, so the wrapper library is not bundled.
         'org.openapitools.jackson.nullable.JsonNullable',
 
-        // Optional response-decompression and TLS providers referenced by
-        // the bundled httpclient5. Brotli decoding only loads when a
-        // response arrives brotli-encoded and Conscrypt only when selected
-        // as the TLS provider; neither is bundled, matching how the SDK's
-        // optional pieces are handled above.
-        'org.brotli.dec.BrotliInputStream',
+        // Optional compression codecs and TLS providers referenced by the
+        // bundled httpclient5 5.6.1. Each loads only when a response
+        // arrives in that encoding or when Conscrypt is selected as the
+        // TLS provider; the classes below are the subset the audit
+        // classpath does not already carry.
+        'com.aayushatharva.brotli4j.decoder.DecoderJNI$Status',
+        'com.aayushatharva.brotli4j.decoder.DecoderJNI$Wrapper',
+        'com.aayushatharva.brotli4j.encoder.Encoder$Mode',
+        'com.aayushatharva.brotli4j.encoder.EncoderJNI$Operation',
+        'com.aayushatharva.brotli4j.encoder.EncoderJNI$Wrapper',
+        'org.apache.commons.compress.compressors.CompressorStreamFactory',
         'org.conscrypt.Conscrypt',
 
         // Internal helpers referenced by lance-core's shaded Guava on some JVMs.
