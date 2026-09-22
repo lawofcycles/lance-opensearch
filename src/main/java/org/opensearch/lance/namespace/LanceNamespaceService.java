@@ -476,7 +476,9 @@ public final class LanceNamespaceService {
         return tables;
     }
 
-    private void poll() {
+    // Package-private so tests can drive a poll cycle synchronously
+    // instead of waiting for the scheduled cadence.
+    void poll() {
         // Skip poll cycles that fire before the applier delivers a
         // cluster state, which happens once at startup. Reading state()
         // then would trip the AssertionError inside
@@ -580,6 +582,16 @@ public final class LanceNamespaceService {
         }
         warnedDisallowedLocation.remove(entry.name() + ":" + indexName);
         runSyncCycle(location, indexName, mergeStorageOptions(described.getStorageOptions(), entry.storageOptions()), null, entry.overridesJson());
+    }
+
+    /** Visible for tests: whether the disallowed-location warning for this namespace and index has fired. */
+    boolean hasWarnedDisallowedLocation(String namespaceName, String indexName) {
+        return warnedDisallowedLocation.contains(namespaceName + ":" + indexName);
+    }
+
+    /** Visible for tests: how many distinct disallowed-location warnings have fired. */
+    int disallowedLocationWarningCount() {
+        return warnedDisallowedLocation.size();
     }
 
     /**

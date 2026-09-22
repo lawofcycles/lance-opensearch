@@ -11,11 +11,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
 import org.lance.namespace.model.DescribeTableResponse;
 
+import org.opensearch.action.ActionRequest;
+import org.opensearch.action.ActionType;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.action.ActionResponse;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
@@ -293,6 +298,84 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
             assertEquals("123456789012", infos.get(0).config().get("catalog_id"));
         } finally {
             LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+    }
+
+    public void testPollSkipsCatalogTableOutsideAllowedRootsAndWarnsOnce() throws Exception {
+        // The register call for a catalog type names no root, so the
+        // allowlist applies to each table location the catalog returns.
+        // A location outside the roots is skipped without touching the
+        // client, and its warning fires once, not on every poll.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.tables = Set.of("orders");
+        recording.tableLocations = Map.of("orders", "/forbidden/orders.lance");
+        LanceNamespaceFactory.setInstantiatorForTests(type -> recording);
+        RecordingNoOpClient recordingClient = new RecordingNoOpClient(threadPool);
+        LanceNamespaceService guarded = new LanceNamespaceService(
+            recordingClient,
+            clusterService,
+            threadPool,
+            TimeValue.timeValueHours(1),
+            1_000_000L,
+            TimeValue.timeValueHours(1),
+            null,
+            new AllowedTableRoots(List.of("/allowed"))
+        );
+        try {
+            LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
+                new LanceNamespaceMetadata.Entry(
+                    "glue-tokyo",
+                    LanceNamespaceMetadata.Entry.TYPE_GLUE,
+                    null,
+                    StorageOptions.empty(),
+                    Map.of("region", "ap-northeast-1")
+                )
+            );
+            ClusterState state = ClusterState.builder(clusterService.state())
+                .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
+                .build();
+            ClusterServiceUtils.setState(clusterService, state);
+
+            guarded.poll();
+            assertTrue(
+                "expected the disallowed-location warning after the first poll",
+                guarded.hasWarnedDisallowedLocation("glue-tokyo", "orders")
+            );
+            assertEquals(1, guarded.disallowedLocationWarningCount());
+            assertTrue(
+                "no client action may fire for a disallowed location: " + recordingClient.actionNames,
+                recordingClient.actionNames.isEmpty()
+            );
+
+            guarded.poll();
+            assertEquals("the warning fires once, not per poll", 1, guarded.disallowedLocationWarningCount());
+            assertTrue(
+                "still no client action after the second poll: " + recordingClient.actionNames,
+                recordingClient.actionNames.isEmpty()
+            );
+            // The registration itself stays healthy; only the table is skipped.
+            assertEquals(2, recording.describeTableCalls);
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+    }
+
+    /** NoOpClient that records the action names driven through it. */
+    private static final class RecordingNoOpClient extends NoOpClient {
+        final List<String> actionNames = new CopyOnWriteArrayList<>();
+
+        RecordingNoOpClient(ThreadPool threadPool) {
+            super(threadPool);
+        }
+
+        @Override
+        protected <Request extends ActionRequest, Response extends ActionResponse> void doExecute(
+            ActionType<Response> action,
+            Request request,
+            ActionListener<Response> listener
+        ) {
+            actionNames.add(action.name());
+            super.doExecute(action, request, listener);
         }
     }
 

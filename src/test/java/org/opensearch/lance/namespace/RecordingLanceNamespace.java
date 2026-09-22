@@ -33,6 +33,7 @@ class RecordingLanceNamespace implements LanceNamespace {
     Set<String> tables = Set.of();
     Set<String> childNamespaces;
     Map<String, String> tableLocations = Map.of();
+    int describeTableCalls;
 
     @Override
     public void initialize(Map<String, String> properties, BufferAllocator allocator) {
@@ -67,6 +68,7 @@ class RecordingLanceNamespace implements LanceNamespace {
 
     @Override
     public DescribeTableResponse describeTable(DescribeTableRequest request) {
+        describeTableCalls++;
         String tableName = request.getId().get(request.getId().size() - 1);
         DescribeTableResponse response = new DescribeTableResponse();
         response.setLocation(tableLocations.get(tableName));
