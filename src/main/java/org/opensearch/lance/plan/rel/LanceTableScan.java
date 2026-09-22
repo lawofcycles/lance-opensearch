@@ -14,11 +14,14 @@ import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.core.TableScan;
+import org.apache.calcite.rel.metadata.RelMdUtil;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.opensearch.lance.plan.calcite.LanceConvention;
 import org.opensearch.lance.plan.calcite.LanceRel;
+import org.apache.calcite.rex.RexNode;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedAggregate;
+import org.opensearch.lance.plan.rel.PushedOperation.PushedFilter;
 
 import java.nio.ByteBuffer;
 import java.util.List;
@@ -61,6 +64,16 @@ public class LanceTableScan extends TableScan implements LanceRel {
         return Optional.empty();
     }
 
+    /** The pushed filter, when the scan carries one. */
+    public Optional<PushedFilter> pushedFilter() {
+        for (PushedOperation operation : pushedOperations) {
+            if (operation instanceof PushedFilter filter) {
+                return Optional.of(filter);
+            }
+        }
+        return Optional.empty();
+    }
+
     /**
      * The same scan with {@code aggregate} pushed into it: the scan's
      * row type becomes the aggregate's and the plan above no longer
@@ -75,6 +88,22 @@ public class LanceTableScan extends TableScan implements LanceRel {
         ImmutableList<PushedOperation> pushed = ImmutableList.<PushedOperation>builder()
             .addAll(pushedOperations)
             .add(new PushedAggregate(aggregate, bytes))
+            .build();
+        return new LanceTableScan(getCluster(), getTraitSet(), table, pushed);
+    }
+
+    /**
+     * The same scan with {@code condition} pushed as its filter,
+     * spelled as {@code sql} for the executor's
+     * {@code ScanOptions.filter}. The row type does not change.
+     */
+    public LanceTableScan withPushedFilter(RexNode condition, String sql) {
+        if (pushedFilter().isPresent()) {
+            throw new IllegalStateException("the scan already carries a pushed filter");
+        }
+        ImmutableList<PushedOperation> pushed = ImmutableList.<PushedOperation>builder()
+            .addAll(pushedOperations)
+            .add(new PushedFilter(condition, sql))
             .build();
         return new LanceTableScan(getCluster(), getTraitSet(), table, pushed);
     }
@@ -97,8 +126,9 @@ public class LanceTableScan extends TableScan implements LanceRel {
 
     /**
      * Row count from the table's statistic (the Lance fragment row
-     * counts) for a bare scan; a pushed aggregate returns one row per
-     * group, so its own estimate stands.
+     * counts) for a bare scan, scaled by the pushed filter's guessed
+     * selectivity when one is pushed; a pushed aggregate returns one
+     * row per group, so its own estimate stands.
      */
     @Override
     public double estimateRowCount(RelMetadataQuery mq) {
@@ -106,7 +136,12 @@ public class LanceTableScan extends TableScan implements LanceRel {
         if (pushed.isPresent()) {
             return pushed.get().aggregate().estimateRowCount(mq);
         }
-        return table.getRowCount();
+        double rows = table.getRowCount();
+        Optional<PushedFilter> filter = pushedFilter();
+        if (filter.isPresent()) {
+            rows *= RelMdUtil.guessSelectivity(filter.get().condition());
+        }
+        return rows;
     }
 
     /**
