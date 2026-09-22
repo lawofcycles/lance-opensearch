@@ -17,7 +17,7 @@ cd lance-opensearch
 ./gradlew build
 ```
 
-`build/distributions/opensearch-lance-0.1.0.zip` is the plugin artifact. It is about 280 MB; the bulk is `org.lance:lance-core:11.0.0`, which ships Lance's Rust native library.
+`build/distributions/opensearch-lance-0.1.0.zip` is the plugin artifact. It is about 280 MB; the bulk is `org.lance:lance-core:12.0.0`, which ships Lance's Rust native library.
 
 If you only want to check tests pass:
 
