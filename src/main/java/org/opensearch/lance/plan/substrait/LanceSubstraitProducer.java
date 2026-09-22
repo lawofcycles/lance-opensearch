@@ -13,6 +13,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 
 import io.substrait.expression.AggregateFunctionInvocation;
 import io.substrait.expression.Expression;
@@ -121,11 +122,12 @@ public final class LanceSubstraitProducer {
      * every {@code cardinality} call after them, a {@code count(*)}
      * measure and every metric's measures. Empty when the tree is not
      * an {@code Aggregate} implementing {@link LanceAggregateSpecs}
-     * over an optional {@code Project} over an optional {@code Filter}
-     * over a {@code TableScan}, or when an expression needs a function
-     * Lance's consumer cannot resolve. A {@code Filter} input is
-     * accepted but not encoded: the scan filter travels next to the
-     * plan in {@code ScanOptions.filter}, never inside these bytes.
+     * over an optional {@code Project} and an optional {@code Filter}
+     * (in either order) over a {@code TableScan}, or when an expression
+     * needs a function Lance's consumer cannot resolve. A {@code Filter}
+     * input is accepted but not encoded: the scan filter travels next
+     * to the plan in {@code ScanOptions.filter}, never inside these
+     * bytes.
      */
     public static Optional<ByteBuffer> toLanceAggregate(RelNode root) {
         Shape shape = resolve(root);
@@ -214,14 +216,21 @@ public final class LanceSubstraitProducer {
         }
         RelNode input = aggregate.getInput();
         Project project = null;
+        boolean filtered = false;
+        if (input instanceof Filter f) {
+            // A filter over the projected keys, as RelBuilder builds it
+            // for an aggregate over a filtered project. The condition
+            // never travels in the aggregate bytes: Lance's consumer
+            // reads the AggregateRel only, and the scan filter is passed
+            // through ScanOptions.filter instead.
+            filtered = true;
+            input = f.getInput();
+        }
         if (input instanceof Project p) {
             project = p;
             input = p.getInput();
         }
-        if (input instanceof Filter f) {
-            // The filter condition never travels in the aggregate bytes:
-            // Lance's consumer reads the AggregateRel only, and the scan
-            // filter is passed through ScanOptions.filter instead.
+        if (input instanceof Filter f && !filtered) {
             input = f.getInput();
         }
         if (!(input instanceof TableScan scan)) {
@@ -278,7 +287,8 @@ public final class LanceSubstraitProducer {
         }
 
         RexNode rex = argument(shape, shape.aggregate.getAggCallList().get(callIndex));
-        Expression value = numeric(rex, accepted(rex.accept(converter)));
+        Expression reference = accepted(rex.accept(converter));
+        Expression value = numeric(rex, reference);
         // Every value falls into bin 0 when they are all equal; any
         // positive width does that, and keeps the centre at the value.
         double width = max > min ? (max - min) / bins : 1d;
@@ -288,7 +298,7 @@ public final class LanceSubstraitProducer {
         // count(field), not count(*): a row without a value has a null
         // bin and must not weigh in.
         List<io.substrait.relation.Aggregate.Measure> measures = new ArrayList<>();
-        measures.add(measure("count", TypeCreator.NULLABLE.I64, accepted(rex.accept(converter))));
+        measures.add(measure("count", TypeCreator.NULLABLE.I64, reference));
         names.add(prefix(callIndex) + "_bc");
 
         return serialize(shape, groupings, measures, names);
@@ -468,7 +478,7 @@ public final class LanceSubstraitProducer {
     private static final class LanceCallConverter implements CallConverter {
 
         @Override
-        public Optional<Expression> convert(RexCall call, java.util.function.Function<RexNode, Expression> converter) {
+        public Optional<Expression> convert(RexCall call, Function<RexNode, Expression> converter) {
             if (call.getKind() == SqlKind.FLOOR && call.getOperands().size() == 1) {
                 RexNode operand = call.getOperands().get(0);
                 Expression value = converter.apply(operand);
