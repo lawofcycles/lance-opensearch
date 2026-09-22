@@ -14,6 +14,7 @@ import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgramBuilder;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.logical.LogicalFilter;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
@@ -30,12 +31,12 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.util.List;
 
 /**
- * The top-k pushdown rule: a score sort folds onto the scan carrying
- * the FTS it scores with, a column sort folds onto a scalar scan with
- * the Lance orderings (and the search_after cursor as a strict SQL
- * bound), the hit shape folds together with the top-k and hands the
- * scan its row type, and the mixed, misplaced and untypeable shapes
- * leave the plan alone for the Lucene collector.
+ * The top-k pushdown rule over the logical chains it matches: a score
+ * sort folds together with the FTS it scores with, a column sort folds
+ * a scalar chain with the Lance orderings (and the search_after cursor
+ * as a strict SQL bound), the hit shape folds with the top-k and hands
+ * the scan its row type, and the mixed, misplaced and untypeable
+ * shapes leave the plan alone for the Lucene collector.
  */
 public class PushSortLimitIntoLanceScanTests extends OpenSearchTestCase {
 
@@ -46,28 +47,25 @@ public class PushSortLimitIntoLanceScanTests extends OpenSearchTestCase {
             .build();
     }
 
-    private LanceTableScan ftsScan() {
-        LanceTableScan bare = scan();
-        LanceFtsMatch fts = new LanceFtsMatch(
-            bare.getCluster(),
-            bare.getCluster().traitSetOf(Convention.NONE),
-            bare,
+    private static LanceFtsMatch ftsOver(RelNode input) {
+        return new LanceFtsMatch(
+            input.getCluster(),
+            input.getCluster().traitSetOf(Convention.NONE),
+            input,
             LanceFtsMatch.Kind.MATCH,
             List.of("body"),
             new LanceMatchQueryBuilder("body", "hello")
         );
-        return bare.withPushedFts(fts, null);
     }
 
-    private LanceTableScan filteredScan() {
-        LanceTableScan bare = scan();
-        RexNode condition = bare.getCluster()
+    private static LogicalFilter filterOver(LanceTableScan scan) {
+        RexNode condition = scan.getCluster()
             .getRexBuilder()
             .makeCall(
                 SqlStdOperatorTable.IS_NOT_NULL,
-                bare.getCluster().getRexBuilder().makeInputRef(bare.getRowType().getFieldList().get(1).getType(), 1)
+                scan.getCluster().getRexBuilder().makeInputRef(scan.getRowType().getFieldList().get(1).getType(), 1)
             );
-        return bare.withPushedFilter(condition, "rating IS NOT NULL");
+        return LogicalFilter.create(scan, condition);
     }
 
     private static LanceTopK topK(RelNode input, List<RelFieldCollation> collations, List<Object> searchAfter) {
@@ -88,44 +86,73 @@ public class PushSortLimitIntoLanceScanTests extends OpenSearchTestCase {
         return node.getRowType().getFieldNames().indexOf(name);
     }
 
-    public void testScoreSortFoldsOntoTheFtsScan() {
-        LanceTableScan fts = ftsScan();
+    public void testScoreSortFoldsWithTheFts() {
+        LanceFtsMatch fts = ftsOver(filterOver(scan()));
         RelFieldCollation score = new RelFieldCollation(
             fieldIndex(fts, "_score"),
             RelFieldCollation.Direction.DESCENDING,
             RelFieldCollation.NullDirection.LAST
         );
-        RelNode best = hep(topK(fts, List.of(score), null));
-        LanceTableScan folded = (LanceTableScan) best;
+        LanceTableScan folded = (LanceTableScan) hep(topK(fts, List.of(score), null));
         PushedTopK pushed = folded.pushedTopK().orElseThrow();
         assertTrue("a score page needs no orderings", pushed.toScanOrderings().isEmpty());
         assertNull(pushed.cursorSql());
         assertTrue(folded.pushedFts().isPresent());
+        assertEquals("the filter rides the FTS as its prefilter", "rating IS NOT NULL", folded.pushedFts().orElseThrow().filterSql());
     }
 
     public void testValueSortFoldsWithTheLanceOrderings() {
-        LanceTableScan filtered = filteredScan();
+        LogicalFilter filter = filterOver(scan());
         RelFieldCollation rating = new RelFieldCollation(
-            fieldIndex(filtered, "rating"),
+            fieldIndex(filter, "rating"),
             RelFieldCollation.Direction.DESCENDING,
             RelFieldCollation.NullDirection.LAST
         );
         RelFieldCollation category = new RelFieldCollation(
-            fieldIndex(filtered, "category"),
+            fieldIndex(filter, "category"),
             RelFieldCollation.Direction.ASCENDING,
             RelFieldCollation.NullDirection.FIRST
         );
-        LanceTableScan folded = (LanceTableScan) hep(topK(filtered, List.of(rating, category), null));
+        LanceTableScan folded = (LanceTableScan) hep(topK(filter, List.of(rating, category), null));
+        assertEquals("rating IS NOT NULL", folded.pushedFilter().orElseThrow().sql());
         PushedTopK pushed = folded.pushedTopK().orElseThrow();
         assertEquals(2, pushed.toScanOrderings().size());
         assertEquals("rating", pushed.toScanOrderings().get(0).getColumnName());
+        assertFalse(pushed.toScanOrderings().get(0).isAscending());
+        assertFalse(pushed.toScanOrderings().get(0).isNullFirst());
         assertEquals("category", pushed.toScanOrderings().get(1).getColumnName());
+        assertTrue(pushed.toScanOrderings().get(1).isAscending());
+        assertTrue(pushed.toScanOrderings().get(1).isNullFirst());
         assertEquals(10, pushed.fetch());
         assertNull(pushed.cursorSql());
     }
 
+    public void testUnprintableFilterPasses() {
+        LanceTableScan scan = scan();
+        RexNode unprintable = scan.getCluster()
+            .getRexBuilder()
+            .makeCall(
+                SqlStdOperatorTable.EQUALS,
+                scan.getCluster()
+                    .getRexBuilder()
+                    .makeCall(
+                        SqlStdOperatorTable.PLUS,
+                        scan.getCluster().getRexBuilder().makeInputRef(scan.getRowType().getFieldList().get(1).getType(), 1),
+                        scan.getCluster().getRexBuilder().makeExactLiteral(java.math.BigDecimal.ONE)
+                    ),
+                scan.getCluster().getRexBuilder().makeExactLiteral(java.math.BigDecimal.TEN)
+            );
+        LogicalFilter filter = LogicalFilter.create(scan, unprintable);
+        RelFieldCollation rating = new RelFieldCollation(
+            fieldIndex(filter, "rating"),
+            RelFieldCollation.Direction.ASCENDING,
+            RelFieldCollation.NullDirection.LAST
+        );
+        assertTrue(hep(topK(filter, List.of(rating), null)) instanceof LanceTopK);
+    }
+
     public void testMixedScoreAndValueSortPasses() {
-        LanceTableScan fts = ftsScan();
+        LanceFtsMatch fts = ftsOver(scan());
         RelFieldCollation score = new RelFieldCollation(
             fieldIndex(fts, "_score"),
             RelFieldCollation.Direction.DESCENDING,
@@ -140,15 +167,15 @@ public class PushSortLimitIntoLanceScanTests extends OpenSearchTestCase {
         assertTrue("the mixed page stays on the Lucene collector: " + best, best instanceof LanceTopK);
     }
 
-    public void testValueSortOverAnFtsScanPasses() {
-        LanceTableScan fts = ftsScan();
+    public void testValueSortOverAnFtsPasses() {
+        LanceFtsMatch fts = ftsOver(scan());
         RelFieldCollation price = new RelFieldCollation(
             fieldIndex(fts, "price"),
             RelFieldCollation.Direction.ASCENDING,
             RelFieldCollation.NullDirection.LAST
         );
         RelNode best = hep(topK(fts, List.of(price), null));
-        assertTrue("a column sort over an FTS scan stays on Lucene: " + best, best instanceof LanceTopK);
+        assertTrue("a column sort over an FTS stays on Lucene: " + best, best instanceof LanceTopK);
     }
 
     public void testUnorderableColumnPasses() {
@@ -180,21 +207,22 @@ public class PushSortLimitIntoLanceScanTests extends OpenSearchTestCase {
     }
 
     public void testCursorFoldsAsAStrictBound() {
-        LanceTableScan filtered = filteredScan();
+        LogicalFilter filter = filterOver(scan());
         RelFieldCollation rating = new RelFieldCollation(
-            fieldIndex(filtered, "rating"),
+            fieldIndex(filter, "rating"),
             RelFieldCollation.Direction.ASCENDING,
             RelFieldCollation.NullDirection.LAST
         );
-        LanceTableScan folded = (LanceTableScan) hep(topK(filtered, List.of(rating), List.of(100)));
+        LanceTableScan folded = (LanceTableScan) hep(topK(filter, List.of(rating), List.of(100)));
         assertEquals("(rating > 100 OR rating IS NULL)", folded.pushedTopK().orElseThrow().cursorSql());
+        assertEquals("rating IS NOT NULL", folded.pushedFilter().orElseThrow().sql());
 
         RelFieldCollation descFirst = new RelFieldCollation(
-            fieldIndex(filtered, "rating"),
+            fieldIndex(filter, "rating"),
             RelFieldCollation.Direction.DESCENDING,
             RelFieldCollation.NullDirection.FIRST
         );
-        LanceTableScan desc = (LanceTableScan) hep(topK(filteredScan(), List.of(descFirst), List.of(100)));
+        LanceTableScan desc = (LanceTableScan) hep(topK(filterOver(scan()), List.of(descFirst), List.of(100)));
         assertEquals("rating < 100", desc.pushedTopK().orElseThrow().cursorSql());
     }
 
@@ -245,24 +273,24 @@ public class PushSortLimitIntoLanceScanTests extends OpenSearchTestCase {
     }
 
     public void testEmptyCollationsFoldAsABarePage() {
-        LanceTableScan filtered = filteredScan();
-        LanceTableScan folded = (LanceTableScan) hep(topK(filtered, List.of(), null));
+        LanceTableScan folded = (LanceTableScan) hep(topK(filterOver(scan()), List.of(), null));
         PushedTopK pushed = folded.pushedTopK().orElseThrow();
         assertTrue(pushed.toScanOrderings().isEmpty());
         assertNull(pushed.cursorSql());
+        assertTrue(folded.pushedFilter().isPresent());
     }
 
     public void testHitShapeFoldsWithTheTopKAndSetsTheRowType() {
-        LanceTableScan filtered = filteredScan();
+        LogicalFilter filter = filterOver(scan());
         RelFieldCollation rating = new RelFieldCollation(
-            fieldIndex(filtered, "rating"),
+            fieldIndex(filter, "rating"),
             RelFieldCollation.Direction.ASCENDING,
             RelFieldCollation.NullDirection.LAST
         );
-        LanceTopK topK = topK(filtered, List.of(rating), null);
+        LanceTopK topK = topK(filter, List.of(rating), null);
         LanceHitShape hitShape = new LanceHitShape(
-            filtered.getCluster(),
-            filtered.getCluster().traitSetOf(Convention.NONE),
+            filter.getCluster(),
+            filter.getCluster().traitSetOf(Convention.NONE),
             topK,
             List.of("id", "rating"),
             true,
