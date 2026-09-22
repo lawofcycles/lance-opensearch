@@ -487,6 +487,31 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
 
     /**
+     * How many times {@code shard_size} groups each scan of a single
+     * level {@code terms} ordered by {@code _count} or by one metric
+     * keeps while it reads Lance's group rows. Groups outside the
+     * selection only add their count to {@code sum_other_doc_count},
+     * so the executor's memory and time stop growing with the number
+     * of distinct keys; a key another scan kept has its counts summed
+     * before the final {@code shard_size} cut, and the slack is what
+     * keeps a key split over several scans from being dropped while it
+     * is still a contender. The doc count error the coordinator
+     * derives from the smallest returned bucket keeps its meaning, the
+     * same way it covers the terms a shard did not return. Raise it
+     * when high cardinality terms need tighter counts, at the cost of
+     * proportionally more retained groups per scan. Dynamic; the
+     * executor reads it when it plans a request.
+     */
+    public static final Setting<Integer> AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING = Setting.intSetting(
+        "lance.aggregation.pushdown_topk_slack",
+        4,
+        1,
+        64,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * How many Lance scans a fragment path request runs side by side on
      * one executor when it materialises a column (the aggregator and
      * sort paths that read a column into the off-heap store or into
@@ -605,6 +630,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             AGGREGATION_PUSHDOWN_PARALLELISM_SETTING,
             AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING,
             AGGREGATION_PERCENTILES_BINS_SETTING,
+            AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING,
             FRAGMENT_PATH_PARALLELISM_SETTING,
             FRAGMENT_PATH_SLICES_SETTING,
             ATTACH_WARM_INDEXES_SETTING,
@@ -907,11 +933,15 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(FTS_SUBSET_PROBE_MIN_ROWS_SETTING, LanceFtsQuery::setSubsetProbeMinRows);
 
-        // The percentiles bin count is read by the aggregation pushdown
-        // when it plans a request, from the same kind of static holder.
+        // The percentiles bin count and the terms top-k slack are read
+        // by the aggregation pushdown when it plans a request, from the
+        // same kind of static holder.
         LanceAggregatePushdown.setPercentilesBins(AGGREGATION_PERCENTILES_BINS_SETTING.get(environment.settings()));
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(AGGREGATION_PERCENTILES_BINS_SETTING, LanceAggregatePushdown::setPercentilesBins);
+        LanceAggregatePushdown.setTopkSlack(AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.get(environment.settings()));
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING, LanceAggregatePushdown::setTopkSlack);
 
         // Register the shard-free dispatch ActionFilter. It
         // intercepts every _search request against Lance-backed
