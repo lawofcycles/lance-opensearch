@@ -192,9 +192,11 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
             ClusterState state = ClusterState.builder(clusterService.state())
                 .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
                 .build();
-            // The applier callback drives ensureHandle; the failure is
-            // recorded rather than thrown.
+            // The applier only records the registration; the poll (on
+            // the generic pool in production) drives ensureHandle and
+            // records the failure rather than throwing.
             ClusterServiceUtils.setState(clusterService, state);
+            service.poll();
             List<LanceNamespaceListResponse.NamespaceInfo> infos = service.namespaceInfos();
             assertEquals(1, infos.size());
             assertEquals("cat", infos.get(0).name());
@@ -207,13 +209,9 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
             // The failed initialise still received the raw secret.
             assertEquals("Bearer hunter2", recording.initializeCalls.get(0).get("header.Authorization"));
 
-            // A later applier tick retries; success clears the status.
+            // A later poll cycle retries; success clears the status.
             recording.initializeFailure = null;
-            ClusterState touched = ClusterState.builder(clusterService.state())
-                .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
-                .version(clusterService.state().version() + 1)
-                .build();
-            ClusterServiceUtils.setState(clusterService, touched);
+            service.poll();
             assertNull(service.namespaceInfos().get(0).error());
             assertEquals(2, recording.initializeCalls.size());
         } finally {
@@ -407,6 +405,7 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
                     .version(clusterService.state().version() + ++slot)
                     .build();
                 ClusterServiceUtils.setState(clusterService, state);
+                service.poll();
                 List<LanceNamespaceListResponse.NamespaceInfo> infos = service.namespaceInfos();
                 assertEquals(1, infos.size());
                 assertEquals(type, infos.get(0).type());
@@ -461,6 +460,7 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
                 .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
                 .build();
             ClusterServiceUtils.setState(clusterService, state);
+            service.poll();
             Map<String, String> received = recording.initializeCalls.get(0);
             assertEquals("sekrit", received.get("secret_access_key"));
             assertEquals("AKIA123", received.get("access_key_id"));

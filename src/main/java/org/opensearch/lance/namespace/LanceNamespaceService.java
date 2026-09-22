@@ -206,10 +206,11 @@ public final class LanceNamespaceService {
         this.warmCache = warmCache;
         this.allowedRoots = allowedRoots;
         this.resurfaceGrace = new java.util.concurrent.atomic.AtomicReference<>(resurfaceGrace);
-        // Subscribe before the first schedule fires so the poller
-        // never runs against a stale cache. addListener returns
-        // immediately; the listener body reads whatever state is
-        // current when the applier fires.
+        // The applier listener keeps the tombstone bookkeeping current
+        // and releases handles of removed registrations; the poll
+        // builds handles itself on the generic pool. addListener
+        // returns immediately; the listener body reads whatever state
+        // is current when the applier fires.
         clusterService.addListener(this::onClusterStateChanged);
         threadPool.scheduleWithFixedDelay(this::poll, cadence, ThreadPool.Names.GENERIC);
     }
@@ -224,12 +225,15 @@ public final class LanceNamespaceService {
     }
 
     /**
-     * Reconcile the per-node {@link #namespaceCache} against the
-     * cluster's {@link LanceNamespaceMetadata}. Called from the
-     * cluster state applier on every state that touches metadata, so
-     * new registrations propagated from another node reach the
-     * cache in time for the next poll cycle. Failures to initialise
-     * a {@link LanceNamespace} surface as warnings.
+     * Reconcile the per-node bookkeeping against the cluster's
+     * {@link LanceNamespaceMetadata}. Called from the cluster state
+     * applier on every state that touches metadata. The applier thread
+     * must never block on I/O — a stalled applier delays every cluster
+     * state update on the node — so this method only records tombstones
+     * and drops bookkeeping for removed registrations; the runtime
+     * handles are built lazily off this thread (see
+     * {@link #ensureHandle}), and a removed handle's native release is
+     * handed to the generic pool.
      */
     private void onClusterStateChanged(ClusterChangedEvent event) {
         if (!event.metadataChanged()) {
@@ -284,16 +288,22 @@ public final class LanceNamespaceService {
         Set<String> desired = new java.util.HashSet<>(metadata.entries().size());
         for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
             desired.add(entry.name());
-            ensureHandle(entry);
         }
-        // Drop cache entries for namespaces the cluster removed, and
-        // release whatever native resources the handle holds.
+        // Drop cache entries for namespaces the cluster removed. The
+        // handles are not built here: DirectoryNamespace.initialize reads
+        // the manifest table from storage (a network round trip for
+        // object-store roots), which must not run on the applier thread;
+        // the poll and the tables preview build handles on the generic
+        // pool through ensureHandle instead. Closing a handle releases
+        // native resources, so that leaves the applier thread too.
         for (String name : namespaceCache.keySet()) {
             if (desired.contains(name)) {
                 continue;
             }
             LanceNamespace removed = namespaceCache.remove(name);
-            closeQuietly(name, removed);
+            if (removed != null) {
+                threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> closeQuietly(name, removed));
+            }
         }
         unavailable.keySet().removeIf(name -> !desired.contains(name));
         warnedInitFailure.removeIf(name -> !desired.contains(name));
@@ -307,6 +317,18 @@ public final class LanceNamespaceService {
      * the next call — every poll cycle goes through here, so a
      * registration that failed to initialise keeps being retried at
      * the poll cadence.
+     *
+     * <p>Callers run on the generic pool (the poll's schedule and the
+     * tables preview's fork), never on the cluster state applier
+     * thread, because {@code initialize} is not free of I/O for every
+     * implementation. Per implementation: DirectoryNamespace builds its
+     * object store and opens the manifest table from storage when
+     * manifest support is on (its default) — a network round trip for
+     * object-store roots; RestNamespace, IcebergNamespace,
+     * PolarisNamespace and UnityNamespace only construct their HTTP
+     * client without sending a request; GlueNamespace only builds the
+     * AWS SDK client, whose credential providers resolve lazily on the
+     * first call.
      */
     private LanceNamespace ensureHandle(LanceNamespaceMetadata.Entry entry) {
         LanceNamespace cached = namespaceCache.get(entry.name());
@@ -368,8 +390,8 @@ public final class LanceNamespaceService {
      * List the tables the poll cycle would surface from the namespace
      * registered under {@code identifier} (a registration name, or a
      * directory registration's path). Returns an empty {@link Optional}
-     * when nothing is registered under the identifier (or the local
-     * applier has not yet built the runtime handle for it), a populated
+     * when nothing is registered under the identifier (or the handle
+     * failed to initialise on this node), a populated
      * set otherwise. Table names come from the catalog's
      * {@code listTables} without any {@code .lance} suffix or scheme
      * prefix — matching the form the surface path uses.
@@ -385,7 +407,11 @@ public final class LanceNamespaceService {
         if (entry == null) {
             return Optional.empty();
         }
-        LanceNamespace handle = namespaceCache.get(entry.name());
+        // Build the handle on demand: the transport action forks this
+        // call to the generic pool, and only the poll (cluster manager
+        // only) builds handles otherwise, so a preview served by a
+        // follower node cannot rely on a pre-built cache entry.
+        LanceNamespace handle = ensureHandle(entry);
         if (handle == null) {
             return Optional.empty();
         }
