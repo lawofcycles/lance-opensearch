@@ -13,6 +13,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.lance.namespace.DirectoryNamespace;
 import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.RestNamespace;
+import org.lance.namespace.glue.GlueNamespace;
 
 /**
  * Builds the runtime {@link LanceNamespace} handle for a cluster-state
@@ -53,6 +54,7 @@ public final class LanceNamespaceFactory {
         return switch (type) {
             case LanceNamespaceMetadata.Entry.TYPE_DIRECTORY -> new DirectoryNamespace();
             case LanceNamespaceMetadata.Entry.TYPE_REST -> new RestNamespace();
+            case LanceNamespaceMetadata.Entry.TYPE_GLUE -> new GlueNamespace();
             default -> throw new IllegalArgumentException(
                 "unknown namespace type [" + type + "]; accepted values are " + LanceNamespaceMetadata.Entry.ACCEPTED_TYPES
             );

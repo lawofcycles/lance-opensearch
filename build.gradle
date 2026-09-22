@@ -99,6 +99,53 @@ dependencies {
     implementation("org.lance:lance-namespace-apache-client:${lance_namespace_version}") {
         exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
     }
+    // AWS Glue catalog implementation of the Lance Namespace interface.
+    // The newest released artifact (0.4.1) still targets lance-namespace
+    // 0.7.7 / lance-core 7.0.0; the surface this plugin drives —
+    // initialize, listTables, describeTable and the model classes they
+    // exchange — is binary-compatible with the bundled lance-namespace
+    // 0.11.1 / lance-core 12.0.0 (method descriptors verified against
+    // both jars). The build resolves no transitive dependencies, so the
+    // closure is declared explicitly: impls-core carries the shared
+    // LanceTableUtil, and the software.amazon.awssdk modules are the
+    // Glue client's full compile tree at 2.32.2 (the version the glue
+    // artifact was built against). The SDK's sync HTTP transport is
+    // url-connection-client, which needs nothing beyond the SPI —
+    // apache-client (httpcore, commons-logging) and netty-nio-client
+    // stay out. Guava comes from the Calcite block above; slf4j-api and
+    // reactive-streams come from the plugin's own declaration and the
+    // OpenSearch core classpath respectively. The impls-core REST client
+    // classes reference httpclient5, which is not bundled because the
+    // plugin never runs that path; thirdPartyAudit ignores those
+    // references below.
+    implementation "org.lance:lance-namespace-glue:${lance_namespace_impls_version}"
+    implementation "org.lance:lance-namespace-impls-core:${lance_namespace_impls_version}"
+    implementation "software.amazon.awssdk:glue:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:aws-json-protocol:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:protocol-core:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:aws-core:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:sdk-core:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:auth:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:regions:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:profiles:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:endpoints-spi:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:identity-spi:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:http-client-spi:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:http-auth:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:http-auth-aws:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:http-auth-spi:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:http-auth-aws-eventstream:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:checksums:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:checksums-spi:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:retries:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:retries-spi:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:metrics-spi:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:json-utils:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:third-party-jackson-core:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:utils:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:annotations:${aws_sdk_version}"
+    implementation "software.amazon.awssdk:url-connection-client:${aws_sdk_version}"
+    implementation "software.amazon.eventstream:eventstream:${aws_eventstream_version}"
     implementation "org.apache.arrow:arrow-memory-unsafe:${arrow_version}"
 
     // Jackson databind + annotations are required at runtime by arrow-vector
@@ -217,8 +264,8 @@ dependencies {
     }
 }
 
-// Collapse the Apache Arrow, Jackson, Calcite, Substrait, and Guava jars
-// into single license/notice entries.
+// Collapse the Apache Arrow, Jackson, Calcite, Substrait, Guava, AWS SDK,
+// and Lance namespace implementation jars into single license/notice entries.
 tasks.named("dependencyLicenses").configure {
     mapping from: /arrow-.*/, to: 'arrow'
     mapping from: /jackson-.*/, to: 'jackson'
@@ -227,8 +274,15 @@ tasks.named("dependencyLicenses").configure {
     mapping from: /guava|failureaccess/, to: 'guava'
     // janino and commons-compiler are both org.codehaus.janino artifacts.
     mapping from: /janino|commons-compiler/, to: 'janino'
-    // io.substrait's core artifact is named core-<version>.jar.
-    mapping from: /^(core|isthmus)$/, to: 'substrait'
+    // io.substrait's core artifact is named core-<version>.jar. Non-capturing
+    // group: the task locates the matched mapping by capture-group index in
+    // one combined regex, so an inner capture group here would shift the
+    // indices of every mapping declared after it.
+    mapping from: /^(?:core|isthmus)$/, to: 'substrait'
+    // The AWS SDK v2 modules the Glue client pulls in. All ship from the
+    // same repository under the same Apache-2.0 license and notice.
+    mapping from: /^(?:glue|aws-core|sdk-core|auth|regions|profiles|utils|annotations|http-client-spi|metrics-spi|endpoints-spi|identity-spi|http-auth.*|checksums.*|retries.*|json-utils|third-party-jackson-core|protocol-core|aws-json-protocol|url-connection-client)$/, to: 'aws-sdk'
+    mapping from: /^lance-namespace-(?:glue|impls-core)$/, to: 'lance-namespace-impls'
 }
 
 // lance-core references API surface from libraries that are either provided
@@ -419,7 +473,29 @@ tasks.named('thirdPartyAudit').configure {
 
         // Internal helpers referenced by lance-core's shaded Guava on some JVMs.
         'org.lance.shaded.guava.util.concurrent.internal.InternalFutureFailureAccess',
-        'org.lance.shaded.guava.util.concurrent.internal.InternalFutures'
+        'org.lance.shaded.guava.util.concurrent.internal.InternalFutures',
+
+        // The lance-namespace-impls-core REST client reaches HTTP catalogs
+        // through Apache HttpClient 5. The plugin reaches REST catalogs
+        // through RestNamespace in lance-core (JNI) instead, so
+        // httpclient5 is not bundled and that code path never loads.
+        'org.apache.hc.client5.http.classic.methods.HttpUriRequestBase',
+        'org.apache.hc.core5.http.message.BasicHttpRequest',
+
+        // Optional CRT-backed SigV4 signer in the AWS SDK's http-auth-aws.
+        // The default signer is pure Java; aws-crt only loads when a
+        // caller selects the CRT signer explicitly, which the Glue
+        // client built here never does.
+        'software.amazon.awssdk.crt.auth.credentials.Credentials',
+        'software.amazon.awssdk.crt.auth.signing.AwsSigner',
+        'software.amazon.awssdk.crt.auth.signing.AwsSigningConfig',
+        'software.amazon.awssdk.crt.auth.signing.AwsSigningConfig$AwsSignatureType',
+        'software.amazon.awssdk.crt.auth.signing.AwsSigningConfig$AwsSignedBodyHeaderType',
+        'software.amazon.awssdk.crt.auth.signing.AwsSigningConfig$AwsSigningAlgorithm',
+        'software.amazon.awssdk.crt.auth.signing.AwsSigningResult',
+        'software.amazon.awssdk.crt.http.HttpHeader',
+        'software.amazon.awssdk.crt.http.HttpRequest',
+        'software.amazon.awssdk.crt.http.HttpRequestBodyStream'
     )
 
     ignoreViolations(
