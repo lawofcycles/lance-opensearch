@@ -25,6 +25,7 @@ import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.TermsQueryBuilder;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
@@ -37,7 +38,6 @@ import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
-import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.search.aggregations.AggregationBuilders;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -285,8 +285,15 @@ public class QueryToRexEquivalenceIT extends OpenSearchSingleNodeTestCase {
     // ---------------------------------------------------------------
 
     private void attach(String index, String uri, Map<String, LinkedHashMap<String, String>> multiFields) {
-        client().execute(LanceAttachAction.INSTANCE, new LanceAttachRequest(uri, index, null, null, StorageOptions.empty(), multiFields))
-            .actionGet();
+        LanceAttachRequest request = new LanceAttachRequest(
+            uri,
+            index,
+            null,
+            null,
+            StorageOptions.empty(),
+            LanceOverrides.fromSubFields(multiFields)
+        );
+        client().execute(LanceAttachAction.INSTANCE, request).actionGet();
         ensureGreen(index);
     }
 
@@ -297,9 +304,7 @@ public class QueryToRexEquivalenceIT extends OpenSearchSingleNodeTestCase {
     private LanceSchemas.IndexModel modelOf(String index, Dataset dataset) {
         IndexMetadata metadata = metadataOf(index);
         String primaryKey = metadata.getSettings().get(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, "");
-        Map<String, LinkedHashMap<String, String>> multiFields = RestAttachAction.deserialiseMultiFields(
-            metadata.getSettings().get(LanceEngineFactory.MULTI_FIELDS_SETTING, "")
-        );
+        Map<String, LinkedHashMap<String, String>> multiFields = LanceOverrides.of(metadata.getSettings()).subFields();
         long rows = dataset.countRows();
         return LanceSchemas.model(index, dataset.getSchema(), multiFields, primaryKey, () -> rows);
     }
