@@ -1,0 +1,1 @@
+{"query":{"bool":{"must":[{"lance_fts_boost":{"positive":{"lance_match":{"field":"body","query":"hello"}},"negative":{"lance_match":{"field":"body","query":"stale"}}}}],"filter":[{"terms":{"id":[1,2,3]}}]}}}

@@ -18,6 +18,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.search.SearchModule;
@@ -84,7 +85,7 @@ public final class PlanTestFixtures {
     );
 
     private static final NamedXContentRegistry REGISTRY = new NamedXContentRegistry(
-        new SearchModule(Settings.EMPTY, List.of()).getNamedXContents()
+        new SearchModule(Settings.EMPTY, List.of(new LancePlugin())).getNamedXContents()
     );
 
     private static Field field(String name, ArrowType arrowType, boolean nullable) {

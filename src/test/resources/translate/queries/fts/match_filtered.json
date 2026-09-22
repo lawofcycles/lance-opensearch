@@ -1,0 +1,1 @@
+{"query":{"bool":{"must":[{"lance_match":{"field":"body","query":"hello"}}],"filter":[{"term":{"category":"c0"}},{"range":{"id":{"gte":4,"lt":8}}}],"must_not":[{"term":{"id":6}}]}}}

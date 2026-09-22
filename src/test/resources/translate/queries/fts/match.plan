@@ -1,0 +1,2 @@
+LanceFtsMatch(kind=[MATCH], columns=[[body]], query=[{"lance_match":{"field":"body","query":"hello","operator":"and","fuzziness":1,"prefix_length":2,"max_expansions":20,"boost":1.0}}])
+  LanceTableScan(table=[[lance, idx]])

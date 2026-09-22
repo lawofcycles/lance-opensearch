@@ -205,6 +205,18 @@ public class LanceFtsBoostQueryBuilder extends AbstractQueryBuilder<LanceFtsBoos
     }
 
     @Override
+    public Set<String> referencedFields() {
+        Set<String> fields = new java.util.LinkedHashSet<>();
+        if (positive instanceof LanceFtsQueryBuilder pos) {
+            fields.addAll(pos.referencedFields());
+        }
+        if (negative instanceof LanceFtsQueryBuilder neg) {
+            fields.addAll(neg.referencedFields());
+        }
+        return fields;
+    }
+
+    @Override
     protected Query doToQuery(QueryShardContext context) {
         FullTextQuery ftq = toLanceFullTextQuery(context);
         Set<String> columns = LanceFtsQuery.collectColumns(ftq);

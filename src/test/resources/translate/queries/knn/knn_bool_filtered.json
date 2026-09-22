@@ -1,0 +1,1 @@
+{"query":{"lance_knn":{"field":"embedding","vector":[0.1,0.2,0.3,0.4],"k":5,"filter":{"bool":{"filter":[{"range":{"id":{"gte":10}}}],"must_not":[{"term":{"id":12}}]}}}}}

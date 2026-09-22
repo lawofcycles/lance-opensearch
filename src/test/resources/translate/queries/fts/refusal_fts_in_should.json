@@ -1,0 +1,1 @@
+{"query":{"bool":{"should":[{"lance_match":{"field":"body","query":"hello"}}]}}}

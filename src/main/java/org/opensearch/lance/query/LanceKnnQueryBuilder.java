@@ -146,39 +146,39 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
         return this;
     }
 
-    Integer nprobes() {
+    public Integer nprobes() {
         return nprobes;
     }
 
-    Integer refineFactor() {
+    public Integer refineFactor() {
         return refineFactor;
     }
 
-    Integer ef() {
+    public Integer ef() {
         return ef;
     }
 
-    String metric() {
+    public String metric() {
         return metric;
     }
 
-    Boolean useIndex() {
+    public Boolean useIndex() {
         return useIndex;
     }
 
-    org.opensearch.index.query.QueryBuilder filter() {
+    public org.opensearch.index.query.QueryBuilder filter() {
         return filter;
     }
 
-    String field() {
+    public String field() {
         return field;
     }
 
-    float[] vector() {
+    public float[] vector() {
         return vector;
     }
 
-    int k() {
+    public int k() {
         return k;
     }
 

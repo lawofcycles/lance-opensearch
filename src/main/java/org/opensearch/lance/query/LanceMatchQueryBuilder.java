@@ -310,6 +310,11 @@ public class LanceMatchQueryBuilder extends AbstractQueryBuilder<LanceMatchQuery
     }
 
     @Override
+    public Set<String> referencedFields() {
+        return Set.of(field);
+    }
+
+    @Override
     protected Query doToQuery(QueryShardContext context) {
         FullTextQuery ftq = toLanceFullTextQuery(context);
         return new LanceFtsQuery(ftq, Set.of(field));

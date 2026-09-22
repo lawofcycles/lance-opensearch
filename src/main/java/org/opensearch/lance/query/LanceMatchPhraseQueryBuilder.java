@@ -193,6 +193,11 @@ public class LanceMatchPhraseQueryBuilder extends AbstractQueryBuilder<LanceMatc
     }
 
     @Override
+    public java.util.Set<String> referencedFields() {
+        return java.util.Set.of(field);
+    }
+
+    @Override
     protected Query doToQuery(QueryShardContext context) {
         org.lance.ipc.FullTextQuery ftq = toLanceFullTextQuery(context);
         return new LanceFtsQuery(ftq, java.util.Set.of(field));
