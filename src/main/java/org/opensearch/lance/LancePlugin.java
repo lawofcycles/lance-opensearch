@@ -1039,7 +1039,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             cadence,
             builderMaxRows,
             NAMESPACE_RESURFACE_GRACE_SETTING.get(environment.settings()),
-            warmCache
+            warmCache,
+            allowedTableRoots
         );
         // Register a reactive consumer so an operator can adjust the grace
         // period at runtime without a rolling restart.

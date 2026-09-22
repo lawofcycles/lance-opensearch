@@ -8,17 +8,23 @@ package org.opensearch.lance.namespace;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.lance.Dataset;
-import org.lance.namespace.DirectoryNamespace;
+import org.lance.namespace.LanceNamespace;
+import org.lance.namespace.model.DescribeTableRequest;
+import org.lance.namespace.model.DescribeTableResponse;
+import org.lance.namespace.model.ListNamespacesRequest;
+import org.lance.namespace.model.ListNamespacesResponse;
 import org.lance.namespace.model.ListTablesRequest;
 import org.lance.namespace.model.ListTablesResponse;
 import org.lance.schema.LanceField;
@@ -56,10 +62,11 @@ import org.opensearch.transport.client.Client;
  * Namespace API. Tables in the catalog surface as OpenSearch indexes
  * automatically, with mappings and shard counts derived from the Lance
  * schema. Version changes propagate through a shard-level refresh that
- * swaps the reader without closing the index. Today the implementation
- * uses {@link DirectoryNamespace} for filesystem catalogs; the same
- * abstraction will accept REST catalogs (Glue, Unity, Iceberg REST) as
- * the Lance Namespace ecosystem matures.
+ * swaps the reader without closing the index. The runtime handle behind
+ * each registration is a {@link LanceNamespace}: {@code DirectoryNamespace}
+ * for filesystem catalogs, {@code RestNamespace} for REST catalogs, and
+ * the Glue implementation for AWS Glue, all built by
+ * {@link LanceNamespaceFactory}.
  */
 public final class LanceNamespaceService {
 
@@ -69,14 +76,28 @@ public final class LanceNamespaceService {
     private final ClusterService clusterService;
     private final TimeValue cadence;
     private final long builderMaxRows;
+    private final AllowedTableRoots allowedRoots;
     /**
-     * Per-node cache of the runtime {@link DirectoryNamespace} handles
-     * keyed by root URI. Rebuilt from cluster state on every
+     * Per-node cache of the runtime {@link LanceNamespace} handles
+     * keyed by registration name. Rebuilt from cluster state on every
      * {@link #onClusterStateChanged} callback so a fresh node that
      * joins mid-life still sees the registrations that were already
      * in the cluster's {@link LanceNamespaceMetadata}.
      */
-    private final Map<String, DirectoryNamespace> directoryCache = new ConcurrentHashMap<>();
+    private final Map<String, LanceNamespace> namespaceCache = new ConcurrentHashMap<>();
+    /**
+     * Registration names whose catalog is currently unusable, mapped
+     * to the initialise or poll error. An entry here surfaces as
+     * {@code "status": "unavailable"} in the GET listing and is
+     * retried on every poll; success removes it.
+     */
+    private final Map<String, String> unavailable = new ConcurrentHashMap<>();
+    /** Names whose initialise failure has been warned about, so the retry loop logs once. */
+    private final Set<String> warnedInitFailure = ConcurrentHashMap.newKeySet();
+    /** "name:index" pairs whose catalog location fell outside the allowlist, warned once. */
+    private final Set<String> warnedDisallowedLocation = ConcurrentHashMap.newKeySet();
+    /** Serialises handle construction so a poll and an applier tick do not double-initialise. */
+    private final Object initLock = new Object();
     private final Map<String, Long> servedVersions = new ConcurrentHashMap<>();
     // Index names created via /_lance/attach along with the absolute Lance
     // table path and storage_options they point at. Tracked here so poll()
@@ -142,15 +163,9 @@ public final class LanceNamespaceService {
         long builderMaxRows,
         TimeValue resurfaceGrace
     ) {
-        this(client, clusterService, threadPool, cadence, builderMaxRows, resurfaceGrace, null);
+        this(client, clusterService, threadPool, cadence, builderMaxRows, resurfaceGrace, null, new AllowedTableRoots(List.of()));
     }
 
-    /**
-     * @param warmCache fragment path snapshot cache to retire entries
-     *                  from when a table moves to a new version or an
-     *                  index is deleted; {@code null} when there is none
-     *                  (tests)
-     */
     public LanceNamespaceService(
         Client client,
         ClusterService clusterService,
@@ -160,12 +175,35 @@ public final class LanceNamespaceService {
         TimeValue resurfaceGrace,
         LanceWarmCache warmCache
     ) {
+        this(client, clusterService, threadPool, cadence, builderMaxRows, resurfaceGrace, warmCache, new AllowedTableRoots(List.of()));
+    }
+
+    /**
+     * @param warmCache    fragment path snapshot cache to retire entries
+     *                     from when a table moves to a new version or an
+     *                     index is deleted; {@code null} when there is none
+     *                     (tests)
+     * @param allowedRoots the {@code lance.allowed_table_roots} allowlist,
+     *                     applied to the table locations rest / glue
+     *                     catalogs return before their tables surface
+     */
+    public LanceNamespaceService(
+        Client client,
+        ClusterService clusterService,
+        ThreadPool threadPool,
+        TimeValue cadence,
+        long builderMaxRows,
+        TimeValue resurfaceGrace,
+        LanceWarmCache warmCache,
+        AllowedTableRoots allowedRoots
+    ) {
         this.client = client;
         this.clusterService = clusterService;
         this.threadPool = threadPool;
         this.cadence = cadence;
         this.builderMaxRows = builderMaxRows;
         this.warmCache = warmCache;
+        this.allowedRoots = allowedRoots;
         this.resurfaceGrace = new java.util.concurrent.atomic.AtomicReference<>(resurfaceGrace);
         // Subscribe before the first schedule fires so the poller
         // never runs against a stale cache. addListener returns
@@ -244,28 +282,66 @@ public final class LanceNamespaceService {
         LanceNamespaceMetadata metadata = currentMetadata(event.state());
         Set<String> desired = new java.util.HashSet<>(metadata.entries().size());
         for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
-            if (!LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(entry.type())) {
-                // Non-directory catalogs are initialised through the
-                // LanceNamespace interface on the poll path; the
-                // directory cache only ever holds directory handles.
+            desired.add(entry.name());
+            ensureHandle(entry);
+        }
+        // Drop cache entries for namespaces the cluster removed, and
+        // release whatever native resources the handle holds.
+        for (String name : namespaceCache.keySet()) {
+            if (desired.contains(name)) {
                 continue;
             }
-            desired.add(entry.rootUri());
-            directoryCache.computeIfAbsent(entry.rootUri(), uri -> {
-                try {
-                    DirectoryNamespace namespace = new DirectoryNamespace();
-                    Map<String, String> config = new HashMap<>();
-                    config.put("root", uri);
-                    namespace.initialize(config, LanceRegistry.allocator());
-                    return namespace;
-                } catch (Exception e) {
-                    LOG.warn("failed to initialise namespace {} through DirectoryNamespace", uri, e);
-                    return null;
-                }
-            });
+            LanceNamespace removed = namespaceCache.remove(name);
+            closeQuietly(name, removed);
         }
-        // Drop cache entries for namespaces the cluster removed.
-        directoryCache.keySet().removeIf(uri -> !desired.contains(uri));
+        unavailable.keySet().removeIf(name -> !desired.contains(name));
+        warnedInitFailure.removeIf(name -> !desired.contains(name));
+    }
+
+    /**
+     * Return the runtime handle for {@code entry}, building and
+     * initialising it on first use. An {@code initialize} failure (bad
+     * credentials, unreachable endpoint, missing implementation) is
+     * recorded in {@link #unavailable}, warned once, and retried on
+     * the next call — every poll cycle goes through here, so a
+     * registration that failed to initialise keeps being retried at
+     * the poll cadence.
+     */
+    private LanceNamespace ensureHandle(LanceNamespaceMetadata.Entry entry) {
+        LanceNamespace cached = namespaceCache.get(entry.name());
+        if (cached != null) {
+            return cached;
+        }
+        synchronized (initLock) {
+            cached = namespaceCache.get(entry.name());
+            if (cached != null) {
+                return cached;
+            }
+            try {
+                LanceNamespace created = LanceNamespaceFactory.create(entry, LanceRegistry.allocator());
+                namespaceCache.put(entry.name(), created);
+                unavailable.remove(entry.name());
+                warnedInitFailure.remove(entry.name());
+                return created;
+            } catch (Exception e) {
+                String message = e.getMessage() == null ? e.toString() : e.getMessage();
+                unavailable.put(entry.name(), message);
+                if (warnedInitFailure.add(entry.name())) {
+                    LOG.warn("failed to initialise namespace {} (type {}); retrying on every poll", entry.name(), entry.type(), e);
+                }
+                return null;
+            }
+        }
+    }
+
+    private static void closeQuietly(String name, LanceNamespace handle) {
+        if (handle instanceof AutoCloseable closeable) {
+            try {
+                closeable.close();
+            } catch (Exception e) {
+                LOG.debug("closing namespace handle {} failed: {}", name, e.getMessage());
+            }
+        }
     }
 
     private static LanceNamespaceMetadata currentMetadata(ClusterState state) {
@@ -289,12 +365,13 @@ public final class LanceNamespaceService {
 
     /**
      * List the tables the poll cycle would surface from the namespace
-     * registered at {@code rootUri}. Returns an empty {@link Optional} when
-     * the namespace is not registered (or the local applier has not yet
-     * built the runtime handle for it), a populated set otherwise. The
-     * value comes straight from {@link DirectoryNamespace#listTables}, so
-     * table names are without the {@code .lance} suffix and without any
-     * scheme prefix — matching the form the surface path uses.
+     * registered under {@code identifier} (a registration name, or a
+     * directory registration's path). Returns an empty {@link Optional}
+     * when nothing is registered under the identifier (or the local
+     * applier has not yet built the runtime handle for it), a populated
+     * set otherwise. Table names come from the catalog's
+     * {@code listTables} without any {@code .lance} suffix or scheme
+     * prefix — matching the form the surface path uses.
      *
      * <p>Read-only: does not create, delete, or advance anything. The
      * caller can use this to preview what the next poll would do (for
@@ -302,14 +379,101 @@ public final class LanceNamespaceService {
      * or to spot tables the poller failed to surface due to a name
      * clash with an existing OpenSearch index.
      */
-    public Optional<java.util.Set<String>> listTables(String rootUri) throws Exception {
-        DirectoryNamespace directory = directoryCache.get(rootUri);
-        if (directory == null) {
+    public Optional<java.util.Set<String>> listTables(String identifier) throws Exception {
+        LanceNamespaceMetadata.Entry entry = currentMetadata(clusterService.state()).findByIdentifier(identifier);
+        if (entry == null) {
             return Optional.empty();
         }
-        ListTablesResponse response = directory.listTables(new ListTablesRequest());
-        java.util.Set<String> tables = response.getTables();
-        return Optional.of(tables == null ? java.util.Collections.emptySet() : tables);
+        LanceNamespace handle = namespaceCache.get(entry.name());
+        if (handle == null) {
+            return Optional.empty();
+        }
+        Set<String> names = new TreeSet<>();
+        for (CatalogTable table : enumerateTables(handle)) {
+            names.add(table.name());
+        }
+        return Optional.of(names);
+    }
+
+    /**
+     * The GET listing: one row per registration with its redacted
+     * config and this node's view of the catalog's availability.
+     */
+    public List<LanceNamespaceListResponse.NamespaceInfo> namespaceInfos() {
+        LanceNamespaceMetadata metadata = currentMetadata(clusterService.state());
+        List<LanceNamespaceListResponse.NamespaceInfo> infos = new ArrayList<>(metadata.entries().size());
+        for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
+            String path = LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(entry.type()) ? entry.rootUri() : null;
+            infos.add(
+                new LanceNamespaceListResponse.NamespaceInfo(
+                    entry.name(),
+                    entry.type(),
+                    path,
+                    entry.redactedConfig(),
+                    unavailable.get(entry.name())
+                )
+            );
+        }
+        return List.copyOf(infos);
+    }
+
+    /** One table the catalog names: its identifier path and its plain name (the last segment). */
+    private record CatalogTable(List<String> id, String name) {
+    }
+
+    /**
+     * Enumerate the catalog's tables through the {@link LanceNamespace}
+     * interface. Implementations disagree on how the root namespace is
+     * addressed: DirectoryNamespace accepts a request without an id,
+     * RestNamespace requires an explicit (empty) id for the root, and
+     * Glue rejects a root table listing outright because tables live
+     * inside databases. The chain below tries each shape in turn and
+     * finally walks the first level of child namespaces.
+     */
+    private static List<CatalogTable> enumerateTables(LanceNamespace handle) throws Exception {
+        Exception rootListingFailure;
+        try {
+            return rootTables(handle.listTables(new ListTablesRequest()));
+        } catch (Exception noIdFailure) {
+            rootListingFailure = noIdFailure;
+        }
+        try {
+            return rootTables(handle.listTables(new ListTablesRequest().id(List.of())));
+        } catch (Exception emptyIdFailure) {
+            // fall through to the child walk with the original failure.
+        }
+        ListNamespacesResponse children;
+        try {
+            children = handle.listNamespaces(new ListNamespacesRequest().id(List.of()));
+        } catch (Exception childListingFailure) {
+            // Neither shape works; report the root failure, which names
+            // the catalog's own error rather than the fallback's.
+            throw rootListingFailure;
+        }
+        List<CatalogTable> tables = new ArrayList<>();
+        if (children.getNamespaces() == null) {
+            return tables;
+        }
+        for (String child : children.getNamespaces()) {
+            ListTablesResponse response = handle.listTables(new ListTablesRequest().id(List.of(child)));
+            if (response.getTables() == null) {
+                continue;
+            }
+            for (String table : response.getTables()) {
+                tables.add(new CatalogTable(List.of(child, table), table));
+            }
+        }
+        return tables;
+    }
+
+    private static List<CatalogTable> rootTables(ListTablesResponse response) {
+        List<CatalogTable> tables = new ArrayList<>();
+        if (response.getTables() != null) {
+            for (String table : response.getTables()) {
+                tables.add(new CatalogTable(List.of(table), table));
+            }
+        }
+        return tables;
     }
 
     private void poll() {
@@ -339,28 +503,24 @@ public final class LanceNamespaceService {
         adoptUntrackedIndexes(state);
         LanceNamespaceMetadata metadata = currentMetadata(state);
         for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
-            if (!LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(entry.type())) {
-                continue;
-            }
-            DirectoryNamespace directory = directoryCache.get(entry.rootUri());
-            if (directory == null) {
-                // Cluster state carries the registration but the
-                // applier has not yet built a runtime handle on this
-                // node. Skip this cycle; the next poll after
-                // onClusterStateChanged finishes will pick it up.
+            LanceNamespace handle = ensureHandle(entry);
+            if (handle == null) {
+                // initialise failed; ensureHandle recorded the error and
+                // will retry on the next poll.
                 continue;
             }
             try {
-                ListTablesResponse response = directory.listTables(new ListTablesRequest());
-                Set<String> tables = response.getTables();
-                if (tables == null) {
-                    continue;
+                for (CatalogTable table : enumerateTables(handle)) {
+                    syncCatalogTable(entry, handle, table);
                 }
-                for (String tableName : tables) {
-                    syncTable(entry.rootUri(), tableName, entry.storageOptions(), entry.overridesJson());
-                }
+                unavailable.remove(entry.name());
             } catch (Exception e) {
-                LOG.warn("namespace poll failed for {}", entry.rootUri(), e);
+                // A listing failure (unreachable endpoint, revoked
+                // credentials after a successful initialise) marks the
+                // registration unavailable until a poll succeeds again.
+                String message = e.getMessage() == null ? e.toString() : e.getMessage();
+                unavailable.put(entry.name(), message);
+                LOG.warn("namespace poll failed for {}", entry.name(), e);
             }
         }
         // Sync attach-created indexes so append fragments surface on the
@@ -377,9 +537,84 @@ public final class LanceNamespaceService {
         }
     }
 
-    private void syncTable(String rootUri, String tableName, StorageOptions storageOptions, String overridesJson) {
-        String table = rootUri + "/" + tableName + ".lance";
-        runSyncCycle(table, tableName, storageOptions, null, overridesJson);
+    /**
+     * Sync one catalog table into the poll's index bookkeeping.
+     *
+     * <p>A directory registration builds the table path from its root
+     * and the table name, exactly the shape adoption classification
+     * and the persisted {@code index.lance.table} setting rely on. A
+     * rest or glue registration asks the catalog itself through
+     * {@code describeTable}; the returned location is validated
+     * against {@code lance.allowed_table_roots} before anything
+     * surfaces, because for these types the register call had no root
+     * the allowlist could gate.
+     */
+    private void syncCatalogTable(LanceNamespaceMetadata.Entry entry, LanceNamespace handle, CatalogTable table) {
+        String indexName = table.name();
+        if (LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(entry.type())) {
+            runSyncCycle(entry.rootUri() + "/" + indexName + ".lance", indexName, entry.storageOptions(), null, entry.overridesJson());
+            return;
+        }
+        DescribeTableResponse described;
+        try {
+            described = handle.describeTable(new DescribeTableRequest().id(table.id()));
+        } catch (Exception e) {
+            LOG.warn("describe_table failed for {} in namespace {}: {}", indexName, entry.name(), e.getMessage());
+            return;
+        }
+        String location = tableLocation(described);
+        if (location == null) {
+            LOG.warn("catalog {} returned no location for table {}; skipping", entry.name(), indexName);
+            return;
+        }
+        if (!allowedRoots.allows(location)) {
+            if (warnedDisallowedLocation.add(entry.name() + ":" + indexName)) {
+                LOG.warn(
+                    "table {} from namespace {} resolves to {}, outside the configured lance.allowed_table_roots; skipping",
+                    indexName,
+                    entry.name(),
+                    location
+                );
+            }
+            return;
+        }
+        warnedDisallowedLocation.remove(entry.name() + ":" + indexName);
+        runSyncCycle(location, indexName, mergeStorageOptions(described.getStorageOptions(), entry.storageOptions()), null, entry.overridesJson());
+    }
+
+    /**
+     * The single place a table location is read out of a
+     * {@code DescribeTableResponse}, whichever implementation produced
+     * it. Directory, REST and Glue namespaces all set {@code location};
+     * a trailing slash (Glue storage descriptors sometimes carry one)
+     * is stripped so the value matches the path shape
+     * {@code index.lance.table} persists.
+     */
+    static String tableLocation(DescribeTableResponse response) {
+        if (response == null) {
+            return null;
+        }
+        String location = response.getLocation();
+        if (location == null || location.isEmpty()) {
+            return null;
+        }
+        return location.endsWith("/") ? location.substring(0, location.length() - 1) : location;
+    }
+
+    /**
+     * Overlay the registration's storage options on whatever the
+     * catalog returned with the table (Glue passes its
+     * {@code storage.*} config through, REST catalogs may vend
+     * credentials). The registration's values win so an operator can
+     * override what the catalog hands out.
+     */
+    static StorageOptions mergeStorageOptions(Map<String, String> fromCatalog, StorageOptions fromEntry) {
+        if (fromCatalog == null || fromCatalog.isEmpty()) {
+            return fromEntry;
+        }
+        Map<String, String> merged = new LinkedHashMap<>(fromCatalog);
+        merged.putAll(fromEntry.asMap());
+        return StorageOptions.of(merged);
     }
 
     /**

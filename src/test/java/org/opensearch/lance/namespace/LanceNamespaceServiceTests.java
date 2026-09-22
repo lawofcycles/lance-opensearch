@@ -164,4 +164,101 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
             .build();
         assertEquals(LanceNamespaceService.Adoption.ATTACH, LanceNamespaceService.classifyForAdoption("demo", tagged, Set.of("/ns")));
     }
+
+    public void testInitializeFailureSurfacesAsUnavailableAndRetries() throws Exception {
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.initializeFailure = new IllegalStateException("bad credentials");
+        LanceNamespaceFactory.setInstantiatorForTests(type -> recording);
+        try {
+            LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
+                new LanceNamespaceMetadata.Entry(
+                    "cat",
+                    LanceNamespaceMetadata.Entry.TYPE_REST,
+                    null,
+                    StorageOptions.empty(),
+                    java.util.Map.of("uri", "http://catalog.example:8080", "header.Authorization", "Bearer hunter2")
+                )
+            );
+            ClusterState state = ClusterState.builder(clusterService.state())
+                .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
+                .build();
+            // The applier callback drives ensureHandle; the failure is
+            // recorded rather than thrown.
+            ClusterServiceUtils.setState(clusterService, state);
+            java.util.List<org.opensearch.lance.namespace.LanceNamespaceListResponse.NamespaceInfo> infos = service.namespaceInfos();
+            assertEquals(1, infos.size());
+            assertEquals("cat", infos.get(0).name());
+            assertEquals("rest", infos.get(0).type());
+            assertNull(infos.get(0).path());
+            assertEquals("bad credentials", infos.get(0).error());
+            // The listing redacts the credential-bearing config key.
+            assertEquals("***", infos.get(0).config().get("header.Authorization"));
+            assertEquals("http://catalog.example:8080", infos.get(0).config().get("uri"));
+            // The failed initialise still received the raw secret.
+            assertEquals("Bearer hunter2", recording.initializeCalls.get(0).get("header.Authorization"));
+
+            // A later applier tick retries; success clears the status.
+            recording.initializeFailure = null;
+            ClusterState touched = ClusterState.builder(clusterService.state())
+                .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
+                .version(clusterService.state().version() + 1)
+                .build();
+            ClusterServiceUtils.setState(clusterService, touched);
+            assertNull(service.namespaceInfos().get(0).error());
+            assertEquals(2, recording.initializeCalls.size());
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+    }
+
+    public void testListTablesFallsBackToChildNamespacesForParentScopedCatalogs() throws Exception {
+        // A Glue-style catalog rejects a root table listing; the service
+        // walks the first level of child namespaces instead.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.childNamespaces = Set.of("salesdb");
+        recording.tables = Set.of("orders", "customers");
+        LanceNamespaceFactory.setInstantiatorForTests(type -> recording);
+        try {
+            LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
+                new LanceNamespaceMetadata.Entry(
+                    "glue-tokyo",
+                    LanceNamespaceMetadata.Entry.TYPE_GLUE,
+                    null,
+                    StorageOptions.empty(),
+                    java.util.Map.of("region", "ap-northeast-1")
+                )
+            );
+            ClusterState state = ClusterState.builder(clusterService.state())
+                .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
+                .build();
+            ClusterServiceUtils.setState(clusterService, state);
+            java.util.Optional<Set<String>> tables = service.listTables("glue-tokyo");
+            assertTrue(tables.isPresent());
+            assertEquals(Set.of("orders", "customers"), tables.get());
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+    }
+
+    public void testTableLocationStripsTrailingSlashAndHandlesMissingLocation() {
+        org.lance.namespace.model.DescribeTableResponse response = new org.lance.namespace.model.DescribeTableResponse();
+        assertNull(LanceNamespaceService.tableLocation(response));
+        response.setLocation("s3://bucket/prefix/orders.lance/");
+        assertEquals("s3://bucket/prefix/orders.lance", LanceNamespaceService.tableLocation(response));
+        response.setLocation("/data/orders.lance");
+        assertEquals("/data/orders.lance", LanceNamespaceService.tableLocation(response));
+        assertNull(LanceNamespaceService.tableLocation(null));
+    }
+
+    public void testMergeStorageOptionsOverlaysEntryValuesOnCatalogValues() {
+        StorageOptions entryOptions = StorageOptions.of(java.util.Map.of("aws_region", "ap-northeast-1"));
+        assertEquals(entryOptions, LanceNamespaceService.mergeStorageOptions(null, entryOptions));
+        assertEquals(entryOptions, LanceNamespaceService.mergeStorageOptions(java.util.Map.of(), entryOptions));
+        StorageOptions merged = LanceNamespaceService.mergeStorageOptions(
+            java.util.Map.of("aws_region", "us-east-1", "allow_http", "true"),
+            entryOptions
+        );
+        assertEquals("ap-northeast-1", merged.asMap().get("aws_region"));
+        assertEquals("true", merged.asMap().get("allow_http"));
+    }
 }
