@@ -19,6 +19,12 @@ import java.io.IOException;
  * {@code RelOptUtil.toString} renders them, one node per line. The
  * text is for humans; its format will change as the planner grows
  * traits and costs.
+ *
+ * <p>The stream fields are read and written unconditionally, so the
+ * wire format is not rolling upgrade safe; the plugin has no mixed
+ * version story yet, as the backwards-compatibility policy on
+ * {@link org.opensearch.lance.namespace.LanceNamespaceMetadata} spells
+ * out.
  */
 public final class LanceExplainResponse extends ActionResponse implements ToXContentObject {
 
