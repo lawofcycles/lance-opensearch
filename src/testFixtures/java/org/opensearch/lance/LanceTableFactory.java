@@ -1030,6 +1030,138 @@ public final class LanceTableFactory {
         return withLocaleRoot(() -> writeDatedTableOnce(parent, name));
     }
 
+    /**
+     * Writes a Lance table for the mapping override tests: epoch millis
+     * stored as a plain Int64 column next to a Utf8 column that carries
+     * an inverted index.
+     *
+     * <p>Row layout (fixed six-row table):
+     * <ul>
+     *   <li>id (int32, nullable, no PK metadata): {@code i}</li>
+     *   <li>ts (int64, nullable): epoch millis of 2024-01-15, 2024-02-20,
+     *       2024-03-10, 2024-03-25, 2024-04-05, 2024-05-30 (midnight
+     *       UTC), so a March range holds exactly rows 2 and 3</li>
+     *   <li>label (utf8, nullable, INVERTED index): {@code "hello lance " + i}
+     *       for even {@code i}, {@code "quick brown fox " + i} for odd
+     *       {@code i} — six distinct values, each with spaces so an
+     *       exact term match proves the value was not analysed</li>
+     * </ul>
+     *
+     * <p>Without overrides derivation maps ts to {@code long} and label
+     * to {@code lance_text}; the override tests flip them to
+     * {@code date} and {@code keyword}.
+     */
+    public static String writeEpochMillisTable(Path parent, String name) throws Exception {
+        return withLocaleRoot(() -> writeEpochMillisTableOnce(parent, name));
+    }
+
+    /** Epoch millis (midnight UTC) of the six rows {@link #writeEpochMillisTable} writes. */
+    public static long[] epochMillisFixtureValues() {
+        return new long[] {
+            Instant.parse("2024-01-15T00:00:00Z").toEpochMilli(),
+            Instant.parse("2024-02-20T00:00:00Z").toEpochMilli(),
+            Instant.parse("2024-03-10T00:00:00Z").toEpochMilli(),
+            Instant.parse("2024-03-25T00:00:00Z").toEpochMilli(),
+            Instant.parse("2024-04-05T00:00:00Z").toEpochMilli(),
+            Instant.parse("2024-05-30T00:00:00Z").toEpochMilli() };
+    }
+
+    private static String writeEpochMillisTableOnce(Path parent, String name) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        long[] millis = epochMillisFixtureValues();
+        int rowCount = millis.length;
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            byte[] ipcBytes = epochMillisBatch(allocator, 0, rowCount, millis);
+            try (
+                ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+            ) {
+                Data.exportArrayStream(allocator, reader, stream);
+                WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
+                try (Dataset dataset = Dataset.create(allocator, stream, uri, writeParams)) {
+                    ScalarIndexParams scalarParams = ScalarIndexParams.create(
+                        "inverted",
+                        "{\"base_tokenizer\":\"simple\",\"language\":\"English\",\"with_position\":true}"
+                    );
+                    IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+                    dataset.createIndex(
+                        IndexOptions.builder(Collections.singletonList("label"), IndexType.INVERTED, indexParams)
+                            .withIndexName("label_fts")
+                            .build()
+                    );
+                }
+            }
+        }
+        return uri;
+    }
+
+    /**
+     * Appends {@code rowCount} more rows to an existing
+     * {@link #writeEpochMillisTable} table: ids from {@code startId},
+     * ts values one day apart from 2024-06-01 and labels
+     * {@code "extra lance " + id}. Produces a new manifest version.
+     */
+    public static void appendEpochMillisRows(String tableUri, int startId, int rowCount) throws Exception {
+        withLocaleRoot(() -> {
+            long base = Instant.parse("2024-06-01T00:00:00Z").toEpochMilli();
+            long[] millis = new long[rowCount];
+            for (int i = 0; i < rowCount; i++) {
+                millis[i] = base + i * 86_400_000L;
+            }
+            try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+                byte[] ipcBytes = epochMillisBatch(allocator, startId, rowCount, millis);
+                try (
+                    ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                    ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                    ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+                ) {
+                    Data.exportArrayStream(allocator, reader, stream);
+                    WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.APPEND).build();
+                    Dataset.create(allocator, stream, tableUri, writeParams).close();
+                }
+            }
+            return tableUri;
+        });
+    }
+
+    private static byte[] epochMillisBatch(RootAllocator allocator, int startId, int rowCount, long[] millis) throws Exception {
+        Schema schema = new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("ts", FieldType.nullable(new ArrowType.Int(64, true)), null),
+                new Field("label", FieldType.nullable(new ArrowType.Utf8()), null)
+            ),
+            Map.of()
+        );
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            IntVector idVector = (IntVector) root.getVector("id");
+            BigIntVector tsVector = (BigIntVector) root.getVector("ts");
+            VarCharVector labelVector = (VarCharVector) root.getVector("label");
+            idVector.allocateNew(rowCount);
+            tsVector.allocateNew(rowCount);
+            labelVector.allocateNew();
+            for (int i = 0; i < rowCount; i++) {
+                int id = startId + i;
+                idVector.set(i, id);
+                tsVector.set(i, millis[i]);
+                String label = startId > 0 ? "extra lance " + id : (id % 2 == 0 ? "hello lance " + id : "quick brown fox " + id);
+                labelVector.setSafe(i, label.getBytes(StandardCharsets.UTF_8));
+            }
+            idVector.setValueCount(rowCount);
+            tsVector.setValueCount(rowCount);
+            labelVector.setValueCount(rowCount);
+            root.setRowCount(rowCount);
+            try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                writer.start();
+                writer.writeBatch();
+                writer.end();
+            }
+            return out.toByteArray();
+        }
+    }
+
     private static String writeDatedTableOnce(Path parent, String name) throws Exception {
         Path tablePath = parent.resolve(name + ".lance");
         String uri = tablePath.toString();

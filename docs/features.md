@@ -98,22 +98,39 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 - The per-node executors run as child tasks of the coordinator task (`internal:lance/coordinator_search`), which is itself a child of the search task (`indices:data/read/search`). Cancelling the search task or the coordinator task through `POST /_tasks/_cancel`, or a client that closes its connection before the answer, cancels every executor task (`internal:lance/fragment_query`) and ends the request with `task_cancelled_exception`. Cancelling one executor task alone (`_tasks/_cancel?nodes=...&actions=internal:lance/fragment_query`) is treated like that node timing out: partial results with `timed_out: true`, or a failure under `allow_partial_search_results: false`.
 - A Lance scan cannot be interrupted from Java while it is inside a batch, so a cancelled executor stops at the next batch boundary of the scan it is in (the FTS or vector scan, a count scan, a sorted page scan, an aggregation pushdown group, a column load) and between Lucene leaves and every few hundred documents of a collection; a batch that has started runs to its end.
 
-### Multi-fields
+### Mapping overrides
 
-- Attach body accepts a `multi_fields` clause (or the equivalent `overrides.[col].fields` clause, see below) that declares a `keyword` sub-field on a Utf8 base column, so a single Lance column serves both full-text (`lance_text`) and exact-match / aggregation (`.raw`) without duplicating source:
+- Attach body accepts an `overrides` clause with per-column mapping rules. Three kinds are supported: a `date` type override, a `keyword` type override, and keyword sub-fields (`fields`). `type` and `fields` may appear together on one column:
 
   ```json
   POST /_lance/attach
   {
     "table": "s3://bucket/tables/demo.lance",
-    "overrides": { "body": { "fields": { "raw": { "type": "keyword" } } } }
+    "overrides": {
+      "ts": { "type": "date", "format": "epoch_millis" },
+      "body": { "type": "keyword", "fields": { "raw": { "type": "keyword" } } }
+    }
   }
   ```
 
-  The legacy shape `"multi_fields": {"body": {"raw": {"type": "keyword"}}}` is still accepted for backward compatibility; both shapes end up in the same `index.lance.multi_fields` setting.
+- `type: date` on a signed 32 or 64 bit integer column reads the stored value as epoch millis: the mapping becomes `date` with the declared `format` (default `epoch_millis`), so range queries with ISO dates, `date_histogram`, and sort behave as on a real date column. An Int32 column is accepted and its values are read as millis too (which places them near 1970; useful only when that is what the writer stored). On a Date / Timestamp column the override is a no-op pin of the type the derivation picks anyway, so one override list can be applied uniformly to several tables. `_source` renders the raw integer, not a formatted date.
+- `type: keyword` on a Utf8 column maps it to `keyword` even when the column carries a Lance inverted index, for operators that prefer exact matches and terms aggregations over `lance_text`. The column leaves the FTS build targets, so `build_indexes` neither creates nor optimises an FTS index for it; an inverted index the table already has stays untouched on the Lance side. On a List&lt;Utf8&gt; column the override pins the derived type. `lance_match` and friends on such a column are refused like on any other keyword field.
+- `fields` declares `keyword` sub-fields on a Utf8 base column (`lance_text` or `keyword`), so a single Lance column serves both full-text and exact-match / aggregation without duplicating source. Sub-field query resolution goes through Lucene doc values on the base column.
+- Validation answers 400 naming the column and the reason:
 
-- The base column must be Utf8 (`lance_text` or `keyword`); other Arrow types are rejected at attach with a 400. Sub-field type must be `keyword` today. Base column type overrides (`overrides.[col].type`) are reserved for `ip` / `wildcard`, analyzer mode, and preferred index type; today the parser refuses them with 400.
-- Persisted in `index.lance.multi_fields` (an index setting). Namespace poll re-derivation reads the setting back and re-applies it on every manifest version advance, so multi-field declarations survive schema changes.
+  | rule | accepted |
+  |---|---|
+  | `type` values | `date`, `keyword` |
+  | `type: date` column | signed Int32 / Int64, Date, Timestamp |
+  | `type: keyword` column | Utf8 (with or without inverted index), List&lt;Utf8&gt; |
+  | `fields` column | Utf8 (resolves to `lance_text` or `keyword`) |
+  | `format` | only with `type: date`, validated as a date format pattern |
+  | keys under a column | `type`, `format`, `fields` |
+  | column | must exist in the table and must not be the primary key |
+
+- The legacy `multi_fields` clause (`{"body": {"raw": {"type": "keyword"}}}`) is still accepted for one release as an alias: it folds into `overrides.[col].fields` at parse time, and a body declaring sub-fields for the same column through both clauses returns 400.
+- `POST /_lance/namespace` accepts the same `overrides` object and applies it to every table it surfaces under the root. A column a table lacks is skipped for that table (logged at debug) while the full list is persisted, so the override applies once a later manifest adds the column.
+- Persisted as canonical JSON in the `index.lance.overrides` index setting. Namespace poll re-derivation reads the setting back and re-applies it on every manifest version advance, so overrides survive schema changes; an override whose column disappears is kept in the setting and skipped until the column returns. Indexes created before this setting existed keep resolving their sub-fields from the legacy `index.lance.multi_fields` setting.
 
 ## Aggregations
 
@@ -241,7 +258,7 @@ Types listed here map to real OpenSearch field types with doc values or FTS back
 | `fixed_size_list<float32>` | `knn_vector` | Dimension carried through the mapping; `lance_knn` validates it. |
 | `binary` / `large_binary` | `binary` | Base64 in `_source`, no doc values. |
 
-Multi-fields (`fields.raw: keyword` on a Utf8 base column) is supported through the `multi_fields` attach clause above.
+Multi-fields (`fields.raw: keyword` on a Utf8 base column), a `date` override on an epoch-millis integer column, and a `keyword` override on an inverted-index Utf8 column are supported through the `overrides` attach clause above.
 
 Types not yet surfaced: `ip`, `wildcard`, and the geo family. `Utf8` list, `Decimal`, and `FloatingPoint(HALF)` are stored in the table but excluded from the mapping today; the attach response notes them.
 
