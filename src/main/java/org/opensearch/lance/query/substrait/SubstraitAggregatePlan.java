@@ -18,7 +18,9 @@ import java.util.Map;
  * grouping expressions and aggregate measures. Lance parses it with
  * datafusion-substrait against the dataset's Arrow schema and runs the
  * group by inside the scan, so the plugin receives one row per group
- * instead of one row per document.
+ * instead of one row per document. {@link Builder#topK} can put a
+ * {@code SortRel} and a {@code FetchRel} above the aggregate, which the
+ * Lance 12 consumer rejects; see the method for why it exists.
  *
  * <p>The encoding follows substrait 0.63.0, the version the Lance 12
  * native library links. Field numbers are quoted from the proto files
@@ -163,6 +165,9 @@ public final class SubstraitAggregatePlan {
         private final List<String> groupingNames = new ArrayList<>();
         private final List<Measure> measures = new ArrayList<>();
         private final LinkedHashMap<String, Integer> functionAnchors = new LinkedHashMap<>();
+        private Expression topKSort;
+        private boolean topKAscending;
+        private long topKCount;
 
         private record Measure(String function, List<Expression> arguments, ScalarType outputType, String outputName) {
         }
@@ -182,6 +187,36 @@ public final class SubstraitAggregatePlan {
          */
         public Builder measure(String function, List<Expression> arguments, ScalarType outputType, String outputName) {
             measures.add(new Measure(function, List.copyOf(arguments), outputType, outputName));
+            return this;
+        }
+
+        /**
+         * Cuts the aggregate's rows to the {@code count} best by
+         * {@code sortExpression}: a {@code SortRel} over the aggregate
+         * and a {@code FetchRel} of {@code count} rows above it.
+         * {@code sortExpression} reads the aggregate's output schema, the
+         * groupings first and then the measures, so a
+         * {@link FieldReference} of the grouping count is the first
+         * measure. Nulls sort last in either direction.
+         *
+         * <p>No caller sends this to Lance today: the Lance 12 Substrait
+         * consumer takes the one relation of the plan as an
+         * {@code AggregateRel} and rejects anything else, the
+         * {@code FetchRel} included, with "Expected Substrait
+         * AggregateRel". The producer is ready for a consumer that takes
+         * the sorted cut, at which point the executor can stop cutting
+         * top-k on the Java side.
+         */
+        public Builder topK(Expression sortExpression, boolean ascending, long count) {
+            if (sortExpression == null) {
+                throw new IllegalArgumentException("top-k needs a sort expression");
+            }
+            if (count <= 0L) {
+                throw new IllegalArgumentException("top-k count must be positive: " + count);
+            }
+            this.topKSort = sortExpression;
+            this.topKAscending = ascending;
+            this.topKCount = count;
             return this;
         }
 
@@ -210,8 +245,21 @@ public final class SubstraitAggregatePlan {
                 aggregateRel.message(4, new ProtoWriter().message(1, aggregateFunction(measure)));
             }
 
-            // Rel: aggregate = 4. RelRoot: input = 1, names = 2.
-            ProtoWriter relRoot = new ProtoWriter().message(1, new ProtoWriter().message(4, aggregateRel));
+            // Rel: fetch = 3, aggregate = 4, sort = 5. RelRoot: input = 1,
+            // names = 2.
+            ProtoWriter rel = new ProtoWriter().message(4, aggregateRel);
+            if (topKSort != null) {
+                // SortRel: input = 2, sorts = 3. SortField: expr = 1,
+                // direction = 2 (SORT_DIRECTION_ASC_NULLS_LAST = 2,
+                // SORT_DIRECTION_DESC_NULLS_LAST = 4).
+                ProtoWriter sortField = new ProtoWriter().message(1, expression(topKSort)).varint(2, topKAscending ? 2 : 4);
+                ProtoWriter sortRel = new ProtoWriter().message(2, rel).message(3, sortField);
+                // FetchRel: input = 2, count = 4 (the int64 form; the
+                // expression form is count_expr = 6).
+                ProtoWriter fetchRel = new ProtoWriter().message(2, new ProtoWriter().message(5, sortRel)).varint(4, topKCount);
+                rel = new ProtoWriter().message(3, fetchRel);
+            }
+            ProtoWriter relRoot = new ProtoWriter().message(1, rel);
             for (String name : groupingNames) {
                 relRoot.string(2, name);
             }
