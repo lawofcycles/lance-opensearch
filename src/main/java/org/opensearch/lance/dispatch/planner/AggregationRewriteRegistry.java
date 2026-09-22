@@ -11,19 +11,21 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * The ordered rule set the aggregation dispatcher consults before the
- * legacy shape dispatcher. {@link #rewrite} asks each rule in
- * registration order and returns the first match; an empty answer
- * means no rule owns the request's shape and the caller falls through.
- * The production set is the {@link #instance() singleton}, currently
- * the metric only rule then the composite rule (disjoint: a composite
- * top is never a pushdown metric); the remaining shapes are registered
- * here as they are extracted from the legacy dispatcher.
+ * The ordered rule set behind the aggregation pushdown: {@link #rewrite}
+ * asks each rule in registration order and returns the first match; an
+ * empty answer means no rule owns the request's shape and the Lucene
+ * aggregators run. The production set is the {@link #instance()
+ * singleton}: the metric only rule, the composite rule, then the
+ * nested bucket rule. The shapes are disjoint (a composite top is
+ * never a pushdown metric, and the nested bucket rule refuses both),
+ * so the order documents the shape space rather than resolves an
+ * overlap; together the three rules answer every shape the structural
+ * gate accepts.
  */
 public final class AggregationRewriteRegistry {
 
     private static final AggregationRewriteRegistry INSTANCE = new AggregationRewriteRegistry(
-        List.of(new MetricOnlyRule(), new CompositeRule())
+        List.of(new MetricOnlyRule(), new CompositeRule(), new NestedBucketRule())
     );
 
     /** The production rule set. */

@@ -603,11 +603,10 @@ final class LanceAggregationSupport {
      * through the builder's own JSON rendering, which writes the
      * {@code hard_bounds} key only when the option was set. It is the
      * last condition of {@link #isPushdownBucket}, and
-     * {@link #isPushdownCandidate} runs at most twice per executor
-     * request (once as the rule registry's structural gate and once in
-     * the legacy shape dispatcher), so the render happens at most twice
-     * per request and only for a histogram that passed every other
-     * condition.
+     * {@link #isPushdownCandidate} runs once per executor request as
+     * the rule registry's structural gate, so the render happens at
+     * most once per request and only for a histogram that passed every
+     * other condition.
      */
     private static boolean mentionsHardBounds(HistogramAggregationBuilder histogram) {
         return Strings.toString(XContentType.JSON, histogram).contains("\"" + Histogram.HARD_BOUNDS_FIELD.getPreferredName() + "\"");

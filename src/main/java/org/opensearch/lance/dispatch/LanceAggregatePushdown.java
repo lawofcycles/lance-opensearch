@@ -14,7 +14,6 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.Executor;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
@@ -2949,9 +2948,9 @@ public final class LanceAggregatePushdown {
      * estimate bound. Returns {@code null} when any part of the tree is
      * outside what the scan can compute, in which case the caller runs
      * the Lucene aggregators. Asks the
-     * {@link AggregationRewriteRegistry} first: the first matching
-     * rule's plan is the answer, and an empty answer falls through to
-     * the shape dispatcher in the innermost overload.
+     * {@link AggregationRewriteRegistry}: the first matching rule's
+     * plan is the answer, and an empty answer means no rule owns the
+     * request's shape.
      *
      * @param aggregations the request's aggregation builders, already
      *                     accepted by {@link LanceAggregationSupport#isPushdownCandidate}
@@ -2984,15 +2983,14 @@ public final class LanceAggregatePushdown {
     /**
      * The registry consultation behind
      * {@link #plan(AggregatorFactories.Builder, Schema, Map, QueryShardContext)},
-     * with the registry as a parameter so tests can drive the hook with
-     * a curated rule set: the first matching rule's plan is the answer,
-     * and an empty registry or an empty answer falls through to the
-     * legacy shape dispatcher. The rules only see a tree that
-     * {@link LanceAggregationSupport#isPushdownCandidate} accepts, the
-     * same structural gate the legacy dispatcher applies, so moving a
-     * shape from the dispatcher into a rule cannot widen what pushes
-     * down. Skips building the context while the registry has no
-     * rules, so an empty registry costs one list check.
+     * with the registry as a parameter so tests can drive the dispatch
+     * with a curated rule set: the structural gate
+     * ({@link LanceAggregationSupport#isPushdownCandidate}) refuses a
+     * tree no rule could own, then the first matching rule's plan is
+     * the answer and an empty answer means the aggregators run. No
+     * shape specific branching lives here: the registered rules cover
+     * every shape the gate accepts, so a gated tree no rule matches is
+     * one a rule's field or bound resolution refused.
      */
     static Plan planViaRegistry(
         AggregatorFactories.Builder aggregations,
@@ -3004,14 +3002,11 @@ public final class LanceAggregatePushdown {
         int bins,
         int slack
     ) {
-        if (!registry.rules().isEmpty() && LanceAggregationSupport.isPushdownCandidate(aggregations)) {
-            AggregationRewriteContext ctx = new AggregationRewriteContext(aggregations, schema, multiFields, qsc, maxGroups, bins, slack);
-            Optional<PushdownPlan> rewritten = registry.rewrite(ctx);
-            if (rewritten.isPresent()) {
-                return rewritten.get().asLegacyPlan();
-            }
+        if (!LanceAggregationSupport.isPushdownCandidate(aggregations)) {
+            return null;
         }
-        return plan(aggregations, schema, multiFields, qsc, maxGroups, bins, slack);
+        AggregationRewriteContext ctx = new AggregationRewriteContext(aggregations, schema, multiFields, qsc, maxGroups, bins, slack);
+        return registry.rewrite(ctx).map(PushdownPlan::asLegacyPlan).orElse(null);
     }
 
     /**
@@ -3057,15 +3052,45 @@ public final class LanceAggregatePushdown {
         int bins,
         int slack
     ) {
-        if (!LanceAggregationSupport.isPushdownCandidate(aggregations)) {
+        return planViaRegistry(aggregations, schema, multiFields, qsc, AggregationRewriteRegistry.instance(), maxGroups, bins, slack);
+    }
+
+    /**
+     * The plan of a nested bucket tree, every pushdown shape that is
+     * neither metric only nor composite: one bucket level per nesting
+     * step ({@code terms}, {@code histogram}, {@code date_histogram},
+     * {@code range}, {@code date_range}, {@code filter},
+     * {@code filters}, {@code missing}), each with any number of metric
+     * children and at most one nested bucket, so the scan groups by one
+     * key expression per level. Null when the tree is not this shape
+     * (an empty top, a metric top or a composite top, which the other
+     * two resolvers own), when a level or a metric fails to resolve
+     * against the schema and the mapping, when the group estimate
+     * exceeds {@code maxGroups}, or when a {@code terms} order needs a
+     * top-k selection this tree does not support, in which case the
+     * aggregators answer. The level handling assumes a tree the
+     * structural gate ({@link LanceAggregationSupport#isPushdownCandidate})
+     * accepted, as on the production path. Public because the planner
+     * package's nested bucket rule is the production caller.
+     *
+     * @param top       the request's top level aggregation builders, in
+     *                  request order
+     * @param maxGroups the bound on the estimated number of groups
+     * @param bins      bins of a pushed down percentiles histogram
+     * @param slack     how many times {@code shard_size} groups a
+     *                  single level terms scan keeps
+     */
+    public static Plan resolveNestedBucketShape(
+        List<AggregationBuilder> top,
+        Schema schema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        QueryShardContext qsc,
+        int maxGroups,
+        int bins,
+        int slack
+    ) {
+        if (top.isEmpty() || LanceAggregationSupport.isPushdownMetric(top.get(0)) || top.get(0) instanceof CompositeAggregationBuilder) {
             return null;
-        }
-        List<AggregationBuilder> top = new ArrayList<>(aggregations.getAggregatorFactories());
-        if (LanceAggregationSupport.isPushdownMetric(top.get(0))) {
-            return resolveMetricOnly(top, schema, multiFields, qsc, bins);
-        }
-        if (top.get(0) instanceof CompositeAggregationBuilder) {
-            return resolveCompositeShape(top, schema, multiFields, qsc, bins);
         }
         SubstraitAggregatePlan.Builder builder = new SubstraitAggregatePlan.Builder();
         List<Metric> allMetrics = new ArrayList<>();
@@ -3271,9 +3296,7 @@ public final class LanceAggregatePushdown {
      * aggregation is not such a metric (the tree is not this shape) or
      * when any metric fails to resolve against the schema and the
      * mapping, in which case the aggregators answer. Public because
-     * the planner package's metric only rule is the production caller;
-     * the shape dispatcher above delegates here too, so the rule path
-     * and the fall through path are one code path.
+     * the planner package's metric only rule is the production caller.
      *
      * @param top  the request's top level aggregation builders, in
      *             request order
@@ -3311,11 +3334,10 @@ public final class LanceAggregatePushdown {
      * metric fails to resolve against the schema and the mapping, in
      * which case the aggregators answer. The structural check repeats
      * the composite half of the candidate gate so this method decides
-     * the shape on its own; the gate already accepted the tree on both
-     * production paths, so the repeat cannot change what pushes down.
+     * the shape on its own; the gate already accepted the tree on the
+     * production path, so the repeat cannot change what pushes down.
      * Public because the planner package's composite rule is the
-     * production caller; the shape dispatcher above delegates here too,
-     * so the rule path and the fall through path are one code path.
+     * production caller.
      *
      * @param top  the request's top level aggregation builders, in
      *             request order

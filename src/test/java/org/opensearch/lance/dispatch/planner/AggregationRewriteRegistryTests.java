@@ -21,8 +21,8 @@ import org.opensearch.test.OpenSearchTestCase;
 /**
  * {@link AggregationRewriteRegistry#rewrite} asks each rule in
  * registration order and returns the first non empty answer, so an
- * empty registry always answers empty (the dispatcher's fall through
- * to the legacy shape dispatcher) and the first matching rule wins
+ * empty registry always answers empty (the dispatcher then leaves the
+ * request to the Lucene aggregators) and the first matching rule wins
  * when several would match. The registry itself never reads the
  * context, so these tests hand every rule the same minimal one.
  */
@@ -119,16 +119,17 @@ public class AggregationRewriteRegistryTests extends OpenSearchTestCase {
     }
 
     public void testProductionInstanceCarriesTheExtractedRulesOnly() {
-        // The production rule set grows only by deliberate extraction
-        // from the legacy dispatcher; a rule accidentally registered on
-        // the singleton in a later change must trip this. The order is
-        // part of the contract: the registry answers with the first
-        // match, so the metric only rule is consulted before the
-        // composite rule.
+        // The production rule set grows only by deliberate registration;
+        // a rule accidentally registered on the singleton in a later
+        // change must trip this. The order is part of the contract: the
+        // registry answers with the first match, so the metric only rule
+        // is consulted before the composite rule and the nested bucket
+        // rule last.
         List<AggregationRewriteRule> rules = AggregationRewriteRegistry.instance().rules();
-        assertEquals(2, rules.size());
+        assertEquals(3, rules.size());
         assertEquals(MetricOnlyRule.NAME, rules.get(0).name());
         assertEquals(CompositeRule.NAME, rules.get(1).name());
+        assertEquals(NestedBucketRule.NAME, rules.get(2).name());
     }
 
     public void testRejectsEmptyAndDuplicateRuleNames() {

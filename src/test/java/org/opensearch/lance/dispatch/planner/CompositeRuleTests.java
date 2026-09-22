@@ -44,8 +44,7 @@ import org.opensearch.test.OpenSearchTestCase;
  * column is unmapped and a {@code missing_bucket} source all answer
  * empty, an {@code after} map lands parsed on the plan's composite,
  * and the plan of the fixture request carries the scan bytes pinned
- * in {@link #WIRE_FIXTURE}, through the rule and through the legacy
- * path alike.
+ * in {@link #WIRE_FIXTURE}.
  */
 public class CompositeRuleTests extends OpenSearchTestCase {
 
@@ -60,13 +59,11 @@ public class CompositeRuleTests extends OpenSearchTestCase {
      * {@code date_histogram} source on the date column {@code d} (field
      * index 1), size 100 and no {@code after}, captured from
      * {@code LanceAggregatePushdown.resolveCompositeShape} and baked in
-     * as a wire form snapshot. Both dispatch paths call that helper, so
-     * comparing them to each other could not catch a wrong encoding
-     * inside it; this pin fails when a future edit shifts any encoded
-     * byte: the two grouping expressions (the raw field reference for
-     * the keyword source, the epoch millis floor division for the date
-     * source), the group count measure, or the output column names
-     * ({@code k0}, {@code k1}, {@code n}). {@code size},
+     * as a wire form snapshot. This pin fails when a future edit shifts
+     * any encoded byte: the two grouping expressions (the raw field
+     * reference for the keyword source, the epoch millis floor division
+     * for the date source), the group count measure, or the output
+     * column names ({@code k0}, {@code k1}, {@code n}). {@code size},
      * {@code after} and the source directions are not in the wire form
      * (the executor applies them to the sorted group rows), so they are
      * pinned by {@link #testAfterKeyIsHonored} instead.
@@ -188,23 +185,10 @@ public class CompositeRuleTests extends OpenSearchTestCase {
         assertTrue("a composite with a missing_bucket source resolves to no plan", out.isEmpty());
     }
 
-    public void testRuleAndLegacyPathEncodeTheSameScan() {
-        QueryShardContext qsc = mappedContext();
+    public void testRuleEncodesThePinnedScan() {
+        Optional<PushdownPlan> out = new CompositeRule().tryRewrite(context(tree(fixtureComposite()), mappedContext()));
 
-        Optional<PushdownPlan> viaRule = new CompositeRule().tryRewrite(context(tree(fixtureComposite()), qsc));
-        LanceAggregatePushdown.Plan viaLegacy = PlannerTestPlans.planWithoutRules(
-            tree(fixtureComposite()),
-            fixtureSchema(),
-            Map.of(),
-            qsc,
-            MAX_GROUPS,
-            BINS,
-            SLACK
-        );
-
-        assertTrue(viaRule.isPresent());
-        assertNotNull(viaLegacy);
-        assertArrayEquals("the rule path must encode the pinned wire form", WIRE_FIXTURE, bytesOf(viaRule.get().asLegacyPlan()));
-        assertArrayEquals("the legacy path must encode the pinned wire form", WIRE_FIXTURE, bytesOf(viaLegacy));
+        assertTrue(out.isPresent());
+        assertArrayEquals("the rule must encode the pinned wire form", WIRE_FIXTURE, bytesOf(out.get().asLegacyPlan()));
     }
 }

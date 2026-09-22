@@ -32,8 +32,7 @@ import org.opensearch.test.OpenSearchTestCase;
  * whose fields resolve against the schema and the mapping, no bucket
  * level. A bucket at the top and a metric the resolution refuses (a
  * {@code sum} on a keyword column) both answer empty, and the plan of
- * a match carries the scan bytes pinned in {@link #WIRE_FIXTURE},
- * through the rule and through the legacy path alike.
+ * a match carries the scan bytes pinned in {@link #WIRE_FIXTURE}.
  */
 public class MetricOnlyRuleTests extends OpenSearchTestCase {
 
@@ -45,15 +44,13 @@ public class MetricOnlyRuleTests extends OpenSearchTestCase {
      * The Substrait bytes of the fixture request, a {@code sum} named
      * {@code s} over the second column of {@link #fixtureSchema()},
      * captured from {@code LanceAggregatePushdown.resolveMetricOnly}
-     * and baked in as a wire form snapshot. Both dispatch paths call
-     * that helper, so comparing them to each other could not catch a
-     * wrong encoding inside it; this pin fails when a future edit
-     * shifts any encoded byte: the {@code sum} measure, its field
-     * reference (index 1), the absence of grouping expressions, or the
-     * output column names ({@code n} for the group count, {@code m0}
-     * for the metric's slot). The request's metric name is not in the
-     * wire form (it only names the result the executor builds), so it
-     * is not pinned here.
+     * and baked in as a wire form snapshot. This pin fails when a
+     * future edit shifts any encoded byte: the {@code sum} measure, its
+     * field reference (index 1), the absence of grouping expressions,
+     * or the output column names ({@code n} for the group count,
+     * {@code m0} for the metric's slot). The request's metric name is
+     * not in the wire form (it only names the result the executor
+     * builds), so it is not pinned here.
      */
     private static final byte[] WIRE_FIXTURE = HexFormat.of()
         .parseHex(
@@ -130,26 +127,5 @@ public class MetricOnlyRuleTests extends OpenSearchTestCase {
         Optional<PushdownPlan> out = new MetricOnlyRule().tryRewrite(context(sumTree(), fixtureSchema(), mock(QueryShardContext.class)));
 
         assertTrue(out.isEmpty());
-    }
-
-    public void testRuleAndLegacyPathBothEncodeThePinnedScan() {
-        Schema schema = fixtureSchema();
-        QueryShardContext qsc = longContext();
-
-        Optional<PushdownPlan> viaRule = new MetricOnlyRule().tryRewrite(context(sumTree(), schema, qsc));
-        LanceAggregatePushdown.Plan viaLegacy = PlannerTestPlans.planWithoutRules(
-            sumTree(),
-            schema,
-            Map.of(),
-            qsc,
-            MAX_GROUPS,
-            BINS,
-            SLACK
-        );
-
-        assertTrue(viaRule.isPresent());
-        assertNotNull(viaLegacy);
-        assertArrayEquals("the rule path must encode the pinned wire form", WIRE_FIXTURE, bytesOf(viaRule.get().asLegacyPlan()));
-        assertArrayEquals("the legacy path must encode the pinned wire form", WIRE_FIXTURE, bytesOf(viaLegacy));
     }
 }
