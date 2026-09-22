@@ -32,12 +32,12 @@ import org.opensearch.test.OpenSearchTestCase;
 /**
  * {@link LanceAggregatePushdown#planViaRegistry} consults the rules
  * only for a tree the structural gate accepts, returns the first
- * matching rule's unwrapped plan, and falls through to the legacy
- * shape dispatcher when the registry is empty or no rule matches.
- * These tests drive the hook with curated registries over a one metric
- * tree the gate accepts; its field is unmapped in the mock context, so
- * a fall through answers null and a rule match answers the wrapped
- * plan, which tells the two paths apart.
+ * matching rule's unwrapped plan, and answers null when the registry
+ * is empty or no rule matches, in which case the Lucene aggregators
+ * run. These tests drive the dispatch with curated registries over a
+ * one metric tree the gate accepts; a rule match answers the wrapped
+ * plan and every refusal answers null, which tells the two outcomes
+ * apart.
  */
 public class LanceAggregatePushdownRewriteHookTests extends OpenSearchTestCase {
 
@@ -49,7 +49,7 @@ public class LanceAggregatePushdownRewriteHookTests extends OpenSearchTestCase {
         }
     }
 
-    /** A single top level sum: the structural gate accepts it, and its unmapped field resolves to no legacy plan. */
+    /** A single top level sum: the structural gate accepts it, so the dispatch reaches the rules. */
     private static AggregatorFactories.Builder metricTree() {
         return AggregatorFactories.builder().addAggregator(AggregationBuilders.sum("s").field("f"));
     }
@@ -78,16 +78,16 @@ public class LanceAggregatePushdownRewriteHookTests extends OpenSearchTestCase {
         assertSame(wrapped.asLegacyPlan(), out);
     }
 
-    public void testEmptyRegistryFallsThroughToTheLegacyPath() {
+    public void testEmptyRegistryAnswersNull() {
         LanceAggregatePushdown.Plan out = planVia(PlannerTestRegistries.registryOf());
 
-        // The legacy dispatcher refuses the empty tree, so the fall
-        // through answer is null; a rule match would have answered the
+        // No rule owns the tree, so the dispatch answers null and the
+        // Lucene aggregators run; a rule match would have answered the
         // wrapped plan instead.
         assertNull(out);
     }
 
-    public void testNonMatchingRuleFallsThroughToTheLegacyPath() {
+    public void testNonMatchingRuleAnswersNull() {
         LanceAggregatePushdown.Plan out = planVia(PlannerTestRegistries.registryOf(new FixedRule("miss", Optional.empty())));
 
         assertNull(out);
@@ -95,8 +95,8 @@ public class LanceAggregatePushdownRewriteHookTests extends OpenSearchTestCase {
 
     public void testNonCandidateTreeSkipsTheRules() {
         // The empty tree fails the structural gate, so a rule that
-        // would match everything is never asked and the legacy path's
-        // refusal is the answer.
+        // would match everything is never asked and the gate's refusal
+        // is the answer.
         LanceAggregatePushdown.Plan out = planVia(
             PlannerTestRegistries.registryOf(new FixedRule("match", Optional.of(PushdownPlan.of(PlannerTestPlans.identityMarkerPlan())))),
             new AggregatorFactories.Builder()
@@ -109,9 +109,9 @@ public class LanceAggregatePushdownRewriteHookTests extends OpenSearchTestCase {
         // The 4 argument overload reads maxGroups from the node
         // settings and hands the production registry to the hook; the
         // empty tree fails the structural gate, so no rule is
-        // consulted and the answer is the legacy path's null. A broken
-        // delegation would throw here instead (the settings read or
-        // the hook call would fail).
+        // consulted and the answer is null. A broken delegation would
+        // throw here instead (the settings read or the hook call would
+        // fail).
         IndexSettings indexSettings = IndexSettingsModule.newIndexSettings(
             new Index("lance", "uuid"),
             Settings.EMPTY,

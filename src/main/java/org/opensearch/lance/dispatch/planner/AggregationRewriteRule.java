@@ -12,9 +12,9 @@ import java.util.Optional;
  * scan. A rule inspects the request in the
  * {@link AggregationRewriteContext} and either produces the full
  * {@link PushdownPlan} for its shape or returns empty so the next rule
- * (or the legacy dispatcher) gets a look. Rules own disjoint shapes:
- * the first rule that matches wins, so no two rules may match the same
- * tree.
+ * gets a look; empty from every rule means the Lucene aggregators run.
+ * Rules own disjoint shapes: the first rule that matches wins, so no
+ * two rules may match the same tree.
  */
 public interface AggregationRewriteRule {
 
