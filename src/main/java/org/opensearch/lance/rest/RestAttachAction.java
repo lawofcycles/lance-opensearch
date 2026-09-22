@@ -11,6 +11,7 @@ import java.util.Map;
 
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.lance.Dataset;
 import org.lance.index.IndexCriteria;
 import org.lance.schema.LanceField;
@@ -473,7 +474,7 @@ public class RestAttachAction extends BaseRestHandler {
                 // logicalType and materialised only when asArrowField() is
                 // called. Go through the Arrow representation so we can
                 // inspect the element type.
-                org.apache.arrow.vector.types.pojo.Field arrow = field.asArrowField();
+                Field arrow = field.asArrowField();
                 ArrowType childType = arrow.getChildren().isEmpty() ? null : arrow.getChildren().get(0).getType();
                 boolean float32 = childType instanceof ArrowType.FloatingPoint fp
                     && fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE;
@@ -831,7 +832,7 @@ public class RestAttachAction extends BaseRestHandler {
         }
         // LanceField.getChildren() is empty for FixedSizeList; the item
         // type only materialises through the Arrow representation.
-        org.apache.arrow.vector.types.pojo.Field arrow = field.asArrowField();
+        Field arrow = field.asArrowField();
         ArrowType childType = arrow.getChildren().isEmpty() ? null : arrow.getChildren().get(0).getType();
         return childType instanceof ArrowType.FloatingPoint fp && fp.getPrecision() == FloatingPointPrecision.SINGLE;
     }
