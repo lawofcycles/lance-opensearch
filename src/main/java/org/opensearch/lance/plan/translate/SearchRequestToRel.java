@@ -50,7 +50,7 @@ public final class SearchRequestToRel {
 
     /**
      * @param source the parsed search body; null stands for an empty
-     *     body and is rejected like a body without aggregations
+     *     body and is rejected as {@code empty body}
      * @param model the index's planner model from
      *     {@link LanceSchemas#build} (or a test fixture)
      * @param factory supplies the {@link RelBuilder} the plan is built
@@ -73,14 +73,17 @@ public final class SearchRequestToRel {
      * body always names the same element.
      */
     private static ValuesSourceAggregationBuilder<?> validate(SearchSourceBuilder source) {
-        QueryBuilder query = source == null ? null : source.query();
+        if (source == null) {
+            throw unsupported("empty body");
+        }
+        QueryBuilder query = source.query();
         if (query != null && !(query instanceof MatchAllQueryBuilder)) {
             throw unsupported("query type [" + query.getName() + "]");
         }
-        if (source != null && source.from() > 0) {
+        if (source.from() > 0) {
             throw unsupported("from [" + source.from() + "]");
         }
-        int size = source == null || source.size() < 0 ? 10 : source.size();
+        int size = source.size() < 0 ? 10 : source.size();
         if (size != 0) {
             throw unsupported("size [" + size + "] (only 0)");
         }

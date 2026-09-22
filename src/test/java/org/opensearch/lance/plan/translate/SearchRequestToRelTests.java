@@ -171,9 +171,9 @@ public class SearchRequestToRelTests extends OpenSearchTestCase {
     }
 
     public void testEmptyBodyThrows() {
-        // No body parses to no source; the default size names the first
-        // unsupported element.
-        assertEquals("size [10] (only 0)", messageOf(null));
+        // No body parses to no source; the explicit check names it
+        // before any element check runs.
+        assertEquals("empty body", messageOf(null));
     }
 
     public void testTwoTopLevelAggregationsThrow() {
