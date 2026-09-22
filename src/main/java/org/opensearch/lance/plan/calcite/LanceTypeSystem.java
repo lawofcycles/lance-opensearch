@@ -29,7 +29,7 @@ import org.apache.calcite.sql.type.SqlTypeName;
  * A fixed size list of single precision floats is the Arrow shape of a
  * Lance vector column and maps to an array of {@code REAL}; the fixed
  * length is not represented in the Calcite type yet and is left to the
- * planner phases that cost vector scans. A nullable Arrow struct maps to a
+ * planner passes that cost vector scans. A nullable Arrow struct maps to a
  * nullable {@code ROW} whose fields all become nullable, because Calcite's
  * type factory propagates a record's nullability into its fields.
  */
