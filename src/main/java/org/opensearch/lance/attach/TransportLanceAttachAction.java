@@ -199,7 +199,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         RestAttachAction.Derivation derivation;
         long[] fragmentDocs;
         try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions(), openVersion)) {
-            derivation = RestAttachAction.derive(dataset, request.multiFields());
+            derivation = RestAttachAction.derive(dataset, request.overrides());
             List<Fragment> fragments = dataset.getFragments();
             fragmentDocs = new long[fragments.size()];
             for (int i = 0; i < fragmentDocs.length; i++) {
@@ -389,8 +389,8 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             .put(LanceEngineFactory.TABLE_SETTING, table)
             .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField())
             .put(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, derivation.keyFieldType());
-        if (!derivation.multiFieldsJson().isEmpty()) {
-            settings.put(LanceEngineFactory.MULTI_FIELDS_SETTING, derivation.multiFieldsJson());
+        if (!derivation.overridesJson().isEmpty()) {
+            settings.put(LanceEngineFactory.OVERRIDES_SETTING, derivation.overridesJson());
         }
         pinnedVersion.ifPresent(v -> settings.put(LanceEngineFactory.VERSION_SETTING, v));
         tag.ifPresent(t -> settings.put(LanceEngineFactory.TAG_SETTING, t));

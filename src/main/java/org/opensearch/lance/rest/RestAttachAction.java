@@ -5,7 +5,6 @@
 
 package org.opensearch.lance.rest;
 
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -18,6 +17,7 @@ import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
 import org.opensearch.lance.attach.LanceAttachRequest;
@@ -77,7 +77,7 @@ public class RestAttachAction extends BaseRestHandler {
         Long pinnedVersion;
         String tag;
         StorageOptions storageOptions;
-        Map<String, LinkedHashMap<String, String>> multiFields;
+        LanceOverrides overrides;
         try {
             table = readOptionalString(body, "table");
             if (table == null || table.isEmpty()) {
@@ -116,41 +116,16 @@ public class RestAttachAction extends BaseRestHandler {
                 );
             }
             storageOptions = StorageOptions.parseFromRequestField(body.get("storage_options"), "[lance_attach]");
-            multiFields = parseMultiFields(body.get("multi_fields"));
-            Map<String, LinkedHashMap<String, String>> overrides = parseOverrides(body.get("overrides"));
-            if (!overrides.isEmpty()) {
-                if (!multiFields.isEmpty()) {
-                    // Same conceptual data (sub-field spec) coming in twice
-                    // through both shapes is ambiguous: which one wins?
-                    // Reject rather than pick a rule the operator did not
-                    // know about. `overrides` is the forward-looking shape;
-                    // the old `multi_fields` clause is kept for BC only.
-                    for (String col : overrides.keySet()) {
-                        if (multiFields.containsKey(col)) {
-                            throw new IllegalArgumentException(
-                                "attach body carries both [multi_fields] and [overrides] entries for column ["
-                                    + col
-                                    + "]; use [overrides] and drop the duplicate [multi_fields] entry"
-                            );
-                        }
-                    }
-                    // No column conflict; merge into one map. `overrides`
-                    // wins on any later augmentation because it is the
-                    // canonical shape.
-                    LinkedHashMap<String, LinkedHashMap<String, String>> merged = new LinkedHashMap<>();
-                    merged.putAll(multiFields);
-                    merged.putAll(overrides);
-                    multiFields = merged;
-                } else {
-                    multiFields = overrides;
-                }
-            }
+            // `overrides` is the forward-looking clause; the legacy
+            // `multi_fields` clause folds into `overrides.[col].fields`
+            // at parse time so everything downstream sees one shape.
+            overrides = LanceOverrides.parseAttachClauses(body.get("overrides"), body.get("multi_fields"));
         } catch (IllegalArgumentException e) {
             String message = e.getMessage();
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
         }
 
-        LanceAttachRequest attach = new LanceAttachRequest(table, explicitName, pinnedVersion, tag, storageOptions, multiFields);
+        LanceAttachRequest attach = new LanceAttachRequest(table, explicitName, pinnedVersion, tag, storageOptions, overrides);
         return channel -> client.execute(LanceAttachAction.INSTANCE, attach, new RestToXContentListener<>(channel));
     }
 
@@ -176,30 +151,49 @@ public class RestAttachAction extends BaseRestHandler {
         return ((Number) v).longValue();
     }
 
-    public record Derivation(String mappingJson, String keyField, String keyFieldType, String multiFieldsJson, long version, long rows,
+    public record Derivation(String mappingJson, String keyField, String keyFieldType, String overridesJson, long version, long rows,
         int fragments, List<String> notes, java.util.Set<String> ftsColumns, java.util.Set<String> scalarColumns, java.util.Set<
             String> vectorColumns, java.util.Set<String> nestedColumns) {
     }
 
     public static Derivation derive(Dataset dataset) throws Exception {
-        return derive(dataset, java.util.Collections.emptyMap());
+        return derive(dataset, LanceOverrides.EMPTY, false);
+    }
+
+    /** Strict derivation: any override the schema cannot honour is an {@link IllegalArgumentException} (a 400 at attach). */
+    public static Derivation derive(Dataset dataset, LanceOverrides overrides) throws Exception {
+        return derive(dataset, overrides, false);
     }
 
     /**
-     * Extended derive that honours the {@code multi_fields} clause on the
-     * attach body. {@code multiFields} keys are base column names in the
-     * Lance schema; each value is an ordered map of sub-field-name to
-     * sub-field type (only {@code "keyword"} is accepted today; see design
-     * note 36). The base column must resolve to a Utf8 mapping (either
-     * {@code lance_text} or {@code keyword}); anything else is rejected
-     * with {@link IllegalArgumentException} so a mistyped body surfaces as
-     * a 400 rather than a silently unusable index. The mapping JSON gets a
-     * {@code fields} block per base column, and the derivation carries a
-     * JSON stringified form of the multi-fields spec so the engine can
-     * rehydrate it on shard open.
+     * Extended derive that honours the per-column mapping overrides of the
+     * attach or namespace-register body (see {@link LanceOverrides}).
+     * {@code type: date} on a signed 32 or 64 bit integer column emits a
+     * {@code date} mapping (the stored value is read as epoch millis) with
+     * the declared {@code format} (default {@code epoch_millis}) while the
+     * field meta keeps the real Arrow type; on a Date / Timestamp column
+     * it pins the type the derivation picks anyway, so an override list
+     * can be applied uniformly to several tables. {@code type: keyword} on
+     * a Utf8 column maps it to {@code keyword} even when the column
+     * carries a Lance inverted index, which also keeps it out of
+     * {@code ftsColumns} so no FTS index is built or optimised for it; on
+     * a List&lt;Utf8&gt; column it pins the derived type. Sub-field
+     * declarations ({@code fields}) behave as the {@code multi_fields}
+     * clause always has.
+     *
+     * <p>Schema-dependent validation happens here, where the dataset is
+     * open. With {@code lenient} false every violation (unknown column,
+     * primary key column, Arrow type outside the accepted set) is an
+     * {@link IllegalArgumentException} the REST layer turns into a 400.
+     * With {@code lenient} true, used by the namespace surface and the
+     * poll re-derivation where one override list applies to many tables
+     * and a table may lack or have changed a column, the offending
+     * override is skipped with a note and the rest apply; the caller
+     * keeps the full override list in the index setting so the column
+     * picks the override back up if a later manifest restores it.
      */
-    public static Derivation derive(Dataset dataset, java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields)
-        throws Exception {
+    public static Derivation derive(Dataset dataset, LanceOverrides overrides, boolean lenient) throws Exception {
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields = overrides.subFields();
         long rows = dataset.countRows();
         int fragments = dataset.getFragments().size();
 
@@ -219,6 +213,10 @@ public class RestAttachAction extends BaseRestHandler {
         XContentBuilder mapping = XContentFactory.jsonBuilder();
         mapping.startObject().startObject("properties");
         LanceSchema lanceSchema = dataset.getLanceSchema();
+        LanceOverrides effective = validateOverrides(overrides, lanceSchema, lenient, notes);
+        multiFields = effective.subFields();
+        java.util.Map<String, String> dateOverrides = effective.dateColumns();
+        java.util.Set<String> keywordOverrides = effective.keywordColumns();
         for (LanceField field : lanceSchema.fields()) {
             ArrowType type = field.getType();
             String name = field.getName();
@@ -344,6 +342,21 @@ public class RestAttachAction extends BaseRestHandler {
                         notes.add("column " + name + ": unsupported int width " + bitWidth);
                         continue;
                 }
+                if (dateOverrides.containsKey(name)) {
+                    // Epoch millis stored as a signed integer column. The
+                    // reader already serves the raw value through numeric
+                    // doc values; the `date` field type interprets it as
+                    // millis, so range / sort / date_histogram parse and
+                    // format through the declared date format. The meta
+                    // keeps the real Arrow type for column identity
+                    // across manifest versions.
+                    String format = dateOverrides.get(name);
+                    startFieldWithId(mapping, name, fieldId, "date", arrowTypeIdentity(intType));
+                    mapping.field("format", format == null ? LanceOverrides.DEFAULT_DATE_FORMAT : format);
+                    mapping.field("index", false).field("doc_values", true).endObject();
+                    scalarColumns.add(name);
+                    continue;
+                }
                 startFieldWithId(mapping, name, fieldId, osType, arrowTypeIdentity(intType));
                 mapping.field("index", false).field("doc_values", true).endObject();
                 scalarColumns.add(name);
@@ -382,18 +395,29 @@ public class RestAttachAction extends BaseRestHandler {
             } else if (type instanceof ArrowType.Date || type instanceof ArrowType.Timestamp) {
                 // Date32/Date64 and every Timestamp unit are normalized to epoch millis
                 // by the reader, so the default epoch_millis-friendly format applies.
+                // A `type: date` override on such a column pins the type the
+                // derivation picks anyway; a declared `format` is emitted.
                 startFieldWithId(mapping, name, fieldId, "date", arrowTypeIdentity(type));
+                if (dateOverrides.containsKey(name) && dateOverrides.get(name) != null) {
+                    mapping.field("format", dateOverrides.get(name));
+                }
                 mapping.field("index", false).field("doc_values", true).endObject();
                 scalarColumns.add(name);
             } else if (type instanceof ArrowType.Utf8) {
                 boolean hasFts = !dataset.describeIndices(new IndexCriteria.Builder().forColumn(name).mustSupportFts(true).build())
                     .isEmpty();
-                if (hasFts) {
+                if (hasFts && !keywordOverrides.contains(name)) {
                     startFieldWithId(mapping, name, fieldId, "lance_text", arrowTypeIdentity(type));
                     writeMultiFieldsBlock(mapping, name, multiFields);
                     mapping.endObject();
                     ftsColumns.add(name);
                 } else {
+                    // Either no FTS index, or the operator overrode the
+                    // column to keyword: map it onto the doc-values path
+                    // and leave it out of ftsColumns so the index build
+                    // paths do not create or optimise an FTS index for
+                    // it. The Lance inverted index the table may carry
+                    // stays untouched; this index just does not use it.
                     startFieldWithId(mapping, name, fieldId, "keyword", arrowTypeIdentity(type));
                     mapping.field("index", false).field("doc_values", true);
                     writeMultiFieldsBlock(mapping, name, multiFields);
@@ -511,50 +535,13 @@ public class RestAttachAction extends BaseRestHandler {
             notes.add("no primary key declared; _id GET returns 404, `_id` values are not unique");
         }
 
-        // Validate multi_fields against the actual schema: every declared
-        // base column must exist and must be Utf8, because keyword-flavoured
-        // sub-fields only make sense on a string column (they share the
-        // underlying data with the base field). Sub-field type must be
-        // "keyword" today.
-        // Also refuse a sub-field name that collides with an existing
-        // field id so the mapping stays unambiguous.
-        java.util.Set<String> allColumnNames = new java.util.HashSet<>();
-        for (LanceField field : lanceSchema.fields()) {
-            allColumnNames.add(field.getName());
-        }
-        for (java.util.Map.Entry<String, java.util.LinkedHashMap<String, String>> entry : multiFields.entrySet()) {
-            String baseName = entry.getKey();
-            if (!allColumnNames.contains(baseName)) {
-                throw new IllegalArgumentException("multi_fields references unknown column [" + baseName + "]");
-            }
-            if (!ftsColumns.contains(baseName) && !isKeywordScalar(lanceSchema, baseName)) {
-                throw new IllegalArgumentException(
-                    "multi_fields column [" + baseName + "] must be Utf8; other Arrow types cannot host a keyword sub-field"
-                );
-            }
-            for (java.util.Map.Entry<String, String> sub : entry.getValue().entrySet()) {
-                String subName = sub.getKey();
-                String subType = sub.getValue();
-                if (!"keyword".equals(subType)) {
-                    throw new IllegalArgumentException(
-                        "multi_fields sub-field [" + baseName + "." + subName + "] type must be [keyword], got [" + subType + "]"
-                    );
-                }
-                if (allColumnNames.contains(baseName + "." + subName)) {
-                    throw new IllegalArgumentException(
-                        "multi_fields sub-field [" + baseName + "." + subName + "] collides with an existing schema column"
-                    );
-                }
-            }
-        }
-
-        String multiFieldsJson = serialiseMultiFields(multiFields);
+        String overridesJson = overrides.toJson();
 
         return new Derivation(
             mapping.toString(),
             keyField,
             keyFieldType,
-            multiFieldsJson,
+            overridesJson,
             dataset.version(),
             rows,
             fragments,
@@ -567,18 +554,113 @@ public class RestAttachAction extends BaseRestHandler {
     }
 
     /**
-     * True when {@code baseName} exists in the schema as a Utf8 column
-     * without a Lance FTS index (i.e. derivation maps it to keyword).
-     * Utf8 with FTS is picked up separately via {@code ftsColumns.contains}
-     * on the caller side.
+     * Validate {@code overrides} against the actual schema and return the
+     * overrides derivation applies. Strict mode ({@code lenient} false)
+     * throws {@link IllegalArgumentException} on the first violation so
+     * attach answers 400 naming the column and the reason; lenient mode
+     * skips the offending column's override with a note and returns the
+     * rest, so one override list can apply to several tables that do not
+     * all carry every column.
+     *
+     * <p>Rules: the column must exist at the top level and must not be
+     * the declared primary key; {@code type: date} needs a signed 32 or
+     * 64 bit integer column (read as epoch millis) or a Date / Timestamp
+     * column (a pin of the derived type); {@code type: keyword} needs a
+     * Utf8 column (with or without an inverted index) or a List&lt;Utf8&gt;
+     * column (a pin); {@code fields} needs a Utf8 column, sub-field types
+     * must be {@code keyword}, and a sub-field path must not collide with
+     * an existing schema column.
      */
-    private static boolean isKeywordScalar(LanceSchema lanceSchema, String baseName) {
+    private static LanceOverrides validateOverrides(
+        LanceOverrides overrides,
+        LanceSchema lanceSchema,
+        boolean lenient,
+        List<String> notes
+    ) {
+        if (overrides.isEmpty()) {
+            return overrides;
+        }
+        java.util.Map<String, LanceField> fieldsByName = new java.util.LinkedHashMap<>();
         for (LanceField field : lanceSchema.fields()) {
-            if (baseName.equals(field.getName())) {
-                return field.getType() instanceof ArrowType.Utf8;
+            fieldsByName.put(field.getName(), field);
+        }
+        java.util.LinkedHashMap<String, LanceOverrides.Column> accepted = new java.util.LinkedHashMap<>();
+        for (java.util.Map.Entry<String, LanceOverrides.Column> entry : overrides.columns().entrySet()) {
+            String baseName = entry.getKey();
+            LanceOverrides.Column column = entry.getValue();
+            try {
+                LanceField field = fieldsByName.get(baseName);
+                if (field == null) {
+                    throw new IllegalArgumentException("[overrides] references unknown column [" + baseName + "]");
+                }
+                if (field.getMetadata() != null && field.getMetadata().containsKey(PK_METADATA_KEY)) {
+                    throw new IllegalArgumentException(
+                        "[overrides." + baseName + "] targets the primary key column; the primary key mapping cannot be overridden"
+                    );
+                }
+                ArrowType type = field.getType();
+                if (LanceOverrides.TYPE_DATE.equals(column.type())) {
+                    boolean signedInt = type instanceof ArrowType.Int intType
+                        && intType.getIsSigned()
+                        && (intType.getBitWidth() == 32 || intType.getBitWidth() == 64);
+                    boolean alreadyDate = type instanceof ArrowType.Date || type instanceof ArrowType.Timestamp;
+                    if (!signedInt && !alreadyDate) {
+                        throw new IllegalArgumentException(
+                            "[overrides."
+                                + baseName
+                                + ".type=date] needs a signed 32 or 64 bit integer column holding epoch millis, or a "
+                                + "Date / Timestamp column; ["
+                                + baseName
+                                + "] is "
+                                + type
+                                + " (unsigned integer columns are not surfaced by the reader)"
+                        );
+                    }
+                }
+                if (LanceOverrides.TYPE_KEYWORD.equals(column.type())) {
+                    boolean utf8 = type instanceof ArrowType.Utf8;
+                    boolean listOfUtf8 = type instanceof ArrowType.List
+                        && field.getChildren().size() == 1
+                        && field.getChildren().get(0).getType() instanceof ArrowType.Utf8;
+                    if (!utf8 && !listOfUtf8) {
+                        throw new IllegalArgumentException(
+                            "[overrides." + baseName + ".type=keyword] needs a Utf8 or List<Utf8> column; [" + baseName + "] is " + type
+                        );
+                    }
+                }
+                if (!column.subFields().isEmpty()) {
+                    if (!(type instanceof ArrowType.Utf8)) {
+                        throw new IllegalArgumentException(
+                            "[overrides."
+                                + baseName
+                                + ".fields] column must be Utf8; other Arrow types cannot host a keyword sub-field, ["
+                                + baseName
+                                + "] is "
+                                + type
+                        );
+                    }
+                    for (java.util.Map.Entry<String, String> sub : column.subFields().entrySet()) {
+                        if (!"keyword".equals(sub.getValue())) {
+                            throw new IllegalArgumentException(
+                                "sub-field [" + baseName + "." + sub.getKey() + "] type must be [keyword], got [" + sub.getValue() + "]"
+                            );
+                        }
+                        if (fieldsByName.containsKey(baseName + "." + sub.getKey())) {
+                            throw new IllegalArgumentException(
+                                "sub-field [" + baseName + "." + sub.getKey() + "] collides with an existing schema column"
+                            );
+                        }
+                    }
+                }
+                accepted.put(baseName, column);
+            } catch (IllegalArgumentException e) {
+                if (!lenient) {
+                    throw e;
+                }
+                notes.add(baseName + ": override skipped (" + e.getMessage() + ")");
             }
         }
-        return false;
+        return LanceOverrides.fromColumns(accepted);
     }
 
     /**
@@ -597,91 +679,6 @@ public class RestAttachAction extends BaseRestHandler {
      */
     public static java.util.Map<String, java.util.LinkedHashMap<String, String>> parseMultiFields(Object raw) {
         return parseSubFieldsBody(raw, "multi_fields");
-    }
-
-    /**
-     * Parse the {@code overrides} block on the attach body. This is the
-     * forward-looking receiver for per-column mapping overrides (RFC
-     * Mapping interface: "optional override rules where the defaults
-     * resolve a column differently than intended"). Today it accepts
-     * only sub-field declarations, so structurally it is a superset of
-     * {@link #parseMultiFields}: {@code overrides.[col].fields.[sub].type}
-     * takes exactly the same shape as
-     * {@code multi_fields.[col].[sub].type}.
-     *
-     * <p>The clause is versioned by shape rather than by a flag:
-     * {@code type} on the base column (for {@code ip}, {@code wildcard},
-     * an analyzer mode, or a preferred index type) is not accepted yet
-     * and returns 400. That reservation lets those features land
-     * without another wire-format change.
-     *
-     * <p>Returns the same normalised shape as
-     * {@link #parseMultiFields} so callers can persist it through the
-     * existing {@code index.lance.multi_fields} setting and re-derive
-     * from it on version advance.
-     */
-    public static java.util.Map<String, java.util.LinkedHashMap<String, String>> parseOverrides(Object raw) {
-        if (raw == null) {
-            return java.util.Collections.emptyMap();
-        }
-        if (!(raw instanceof java.util.Map<?, ?> rawMap)) {
-            throw new IllegalArgumentException("[overrides] must be an object; per-column override rules");
-        }
-        java.util.LinkedHashMap<String, java.util.LinkedHashMap<String, String>> out = new java.util.LinkedHashMap<>();
-        for (java.util.Map.Entry<?, ?> entry : rawMap.entrySet()) {
-            if (!(entry.getKey() instanceof String baseName) || baseName.isEmpty()) {
-                throw new IllegalArgumentException("[overrides] keys must be non-empty column names");
-            }
-            if (!(entry.getValue() instanceof java.util.Map<?, ?> spec)) {
-                throw new IllegalArgumentException("[overrides." + baseName + "] must be an object");
-            }
-            if (spec.containsKey("type")) {
-                // Base-column type override (ip / wildcard / analyzer /
-                // scalar / vector index type) is reserved but not
-                // implemented yet. Explicitly refuse rather than
-                // silently ignore so an operator experimenting today
-                // knows the override had no effect.
-                Object t = spec.get("type");
-                throw new IllegalArgumentException(
-                    "[overrides."
-                        + baseName
-                        + ".type="
-                        + t
-                        + "] is not supported yet; only [overrides."
-                        + baseName
-                        + ".fields] is accepted today"
-                );
-            }
-            Object rawFields = spec.get("fields");
-            if (rawFields == null) {
-                // Empty override entry is not useful; refuse so a stray
-                // `"body": {}` does not silently accomplish nothing.
-                throw new IllegalArgumentException("[overrides." + baseName + "] must declare at least [fields]");
-            }
-            if (!(rawFields instanceof java.util.Map<?, ?> fieldsMap)) {
-                throw new IllegalArgumentException("[overrides." + baseName + ".fields] must be an object");
-            }
-            java.util.LinkedHashMap<String, String> subs = new java.util.LinkedHashMap<>();
-            for (java.util.Map.Entry<?, ?> subEntry : fieldsMap.entrySet()) {
-                if (!(subEntry.getKey() instanceof String subName) || subName.isEmpty()) {
-                    throw new IllegalArgumentException("[overrides." + baseName + ".fields] sub-field names must be non-empty strings");
-                }
-                if (!(subEntry.getValue() instanceof java.util.Map<?, ?> subDefMap)) {
-                    throw new IllegalArgumentException("[overrides." + baseName + ".fields." + subName + "] must be an object");
-                }
-                Object typeValue = subDefMap.get("type");
-                if (!(typeValue instanceof String typeStr) || typeStr.isEmpty()) {
-                    throw new IllegalArgumentException(
-                        "[overrides." + baseName + ".fields." + subName + ".type] is required and must be a string"
-                    );
-                }
-                subs.put(subName, typeStr);
-            }
-            if (!subs.isEmpty()) {
-                out.put(baseName, subs);
-            }
-        }
-        return out;
     }
 
     /**

@@ -6,15 +6,13 @@
 package org.opensearch.lance.attach;
 
 import java.io.IOException;
-import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.Map;
 import java.util.Optional;
 
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.StorageOptions;
 
 /**
@@ -33,7 +31,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
     private final Long pinnedVersion;
     private final String tag;
     private final StorageOptions storageOptions;
-    private final Map<String, LinkedHashMap<String, String>> multiFields;
+    private final LanceOverrides overrides;
 
     /**
      * @param table          Lance table URI to attach.
@@ -44,9 +42,9 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
      * @param tag            Lance tag to follow, or {@code null}. Not
      *                       accepted together with {@code pinnedVersion}.
      * @param storageOptions object-store options for the table.
-     * @param multiFields    base column to (sub-field name to sub-field
-     *                       type), already merged from the {@code multi_fields}
-     *                       and {@code overrides} clauses.
+     * @param overrides      per-column mapping overrides, already merged
+     *                       from the {@code overrides} and legacy
+     *                       {@code multi_fields} clauses.
      */
     public LanceAttachRequest(
         String table,
@@ -54,14 +52,14 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         Long pinnedVersion,
         String tag,
         StorageOptions storageOptions,
-        Map<String, LinkedHashMap<String, String>> multiFields
+        LanceOverrides overrides
     ) {
         this.table = table;
         this.indexName = indexName;
         this.pinnedVersion = pinnedVersion;
         this.tag = tag;
         this.storageOptions = storageOptions == null ? StorageOptions.empty() : storageOptions;
-        this.multiFields = multiFields == null ? Collections.emptyMap() : copyMultiFields(multiFields);
+        this.overrides = overrides == null ? LanceOverrides.EMPTY : overrides;
     }
 
     public LanceAttachRequest(StreamInput in) throws IOException {
@@ -71,18 +69,11 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         this.pinnedVersion = in.readOptionalLong();
         this.tag = in.readOptionalString();
         this.storageOptions = StorageOptions.readFromStream(in);
-        int columns = in.readVInt();
-        LinkedHashMap<String, LinkedHashMap<String, String>> read = new LinkedHashMap<>();
-        for (int i = 0; i < columns; i++) {
-            String column = in.readString();
-            int subFields = in.readVInt();
-            LinkedHashMap<String, String> subs = new LinkedHashMap<>();
-            for (int j = 0; j < subFields; j++) {
-                subs.put(in.readString(), in.readString());
-            }
-            read.put(column, subs);
-        }
-        this.multiFields = Collections.unmodifiableMap(read);
+        // The overrides travel as their canonical JSON: one string
+        // instead of a hand-rolled nested map encoding, and the same
+        // bytes that end up in the index setting. Declaration order
+        // survives because the JSON object preserves it.
+        this.overrides = LanceOverrides.parse(in.readString());
     }
 
     @Override
@@ -93,26 +84,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         out.writeOptionalLong(pinnedVersion);
         out.writeOptionalString(tag);
         storageOptions.writeTo(out);
-        // Written by hand rather than through writeMap so the sub-field
-        // order the operator declared survives the wire; the mapping
-        // emits fields in that order.
-        out.writeVInt(multiFields.size());
-        for (Map.Entry<String, LinkedHashMap<String, String>> entry : multiFields.entrySet()) {
-            out.writeString(entry.getKey());
-            out.writeVInt(entry.getValue().size());
-            for (Map.Entry<String, String> sub : entry.getValue().entrySet()) {
-                out.writeString(sub.getKey());
-                out.writeString(sub.getValue());
-            }
-        }
-    }
-
-    private static Map<String, LinkedHashMap<String, String>> copyMultiFields(Map<String, LinkedHashMap<String, String>> source) {
-        LinkedHashMap<String, LinkedHashMap<String, String>> copy = new LinkedHashMap<>();
-        for (Map.Entry<String, LinkedHashMap<String, String>> entry : source.entrySet()) {
-            copy.put(entry.getKey(), new LinkedHashMap<>(entry.getValue()));
-        }
-        return Collections.unmodifiableMap(copy);
+        out.writeString(overrides.toJson());
     }
 
     @Override
@@ -167,7 +139,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         return storageOptions;
     }
 
-    public Map<String, LinkedHashMap<String, String>> multiFields() {
-        return multiFields;
+    public LanceOverrides overrides() {
+        return overrides;
     }
 }
