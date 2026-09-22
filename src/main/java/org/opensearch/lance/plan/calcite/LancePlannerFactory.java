@@ -11,16 +11,19 @@ import org.apache.calcite.jdbc.CalciteSchema;
 import org.apache.calcite.plan.Contexts;
 import org.apache.calcite.plan.ConventionTraitDef;
 import org.apache.calcite.plan.RelOptCluster;
+import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgramBuilder;
 import org.apache.calcite.plan.volcano.VolcanoPlanner;
 import org.apache.calcite.prepare.CalciteCatalogReader;
+import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.RelFactories;
 import org.apache.calcite.rel.metadata.DefaultRelMetadataProvider;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.apache.calcite.tools.RelBuilder;
 import org.opensearch.lance.plan.rel.LanceTableScan;
+import org.opensearch.lance.plan.rules.PushAggregateIntoLanceScan;
 
 /**
  * Assembles the Calcite planner objects for Lance backed indexes: a Volcano
@@ -49,20 +52,42 @@ public final class LancePlannerFactory {
 
     /**
      * A fresh cluster over a Volcano planner costed by
-     * {@link LanceCostFactory}. The type factory uses
-     * {@link LanceTypeSystem#INSTANCE} so timestamp precision above 3 and
-     * {@code DECIMAL(20, 0)} survive. Registering the convention trait def
-     * is what makes conventions available to the planner; the individual
-     * conventions need no explicit registration. The metadata provider is
-     * Calcite's default for now; wiring Lance statistics into it is later
-     * work.
+     * {@link LanceCostFactory}, with the pushdown rules registered. The
+     * type factory uses {@link LanceTypeSystem#INSTANCE} so timestamp
+     * precision above 3 and {@code DECIMAL(20, 0)} survive. Registering
+     * the convention trait def is what makes conventions available to
+     * the planner; the individual conventions need no explicit
+     * registration. The metadata provider is Calcite's default for now;
+     * wiring Lance statistics into it is later work.
      */
     public RelOptCluster newCluster() {
         VolcanoPlanner planner = new VolcanoPlanner(costFactory, Contexts.empty());
         planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+        for (PushAggregateIntoLanceScan rule : PushAggregateIntoLanceScan.rules()) {
+            planner.addRule(rule);
+        }
         RelOptCluster cluster = RelOptCluster.create(planner, new RexBuilder(new SqlTypeFactoryImpl(LanceTypeSystem.INSTANCE)));
         cluster.setMetadataProvider(DefaultRelMetadataProvider.INSTANCE);
         return cluster;
+    }
+
+    /**
+     * Runs the Volcano planner over {@code logical} demanding
+     * {@link LanceConvention} at the root and returns the best physical
+     * plan. When no physical form exists (the Substrait producer
+     * refused every candidate, so no rule fired), the logical plan
+     * itself is returned: the caller reads the root's type to see
+     * whether anything was pushed.
+     */
+    public RelNode plan(RelNode logical) {
+        VolcanoPlanner planner = (VolcanoPlanner) logical.getCluster().getPlanner();
+        RelNode root = planner.changeTraits(logical, logical.getTraitSet().replace(LanceConvention.INSTANCE));
+        planner.setRoot(root);
+        try {
+            return planner.findBestExp();
+        } catch (RelOptPlanner.CannotPlanException nothingPushed) {
+            return logical;
+        }
     }
 
     /** A fresh Hep planner over an empty program; no rules exist to run yet. */

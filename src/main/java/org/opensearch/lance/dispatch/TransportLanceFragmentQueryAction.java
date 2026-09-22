@@ -58,6 +58,7 @@ import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
+import org.apache.calcite.rel.RelNode;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ipc.ColumnOrdering;
@@ -93,6 +94,8 @@ import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.NativeMemoryLimit;
+import org.opensearch.lance.execute.LanceAggregateResults;
 import org.opensearch.lance.engine.ColumnStore;
 import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.lance.engine.FragmentGroupScan;
@@ -101,6 +104,11 @@ import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.lance.engine.LanceWarmCache;
+import org.opensearch.lance.plan.calcite.LancePlannerFactory;
+import org.opensearch.lance.plan.calcite.LanceSchemas;
+import org.opensearch.lance.plan.rel.LanceTableScan;
+import org.opensearch.lance.plan.rel.PushedOperation.PushedAggregate;
+import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.query.FtsAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceFtsQueryBuilder;
@@ -270,6 +278,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * table view from; created by {@code LancePlugin.createComponents}.
      */
     private final LanceWarmCache warmCache;
+    /**
+     * Builds the Volcano planner an aggregation request is routed
+     * through: when the pushdown rule fires, the physical plan is the
+     * scan carrying the Substrait bytes and the request skips the
+     * Lucene aggregators. The budgets mirror the explain action's.
+     */
+    private final LancePlannerFactory plannerFactory;
 
     @Inject
     public TransportLanceFragmentQueryAction(
@@ -292,6 +307,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         int permits = LancePlugin.FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING.get(clusterService.getSettings());
         this.concurrencyLimit = new java.util.concurrent.Semaphore(permits, /*fair*/ false);
         this.searchExecutor = transportService.getThreadPool().executor(ThreadPool.Names.SEARCH);
+        long nativeBudgetBytes = NativeMemoryLimit.parse(
+            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.get(clusterService.getSettings()),
+            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.getKey()
+        );
+        this.plannerFactory = new LancePlannerFactory(nativeBudgetBytes, Runtime.getRuntime().maxMemory());
     }
 
     @Override
@@ -825,7 +845,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 }
                 InternalAggregations aggregations;
                 MatchedCount matched;
-                LanceAggregatePushdown.Plan pushdown = resolveAggregatePushdown(request, hasSecurityWrapper, dataset, multiFields, qsc);
+                LanceAggregateResults pushdown = resolveAggregatePushdown(
+                    request,
+                    hasSecurityWrapper,
+                    dataset,
+                    multiFields,
+                    qsc,
+                    searcher.getIndexReader()
+                );
                 if (pushdown != null) {
                     // The scan groups and aggregates on the Lance side and
                     // also yields the row total, so neither the Lucene
@@ -834,7 +861,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     // pushdown_parallelism groups; the extra scans run on
                     // the SEARCH pool this request already executes on.
                     long pushdownStart = System.nanoTime();
-                    LanceAggregatePushdown.Result result = pushdown.execute(
+                    LanceAggregateResults.Result result = pushdown.execute(
                         dataset,
                         effectiveFragmentIds,
                         request.filterSql(),
@@ -940,24 +967,28 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
 
     /**
      * Decide whether this request's aggregations run as a Substrait
-     * group by inside the Lance scan ({@link LanceAggregatePushdown})
-     * and, when they do, encode the plan. The request qualifies when
+     * group by inside the Lance scan and, when they do, prepare the
+     * executor. The request qualifies when
      * {@code lance.aggregation.pushdown} is on, it asks for no hits
      * ({@code size} 0) and has no {@code post_filter}, its query is
      * {@code match_all} or a scalar filter the coordinator translated to
      * Lance SQL ({@link LanceFragmentQueryRequest#filterSql()}; FTS and
      * knn queries have no SQL form and stay on the aggregator path), no
      * reader wrapper is installed (DLS / FLS filter documents in the
-     * Lucene reader, which the scan never sees), and the aggregation tree
-     * and its fields pass {@link LanceAggregatePushdown#plan}. Returns
-     * {@code null} otherwise.
+     * Lucene reader, which the scan never sees), and the planner pushed
+     * the aggregation tree into the scan: the translator accepts the
+     * tree, the Volcano planner's pushdown rule obtains the Substrait
+     * bytes from the producer, and {@link LanceAggregateResults#resolve}
+     * pairs the request's builders with the pushed aggregate. Returns
+     * {@code null} otherwise, in which case the Lucene aggregators run.
      */
-    private LanceAggregatePushdown.Plan resolveAggregatePushdown(
+    private LanceAggregateResults resolveAggregatePushdown(
         LanceFragmentQueryRequest request,
         boolean hasSecurityWrapper,
         Dataset dataset,
         Map<String, LinkedHashMap<String, String>> multiFields,
-        QueryShardContext qsc
+        QueryShardContext qsc,
+        IndexReader reader
     ) {
         if (!clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_SETTING)) {
             return null;
@@ -969,7 +1000,34 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (!scalarQuery) {
             return null;
         }
-        return LanceAggregatePushdown.plan(request.aggregations(), dataset.getSchema(), multiFields, qsc);
+        if (!LanceAggregationSupport.isPushdownCandidate(request.aggregations())) {
+            return null;
+        }
+        RelNode logical;
+        try {
+            LanceSchemas.IndexModel model = LanceSchemas.model(request.indexName(), dataset.getSchema(), multiFields, reader::numDocs);
+            logical = SearchRequestToRel.translateAggregations(request.aggregations(), model, plannerFactory);
+        } catch (UnsupportedOperationException unsupported) {
+            return null;
+        }
+        RelNode physical = plannerFactory.plan(logical);
+        if (!(physical instanceof LanceTableScan scan)) {
+            return null;
+        }
+        PushedAggregate pushed = scan.pushedAggregate().orElse(null);
+        if (pushed == null) {
+            return null;
+        }
+        int maxGroups = LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
+        return LanceAggregateResults.resolve(
+            pushed.aggregate(),
+            pushed.substrait(),
+            request.aggregations(),
+            dataset.getSchema(),
+            multiFields,
+            qsc,
+            maxGroups
+        );
     }
 
     /**

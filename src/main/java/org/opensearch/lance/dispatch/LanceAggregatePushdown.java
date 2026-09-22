@@ -60,6 +60,7 @@ import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
+import org.opensearch.lance.execute.CoreAggregationResults;
 import org.opensearch.lance.dispatch.planner.AggregationRewriteContext;
 import org.opensearch.lance.dispatch.planner.AggregationRewriteRegistry;
 import org.opensearch.lance.dispatch.planner.PushdownPlan;

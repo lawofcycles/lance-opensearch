@@ -48,16 +48,26 @@ public class LanceExplainIT extends LanceRestTestCase {
             assertTrue("logical plan carries the aggregate: " + logical, logical.contains("LanceAggregate"));
             assertTrue("logical plan carries the scan: " + logical, logical.contains("LanceTableScan"));
             assertTrue("the aggregation name is the output alias: " + logical, logical.contains("s=[SUM("));
+            String physical = stringPath(body, "physical");
+            assertTrue("physical root is the scan with the pushed aggregate: " + physical, physical.startsWith("LanceTableScan("));
+            assertTrue("physical plan names the pushed aggregate: " + physical, physical.contains("pushed=[[aggregate{"));
 
             Response bucket = explain(
                 indexName,
                 "{\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\"},\"aggs\":{\"a\":{\"avg\":{\"field\":\"id\"}}}}}}"
             );
             assertEquals(RestStatus.OK.getStatus(), bucket.getStatusLine().getStatusCode());
-            String bucketLogical = stringPath(readAll(bucket), "logical");
+            String bucketBody = readAll(bucket);
+            String bucketLogical = stringPath(bucketBody, "logical");
             assertTrue("bucket plan carries the aggregate: " + bucketLogical, bucketLogical.contains("LanceAggregate"));
             assertTrue("bucket plan carries the bucket spec: " + bucketLogical, bucketLogical.contains("TERMS{name=by_id"));
             assertTrue("bucket plan carries the metric spec: " + bucketLogical, bucketLogical.contains("AVG{name=a}"));
+            String bucketPhysical = stringPath(bucketBody, "physical");
+            assertTrue(
+                "bucket physical root is the scan with the pushed aggregate: " + bucketPhysical,
+                bucketPhysical.startsWith("LanceTableScan(") && bucketPhysical.contains("pushed=[[aggregate{")
+            );
+            assertTrue("the pushed shape names the bucket: " + bucketPhysical, bucketPhysical.contains("TERMS{name=by_id"));
 
             ResponseException terms = expectThrows(
                 ResponseException.class,

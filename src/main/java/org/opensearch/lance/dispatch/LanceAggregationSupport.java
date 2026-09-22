@@ -100,7 +100,7 @@ import org.opensearch.search.builder.SearchSourceBuilder;
  * {@code percentiles}) instead of from every document; see
  * {@link LanceAggregatePushdown} for the error that adds.
  */
-final class LanceAggregationSupport {
+public final class LanceAggregationSupport {
 
     private LanceAggregationSupport() {}
 
@@ -299,7 +299,7 @@ final class LanceAggregationSupport {
      *       children are all metrics.</li>
      * </ul>
      */
-    static boolean isPushdownCandidate(AggregatorFactories.Builder aggregations) {
+    public static boolean isPushdownCandidate(AggregatorFactories.Builder aggregations) {
         if (aggregations == null || aggregations.getAggregatorFactories().isEmpty()) {
             return false;
         }
@@ -349,7 +349,7 @@ final class LanceAggregationSupport {
      * and whose children are all metrics. {@code size} and {@code after}
      * are applied by the executor to the sorted group rows.
      */
-    static boolean isPushdownComposite(CompositeAggregationBuilder composite) {
+    public static boolean isPushdownComposite(CompositeAggregationBuilder composite) {
         if (composite.sources().isEmpty() || !composite.getPipelineAggregations().isEmpty()) {
             return false;
         }
@@ -373,7 +373,7 @@ final class LanceAggregationSupport {
      * {@code terms} in either order, or {@code date_histogram} with a
      * fixed length interval, {@code offset} 0 and no time zone.
      */
-    static boolean isPushdownCompositeSource(CompositeValuesSourceBuilder<?> source) {
+    public static boolean isPushdownCompositeSource(CompositeValuesSourceBuilder<?> source) {
         if (source.field() == null
             || source.field().isEmpty()
             || source.script() != null
@@ -417,7 +417,7 @@ final class LanceAggregationSupport {
      * percentile_ranks ({@code hdr} keeps its own histogram and stays on
      * the aggregators).
      */
-    static boolean isPushdownMetric(AggregationBuilder builder) {
+    public static boolean isPushdownMetric(AggregationBuilder builder) {
         boolean metric = builder instanceof SumAggregationBuilder
             || builder instanceof AvgAggregationBuilder
             || builder instanceof MinAggregationBuilder
@@ -514,7 +514,7 @@ final class LanceAggregationSupport {
     }
 
     /** A terms order on one sub aggregation: its path and direction. */
-    record AggregationOrder(String path, boolean ascending) {
+    public record AggregationOrder(String path, boolean ascending) {
     }
 
     /**
@@ -529,7 +529,7 @@ final class LanceAggregationSupport {
      * element count, an aggregation order is 0 followed by the
      * direction and the path, {@code _key} ascending is 4).
      */
-    static AggregationOrder aggregationOrder(BucketOrder order) {
+    public static AggregationOrder aggregationOrder(BucketOrder order) {
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             order.writeTo(out);
             try (StreamInput in = out.bytes().streamInput()) {
@@ -567,7 +567,7 @@ final class LanceAggregationSupport {
      * weeks start on Monday, quarters on January, April, July and
      * October.
      */
-    static String calendarUnit(DateHistogramAggregationBuilder dateHistogram) {
+    public static String calendarUnit(DateHistogramAggregationBuilder dateHistogram) {
         DateHistogramInterval interval = dateHistogram.getCalendarInterval();
         if (interval == null) {
             return null;

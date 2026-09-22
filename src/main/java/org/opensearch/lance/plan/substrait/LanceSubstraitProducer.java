@@ -553,13 +553,36 @@ public final class LanceSubstraitProducer {
     /**
      * {@code Math.floorDiv(a, b)} on {@code i64} values: the truncating
      * division lowered by one when the remainder is negative, the
-     * arithmetic the fragment leaf reader's date bucketing applies.
+     * arithmetic the fragment leaf reader's date bucketing applies. The
+     * operands are widened to {@code i64} first, because Calcite types
+     * an interval literal that fits 32 bits as {@code INTEGER} and the
+     * DataFusion build inside Lance runs no coercion pass over
+     * {@code i64 / i32}.
      */
     private static Expression floorDiv(Expression dividend, Expression divisor) {
-        Expression quotient = scalar("divide", TypeCreator.NULLABLE.I64, dividend, divisor);
-        Expression remainder = scalar("modulus", TypeCreator.NULLABLE.I64, dividend, divisor);
+        Expression a = asI64(dividend);
+        Expression b = asI64(divisor);
+        Expression quotient = scalar("divide", TypeCreator.NULLABLE.I64, a, b);
+        Expression remainder = scalar("modulus", TypeCreator.NULLABLE.I64, a, b);
         Expression negative = scalar("lt", TypeCreator.NULLABLE.BOOLEAN, remainder, i64(0L));
         return scalar("subtract", TypeCreator.NULLABLE.I64, quotient, cast(TypeCreator.NULLABLE.I64, negative));
+    }
+
+    /** The expression as an {@code i64}: an integer literal re-spelled, anything else cast unless already 64 bit. */
+    private static Expression asI64(Expression expression) {
+        if (expression instanceof Expression.I32Literal i32) {
+            return i64(i32.value());
+        }
+        if (expression instanceof Expression.I16Literal i16) {
+            return i64(i16.value());
+        }
+        if (expression instanceof Expression.I8Literal i8) {
+            return i64(i8.value());
+        }
+        if (expression.getType() instanceof Type.I64) {
+            return expression;
+        }
+        return cast(TypeCreator.NULLABLE.I64, expression);
     }
 
     private static boolean isDateOrTimestamp(RelDataType type) {
