@@ -1855,6 +1855,15 @@ public final class LanceAggregatePushdown {
             return composite != null ? composite.sources().size() : levels.size();
         }
 
+        /**
+         * The encoded main scan, as a read only view. Package private
+         * for the test sources' byte equivalence assertions between
+         * two plans of the same request.
+         */
+        ByteBuffer substraitPlan() {
+            return substrait.asReadOnlyBuffer();
+        }
+
         private long dateInterval(int key) {
             return composite != null ? composite.sources().get(key).dateInterval() : levels.get(key).dateInterval();
         }
@@ -2959,8 +2968,12 @@ public final class LanceAggregatePushdown {
      * with the registry as a parameter so tests can drive the hook with
      * a curated rule set: the first matching rule's plan is the answer,
      * and an empty registry or an empty answer falls through to the
-     * legacy shape dispatcher. Skips building the context while the
-     * registry has no rules, so an empty registry costs one list check.
+     * legacy shape dispatcher. The rules only see a tree that
+     * {@link LanceAggregationSupport#isPushdownCandidate} accepts, the
+     * same structural gate the legacy dispatcher applies, so moving a
+     * shape from the dispatcher into a rule cannot widen what pushes
+     * down. Skips building the context while the registry has no
+     * rules, so an empty registry costs one list check.
      */
     static Plan planViaRegistry(
         AggregatorFactories.Builder aggregations,
@@ -2972,7 +2985,7 @@ public final class LanceAggregatePushdown {
         int bins,
         int slack
     ) {
-        if (!registry.rules().isEmpty()) {
+        if (!registry.rules().isEmpty() && LanceAggregationSupport.isPushdownCandidate(aggregations)) {
             AggregationRewriteContext ctx = new AggregationRewriteContext(aggregations, schema, multiFields, qsc, maxGroups, bins, slack);
             Optional<PushdownPlan> rewritten = registry.rewrite(ctx);
             if (rewritten.isPresent()) {
@@ -3029,15 +3042,11 @@ public final class LanceAggregatePushdown {
             return null;
         }
         List<AggregationBuilder> top = new ArrayList<>(aggregations.getAggregatorFactories());
+        if (LanceAggregationSupport.isPushdownMetric(top.get(0))) {
+            return resolveMetricOnly(top, schema, multiFields, qsc, bins);
+        }
         SubstraitAggregatePlan.Builder builder = new SubstraitAggregatePlan.Builder();
         List<Metric> allMetrics = new ArrayList<>();
-        if (LanceAggregationSupport.isPushdownMetric(top.get(0))) {
-            List<Metric> metrics = resolveMetrics(top, schema, multiFields, qsc, allMetrics);
-            if (metrics == null) {
-                return null;
-            }
-            return new Plan(finish(builder, List.of(), allMetrics), List.of(), List.of(), null, metrics, allMetrics, bins, null);
-        }
         if (top.get(0) instanceof CompositeAggregationBuilder compositeBuilder) {
             List<Expression> keyExpressions = new ArrayList<>();
             Composite composite = resolveComposite(compositeBuilder, schema, multiFields, qsc, keyExpressions, allMetrics);
@@ -3247,6 +3256,41 @@ public final class LanceAggregatePushdown {
             }
         }
         return new Plan(finish(builder, keyExpressions, allMetrics), keyExpressions, levels, null, List.of(), allMetrics, bins, topK);
+    }
+
+    /**
+     * The plan of a metric only tree: every top level aggregation is a
+     * metric the scan computes and there is no bucket level, so the
+     * scan groups by nothing and the plan carries no key expressions,
+     * no composite and no top-k. Null when the first top level
+     * aggregation is not such a metric (the tree is not this shape) or
+     * when any metric fails to resolve against the schema and the
+     * mapping, in which case the aggregators answer. Public because
+     * the planner package's metric only rule is the production caller;
+     * the shape dispatcher above delegates here too, so the rule path
+     * and the fall through path are one code path.
+     *
+     * @param top  the request's top level aggregation builders, in
+     *             request order
+     * @param bins bins of a pushed down percentiles histogram
+     */
+    public static Plan resolveMetricOnly(
+        List<AggregationBuilder> top,
+        Schema schema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        QueryShardContext qsc,
+        int bins
+    ) {
+        if (top.isEmpty() || !LanceAggregationSupport.isPushdownMetric(top.get(0))) {
+            return null;
+        }
+        SubstraitAggregatePlan.Builder builder = new SubstraitAggregatePlan.Builder();
+        List<Metric> allMetrics = new ArrayList<>();
+        List<Metric> metrics = resolveMetrics(top, schema, multiFields, qsc, allMetrics);
+        if (metrics == null) {
+            return null;
+        }
+        return new Plan(finish(builder, List.of(), allMetrics), List.of(), List.of(), null, metrics, allMetrics, bins, null);
     }
 
     /**

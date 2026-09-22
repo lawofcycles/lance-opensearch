@@ -118,10 +118,13 @@ public class AggregationRewriteRegistryTests extends OpenSearchTestCase {
         expectThrows(UnsupportedOperationException.class, () -> registry.rules().add(new TestRule("late", Optional.empty())));
     }
 
-    public void testProductionInstanceIsEmpty() {
-        // No rule is registered yet; a rule accidentally registered on
-        // the production singleton in a later change must trip this.
-        assertTrue(AggregationRewriteRegistry.instance().rules().isEmpty());
+    public void testProductionInstanceCarriesTheMetricOnlyRuleOnly() {
+        // The production rule set grows only by deliberate extraction
+        // from the legacy dispatcher; a rule accidentally registered on
+        // the singleton in a later change must trip this.
+        List<AggregationRewriteRule> rules = AggregationRewriteRegistry.instance().rules();
+        assertEquals(1, rules.size());
+        assertEquals(MetricOnlyRule.NAME, rules.get(0).name());
     }
 
     public void testRejectsEmptyAndDuplicateRuleNames() {
