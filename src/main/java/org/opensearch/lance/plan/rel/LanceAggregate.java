@@ -124,9 +124,13 @@ public class LanceAggregate extends Aggregate {
     }
 
     /**
-     * Per group key, the filter / filters predicates over the input row
-     * type, parallel to the spec's {@code filterKeys}; empty for the
-     * bucket kinds that are not filter shaped.
+     * Per group key, the filter / filters predicates, parallel to the
+     * spec's {@code filterKeys}; empty for the bucket kinds that are
+     * not filter shaped. The predicates are expressions over
+     * {@code getInput().getRowType()}: the projection under this node
+     * carries a pass through of every scan column after the group key
+     * expressions, and the predicates reference those pass through
+     * positions.
      */
     public List<ImmutableList<RexNode>> filterPredicates() {
         return filterPredicates;
