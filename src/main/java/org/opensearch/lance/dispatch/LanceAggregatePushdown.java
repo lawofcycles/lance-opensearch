@@ -14,6 +14,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executor;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
@@ -60,6 +61,9 @@ import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
+import org.opensearch.lance.dispatch.planner.AggregationRewriteContext;
+import org.opensearch.lance.dispatch.planner.AggregationRewriteRegistry;
+import org.opensearch.lance.dispatch.planner.PushdownPlan;
 import org.opensearch.lance.engine.FragmentGroupScan;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.LancePlugin;
@@ -1808,8 +1812,10 @@ public final class LanceAggregatePushdown {
      * {@code null} plan means the request takes the aggregator path.
      * {@code keyExpressions} are the bucket key groupings in key order,
      * kept so the percentiles bin scans can group by the same keys.
+     * Public so the planner package's rule engine can carry it; the
+     * constructor stays private, so only this class builds plans.
      */
-    static final class Plan {
+    public static final class Plan {
         private final ByteBuffer substrait;
         private final List<Expression> keyExpressions;
         private final List<Level> levels;
@@ -2908,7 +2914,10 @@ public final class LanceAggregatePushdown {
      * {@code lance.aggregation.pushdown_max_groups} as the group
      * estimate bound. Returns {@code null} when any part of the tree is
      * outside what the scan can compute, in which case the caller runs
-     * the Lucene aggregators.
+     * the Lucene aggregators. Asks the
+     * {@link AggregationRewriteRegistry} first: the first matching
+     * rule's plan is the answer, and an empty answer falls through to
+     * the shape dispatcher in the innermost overload.
      *
      * @param aggregations the request's aggregation builders, already
      *                     accepted by {@link LanceAggregationSupport#isPushdownCandidate}
@@ -2926,6 +2935,19 @@ public final class LanceAggregatePushdown {
         QueryShardContext qsc
     ) {
         int maxGroups = LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
+        AggregationRewriteContext ctx = new AggregationRewriteContext(
+            aggregations,
+            schema,
+            multiFields,
+            qsc,
+            maxGroups,
+            percentilesBins,
+            topkSlack
+        );
+        Optional<PushdownPlan> rewritten = AggregationRewriteRegistry.instance().rewrite(ctx);
+        if (rewritten.isPresent()) {
+            return rewritten.get().asLegacyPlan();
+        }
         return plan(aggregations, schema, multiFields, qsc, maxGroups, percentilesBins);
     }
 
