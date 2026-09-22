@@ -2360,7 +2360,7 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
             filterSql = TransportLanceCoordinatorAction.resolveScanFilterSql(
                 query,
                 model,
-                LanceOverrides.of(metadata.getSettings()).ipColumns(),
+                TransportLanceCoordinatorAction.sqlExcludedColumns(LanceOverrides.of(metadata.getSettings())),
                 new LancePlannerFactory(1L << 30, 1L << 30)
             );
         } catch (java.io.IOException e) {

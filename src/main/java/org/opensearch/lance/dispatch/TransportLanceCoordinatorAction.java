@@ -67,7 +67,7 @@ import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
-import org.opensearch.lance.plan.substrait.RexToLanceSql;
+import org.opensearch.lance.plan.lancesql.RexToLanceSql;
 import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
@@ -487,7 +487,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             () -> totalRows
         );
         FragmentQuerySpec spec = new FragmentQuerySpec(
-            resolveScanFilterSql(source == null ? null : source.query(), model, target.ipColumns(), plannerFactory),
+            resolveScanFilterSql(source == null ? null : source.query(), model, target.sqlExcludedColumns(), plannerFactory),
             baseSpec.query(),
             baseSpec.postFilter(),
             baseSpec.sorts(),
@@ -1044,22 +1044,22 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * translator and printer so the SQL spelling has one source.
      * Returns {@code null} when the query is match_all, absent, cannot
      * be expressed (match, knn, an unmapped field, a construct without
-     * a SQL spelling), or references an {@code ip} override column,
-     * whose stored strings compare differently from the encoded doc
-     * values the shard path uses. In those cases the per-node executor
-     * falls back to the Lucene tree and
+     * a SQL spelling), or references an {@code ip} or {@code geo_point}
+     * override column, whose Lucene form (encoded doc values) differs
+     * from what the Lance column stores. In those cases the per-node
+     * executor falls back to the Lucene tree and
      * {@link org.apache.lucene.search.IndexSearcher#count}.
      */
     static String resolveScanFilterSql(
         QueryBuilder query,
         LanceSchemas.IndexModel model,
-        Set<String> ipColumns,
+        Set<String> sqlExcludedColumns,
         LancePlannerFactory factory
     ) {
         if (query == null || query instanceof MatchAllQueryBuilder) {
             return null;
         }
-        if (QueryToRex.referencesAny(query, ipColumns)) {
+        if (QueryToRex.referencesAny(query, sqlExcludedColumns)) {
             return null;
         }
         try {
@@ -1075,6 +1075,17 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // Lucene.
             return null;
         }
+    }
+
+    /**
+     * The override columns whose predicates never travel to Lance SQL:
+     * {@code ip} (raw strings versus encoded doc values) and
+     * {@code geo_point} (children hidden by the mapping).
+     */
+    static Set<String> sqlExcludedColumns(LanceOverrides overrides) {
+        Set<String> excluded = new java.util.LinkedHashSet<>(overrides.ipColumns());
+        excluded.addAll(overrides.geoPointColumns().keySet());
+        return excluded;
     }
 
     private static int resolveSize(SearchSourceBuilder source) {
@@ -1120,7 +1131,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                     overrides.subFields(),
                     renamedFields,
                     primaryKeyField,
-                    overrides.ipColumns(),
+                    sqlExcludedColumns(overrides),
                     overrides.dateColumns().keySet()
                 )
             );
@@ -1377,15 +1388,15 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * enumeration, whose observed version then travels with every
      * per-node request so the executors read the same manifest.
      * {@code multiFields}, {@code renamedFields},
-     * {@code primaryKeyField}, {@code ipColumns} and
+     * {@code primaryKeyField}, {@code sqlExcludedColumns} and
      * {@code dateOverrideColumns} feed the planner model the per-target
      * filter SQL derivation builds once the target's Arrow schema is
      * known.
      */
     private record IndexTarget(String indexName, String tableUri, StorageOptions storageOptions, long pinnedVersion, Map<
         String,
-        LinkedHashMap<String, String>> multiFields, Map<String, String> renamedFields, String primaryKeyField, Set<String> ipColumns, Set<
-            String> dateOverrideColumns) {
+        LinkedHashMap<String, String>> multiFields, Map<String, String> renamedFields, String primaryKeyField, Set<
+            String> sqlExcludedColumns, Set<String> dateOverrideColumns) {
 
         Optional<Long> pinnedVersionOrEmpty() {
             return pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();

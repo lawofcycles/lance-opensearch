@@ -805,14 +805,15 @@ public final class QueryToRex {
 
     /**
      * Whether any leaf of {@code query} names a field in
-     * {@code columns}. The callers that turn a translated predicate
-     * into executable Lance SQL use this as a pre-flight for the
-     * {@code ip}-overridden columns: their Lance column stores the raw
-     * strings while the shard path compares 16 byte encoded forms, so
-     * no predicate on them may travel to Lance SQL and the caller keeps
-     * the query on the Lucene side. Only the leaf shapes this
-     * translator supports are inspected; anything else refuses at
-     * translation anyway.
+     * {@code columns}, or a dotted child of one. The callers that turn
+     * a translated predicate into executable Lance SQL use this as a
+     * pre-flight for the {@code ip} and {@code geo_point} override
+     * columns: an ip column stores raw strings while the shard path
+     * compares 16 byte encoded forms, and a geo column's children are
+     * hidden by the geo_point mapping, so no predicate on them may
+     * travel to Lance SQL and the caller keeps the query on the Lucene
+     * side. Only the leaf shapes this translator supports are
+     * inspected; anything else refuses at translation anyway.
      */
     public static boolean referencesAny(QueryBuilder query, Set<String> columns) {
         if (query == null || columns.isEmpty()) {
@@ -844,6 +845,19 @@ public final class QueryToRex {
         } else if (query instanceof PrefixQueryBuilder prefix) {
             field = prefix.fieldName();
         }
-        return field != null && columns.contains(field);
+        if (field == null) {
+            return false;
+        }
+        if (columns.contains(field)) {
+            return true;
+        }
+        int dot = field.indexOf('.');
+        while (dot > 0) {
+            if (columns.contains(field.substring(0, dot))) {
+                return true;
+            }
+            dot = field.indexOf('.', dot + 1);
+        }
+        return false;
     }
 }

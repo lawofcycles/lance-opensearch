@@ -11,7 +11,7 @@ import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.tools.RelBuilderFactory;
 import org.opensearch.lance.plan.rel.LanceFtsMatch;
 import org.opensearch.lance.plan.rel.LanceTableScan;
-import org.opensearch.lance.plan.substrait.RexToLanceSql;
+import org.opensearch.lance.plan.lancesql.RexToLanceSql;
 
 import java.util.List;
 import java.util.Optional;

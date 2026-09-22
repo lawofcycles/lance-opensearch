@@ -1285,13 +1285,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (knn != null && knn.filter() == null) {
             return null;
         }
-        Set<String> ipColumns = LanceOverrides.of(indexMetadata.getSettings()).ipColumns();
-        if (knn != null && QueryToRex.referencesAny(knn.filter(), ipColumns)) {
-            throw knnFilterRefusal(knn, "predicates on ip fields are evaluated over encoded doc values on the Lucene side");
+        Set<String> excludedColumns = TransportLanceCoordinatorAction.sqlExcludedColumns(LanceOverrides.of(indexMetadata.getSettings()));
+        if (knn != null && QueryToRex.referencesAny(knn.filter(), excludedColumns)) {
+            throw knnFilterRefusal(knn, "predicates on ip and geo_point fields are evaluated over encoded doc values on the Lucene side");
         }
-        if (knn == null && rewritten instanceof BoolQueryBuilder bool && QueryToRex.referencesAny(bool, ipColumns)) {
-            // An ip predicate has no Lance SQL form; keep the whole
-            // bool on the Lucene composition.
+        if (knn == null && rewritten instanceof BoolQueryBuilder bool && QueryToRex.referencesAny(bool, excludedColumns)) {
+            // An ip or geo predicate has no Lance SQL form; keep the
+            // whole bool on the Lucene composition.
             return null;
         }
         RelNode physical;
