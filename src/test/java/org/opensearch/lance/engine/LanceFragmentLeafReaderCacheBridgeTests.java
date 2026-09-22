@@ -125,15 +125,15 @@ public class LanceFragmentLeafReaderCacheBridgeTests extends OpenSearchTestCase 
     }
 
     public void testReaderClosesWithoutEverBuildingABridge() throws Exception {
-        LanceDirectoryReader reader = openReader();
         List<LanceFragmentLeafReader> raws = new ArrayList<>();
-        for (LeafReaderContext ctx : reader.leaves()) {
-            raws.add(raw(ctx));
+        try (LanceDirectoryReader reader = openReader()) {
+            for (LeafReaderContext ctx : reader.leaves()) {
+                raws.add(raw(ctx));
+            }
+            for (LanceFragmentLeafReader leaf : raws) {
+                assertFalse(leaf.cacheLifetimeBridgeExists());
+            }
         }
-        for (LanceFragmentLeafReader leaf : raws) {
-            assertFalse(leaf.cacheLifetimeBridgeExists());
-        }
-        reader.close();
         // No helper was ever requested, so no bridge was ever built.
         for (LanceFragmentLeafReader leaf : raws) {
             assertFalse(leaf.cacheLifetimeBridgeExists());
