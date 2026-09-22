@@ -161,6 +161,7 @@ Lucene refuses a composite reader whose leaves hold more than `IndexWriter.MAX_D
 - The shard engine's whole table reader holds the leading fragments that fit, so the index comes up green. `GET /_doc/{id}` resolves the key through a Lance scan over the whole table and, for a row outside the shard reader, reads it through a reader over that row's fragment. `_count` and `_search` run on the fragment path over every row.
 - A request shape the fragment path does not serve ([limitations.md](limitations.md#query-shapes-routed-to-the-shard-path)) would read the shard reader's rows only; against such a table it is refused with 400 `illegal_argument_exception` naming the table's rows and the reader's rows instead of answering from part of the table.
 - `lance.test.max_docs_per_reader` (node scope, dynamic, default `IndexWriter.MAX_DOCS`, minimum 1) is the bound the coordinator, the dispatch filter, attach and the engine apply. It exists so the integration tests can exercise the split on a small table; do not change it on a real node. A reader already open keeps its fragments until the next refresh swaps it.
+- `lance.test.index_cache_shard_share` (node scope, dynamic, default 0 = use the installed Session's sizing) overrides the index cache shard share the full-text admission gate compares its estimate with. It exists so the integration tests can declare a small fixture table's inverted index as not fitting the cache; do not change it on a real node.
 
 ## Snapshot and column cache
 
