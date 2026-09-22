@@ -148,7 +148,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             for (HttpHost host : getClusterHosts()) {
                 try (var pinned = buildClient(restClientSettings(), new HttpHost[] { host })) {
                     Request explain = new Request("GET", "/" + indexName + "/_lance/explain");
-                    explain.setJsonEntity("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}");
+                    explain.setJsonEntity("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
                     Response response = pinned.performRequest(explain);
                     assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
                     String body = readAll(response);
@@ -1560,7 +1560,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         LanceTableFactory.writeHintFixtureTable(scratchDir, tableName, fragments, rowsPerFragment);
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
-        String sum = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}";
+        String sum = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
         updateClusterSetting("lance.aggregation.pushdown", "false");
         updateClusterSetting("lance.cache.enabled", "false");
         updateClusterSetting("lance.fragment_path.slices", "1");
