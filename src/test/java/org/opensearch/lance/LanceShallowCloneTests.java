@@ -23,6 +23,7 @@ import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
+import org.opensearch.common.io.PathUtils;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -47,7 +48,7 @@ public class LanceShallowCloneTests extends OpenSearchTestCase {
     public void testShallowCloneFactsOnReadOnlySource() throws Exception {
         assumeTrue(
             "POSIX permissions are required to make the source read-only",
-            Files.getFileStore(createTempDir()).supportsFileAttributeView("posix")
+            PathUtils.getDefaultFileSystem().supportedFileAttributeViews().contains("posix")
         );
         Path scratch = createTempDir();
         String sourceUri = LanceTableFactory.writeMultiFragmentTable(scratch, "clone-src", 12, 4);
