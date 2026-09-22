@@ -136,6 +136,17 @@ public class LanceAggregate extends Aggregate {
         return filterPredicates;
     }
 
+    /**
+     * Copies the node, keeping the specs. The specs are aligned with
+     * the group keys and the calls, so a copy may substitute the input
+     * and the traits (what planner rules do) but not the grouping or
+     * the calls; changing those without the specs would silently
+     * misalign them.
+     *
+     * @throws IllegalArgumentException when {@code groupSet},
+     *     {@code groupSets} or {@code aggCalls} differ from this node's
+     *     own
+     */
     @Override
     public Aggregate copy(
         RelTraitSet traitSet,
@@ -144,7 +155,17 @@ public class LanceAggregate extends Aggregate {
         List<ImmutableBitSet> groupSets,
         List<AggregateCall> aggCalls
     ) {
+        if (!getGroupSet().equals(groupSet) || !getGroupSets().equals(groupSets) || !getAggCallList().equals(aggCalls)) {
+            throw new IllegalArgumentException(
+                "a LanceAggregate copy cannot change the grouping or the calls: the bucket and metric specs are aligned with them"
+            );
+        }
         return new LanceAggregate(getCluster(), traitSet, input, groupSet, groupSets, aggCalls, bucketSpecs, metricSpecs, filterPredicates);
+    }
+
+    /** The same aggregate over a substituted input, for rules that rewrite the tree below this node. */
+    public LanceAggregate withInput(RelNode input) {
+        return input == getInput() ? this : (LanceAggregate) copy(getTraitSet(), input, getGroupSet(), getGroupSets(), getAggCallList());
     }
 
     /**

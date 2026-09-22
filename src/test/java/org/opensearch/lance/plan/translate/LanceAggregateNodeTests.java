@@ -5,10 +5,12 @@
 
 package org.opensearch.lance.plan.translate;
 
+import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexVisitorImpl;
+import org.apache.calcite.util.ImmutableBitSet;
 import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -71,5 +73,42 @@ public class LanceAggregateNodeTests extends OpenSearchTestCase {
                 name.equals("rating") || name.equals("category")
             );
         }
+    }
+
+    public void testCopyKeepsTheSpecsAndRejectsChangedGroupingOrCalls() throws IOException {
+        LanceAggregate aggregate = translate(
+            "{\"size\":0,\"aggs\":{\"by_cat\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"a\":{\"avg\":{\"field\":\"price\"}}}}}}"
+        );
+        RelNode input = aggregate.getInput();
+
+        LanceAggregate substituted = aggregate.withInput(input);
+        assertSame("same input answers the same node", aggregate, substituted);
+        LanceAggregate copied = (LanceAggregate) aggregate.copy(
+            aggregate.getTraitSet(),
+            input,
+            aggregate.getGroupSet(),
+            aggregate.getGroupSets(),
+            aggregate.getAggCallList()
+        );
+        assertEquals(aggregate.bucketSpecs(), copied.bucketSpecs());
+        assertEquals(aggregate.metricSpecs(), copied.metricSpecs());
+        assertEquals(aggregate.filterPredicates(), copied.filterPredicates());
+
+        IllegalArgumentException grouping = expectThrows(
+            IllegalArgumentException.class,
+            () -> aggregate.copy(
+                aggregate.getTraitSet(),
+                input,
+                ImmutableBitSet.of(),
+                List.of(ImmutableBitSet.of()),
+                aggregate.getAggCallList()
+            )
+        );
+        assertTrue(grouping.getMessage(), grouping.getMessage().contains("cannot change the grouping or the calls"));
+        IllegalArgumentException calls = expectThrows(
+            IllegalArgumentException.class,
+            () -> aggregate.copy(aggregate.getTraitSet(), input, aggregate.getGroupSet(), aggregate.getGroupSets(), List.of())
+        );
+        assertTrue(calls.getMessage(), calls.getMessage().contains("cannot change the grouping or the calls"));
     }
 }
