@@ -2941,23 +2941,45 @@ public final class LanceAggregatePushdown {
         QueryShardContext qsc
     ) {
         int maxGroups = LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
-        AggregationRewriteRegistry registry = AggregationRewriteRegistry.instance();
+        return planViaRegistry(
+            aggregations,
+            schema,
+            multiFields,
+            qsc,
+            AggregationRewriteRegistry.instance(),
+            maxGroups,
+            percentilesBins,
+            topkSlack
+        );
+    }
+
+    /**
+     * The registry consultation behind
+     * {@link #plan(AggregatorFactories.Builder, Schema, Map, QueryShardContext)},
+     * with the registry as a parameter so tests can drive the hook with
+     * a curated rule set: the first matching rule's plan is the answer,
+     * and an empty registry or an empty answer falls through to the
+     * legacy shape dispatcher. Skips building the context while the
+     * registry has no rules, so an empty registry costs one list check.
+     */
+    static Plan planViaRegistry(
+        AggregatorFactories.Builder aggregations,
+        Schema schema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        QueryShardContext qsc,
+        AggregationRewriteRegistry registry,
+        int maxGroups,
+        int bins,
+        int slack
+    ) {
         if (!registry.rules().isEmpty()) {
-            AggregationRewriteContext ctx = new AggregationRewriteContext(
-                aggregations,
-                schema,
-                multiFields,
-                qsc,
-                maxGroups,
-                percentilesBins,
-                topkSlack
-            );
+            AggregationRewriteContext ctx = new AggregationRewriteContext(aggregations, schema, multiFields, qsc, maxGroups, bins, slack);
             Optional<PushdownPlan> rewritten = registry.rewrite(ctx);
             if (rewritten.isPresent()) {
                 return rewritten.get().asLegacyPlan();
             }
         }
-        return plan(aggregations, schema, multiFields, qsc, maxGroups, percentilesBins);
+        return plan(aggregations, schema, multiFields, qsc, maxGroups, bins, slack);
     }
 
     /**
