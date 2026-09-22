@@ -8,12 +8,38 @@ Distribution over the cluster is automatic: fragments are spread over every data
 
 ## Attach and namespace surface
 
-- `POST /_lance/namespace` registers a directory as a Lance namespace. The plugin polls it for `*.lance` tables and surfaces each as an OpenSearch index. Mapping is derived from the Lance Arrow schema on every surface.
+- `POST /_lance/namespace` registers a Lance namespace catalog. The plugin polls it for tables and surfaces each as an OpenSearch index; mapping is derived from the Lance Arrow schema on every surface. The body takes a `type` (`directory` when absent, `rest`, or `glue`), a registration `name` that identifies the entry everywhere (required for `rest` and `glue`; defaults to the path for `directory`), and a `config` object of string values handed to the implementation's `initialize`. Unknown `type` returns 400 naming the accepted values; unknown `config` keys pass through to the implementation unvalidated.
+
+  A directory namespace registers a filesystem or object-store prefix; `path` is required and is the catalog root:
+
+  ```json
+  POST /_lance/namespace
+  {"path": "/data/lance"}
+  ```
+
+  A REST namespace registers a Lance Namespace REST catalog through the `RestNamespace` client. The root and everything else the client reads come from `config`: `uri` (required), optional `delimiter`, and `header.*` entries for HTTP headers such as a bearer credential:
+
+  ```json
+  POST /_lance/namespace
+  {"type": "rest", "name": "catalog-a", "config": {"uri": "https://catalog.example.com", "header.Authorization": "Bearer ..."}}
+  ```
+
+  A Glue namespace registers an AWS Glue Data Catalog. `config` carries the property names the Glue implementation reads: `region`, optional `endpoint`, `catalog_id`, `root`, and the static credential keys `access_key_id` / `secret_access_key` / `session_token` (absent, the SDK's default credential chain applies). Tables inside every Glue database whose `table_type` is `lance` surface under their table name:
+
+  ```json
+  POST /_lance/namespace
+  {"type": "glue", "name": "glue-tokyo", "config": {"region": "ap-northeast-1", "catalog_id": "123456789012", "root": "s3://bucket/prefix"}}
+  ```
+
+- Config values whose key contains `secret`, `password`, `token`, `key`, or `authorization` (case-insensitive) are accepted and handed to the implementation intact, but never leave the node readable: `GET /_lance/namespace`, the cluster state API, and every log line show them as `***`. Only the gateway-persisted cluster state keeps the raw values, so the catalogs re-initialise after a full cluster restart.
+- A catalog whose `initialize` or listing fails (bad credentials, unreachable endpoint) is kept as a registration, warned about once, and retried on every poll; `GET /_lance/namespace` shows it as `"status": "unavailable"` with the error message until a poll succeeds.
+- For `rest` and `glue`, each table's location comes from the catalog's `describeTable` and is checked against `lance.allowed_table_roots` before the table surfaces (the register call names no path the allowlist could gate up front); a directory registration checks its root at register time as before.
 - `POST /_lance/attach` attaches a single Lance table URI directly. Idempotent: a repeated call for the same URI returns `already_attached: true`; a name clash with a non-Lance index or a Lance index for a different table returns 409. The body takes either `"version": N` (fixed pin, see below) or `"tag": "name"` (follow a Lance tag); both together return 400, and an unknown tag returns 400 with Lance's message. The request can be sent to any node: it is forwarded to the elected cluster manager, which opens the table, creates the index and records the index for the poll.
 - A table with more physical rows than one Lucene reader may hold (`IndexWriter.MAX_DOCS`, 2,147,483,519) attaches too; the response then carries `lucene_bound_exceeded: true` and the manager logs one WARN naming the rows the shard reader holds and the fragment groups the fan-out cuts. Searches, `_count` and GET read every row (see [Tables above the Lucene document bound](#tables-above-the-lucene-document-bound)); only a table whose single fragment is above the bound is refused with 400, because no reader can hold that fragment.
 - `GET /_lance/refs/{index}` lists the tags (`name`, `version`) and branches (`name`) of the Lance table behind an index: `{"index": ..., "table": ..., "tags": [...], "branches": [...]}`. Unknown index returns 404, a non-Lance index 400.
-- `POST /_lance/namespace/tables {"path": "..."}` returns the table names the poll would surface from a registered namespace. Read-only preview, useful for spotting a table the poll skipped due to a name clash. Unregistered paths return 404.
-- `DELETE /_lance/namespace {"path": "..."}` stops polling that namespace. Already-surfaced indexes stay in place; delete them separately if the tables should disappear.
+- `GET /_lance/namespace` lists the registrations: one object per entry with `name`, `type`, `path` (directory only), the redacted `config`, and `status` (`available`, or `unavailable` with `error`).
+- `POST /_lance/namespace/tables {"name": "..."}` returns the table names the poll would surface from a registered namespace (`path` still works as the identifier for directory registrations). Read-only preview, useful for spotting a table the poll skipped due to a name clash. Unknown identifiers return 404.
+- `DELETE /_lance/namespace {"name": "..."}` stops polling that namespace (`path` also identifies a directory registration). Already-surfaced indexes stay in place; delete them separately if the tables should disappear.
 - `POST /_lance/build_indexes/{index}` triggers Lance-side FTS / scalar / vector index builds from OpenSearch. Automatic builds happen for tables at or under `lance.builder.max_rows` (default 1,000,000 rows); larger tables use this explicit endpoint. `fts_columns`, `tokenizer` and `with_position` create inverted indexes on Utf8 columns that have none yet (see [Full-text search](#full-text-search)).
   - The response reports every target column under one of three keys, each split by index kind: `built` (`{"fts": [...], "scalar": [...], "vector": [...]}`, column names, or Lance index names with `optimize: true`), `skipped` (`{"fts": [{"column": "...", "reason": "..."}], ...}`, an index already exists, the table has fewer than 256 rows for IVF_PQ, or with `optimize: true` the column has no index to extend) and `failed` (same shape, `reason` is the message Lance threw, for example `LanceError(IO): Permission denied (os error 13)` when the OpenSearch process cannot write into the table).
   - Status: 200 when `failed` is empty (skips are not failures), 400 when every failure is Lance rejecting the input (unknown `tokenizer`, malformed index parameters), 500 for anything else Lance threw. The body carries `built`, `skipped` and `failed` in all three cases, so a build that landed on some columns and failed on others shows both. A build that stops before Lance runs (unknown index 404, a `columns` entry that is not indexable 400, `fts_columns` naming a non-Utf8 column 400) returns the usual error body instead.
