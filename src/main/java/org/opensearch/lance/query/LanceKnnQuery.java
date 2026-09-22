@@ -147,7 +147,10 @@ public final class LanceKnnQuery extends Query {
             if (leaf == null) {
                 return;
             }
-            leaf.hintMatchedOffsets(leafHits(leaf).sortedDocIds(), LanceFragmentLeafReader.wrappedOnlyByOwnReaders(context.reader()));
+            leaf.hintMatchedOffsets(
+                leaf.docsOfRows(leafHits(leaf).sortedDocIds()),
+                LanceFragmentLeafReader.wrappedOnlyByOwnReaders(context.reader())
+            );
         }
 
         @Override
@@ -167,8 +170,10 @@ public final class LanceKnnQuery extends Query {
             // the Lucene DocIdSetIterator contract asks for ascending
             // docIds, so the sorted view is used; it is the same array
             // every other supplier and hint of this Weight sees for the
-            // fragment.
-            int[] docIds = hits.sortedDocIds();
+            // fragment. The decoded offsets are physical rows and map to
+            // parent doc ids through the leaf (identity unless the table
+            // has nested columns; monotonic, so sorted stays sorted).
+            int[] docIds = leaf.docsOfRows(hits.sortedDocIds());
             float[] hitScores = hits.sortedScores();
             // Same hint protocol as LanceFtsQuery: the leaf learns the
             // k nearest rows of this fragment so sort and aggregation

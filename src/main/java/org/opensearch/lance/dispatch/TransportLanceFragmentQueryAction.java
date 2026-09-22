@@ -34,6 +34,8 @@ import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.ReaderUtil;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.Collector;
 import org.apache.lucene.search.CollectorManager;
@@ -70,6 +72,7 @@ import org.opensearch.common.CheckedFunction;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
+import org.opensearch.common.lucene.search.Queries;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.breaker.CircuitBreaker;
@@ -78,12 +81,14 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.Rewriteable;
+import org.opensearch.index.search.NestedHelper;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
@@ -696,7 +701,10 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 QueryShardContext qsc = indexService.newQueryShardContext(0, searcher, System::currentTimeMillis, null);
                 searchContext.withQueryShardContext(qsc);
 
-                Query query = resolveLuceneQuery(request, qsc, hasSecurityWrapper, indexMetadata);
+                Query query = applyNonNestedFilter(
+                    resolveLuceneQuery(request, qsc, hasSecurityWrapper, indexMetadata),
+                    indexService.mapperService()
+                );
 
                 // Unbounded full-text scans (a full-text clause the
                 // resolver left without a scan limit, or a bounded
@@ -876,6 +884,34 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
+     * Confine {@code query} to parent (non nested) docs when the mapping
+     * has nested fields, the way the shard path's
+     * {@code DefaultSearchContext.buildFilteredQuery} does. Without the
+     * filter a {@code match_all} or any doc-value query over a reader
+     * with nested columns would collect the hidden child docs as hits
+     * and count them in {@code hits.total}.
+     *
+     * <p>The Lance-side queries are exempt: their scorers decode row
+     * addresses and map them to parent doc ids, so they can never yield
+     * a child doc, and wrapping them would push the executor off the
+     * shared-Weight and count fast paths for no gain.
+     */
+    private static Query applyNonNestedFilter(Query query, MapperService mapperService) {
+        if (!mapperService.hasNested()) {
+            return query;
+        }
+        if (query instanceof LanceScanFilterQuery || query instanceof LanceFtsQuery || query instanceof LanceKnnQuery) {
+            return query;
+        }
+        if (!new NestedHelper(mapperService).mightMatchNestedDocs(query)) {
+            return query;
+        }
+        return new BooleanQuery.Builder().add(query, BooleanClause.Occur.MUST)
+            .add(Queries.newNonNestedFilter(), BooleanClause.Occur.FILTER)
+            .build();
+    }
+
+    /**
      * The hits of one page together with the Lance row address
      * ({@code fragmentId << 32 | offset}) of each, parallel arrays. The
      * addresses travel to the coordinator, which breaks ties between
@@ -899,7 +935,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (lance == null) {
             throw new IllegalStateException("leaf " + leaf.ord + " of the fragment reader is not backed by a Lance fragment");
         }
-        return ((long) lance.fragmentId() << 32) | ((doc - leaf.docBase) & 0xFFFFFFFFL);
+        return ((long) lance.fragmentId() << 32) | (lance.rowOf(doc - leaf.docBase) & 0xFFFFFFFFL);
     }
 
     /**
@@ -1869,10 +1905,17 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             throw new IOException(e);
         }
         // One take per leaf for the rows behind the page, then render
-        // each hit in Lance's order.
+        // each hit in Lance's order. The decoded offsets are physical
+        // rows; the leaf's stored-fields and prefetch paths are keyed by
+        // doc id, so each offset maps through docOfRow (identity unless
+        // the table has nested columns).
         java.util.Map<Integer, List<Integer>> docsByFragment = new java.util.HashMap<>();
         for (long[] address : addresses) {
-            docsByFragment.computeIfAbsent((int) address[0], k -> new ArrayList<>()).add((int) address[1]);
+            LanceFragmentLeafReader lance = leafByFragment.get((int) address[0]);
+            if (lance == null) {
+                continue;
+            }
+            docsByFragment.computeIfAbsent((int) address[0], k -> new ArrayList<>()).add(lance.docOfRow((int) address[1]));
         }
         for (java.util.Map.Entry<Integer, List<Integer>> entry : docsByFragment.entrySet()) {
             LanceFragmentLeafReader lance = leafByFragment.get(entry.getKey());
@@ -1900,7 +1943,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 continue;
             }
             HitVisitor visitor = new HitVisitor();
-            lance.materialiseStoredFields((int) address[1], visitor);
+            lance.materialiseStoredFields(lance.docOfRow((int) address[1]), visitor);
             SearchHit hit = new SearchHit(out.size(), visitor.idString(), Collections.emptyMap(), Collections.emptyMap());
             hit.score(score);
             if (visitor.source != null) {

@@ -69,13 +69,17 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     /**
      * The shard reader of one Lance-backed index this node hosts: the
      * live rows of the table version it was opened over, the live rows
-     * it holds, and whether the two differ because the table is above
-     * the Lucene document bound. {@code _stats} counts the reader's rows.
+     * it holds, the hidden nested child docs its leaves carry beyond
+     * those rows (0 unless the table has {@code List<Struct>} columns),
+     * and whether the rows differ because the table is above the Lucene
+     * document bound. {@code _stats} counts the reader's docs.
      */
-    public record IndexReaderStats(String index, long rows, long shardReaderRows, boolean luceneBoundExceeded) implements Writeable {
+    public record IndexReaderStats(String index, long rows, long shardReaderRows, long nestedDocs, boolean luceneBoundExceeded)
+        implements
+            Writeable {
 
         public IndexReaderStats(StreamInput in) throws IOException {
-            this(in.readString(), in.readVLong(), in.readVLong(), in.readBoolean());
+            this(in.readString(), in.readVLong(), in.readVLong(), in.readVLong(), in.readBoolean());
         }
 
         @Override
@@ -83,6 +87,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             out.writeString(index);
             out.writeVLong(rows);
             out.writeVLong(shardReaderRows);
+            out.writeVLong(nestedDocs);
             out.writeBoolean(luceneBoundExceeded);
         }
     }
@@ -319,6 +324,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             builder.startObject(index.index());
             builder.field("rows", index.rows());
             builder.field("shard_reader_rows", index.shardReaderRows());
+            builder.field("nested_docs", index.nestedDocs());
             builder.field("lucene_bound_exceeded", index.luceneBoundExceeded());
             builder.endObject();
         }
