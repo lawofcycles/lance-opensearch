@@ -31,6 +31,9 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
+import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
@@ -167,15 +170,66 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
         LanceBuildIndexesNodesRequest nodesRequest = new LanceBuildIndexesNodesRequest(request, sourceVersion, dataNodeIds);
         client.execute(LanceBuildIndexesNodesAction.INSTANCE, nodesRequest, ActionListener.wrap(nodesResponse -> {
             LanceBuildIndexesResponse response = mergeNodeResponses(indexName, request, nodesResponse);
-            String mappingJson = null;
+            Map<String, String> mappingJsonByNode = new LinkedHashMap<>();
             for (LanceBuildIndexesNodeResponse node : nodesResponse.getNodes()) {
                 if (node.mappingJson() != null) {
-                    mappingJson = node.mappingJson();
-                    break;
+                    mappingJsonByNode.put(node.getNode().getId(), node.mappingJson());
                 }
             }
-            applyMappingAndRefresh(indexName, mappingJson, response, listener);
+            MappingConsensus consensus = mappingConsensus(mappingJsonByNode);
+            if (consensus.error() != null) {
+                // Every clone must derive the same mapping because they
+                // were all cloned from the same source version and built
+                // with the same request; a disagreement means the nodes
+                // are not serving the same schema, and applying either
+                // side would hide that. Fail loudly instead.
+                listener.onFailure(new IllegalStateException(consensus.error()));
+                return;
+            }
+            applyMappingAndRefresh(indexName, consensus.mappingJson(), response, listener);
         }, listener::onFailure));
+    }
+
+    /** The one mapping every node leg agrees on, or the error to fail the build with. */
+    record MappingConsensus(String mappingJson, String error) {}
+
+    /**
+     * Compare the mapping JSON each node leg re-derived from its clone.
+     * The comparison normalises through a parsed map so key order and
+     * whitespace differences do not count as disagreement. Returns the
+     * agreed mapping (or none when no node sent one), or an error naming
+     * the node whose mapping is the reference and the node ids that
+     * disagree with it.
+     */
+    static MappingConsensus mappingConsensus(Map<String, String> mappingJsonByNode) {
+        String referenceNode = null;
+        String referenceJson = null;
+        Map<String, Object> referenceMap = null;
+        List<String> disagreeing = new ArrayList<>();
+        for (Map.Entry<String, String> entry : mappingJsonByNode.entrySet()) {
+            Map<String, Object> parsed = XContentHelper.convertToMap(new BytesArray(entry.getValue()), false, XContentType.JSON).v2();
+            if (referenceMap == null) {
+                referenceNode = entry.getKey();
+                referenceJson = entry.getValue();
+                referenceMap = parsed;
+            } else if (!referenceMap.equals(parsed)) {
+                disagreeing.add(entry.getKey());
+            }
+        }
+        if (referenceJson == null) {
+            return new MappingConsensus(null, null);
+        }
+        if (!disagreeing.isEmpty()) {
+            return new MappingConsensus(
+                null,
+                "node_local build derived different mappings across the data nodes: nodes "
+                    + disagreeing
+                    + " disagree with node ["
+                    + referenceNode
+                    + "]; no mapping was applied. Re-run POST /_lance/build_indexes once the nodes serve the same clone version"
+            );
+        }
+        return new MappingConsensus(referenceJson, null);
     }
 
     /**
