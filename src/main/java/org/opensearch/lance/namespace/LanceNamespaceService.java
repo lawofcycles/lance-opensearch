@@ -581,7 +581,13 @@ public final class LanceNamespaceService {
             return;
         }
         warnedDisallowedLocation.remove(entry.name() + ":" + indexName);
-        runSyncCycle(location, indexName, mergeStorageOptions(described.getStorageOptions(), entry.storageOptions()), null, entry.overridesJson());
+        runSyncCycle(
+            location,
+            indexName,
+            mergeStorageOptions(described.getStorageOptions(), entry.storageOptions()),
+            null,
+            entry.overridesJson()
+        );
     }
 
     /** Visible for tests: whether the disallowed-location warning for this namespace and index has fired. */

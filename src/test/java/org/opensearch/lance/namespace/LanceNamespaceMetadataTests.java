@@ -65,12 +65,14 @@ public class LanceNamespaceMetadataTests extends OpenSearchTestCase {
 
     public void testOldWireFormatReadsAsDirectoryEntries() throws Exception {
         // Simulate a stream produced before the format marker existed:
-        // entry count first, then rootUri + storage options per entry.
+        // entry count first, then rootUri + storage options + overrides
+        // JSON per entry (the last marker-less format).
         StorageOptions options = StorageOptions.of(Map.of("aws_region", "eu-west-1"));
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             out.writeVInt(1);
             out.writeString("/old/root");
             options.writeTo(out);
+            out.writeString("");
             try (StreamInput in = out.bytes().streamInput()) {
                 LanceNamespaceMetadata restored = new LanceNamespaceMetadata(in);
                 assertEquals(1, restored.entries().size());
