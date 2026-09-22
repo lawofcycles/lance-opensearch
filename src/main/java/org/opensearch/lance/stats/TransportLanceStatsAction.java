@@ -27,6 +27,7 @@ import org.opensearch.index.engine.Engine;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.threadpool.ThreadPool;
@@ -222,7 +223,8 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
                             shardReaderRows,
                             nestedDocs,
                             reader.luceneBoundExceeded(),
-                            indexTypes
+                            indexTypes,
+                            LanceMappingMeta.renamedFields(indexService.getMetadata().mapping())
                         )
                     );
                 } catch (Exception e) {

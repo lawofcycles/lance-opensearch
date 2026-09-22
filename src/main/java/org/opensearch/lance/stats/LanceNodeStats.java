@@ -16,6 +16,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.ToXContentFragment;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.query.FtsAdmission;
 
 /**
@@ -95,13 +96,28 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * it holds, the hidden nested child docs its leaves carry beyond
      * those rows (0 unless the table has {@code List<Struct>} columns),
      * whether the rows differ because the table is above the Lucene
-     * document bound, and the Lance index types present per column
+     * document bound, the Lance index types present per column
      * (from one {@code describeIndices} on the reader's dataset; empty
-     * when the read failed). {@code _stats} counts the reader's docs.
+     * when the read failed), and the column renames the index's mapping
+     * records (a stale name marked {@code lance_dropped} whose Lance
+     * field id lives on under a new name), so operators learn which
+     * field names their clients must move to. {@code _stats} counts the
+     * reader's docs.
      */
     public record IndexReaderStats(String index, long rows, long shardReaderRows, long nestedDocs, boolean luceneBoundExceeded, Map<
         String,
-        List<String>> indexTypes) implements Writeable {
+        List<String>> indexTypes, List<LanceMappingMeta.RenamedField> renamedFields) implements Writeable {
+
+        public IndexReaderStats(
+            String index,
+            long rows,
+            long shardReaderRows,
+            long nestedDocs,
+            boolean luceneBoundExceeded,
+            Map<String, List<String>> indexTypes
+        ) {
+            this(index, rows, shardReaderRows, nestedDocs, luceneBoundExceeded, indexTypes, List.of());
+        }
 
         public IndexReaderStats(StreamInput in) throws IOException {
             this(
@@ -110,7 +126,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
                 in.readVLong(),
                 in.readVLong(),
                 in.readBoolean(),
-                in.readMap(StreamInput::readString, StreamInput::readStringList)
+                in.readMap(StreamInput::readString, StreamInput::readStringList),
+                in.readList(LanceMappingMeta.RenamedField::new)
             );
         }
 
@@ -122,6 +139,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             out.writeVLong(nestedDocs);
             out.writeBoolean(luceneBoundExceeded);
             out.writeMap(indexTypes, StreamOutput::writeString, StreamOutput::writeStringCollection);
+            out.writeList(renamedFields);
         }
     }
 
@@ -369,6 +387,17 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
                 builder.field(column.getKey(), column.getValue());
             }
             builder.endObject();
+            if (!index.renamedFields().isEmpty()) {
+                builder.startArray("renamed_fields");
+                for (LanceMappingMeta.RenamedField renamed : index.renamedFields()) {
+                    builder.startObject();
+                    builder.field("from", renamed.from());
+                    builder.field("to", renamed.to());
+                    builder.field("lance_field_id", renamed.fieldId());
+                    builder.endObject();
+                }
+                builder.endArray();
+            }
             builder.endObject();
         }
         builder.endObject();
