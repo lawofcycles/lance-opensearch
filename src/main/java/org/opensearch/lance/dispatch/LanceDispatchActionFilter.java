@@ -6,6 +6,7 @@
 package org.opensearch.lance.dispatch;
 
 import java.util.Arrays;
+import java.util.List;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -24,6 +25,11 @@ import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.index.Index;
+import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.BoostingQueryBuilder;
+import org.opensearch.index.query.ConstantScoreQueryBuilder;
+import org.opensearch.index.query.DisMaxQueryBuilder;
+import org.opensearch.index.query.NestedQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -134,6 +140,20 @@ public class LanceDispatchActionFilter implements ActionFilter {
             return;
         }
 
+        String innerHitsPath = findNestedInnerHitsPath(searchRequest.source());
+        if (innerHitsPath != null) {
+            // Neither the fragment executor nor the shard fetch phase
+            // materialises per-hit inner_hits for Lance-backed indices;
+            // refuse loudly rather than return hits with the block
+            // silently missing.
+            listener.onFailure(
+                new IllegalArgumentException(
+                    "[inner_hits] on the nested query [path=" + innerHitsPath + "] is not supported for Lance-backed indices"
+                )
+            );
+            return;
+        }
+
         if (!isDispatchable(searchRequest)) {
             // search_after / highlighter / suggester / post_filter,
             // or a top-level query builder outside the fragment
@@ -227,6 +247,59 @@ public class LanceDispatchActionFilter implements ActionFilter {
             // rather than leave the request open.
             listener.onFailure(e);
         }
+    }
+
+    /**
+     * The path of the first {@link NestedQueryBuilder} in the request's
+     * query or post_filter that carries an {@code inner_hits} block, or
+     * {@code null} when there is none. Walks the compound builders a
+     * nested clause can hide in (bool, boost, constant_score, dis_max).
+     */
+    private static String findNestedInnerHitsPath(SearchSourceBuilder source) {
+        if (source == null) {
+            return null;
+        }
+        String inQuery = findNestedInnerHitsPath(source.query());
+        return inQuery != null ? inQuery : findNestedInnerHitsPath(source.postFilter());
+    }
+
+    private static String findNestedInnerHitsPath(QueryBuilder builder) {
+        if (builder == null) {
+            return null;
+        }
+        if (builder instanceof NestedQueryBuilder nested) {
+            if (nested.innerHit() != null) {
+                return nested.path();
+            }
+            return findNestedInnerHitsPath(nested.query());
+        }
+        if (builder instanceof BoolQueryBuilder bool) {
+            for (List<QueryBuilder> clauses : List.of(bool.must(), bool.filter(), bool.should(), bool.mustNot())) {
+                for (QueryBuilder clause : clauses) {
+                    String path = findNestedInnerHitsPath(clause);
+                    if (path != null) {
+                        return path;
+                    }
+                }
+            }
+            return null;
+        }
+        if (builder instanceof BoostingQueryBuilder boosting) {
+            String positive = findNestedInnerHitsPath(boosting.positiveQuery());
+            return positive != null ? positive : findNestedInnerHitsPath(boosting.negativeQuery());
+        }
+        if (builder instanceof ConstantScoreQueryBuilder constantScore) {
+            return findNestedInnerHitsPath(constantScore.innerQuery());
+        }
+        if (builder instanceof DisMaxQueryBuilder disMax) {
+            for (QueryBuilder clause : disMax.innerQueries()) {
+                String path = findNestedInnerHitsPath(clause);
+                if (path != null) {
+                    return path;
+                }
+            }
+        }
+        return null;
     }
 
     /**

@@ -81,8 +81,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 )
             ),
             List.of(
-                new LanceNodeStats.IndexReaderStats("big", 3_000_000_000L, 2_000_000_000L, true),
-                new LanceNodeStats.IndexReaderStats("small", 120L, 120L, false)
+                new LanceNodeStats.IndexReaderStats("big", 3_000_000_000L, 2_000_000_000L, 0L, true),
+                new LanceNodeStats.IndexReaderStats("small", 120L, 120L, 14L, false)
             )
         );
     }
@@ -121,8 +121,9 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"indexes\":[{\"name\":\"rating_idx\",\"type\":\"BTree\",\"column\":\"rating\",\"state\":\"done\",\"seconds\":0.4},"
                     + "{\"name\":\"body_idx\",\"type\":\"Inverted\",\"column\":\"body\",\"state\":\"failed\",\"seconds\":1.25,"
                     + "\"detail\":\"boom\"}]}]},"
-                    + "\"indices\":{\"big\":{\"rows\":3000000000,\"shard_reader_rows\":2000000000,\"lucene_bound_exceeded\":true},"
-                    + "\"small\":{\"rows\":120,\"shard_reader_rows\":120,\"lucene_bound_exceeded\":false}}}",
+                    + "\"indices\":{\"big\":{\"rows\":3000000000,\"shard_reader_rows\":2000000000,\"nested_docs\":0,"
+                    + "\"lucene_bound_exceeded\":true},"
+                    + "\"small\":{\"rows\":120,\"shard_reader_rows\":120,\"nested_docs\":14,\"lucene_bound_exceeded\":false}}}",
                 builder.toString()
             );
         }

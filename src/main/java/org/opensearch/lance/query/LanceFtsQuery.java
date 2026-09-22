@@ -480,7 +480,7 @@ public final class LanceFtsQuery extends Query {
                 return;
             }
             leaf.hintMatchedOffsets(
-                leafHits(context, leaf).sortedDocIds(),
+                leaf.docsOfRows(leafHits(context, leaf).sortedDocIds()),
                 LanceFragmentLeafReader.wrappedOnlyByOwnReaders(context.reader())
             );
         }
@@ -495,8 +495,11 @@ public final class LanceFtsQuery extends Query {
             // Sorted by offset so the Lucene DocIdSetIterator contract
             // (ascending docIds) is satisfied; the arrays are the ones
             // every other supplier and hint of this Weight sees for
-            // the fragment.
-            int[] docIds = hits.sortedDocIds();
+            // the fragment. The decoded offsets are physical rows and
+            // map to parent doc ids through the leaf (identity unless
+            // the table has nested columns; the mapping is monotonic,
+            // so sorted stays sorted).
+            int[] docIds = leaf.docsOfRows(hits.sortedDocIds());
             float[] hitScores = hits.sortedScores();
             // Tell the leaf which rows this Weight matched so a sort or
             // aggregation column can be fetched for those rows alone;

@@ -12,6 +12,7 @@ import java.util.List;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.index.LeafReaderContext;
 import org.opensearch.action.FailedNodeException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.nodes.TransportNodesAction;
@@ -25,6 +26,7 @@ import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
+import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
@@ -128,13 +130,26 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
                     // caller's stats must not count rows the wrapper
                     // hides. Only the table's rows outside a cut reader
                     // have no wrapped figure; that one comes from Lance.
-                    long shardReaderRows = searcher.getIndexReader().numDocs();
+                    //
+                    // A table with nested columns inflates numDocs with
+                    // one hidden child doc per nested element; report the
+                    // child docs separately and keep shard_reader_rows a
+                    // row count.
+                    long nestedDocs = 0L;
+                    for (LeafReaderContext ctx : searcher.getIndexReader().leaves()) {
+                        LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(ctx.reader());
+                        if (lance != null) {
+                            nestedDocs += lance.nestedDocCount();
+                        }
+                    }
+                    long shardReaderRows = searcher.getIndexReader().numDocs() - nestedDocs;
                     long rows = reader.luceneBoundExceeded() ? reader.tableRows() : shardReaderRows;
                     stats.add(
                         new LanceNodeStats.IndexReaderStats(
                             shard.shardId().getIndexName(),
                             rows,
                             shardReaderRows,
+                            nestedDocs,
                             reader.luceneBoundExceeded()
                         )
                     );

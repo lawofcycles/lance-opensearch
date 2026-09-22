@@ -232,11 +232,13 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
                 topCtx = topCtx.parent;
             }
             java.util.Map<Integer, FixedBitSet> matchesByFragment = new java.util.HashMap<>();
+            java.util.Map<Integer, LanceFragmentLeafReader> leavesByFragment = new java.util.HashMap<>();
             java.util.List<Integer> fragmentIds = new java.util.ArrayList<>();
             for (LeafReaderContext sibling : topCtx.leaves()) {
                 LanceFragmentLeafReader sl = LanceFragmentLeafReader.unwrap(sibling.reader());
                 if (sl != null) {
                     fragmentIds.add(sl.fragmentId());
+                    leavesByFragment.put(sl.fragmentId(), sl);
                     matchesByFragment.put(sl.fragmentId(), new FixedBitSet(sl.maxDoc()));
                 }
             }
@@ -259,9 +261,14 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
                     UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
                     for (int i = 0; i < root.getRowCount(); i++) {
                         long addr = rowAddr.get(i);
-                        FixedBitSet matches = matchesByFragment.get((int) (addr >>> 32));
+                        int fragId = (int) (addr >>> 32);
+                        FixedBitSet matches = matchesByFragment.get(fragId);
                         if (matches != null) {
-                            matches.set((int) (addr & 0xFFFFFFFFL));
+                            // The decoded offset is a physical row; the
+                            // bit is set at the row's parent doc id
+                            // (identity unless the table has nested
+                            // columns).
+                            matches.set(leavesByFragment.get(fragId).docOfRow((int) (addr & 0xFFFFFFFFL)));
                         }
                     }
                 }
