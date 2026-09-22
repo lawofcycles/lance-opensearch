@@ -149,7 +149,7 @@ public class RestNamespaceAction extends BaseRestHandler {
             name = optionalString(body, "name");
             config = parseConfig(body.get("config"));
             storageOptions = StorageOptions.parseFromRequestField(body.get("storage_options"), "[lance_namespace]");
-            overridesJson = LanceOverrides.parseAttachClauses(body.get("overrides"), null).toJson();
+            overridesJson = LanceOverrides.parseAttachClauses(body.get("overrides"), null, body.get("indexes")).toJson();
             if (LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(type)) {
                 if (path == null) {
                     return badRequest("[path] is required");
