@@ -29,6 +29,7 @@ Every `/_lance/*` endpoint runs through a transport action, so a security plugin
 - `cluster:admin/lance/namespace/update` for `POST` / `DELETE /_lance/namespace` (the same operator roles).
 - `indices:admin/lance/build_indexes` as an index-level permission for `POST /_lance/build_indexes/{index}` (roles that own the Lance table behind that index; the build writes into the table). The refresh that follows the build runs as the caller, so the role also needs `indices:admin/refresh` on the index.
 - `indices:monitor/lance/refs` as an index-level permission for `GET /_lance/refs/{index}` (read-only roles; it reveals tag and branch names).
+- `indices:monitor/lance/explain` as an index-level permission for `GET /{index}/_lance/explain` (read-only roles; it reveals column names and the row count).
 - `cluster:monitor/lance/namespace` for `GET /_lance/namespace` and `POST /_lance/namespace/tables` (read-only roles; it reveals registered paths and table names).
 - `cluster:monitor/lance/stats` for `GET /_lance/stats` (read-only roles; it reveals cache counters and byte totals, no table content).
 
@@ -139,6 +140,12 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 - A plan Lance rejects fails the request instead of falling back, so a missing function or a schema mismatch surfaces as an error rather than as a slow answer.
 - Each executor scans its fragments in up to `lance.aggregation.pushdown_parallelism` contiguous groups at once (Lance runs the aggregate of one scan on a single thread) and merges the group rows by key before building its buckets, so `shard_size`, `sum_other_doc_count` and the error bound keep the meaning of a single scan per node. The extra scans run on the node's `search` thread pool; when that pool has no free thread the request's own thread scans the remaining groups.
 - Settings: `lance.aggregation.pushdown` (dynamic, default `true`; `false` sends every aggregation through the aggregators, for before / after comparisons); `lance.aggregation.pushdown_parallelism` (dynamic, 1 to 32, default half the CPUs the JVM sees, at least 1; `1` is a single scan per executor); `lance.aggregation.pushdown_max_groups` (node setting, default `1000000`; the bound on the estimated key combinations of a nested `terms` tree); `lance.aggregation.percentiles_bins` (dynamic, 16 to 1,000,000, default `4096`; the bins of a pushed down tdigest percentiles histogram); `lance.aggregation.pushdown_topk_slack` (dynamic, 1 to 64, default `4`; how many times `shard_size` groups each scan of a single top-k ordered `terms` level retains).
+
+## Query plan (preview)
+
+- `GET /{index}/_lance/explain` with a search body returns the logical plan the Calcite based planner builds for it, as `{"index": ..., "logical": "..."}` with one plan node per line. The endpoint only reports; no request executes through the planner yet, and search behaviour is unchanged.
+- The supported shape today is small: the query absent or `match_all`, `size: 0`, and exactly one top level metric aggregation (`sum`, `avg`, `min`, `max`, `value_count`) over a numeric column (a keyword sub-field resolves to its base column and is rejected as non numeric). Anything else answers 400 naming the first unsupported element.
+- The plan text format will change as the planner grows physical operators, traits and costs; do not parse it.
 
 ## Doc values for full-text and vector hits
 
