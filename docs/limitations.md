@@ -102,8 +102,9 @@ The coordinator orders hits with equal scores or equal sort values by their Lanc
 
 ## Mapping coverage gaps
 
-- `ip`, `wildcard`, `nested` (Arrow `List<Struct>`), and the geo family are not surfaced.
-- FTS and knn on struct children are not derived: a Utf8 child always maps to `keyword` (never `lance_text`) and a `FixedSizeList` vector child is skipped with a note. A struct child type outside the scalar derivation (unsigned integers, binary, decimals) is skipped with a note while the parent `object` is still emitted; a struct with no supported descendants at all is skipped whole with one note instead of surfacing as an empty object.
+- `ip`, `wildcard`, and the geo family are not surfaced.
+- Nested fields (`List<Struct>` → `nested`) serve `nested` queries but not `inner_hits` (refused with 400 when a nested query carries one), not the `nested` / `reverse_nested` aggregations (off the fragment path allow list), and no Lance SQL pushdown for nested predicates (DataFusion has no `UNNEST` in a filter; the Lucene side filters). `list<utf8>` children and `List<Struct>` inside an element (nested in nested) are skipped with a note.
+- FTS and knn on struct children are not derived: a Utf8 child always maps to `keyword` (never `lance_text`) and a `FixedSizeList` vector child is skipped with a note. A struct child type outside the scalar derivation (unsigned integers, binary, decimals) is skipped with a note while the parent `object` is still emitted; a struct with no supported descendants at all is skipped whole with one note instead of surfacing as an empty object. The same applies to nested element children.
 - `Utf8` list, `Decimal`, and `FloatingPoint(HALF|DOUBLE)` columns are stored in the table but excluded from the mapping. The attach response notes them.
 - Blob columns and `LargeBinary` beyond the basic `binary` mapping share the same status.
 - Lindera and Jieba tokenizers are not bundled with lance-jni. Only ICU-based tokenization is available for CJK text through the Lance FTS index.

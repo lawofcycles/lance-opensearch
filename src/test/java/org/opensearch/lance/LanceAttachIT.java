@@ -92,7 +92,10 @@ public class LanceAttachIT extends LanceRestTestCase {
             );
             assertEquals(400, refused.getResponse().getStatusLine().getStatusCode());
             String body = readAll(refused.getResponse());
-            assertTrue(body, body.contains("has a fragment of 4 rows, above the bound of 3 rows per Lucene reader"));
+            assertTrue(
+                body,
+                body.contains("has a fragment of 4 docs (rows plus nested elements), above the bound of 3 docs per Lucene reader")
+            );
 
             // Under the default bound the flag is absent.
             setMaxDocsPerReader(null);

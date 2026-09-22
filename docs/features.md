@@ -237,12 +237,22 @@ Types listed here map to real OpenSearch field types with doc values or FTS back
 | `utf8` without a Lance FTS index | `keyword` | SortedSetDocValues, so `term` / `terms` / `terms` aggregation work. |
 | `list<utf8>` | multi-valued `keyword` | |
 | `struct` | `object` | Children map recursively under `properties` (int widths, float/double, boolean, date/timestamp, `utf8` → `keyword`, `list<utf8>` → `keyword`); term / terms / range / exists, sort, and aggregations resolve on the `parent.child` path, and `_source` renders the nested JSON object. FTS and knn are not derived on struct children; a child type outside this list is noted in the attach response and skipped while the parent object is still emitted. |
+| `list<struct>` | `nested` | Each list element becomes a hidden child document before its row's parent document, so a `nested` query can match several attributes of the same element. See the Nested subsection below. |
 | `fixed_size_list<float32>` | `knn_vector` | Dimension carried through the mapping; `lance_knn` validates it. |
 | `binary` / `large_binary` | `binary` | Base64 in `_source`, no doc values. |
 
 Multi-fields (`fields.raw: keyword` on a Utf8 base column) is supported through the `multi_fields` attach clause above.
 
-Types not yet surfaced: `ip`, `wildcard`, `nested` (Arrow `List<Struct>`), and the geo family. `Utf8` list, `Decimal`, and `FloatingPoint(HALF)` are stored in the table but excluded from the mapping today; the attach response notes them.
+Types not yet surfaced: `ip`, `wildcard`, and the geo family. `Utf8` list, `Decimal`, and `FloatingPoint(HALF)` are stored in the table but excluded from the mapping today; the attach response notes them.
+
+### Nested (`list<struct>`)
+
+- A `List<Struct>` column maps to the `nested` field type. Element children follow the struct child derivation (int widths, float/double, boolean, date/timestamp, `utf8` → `keyword`); a struct child inside an element maps as an `object` with the same rules. `list<utf8>` children, `List<Struct>` inside an element (nested in nested), vector children and other unsupported types are skipped with a note.
+- The fragment reader emits one hidden child doc per element immediately before the row's parent doc, the layout OpenSearch's `ToParentBlockJoinQuery` requires, and answers the stock parent filter (`_primary_term` doc values on parents) and child filter (`_nested_path` postings on child docs). `nested` queries with `term` / `range` / `exists` / `bool` inner queries work, alone or combined with top-level clauses in a `bool`; `hits.total`, `_count` and `match_all` count parents only.
+- `_source` and GET by id render the column as the array of element objects; a zero-element list renders as `[]`.
+- `inner_hits` is not served: a `nested` query carrying one is refused with 400. The `nested` and `reverse_nested` aggregations stay off the fragment path allow list.
+- Nested predicates are not pushed down to Lance SQL (DataFusion has no `UNNEST` in a filter), so a `nested` query keeps its filter on the Lucene side: the scan runs unfiltered and Lucene filters, and the Lance sort pushdown is skipped for requests carrying a `nested` query.
+- `GET /_lance/stats` reports the hidden child docs per index as `indices.<index>.nested_docs`, and the attach-time Lucene bound arithmetic counts rows plus nested elements.
 
 ## Native memory bounds
 
