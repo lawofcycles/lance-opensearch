@@ -976,12 +976,30 @@ public final class LanceFragmentLeafReader extends LeafReader {
         ensureTextLoaded(name, true);
     }
 
+    /**
+     * The Lance column a dictionary storage name reads. Almost always
+     * the name itself; the keyword sub-field of an {@code ip} column is
+     * the exception: its raw-string view is keyed under the sub-field
+     * name while the bytes come from the base column's scan. Plain
+     * sub-fields never reach the loaders under their own name because
+     * {@link #getSortedDocValues} routes them to the base column.
+     */
+    private String scanColumnFor(String name) {
+        String base = keywordSubFields.get(name);
+        return base != null && schema.ipColumns().contains(base) ? base : name;
+    }
+
     private void ensureTextLoaded(String name, boolean useShardCache) throws IOException {
         if (keywordOrds.containsKey(name) || offHeapKeywordColumns.containsKey(name)) {
             return;
         }
+        String scanColumn = scanColumnFor(name);
         LanceShardColumnCache cache = shardColumnCache;
-        if (cache != null && useShardCache) {
+        // The raw-string view of an ip column's sub-field stays a
+        // per-leaf load: the shard cache and the off-heap store key
+        // dictionaries by the Lance column name, which for this view
+        // would collide with the encoded dictionary of the base column.
+        if (cache != null && useShardCache && scanColumn.equals(name)) {
             cache.loadTextColumn(name);
             return;
         }
@@ -989,7 +1007,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             if (keywordOrds.containsKey(name) || offHeapKeywordColumns.containsKey(name)) {
                 return;
             }
-            if (cache != null && cache.publishKeywordFromStoreForLeaf(this, name)) {
+            if (cache != null && scanColumn.equals(name) && cache.publishKeywordFromStoreForLeaf(this, name)) {
                 return;
             }
             long charged = LanceShardColumnCache.intArrayBytes(maxDoc);
@@ -998,13 +1016,13 @@ public final class LanceFragmentLeafReader extends LeafReader {
             try {
                 int[] ids = new int[maxDoc];
                 Arrays.fill(ids, -1);
-                KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder();
-                ScanOptions colOptions = singleColumnScan(name);
+                KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder(schema.termEncoder(name));
+                ScanOptions colOptions = singleColumnScan(scanColumn);
                 try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
                     while (reader.loadNextBatch()) {
                         VectorSchemaRoot root = reader.getVectorSchemaRoot();
                         UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                        VarCharVector vector = (VarCharVector) root.getVector(name);
+                        VarCharVector vector = (VarCharVector) root.getVector(scanColumn);
                         for (int i = 0; i < root.getRowCount(); i++) {
                             if (vector.isNull(i)) {
                                 continue;
@@ -1016,6 +1034,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 } catch (Exception e) {
                     throw new IOException(e);
                 }
+                IpTermEncoder.logInvalid(name, fragmentId, builder.invalidCount());
                 long termBytes = LanceShardColumnCache.termsHeapBytes(builder.size(), builder.termBytes());
                 chargeHeap(cache, termBytes, name);
                 charged += termBytes;
@@ -1100,7 +1119,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             boolean published = false;
             try {
                 int[][] rows = new int[maxDoc][];
-                KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder();
+                KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder(schema.termEncoder(name));
                 ScanOptions colOptions = singleColumnScan(name);
                 try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
                     while (reader.loadNextBatch()) {
@@ -1119,6 +1138,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 } catch (Exception e) {
                     throw new IOException(e);
                 }
+                IpTermEncoder.logInvalid(name, fragmentId, builder.invalidCount());
                 int[] idToOrd = builder.sort();
                 for (int r = 0; r < rows.length; r++) {
                     if (rows[r] != null) {
@@ -1144,6 +1164,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
     /**
      * Intern the non-null elements of list {@code index} and return
      * their insertion-order ids (not yet remapped to sorted ordinals).
+     * Elements the builder's encoder rejects are skipped like nulls.
      * Shared by the per-leaf loader and {@link LanceShardColumnCache}.
      */
     static int[] internListElements(KeywordDictionaryBuilder builder, ListVector vector, VarCharVector elements, int index) {
@@ -1153,7 +1174,10 @@ public final class LanceFragmentLeafReader extends LeafReader {
         int count = 0;
         for (int e = start; e < end; e++) {
             if (!elements.isNull(e)) {
-                ids[count++] = builder.intern(elements, e);
+                int id = builder.intern(elements, e);
+                if (id >= 0) {
+                    ids[count++] = id;
+                }
             }
         }
         return count == ids.length ? ids : Arrays.copyOf(ids, count);
@@ -1531,12 +1555,13 @@ public final class LanceFragmentLeafReader extends LeafReader {
             }
             int[] ids = new int[hint.length];
             Arrays.fill(ids, -1);
-            KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder();
-            takeHintedRows(name, hint, (hintIndex, vector, row) -> {
+            KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder(schema.termEncoder(name));
+            takeHintedRows(scanColumnFor(name), hint, (hintIndex, vector, row) -> {
                 if (!vector.isNull(row)) {
                     ids[hintIndex] = builder.intern((VarCharVector) vector, row);
                 }
             });
+            IpTermEncoder.logInvalid(name, fragmentId, builder.invalidCount());
             KeywordDictionaryBuilder.Dictionary dictionary = builder.finish();
             dictionary.remap(ids);
             SparseKeyword fresh = new SparseKeyword(hint, ids, dictionary.terms());
@@ -1557,13 +1582,14 @@ public final class LanceFragmentLeafReader extends LeafReader {
                 return existing;
             }
             int[][] rows = new int[hint.length][];
-            KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder();
+            KeywordDictionaryBuilder builder = new KeywordDictionaryBuilder(schema.termEncoder(name));
             takeHintedRows(name, hint, (hintIndex, vector, row) -> {
                 if (!vector.isNull(row)) {
                     ListVector list = (ListVector) vector;
                     rows[hintIndex] = internListElements(builder, list, (VarCharVector) list.getDataVector(), row);
                 }
             });
+            IpTermEncoder.logInvalid(name, fragmentId, builder.invalidCount());
             KeywordDictionaryBuilder.Dictionary dictionary = builder.finish();
             for (int r = 0; r < rows.length; r++) {
                 if (rows[r] != null) {
@@ -1896,11 +1922,18 @@ public final class LanceFragmentLeafReader extends LeafReader {
         // ord data structure. Route through the base column name so
         // ensureTextLoaded reuses whatever ords were already built for
         // TEXT_KEYWORD, or builds fresh ords for a TEXT_FTS base that
-        // otherwise would not have any.
+        // otherwise would not have any. The sub-field of an ip column is
+        // the exception: the base dictionary holds InetAddressPoint
+        // encodings while the sub-field promises the raw strings, so it
+        // keeps its own name and the loaders build it a raw per-leaf
+        // dictionary from the base column's bytes (see scanColumnFor).
         String source = keywordSubFields.getOrDefault(field, field);
         ColumnKind kind = columnKind.get(source);
         if (kind != ColumnKind.TEXT_KEYWORD && !basesWithKeywordSub.contains(source)) {
             return null;
+        }
+        if (!field.equals(source) && schema.ipColumns().contains(source)) {
+            return new HintedSortedDocValues(field);
         }
         return new HintedSortedDocValues(source);
     }
@@ -3456,6 +3489,11 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
     public int fragmentId() {
         return fragmentId;
+    }
+
+    /** Shared column description of the table; the shard cache reads the dictionary encoders from it. */
+    LanceFragmentSchema schema() {
+        return schema;
     }
 
     /**

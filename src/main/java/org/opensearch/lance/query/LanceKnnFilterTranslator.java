@@ -99,6 +99,21 @@ public final class LanceKnnFilterTranslator {
     public static final String DATE_ON_INTEGER = "date_on_integer";
 
     /**
+     * Sentinel a field-type lookup returns for an {@code ip}-mapped
+     * field whose Lance column is Utf8 (the attach body's
+     * {@code type: ip} override). No predicate on such a field pushes
+     * down to Lance SQL: a {@code range} (CIDR or explicit bounds) is
+     * an order over the 16 byte encoded form, not a lexical string
+     * order over the stored strings, and even a {@code term} equality
+     * only matches when the stored strings are canonical, which the
+     * plugin cannot know. The translator refuses the clause, the
+     * caller keeps {@code filterSql} null, and the scan runs
+     * unfiltered with Lucene evaluating the predicate over the encoded
+     * doc values.
+     */
+    public static final String IP_ON_UTF8 = "ip_on_utf8";
+
+    /**
      * Parses the ISO-8601 shapes {@link #ISO_DATE_LIKE} recognises so a
      * string bound on a {@link #DATE_ON_INTEGER} column becomes epoch
      * millis. The same default format the {@code date} field type uses
@@ -263,10 +278,12 @@ public final class LanceKnnFilterTranslator {
         }
         if (builder instanceof TermQueryBuilder t) {
             rejectUnresolvableDottedPath(t.fieldName(), lookup);
+            rejectIpField(t.fieldName(), "term", lookup);
             return t.fieldName() + " = " + literal(t.value(), t.fieldName(), lookup);
         }
         if (builder instanceof TermsQueryBuilder t) {
             rejectUnresolvableDottedPath(t.fieldName(), lookup);
+            rejectIpField(t.fieldName(), "terms", lookup);
             java.util.List<?> values = t.values();
             if (values == null || values.isEmpty()) {
                 // `terms {"col": []}` matches nothing; translate to `false`
@@ -279,10 +296,15 @@ public final class LanceKnnFilterTranslator {
         }
         if (builder instanceof ExistsQueryBuilder e) {
             rejectUnresolvableDottedPath(e.fieldName(), lookup);
+            // `IS NOT NULL` would count rows whose string does not parse
+            // as an IP address, which the doc-value path serves as
+            // missing; exists stays on the Lucene side for consistency.
+            rejectIpField(e.fieldName(), "exists", lookup);
             return e.fieldName() + " IS NOT NULL";
         }
         if (builder instanceof RangeQueryBuilder r) {
             rejectUnresolvableDottedPath(r.fieldName(), lookup);
+            rejectIpField(r.fieldName(), "range", lookup);
             return translateRange(r, lookup);
         }
         if (builder instanceof WildcardQueryBuilder w) {
@@ -332,6 +354,26 @@ public final class LanceKnnFilterTranslator {
         if (fieldType != null && !STRING_FIELD_TYPES.contains(fieldType)) {
             throw new IllegalArgumentException(
                 "[lance_knn] " + queryName + " filter on [" + fieldName + "] of type [" + fieldType + "] needs a string column"
+            );
+        }
+    }
+
+    /**
+     * Refuse any predicate on a field the lookup reports as
+     * {@link #IP_ON_UTF8}. See the constant for why no shape pushes:
+     * the SQL comparison would run over the stored strings while the
+     * doc-value path compares encoded 16 byte forms. Throwing sends the
+     * caller to the Lucene path, where {@code IpFieldType} builds the
+     * correct doc-value query.
+     */
+    private static void rejectIpField(String fieldName, String queryName, Function<String, String> lookup) {
+        if (IP_ON_UTF8.equals(lookup.apply(fieldName))) {
+            throw new IllegalArgumentException(
+                "[lance_knn] "
+                    + queryName
+                    + " filter on ["
+                    + fieldName
+                    + "] cannot push down to Lance; ip fields are evaluated over encoded doc values on the Lucene side"
             );
         }
     }

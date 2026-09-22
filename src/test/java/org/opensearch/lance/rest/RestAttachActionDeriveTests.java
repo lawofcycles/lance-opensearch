@@ -259,4 +259,66 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
             assertTrue(e.getMessage(), e.getMessage().contains("must be [keyword]"));
         }
     }
+
+    private String ipTable() throws Exception {
+        Path scratchDir = createTempDir();
+        return LanceTableFactory.writeIpTable(scratchDir, "derive-" + getTestName().toLowerCase(Locale.ROOT));
+    }
+
+    public void testIpOverrideOnUtf8DerivesIpMapping() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides(Map.of("ip", Map.of("type", "ip"))));
+            String mapping = derivation.mappingJson();
+            assertTrue("ip must map as ip: " + mapping, mapping.contains("\"ip\":{\"type\":\"ip\""));
+            assertTrue("meta must keep the real Arrow type: " + mapping, mapping.contains("\"lance_arrow_type\":\"Utf8\""));
+            assertTrue("doc values only, like every scalar: " + mapping, mapping.contains("\"index\":false,\"doc_values\":true"));
+            assertFalse("ip must not join ftsColumns: " + derivation.ftsColumns(), derivation.ftsColumns().contains("ip"));
+            assertTrue("ip joins scalarColumns: " + derivation.scalarColumns(), derivation.scalarColumns().contains("ip"));
+        }
+    }
+
+    public void testIpOverrideOnListOfUtf8DerivesIpMapping() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides(Map.of("addrs", Map.of("type", "ip"))));
+            String mapping = derivation.mappingJson();
+            assertTrue("addrs must map as ip: " + mapping, mapping.contains("\"addrs\":{\"type\":\"ip\""));
+            assertTrue("meta must keep the list shape: " + mapping, mapping.contains("\"lance_arrow_type\":\"list<utf8>\""));
+        }
+    }
+
+    public void testIpOverrideWithKeywordSubFieldEmitsBoth() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("ip", Map.of("type", "ip", "fields", Map.of("raw", Map.of("type", "keyword")))))
+            );
+            String mapping = derivation.mappingJson();
+            assertTrue(mapping, mapping.contains("\"ip\":{\"type\":\"ip\""));
+            assertTrue(mapping, mapping.contains("\"fields\":{\"raw\":{\"type\":\"keyword\""));
+        }
+    }
+
+    public void testIpOverrideOnNonStringColumnRejected() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("id", Map.of("type", "ip"))))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("needs a Utf8 or List<Utf8> column"));
+            assertTrue(e.getMessage(), e.getMessage().contains("id"));
+        }
+    }
+
+    public void testIpOverrideOnInvertedIndexColumnLeavesFts() throws Exception {
+        // The label column of the epoch-millis fixture carries a Lance
+        // inverted index; an ip override takes it off the FTS path like
+        // a keyword override does.
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides(Map.of("label", Map.of("type", "ip"))));
+            String mapping = derivation.mappingJson();
+            assertTrue("label must map as ip: " + mapping, mapping.contains("\"label\":{\"type\":\"ip\""));
+            assertFalse("label must not map as lance_text: " + mapping, mapping.contains("lance_text"));
+            assertFalse("label must leave ftsColumns: " + derivation.ftsColumns(), derivation.ftsColumns().contains("label"));
+        }
+    }
 }

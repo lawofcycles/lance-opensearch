@@ -97,6 +97,7 @@ public final class LanceFragmentSchema {
     private final Map<String, NumericPrecision> numericPrecision;
     private final Map<String, String> keywordSubFields;
     private final Set<String> basesWithKeywordSub;
+    private final Set<String> ipColumns;
     private final Set<String> structColumns;
     private final Set<String> nestedColumns;
     private final Map<String, String> nestedChildToParent;
@@ -112,6 +113,7 @@ public final class LanceFragmentSchema {
         Map<String, NumericPrecision> numericPrecision,
         Map<String, String> keywordSubFields,
         Set<String> basesWithKeywordSub,
+        Set<String> ipColumns,
         Set<String> structColumns,
         Set<String> nestedColumns,
         Map<String, String> nestedChildToParent,
@@ -126,6 +128,7 @@ public final class LanceFragmentSchema {
         this.numericPrecision = numericPrecision;
         this.keywordSubFields = keywordSubFields;
         this.basesWithKeywordSub = basesWithKeywordSub;
+        this.ipColumns = ipColumns;
         this.structColumns = structColumns;
         this.nestedColumns = nestedColumns;
         this.nestedChildToParent = nestedChildToParent;
@@ -198,8 +201,12 @@ public final class LanceFragmentSchema {
         // reader must serve it through SortedSetDocValues like any other
         // keyword column; drop it from the FTS set before classification
         // refines TEXT_FTS. The Lance inverted index on the column stays
-        // in place, it is just not consulted by this index.
+        // in place, it is just not consulted by this index. An `ip`
+        // override does the same and additionally marks the column so
+        // the dictionary loaders encode every value into the 16 byte
+        // InetAddressPoint form the `ip` field type reads.
         Set<String> keywordOverridden = overrides == null ? Set.of() : overrides.keywordColumns();
+        Set<String> ipOverridden = overrides == null ? Set.of() : overrides.ipColumns();
 
         // Flatten the multi-fields spec into "<sub>" → "<base>" lookup so
         // getSortedDocValues("body.raw") can route to the base column's
@@ -270,9 +277,9 @@ public final class LanceFragmentSchema {
                     continue;
                 }
                 if (kind == ColumnKind.TEXT_FTS) {
-                    kind = ftsColumns.contains(field.getName()) && !keywordOverridden.contains(field.getName())
-                        ? ColumnKind.TEXT_FTS
-                        : ColumnKind.TEXT_KEYWORD;
+                    kind = ftsColumns.contains(field.getName())
+                        && !keywordOverridden.contains(field.getName())
+                        && !ipOverridden.contains(field.getName()) ? ColumnKind.TEXT_FTS : ColumnKind.TEXT_KEYWORD;
                 }
                 columnKind.put(field.getName(), kind);
                 topLevelOrder.add(field.getName());
@@ -353,6 +360,19 @@ public final class LanceFragmentSchema {
             infos.add(indexedFieldInfo(NestedPathFieldMapper.NAME, number++));
         }
 
+        // Columns whose dictionary terms are InetAddressPoint-encoded:
+        // the `ip` overrides that classified onto an ordinal-based kind
+        // (a scalar Utf8 or a List<Utf8> column present in this
+        // manifest). An override whose column is absent waits in the
+        // index setting and encodes nothing here.
+        Set<String> ipColumns = new LinkedHashSet<>();
+        for (String ipColumn : ipOverridden) {
+            ColumnKind kind = columnKind.get(ipColumn);
+            if (kind == ColumnKind.TEXT_KEYWORD || kind == ColumnKind.KEYWORD_ARRAY) {
+                ipColumns.add(ipColumn);
+            }
+        }
+
         return new LanceFragmentSchema(
             intField,
             effectivePkType,
@@ -360,6 +380,7 @@ public final class LanceFragmentSchema {
             Collections.unmodifiableMap(numericPrecision),
             Collections.unmodifiableMap(subToBase),
             Collections.unmodifiableSet(basesWithKeywordSub),
+            Collections.unmodifiableSet(ipColumns),
             Collections.unmodifiableSet(structColumns),
             Collections.unmodifiableSet(nestedColumns),
             Collections.unmodifiableMap(nestedChildToParent),
@@ -594,6 +615,28 @@ public final class LanceFragmentSchema {
     /** Base column names that carry at least one keyword sub-field. */
     Set<String> basesWithKeywordSub() {
         return basesWithKeywordSub;
+    }
+
+    /**
+     * Columns whose dictionary terms are the 16 byte
+     * {@link org.apache.lucene.document.InetAddressPoint} encoding of
+     * the stored strings ({@code type: ip} overrides). Their keyword
+     * sub-fields keep serving the raw strings through a separate
+     * per-leaf dictionary.
+     */
+    Set<String> ipColumns() {
+        return ipColumns;
+    }
+
+    /**
+     * The value encoder the dictionary loaders install for
+     * {@code column}, or {@code null} when the raw UTF-8 bytes are the
+     * dictionary terms. Keyed by the dictionary's storage name: the
+     * base column name answers the encoder, a sub-field name answers
+     * {@code null} (its raw view interns unencoded strings).
+     */
+    KeywordDictionaryBuilder.TermEncoder termEncoder(String column) {
+        return ipColumns.contains(column) ? IpTermEncoder.INSTANCE : null;
     }
 
     /**

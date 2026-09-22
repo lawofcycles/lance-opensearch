@@ -324,4 +324,41 @@ public class LanceKnnFilterTranslatorTests extends OpenSearchTestCase {
             LanceKnnFilterTranslator.toLanceSql(QueryBuilders.rangeQuery("ts").gte(1709251200000L), lookup)
         );
     }
+
+    public void testIpFieldRejectsEveryPushableShape() {
+        // No predicate on an ip-overridden field pushes to Lance SQL:
+        // the SQL would compare stored strings while the doc-value path
+        // compares 16 byte encoded forms, so a range or CIDR match over
+        // strings answers differently. The refusal sends the caller to
+        // the Lucene path where IpFieldType builds the doc-value query.
+        Function<String, String> lookup = name -> "addr".equals(name) ? LanceKnnFilterTranslator.IP_ON_UTF8 : null;
+        for (QueryBuilder builder : List.<QueryBuilder>of(
+            QueryBuilders.termQuery("addr", "10.0.0.4"),
+            QueryBuilders.termsQuery("addr", "10.0.0.4", "2001:db8::1"),
+            QueryBuilders.rangeQuery("addr").gte("10.0.0.0").lte("10.255.255.255"),
+            QueryBuilders.termQuery("addr", "10.0.0.0/8"),
+            QueryBuilders.existsQuery("addr")
+        )) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> LanceKnnFilterTranslator.toLanceSql(builder, lookup)
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("addr"));
+        }
+        // Pattern queries refuse through the string-column gate: an ip
+        // field is not a string type on the SQL side.
+        IllegalArgumentException wildcard = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceKnnFilterTranslator.toLanceSql(QueryBuilders.wildcardQuery("addr", "10.*"), lookup)
+        );
+        assertTrue(wildcard.getMessage(), wildcard.getMessage().contains("needs a string column"));
+        // A bool wrapping an ip clause refuses as a whole, so the
+        // coordinator falls back to a null filterSql for the request.
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceKnnFilterTranslator.toLanceSql(QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("addr", "10.0.0.4")), lookup)
+        );
+        // Other fields keep translating under the same lookup.
+        assertEquals("id = 1", LanceKnnFilterTranslator.toLanceSql(QueryBuilders.termQuery("id", 1), lookup));
+    }
 }

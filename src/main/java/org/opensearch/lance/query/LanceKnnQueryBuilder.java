@@ -426,6 +426,12 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
                     return LanceKnnFilterTranslator.DATE_ON_INTEGER;
                 }
             }
+            if ("ip".equals(typeName)) {
+                // An ip field always sits on a Utf8 column in this
+                // plugin; its predicates never push as string
+                // comparisons (see LanceKnnFilterTranslator.IP_ON_UTF8).
+                return LanceKnnFilterTranslator.IP_ON_UTF8;
+            }
             return typeName;
         });
         return new LanceKnnQuery(field, vector, k, nprobes, refineFactor, ef, parseDistance(metric), useIndex, filterSql);

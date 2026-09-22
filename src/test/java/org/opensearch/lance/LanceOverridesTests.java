@@ -101,10 +101,25 @@ public class LanceOverridesTests extends OpenSearchTestCase {
     public void testUnknownTypeRejected() {
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> LanceOverrides.parseAttachClauses(Map.of("col", Map.of("type", "ip")), null)
+            () -> LanceOverrides.parseAttachClauses(Map.of("col", Map.of("type", "geo_point")), null)
         );
-        assertTrue(e.getMessage(), e.getMessage().contains("type=ip"));
-        assertTrue(e.getMessage(), e.getMessage().contains("[date], [keyword]"));
+        assertTrue(e.getMessage(), e.getMessage().contains("type=geo_point"));
+        assertTrue(e.getMessage(), e.getMessage().contains("[date], [keyword], [ip]"));
+    }
+
+    public void testIpTypeParsesAndReportsThroughIpColumns() {
+        LanceOverrides overrides = LanceOverrides.parseAttachClauses(Map.of("addr", Map.of("type", "ip")), null);
+        assertEquals(java.util.Set.of("addr"), overrides.ipColumns());
+        assertTrue(overrides.keywordColumns().isEmpty());
+        assertEquals(overrides, LanceOverrides.parse(overrides.toJson()));
+    }
+
+    public void testFormatWithIpTypeRejected() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(Map.of("addr", Map.of("type", "ip", "format", "epoch_millis")), null)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("only accepted together with [type: date]"));
     }
 
     public void testFormatWithoutDateTypeRejected() {

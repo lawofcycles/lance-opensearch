@@ -816,7 +816,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     }
 
     public void testOverridesRejectsUnknownColumnType() throws Exception {
-        // Type values outside the accepted set (date, keyword) are
+        // Type values outside the accepted set (date, keyword, ip) are
         // refused at parse time, naming the accepted set.
         String suffix = "overrides-type-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
@@ -825,11 +825,11 @@ public class LanceAttachIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         ResponseException failure = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"type\":\"ip\"}}}")
+            () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"type\":\"geo_point\"}}}")
         );
         assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
         String body = readAll(failure.getResponse());
-        assertTrue("expected message naming the accepted types: " + body, body.contains("[date], [keyword]"));
+        assertTrue("expected message naming the accepted types: " + body, body.contains("[date], [keyword], [ip]"));
     }
 
     public void testOverridesConflictsWithMultiFieldsRejected() throws Exception {
