@@ -40,10 +40,14 @@ import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.document.Document;
+import org.apache.lucene.geo.GeoEncodingUtils;
 import org.apache.lucene.index.BaseTermsEnum;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.ByteVectorValues;
@@ -122,6 +126,8 @@ import org.opensearch.lance.engine.LanceFragmentSchema.NumericPrecision;
  * {@link CachedKeywordArrayColumn}).
  */
 public final class LanceFragmentLeafReader extends LeafReader {
+
+    private static final Logger LOGGER = LogManager.getLogger(LanceFragmentLeafReader.class);
 
     private final String fieldName;
     /**
@@ -279,6 +285,20 @@ public final class LanceFragmentLeafReader extends LeafReader {
     private final Map<String, FixedBitSet> numericPresence = new ConcurrentHashMap<>();
     private final Map<String, long[]> booleanColumns = new ConcurrentHashMap<>();
     private final Map<String, FixedBitSet> booleanPresence = new ConcurrentHashMap<>();
+    /**
+     * geo_point-overridden columns of this fragment: one encoded long
+     * per row, {@code (encodeLatitude(lat) << 32) | (encodeLongitude(lon)
+     * & 0xFFFFFFFFL)} — the exact {@code LatLonDocValuesField} layout
+     * OpenSearch's geo queries, {@code _geo_distance} sort and geo
+     * aggregations decode. Loaded by {@link #ensureGeoPointLoaded} in
+     * one Lance scan of the Struct's two children (or the
+     * FixedSizeList's element vector); presence bit clear when the cell
+     * or either component is Arrow null or out of coordinate range.
+     */
+    private final Map<String, long[]> geoColumns = new ConcurrentHashMap<>();
+    private final Map<String, FixedBitSet> geoPresence = new ConcurrentHashMap<>();
+    /** How each geo_point column stores its point (Struct child names or FixedSizeList element order), from the schema. */
+    private final Map<String, LanceFragmentSchema.GeoPointColumn> geoPointColumns;
     /**
      * Numeric and boolean columns of this fragment served from the
      * off-heap {@link ColumnStore}, published by
@@ -592,6 +612,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
         }
         this.columnKind = schema.columnKind();
         this.numericPrecision = schema.numericPrecision();
+        this.geoPointColumns = schema.geoPointColumns();
         this.sourceColumnCount = schema.sourceColumnCount();
         this.pkTakeIndex = schema.pkTakeIndex();
         this.takeColumns = schema.takeColumns();
@@ -957,6 +978,110 @@ public final class LanceFragmentLeafReader extends LeafReader {
     void publishBooleanColumn(String name, long[] values, FixedBitSet presence) {
         booleanPresence.put(name, presence);
         booleanColumns.put(name, values);
+    }
+
+    /**
+     * Lance-scan a geo_point column into {@link #geoColumns} /
+     * {@link #geoPresence}: one scan of the single column (the whole
+     * Struct or FixedSizeList projects both components), each present
+     * pair encoded into the {@code LatLonDocValuesField} long layout
+     * ({@code encodeLatitude(lat) << 32 | encodeLongitude(lon) &
+     * 0xFFFFFFFFL}). A row whose cell or either component is Arrow
+     * null, or whose coordinates are outside the +/-90 / +/-180 bounds,
+     * is served as missing (presence bit clear); out-of-range rows are
+     * counted and logged once per fragment, mirroring the unparsable-ip
+     * handling. The load is per fragment and charged to the request
+     * breaker; the shard cache's consolidated scan does not carry geo
+     * columns today.
+     */
+    private void ensureGeoPointLoaded(String name) throws IOException {
+        if (geoColumns.containsKey(name)) {
+            return;
+        }
+        synchronized (columnLock(name)) {
+            if (geoColumns.containsKey(name)) {
+                return;
+            }
+            LanceShardColumnCache cache = shardColumnCache;
+            long heapBytes = LanceShardColumnCache.numericHeapBytes(maxDoc);
+            chargeHeap(cache, heapBytes, name);
+            boolean published = false;
+            try {
+                long[] col = new long[maxDoc];
+                FixedBitSet presence = new FixedBitSet(maxDoc);
+                LanceFragmentSchema.GeoPointColumn spec = geoPointColumns.get(name);
+                int outOfRange = 0;
+                ScanOptions colOptions = singleColumnScan(name);
+                try (LanceScanner scanner = dataset.newScan(colOptions); ArrowReader reader = scanner.scanBatches()) {
+                    while (reader.loadNextBatch()) {
+                        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                        UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                        FieldVector vector = root.getVector(name);
+                        for (int i = 0; i < root.getRowCount(); i++) {
+                            int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
+                            double[] point = decodeGeoPoint(spec, vector, i);
+                            if (point == null) {
+                                continue;
+                            }
+                            try {
+                                col[offset] = (((long) GeoEncodingUtils.encodeLatitude(point[0])) << 32) | (GeoEncodingUtils
+                                    .encodeLongitude(point[1]) & 0xFFFFFFFFL);
+                                presence.set(offset);
+                            } catch (IllegalArgumentException outOfBounds) {
+                                outOfRange++;
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    throw new IOException(e);
+                }
+                if (outOfRange > 0) {
+                    LOGGER.warn(
+                        "fragment {}: {} rows of geo_point column [{}] have coordinates outside +/-90 / +/-180 and are served as missing",
+                        fragmentId,
+                        outOfRange,
+                        name
+                    );
+                }
+                geoPresence.put(name, presence);
+                geoColumns.put(name, col);
+                published = true;
+            } finally {
+                if (!published) {
+                    releaseHeap(cache, heapBytes);
+                }
+            }
+        }
+    }
+
+    /**
+     * Decode one geo cell into {@code {lat, lon}}, or {@code null} when
+     * the cell or either component is Arrow null. Shared by the column
+     * load above and the per-hit take decode so {@code _source} and the
+     * doc values agree on what counts as missing.
+     */
+    private static double[] decodeGeoPoint(LanceFragmentSchema.GeoPointColumn spec, FieldVector vector, int i) {
+        if (vector == null || vector.isNull(i)) {
+            return null;
+        }
+        if (spec.isStruct()) {
+            StructVector struct = (StructVector) vector;
+            Float8Vector lat = (Float8Vector) struct.getChild(spec.latChild());
+            Float8Vector lon = (Float8Vector) struct.getChild(spec.lonChild());
+            if (lat == null || lon == null || lat.isNull(i) || lon.isNull(i)) {
+                return null;
+            }
+            return new double[] { lat.get(i), lon.get(i) };
+        }
+        FixedSizeListVector list = (FixedSizeListVector) vector;
+        Float8Vector element = (Float8Vector) list.getDataVector();
+        int base = i * 2;
+        if (element.isNull(base) || element.isNull(base + 1)) {
+            return null;
+        }
+        double first = element.get(base);
+        double second = element.get(base + 1);
+        return spec.latFirst() ? new double[] { first, second } : new double[] { second, first };
     }
 
     /**
@@ -1864,8 +1989,102 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
     @Override
     public SortedNumericDocValues getSortedNumericDocValues(String field) {
+        if (columnKind.get(field) == ColumnKind.GEO_POINT) {
+            // One point per row (multi-valued geo points are refused at
+            // attach), so the multi-valued interface geo queries, the
+            // _geo_distance sort and geo aggregations read is a
+            // singleton over the encoded-long column.
+            return DocValues.singleton(new GeoPointNumericDocValues(field));
+        }
         NumericDocValues numeric = getNumericDocValues(field);
         return numeric == null ? null : DocValues.singleton(numeric);
+    }
+
+    /**
+     * Doc values of a geo_point column: the encoded {@code lat|lon}
+     * long per present row. Loads the column on first use (Lucene asks
+     * for doc values while building scorers, before any doc is
+     * consumed) and answers presence from the load's bitmap so
+     * {@code exists} and the two-phase geo iterators skip Arrow-null
+     * locations. No hint path: geo predicates never push to Lance, so
+     * the scan that produced the hits ran unfiltered and every doc of
+     * the leaf may be asked.
+     */
+    private final class GeoPointNumericDocValues extends NumericDocValues {
+        private final String name;
+        private long[] column;
+        private FixedBitSet presence;
+        private int doc = -1;
+        /** Row behind {@link #doc}; what the column and presence are indexed by. */
+        private int row = -1;
+
+        GeoPointNumericDocValues(String name) {
+            this.name = name;
+        }
+
+        private void resolve() throws IOException {
+            if (column != null) {
+                return;
+            }
+            ensureGeoPointLoaded(name);
+            column = geoColumns.get(name);
+            presence = geoPresence.get(name);
+        }
+
+        @Override
+        public long longValue() {
+            return column[row];
+        }
+
+        @Override
+        public boolean advanceExact(int target) throws IOException {
+            doc = target;
+            if (liveDocs != null && !liveDocs.get(target)) {
+                return false;
+            }
+            row = rowIfParent(target);
+            if (row < 0) {
+                return false;
+            }
+            resolve();
+            return presence.get(row);
+        }
+
+        @Override
+        public int docID() {
+            return doc;
+        }
+
+        @Override
+        public int nextDoc() throws IOException {
+            return advance(doc + 1);
+        }
+
+        @Override
+        public int advance(int target) throws IOException {
+            resolve();
+            for (int candidate = target; candidate < maxDoc; candidate++) {
+                if (liveDocs != null && !liveDocs.get(candidate)) {
+                    continue;
+                }
+                int candidateRow = rowIfParent(candidate);
+                if (candidateRow < 0) {
+                    continue;
+                }
+                if (presence.get(candidateRow)) {
+                    doc = candidate;
+                    row = candidateRow;
+                    return doc;
+                }
+            }
+            doc = NO_MORE_DOCS;
+            return doc;
+        }
+
+        @Override
+        public long cost() {
+            return maxDoc;
+        }
     }
 
     @Override
@@ -3225,6 +3444,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             case NUMERIC -> readAsLong(vector, i);
             case BOOLEAN -> ((BitVector) vector).get(i) == 1;
             case TEXT_FTS, TEXT_KEYWORD -> new String(((VarCharVector) vector).get(i), java.nio.charset.StandardCharsets.UTF_8);
+            case GEO_POINT -> decodeGeoPoint(geoPointColumns.get(name), vector, i);
             case KEYWORD_ARRAY -> {
                 ListVector list = (ListVector) vector;
                 VarCharVector elements = (VarCharVector) list.getDataVector();
@@ -3471,6 +3691,15 @@ public final class LanceFragmentLeafReader extends LeafReader {
             case BOOLEAN -> builder.field(key, (Boolean) value);
             case TEXT_FTS, TEXT_KEYWORD -> builder.field(key, (String) value);
             case KEYWORD_ARRAY -> builder.field(key, (String[]) value);
+            case GEO_POINT -> {
+                // Render canonically as {"lat": .., "lon": ..} with the
+                // original double values regardless of the Arrow storage
+                // (Struct child names or FixedSizeList order): the field
+                // maps as geo_point, so the object shape every geo_point
+                // consumer understands is the faithful projection.
+                double[] point = (double[]) value;
+                builder.startObject(key).field("lat", point[0]).field("lon", point[1]).endObject();
+            }
             case BINARY -> builder.field(key, Base64.getEncoder().encodeToString((byte[]) value));
         }
     }

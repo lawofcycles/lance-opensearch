@@ -57,7 +57,22 @@ public final class LanceFragmentSchema {
         TEXT_FTS,      // Utf8 with a Lance FTS index — FieldInfo only, no doc values
         TEXT_KEYWORD,  // Utf8 without an FTS index — SortedSetDocValues via ords
         KEYWORD_ARRAY, // List<Utf8> — multi-valued SortedSetDocValues
-        BINARY         // Binary / LargeBinary — FieldInfo only, values fetched for _source
+        BINARY,        // Binary / LargeBinary — FieldInfo only, values fetched for _source
+        GEO_POINT      // geo_point override on Struct<Float64,Float64> or FixedSizeList<Float64>[2] — SortedNumericDocValues of encoded lat|lon longs
+    }
+
+    /**
+     * How a {@link ColumnKind#GEO_POINT} column stores its point. A
+     * Struct column names its two Float64 children ({@code latChild} /
+     * {@code lonChild}, resolved from the accepted name pairs at derive
+     * time); a FixedSizeList column carries {@code null} child names and
+     * {@code latFirst} decides which of the two elements is the
+     * latitude (the attach body's {@code overrides.<col>.order}).
+     */
+    record GeoPointColumn(String latChild, String lonChild, boolean latFirst) {
+        boolean isStruct() {
+            return latChild != null;
+        }
     }
 
     /**
@@ -98,6 +113,7 @@ public final class LanceFragmentSchema {
     private final Map<String, String> keywordSubFields;
     private final Set<String> basesWithKeywordSub;
     private final Set<String> ipColumns;
+    private final Map<String, GeoPointColumn> geoPointColumns;
     private final Set<String> structColumns;
     private final Set<String> nestedColumns;
     private final Map<String, String> nestedChildToParent;
@@ -114,6 +130,7 @@ public final class LanceFragmentSchema {
         Map<String, String> keywordSubFields,
         Set<String> basesWithKeywordSub,
         Set<String> ipColumns,
+        Map<String, GeoPointColumn> geoPointColumns,
         Set<String> structColumns,
         Set<String> nestedColumns,
         Map<String, String> nestedChildToParent,
@@ -129,6 +146,7 @@ public final class LanceFragmentSchema {
         this.keywordSubFields = keywordSubFields;
         this.basesWithKeywordSub = basesWithKeywordSub;
         this.ipColumns = ipColumns;
+        this.geoPointColumns = geoPointColumns;
         this.structColumns = structColumns;
         this.nestedColumns = nestedColumns;
         this.nestedChildToParent = nestedChildToParent;
@@ -213,6 +231,12 @@ public final class LanceFragmentSchema {
             keywordOverridden.addAll(overrides.wildcardColumns());
         }
         Set<String> ipOverridden = overrides == null ? Set.of() : overrides.ipColumns();
+        // A `type: geo_point` override classifies its Struct or
+        // FixedSizeList column as GEO_POINT: one field, encoded lat|lon
+        // longs served through SortedNumericDocValues. The map value is
+        // the declared FixedSizeList order (null on a Struct, whose
+        // child names fix the order).
+        Map<String, String> geoOverridden = overrides == null ? Map.of() : overrides.geoPointColumns();
 
         // Flatten the multi-fields spec into "<sub>" → "<base>" lookup so
         // getSortedDocValues("body.raw") can route to the base column's
@@ -245,12 +269,28 @@ public final class LanceFragmentSchema {
         // struct columns by the parent name.
         LinkedHashMap<String, ColumnKind> columnKind = new LinkedHashMap<>();
         Map<String, NumericPrecision> numericPrecision = new LinkedHashMap<>();
+        Map<String, GeoPointColumn> geoPointColumns = new LinkedHashMap<>();
         Set<String> structColumns = new LinkedHashSet<>();
         Set<String> nestedColumns = new LinkedHashSet<>();
         Map<String, String> nestedChildToParent = new LinkedHashMap<>();
         List<String> topLevelOrder = new ArrayList<>();
         try {
             for (Field field : dataset.getSchema().getFields()) {
+                if (geoOverridden.containsKey(field.getName())) {
+                    // Geo override first: it replaces both the object
+                    // classification a Struct would get and the null a
+                    // FixedSizeList would get. A column whose current
+                    // shape no longer admits the override (a schema
+                    // reset since attach) falls through to the normal
+                    // classification, mirroring the lenient derive.
+                    GeoPointColumn spec = geoPointSpec(field, geoOverridden.get(field.getName()));
+                    if (spec != null) {
+                        columnKind.put(field.getName(), ColumnKind.GEO_POINT);
+                        geoPointColumns.put(field.getName(), spec);
+                        topLevelOrder.add(field.getName());
+                        continue;
+                    }
+                }
                 if (field.getType() instanceof ArrowType.Struct) {
                     int before = columnKind.size();
                     classifyStructChildren(field, field.getName(), columnKind, numericPrecision);
@@ -347,6 +387,7 @@ public final class LanceFragmentSchema {
             DocValuesType dvType = switch (entry.getValue()) {
                 case NUMERIC, BOOLEAN -> DocValuesType.NUMERIC;
                 case TEXT_KEYWORD, KEYWORD_ARRAY -> DocValuesType.SORTED_SET;
+                case GEO_POINT -> DocValuesType.SORTED_NUMERIC;
                 case TEXT_FTS, BINARY -> DocValuesType.NONE;
             };
             infos.add(fieldInfo(entry.getKey(), number++, dvType));
@@ -387,6 +428,7 @@ public final class LanceFragmentSchema {
             Collections.unmodifiableMap(subToBase),
             Collections.unmodifiableSet(basesWithKeywordSub),
             Collections.unmodifiableSet(ipColumns),
+            Collections.unmodifiableMap(geoPointColumns),
             Collections.unmodifiableSet(structColumns),
             Collections.unmodifiableSet(nestedColumns),
             Collections.unmodifiableMap(nestedChildToParent),
@@ -395,6 +437,57 @@ public final class LanceFragmentSchema {
             pkIndex,
             new FieldInfos(infos.toArray(new FieldInfo[0]))
         );
+    }
+
+    /**
+     * Resolve the storage of a geo_point-overridden column, or
+     * {@code null} when the column's current Arrow shape does not admit
+     * the override (a schema reset since attach; the caller falls back
+     * to the normal classification). Mirrors the attach-time validation
+     * in {@code RestAttachAction.validateColumnOverride}: a Struct with
+     * two Float64 children named {@code (lat, lon)},
+     * {@code (latitude, longitude)} or {@code (y, x)} in either order,
+     * or a FixedSizeList&lt;Float64&gt;[2] whose element order comes
+     * from the override's declared {@code order} ({@code lat_lon} when
+     * none was declared).
+     */
+    private static GeoPointColumn geoPointSpec(Field field, String declaredOrder) {
+        ArrowType type = field.getType();
+        if (type instanceof ArrowType.Struct && field.getChildren().size() == 2) {
+            Field c0 = field.getChildren().get(0);
+            Field c1 = field.getChildren().get(1);
+            boolean bothFloat64 = c0.getType() instanceof ArrowType.FloatingPoint fp0
+                && fp0.getPrecision() == FloatingPointPrecision.DOUBLE
+                && c1.getType() instanceof ArrowType.FloatingPoint fp1
+                && fp1.getPrecision() == FloatingPointPrecision.DOUBLE;
+            if (!bothFloat64) {
+                return null;
+            }
+            String n0 = c0.getName().toLowerCase(java.util.Locale.ROOT);
+            String n1 = c1.getName().toLowerCase(java.util.Locale.ROOT);
+            if (isLatName(n0) && isLonName(n1)) {
+                return new GeoPointColumn(c0.getName(), c1.getName(), true);
+            }
+            if (isLonName(n0) && isLatName(n1)) {
+                return new GeoPointColumn(c1.getName(), c0.getName(), true);
+            }
+            return null;
+        }
+        if (type instanceof ArrowType.FixedSizeList fsl && fsl.getListSize() == 2 && field.getChildren().size() == 1) {
+            ArrowType childType = field.getChildren().get(0).getType();
+            if (childType instanceof ArrowType.FloatingPoint fp && fp.getPrecision() == FloatingPointPrecision.DOUBLE) {
+                return new GeoPointColumn(null, null, !"lon_lat".equals(declaredOrder));
+            }
+        }
+        return null;
+    }
+
+    private static boolean isLatName(String name) {
+        return "lat".equals(name) || "latitude".equals(name) || "y".equals(name);
+    }
+
+    private static boolean isLonName(String name) {
+        return "lon".equals(name) || "longitude".equals(name) || "x".equals(name);
     }
 
     /** Whether {@code field} is a {@code List} whose single child is a {@code Struct}. */
@@ -632,6 +725,15 @@ public final class LanceFragmentSchema {
      */
     Set<String> ipColumns() {
         return ipColumns;
+    }
+
+    /**
+     * geo_point-overridden columns and how each stores its point
+     * (Struct child names or FixedSizeList element order). Keys are the
+     * {@link ColumnKind#GEO_POINT} entries of {@link #columnKind()}.
+     */
+    Map<String, GeoPointColumn> geoPointColumns() {
+        return geoPointColumns;
     }
 
     /**
