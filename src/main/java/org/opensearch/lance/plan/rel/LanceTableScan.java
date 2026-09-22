@@ -24,6 +24,8 @@ import org.opensearch.lance.plan.rel.PushedOperation.PushedAggregate;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedFilter;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedFts;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedKnn;
+import org.opensearch.lance.plan.rel.PushedOperation.PushedTopK;
+import org.lance.ipc.ColumnOrdering;
 
 import java.nio.ByteBuffer;
 import java.util.List;
@@ -96,6 +98,16 @@ public class LanceTableScan extends TableScan implements LanceRel {
         return Optional.empty();
     }
 
+    /** The pushed top-k page, when the scan carries one. */
+    public Optional<PushedTopK> pushedTopK() {
+        for (PushedOperation operation : pushedOperations) {
+            if (operation instanceof PushedTopK topK) {
+                return Optional.of(topK);
+            }
+        }
+        return Optional.empty();
+    }
+
     /**
      * The same scan with {@code aggregate} pushed into it: the scan's
      * row type becomes the aggregate's and the plan above no longer
@@ -106,6 +118,9 @@ public class LanceTableScan extends TableScan implements LanceRel {
     public LanceTableScan withPushedAggregate(LanceAggregate aggregate, ByteBuffer bytes) {
         if (pushedAggregate().isPresent()) {
             throw new IllegalStateException("the scan already carries a pushed aggregate");
+        }
+        if (pushedTopK().isPresent()) {
+            throw new IllegalStateException("a pushed aggregate does not combine with a pushed top-k");
         }
         ImmutableList<PushedOperation> pushed = ImmutableList.<PushedOperation>builder()
             .addAll(pushedOperations)
@@ -122,6 +137,9 @@ public class LanceTableScan extends TableScan implements LanceRel {
     public LanceTableScan withPushedFilter(RexNode condition, String sql) {
         if (pushedFilter().isPresent()) {
             throw new IllegalStateException("the scan already carries a pushed filter");
+        }
+        if (pushedTopK().isPresent()) {
+            throw new IllegalStateException("a filter cannot push below a pushed top-k, which already cut the page");
         }
         ImmutableList<PushedOperation> pushed = ImmutableList.<PushedOperation>builder()
             .addAll(pushedOperations)
@@ -159,6 +177,35 @@ public class LanceTableScan extends TableScan implements LanceRel {
         return new LanceTableScan(getCluster(), getTraitSet(), table, ImmutableList.of(new PushedKnn(knn, filterSql)));
     }
 
+    /**
+     * The same scan with the hits page pushed into it: the Lance
+     * dataset scan returns the top {@code fetch} rows already in
+     * {@code orderings} order (or in the FTS / knn scan's score order
+     * when {@code orderings} is empty), with {@code cursorSql} ANDed
+     * into the scan filter for a {@code search_after} continuation.
+     * The page cuts the rows of exactly one query, so the scan must be
+     * bare or carry a single pushed filter, FTS or knn; a pushed
+     * aggregate consumes every matching row and does not combine with
+     * a page. With {@code hitShape} the scan stands in for the whole
+     * hits plan and takes the hit shape's row type.
+     */
+    public LanceTableScan withPushedTopK(LanceTopK topK, LanceHitShape hitShape, List<ColumnOrdering> orderings, String cursorSql) {
+        if (pushedTopK().isPresent()) {
+            throw new IllegalStateException("the scan already carries a pushed top-k");
+        }
+        if (pushedAggregate().isPresent()) {
+            throw new IllegalStateException("a pushed top-k does not combine with a pushed aggregate");
+        }
+        if (pushedOperations.size() > 1) {
+            throw new IllegalStateException("a pushed top-k combines with at most one pushed operation: " + pushedOperations);
+        }
+        ImmutableList<PushedOperation> pushed = ImmutableList.<PushedOperation>builder()
+            .addAll(pushedOperations)
+            .add(new PushedTopK(topK, hitShape, orderings, cursorSql))
+            .build();
+        return new LanceTableScan(getCluster(), getTraitSet(), table, pushed);
+    }
+
     @Override
     public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
         assert inputs.isEmpty();
@@ -166,11 +213,16 @@ public class LanceTableScan extends TableScan implements LanceRel {
     }
 
     /**
-     * The aggregate's, FTS node's or knn node's row type when one is
+     * The hit shape's row type when a pushed top-k carries one, then
+     * the aggregate's, FTS node's or knn node's row type when one is
      * pushed, the table row type otherwise.
      */
     @Override
     public RelDataType deriveRowType() {
+        Optional<PushedTopK> topK = pushedTopK();
+        if (topK.isPresent() && topK.get().hitShape() != null) {
+            return topK.get().hitShape().getRowType();
+        }
         Optional<PushedAggregate> pushed = pushedAggregate();
         if (pushed.isPresent()) {
             return pushed.get().aggregate().getRowType();
@@ -191,10 +243,21 @@ public class LanceTableScan extends TableScan implements LanceRel {
      * counts) for a bare scan, scaled by the pushed filter's guessed
      * selectivity when one is pushed; a pushed aggregate returns one
      * row per group, a pushed FTS its match estimate and a pushed knn
-     * at most {@code k} rows, so their own estimates stand.
+     * at most {@code k} rows, so their own estimates stand. A pushed
+     * top-k caps whatever the query below it yields at its page.
      */
     @Override
     public double estimateRowCount(RelMetadataQuery mq) {
+        double rows = estimateQueryRowCount(mq);
+        Optional<PushedTopK> topK = pushedTopK();
+        if (topK.isPresent()) {
+            rows = Math.min(rows, (double) topK.get().topK().fetch() + topK.get().topK().offset());
+        }
+        return rows;
+    }
+
+    /** The row estimate of the pushed query alone, before any pushed top-k cut. */
+    private double estimateQueryRowCount(RelMetadataQuery mq) {
         Optional<PushedAggregate> pushed = pushedAggregate();
         if (pushed.isPresent()) {
             return pushed.get().aggregate().estimateRowCount(mq);

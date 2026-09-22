@@ -53,6 +53,16 @@ public final class LanceTable extends AbstractTable implements TranslatableTable
         return LanceTypeSystem.rowType(arrowSchema, typeFactory);
     }
 
+    /**
+     * The Arrow schema of the attached Lance table, for rules that
+     * need the physical column types behind the row type (the sort
+     * pushdown reads it to decide whether Lance can order by a
+     * column).
+     */
+    public Schema arrowSchema() {
+        return arrowSchema;
+    }
+
     @Override
     public Statistic getStatistic() {
         return Statistics.of(rowCount.getAsLong(), ImmutableList.of());

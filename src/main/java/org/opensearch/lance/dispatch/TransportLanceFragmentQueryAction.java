@@ -24,8 +24,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
-import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DirectoryReader;
@@ -106,9 +104,13 @@ import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.rel.LanceTableScan;
+import org.opensearch.lance.plan.rel.LanceTopK;
+import org.opensearch.lance.plan.rel.PushedOperation;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedAggregate;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedFts;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedKnn;
+import org.opensearch.lance.plan.rel.PushedOperation.PushedTopK;
+import org.opensearch.lance.plan.rules.SortResolution;
 import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.query.FtsAdmission;
@@ -809,22 +811,29 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // but not to aggregations. Hits and matched
                 // therefore use the AND-combined query.
                 //
-                // Sorted scalar-filter pages take the Lance sort
-                // pushdown when every clause translates to a
-                // ColumnOrdering (see resolvePushdownOrderings):
-                // Lance returns the top `size` rows already
-                // ordered, so the hits phase never materialises
-                // the sort column for every matching row. Every
-                // other shape goes through the Lucene collector.
-                List<ColumnOrdering> pushdownOrderings = hasSecurityWrapper || sortAndFormats == null
+                // Sorted scalar-filter pages go through the planner:
+                // SearchRequestToRel.translateQuery builds the query
+                // root, the sort clauses become the LanceTopK's
+                // collations, and PushSortLimitIntoLanceScan folds
+                // both into the scan when every collation resolves to
+                // a Lance ColumnOrdering (and the search_after cursor,
+                // when present, to a strict SQL bound). Lance then
+                // returns the top `size` rows already ordered, so the
+                // hits phase never materialises the sort column for
+                // every matching row. Every shape the planner does not
+                // fold goes through the Lucene collector.
+                LanceTableScan plannedTopK = hasSecurityWrapper || sortAndFormats == null
                     ? null
-                    : resolvePushdownOrderings(request, dataset.getSchema(), multiFields, sortAndFormats);
+                    : resolvePlannedTopK(request, qsc, indexMetadata, dataset, multiFields, searcher.getIndexReader(), sortAndFormats);
                 HitsPage hits;
-                if (pushdownOrderings != null) {
+                if (plannedTopK != null) {
+                    PushedTopK pushedTopK = plannedTopK.pushedTopK().orElseThrow();
                     hits = scanSortedHitsViaLance(
                         dataset,
                         request,
-                        pushdownOrderings,
+                        pushedTopK.toScanOrderings(),
+                        pushedTopK.fetch(),
+                        plannedScanFilter(plannedTopK, pushedTopK),
                         sortAndFormats,
                         searcher.getIndexReader(),
                         effectiveFragmentIds,
@@ -1387,6 +1396,150 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
+     * Plan a sorted hits page through the planner: the query root from
+     * {@link SearchRequestToRel#translateQuery}, the sort clauses as
+     * the {@link LanceTopK}'s collations, and the Volcano run firing
+     * {@code PushSortLimitIntoLanceScan}. Returns the scan carrying
+     * the {@link PushedTopK} (and, for a scalar page, the pushed
+     * filter whose SQL the ordered scan evaluates) when the planner
+     * folded the page, or null when the shape stays on the Lucene
+     * collector.
+     *
+     * <p>The guards mirror what the fold can reproduce. {@code size}
+     * must be positive with no {@code post_filter} and no aggregations
+     * (both need the full match set on the Lucene side). Every Lucene
+     * {@link org.apache.lucene.search.SortField} OpenSearch built must
+     * be one of the two plain field-data shapes, because
+     * {@link #sortValueFrom} types the page's sort values from them;
+     * an {@code ip} format is excluded because address order is not
+     * the stored strings' order. The shape must be scalar: a non-null
+     * {@link LanceFragmentQueryRequest#filterSql()} (the coordinator
+     * translated the whole tree), no query, or {@code match_all};
+     * FTS and knn order by score, which the fold serves through the
+     * scan limit instead (see {@link #resolveScanFilterTopK}). A
+     * {@code search_after} whose cursor equals a sort field's missing
+     * sentinel stays on Lucene: the strict SQL bound cannot tell the
+     * sentinel from a stored value.
+     */
+    private LanceTableScan resolvePlannedTopK(
+        LanceFragmentQueryRequest request,
+        QueryShardContext qsc,
+        IndexMetadata indexMetadata,
+        Dataset dataset,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        IndexReader reader,
+        SortAndFormats sortAndFormats
+    ) {
+        if (request.size() <= 0 || request.postFilter() != null) {
+            return null;
+        }
+        if (request.aggregations() != null && !request.aggregations().getAggregatorFactories().isEmpty()) {
+            return null;
+        }
+        org.apache.lucene.search.SortField[] sortFields = sortAndFormats.sort.getSort();
+        if (sortFields.length != request.sorts().size()) {
+            return null;
+        }
+        for (org.apache.lucene.search.SortField sortField : sortFields) {
+            if (sortField instanceof org.apache.lucene.search.SortedNumericSortField numeric) {
+                switch (numeric.getNumericType()) {
+                    case INT, LONG, FLOAT, DOUBLE -> {
+                    }
+                    default -> {
+                        return null;
+                    }
+                }
+            } else if (!(sortField instanceof org.apache.lucene.search.SortedSetSortField)) {
+                return null;
+            }
+        }
+        for (DocValueFormat format : sortAndFormats.formats) {
+            if (format == DocValueFormat.IP) {
+                return null;
+            }
+        }
+        boolean scalarShape = request.filterSql() != null
+            || request.query() == null
+            || request.query() instanceof org.opensearch.index.query.MatchAllQueryBuilder;
+        if (!scalarShape) {
+            return null;
+        }
+        Object[] searchAfter = request.searchAfter();
+        if (searchAfter != null && (searchAfter.length != sortFields.length || cursorHitsMissingSentinel(searchAfter, sortFields))) {
+            return null;
+        }
+        try {
+            LanceSchemas.IndexModel model = plannerQueryModel(request.indexName(), indexMetadata, dataset, multiFields, reader);
+            QueryBuilder rewritten = request.query() == null ? null : Rewriteable.rewrite(request.query(), qsc, true);
+            RelNode root = SearchRequestToRel.translateQuery(rewritten, model, plannerFactory);
+            List<org.apache.calcite.rel.RelFieldCollation> collations = SortResolution.collationsOf(
+                request.sorts(),
+                root.getRowType(),
+                model
+            );
+            LanceTopK topK = new LanceTopK(
+                root.getCluster(),
+                root.getCluster().traitSetOf(org.apache.calcite.plan.Convention.NONE),
+                root,
+                collations,
+                request.size(),
+                0,
+                searchAfter == null ? null : Arrays.asList(searchAfter)
+            );
+            RelNode physical = plannerFactory.plan(topK);
+            if (physical instanceof LanceTableScan scan) {
+                PushedTopK pushed = scan.pushedTopK().orElse(null);
+                if (pushed != null && !pushed.toScanOrderings().isEmpty()) {
+                    return scan;
+                }
+            }
+            return null;
+        } catch (UnsupportedOperationException | IOException notPlanned) {
+            // A sort clause without a collation spelling (geo distance,
+            // script, nested, mode, literal missing) or a query the
+            // translator refuses: the Lucene collector serves it.
+            return null;
+        }
+    }
+
+    /**
+     * Whether a {@code search_after} value equals the missing-value
+     * sentinel its sort field reports for null rows. A client paging
+     * past a null row feeds the sentinel back; the strict SQL bound
+     * compares stored values only, so such a cursor stays on the
+     * Lucene comparator, which knows the sentinel.
+     */
+    private static boolean cursorHitsMissingSentinel(Object[] searchAfter, org.apache.lucene.search.SortField[] sortFields) {
+        for (int i = 0; i < searchAfter.length; i++) {
+            Object missing = sortFields[i].getMissingValue();
+            if (missing instanceof Number sentinel
+                && searchAfter[i] instanceof Number cursor
+                && Double.compare(sentinel.doubleValue(), cursor.doubleValue()) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The filter of the ordered Lance scan: the pushed filter's SQL
+     * (the query the page cuts) ANDed with the {@code search_after}
+     * cursor bound, either alone when the other is absent, null when
+     * the page is an unfiltered first page.
+     */
+    private static String plannedScanFilter(LanceTableScan scan, PushedTopK pushedTopK) {
+        String filterSql = scan.pushedFilter().map(PushedOperation.PushedFilter::sql).orElse(null);
+        String cursorSql = pushedTopK.cursorSql();
+        if (filterSql == null) {
+            return cursorSql;
+        }
+        if (cursorSql == null) {
+            return filterSql;
+        }
+        return "(" + filterSql + ") AND (" + cursorSql + ")";
+    }
+
+    /**
      * Decide whether the pure scalar filter shape can push a
      * {@code limit(size)} into the per-fragment Lance scan.
      *
@@ -1394,9 +1547,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * this transport action is content with the top-k (or when there
      * are no consumers at all):
      * <ul>
-     *   <li>No sort clause — Lance's row-address ordering matches
-     *       what {@link org.apache.lucene.search.IndexSearcher#search(Query, int)}
-     *       returns for a scalar query.</li>
+     *   <li>No sort clause, or a sort that is only {@code _score}
+     *       descending — Lance's row-address ordering matches what
+     *       {@link org.apache.lucene.search.IndexSearcher#search(Query, int)}
+     *       returns for a scalar query, and a descending score sort is
+     *       the order that overload already collects (an FTS or knn
+     *       scan produces it natively), so spelling it out changes
+     *       nothing.</li>
      *   <li>No aggregations — aggregators need every matched doc to
      *       accumulate bucket counts and metric state.</li>
      *   <li>No post_filter — post_filter narrows below the scan and
@@ -1422,7 +1579,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * when top-k pushdown is not safe.
      */
     private int resolveScanFilterTopK(LanceFragmentQueryRequest request) {
-        if (!request.sorts().isEmpty()) {
+        if (!request.sorts().isEmpty() && !scoreOnlySort(request.sorts())) {
             return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
         }
         if (request.aggregations() != null && !request.aggregations().getAggregatorFactories().isEmpty()) {
@@ -1440,6 +1597,24 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
         }
         return size;
+    }
+
+    /**
+     * Whether every sort clause is {@code _score} descending, the
+     * order a request without a {@code sort} clause gets:
+     * {@link org.opensearch.search.sort.SortBuilder#buildSort} folds
+     * that shape away (no {@code SortAndFormats}), so the executor
+     * treats it like an absent sort everywhere, including the scan
+     * top-k above.
+     */
+    private static boolean scoreOnlySort(List<org.opensearch.search.sort.SortBuilder<?>> sorts) {
+        for (org.opensearch.search.sort.SortBuilder<?> sort : sorts) {
+            if (!(sort instanceof org.opensearch.search.sort.ScoreSortBuilder score)
+                || score.order() == org.opensearch.search.sort.SortOrder.ASC) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -1752,217 +1927,10 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
-     * Translate the request's sort clauses into Lance
-     * {@link ColumnOrdering}s so the hits phase can run
-     * as a single ordered, limited Lance scan instead of a Lucene
-     * {@code TopFieldCollector} over every matching row. Returns
-     * {@code null} when the request cannot take that path, in which
-     * case the caller uses {@link #scanHitsViaIndexSearcher}.
-     *
-     * <p>The pushdown is only correct when the Lance scan can
-     * reproduce exactly what Lucene would return. That holds when all
-     * of the following are true.
-     * <ul>
-     *   <li>{@code size > 0} and no {@code search_after}: the cursor
-     *       is value-based and Lance has no equivalent of Lucene's
-     *       after-doc tie-break, so paginated pages stay on the
-     *       Lucene path.</li>
-     *   <li>Scalar shape: the request is match_all, has no query, or
-     *       carries a {@link LanceFragmentQueryRequest#filterSql()}
-     *       the coordinator translated from the whole query tree. FTS
-     *       and knn shapes score, and their order is defined by
-     *       Lucene's scorer, not by a column.</li>
-     *   <li>No {@code post_filter} and no aggregations: both need the
-     *       full match set on the Lucene side, so the limited scan
-     *       would not save anything and the aggregation collector
-     *       still walks every doc.</li>
-     *   <li>Every clause is a plain {@link FieldSortBuilder} on a
-     *       column Lance can order by (integers, floats, booleans,
-     *       dates, timestamps, Utf8, or a {@code multi_fields} keyword
-     *       sub-field routed to its Utf8 base column), with no nested
-     *       sort, no {@code mode}, no {@code numeric_type} cast, and a
-     *       {@code missing} of {@code _first} / {@code _last} / unset
-     *       (a literal missing value has no ColumnOrdering
-     *       equivalent). An {@code ip} mapped column is excluded even
-     *       though its storage is Utf8, because address order is not
-     *       the column's string order.</li>
-     * </ul>
-     *
-     * <p>The caller additionally refuses the pushdown when a reader
-     * wrapper is installed, because the Lance-side hits would bypass
-     * DLS / FLS the same way a Lance-side count would.
-     */
-    private static List<ColumnOrdering> resolvePushdownOrderings(
-        LanceFragmentQueryRequest request,
-        org.apache.arrow.vector.types.pojo.Schema schema,
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
-        SortAndFormats sortAndFormats
-    ) {
-        if (request.size() <= 0 || request.searchAfter() != null || request.postFilter() != null) {
-            return null;
-        }
-        // The Lucene SortFields OpenSearch built for this request are
-        // the authority on how sort values are typed (Integer for
-        // byte / short / integer / boolean, Long for long / date,
-        // Float / Double for the two float widths, BytesRef for
-        // keyword) and on the missing-value sentinel each comparator
-        // reports. Only the two plain field-data SortField shapes are
-        // reproducible from a Lance scan; anything else (custom
-        // comparator source, script, geo distance) stays on Lucene.
-        org.apache.lucene.search.SortField[] sortFields = sortAndFormats.sort.getSort();
-        if (sortFields.length != request.sorts().size()) {
-            return null;
-        }
-        for (org.apache.lucene.search.SortField sortField : sortFields) {
-            if (sortField instanceof org.apache.lucene.search.SortedNumericSortField numeric) {
-                switch (numeric.getNumericType()) {
-                    case INT, LONG, FLOAT, DOUBLE -> {
-                    }
-                    default -> {
-                        return null;
-                    }
-                }
-            } else if (!(sortField instanceof org.apache.lucene.search.SortedSetSortField)) {
-                return null;
-            }
-        }
-        // An ip mapped column sits on a plain Utf8 Lance column whose
-        // lexical string order is not address order, and the response
-        // formats sort values with DocValueFormat.IP, which only decodes
-        // the 16 byte encoded form the Lucene doc values serve. A Lance
-        // ordering over the raw strings would return the wrong order and
-        // fail formatting the sort values, so such a clause stays on the
-        // Lucene collector.
-        for (DocValueFormat format : sortAndFormats.formats) {
-            if (format == DocValueFormat.IP) {
-                return null;
-            }
-        }
-        // The coordinator ships the top-level QueryBuilder on every
-        // request and additionally sets filterSql when the whole tree
-        // translated to Lance SQL. A non-null filterSql therefore
-        // means "scalar filter shape"; a null one with a non-match_all
-        // query means FTS / knn / untranslatable, which must stay on
-        // the Lucene scorer.
-        boolean scalarShape = request.filterSql() != null
-            || request.query() == null
-            || request.query() instanceof org.opensearch.index.query.MatchAllQueryBuilder;
-        if (!scalarShape) {
-            return null;
-        }
-        if (request.aggregations() != null && !request.aggregations().getAggregatorFactories().isEmpty()) {
-            return null;
-        }
-        if (request.sorts().isEmpty()) {
-            return null;
-        }
-        List<ColumnOrdering> orderings = new ArrayList<>(request.sorts().size());
-        for (org.opensearch.search.sort.SortBuilder<?> sort : request.sorts()) {
-            if (!(sort instanceof org.opensearch.search.sort.FieldSortBuilder field)) {
-                return null;
-            }
-            if (field.getNestedSort() != null || field.sortMode() != null || field.getNumericType() != null) {
-                return null;
-            }
-            String name = field.getFieldName();
-            if (name.startsWith("_")) {
-                // _score, _doc, _id and other metadata fields have no
-                // Lance column behind them.
-                return null;
-            }
-            boolean nullFirst;
-            Object missing = field.missing();
-            if (missing == null || "_last".equals(missing)) {
-                nullFirst = false;
-            } else if ("_first".equals(missing)) {
-                nullFirst = true;
-            } else {
-                return null;
-            }
-            String column = resolveSortColumn(name, schema, multiFields);
-            if (column == null) {
-                return null;
-            }
-            ColumnOrdering.Builder builder = new ColumnOrdering.Builder();
-            builder.setColumnName(column);
-            builder.setAscending(field.order() != org.opensearch.search.sort.SortOrder.DESC);
-            builder.setNullFirst(nullFirst);
-            orderings.add(builder.build());
-        }
-        return orderings;
-    }
-
-    /**
-     * Map a sort field name to the Lance column that backs it, or
-     * {@code null} when the column does not exist or its Arrow type is
-     * not one Lance / DataFusion can order by. A {@code base.sub}
-     * name is accepted when {@code multiFields} declares {@code sub}
-     * as a keyword sub-field of {@code base}; the ordering then runs
-     * on the base Utf8 column, which is exactly what the reader's
-     * {@code getSortedDocValues(base.sub)} resolves to. Any other
-     * dotted name (a struct child, an undeclared sub-field) returns
-     * {@code null} so the caller falls back to the Lucene collector,
-     * which serves the sort through the reader's doc values.
-     *
-     * <p>Names are resolved with {@link #topLevelField} rather than
-     * Arrow's {@code Schema.findField}: that method throws
-     * {@link IllegalArgumentException} for any name that is not a top
-     * level column instead of returning {@code null}, which used to
-     * turn a plain sorted page on a dotted field into a 400 before the
-     * fallback below could run.
-     */
-    private static String resolveSortColumn(
-        String name,
-        org.apache.arrow.vector.types.pojo.Schema schema,
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
-    ) {
-        Field field = topLevelField(schema, name);
-        if (field == null) {
-            int dot = name.lastIndexOf('.');
-            if (dot <= 0 || multiFields == null) {
-                return null;
-            }
-            String base = name.substring(0, dot);
-            String sub = name.substring(dot + 1);
-            java.util.LinkedHashMap<String, String> subs = multiFields.get(base);
-            if (subs == null || !"keyword".equals(subs.get(sub))) {
-                return null;
-            }
-            field = topLevelField(schema, base);
-            if (field == null || !(field.getType() instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8)) {
-                return null;
-            }
-            return base;
-        }
-        org.apache.arrow.vector.types.pojo.ArrowType type = field.getType();
-        if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Int
-            || type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Bool
-            || type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Date
-            || type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Timestamp
-            || type instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8) {
-            return name;
-        }
-        if (type instanceof org.apache.arrow.vector.types.pojo.ArrowType.FloatingPoint fp) {
-            return fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE
-                || fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE ? name : null;
-        }
-        return null;
-    }
-
-    /** The top level Arrow field named {@code name}, or {@code null} when the schema has none (never throws). */
-    private static Field topLevelField(Schema schema, String name) {
-        for (Field candidate : schema.getFields()) {
-            if (candidate.getName().equals(name)) {
-                return candidate;
-            }
-        }
-        return null;
-    }
-
-    /**
      * Hits phase for sorted scalar-filter pages: one Lance scan with
-     * {@link LanceFragmentQueryRequest#filterSql()},
-     * {@code setColumnOrderings}, {@code limit(size)} and the sort
+     * the pushed query's SQL (plus the {@code search_after} cursor
+     * bound, see {@link #plannedScanFilter}),
+     * {@code setColumnOrderings}, {@code limit(fetch)} and the sort
      * columns projected. Lance evaluates the filter and the top-k in
      * one pass (pylance measures {@code filter + order_by + limit 10}
      * on a 10M-row table at tens of milliseconds where the Lucene
@@ -1987,6 +1955,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         Dataset dataset,
         LanceFragmentQueryRequest request,
         List<ColumnOrdering> orderings,
+        int fetch,
+        String filterSql,
         SortAndFormats sortAndFormats,
         org.apache.lucene.index.IndexReader reader,
         List<Integer> fragmentIds,
@@ -2009,15 +1979,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         org.lance.ipc.ScanOptions.Builder builder = new org.lance.ipc.ScanOptions.Builder().fragmentIds(fragmentIds)
             .columns(sortColumns)
             .setColumnOrderings(orderings)
-            .limit(request.size())
+            .limit(fetch)
             .withRowAddress(true);
-        if (request.filterSql() != null) {
-            builder = builder.filter(request.filterSql());
+        if (filterSql != null) {
+            builder = builder.filter(filterSql);
         }
         // Ordered (fragment id, doc id, raw sort values) triples in the
         // order Lance returned them, which is the response order.
-        List<long[]> addresses = new ArrayList<>(request.size());
-        List<Object[]> sortValues = new ArrayList<>(request.size());
+        List<long[]> addresses = new ArrayList<>(fetch);
+        List<Object[]> sortValues = new ArrayList<>(fetch);
         try (
             org.lance.ipc.LanceScanner scanner = dataset.newScan(builder.build());
             org.apache.arrow.vector.ipc.ArrowReader arrowReader = scanner.scanBatches()

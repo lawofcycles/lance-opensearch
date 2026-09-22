@@ -8,17 +8,83 @@ package org.opensearch.lance.plan.rel;
 import org.apache.calcite.rex.RexNode;
 
 import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.Objects;
+
+import org.lance.ipc.ColumnOrdering;
 
 /**
  * One operation pushed into a {@link LanceTableScan}: the Lance dataset
  * scan computes it, so the plan above the scan no longer contains the
  * node it replaced. The kinds today are {@link PushedAggregate},
- * {@link PushedFilter}, {@link PushedFts} and {@link PushedKnn};
- * project and sort kinds join when their pushdown rules land.
+ * {@link PushedFilter}, {@link PushedFts}, {@link PushedKnn} and
+ * {@link PushedTopK}; the project kind joins when its pushdown rule
+ * lands.
  */
 public sealed interface PushedOperation permits PushedOperation.PushedAggregate, PushedOperation.PushedFilter, PushedOperation.PushedFts,
-    PushedOperation.PushedKnn {
+    PushedOperation.PushedKnn, PushedOperation.PushedTopK {
+
+    /**
+     * A sorted, cut hits page pushed into the scan: the
+     * {@link LanceTopK} the scan replaced, the {@link LanceHitShape}
+     * folded with it (null when the plan carried none, the executor's
+     * own top-k route), the Lance {@code ColumnOrdering}s the executor
+     * hands to {@code ScanOptions.setColumnOrderings} (empty for a
+     * score ordered page, whose order the FTS or knn scan produces by
+     * itself), and the SQL of the {@code search_after} cursor bound the
+     * scan ANDs into its filter, or null when the page starts at the
+     * top. Aggregates do not combine with a top-k; a pushed filter, FTS
+     * or knn is the query the page is cut from.
+     */
+    record PushedTopK(LanceTopK topK, LanceHitShape hitShape, List<ColumnOrdering> orderings, String cursorSql) implements PushedOperation {
+
+        public PushedTopK {
+            Objects.requireNonNull(topK, "topK");
+            orderings = List.copyOf(Objects.requireNonNull(orderings, "orderings"));
+        }
+
+        /** Rows the page keeps, the {@code limit} of the executor's scan. */
+        public int fetch() {
+            return topK.fetch();
+        }
+
+        /** The Lance orderings of the executor's scan; empty for a score ordered page. */
+        public List<ColumnOrdering> toScanOrderings() {
+            return orderings;
+        }
+
+        /**
+         * Prints the collations, the page bounds, the cursor SQL and
+         * the hit shape, so the digest of two scans with different
+         * pushed pages differs and the explain output names what was
+         * pushed.
+         */
+        @Override
+        public String toString() {
+            StringBuilder sb = new StringBuilder("topk{collations=").append(topK.collations())
+                .append(", fetch=")
+                .append(topK.fetch())
+                .append(", offset=")
+                .append(topK.offset());
+            if (cursorSql != null) {
+                sb.append(", cursor=").append(cursorSql);
+            }
+            if (hitShape != null) {
+                sb.append(", hits{columns=")
+                    .append(hitShape.outputColumns())
+                    .append(", source=")
+                    .append(hitShape.includeSource())
+                    .append(", id=")
+                    .append(hitShape.includeId())
+                    .append(", score=")
+                    .append(hitShape.includeScore())
+                    .append(", sortValues=")
+                    .append(hitShape.includeSortValues())
+                    .append("}");
+            }
+            return sb.append("}").toString();
+        }
+    }
 
     /**
      * A full text match pushed into the scan: the {@link LanceFtsMatch}
