@@ -26,6 +26,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.rules.PushAggregateIntoLanceScan;
+import org.opensearch.lance.plan.rules.PushFilterIntoLanceScan;
 
 /**
  * Assembles the Calcite planner objects for Lance backed indexes: a Volcano
@@ -68,6 +69,9 @@ public final class LancePlannerFactory {
         VolcanoPlanner planner = new VolcanoPlanner(costFactory, Contexts.empty());
         planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
         for (PushAggregateIntoLanceScan rule : PushAggregateIntoLanceScan.rules()) {
+            planner.addRule(rule);
+        }
+        for (PushFilterIntoLanceScan rule : PushFilterIntoLanceScan.rules()) {
             planner.addRule(rule);
         }
         RelOptCluster cluster = RelOptCluster.create(planner, new RexBuilder(new SqlTypeFactoryImpl(LanceTypeSystem.INSTANCE)));
