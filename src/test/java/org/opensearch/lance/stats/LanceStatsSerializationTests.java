@@ -26,6 +26,7 @@ import org.opensearch.lance.NativeMemoryLimit.IndexCacheSizing;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceWarmCache;
+import org.opensearch.lance.query.FtsAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -61,6 +62,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             2,
             8_589_934_591L,
             1_000_000,
+            7L,
+            832L,
             "metadata",
             List.of(
                 new LanceWarmUpStatus(
@@ -98,6 +101,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
     }
 
     public void testNodeStatsXContentShape() throws Exception {
+        FtsAdmission.setEnabled(true);
+        FtsAdmission.setHeadroom(FtsAdmission.DEFAULT_HEADROOM);
         try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
             builder.startObject();
             sample().toXContent(builder, ToXContent.EMPTY_PARAMS);
@@ -109,7 +114,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"budget_misses\":1,\"heap_fallback_bytes\":2048,\"heap_fallback_rejections\":3},"
                     + "\"native_memory\":{\"estimated_bytes\":5000,\"session_bytes\":900,\"column_store_bytes\":4096,"
                     + "\"index_cache_capacity\":17179869183,\"index_cache_shards\":2,\"index_cache_shard_share\":8589934591},"
-                    + "\"fts\":{\"subset_probe_limit\":1000000},"
+                    + "\"fts\":{\"subset_probe_limit\":1000000,\"admission\":{\"enabled\":true,\"headroom_bytes\":8589934592,"
+                    + "\"rejections\":7,\"last_estimate_bytes\":832}},"
                     + "\"warm_up\":{\"mode\":\"metadata\",\"tables\":[{\"index\":\"perf\",\"table\":\"s3://bucket/perf.lance\","
                     + "\"version\":8,\"mode\":\"metadata\",\"state\":\"done\",\"started_at\":\"2023-11-14T22:13:20Z\",\"seconds\":3.46,"
                     + "\"indexes\":[{\"name\":\"rating_idx\",\"type\":\"BTree\",\"column\":\"rating\",\"state\":\"done\",\"seconds\":0.4},"
@@ -155,7 +161,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             builder.endObject();
             String json = builder.toString();
             assertTrue(json, json.startsWith("{\"nodes\":{\"node-1\":{\"name\":\"node-1\",\"snapshots\":{"));
-            assertTrue(json, json.contains("\"fts\":{\"subset_probe_limit\":1000000},\"warm_up\":{\"mode\":\"metadata\""));
+            assertTrue(json, json.contains("\"fts\":{\"subset_probe_limit\":1000000,\"admission\":{"));
+            assertTrue(json, json.contains("\"rejections\":7,\"last_estimate_bytes\":832}},\"warm_up\":{\"mode\":\"metadata\""));
             assertTrue(json, json.endsWith("\"lucene_bound_exceeded\":false}}}}}"));
         }
     }

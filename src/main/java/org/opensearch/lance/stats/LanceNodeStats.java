@@ -15,6 +15,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.ToXContentFragment;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.lance.query.FtsAdmission;
 
 /**
  * One node's view of the plugin's caches at the moment
@@ -58,6 +59,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     private final long indexCacheShardShareBytes;
 
     private final int ftsSubsetProbeLimit;
+    private final long ftsAdmissionRejections;
+    private final long ftsAdmissionLastEstimateBytes;
 
     private final String warmUpMode;
     private final List<LanceWarmUpStatus> warmUps;
@@ -129,6 +132,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             indexCacheShards,
             indexCacheShardShareBytes,
             ftsSubsetProbeLimit,
+            0L,
+            0L,
             "none",
             List.of(),
             List.of()
@@ -157,6 +162,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         int indexCacheShards,
         long indexCacheShardShareBytes,
         int ftsSubsetProbeLimit,
+        long ftsAdmissionRejections,
+        long ftsAdmissionLastEstimateBytes,
         String warmUpMode,
         List<LanceWarmUpStatus> warmUps,
         List<IndexReaderStats> indices
@@ -182,6 +189,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.indexCacheShards = indexCacheShards;
         this.indexCacheShardShareBytes = indexCacheShardShareBytes;
         this.ftsSubsetProbeLimit = ftsSubsetProbeLimit;
+        this.ftsAdmissionRejections = ftsAdmissionRejections;
+        this.ftsAdmissionLastEstimateBytes = ftsAdmissionLastEstimateBytes;
         this.warmUpMode = warmUpMode;
         this.warmUps = List.copyOf(warmUps);
         this.indices = List.copyOf(indices);
@@ -209,6 +218,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.indexCacheShards = in.readVInt();
         this.indexCacheShardShareBytes = in.readVLong();
         this.ftsSubsetProbeLimit = in.readVInt();
+        this.ftsAdmissionRejections = in.readVLong();
+        this.ftsAdmissionLastEstimateBytes = in.readVLong();
         this.warmUpMode = in.readString();
         int warmUpCount = in.readVInt();
         List<LanceWarmUpStatus> read = new ArrayList<>(warmUpCount);
@@ -242,6 +253,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         out.writeVInt(indexCacheShards);
         out.writeVLong(indexCacheShardShareBytes);
         out.writeVInt(ftsSubsetProbeLimit);
+        out.writeVLong(ftsAdmissionRejections);
+        out.writeVLong(ftsAdmissionLastEstimateBytes);
         out.writeString(warmUpMode);
         out.writeVInt(warmUps.size());
         for (LanceWarmUpStatus warmUp : warmUps) {
@@ -284,6 +297,12 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
         builder.startObject("fts");
         builder.field("subset_probe_limit", ftsSubsetProbeLimit);
+        builder.startObject("admission");
+        builder.field("enabled", FtsAdmission.enabled());
+        builder.field("headroom_bytes", FtsAdmission.headroomBytes());
+        builder.field("rejections", ftsAdmissionRejections);
+        builder.field("last_estimate_bytes", ftsAdmissionLastEstimateBytes);
+        builder.endObject();
         builder.endObject();
 
         builder.startObject("warm_up");
@@ -393,6 +412,16 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         return ftsSubsetProbeLimit;
     }
 
+    /** Unbounded full-text scans this node's admission gate refused since it started. */
+    public long ftsAdmissionRejections() {
+        return ftsAdmissionRejections;
+    }
+
+    /** Document set estimate of the node's last admission decision, admitted or not. */
+    public long ftsAdmissionLastEstimateBytes() {
+        return ftsAdmissionLastEstimateBytes;
+    }
+
     /** Value of {@code lance.attach.warm_indexes} on the node. */
     public String warmUpMode() {
         return warmUpMode;
@@ -437,6 +466,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && indexCacheShards == other.indexCacheShards
             && indexCacheShardShareBytes == other.indexCacheShardShareBytes
             && ftsSubsetProbeLimit == other.ftsSubsetProbeLimit
+            && ftsAdmissionRejections == other.ftsAdmissionRejections
+            && ftsAdmissionLastEstimateBytes == other.ftsAdmissionLastEstimateBytes
             && warmUpMode.equals(other.warmUpMode)
             && warmUps.equals(other.warmUps)
             && indices.equals(other.indices);
@@ -466,6 +497,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             indexCacheShards,
             indexCacheShardShareBytes,
             ftsSubsetProbeLimit,
+            ftsAdmissionRejections,
+            ftsAdmissionLastEstimateBytes,
             warmUpMode,
             warmUps,
             indices
