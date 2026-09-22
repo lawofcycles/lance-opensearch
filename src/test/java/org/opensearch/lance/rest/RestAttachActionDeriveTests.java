@@ -8,10 +8,13 @@ package org.opensearch.lance.rest;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 
 import org.lance.Dataset;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -89,6 +92,171 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
             // Nested children stay out of the index-eligible column sets.
             assertTrue("ftsColumns must be empty: " + derivation.ftsColumns(), derivation.ftsColumns().isEmpty());
             assertFalse("children must not be scalar columns: " + derivation.scalarColumns(), derivation.scalarColumns().contains("items"));
+        }
+    }
+
+    /** Overrides parsed the way the REST layer parses an attach body clause. */
+    private static LanceOverrides overrides(Map<String, Object> body) {
+        return LanceOverrides.parseAttachClauses(body, null);
+    }
+
+    private String epochMillisTable() throws Exception {
+        Path scratchDir = createTempDir();
+        return LanceTableFactory.writeEpochMillisTable(scratchDir, "derive-" + getTestName().toLowerCase(Locale.ROOT));
+    }
+
+    public void testDateOverrideOnInt64DerivesDateMapping() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides(Map.of("ts", Map.of("type", "date"))));
+            String mapping = derivation.mappingJson();
+            assertTrue("ts must map as date: " + mapping, mapping.contains("\"ts\":{\"type\":\"date\""));
+            assertTrue("default format must be epoch_millis: " + mapping, mapping.contains("\"format\":\"epoch_millis\""));
+            assertTrue("meta must keep the real Arrow type: " + mapping, mapping.contains("\"lance_arrow_type\":\"Int(64, true)\""));
+            assertTrue("ts stays a scalar column: " + derivation.scalarColumns(), derivation.scalarColumns().contains("ts"));
+            assertTrue("overrides JSON must persist: " + derivation.overridesJson(), derivation.overridesJson().contains("\"ts\""));
+        }
+    }
+
+    public void testDateOverrideEmitsDeclaredFormat() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("ts", Map.of("type", "date", "format", "strict_date_optional_time||epoch_millis")))
+            );
+            assertTrue(
+                derivation.mappingJson(),
+                derivation.mappingJson().contains("\"format\":\"strict_date_optional_time||epoch_millis\"")
+            );
+        }
+    }
+
+    public void testDateOverrideOnTimestampColumnPinsTheDerivedType() throws Exception {
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeDatedTable(scratchDir, "derive-" + getTestName().toLowerCase(Locale.ROOT));
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides(Map.of("ts", Map.of("type", "date"))));
+            assertTrue(derivation.mappingJson(), derivation.mappingJson().contains("\"ts\":{\"type\":\"date\""));
+        }
+    }
+
+    public void testDateOverrideOnUtf8Rejected() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("label", Map.of("type", "date"))))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("needs a signed 32 or 64 bit integer"));
+            assertTrue(e.getMessage(), e.getMessage().contains("label"));
+        }
+    }
+
+    public void testKeywordOverrideOnInvertedIndexColumnDerivesKeyword() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("label", Map.of("type", "keyword")))
+            );
+            String mapping = derivation.mappingJson();
+            assertTrue("label must map as keyword: " + mapping, mapping.contains("\"label\":{\"type\":\"keyword\""));
+            assertFalse("label must not map as lance_text: " + mapping, mapping.contains("lance_text"));
+            // Out of ftsColumns so the index build paths do not create or
+            // optimise an FTS index for it.
+            assertFalse("label must leave ftsColumns: " + derivation.ftsColumns(), derivation.ftsColumns().contains("label"));
+            assertTrue("label joins scalarColumns: " + derivation.scalarColumns(), derivation.scalarColumns().contains("label"));
+        }
+    }
+
+    public void testKeywordOverrideOnNonUtf8Rejected() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("ts", Map.of("type", "keyword"))))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("needs a Utf8 or List<Utf8> column"));
+        }
+    }
+
+    public void testOverrideOnUnknownColumnRejected() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("nope", Map.of("type", "date"))))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("unknown column [nope]"));
+        }
+    }
+
+    public void testOverrideOnPrimaryKeyColumnRejected() throws Exception {
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeStructTable(scratchDir, "derive-" + getTestName().toLowerCase(Locale.ROOT), 0);
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("id", Map.of("type", "date"))))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("primary key"));
+        }
+    }
+
+    public void testLenientDeriveSkipsUnknownColumnAndKeepsTheRest() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+            body.put("nope", Map.of("type", "date"));
+            body.put("ts", Map.of("type", "date"));
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides(body), true);
+            assertTrue(
+                "ts override must still apply: " + derivation.mappingJson(),
+                derivation.mappingJson().contains("\"ts\":{\"type\":\"date\"")
+            );
+            assertTrue(
+                "a note must record the skip: " + derivation.notes(),
+                derivation.notes().stream().anyMatch(note -> note.contains("override skipped"))
+            );
+            // The full list stays in the setting so the column picks the
+            // override back up if a later manifest adds it.
+            assertTrue(derivation.overridesJson(), derivation.overridesJson().contains("\"nope\""));
+        }
+    }
+
+    public void testFieldsOverrideEmitsSubFieldBlock() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("label", Map.of("fields", Map.of("raw", Map.of("type", "keyword")))))
+            );
+            assertTrue(derivation.mappingJson(), derivation.mappingJson().contains("\"fields\":{\"raw\":{\"type\":\"keyword\""));
+        }
+    }
+
+    public void testTypeAndFieldsTogetherApplyBoth() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("label", Map.of("type", "keyword", "fields", Map.of("raw", Map.of("type", "keyword")))))
+            );
+            String mapping = derivation.mappingJson();
+            assertTrue(mapping, mapping.contains("\"label\":{\"type\":\"keyword\""));
+            assertTrue(mapping, mapping.contains("\"fields\":{\"raw\":{\"type\":\"keyword\""));
+        }
+    }
+
+    public void testFieldsOnNonUtf8Rejected() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("ts", Map.of("fields", Map.of("raw", Map.of("type", "keyword"))))))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("must be Utf8"));
+        }
+    }
+
+    public void testSubFieldTypeMustBeKeyword() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("label", Map.of("fields", Map.of("raw", Map.of("type", "text"))))))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("must be [keyword]"));
         }
     }
 }

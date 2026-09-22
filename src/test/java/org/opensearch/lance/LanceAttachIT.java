@@ -815,9 +815,9 @@ public class LanceAttachIT extends LanceRestTestCase {
         }
     }
 
-    public void testOverridesRejectsColumnTypeOverride() throws Exception {
-        // overrides.<column>.type is reserved and not implemented; the
-        // parser must refuse it rather than silently accept it.
+    public void testOverridesRejectsUnknownColumnType() throws Exception {
+        // Type values outside the accepted set (date, keyword) are
+        // refused at parse time, naming the accepted set.
         String suffix = "overrides-type-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -829,7 +829,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         );
         assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
         String body = readAll(failure.getResponse());
-        assertTrue("expected message about type not supported: " + body, body.contains("not supported yet"));
+        assertTrue("expected message naming the accepted types: " + body, body.contains("[date], [keyword]"));
     }
 
     public void testOverridesConflictsWithMultiFieldsRejected() throws Exception {
@@ -853,7 +853,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         );
         assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
         String body = readAll(failure.getResponse());
-        assertTrue("expected message about ambiguous body: " + body, body.contains("both [multi_fields] and [overrides]"));
+        assertTrue("expected message about ambiguous body: " + body, body.contains("both [multi_fields] and [overrides"));
     }
 
     public void testDropColumnMarksLanceTextFieldDroppedAndRejectsQuery() throws Exception {

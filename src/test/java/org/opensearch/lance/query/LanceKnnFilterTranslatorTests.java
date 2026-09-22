@@ -292,4 +292,36 @@ public class LanceKnnFilterTranslatorTests extends OpenSearchTestCase {
         // handles it inside toLanceSql.
         assertFalse(LanceKnnFilterTranslator.hasUnmappedField(QueryBuilders.wildcardQuery("body.raw", "h*"), lookup));
     }
+
+    public void testDateOnIntegerColumnKeepsLiteralsNumeric() {
+        // A date-mapped field whose Lance column is a plain integer
+        // (the attach body's type: date override) compares as a number:
+        // ISO strings are parsed to epoch millis and numeric bounds
+        // stay bare, so DataFusion never sees a Timestamp literal
+        // against an Int64 column.
+        Function<String, String> lookup = name -> "ts".equals(name) ? LanceKnnFilterTranslator.DATE_ON_INTEGER : null;
+        assertEquals(
+            "(ts >= 1709251200000 AND ts < 1711929600000)",
+            LanceKnnFilterTranslator.toLanceSql(QueryBuilders.rangeQuery("ts").gte("2024-03-01").lt("2024-04-01"), lookup)
+        );
+        assertEquals(
+            "(ts >= 1709251200000)",
+            LanceKnnFilterTranslator.toLanceSql(QueryBuilders.rangeQuery("ts").gte(1709251200000L), lookup)
+        );
+        assertEquals("ts = 1709251200000", LanceKnnFilterTranslator.toLanceSql(QueryBuilders.termQuery("ts", "2024-03-01"), lookup));
+    }
+
+    public void testDateOnTimestampColumnKeepsTimestampLiterals() {
+        // The real Date / Timestamp column path is unchanged by the
+        // override handling.
+        Function<String, String> lookup = name -> "ts".equals(name) ? "date" : null;
+        assertEquals(
+            "(ts >= timestamp '2024-03-01')",
+            LanceKnnFilterTranslator.toLanceSql(QueryBuilders.rangeQuery("ts").gte("2024-03-01"), lookup)
+        );
+        assertEquals(
+            "(ts >= to_timestamp_millis(1709251200000))",
+            LanceKnnFilterTranslator.toLanceSql(QueryBuilders.rangeQuery("ts").gte(1709251200000L), lookup)
+        );
+    }
 }
