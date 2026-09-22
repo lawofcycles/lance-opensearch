@@ -10,7 +10,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Stream;
 
@@ -47,7 +49,7 @@ public class LanceIndexPlacementIT extends LanceRestTestCase {
 
             String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
             assertTrue("expected label in the merged fts built list: " + build, build.contains("\"fts\":[\"label\"]"));
-            assertTrue("expected a per-node nodes block: " + build, build.contains("\"nodes\":{"));
+            assertTrue("at least one node must report label under its own built.fts: " + build, anyNodeBuiltFts(build, "label"));
 
             // The keyword -> lance_text flip lands through the rebuild the
             // build action performs; wait for the mapping to show it.
@@ -156,6 +158,26 @@ public class LanceIndexPlacementIT extends LanceRestTestCase {
         } finally {
             deleteRecursively(scratch);
         }
+    }
+
+    /**
+     * Whether the build response's {@code nodes} block has at least one
+     * node whose own {@code built.fts} list carries {@code column}.
+     */
+    private static boolean anyNodeBuiltFts(String buildResponse, String column) {
+        Object nodes = parseJson(buildResponse).get("nodes");
+        if (!(nodes instanceof Map<?, ?> nodeMap) || nodeMap.isEmpty()) {
+            return false;
+        }
+        for (Object entry : nodeMap.values()) {
+            if (entry instanceof Map<?, ?> node
+                && node.get("built") instanceof Map<?, ?> built
+                && built.get("fts") instanceof List<?> fts
+                && fts.contains(column)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private long statsCloneVersion(String indexName) throws IOException {
