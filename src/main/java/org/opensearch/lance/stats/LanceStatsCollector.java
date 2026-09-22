@@ -17,6 +17,7 @@ import org.opensearch.lance.engine.ColumnStore;
 import org.opensearch.lance.engine.HeapFallbackStats;
 import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.engine.LanceWarmCache;
+import org.opensearch.lance.query.FtsAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
 
 /**
@@ -97,6 +98,8 @@ public final class LanceStatsCollector {
         int indexCacheShards = sizing == null ? 0 : sizing.shards();
         long indexCacheShardShare = sizing == null ? 0L : sizing.shardShareBytes();
         int probeLimit = LanceFtsQuery.subsetProbeLimit();
+        long admissionRejections = FtsAdmission.rejections();
+        long admissionLastEstimate = FtsAdmission.lastEstimateBytes();
         long heapFallbackBytes = HeapFallbackStats.bytes();
         long heapFallbackRejections = HeapFallbackStats.rejections();
         String warmUpMode = indexWarmer == null ? "none" : indexWarmer.mode().settingValue();
@@ -130,6 +133,8 @@ public final class LanceStatsCollector {
                 indexCacheShards,
                 indexCacheShardShare,
                 probeLimit,
+                admissionRejections,
+                admissionLastEstimate,
                 warmUpMode,
                 warmUps,
                 indices
@@ -158,6 +163,8 @@ public final class LanceStatsCollector {
             indexCacheShards,
             indexCacheShardShare,
             probeLimit,
+            admissionRejections,
+            admissionLastEstimate,
             warmUpMode,
             warmUps,
             indices

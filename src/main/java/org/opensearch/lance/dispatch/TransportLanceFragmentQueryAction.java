@@ -93,6 +93,7 @@ import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.lance.engine.LanceWarmCache;
+import org.opensearch.lance.query.FtsAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceFtsQueryBuilder;
 import org.opensearch.lance.query.LanceHintingWeight;
@@ -694,6 +695,25 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 searchContext.withQueryShardContext(qsc);
 
                 Query query = resolveLuceneQuery(request, qsc, hasSecurityWrapper, indexMetadata);
+
+                // Unbounded full-text scans (a full-text clause the
+                // resolver left without a scan limit, or a bounded
+                // page whose exact match count would run the unbounded
+                // count-only scan) rebuild the inverted index document
+                // set in native memory when the index does not fit the
+                // cache shard. Refuse the request with 429 before any
+                // Lance scan of it is created when the node's free
+                // memory cannot hold that rebuild. The estimate is per
+                // table, so it is judged on the table's physical rows,
+                // not this executor's share: Lance rebuilds the whole
+                // document set whichever fragments the scan keeps.
+                if (FtsAdmission.runsUnboundedFtsScan(query, request.trackTotalHitsUpTo() == SearchContext.TRACK_TOTAL_HITS_ACCURATE)) {
+                    long tableRows = 0L;
+                    for (LanceWarmCache.FragmentMeta fragment : snapshot.fragments()) {
+                        tableRows += fragment.physicalRows();
+                    }
+                    FtsAdmission.admit(request.indexName(), tableRows);
+                }
 
                 // A bare Lance clause at the top level (LanceFtsQuery,
                 // possibly a bool collapsed into one with a SQL
