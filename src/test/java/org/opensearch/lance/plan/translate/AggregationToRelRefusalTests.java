@@ -5,10 +5,13 @@
 
 package org.opensearch.lance.plan.translate;
 
+import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * One test per aggregation shape the pushdown refuses today, asserting
@@ -287,6 +290,54 @@ public class AggregationToRelRefusalTests extends OpenSearchTestCase {
         assertEquals(
             "column [price] behind aggregation field [price] is not a date",
             messageOf("{\"size\":0,\"aggs\":{\"dr\":{\"date_range\":{\"field\":\"price\",\"ranges\":[{\"to\":\"2024-01-01\"}]}}}}")
+        );
+    }
+
+    /**
+     * A model whose mapping recorded that the Lance table renamed
+     * {@code old_price} to {@code price}: the stale name is refused with
+     * the rename, everywhere field resolution runs.
+     */
+    private static LanceSchemas.IndexModel renamedModel() {
+        LinkedHashMap<String, String> bodySubs = new LinkedHashMap<>();
+        bodySubs.put("raw", "keyword");
+        return LanceSchemas.model("idx", PlanTestFixtures.SCHEMA, Map.of("body", bodySubs), Map.of("old_price", "price"), () -> 512L);
+    }
+
+    private static String renamedMessageOf(String json) throws IOException {
+        SearchSourceBuilder source = PlanTestFixtures.parse(json);
+        UnsupportedOperationException e = expectThrows(
+            UnsupportedOperationException.class,
+            () -> SearchRequestToRel.translate(source, renamedModel(), PlanTestFixtures.factory())
+        );
+        return e.getMessage();
+    }
+
+    public void testRenamedFieldOnMetricNamesTheRename() throws IOException {
+        assertEquals(
+            "field [old_price] was renamed to [price] in the Lance table",
+            renamedMessageOf("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"old_price\"}}}}")
+        );
+    }
+
+    public void testRenamedFieldOnBucketNamesTheRename() throws IOException {
+        assertEquals(
+            "field [old_price] was renamed to [price] in the Lance table",
+            renamedMessageOf("{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"old_price\"}}}}")
+        );
+    }
+
+    public void testRenamedFieldInFilterNamesTheRename() throws IOException {
+        assertEquals(
+            "field [old_price] was renamed to [price] in the Lance table",
+            renamedMessageOf("{\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"range\":{\"old_price\":{\"gte\":1}}}}}}")
+        );
+    }
+
+    public void testUnknownFieldWithoutRenameKeepsGenericMessage() throws IOException {
+        assertEquals(
+            "field [absent] does not map to a Lance column",
+            renamedMessageOf("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"absent\"}}}}")
         );
     }
 }
