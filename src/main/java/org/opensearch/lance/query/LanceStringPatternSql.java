@@ -12,7 +12,7 @@ import org.apache.lucene.util.automaton.RegExp;
  * or {@code prefix} query on a Utf8 column, so the same SQL is produced
  * whether the query arrives through the field type
  * ({@code LanceTextFieldType.wildcardQuery} and friends) or through
- * {@link LanceKnnFilterTranslator} (the coordinator's count only scan,
+ * the query planner's printer (the coordinator's count only scan,
  * {@code lance_knn.filter}, the FTS prefilter of a {@code bool}).
  *
  * <p>The predicate is evaluated by Lance's scan filter (DataFusion SQL)

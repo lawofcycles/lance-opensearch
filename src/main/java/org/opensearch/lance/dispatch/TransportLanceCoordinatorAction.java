@@ -69,7 +69,6 @@ import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.substrait.RexToLanceSql;
 import org.opensearch.lance.plan.translate.QueryToRex;
-import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
@@ -1184,123 +1183,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         boolean exceeded() {
             return readerRows < tableRows;
         }
-    }
-
-    /**
-     * Build a field-type lookup for {@code indexMetadata} that reads
-     * the mapping straight out of cluster state so
-     * {@link LanceKnnFilterTranslator} can consult it while emitting
-     * SQL literals. The lookup returns the mapping's {@code type}
-     * string ({@code "date"}, {@code "long"}, {@code "keyword"}, ...)
-     * for a top-level field name and {@code null} for unmapped or
-     * sub-field names — the translator's
-     * {@link LanceKnnFilterTranslator#rejectMultiFieldPath} guard
-     * already refuses dotted paths, so multi-field paths never reach
-     * the literal encoder in the first place.
-     *
-     * <p>Cluster-state metadata carries the mapping as the same JSON
-     * the operator sent to {@code POST /_lance/attach}, deserialised
-     * into a {@code Map<String, Object>} tree. The top-level
-     * {@code properties} entry holds one entry per column, keyed by
-     * the OpenSearch field name; the {@code type} field on each
-     * entry is what we need. A dotted name walks nested
-     * {@code properties} maps (a Struct column mapped as
-     * {@code object}), so {@code meta.region} resolves to its child
-     * type while a multi-field sub-field ({@code body.raw}, declared
-     * under {@code fields}) stays unresolved.
-     *
-     * <p>Package-private so the per-node executor can build the same
-     * lookup from its own copy of the index metadata when it decides
-     * whether a bool query's scalar clauses can travel to Lance as an
-     * FTS prefilter.
-     */
-    @SuppressWarnings("unchecked")
-    static java.util.function.Function<String, String> buildFieldTypeLookup(IndexMetadata indexMetadata) {
-        org.opensearch.cluster.metadata.MappingMetadata mapping = indexMetadata.mapping();
-        if (mapping == null) {
-            return LanceKnnFilterTranslator.NO_MAPPING;
-        }
-        java.util.Map<String, Object> source = mapping.getSourceAsMap();
-        Object properties = source == null ? null : source.get("properties");
-        if (!(properties instanceof java.util.Map)) {
-            return LanceKnnFilterTranslator.NO_MAPPING;
-        }
-        final java.util.Map<String, Object> propertyMap = (java.util.Map<String, Object>) properties;
-        return name -> {
-            Object field = propertyMap.get(name);
-            if (field == null && name != null && name.indexOf('.') >= 0) {
-                field = resolveObjectPath(propertyMap, name);
-            }
-            if (!(field instanceof java.util.Map)) {
-                return null;
-            }
-            Map<String, Object> fieldMap = (Map<String, Object>) field;
-            if (LanceMappingMeta.isDropped(fieldMap)) {
-                // The Lance table renamed, reset or dropped the column
-                // behind this name. Answering null makes the translator
-                // treat it as unmapped, so no Lance SQL names a column
-                // the table no longer has (which would fail the scan)
-                // and the query folds to the unmapped behaviour: 0 hits.
-                return null;
-            }
-            Object type = fieldMap.get("type");
-            if (!(type instanceof String typeName)) {
-                return null;
-            }
-            return LanceKnnFilterTranslator.sentinelFor(typeName, arrowTypeMeta(fieldMap));
-        };
-    }
-
-    /**
-     * The mapping entry's {@code meta.lance_arrow_type} string, or
-     * {@code null} when the entry carries no meta or no such key. Fed
-     * to {@link LanceKnnFilterTranslator#sentinelFor} so a {@code date}
-     * field the attach body overrode onto an epoch-millis integer
-     * column keeps numeric SQL literals.
-     */
-    @SuppressWarnings("unchecked")
-    static String arrowTypeMeta(Map<String, Object> fieldMap) {
-        Object meta = fieldMap.get("meta");
-        if (!(meta instanceof Map)) {
-            return null;
-        }
-        Object arrowType = ((Map<String, Object>) meta).get("lance_arrow_type");
-        return arrowType instanceof String s ? s : null;
-    }
-
-    /**
-     * Resolve a dotted field name through nested {@code properties}
-     * maps: each segment but the last must name an entry that itself
-     * carries a {@code properties} object (a struct child mapped as an
-     * {@code object}). A multi-field sub-field does not resolve here —
-     * its sub-entries live under {@code fields}, not {@code properties}
-     * — so the filter translator can tell the two dotted shapes apart:
-     * struct children print as Lance nested field accesses, sub-fields
-     * stay on the Lucene doc value path. A path crossing an entry of
-     * type {@code nested} (a {@code List<Struct>} column) does not
-     * resolve either: DataFusion has no {@code UNNEST} in a filter, so a
-     * nested child predicate cannot travel to Lance SQL and belongs on
-     * the Lucene side.
-     */
-    @SuppressWarnings("unchecked")
-    private static Object resolveObjectPath(Map<String, Object> propertyMap, String name) {
-        Map<String, Object> current = propertyMap;
-        String[] segments = name.split("\\.");
-        for (int s = 0; s < segments.length - 1; s++) {
-            Object entry = current.get(segments[s]);
-            if (!(entry instanceof Map)) {
-                return null;
-            }
-            if ("nested".equals(((Map<String, Object>) entry).get("type"))) {
-                return null;
-            }
-            Object nested = ((Map<String, Object>) entry).get("properties");
-            if (!(nested instanceof Map)) {
-                return null;
-            }
-            current = (Map<String, Object>) nested;
-        }
-        return current.get(segments[segments.length - 1]);
     }
 
     /**

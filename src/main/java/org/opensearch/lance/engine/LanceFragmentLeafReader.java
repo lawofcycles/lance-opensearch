@@ -242,8 +242,8 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * this reader issues, or {@code null} for an unfiltered scan.
      *
      * <p>Fragment path queries whose top-level shape is a scalar
-     * filter that {@code LanceKnnFilterTranslator} can translate to
-     * Lance SQL ship the translated predicate as
+     * filter the query planner can print as Lance SQL ship the
+     * predicate as
      * {@code LanceFragmentQueryRequest.filterSql()}, and the fragment
      * dispatch handler forwards it here so the lazy column loads
      * inside {@link #ensureNumericLoaded} et al. only materialise the
