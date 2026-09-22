@@ -34,6 +34,19 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
         + "\"flag\":{\"scalar\":\"none\"},"
         + "\"embedding\":{\"vector\":\"ivf_flat\",\"params\":{\"num_partitions\":2}}}";
 
+    /**
+     * The exact value {@code LanceOverrides.toJson()} persists for
+     * {@link #INDEXES_CLAUSE} in the {@code index.lance.overrides}
+     * setting. Key order is not part of the contract (the REST layer
+     * parses the body into an unordered map), so assertions compare the
+     * parsed structure.
+     */
+    private static final String PERSISTED_OVERRIDES = "{\"indexes\":{"
+        + "\"rating\":{\"scalar\":\"zonemap\",\"params\":{\"rows_per_zone\":8}},"
+        + "\"category\":{\"scalar\":\"bitmap\"},"
+        + "\"flag\":{\"scalar\":\"none\"},"
+        + "\"embedding\":{\"vector\":\"ivf_flat\",\"params\":{\"num_partitions\":2}}}}";
+
     public void testIndexesClausePicksTheTypesEndToEnd() throws Exception {
         String suffix = "idxtypes-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
@@ -54,9 +67,11 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
             assertEquals("attach failed: " + readAll(oracle), RestStatus.OK.getStatus(), oracle.getStatusLine().getStatusCode());
             ensureGreen(oracleIndex);
 
-            // The preference persists inside the overrides setting.
+            // The preference persists inside the overrides setting as
+            // exactly this value (compared structurally; key order is
+            // not part of the contract).
             String settings = readAll(client().performRequest(new Request("GET", "/" + prefIndex + "/_settings")));
-            assertTrue("expected the indexes preference in index.lance.overrides: " + settings, settings.contains("zonemap"));
+            assertOverridesSetting(settings, prefIndex, PERSISTED_OVERRIDES);
 
             // Build with the persisted preference. The columns filter
             // keeps the untargeted columns (id, tags, body) out of this
@@ -107,9 +122,9 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
             );
             assertTrue("expected the one-shot bitmap on flag: " + oneShot, oneShot.contains("{\"column\":\"flag\",\"type\":\"BITMAP\"}"));
             String oracleSettings = readAll(client().performRequest(new Request("GET", "/" + oracleIndex + "/_settings")));
-            assertFalse("the one-shot preference must not persist: " + oracleSettings, oracleSettings.contains("bitmap"));
+            assertNull("the one-shot preference must not persist: " + oracleSettings, overridesSetting(oracleSettings, oracleIndex));
             String prefSettings = readAll(client().performRequest(new Request("GET", "/" + prefIndex + "/_settings")));
-            assertTrue("the attach-time preference must survive: " + prefSettings, prefSettings.contains("zonemap"));
+            assertOverridesSetting(prefSettings, prefIndex, PERSISTED_OVERRIDES);
         } finally {
             for (String index : new String[] { prefIndex, oracleIndex }) {
                 try {
@@ -187,6 +202,33 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
             extractIntPath(leftBody, "hits", "total", "value")
         );
         assertEquals("hit ids must agree for " + query, idsOf(hitsOf(rightBody)), idsOf(hitsOf(leftBody)));
+    }
+
+    /**
+     * The {@code index.lance.overrides} value of {@code index} from a
+     * {@code GET /{index}/_settings} body, or {@code null} when the
+     * setting is absent.
+     */
+    private static String overridesSetting(String settingsBody, String index) {
+        Object value = parseJson(settingsBody).get(index);
+        for (String step : new String[] { "settings", "index", "lance", "overrides" }) {
+            if (!(value instanceof Map<?, ?> map)) {
+                return null;
+            }
+            value = map.get(step);
+        }
+        return value instanceof String string ? string : null;
+    }
+
+    /**
+     * Assert the persisted {@code index.lance.overrides} value of
+     * {@code index} equals {@code expectedJson}, comparing the parsed
+     * structure so key order does not matter.
+     */
+    private static void assertOverridesSetting(String settingsBody, String index, String expectedJson) {
+        String actual = overridesSetting(settingsBody, index);
+        assertNotNull("expected an index.lance.overrides value: " + settingsBody, actual);
+        assertEquals("index.lance.overrides of " + index + ": " + actual, parseJson(expectedJson), parseJson(actual));
     }
 
     /**
