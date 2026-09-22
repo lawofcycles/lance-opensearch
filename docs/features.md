@@ -229,12 +229,13 @@ Types listed here map to real OpenSearch field types with doc values or FTS back
 | `utf8` with a Lance FTS index | `lance_text` | Enables `match`, `lance_match`, `lance_match_phrase`, `lance_multi_match`. |
 | `utf8` without a Lance FTS index | `keyword` | SortedSetDocValues, so `term` / `terms` / `terms` aggregation work. |
 | `list<utf8>` | multi-valued `keyword` | |
+| `struct` | `object` | Children map recursively under `properties` (int widths, float/double, boolean, date/timestamp, `utf8` → `keyword`, `list<utf8>` → `keyword`); term / terms / range / exists, sort, and aggregations resolve on the `parent.child` path, and `_source` renders the nested JSON object. FTS and knn are not derived on struct children; a child type outside this list is noted in the attach response and skipped while the parent object is still emitted. |
 | `fixed_size_list<float32>` | `knn_vector` | Dimension carried through the mapping; `lance_knn` validates it. |
 | `binary` / `large_binary` | `binary` | Base64 in `_source`, no doc values. |
 
 Multi-fields (`fields.raw: keyword` on a Utf8 base column) is supported through the `multi_fields` attach clause above.
 
-Types not yet surfaced: `ip`, `wildcard`, `object` (Arrow `Struct`), `nested` (Arrow `List<Struct>`), and the geo family. `Utf8` list, `Decimal`, and `FloatingPoint(HALF)` are stored in the table but excluded from the mapping today; the attach response notes them.
+Types not yet surfaced: `ip`, `wildcard`, `nested` (Arrow `List<Struct>`), and the geo family. `Utf8` list, `Decimal`, and `FloatingPoint(HALF)` are stored in the table but excluded from the mapping today; the attach response notes them.
 
 ## Native memory bounds
 

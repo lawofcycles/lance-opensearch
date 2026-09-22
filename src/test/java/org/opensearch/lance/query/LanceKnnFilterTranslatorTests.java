@@ -217,6 +217,42 @@ public class LanceKnnFilterTranslatorTests extends OpenSearchTestCase {
         }
     }
 
+    public void testStructChildPathsPrintAsLanceNestedFieldAccess() {
+        // A dotted name the lookup resolves is a struct child mapped
+        // through object properties; Lance's SQL parser reads the
+        // dotted path as a nested field access, so the translator
+        // prints it verbatim.
+        Function<String, String> lookup = name -> switch (name) {
+            case "meta.region" -> "keyword";
+            case "meta.score" -> "double";
+            case "meta.flags.active" -> "boolean";
+            default -> null;
+        };
+        assertEquals("meta.region = 'east'", LanceKnnFilterTranslator.toLanceSql(QueryBuilders.termQuery("meta.region", "east"), lookup));
+        assertEquals(
+            "meta.region IN ('east', 'west')",
+            LanceKnnFilterTranslator.toLanceSql(QueryBuilders.termsQuery("meta.region", List.of("east", "west")), lookup)
+        );
+        assertEquals("(meta.score >= 3.0)", LanceKnnFilterTranslator.toLanceSql(QueryBuilders.rangeQuery("meta.score").gte(3.0), lookup));
+        assertEquals(
+            "meta.flags.active IS NOT NULL",
+            LanceKnnFilterTranslator.toLanceSql(QueryBuilders.existsQuery("meta.flags.active"), lookup)
+        );
+        // A dotted name the lookup does not resolve (a multi-field
+        // sub-field, or no mapping context at all) keeps rejecting so
+        // the query stays on the Lucene doc value path.
+        Exception e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceKnnFilterTranslator.toLanceSql(QueryBuilders.termQuery("body.raw", "x"), lookup)
+        );
+        assertTrue("unexpected message: " + e.getMessage(), e.getMessage().contains("dotted field"));
+        Exception noMapping = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceKnnFilterTranslator.toLanceSql(QueryBuilders.termQuery("meta.region", "east"))
+        );
+        assertTrue("unexpected message: " + noMapping.getMessage(), noMapping.getMessage().contains("dotted field"));
+    }
+
     public void testPatternQueriesOnNonStringColumnRejected() {
         // With a mapping in hand a wildcard on a numeric column is
         // refused so the coordinator falls back to the Lucene path,
