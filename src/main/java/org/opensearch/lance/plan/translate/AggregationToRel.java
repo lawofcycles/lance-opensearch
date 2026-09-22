@@ -32,6 +32,7 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.index.mapper.DateFieldMapper;
+import org.opensearch.lance.dispatch.LanceAggregationSupport;
 import org.opensearch.lance.plan.calcite.LanceOperatorTable;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.rel.BucketSpec;
@@ -121,7 +122,7 @@ final class AggregationToRel {
     static final int MAX_BUCKET_DEPTH = 3;
 
     /** Most conditions a {@code CASE WHEN} bit mask encodes without touching the sign bit. */
-    static final int MAX_MASK_CONDITIONS = 62;
+    static final int MAX_MASK_CONDITIONS = LanceAggregationSupport.MAX_MASK_CONDITIONS;
 
     /**
      * Translates the request's aggregations over the scan the builder

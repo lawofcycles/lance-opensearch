@@ -20,7 +20,6 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
-import org.opensearch.lance.query.substrait.SubstraitExpressions;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.BucketOrder;
@@ -101,6 +100,15 @@ import org.opensearch.search.builder.SearchSourceBuilder;
  * {@link LanceAggregatePushdown} for the error that adds.
  */
 public final class LanceAggregationSupport {
+
+    /**
+     * Most conditions a {@code CASE WHEN} bit mask group key encodes
+     * without touching the sign bit of its {@code i64} value: the bound
+     * on the ranges of a range aggregation and the filters of a filters
+     * aggregation. The translator refuses larger requests with the same
+     * bound.
+     */
+    public static final int MAX_MASK_CONDITIONS = 62;
 
     private LanceAggregationSupport() {}
 
@@ -453,7 +461,7 @@ public final class LanceAggregationSupport {
      * {@code date_histogram} with a {@code fixed_interval} or a
      * {@code calendar_interval} that {@link #calendarUnit} knows,
      * {@code offset} 0, no bounds and no time zone; {@code range} and
-     * {@code date_range} with one to {@link SubstraitExpressions#MAX_MASK_CONDITIONS}
+     * {@code date_range} with one to {@link #MAX_MASK_CONDITIONS}
      * ranges; {@code missing}; {@code filter} and {@code filters} (one to
      * that many filters) whose every query is a scalar filter
      * ({@link #isFilterQuerySupported}) the executor can spell as a
@@ -468,7 +476,7 @@ public final class LanceAggregationSupport {
             return isFilterQuerySupported(filter.getFilter());
         }
         if (builder instanceof FiltersAggregationBuilder filters) {
-            if (filters.filters().isEmpty() || filters.filters().size() > SubstraitExpressions.MAX_MASK_CONDITIONS) {
+            if (filters.filters().isEmpty() || filters.filters().size() > MAX_MASK_CONDITIONS) {
                 return false;
             }
             for (FiltersAggregator.KeyedFilter keyed : filters.filters()) {
@@ -508,7 +516,7 @@ public final class LanceAggregationSupport {
                 && dateHistogram.timeZone() == null;
         }
         if (builder instanceof AbstractRangeBuilder<?, ?> range) {
-            return !range.ranges().isEmpty() && range.ranges().size() <= SubstraitExpressions.MAX_MASK_CONDITIONS;
+            return !range.ranges().isEmpty() && range.ranges().size() <= MAX_MASK_CONDITIONS;
         }
         return builder instanceof MissingAggregationBuilder;
     }
