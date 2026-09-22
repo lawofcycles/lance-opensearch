@@ -95,6 +95,40 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testStructTermsAggregationAcrossThreeNodes() throws Exception {
+        // A terms aggregation on a struct child (dotted field name) fans
+        // out one fragment per node; the per-node responses must reduce
+        // like any keyword terms, proving the wire format carries
+        // nothing struct specific.
+        String suffix = "mn-struct-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeStructTable(scratchDir, tableName, 2);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(3, extractIntPath(readAll(attach), "fragments"));
+
+            String body = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"aggs\":{\"regions\":{\"terms\":{\"field\":\"meta.region\",\"order\":{\"_key\":\"asc\"}}}}}"
+                )
+            );
+            assertEquals("struct terms total: " + body, 6, extractIntPath(body, "hits", "total", "value"));
+            // Fixture regions: east on rows 0, 2, 3; west on 1, 5; south on 4.
+            assertEquals("east bucket: " + body, 3, extractIntPath(body, "aggregations", "regions", "buckets", "0", "doc_count"));
+            assertEquals("south bucket: " + body, 1, extractIntPath(body, "aggregations", "regions", "buckets", "1", "doc_count"));
+            assertEquals("west bucket: " + body, 2, extractIntPath(body, "aggregations", "regions", "buckets", "2", "doc_count"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testFtsAcrossFragmentsOnThreeNodeCluster() throws Exception {
         // 12 rows written 4 per file give fragments 0, 1 and 2. The
         // coordinator sends one fragment to each of the three data

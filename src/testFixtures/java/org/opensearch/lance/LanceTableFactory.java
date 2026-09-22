@@ -27,10 +27,12 @@ import org.apache.arrow.vector.SmallIntVector;
 import org.apache.arrow.vector.TimeStampMicroVector;
 import org.apache.arrow.vector.TimeStampMilliVector;
 import org.apache.arrow.vector.TinyIntVector;
+import org.apache.arrow.vector.UInt4Vector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
@@ -426,6 +428,119 @@ public final class LanceTableFactory {
                 Data.exportArrayStream(allocator, reader, stream);
                 WriteParams writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
                 Dataset.create(allocator, stream, uri, writeParams).close();
+            }
+        }
+        return uri;
+    }
+
+    /**
+     * Writes a Lance table with a nested Struct column, for tests of the
+     * {@code object} mapping derivation and the dotted-path doc value /
+     * {@code _source} plumbing. Public because the rest package's
+     * derivation unit tests need it too.
+     *
+     * <p>Schema: {@code id} int32 primary key (non-nullable),
+     * {@code meta} nullable struct with children {@code region} Utf8,
+     * {@code score} Float64, {@code raw} UInt32 (deliberately a type the
+     * derivation does not support inside a struct, so the skip note and
+     * the "parent object still emitted" behaviour are exercised), and
+     * {@code flags}, itself a nullable struct with one {@code active}
+     * Bool child.
+     *
+     * <p>Six rows ({@code i = 0..5}):
+     * <ul>
+     *   <li>{@code id = i}</li>
+     *   <li>{@code meta.region}: east, west, east, east, south, west</li>
+     *   <li>{@code meta.score = i * 1.5}</li>
+     *   <li>{@code meta.raw = i}</li>
+     *   <li>{@code meta.flags.active = (i % 2 == 0)}, except row 3 where
+     *       {@code meta.flags} is Arrow null (the one nested null)</li>
+     * </ul>
+     *
+     * @param maxRowsPerFile 0 writes one fragment; a positive value
+     *        closes a data file every that many rows (2 gives three
+     *        fragments), for multi-node fan-out coverage
+     */
+    public static String writeStructTable(Path parent, String name, int maxRowsPerFile) throws Exception {
+        return withLocaleRoot(() -> writeStructTableOnce(parent, name, maxRowsPerFile));
+    }
+
+    private static String writeStructTableOnce(Path parent, String name, int maxRowsPerFile) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        Map<String, String> pkMeta = Map.of("lance-schema:unenforced-primary-key", "true");
+        Field flagsField = new Field(
+            "flags",
+            FieldType.nullable(new ArrowType.Struct()),
+            Arrays.asList(new Field("active", FieldType.nullable(new ArrowType.Bool()), null))
+        );
+        Field metaField = new Field(
+            "meta",
+            FieldType.nullable(new ArrowType.Struct()),
+            Arrays.asList(
+                new Field("region", FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("score", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null),
+                new Field("raw", FieldType.nullable(new ArrowType.Int(32, false)), null),
+                flagsField
+            )
+        );
+        Schema schema = new Schema(
+            Arrays.asList(new Field("id", new FieldType(false, new ArrowType.Int(32, true), null, pkMeta), null), metaField),
+            Map.of()
+        );
+
+        int rowCount = 6;
+        String[] regions = { "east", "west", "east", "east", "south", "west" };
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            byte[] ipcBytes;
+            try (
+                VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                ByteArrayOutputStream out = new ByteArrayOutputStream()
+            ) {
+                IntVector idVector = (IntVector) root.getVector("id");
+                StructVector meta = (StructVector) root.getVector("meta");
+                VarCharVector region = (VarCharVector) meta.getChild("region");
+                Float8Vector score = (Float8Vector) meta.getChild("score");
+                UInt4Vector raw = (UInt4Vector) meta.getChild("raw");
+                StructVector flags = (StructVector) meta.getChild("flags");
+                BitVector active = (BitVector) flags.getChild("active");
+
+                root.allocateNew();
+                for (int i = 0; i < rowCount; i++) {
+                    idVector.setSafe(i, i);
+                    meta.setIndexDefined(i);
+                    region.setSafe(i, regions[i].getBytes(StandardCharsets.UTF_8));
+                    score.setSafe(i, i * 1.5d);
+                    raw.setSafe(i, i);
+                    if (i == 3) {
+                        flags.setNull(i);
+                    } else {
+                        flags.setIndexDefined(i);
+                        active.setSafe(i, (i % 2 == 0) ? 1 : 0);
+                    }
+                }
+                root.setRowCount(rowCount);
+
+                try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                }
+                ipcBytes = out.toByteArray();
+            }
+
+            try (
+                ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+            ) {
+                Data.exportArrayStream(allocator, reader, stream);
+                WriteParams.Builder writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE);
+                if (maxRowsPerFile > 0) {
+                    writeParams = writeParams.withMaxRowsPerFile(maxRowsPerFile);
+                }
+                Dataset.create(allocator, stream, uri, writeParams.build()).close();
             }
         }
         return uri;

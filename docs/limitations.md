@@ -102,7 +102,8 @@ The coordinator orders hits with equal scores or equal sort values by their Lanc
 
 ## Mapping coverage gaps
 
-- `ip`, `wildcard`, `object` (Arrow `Struct`), `nested` (Arrow `List<Struct>`), and the geo family are not surfaced.
+- `ip`, `wildcard`, `nested` (Arrow `List<Struct>`), and the geo family are not surfaced.
+- FTS and knn on struct children are not derived: a Utf8 child always maps to `keyword` (never `lance_text`) and a `FixedSizeList` vector child is skipped with a note. A struct child type outside the scalar derivation (unsigned integers, binary, decimals) is skipped with a note while the parent `object` is still emitted.
 - `Utf8` list, `Decimal`, and `FloatingPoint(HALF|DOUBLE)` columns are stored in the table but excluded from the mapping. The attach response notes them.
 - Blob columns and `LargeBinary` beyond the basic `binary` mapping share the same status.
 - Lindera and Jieba tokenizers are not bundled with lance-jni. Only ICU-based tokenization is available for CJK text through the Lance FTS index.
