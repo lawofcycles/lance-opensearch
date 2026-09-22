@@ -16,8 +16,12 @@ public final class PlannerTestPlans {
 
     private PlannerTestPlans() {}
 
-    /** A structurally empty plan: identity only, never executed. */
-    public static LanceAggregatePushdown.Plan emptyPlan() {
+    /**
+     * A plan whose only use is identity comparison in dispatcher
+     * tests: it carries no Substrait bytes and no composite, so
+     * executing it would fail. Never hand it to a scan runner.
+     */
+    public static LanceAggregatePushdown.Plan identityMarkerPlan() {
         return new LanceAggregatePushdown.Plan(null, List.of(), List.of(), null, List.of(), List.of(), 0, null);
     }
 }

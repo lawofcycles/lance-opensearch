@@ -17,10 +17,19 @@ import org.opensearch.search.aggregations.AggregatorFactories;
  * Everything a rule needs to decide whether it matches and to encode
  * its plan: the request's aggregation builders, the table's Arrow
  * schema, the index's keyword sub-field spec, the mapping context, and
- * the node's planning bounds. Immutable; built once per request by the
- * dispatcher and handed to every rule in turn. Every reference field
- * is required, so a rule never sees a null and a missing input fails
- * at construction, close to its source.
+ * the node's planning bounds. Immutable in what it owns: the multi
+ * field map is copied at construction, and the primitives cannot
+ * change. The {@code AggregatorFactories.Builder} is mutable by type
+ * and is held by reference (OpenSearch offers no API to clone one);
+ * rules treat it as read only. Every reference field is required, so a
+ * rule never sees a null and a missing input fails at construction,
+ * close to its source.
+ *
+ * <p>The three int bounds carry no range validation here: production
+ * callers read them from the {@code LancePlugin} settings, whose
+ * {@code Setting<Integer>} validators enforce the ranges, and that
+ * setting layer is the single source of truth. A direct caller (a
+ * test) accepts the responsibility of providing sane values.
  */
 public final class AggregationRewriteContext {
 
@@ -43,14 +52,14 @@ public final class AggregationRewriteContext {
     ) {
         this.aggregations = Objects.requireNonNull(aggregations, "aggregations");
         this.schema = Objects.requireNonNull(schema, "schema");
-        this.multiFields = Objects.requireNonNull(multiFields, "multiFields");
+        this.multiFields = Map.copyOf(Objects.requireNonNull(multiFields, "multiFields"));
         this.queryShardContext = Objects.requireNonNull(queryShardContext, "queryShardContext");
         this.maxGroups = maxGroups;
         this.percentilesBins = percentilesBins;
         this.topKSlack = topKSlack;
     }
 
-    /** The request's aggregation builders. */
+    /** The request's aggregation builders; mutable by type, treated as read only by rules. */
     public AggregatorFactories.Builder aggregations() {
         return aggregations;
     }
@@ -60,7 +69,7 @@ public final class AggregationRewriteContext {
         return schema;
     }
 
-    /** The index's keyword sub-field spec, base column to sub-field name to type. */
+    /** The index's keyword sub-field spec, base column to sub-field name to type; an immutable copy. */
     public Map<String, LinkedHashMap<String, String>> multiFields() {
         return multiFields;
     }

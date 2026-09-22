@@ -25,9 +25,9 @@ public interface AggregationRewriteRule {
     Optional<PushdownPlan> tryRewrite(AggregationRewriteContext ctx);
 
     /**
-     * A name for logs and diagnostics: non empty, stable across
-     * releases, and unique across the registered rules. Not enforced
-     * anywhere; a duplicate or empty name only muddies diagnostics.
+     * A name for logs and diagnostics: non empty and unique across the
+     * registered rules, both enforced by the registry constructor.
+     * Stability across releases is expected but not enforced.
      */
     String name();
 }
