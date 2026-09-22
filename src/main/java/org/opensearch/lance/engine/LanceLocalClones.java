@@ -7,7 +7,6 @@ package org.opensearch.lance.engine;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -28,9 +27,12 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.threadpool.ThreadPool;
@@ -436,26 +438,14 @@ public final class LanceLocalClones implements ClusterStateListener {
     }
 
     void writeMarker(String indexName, Marker marker) throws IOException {
-        String json = "{\"source_uri\":"
-            + jsonString(marker.sourceUri())
-            + ",\"source_version\":"
-            + marker.sourceVersion()
-            + ",\"clone_uri\":"
-            + jsonString(marker.cloneUri())
-            + "}";
-        Files.write(markerPath(indexName), json.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String jsonString(String value) {
-        StringBuilder sb = new StringBuilder(value.length() + 2).append('"');
-        for (int i = 0; i < value.length(); i++) {
-            char c = value.charAt(i);
-            if (c == '"' || c == '\\') {
-                sb.append('\\');
-            }
-            sb.append(c);
+        try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
+            builder.startObject()
+                .field("source_uri", marker.sourceUri())
+                .field("source_version", marker.sourceVersion())
+                .field("clone_uri", marker.cloneUri())
+                .endObject();
+            Files.write(markerPath(indexName), BytesReference.toBytes(BytesReference.bytes(builder)));
         }
-        return sb.append('"').toString();
     }
 
     private static long sizeOf(Path dir) {
