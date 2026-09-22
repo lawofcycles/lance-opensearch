@@ -563,6 +563,120 @@ public final class LanceTableFactory {
     }
 
     /**
+     * Writes a table with a {@code List<Struct>} column for the nested
+     * field tests: {@code id} int32 PK, {@code title} Utf8 (no FTS
+     * index, maps to keyword) and {@code items}, a list of
+     * {@code struct<color: utf8, size: utf8, qty: int32>}. Six rows:
+     * <ul>
+     *   <li>row 0: title alpha, items [(red, small, 1)]</li>
+     *   <li>row 1: title beta, items [(red, large, 2), (blue, small, 3),
+     *       (green, medium, 4)]</li>
+     *   <li>row 2: title alpha, items [] (zero elements)</li>
+     *   <li>row 3: title beta, items [(red, small, 5), (blue, large, 6)]
+     *       — red and large appear in different elements, the cross
+     *       element case a nested query must not match</li>
+     *   <li>row 4: title gamma, items [(yellow, small, 7)]</li>
+     *   <li>row 5: title alpha, items [(red, large, 8), (purple, tiny,
+     *       9)] — tests delete this row afterwards through
+     *       {@link #deleteRows}</li>
+     * </ul>
+     *
+     * @param maxRowsPerFile 0 writes one fragment; a positive value
+     *        closes a data file every that many rows (2 gives three
+     *        fragments), for multi-node fan-out coverage
+     */
+    public static String writeNestedTable(Path parent, String name, int maxRowsPerFile) throws Exception {
+        return withLocaleRoot(() -> writeNestedTableOnce(parent, name, maxRowsPerFile));
+    }
+
+    private static String writeNestedTableOnce(Path parent, String name, int maxRowsPerFile) throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        Map<String, String> pkMeta = Map.of("lance-schema:unenforced-primary-key", "true");
+        Field elementField = new Field(
+            "item",
+            FieldType.nullable(new ArrowType.Struct()),
+            Arrays.asList(
+                new Field("color", FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("size", FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("qty", FieldType.nullable(new ArrowType.Int(32, true)), null)
+            )
+        );
+        Schema schema = new Schema(
+            Arrays.asList(
+                new Field("id", new FieldType(false, new ArrowType.Int(32, true), null, pkMeta), null),
+                new Field("title", FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("items", FieldType.nullable(new ArrowType.List()), Collections.singletonList(elementField))
+            ),
+            Map.of()
+        );
+
+        String[] titles = { "alpha", "beta", "alpha", "beta", "gamma", "alpha" };
+        String[][][] items = {
+            { { "red", "small", "1" } },
+            { { "red", "large", "2" }, { "blue", "small", "3" }, { "green", "medium", "4" } },
+            {},
+            { { "red", "small", "5" }, { "blue", "large", "6" } },
+            { { "yellow", "small", "7" } },
+            { { "red", "large", "8" }, { "purple", "tiny", "9" } } };
+        int rowCount = titles.length;
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            byte[] ipcBytes;
+            try (
+                VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                ByteArrayOutputStream out = new ByteArrayOutputStream()
+            ) {
+                IntVector idVector = (IntVector) root.getVector("id");
+                VarCharVector titleVector = (VarCharVector) root.getVector("title");
+                ListVector itemsVector = (ListVector) root.getVector("items");
+                StructVector element = (StructVector) itemsVector.getDataVector();
+                VarCharVector color = (VarCharVector) element.getChild("color");
+                VarCharVector size = (VarCharVector) element.getChild("size");
+                IntVector qty = (IntVector) element.getChild("qty");
+
+                root.allocateNew();
+                int elem = 0;
+                for (int i = 0; i < rowCount; i++) {
+                    idVector.setSafe(i, i);
+                    titleVector.setSafe(i, titles[i].getBytes(StandardCharsets.UTF_8));
+                    itemsVector.startNewValue(i);
+                    for (String[] item : items[i]) {
+                        element.setIndexDefined(elem);
+                        color.setSafe(elem, item[0].getBytes(StandardCharsets.UTF_8));
+                        size.setSafe(elem, item[1].getBytes(StandardCharsets.UTF_8));
+                        qty.setSafe(elem, Integer.parseInt(item[2]));
+                        elem++;
+                    }
+                    itemsVector.endValue(i, items[i].length);
+                }
+                root.setRowCount(rowCount);
+
+                try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                }
+                ipcBytes = out.toByteArray();
+            }
+
+            try (
+                ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+            ) {
+                Data.exportArrayStream(allocator, reader, stream);
+                WriteParams.Builder writeParams = new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE);
+                if (maxRowsPerFile > 0) {
+                    writeParams = writeParams.withMaxRowsPerFile(maxRowsPerFile);
+                }
+                Dataset.create(allocator, stream, uri, writeParams.build()).close();
+            }
+        }
+        return uri;
+    }
+
+    /**
      * Drop columns from an existing Lance table. Simulates
      * {@code dataset.drop_columns([...])} from Python / Rust; used by
      * integration tests that exercise mapping-drift detection when the

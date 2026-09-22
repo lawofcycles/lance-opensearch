@@ -74,4 +74,23 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
             assertTrue("vectorColumns must be empty: " + derivation.vectorColumns(), derivation.vectorColumns().isEmpty());
         }
     }
+
+    public void testListOfStructDerivesNestedMapping() throws Exception {
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeNestedTable(scratchDir, "derive-" + getTestName().toLowerCase(java.util.Locale.ROOT), 0);
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset);
+
+            String mapping = derivation.mappingJson();
+            assertTrue("items must map as nested: " + mapping, mapping.contains("\"items\":{\"type\":\"nested\",\"properties\":{"));
+            assertTrue("color must map as keyword: " + mapping, mapping.contains("\"color\":{\"type\":\"keyword\""));
+            assertTrue("size must map as keyword: " + mapping, mapping.contains("\"size\":{\"type\":\"keyword\""));
+            assertTrue("qty must map as integer: " + mapping, mapping.contains("\"qty\":{\"type\":\"integer\""));
+            assertEquals("id", derivation.keyField());
+            assertEquals(java.util.Set.of("items"), derivation.nestedColumns());
+            // Nested children stay out of the index-eligible column sets.
+            assertTrue("ftsColumns must be empty: " + derivation.ftsColumns(), derivation.ftsColumns().isEmpty());
+            assertFalse("children must not be scalar columns: " + derivation.scalarColumns(), derivation.scalarColumns().contains("items"));
+        }
+    }
 }

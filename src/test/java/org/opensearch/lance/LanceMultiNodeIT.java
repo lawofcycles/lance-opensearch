@@ -95,6 +95,41 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testNestedQueryAcrossThreeNodes() throws Exception {
+        // A nested query fans out one fragment per node; each executor
+        // builds its own doc id layout (child docs before their parent)
+        // and the per-node parent hits merge like any other hits.
+        String suffix = "mn-nested-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeNestedTable(scratchDir, tableName, 2);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(3, extractIntPath(readAll(attach), "fragments"));
+
+            // red appears in rows 0, 1, 3 and 5, spread over the three
+            // fragments (rows 0..1, 2..3, 4..5); red and large sit in the
+            // same element only in rows 1 and 5.
+            String body = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"query\":{\"nested\":{\"path\":\"items\",\"query\":{\"bool\":{\"must\":["
+                        + "{\"term\":{\"items.color\":\"red\"}},{\"term\":{\"items.size\":\"large\"}}]}}}},\"sort\":[{\"id\":\"asc\"}]}"
+                )
+            );
+            assertEquals("nested red+large across fragments: " + body, 2, extractIntPath(body, "hits", "total", "value"));
+            assertEquals("first hit id: " + body, 1, extractIntPath(body, "hits", "hits", "0", "_source", "id"));
+            assertEquals("second hit id: " + body, 5, extractIntPath(body, "hits", "hits", "1", "_source", "id"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testStructTermsAggregationAcrossThreeNodes() throws Exception {
         // A terms aggregation on a struct child (dotted field name) fans
         // out one fragment per node; the per-node responses must reduce
