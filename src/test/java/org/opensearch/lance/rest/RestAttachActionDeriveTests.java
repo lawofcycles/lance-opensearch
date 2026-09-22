@@ -321,4 +321,46 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
             assertFalse("label must leave ftsColumns: " + derivation.ftsColumns(), derivation.ftsColumns().contains("label"));
         }
     }
+
+    public void testWildcardOverrideDerivesKeywordMappingWithIntentMeta() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("path", Map.of("type", "wildcard")))
+            );
+            String mapping = derivation.mappingJson();
+            assertTrue("path must map as keyword: " + mapping, mapping.contains("\"path\":{\"type\":\"keyword\""));
+            assertTrue("meta must record the declared type: " + mapping, mapping.contains("\"lance_override_type\":\"wildcard\""));
+            assertTrue("path joins scalarColumns: " + derivation.scalarColumns(), derivation.scalarColumns().contains("path"));
+        }
+    }
+
+    public void testWildcardOverrideOnInvertedIndexColumnLeavesFts() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("label", Map.of("type", "wildcard")))
+            );
+            String mapping = derivation.mappingJson();
+            assertTrue("label must map as keyword: " + mapping, mapping.contains("\"label\":{\"type\":\"keyword\""));
+            assertFalse("label must not map as lance_text: " + mapping, mapping.contains("lance_text"));
+            assertFalse("label must leave ftsColumns: " + derivation.ftsColumns(), derivation.ftsColumns().contains("label"));
+        }
+    }
+
+    public void testWildcardOverrideOnNonUtf8Rejected() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
+            IllegalArgumentException onInt = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("id", Map.of("type", "wildcard"))))
+            );
+            assertTrue(onInt.getMessage(), onInt.getMessage().contains("needs a Utf8 column"));
+            // Unlike ip, the multi-valued List<Utf8> shape is refused.
+            IllegalArgumentException onList = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("addrs", Map.of("type", "wildcard"))))
+            );
+            assertTrue(onList.getMessage(), onList.getMessage().contains("needs a Utf8 column"));
+        }
+    }
 }

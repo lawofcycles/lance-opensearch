@@ -1128,10 +1128,12 @@ public final class LanceTableFactory {
     }
 
     /**
-     * Writes a Lance table for the {@code type: ip} override tests: a
-     * Utf8 column of IP address strings (IPv4, IPv6, an IPv4-mapped
-     * IPv6 form and one invalid string) next to a {@code List<Utf8>}
-     * column of the multi-valued shape.
+     * Writes a Lance table for the {@code type: ip} and
+     * {@code type: wildcard} override tests: a Utf8 column of IP
+     * address strings (IPv4, IPv6, an IPv4-mapped IPv6 form and one
+     * invalid string), a {@code List<Utf8>} column of the multi-valued
+     * shape, and a Utf8 column of file-path-like strings for the
+     * wildcard override.
      *
      * <p>Row layout (fixed six-row table):
      * <ul>
@@ -1146,6 +1148,7 @@ public final class LanceTableFactory {
      *   <li>addrs (list&lt;utf8&gt;, nullable): per-row address lists,
      *       row 2 carrying one invalid element ("bogus") next to a valid
      *       one and row 4 an empty list</li>
+     *   <li>path (utf8, nullable): see {@link #pathFixtureValues}</li>
      * </ul>
      */
     public static String writeIpTable(Path parent, String name) throws Exception {
@@ -1157,10 +1160,22 @@ public final class LanceTableFactory {
         return new String[] { "10.0.0.4", "10.0.0.30", "192.168.1.7", "2001:db8::1", "::ffff:10.0.0.2", "not-an-ip" };
     }
 
+    /** The {@code path} column values {@link #writeIpTable} writes, by row. */
+    public static String[] pathFixtureValues() {
+        return new String[] {
+            "/var/log/app.log",
+            "/var/log/sys.log",
+            "/usr/bin/tool",
+            "/home/user/notes.txt",
+            "/var/tmp/cache.bin",
+            "/etc/config.yaml" };
+    }
+
     private static String writeIpTableOnce(Path parent, String name) throws Exception {
         Path tablePath = parent.resolve(name + ".lance");
         String uri = tablePath.toString();
         String[] ips = ipFixtureValues();
+        String[] paths = pathFixtureValues();
         String[][] addrs = {
             { "10.0.0.4", "2001:db8::1" },
             { "10.0.0.30" },
@@ -1174,7 +1189,8 @@ public final class LanceTableFactory {
             Arrays.asList(
                 new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
                 new Field("ip", FieldType.nullable(new ArrowType.Utf8()), null),
-                new Field("addrs", FieldType.nullable(new ArrowType.List()), Collections.singletonList(addrsElement))
+                new Field("addrs", FieldType.nullable(new ArrowType.List()), Collections.singletonList(addrsElement)),
+                new Field("path", FieldType.nullable(new ArrowType.Utf8()), null)
             ),
             Map.of()
         );
@@ -1188,6 +1204,7 @@ public final class LanceTableFactory {
                 VarCharVector ipVector = (VarCharVector) root.getVector("ip");
                 ListVector addrsVector = (ListVector) root.getVector("addrs");
                 VarCharVector element = (VarCharVector) addrsVector.getDataVector();
+                VarCharVector pathVector = (VarCharVector) root.getVector("path");
                 root.allocateNew();
                 int elem = 0;
                 for (int i = 0; i < rowCount; i++) {
@@ -1198,6 +1215,7 @@ public final class LanceTableFactory {
                         element.setSafe(elem++, addr.getBytes(StandardCharsets.UTF_8));
                     }
                     addrsVector.endValue(i, addrs[i].length);
+                    pathVector.setSafe(i, paths[i].getBytes(StandardCharsets.UTF_8));
                 }
                 root.setRowCount(rowCount);
                 try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {

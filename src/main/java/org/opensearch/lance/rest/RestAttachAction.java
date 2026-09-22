@@ -232,6 +232,7 @@ public class RestAttachAction extends BaseRestHandler {
         Map<String, String> dateOverrides = effective.dateColumns();
         java.util.Set<String> keywordOverrides = effective.keywordColumns();
         java.util.Set<String> ipOverrides = effective.ipColumns();
+        java.util.Set<String> wildcardOverrides = effective.wildcardColumns();
         for (LanceField field : lanceSchema.fields()) {
             ArrowType type = field.getType();
             String name = field.getName();
@@ -436,19 +437,26 @@ public class RestAttachAction extends BaseRestHandler {
                     writeMultiFieldsBlock(mapping, name, multiFields);
                     mapping.endObject();
                     scalarColumns.add(name);
-                } else if (hasFts && !keywordOverrides.contains(name)) {
+                } else if (hasFts && !keywordOverrides.contains(name) && !wildcardOverrides.contains(name)) {
                     startFieldWithId(mapping, name, fieldId, "lance_text", arrowTypeIdentity(type));
                     writeMultiFieldsBlock(mapping, name, multiFields);
                     mapping.endObject();
                     ftsColumns.add(name);
                 } else {
                     // Either no FTS index, or the operator overrode the
-                    // column to keyword: map it onto the doc-values path
-                    // and leave it out of ftsColumns so the index build
-                    // paths do not create or optimise an FTS index for
-                    // it. The Lance inverted index the table may carry
-                    // stays untouched; this index just does not use it.
-                    startFieldWithId(mapping, name, fieldId, "keyword", arrowTypeIdentity(type));
+                    // column to keyword or wildcard: map it onto the
+                    // doc-values path and leave it out of ftsColumns so
+                    // the index build paths do not create or optimise an
+                    // FTS index for it. The Lance inverted index the
+                    // table may carry stays untouched; this index just
+                    // does not use it. A `wildcard` override emits the
+                    // same keyword mapping (the reader has no postings
+                    // for the n gram accelerated wildcard field type of
+                    // OpenSearch core, and keyword doc values already
+                    // answer wildcard / prefix / regexp / term) with the
+                    // declared type recorded in the field meta.
+                    String overrideType = wildcardOverrides.contains(name) ? LanceOverrides.TYPE_WILDCARD : null;
+                    startFieldWithId(mapping, name, fieldId, "keyword", arrowTypeIdentity(type), overrideType);
                     mapping.field("index", false).field("doc_values", true);
                     writeMultiFieldsBlock(mapping, name, multiFields);
                     mapping.endObject();
@@ -601,7 +609,9 @@ public class RestAttachAction extends BaseRestHandler {
      * column (a pin of the derived type); {@code type: keyword} needs a
      * Utf8 column (with or without an inverted index) or a List&lt;Utf8&gt;
      * column (a pin); {@code type: ip} needs a Utf8 or List&lt;Utf8&gt;
-     * column whose strings are IP addresses; {@code fields} needs a Utf8
+     * column whose strings are IP addresses; {@code type: wildcard}
+     * needs a Utf8 column (it is served through the keyword mapping);
+     * {@code fields} needs a Utf8
      * column, sub-field types must be {@code keyword}, and a sub-field
      * path must not collide with an existing schema column.
      */
@@ -677,6 +687,11 @@ public class RestAttachAction extends BaseRestHandler {
                                 + type
                         );
                     }
+                }
+                if (LanceOverrides.TYPE_WILDCARD.equals(column.type()) && !(type instanceof ArrowType.Utf8)) {
+                    throw new IllegalArgumentException(
+                        "[overrides." + baseName + ".type=wildcard] needs a Utf8 column; [" + baseName + "] is " + type
+                    );
                 }
                 if (!column.subFields().isEmpty()) {
                     if (!(type instanceof ArrowType.Utf8)) {
@@ -1110,10 +1125,27 @@ public class RestAttachAction extends BaseRestHandler {
 
     private static void startFieldWithId(XContentBuilder mapping, String name, int fieldId, String type, String arrowType)
         throws Exception {
+        startFieldWithId(mapping, name, fieldId, type, arrowType, null);
+    }
+
+    private static void startFieldWithId(
+        XContentBuilder mapping,
+        String name,
+        int fieldId,
+        String type,
+        String arrowType,
+        String overrideType
+    ) throws Exception {
         mapping.startObject(name).field("type", type);
         mapping.startObject("meta").field("lance_field_id", Integer.toString(fieldId));
         if (arrowType != null) {
             mapping.field("lance_arrow_type", arrowType);
+        }
+        if (overrideType != null) {
+            // The operator's declared override when it differs from the
+            // emitted mapping type (a `wildcard` override served by the
+            // keyword mapping), so GET _mapping shows the intent.
+            mapping.field("lance_override_type", overrideType);
         }
         mapping.endObject();
     }

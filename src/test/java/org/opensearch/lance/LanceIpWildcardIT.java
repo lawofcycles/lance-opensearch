@@ -14,7 +14,8 @@ import org.opensearch.client.Response;
 import org.opensearch.core.rest.RestStatus;
 
 /**
- * The attach body's {@code type: ip} override end to end: mapping shape
+ * The attach body's {@code type: ip} and {@code type: wildcard}
+ * overrides end to end. For ip: mapping shape
  * on a Utf8 and a {@code List<Utf8>} column, term (exact and CIDR),
  * terms, range, exists, sort and terms aggregation through the stock
  * {@code IpFieldType} over the encoded doc values, {@code _source}
@@ -22,16 +23,20 @@ import org.opensearch.core.rest.RestStatus;
  * missing, the raw-string keyword sub-field on the ip column,
  * {@code _count} with an ip range (the Lucene filter path, since ip
  * predicates never push to Lance SQL), and the namespace register's
- * lenient application of an ip override.
+ * lenient application of an ip override. For wildcard: the keyword
+ * mapping with the declared type in the field meta, and wildcard /
+ * prefix / regexp / term answers equal to the same column mapped
+ * {@code keyword} under a second index name.
  *
  * <p>Fixture rows (see {@code LanceTableFactory.writeIpTable}): the ip
  * column holds 10.0.0.4, 10.0.0.30, 192.168.1.7, 2001:db8::1,
  * ::ffff:10.0.0.2 and the invalid string "not-an-ip". The 10.0.0.4 /
  * 10.0.0.30 pair orders one way as strings and the other way as
  * addresses, so the range and sort assertions prove the encoded form
- * is what compares.
+ * is what compares. The path column holds one file-path-like string
+ * per row.
  */
-public class LanceIpOverrideIT extends LanceRestTestCase {
+public class LanceIpWildcardIT extends LanceRestTestCase {
 
     private static final String OVERRIDES_CLAUSE = "\"overrides\":{"
         + "\"ip\":{\"type\":\"ip\",\"fields\":{\"raw\":{\"type\":\"keyword\"}}},"
@@ -186,6 +191,75 @@ public class LanceIpOverrideIT extends LanceRestTestCase {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
+        }
+    }
+
+    /** The sorted list of {@code _source.id} values of every hit, for cross-index response comparison. */
+    private static List<Integer> sortedSourceIds(String searchBody) throws Exception {
+        List<Integer> ids = new java.util.ArrayList<>();
+        for (java.util.Map<String, Object> hit : hitsOf(searchBody)) {
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, Object> source = (java.util.Map<String, Object>) hit.get("_source");
+            ids.add(((Number) source.get("id")).intValue());
+        }
+        java.util.Collections.sort(ids);
+        return ids;
+    }
+
+    public void testWildcardOverrideServesKeywordSemantics() throws Exception {
+        // `type: wildcard` is served by the keyword doc values path: the
+        // mapping is keyword with the declared type recorded in the
+        // field meta, and every pattern query answers exactly what the
+        // same column mapped `keyword` answers (the oracle index below).
+        String suffix = "wc-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        String tableUri = LanceTableFactory.writeIpTable(scratchDir, tableName);
+        String wildcardIndex = tableName;
+        String keywordIndex = "oracle-" + suffix;
+        try {
+            Response attach = postJson(
+                "/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"overrides\":{\"path\":{\"type\":\"wildcard\"}}}"
+            );
+            assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            Response attachOracle = postJson(
+                "/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"name\":\"" + keywordIndex + "\",\"overrides\":{\"path\":{\"type\":\"keyword\"}}}"
+            );
+            assertEquals(RestStatus.OK.getStatus(), attachOracle.getStatusLine().getStatusCode());
+
+            String mapping = readAll(client().performRequest(new Request("GET", "/" + wildcardIndex + "/_mapping")));
+            assertTrue("path must map as keyword: " + mapping, mapping.contains("\"path\":{\"type\":\"keyword\""));
+            assertTrue("meta must record the declared type: " + mapping, mapping.contains("\"lance_override_type\":\"wildcard\""));
+
+            String wildcardQuery = "{\"size\":10,\"query\":{\"wildcard\":{\"path\":{\"value\":\"/var/log/*\"}}}}";
+            String prefixQuery = "{\"size\":10,\"query\":{\"prefix\":{\"path\":{\"value\":\"/var\"}}}}";
+            String regexpQuery = "{\"size\":10,\"query\":{\"regexp\":{\"path\":{\"value\":\"/usr/.*\"}}}}";
+            String termQuery = "{\"size\":10,\"query\":{\"term\":{\"path\":\"/etc/config.yaml\"}}}";
+
+            String wildcardBody = readAll(postJson("/" + wildcardIndex + "/_search", wildcardQuery));
+            assertEquals("the two /var/log rows: " + wildcardBody, List.of(0, 1), sortedSourceIds(wildcardBody));
+            String prefixBody = readAll(postJson("/" + wildcardIndex + "/_search", prefixQuery));
+            assertEquals("the three /var rows: " + prefixBody, List.of(0, 1, 4), sortedSourceIds(prefixBody));
+            String regexpBody = readAll(postJson("/" + wildcardIndex + "/_search", regexpQuery));
+            assertEquals("the one /usr row: " + regexpBody, List.of(2), sortedSourceIds(regexpBody));
+            String termBody = readAll(postJson("/" + wildcardIndex + "/_search", termQuery));
+            assertEquals("the one /etc row: " + termBody, List.of(5), sortedSourceIds(termBody));
+
+            // Oracle: the same queries on the same column mapped keyword
+            // return the same rows.
+            for (String query : List.of(wildcardQuery, prefixQuery, regexpQuery, termQuery)) {
+                String overridden = readAll(postJson("/" + wildcardIndex + "/_search", query));
+                String oracle = readAll(postJson("/" + keywordIndex + "/_search", query));
+                assertEquals("wildcard and keyword answers must agree for " + query, sortedSourceIds(oracle), sortedSourceIds(overridden));
+            }
+        } finally {
+            for (String index : List.of(wildcardIndex, keywordIndex)) {
+                try {
+                    client().performRequest(new Request("DELETE", "/" + index));
+                } catch (Exception ignored) {}
+            }
         }
     }
 
