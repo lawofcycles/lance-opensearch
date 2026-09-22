@@ -154,7 +154,12 @@ public class LanceAggregate extends Aggregate implements LanceAggregateSpecs {
      * the group keys and the calls, so a copy may substitute the input
      * and the traits (what planner rules do) but not the grouping or
      * the calls; changing those without the specs would silently
-     * misalign them.
+     * misalign them. Throwing here is intentional: the spec lists carry
+     * OpenSearch request semantics Calcite cannot derive from a new
+     * grouping or call list, so no copy can be correct for them. A rule
+     * that rewrites the aggregate's grouping or calls must build a new
+     * {@code LanceAggregate} through the translator instead of copying
+     * this one.
      *
      * @throws IllegalArgumentException when {@code groupSet},
      *     {@code groupSets} or {@code aggCalls} differ from this node's
