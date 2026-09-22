@@ -33,7 +33,7 @@ import java.util.Map;
  * a schema with one column per type family the translator handles, and
  * the parse / translate helpers the fixture and refusal tests share.
  */
-final class PlanTestFixtures {
+public final class PlanTestFixtures {
 
     private PlanTestFixtures() {}
 
@@ -44,7 +44,7 @@ final class PlanTestFixtures {
      * {@code raw} keyword sub-field, {@code flag} bool, {@code ts}
      * microsecond timestamp without a zone, {@code day} date32.
      */
-    static final Schema SCHEMA = new Schema(
+    public static final Schema SCHEMA = new Schema(
         List.of(
             field("id", new ArrowType.Int(32, true), false),
             field("rating", new ArrowType.Int(32, true), true),
@@ -66,28 +66,28 @@ final class PlanTestFixtures {
         return new Field(name, new FieldType(nullable, arrowType, null), null);
     }
 
-    static LanceSchemas.IndexModel model() {
+    public static LanceSchemas.IndexModel model() {
         LinkedHashMap<String, String> bodySubs = new LinkedHashMap<>();
         bodySubs.put("raw", "keyword");
         return LanceSchemas.model("idx", SCHEMA, Map.of("body", bodySubs), () -> 512L);
     }
 
-    static LancePlannerFactory factory() {
+    public static LancePlannerFactory factory() {
         return new LancePlannerFactory(1L << 30, 1L << 30);
     }
 
     /** Parses a search body with the stock aggregation registry. */
-    static SearchSourceBuilder parse(String json) throws IOException {
+    public static SearchSourceBuilder parse(String json) throws IOException {
         try (XContentParser parser = JsonXContent.jsonXContent.createParser(REGISTRY, null, json)) {
             return SearchSourceBuilder.fromXContent(parser);
         }
     }
 
-    static RelNode translate(SearchSourceBuilder source) {
+    public static RelNode translate(SearchSourceBuilder source) {
         return SearchRequestToRel.translate(source, model(), factory());
     }
 
-    static String plan(SearchSourceBuilder source) {
+    public static String plan(SearchSourceBuilder source) {
         return RelOptUtil.toString(translate(source));
     }
 }

@@ -15,6 +15,7 @@ import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.util.ImmutableBitSet;
+import org.opensearch.lance.plan.substrait.LanceAggregateSpecs;
 
 import java.util.List;
 
@@ -39,7 +40,7 @@ import java.util.List;
  * <p>The node is logical (convention {@link Convention#NONE}); the
  * pushdown rule and the physical conversions come later.
  */
-public class LanceAggregate extends Aggregate {
+public class LanceAggregate extends Aggregate implements LanceAggregateSpecs {
 
     private final ImmutableList<BucketSpec> bucketSpecs;
     private final ImmutableList<MetricSpec> metricSpecs;
@@ -121,6 +122,18 @@ public class LanceAggregate extends Aggregate {
     /** One spec per aggregate call, in call order. */
     public List<MetricSpec> metricSpecs() {
         return metricSpecs;
+    }
+
+    /** The spec of one group key, for the Substrait producer and the executor. */
+    @Override
+    public BucketSpec bucket(int groupKeyIndex) {
+        return bucketSpecs.get(groupKeyIndex);
+    }
+
+    /** The spec of one aggregate call, for the Substrait producer and the executor. */
+    @Override
+    public MetricSpec metric(int callIndex) {
+        return metricSpecs.get(callIndex);
     }
 
     /**

@@ -46,6 +46,7 @@ import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.opensearch.lance.plan.rel.MetricSpec;
 
 /**
  * Produces the Substrait bytes Lance's
@@ -163,8 +164,8 @@ public final class LanceSubstraitProducer {
             || min > max) {
             return Optional.empty();
         }
-        LanceAggregateSpecs.MetricKind kind = shape.specs.metric(callIndex).kind();
-        if (kind != LanceAggregateSpecs.MetricKind.PERCENTILES && kind != LanceAggregateSpecs.MetricKind.PERCENTILE_RANKS) {
+        MetricSpec.Kind kind = shape.specs.metric(callIndex).kind();
+        if (kind != MetricSpec.Kind.PERCENTILES && kind != MetricSpec.Kind.PERCENTILE_RANKS) {
             return Optional.empty();
         }
         try {
@@ -209,8 +210,14 @@ public final class LanceSubstraitProducer {
         if (aggregate.getGroupType() != Aggregate.Group.SIMPLE) {
             return null;
         }
-        for (AggregateCall call : aggregate.getAggCallList()) {
-            if (call.isDistinct() || call.filterArg >= 0 || !call.getCollation().getFieldCollations().isEmpty()) {
+        List<AggregateCall> calls = aggregate.getAggCallList();
+        for (int slot = 0; slot < calls.size(); slot++) {
+            AggregateCall call = calls.get(slot);
+            // The translator spells a cardinality as COUNT(DISTINCT col);
+            // its expansion comes from the spec kind, not from the
+            // Calcite function, so the distinct flag is expected there.
+            boolean cardinality = specs.metric(slot).kind() == MetricSpec.Kind.CARDINALITY;
+            if ((call.isDistinct() && !cardinality) || call.filterArg >= 0 || !call.getCollation().getFieldCollations().isEmpty()) {
                 return null;
             }
         }
@@ -257,7 +264,7 @@ public final class LanceSubstraitProducer {
 
         List<AggregateCall> calls = shape.aggregate.getAggCallList();
         for (int slot = 0; slot < calls.size(); slot++) {
-            if (shape.specs.metric(slot).kind() == LanceAggregateSpecs.MetricKind.CARDINALITY) {
+            if (shape.specs.metric(slot).kind() == MetricSpec.Kind.CARDINALITY) {
                 RexNode rex = argument(shape, calls.get(slot));
                 groupings.add(distinct(rex, accepted(rex.accept(converter))));
                 names.add(prefix(slot) + "_d");
@@ -317,12 +324,12 @@ public final class LanceSubstraitProducer {
         Shape shape,
         RexExpressionConverter converter,
         AggregateCall call,
-        LanceAggregateSpecs.MetricKind kind,
+        MetricSpec.Kind kind,
         int slot,
         List<io.substrait.relation.Aggregate.Measure> measures,
         List<String> names
     ) {
-        if (kind == LanceAggregateSpecs.MetricKind.CARDINALITY) {
+        if (kind == MetricSpec.Kind.CARDINALITY) {
             return;
         }
         RexNode rex = argument(shape, call);
@@ -362,7 +369,7 @@ public final class LanceSubstraitProducer {
                 names.add(prefix + "_mn");
                 measures.add(measure("max", type, value));
                 names.add(prefix + "_mx");
-                if (kind == LanceAggregateSpecs.MetricKind.EXTENDED_STATS) {
+                if (kind == MetricSpec.Kind.EXTENDED_STATS) {
                     Expression asDouble = cast(TypeCreator.NULLABLE.FP64, value);
                     measures.add(
                         measure("sum", TypeCreator.NULLABLE.FP64, scalar("multiply", TypeCreator.NULLABLE.FP64, asDouble, asDouble))
@@ -460,14 +467,28 @@ public final class LanceSubstraitProducer {
      * literal Substrait spelling the Lance consumer cannot evaluate:
      *
      * <ul>
+     * <li>{@code FLOOR} of an integer division: the translator spells a
+     * fixed interval bucket ordinal as {@code FLOOR(millis / interval)},
+     * but an integer division truncates toward zero while the
+     * aggregator floors, so the quotient is lowered by one when the
+     * remainder is negative, the {@code Math.floorDiv} identity
+     * {@code (a / b) - ((a % b) < 0 ? 1 : 0)}.</li>
+     * <li>{@code FLOOR} of any other integer: the operand itself.</li>
      * <li>{@code FLOOR} of a floating value: DataFusion inside Lance
      * registers no math functions, so floor is derived from a
      * truncating cast and a comparison, cast back to the operand's
-     * type. Floor of an integer is the integer itself.</li>
+     * type. </li>
      * <li>{@code CAST} of a date or timestamp to an integer: Calcite's
      * cast means epoch millis, while DataFusion's cast yields the raw
      * ticks of the column's unit, so the unit arithmetic is spelled
      * out.</li>
+     * <li>{@code UNIX_MILLIS}, matched by operator name: the same epoch
+     * millis arithmetic. The translator spells epoch millis of a
+     * timestamp column with this operator, and of a {@code DATE} column
+     * as {@code UNIX_MILLIS(CAST(day AS TIMESTAMP))}; the cast is
+     * looked through so the day count is multiplied by 86 400 000
+     * directly instead of leaning on DataFusion's date-to-timestamp
+     * cast.</li>
      * <li>{@code LANCE_DATE_TRUNC}, matched by operator name: becomes
      * DataFusion's {@code date_trunc(unit, value)} with the unit as a
      * plain string literal.</li>
@@ -481,12 +502,21 @@ public final class LanceSubstraitProducer {
         public Optional<Expression> convert(RexCall call, Function<RexNode, Expression> converter) {
             if (call.getKind() == SqlKind.FLOOR && call.getOperands().size() == 1) {
                 RexNode operand = call.getOperands().get(0);
-                Expression value = converter.apply(operand);
                 SqlTypeName operandType = operand.getType().getSqlTypeName();
                 if (SqlTypeName.INT_TYPES.contains(operandType)) {
-                    return Optional.of(value);
+                    if (operand instanceof RexCall division
+                        && division.getKind() == SqlKind.DIVIDE
+                        && division.getOperands().size() == 2
+                        && SqlTypeName.INT_TYPES.contains(division.getOperands().get(0).getType().getSqlTypeName())
+                        && SqlTypeName.INT_TYPES.contains(division.getOperands().get(1).getType().getSqlTypeName())) {
+                        Expression dividend = converter.apply(division.getOperands().get(0));
+                        Expression divisor = converter.apply(division.getOperands().get(1));
+                        return Optional.of(floorDiv(dividend, divisor));
+                    }
+                    return Optional.of(converter.apply(operand));
                 }
                 if (SqlTypeName.APPROX_TYPES.contains(operandType)) {
+                    Expression value = converter.apply(operand);
                     Type type = TypeConverter.DEFAULT.toSubstrait(operand.getType());
                     return Optional.of(cast(type, floorOrdinal(value, 0d, 1d)));
                 }
@@ -494,6 +524,16 @@ public final class LanceSubstraitProducer {
             }
             if (call.getKind() == SqlKind.CAST && isDateOrTimestamp(call.getOperands().get(0).getType()) && isInteger(call.getType())) {
                 RexNode operand = call.getOperands().get(0);
+                return Optional.of(epochMillis(converter.apply(operand), operand.getType()));
+            }
+            if (call.getOperator().getName().toUpperCase(Locale.ROOT).equals("UNIX_MILLIS") && call.getOperands().size() == 1) {
+                RexNode operand = call.getOperands().get(0);
+                if (operand instanceof RexCall inner
+                    && inner.getKind() == SqlKind.CAST
+                    && inner.getOperands().get(0).getType().getSqlTypeName() == SqlTypeName.DATE) {
+                    RexNode day = inner.getOperands().get(0);
+                    return Optional.of(epochMillis(converter.apply(day), day.getType()));
+                }
                 return Optional.of(epochMillis(converter.apply(operand), operand.getType()));
             }
             if (call.getOperator().getName().toUpperCase(Locale.ROOT).equals("LANCE_DATE_TRUNC") && call.getOperands().size() == 2) {
@@ -508,6 +548,18 @@ public final class LanceSubstraitProducer {
             }
             return Optional.empty();
         }
+    }
+
+    /**
+     * {@code Math.floorDiv(a, b)} on {@code i64} values: the truncating
+     * division lowered by one when the remainder is negative, the
+     * arithmetic the fragment leaf reader's date bucketing applies.
+     */
+    private static Expression floorDiv(Expression dividend, Expression divisor) {
+        Expression quotient = scalar("divide", TypeCreator.NULLABLE.I64, dividend, divisor);
+        Expression remainder = scalar("modulus", TypeCreator.NULLABLE.I64, dividend, divisor);
+        Expression negative = scalar("lt", TypeCreator.NULLABLE.BOOLEAN, remainder, i64(0L));
+        return scalar("subtract", TypeCreator.NULLABLE.I64, quotient, cast(TypeCreator.NULLABLE.I64, negative));
     }
 
     private static boolean isDateOrTimestamp(RelDataType type) {

@@ -15,6 +15,8 @@ import org.opensearch.lance.plan.calcite.LanceConvention;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchema;
 import org.opensearch.lance.plan.calcite.LanceTable;
+import org.opensearch.lance.plan.substrait.LanceSubstraitProducer;
+import org.opensearch.lance.plan.translate.PlanTestFixtures;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.List;
@@ -53,5 +55,34 @@ public class LanceTableScanTests extends OpenSearchTestCase {
         assertSame(LanceConvention.INSTANCE, copy.getConvention());
         assertEquals(scan.getTable(), ((LanceTableScan) copy).getTable());
         assertEquals(scan.getRowType(), copy.getRowType());
+    }
+
+    public void testPushedAggregateChangesRowTypeCostAndDigest() throws Exception {
+        RelNode logical = PlanTestFixtures.translate(
+            PlanTestFixtures.parse(
+                "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"a\":{\"avg\":{\"field\":\"rating\"}}}}}}"
+            )
+        );
+        LanceAggregate aggregate = (LanceAggregate) logical;
+        RelNode project = aggregate.getInput();
+        LanceTableScan bare = (LanceTableScan) project.getInput(0);
+        java.nio.ByteBuffer bytes = LanceSubstraitProducer.toLanceAggregate(aggregate).orElseThrow();
+        LanceTableScan pushed = bare.withPushedAggregate(aggregate, bytes);
+
+        assertEquals(aggregate.getRowType(), pushed.getRowType());
+        assertTrue(pushed.pushedAggregate().isPresent());
+        assertNotEquals("the pushed operations are part of the digest", bare.getDigest(), pushed.getDigest());
+
+        RelOptCost bareCost = bare.computeSelfCost(bare.getCluster().getPlanner(), bare.getCluster().getMetadataQuery());
+        RelOptCost pushedCost = pushed.computeSelfCost(pushed.getCluster().getPlanner(), pushed.getCluster().getMetadataQuery());
+        assertTrue("groups cost less than rows: " + pushedCost + " vs " + bareCost, pushedCost.getRows() < bareCost.getRows());
+        assertEquals("one pushed operation costs one constant", 1.0, pushedCost.getCpu(), 0.0);
+
+        RelNode copy = pushed.copy(pushed.getTraitSet(), List.of());
+        assertTrue(((LanceTableScan) copy).pushedAggregate().isPresent());
+        assertEquals(pushed.getRowType(), copy.getRowType());
+
+        IllegalStateException second = expectThrows(IllegalStateException.class, () -> pushed.withPushedAggregate(aggregate, bytes));
+        assertTrue(second.getMessage().contains("already carries"));
     }
 }

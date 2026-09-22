@@ -95,8 +95,9 @@ import java.util.Map;
  * {@code date_histogram} sources with metric children.
  *
  * <p>Group keys become one expression per bucket level (a field
- * reference for {@code terms}; {@code FLOOR(col / interval) * interval}
- * for the histograms; {@code LANCE_DATE_TRUNC(unit, col)} for a
+ * reference for {@code terms}; the bucket ordinal
+ * {@code FLOOR(col / interval)} for the histograms, which the executor
+ * multiplies back; {@code LANCE_DATE_TRUNC(unit, col)} for a
  * calendar {@code date_histogram}; a {@code CASE WHEN} bit mask for
  * {@code range} / {@code date_range} / {@code filter} / {@code filters}
  * / {@code missing}, under which a row counts toward every matching
@@ -419,7 +420,13 @@ final class AggregationToRel {
                 relBuilder.cast(relBuilder.field(column.index()), SqlTypeName.DOUBLE),
                 interval
             );
-            RexNode key = relBuilder.call(SqlStdOperatorTable.MULTIPLY, relBuilder.call(SqlStdOperatorTable.FLOOR, quotient), interval);
+            // The key is the bucket ordinal floor((value) / interval),
+            // not the bucket start: the executor multiplies the interval
+            // back when it builds the buckets, and the Substrait
+            // producer's floor rewrite yields the ordinal with floor
+            // (not truncation) semantics for negative values. The cast
+            // pins the scan's key column to i64.
+            RexNode key = relBuilder.cast(relBuilder.call(SqlStdOperatorTable.FLOOR, quotient), SqlTypeName.BIGINT);
             addKey(
                 key,
                 BucketSpec.histogram(histogram.getName(), histogram.interval(), histogram.minDocCount(), histogram.format()),
@@ -484,7 +491,9 @@ final class AggregationToRel {
             }
             RexNode interval = relBuilder.literal(intervalMillis);
             RexNode quotient = relBuilder.call(SqlStdOperatorTable.DIVIDE, epochMillis(column), interval);
-            RexNode key = relBuilder.call(SqlStdOperatorTable.MULTIPLY, relBuilder.call(SqlStdOperatorTable.FLOOR, quotient), interval);
+            // The bucket ordinal, as for the numeric histogram; the
+            // executor multiplies the interval back.
+            RexNode key = relBuilder.call(SqlStdOperatorTable.FLOOR, quotient);
             addKey(
                 key,
                 BucketSpec.dateHistogramFixed(dateHistogram.getName(), intervalMillis, dateHistogram.minDocCount(), dateHistogram.format()),
@@ -593,7 +602,8 @@ final class AggregationToRel {
             }
             RexNode interval = relBuilder.literal(intervalMillis);
             RexNode quotient = relBuilder.call(SqlStdOperatorTable.DIVIDE, epochMillis(column), interval);
-            RexNode key = relBuilder.call(SqlStdOperatorTable.MULTIPLY, relBuilder.call(SqlStdOperatorTable.FLOOR, quotient), interval);
+            // The bucket ordinal, as for the fixed date_histogram.
+            RexNode key = relBuilder.call(SqlStdOperatorTable.FLOOR, quotient);
             addKey(
                 key,
                 BucketSpec.compositeDateHistogram(source.name(), intervalMillis, sourceOrder, after, compositeSize, source.format()),

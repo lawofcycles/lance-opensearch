@@ -52,6 +52,11 @@ public record MetricSpec(String aggregationName, Kind kind, double[] percents, d
         return new MetricSpec(name, kind, null, null, null, null, null, format);
     }
 
+    /** A metric with no extra options beyond name and kind. */
+    public static MetricSpec of(Kind kind, String name) {
+        return of(kind, name, null);
+    }
+
     /**
      * Prints the kind and every set field, so the explain output shows
      * the full OpenSearch shape of the metric.
