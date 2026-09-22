@@ -768,12 +768,14 @@ public final class LanceEngineFactory implements EngineFactory {
                             // _search / _count already respect (otherwise a
                             // user restricted to `rating >= 4` could still
                             // GET a row with `rating = 1`).
+                            LanceFragmentLeafReader lanceLeaf = LanceFragmentLeafReader.unwrap(ctx.reader());
+                            int docId = lanceLeaf == null ? offset : lanceLeaf.docOfRow(offset);
                             Bits liveDocs = ctx.reader().getLiveDocs();
-                            if (liveDocs != null && !liveDocs.get(offset)) {
+                            if (liveDocs != null && !liveDocs.get(docId)) {
                                 hiddenByWrapper = true;
                                 continue;
                             }
-                            DocIdAndVersion dv = new DocIdAndVersion(offset, 1, 1, 1, ctx.reader(), ctx.docBase);
+                            DocIdAndVersion dv = new DocIdAndVersion(docId, 1, 1, 1, ctx.reader(), ctx.docBase);
                             return new GetResult(searcher, dv, false);
                         }
                     }
@@ -852,6 +854,8 @@ public final class LanceEngineFactory implements EngineFactory {
                 return GetResult.NOT_EXISTS;
             }
             LeafReaderContext ctx = single.leaves().get(0);
+            LanceFragmentLeafReader outsideLeaf = LanceFragmentLeafReader.unwrap(ctx.reader());
+            int docId = outsideLeaf == null ? offset : outsideLeaf.docOfRow(offset);
             Engine.Searcher both = new Engine.Searcher(
                 "get",
                 single,
@@ -866,7 +870,7 @@ public final class LanceEngineFactory implements EngineFactory {
                     }
                 }
             );
-            return new GetResult(both, new DocIdAndVersion(offset, 1, 1, 1, ctx.reader(), ctx.docBase), false);
+            return new GetResult(both, new DocIdAndVersion(docId, 1, 1, 1, ctx.reader(), ctx.docBase), false);
         }
     }
 
