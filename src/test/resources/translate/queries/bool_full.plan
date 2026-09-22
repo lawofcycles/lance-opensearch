@@ -1,0 +1,1 @@
+AND(AND(=($4, 'c0'), >=(CAST($1):BIGINT NOT NULL, 10)), NOT(IS TRUE(=($6, true))))

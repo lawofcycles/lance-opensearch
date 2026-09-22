@@ -1,0 +1,1 @@
+{"query":{"exists":{"field":"meta.score"}}}

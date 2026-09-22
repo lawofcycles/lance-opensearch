@@ -1,0 +1,1 @@
+{"query":{"range":{"rating":{"gte":100,"lt":900}}}}
