@@ -11,6 +11,9 @@ import java.util.Map;
 
 import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.glue.GlueNamespace;
+import org.lance.namespace.iceberg.IcebergNamespace;
+import org.lance.namespace.polaris.PolarisNamespace;
+import org.lance.namespace.unity.UnityNamespace;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -127,6 +130,92 @@ public class LanceNamespaceFactoryTests extends OpenSearchTestCase {
         );
         LanceNamespace created = LanceNamespaceFactory.create(entry, null);
         assertTrue("expected the bundled GlueNamespace, saw " + created.getClass().getName(), created instanceof GlueNamespace);
+        ((Closeable) created).close();
+    }
+
+    public void testCatalogTypesDispatchAndPassConfigThroughWithSecretsIntact() {
+        // Dispatch and property passthrough for the three catalog types
+        // added after glue. Each type's credential-bearing keys reach
+        // initialize raw; redaction applies to display paths only.
+        Map<String, Map<String, String>> configByType = Map.of(
+            LanceNamespaceMetadata.Entry.TYPE_ICEBERG,
+            Map.of(
+                "endpoint",
+                "http://catalog.example:8181",
+                "warehouse",
+                "wh",
+                "auth_token",
+                "hunter2",
+                "credential",
+                "client-id:client-secret"
+            ),
+            LanceNamespaceMetadata.Entry.TYPE_POLARIS,
+            Map.of("endpoint", "http://polaris.example:8181", "warehouse", "cat", "auth_token", "hunter2"),
+            LanceNamespaceMetadata.Entry.TYPE_UNITY,
+            Map.of("endpoint", "http://unity.example:8080", "catalog", "main", "auth_token", "hunter2")
+        );
+        for (Map.Entry<String, Map<String, String>> typeAndConfig : configByType.entrySet()) {
+            String type = typeAndConfig.getKey();
+            RecordingLanceNamespace recording = new RecordingLanceNamespace();
+            LanceNamespaceFactory.setInstantiatorForTests(seen -> {
+                assertEquals(type, seen);
+                return recording;
+            });
+            LanceNamespaceMetadata.Entry entry = new LanceNamespaceMetadata.Entry(
+                type + "-cat",
+                type,
+                null,
+                StorageOptions.empty(),
+                typeAndConfig.getValue()
+            );
+            LanceNamespaceFactory.create(entry, null);
+            assertEquals(typeAndConfig.getValue(), recording.initializeCalls.get(0));
+        }
+    }
+
+    public void testRealIcebergDispatchInitialisesWithoutNetworkAccess() throws Exception {
+        // Same binary-compatibility probe as the glue test above for the
+        // bundled IcebergNamespace (0.4.1 / lance-namespace 0.7.7): the
+        // class loads, its config parses, and its HTTP client builds on
+        // the plugin classpath without a connection.
+        LanceNamespaceFactory.resetInstantiatorForTests();
+        LanceNamespaceMetadata.Entry entry = new LanceNamespaceMetadata.Entry(
+            "iceberg-offline",
+            LanceNamespaceMetadata.Entry.TYPE_ICEBERG,
+            null,
+            StorageOptions.empty(),
+            Map.of("endpoint", "http://127.0.0.1:1", "warehouse", "wh", "auth_token", "test-token")
+        );
+        LanceNamespace created = LanceNamespaceFactory.create(entry, null);
+        assertTrue("expected the bundled IcebergNamespace, saw " + created.getClass().getName(), created instanceof IcebergNamespace);
+        ((Closeable) created).close();
+    }
+
+    public void testRealPolarisDispatchInitialisesWithoutNetworkAccess() throws Exception {
+        LanceNamespaceFactory.resetInstantiatorForTests();
+        LanceNamespaceMetadata.Entry entry = new LanceNamespaceMetadata.Entry(
+            "polaris-offline",
+            LanceNamespaceMetadata.Entry.TYPE_POLARIS,
+            null,
+            StorageOptions.empty(),
+            Map.of("endpoint", "http://127.0.0.1:1", "warehouse", "cat", "auth_token", "test-token")
+        );
+        LanceNamespace created = LanceNamespaceFactory.create(entry, null);
+        assertTrue("expected the bundled PolarisNamespace, saw " + created.getClass().getName(), created instanceof PolarisNamespace);
+        ((Closeable) created).close();
+    }
+
+    public void testRealUnityDispatchInitialisesWithoutNetworkAccess() throws Exception {
+        LanceNamespaceFactory.resetInstantiatorForTests();
+        LanceNamespaceMetadata.Entry entry = new LanceNamespaceMetadata.Entry(
+            "unity-offline",
+            LanceNamespaceMetadata.Entry.TYPE_UNITY,
+            null,
+            StorageOptions.empty(),
+            Map.of("endpoint", "http://127.0.0.1:1", "catalog", "main", "auth_token", "test-token")
+        );
+        LanceNamespace created = LanceNamespaceFactory.create(entry, null);
+        assertTrue("expected the bundled UnityNamespace, saw " + created.getClass().getName(), created instanceof UnityNamespace);
         ((Closeable) created).close();
     }
 }

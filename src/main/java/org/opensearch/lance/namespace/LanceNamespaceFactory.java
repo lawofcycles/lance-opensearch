@@ -14,6 +14,9 @@ import org.lance.namespace.DirectoryNamespace;
 import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.RestNamespace;
 import org.lance.namespace.glue.GlueNamespace;
+import org.lance.namespace.iceberg.IcebergNamespace;
+import org.lance.namespace.polaris.PolarisNamespace;
+import org.lance.namespace.unity.UnityNamespace;
 
 /**
  * Builds the runtime {@link LanceNamespace} handle for a cluster-state
@@ -55,6 +58,9 @@ public final class LanceNamespaceFactory {
             case LanceNamespaceMetadata.Entry.TYPE_DIRECTORY -> new DirectoryNamespace();
             case LanceNamespaceMetadata.Entry.TYPE_REST -> new RestNamespace();
             case LanceNamespaceMetadata.Entry.TYPE_GLUE -> new GlueNamespace();
+            case LanceNamespaceMetadata.Entry.TYPE_ICEBERG -> new IcebergNamespace();
+            case LanceNamespaceMetadata.Entry.TYPE_POLARIS -> new PolarisNamespace();
+            case LanceNamespaceMetadata.Entry.TYPE_UNITY -> new UnityNamespace();
             default -> throw new IllegalArgumentException(
                 "unknown namespace type [" + type + "]; accepted values are " + LanceNamespaceMetadata.Entry.ACCEPTED_TYPES
             );
