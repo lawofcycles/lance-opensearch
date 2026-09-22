@@ -12,12 +12,12 @@ import java.util.List;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.lucene.index.LeafReaderContext;
 import org.opensearch.action.FailedNodeException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.nodes.TransportNodesAction;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
+import org.opensearch.common.lucene.search.Queries;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.engine.Engine;
@@ -26,7 +26,6 @@ import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
-import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
@@ -132,17 +131,23 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
                     // have no wrapped figure; that one comes from Lance.
                     //
                     // A table with nested columns inflates numDocs with
-                    // one hidden child doc per nested element; report the
-                    // child docs separately and keep shard_reader_rows a
-                    // row count.
-                    long nestedDocs = 0L;
-                    for (LeafReaderContext ctx : searcher.getIndexReader().leaves()) {
-                        LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(ctx.reader());
-                        if (lance != null) {
-                            nestedDocs += lance.nestedDocCount();
-                        }
+                    // one hidden child doc per nested element. The visible
+                    // parents are counted through the wrapped searcher with
+                    // the non nested filter (parents carry _primary_term
+                    // doc values, child docs do not), so a wrapper that
+                    // hides rows subtracts them from both figures; tables
+                    // without nested fields keep the plain numDocs and pay
+                    // for no count.
+                    long numDocs = searcher.getIndexReader().numDocs();
+                    long shardReaderRows;
+                    long nestedDocs;
+                    if (indexService.mapperService().hasNested()) {
+                        shardReaderRows = searcher.count(Queries.newNonNestedFilter());
+                        nestedDocs = numDocs - shardReaderRows;
+                    } else {
+                        shardReaderRows = numDocs;
+                        nestedDocs = 0L;
                     }
-                    long shardReaderRows = searcher.getIndexReader().numDocs() - nestedDocs;
                     long rows = reader.luceneBoundExceeded() ? reader.tableRows() : shardReaderRows;
                     stats.add(
                         new LanceNodeStats.IndexReaderStats(

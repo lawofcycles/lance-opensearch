@@ -8,6 +8,7 @@ package org.opensearch.lance;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
+import java.util.Map;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -188,10 +189,37 @@ public class LanceNestedIT extends LanceRestTestCase {
             assertEquals(RestStatus.BAD_REQUEST.getStatus(), innerHits.getResponse().getStatusLine().getStatusCode());
             String innerHitsBody = readAll(innerHits.getResponse());
             assertTrue("inner_hits refusal must name the feature: " + innerHitsBody, innerHitsBody.contains("inner_hits"));
+
+            // Stats: shard_reader_rows counts visible parents (5 live
+            // rows), nested_docs the hidden child docs (7 elements of
+            // the live rows), and the two sum to the reader's numDocs,
+            // which is what {index}/_stats reports as docs.count.
+            String docStats = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_stats/docs")));
+            int numDocs = extractIntPath(docStats, "indices", indexName, "primaries", "docs", "count");
+            assertEquals("docs.count counts parents plus child docs: " + docStats, 12, numDocs);
+            String lanceStats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+            Map<String, Object> nodes = castMap(parseJson(lanceStats).get("nodes"));
+            Map<String, Object> indices = castMap(castMap(nodes.values().iterator().next()).get("indices"));
+            Map<String, Object> indexStats = castMap(indices.get(indexName));
+            int shardReaderRows = ((Number) indexStats.get("shard_reader_rows")).intValue();
+            int nestedDocs = ((Number) indexStats.get("nested_docs")).intValue();
+            assertEquals("shard_reader_rows counts live parents: " + lanceStats, 5, shardReaderRows);
+            assertEquals("nested_docs counts live child docs: " + lanceStats, 7, nestedDocs);
+            assertEquals(
+                "nested_docs plus shard_reader_rows is the reader's numDocs: " + lanceStats,
+                numDocs,
+                shardReaderRows + nestedDocs
+            );
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> castMap(Object value) {
+        assertTrue("expected a JSON object, got: " + value, value instanceof Map);
+        return (Map<String, Object>) value;
     }
 }
