@@ -230,6 +230,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             request.storageOptions(),
             request.pinnedVersion(),
             request.tag(),
+            request.indexPlacement(),
             luceneBoundExceeded,
             listener
         );
@@ -380,6 +381,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         StorageOptions storageOptions,
         Optional<Long> pinnedVersion,
         Optional<String> tag,
+        Optional<String> indexPlacement,
         boolean luceneBoundExceeded,
         ActionListener<LanceAttachResponse> listener
     ) {
@@ -394,6 +396,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         }
         pinnedVersion.ifPresent(v -> settings.put(LanceEngineFactory.VERSION_SETTING, v));
         tag.ifPresent(t -> settings.put(LanceEngineFactory.TAG_SETTING, t));
+        indexPlacement.ifPresent(p -> settings.put(LanceEngineFactory.INDEX_PLACEMENT_SETTING, p));
         storageOptions.writeToSettings(settings);
         CreateIndexRequest create = new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson());
 

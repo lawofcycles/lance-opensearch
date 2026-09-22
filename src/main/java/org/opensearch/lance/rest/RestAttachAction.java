@@ -22,6 +22,7 @@ import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
 import org.opensearch.lance.attach.LanceAttachRequest;
+import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.namespace.LanceNamespaceService;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
@@ -38,8 +39,10 @@ import org.opensearch.transport.client.node.NodeClient;
  * numeric doc values fields), the shard count is always one, and the
  * primary key is detected from Lance field metadata. Optional overrides:
  * "name" (index name, defaults to the table directory name), "version"
- * (pin a manifest version) or "tag" (follow a Lance tag; not together
- * with "version").
+ * (pin a manifest version), "tag" (follow a Lance tag; not together
+ * with "version") or "index_placement" ("node_local" builds and reads
+ * search structures from per-node shallow clones so the source stays
+ * read-only; default "in_table").
  *
  * <p>Attach always creates a single-shard index because the fragment path
  * (see {@code LanceDispatchActionFilter}) is the only search implementation
@@ -79,6 +82,7 @@ public class RestAttachAction extends BaseRestHandler {
         String tag;
         StorageOptions storageOptions;
         LanceOverrides overrides;
+        String placement;
         try {
             table = readOptionalString(body, "table");
             if (table == null || table.isEmpty()) {
@@ -121,12 +125,21 @@ public class RestAttachAction extends BaseRestHandler {
             // `multi_fields` clause folds into `overrides.[col].fields`
             // at parse time so everything downstream sees one shape.
             overrides = LanceOverrides.parseAttachClauses(body.get("overrides"), body.get("multi_fields"));
+            String indexPlacement = readOptionalString(body, "index_placement");
+            if (indexPlacement != null
+                && !LanceLocalClones.PLACEMENT_IN_TABLE.equals(indexPlacement)
+                && !LanceLocalClones.PLACEMENT_NODE_LOCAL.equals(indexPlacement)) {
+                return channel -> channel.sendResponse(
+                    new BytesRestResponse(RestStatus.BAD_REQUEST, "[index_placement] must be 'in_table' or 'node_local'")
+                );
+            }
+            placement = indexPlacement;
         } catch (IllegalArgumentException e) {
             String message = e.getMessage();
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
         }
 
-        LanceAttachRequest attach = new LanceAttachRequest(table, explicitName, pinnedVersion, tag, storageOptions, overrides);
+        LanceAttachRequest attach = new LanceAttachRequest(table, explicitName, pinnedVersion, tag, storageOptions, overrides, placement);
         return channel -> client.execute(LanceAttachAction.INSTANCE, attach, new RestToXContentListener<>(channel));
     }
 

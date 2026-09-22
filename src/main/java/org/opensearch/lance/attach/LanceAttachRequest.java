@@ -32,6 +32,18 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
     private final String tag;
     private final StorageOptions storageOptions;
     private final LanceOverrides overrides;
+    private final String indexPlacement;
+
+    public LanceAttachRequest(
+        String table,
+        String indexName,
+        Long pinnedVersion,
+        String tag,
+        StorageOptions storageOptions,
+        LanceOverrides overrides
+    ) {
+        this(table, indexName, pinnedVersion, tag, storageOptions, overrides, null);
+    }
 
     /**
      * @param table          Lance table URI to attach.
@@ -45,6 +57,10 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
      * @param overrides      per-column mapping overrides, already merged
      *                       from the {@code overrides} and legacy
      *                       {@code multi_fields} clauses.
+     * @param indexPlacement {@code "node_local"} to build and read search
+     *                       structures from per-node shallow clones,
+     *                       {@code "in_table"} or {@code null} for the
+     *                       default in-table commits.
      */
     public LanceAttachRequest(
         String table,
@@ -52,7 +68,8 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         Long pinnedVersion,
         String tag,
         StorageOptions storageOptions,
-        LanceOverrides overrides
+        LanceOverrides overrides,
+        String indexPlacement
     ) {
         this.table = table;
         this.indexName = indexName;
@@ -60,6 +77,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         this.tag = tag;
         this.storageOptions = storageOptions == null ? StorageOptions.empty() : storageOptions;
         this.overrides = overrides == null ? LanceOverrides.EMPTY : overrides;
+        this.indexPlacement = indexPlacement;
     }
 
     public LanceAttachRequest(StreamInput in) throws IOException {
@@ -74,6 +92,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         // bytes that end up in the index setting. Declaration order
         // survives because the JSON object preserves it.
         this.overrides = LanceOverrides.parse(in.readString());
+        this.indexPlacement = in.readOptionalString();
     }
 
     @Override
@@ -85,6 +104,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         out.writeOptionalString(tag);
         storageOptions.writeTo(out);
         out.writeString(overrides.toJson());
+        out.writeOptionalString(indexPlacement);
     }
 
     @Override
@@ -114,6 +134,12 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
             }
             ex.addValidationError("[version] and [tag] are mutually exclusive");
         }
+        if (indexPlacement != null && !"in_table".equals(indexPlacement) && !"node_local".equals(indexPlacement)) {
+            if (ex == null) {
+                ex = new ActionRequestValidationException();
+            }
+            ex.addValidationError("[index_placement] must be 'in_table' or 'node_local'");
+        }
         return ex;
     }
 
@@ -141,5 +167,13 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
 
     public LanceOverrides overrides() {
         return overrides;
+    }
+
+    /**
+     * Requested {@code index.lance.index_placement}, or empty for the
+     * default ({@code in_table}).
+     */
+    public Optional<String> indexPlacement() {
+        return Optional.ofNullable(indexPlacement);
     }
 }

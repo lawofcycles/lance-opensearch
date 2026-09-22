@@ -439,6 +439,27 @@ public final class LanceWarmCache implements Closeable {
         LancePrimaryKeyType pkType,
         LanceOverrides overrides
     ) throws IOException {
+        // node_local placement: read this node's shallow clone instead of
+        // the source. The version the caller resolved refers to the
+        // source's manifest chain; the clone was created at that version
+        // and index builds have advanced its own chain past it, so the
+        // clone is opened at its latest version (which is where the built
+        // indexes live) and the snapshot is keyed on that. A re-clone
+        // (source version advance) retires every older snapshot of the
+        // index so no request can be handed a snapshot whose dataset reads
+        // a deleted clone directory.
+        LanceLocalClones clones = LanceLocalClones.instance();
+        if (clones != null) {
+            Optional<LanceLocalClones.CloneLocation> clone = clones.locateForRead(indexUuid, tableUri, storageOptions, version);
+            if (clone.isPresent()) {
+                if (clone.get().recreated()) {
+                    retireAll(indexUuid);
+                }
+                tableUri = clone.get().uri();
+                storageOptions = StorageOptions.empty();
+                version = Optional.empty();
+            }
+        }
         if (!enabled) {
             Dataset dataset = openDataset(tableUri, storageOptions, version);
             Snapshot transientSnapshot;
