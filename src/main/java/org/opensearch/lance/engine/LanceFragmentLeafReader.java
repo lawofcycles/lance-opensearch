@@ -92,6 +92,7 @@ import org.opensearch.common.lucene.index.OpenSearchLeafReader;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.engine.LanceFragmentSchema.ColumnKind;
 import org.opensearch.lance.engine.LanceFragmentSchema.NumericPrecision;
 
@@ -491,7 +492,8 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * @param intField        primary key column name, or empty when
      *                        the table declares no primary key
      * @param pkType          Arrow type family of the primary key
-     * @param multiFields     attach-body multi-fields spec, nullable
+     * @param overrides       per-column mapping overrides from the
+     *                        index settings, nullable
      * @param ftsColumns      Utf8 columns with an FTS index, from
      *                        {@link #resolveFtsColumns}
      * @param filterSql       Lance SQL predicate every per-column scan
@@ -506,7 +508,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
         boolean hasDeletionFile,
         String intField,
         org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields,
+        LanceOverrides overrides,
         java.util.Set<String> ftsColumns,
         String filterSql
     ) throws IOException {
@@ -515,7 +517,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
             fragmentId,
             physicalRows,
             hasDeletionFile,
-            LanceFragmentSchema.derive(dataset, intField, pkType, multiFields, ftsColumns),
+            LanceFragmentSchema.derive(dataset, intField, pkType, overrides, ftsColumns),
             filterSql
         );
     }

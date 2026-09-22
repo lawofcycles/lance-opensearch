@@ -8,7 +8,6 @@ package org.opensearch.lance;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -74,7 +73,7 @@ public class LanceDataFileSizeTests extends OpenSearchTestCase {
                 dataset,
                 "",
                 LanceEngineFactory.LancePrimaryKeyType.NONE,
-                Collections.emptyMap(),
+                LanceOverrides.EMPTY,
                 new NoopCircuitBreaker(CircuitBreaker.REQUEST)
             )
         ) {
@@ -99,7 +98,7 @@ public class LanceDataFileSizeTests extends OpenSearchTestCase {
                 fragmentDataset,
                 "",
                 LanceEngineFactory.LancePrimaryKeyType.NONE,
-                Collections.emptyMap(),
+                LanceOverrides.EMPTY,
                 fragmentIds
             )
         ) {

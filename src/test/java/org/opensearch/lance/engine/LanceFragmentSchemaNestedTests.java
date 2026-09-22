@@ -16,6 +16,7 @@ import java.util.Set;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.IndexOptions;
 import org.lance.Dataset;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -42,7 +43,7 @@ public class LanceFragmentSchemaNestedTests extends OpenSearchTestCase {
                 dataset,
                 "id",
                 LanceEngineFactory.LancePrimaryKeyType.LONG,
-                Collections.emptyMap(),
+                LanceOverrides.EMPTY,
                 Collections.emptySet()
             );
 
@@ -77,7 +78,7 @@ public class LanceFragmentSchemaNestedTests extends OpenSearchTestCase {
                 dataset,
                 "id",
                 LanceEngineFactory.LancePrimaryKeyType.LONG,
-                Collections.emptyMap(),
+                LanceOverrides.EMPTY,
                 Collections.emptySet()
             );
             assertTrue(schema.nestedColumns().isEmpty());

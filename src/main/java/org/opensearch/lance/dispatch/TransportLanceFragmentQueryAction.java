@@ -90,6 +90,7 @@ import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.Rewriteable;
 import org.opensearch.index.search.NestedHelper;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.engine.ColumnStore;
@@ -108,7 +109,6 @@ import org.opensearch.lance.query.LanceInvalidInput;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.lance.query.LanceKnnQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
-import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.aggregations.Aggregation;
@@ -433,15 +433,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         LancePrimaryKeyType pkType = pkField.isEmpty()
             ? LancePrimaryKeyType.NONE
             : LancePrimaryKeyType.fromSetting(indexMetadata.getSettings().get("index.lance.primary_key_type", "long"));
-        // Multi-fields spec is persisted as JSON in a single setting.
-        // Empty (no attach-body clause) leaves the reader with an empty
-        // sub-field map. Malformed JSON falls through to
+        // Per-column mapping overrides are persisted as JSON in a single
+        // setting (with a fallback to the legacy multi_fields setting for
+        // indexes created before it existed). Empty leaves the reader
+        // with an empty sub-field map. Malformed JSON falls through to
         // IllegalArgumentException, which the outer catch turns into a
         // 500 for the caller; that is loud enough to surface a bad
         // index setting without hiding the failure behind an empty map.
-        Map<String, LinkedHashMap<String, String>> multiFields = RestAttachAction.deserialiseMultiFields(
-            indexMetadata.getSettings().get("index.lance.multi_fields", "")
-        );
+        LanceOverrides overrides = LanceOverrides.of(indexMetadata.getSettings());
+        Map<String, LinkedHashMap<String, String>> multiFields = overrides.subFields();
         // The snapshot is keyed on the manifest version the coordinator
         // enumerated the fragments from (the pinned or tag version, or
         // the latest it observed), so every node of this request reads
@@ -459,7 +459,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 request.pinnedVersionOrEmpty(),
                 pkField,
                 pkType,
-                multiFields
+                overrides
             )
         ) {
             LanceWarmCache.Snapshot snapshot = lease.snapshot();

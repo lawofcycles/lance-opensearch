@@ -20,6 +20,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.NativeMemoryLimit.IndexCacheSizing;
@@ -221,7 +222,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     Optional.empty(),
                     "",
                     LancePrimaryKeyType.NONE,
-                    Collections.emptyMap()
+                    LanceOverrides.EMPTY
                 )
             ) {
                 LanceNodeStats held = collector.collect();

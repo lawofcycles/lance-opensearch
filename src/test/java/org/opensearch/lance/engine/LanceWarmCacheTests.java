@@ -9,13 +9,13 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.lance.Dataset;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -62,7 +62,7 @@ public class LanceWarmCacheTests extends OpenSearchTestCase {
     }
 
     private Lease acquire(String indexUuid, Optional<Long> version) throws Exception {
-        return cache.acquire(indexUuid, uri, StorageOptions.empty(), version, "", LancePrimaryKeyType.NONE, Collections.emptyMap());
+        return cache.acquire(indexUuid, uri, StorageOptions.empty(), version, "", LancePrimaryKeyType.NONE, LanceOverrides.EMPTY);
     }
 
     private long latestVersion() {

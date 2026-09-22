@@ -29,6 +29,7 @@ import org.lance.Dataset;
 import org.lance.index.IndexCriteria;
 import org.opensearch.index.mapper.NestedPathFieldMapper;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 
 /**
@@ -37,7 +38,7 @@ import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
  * primary key, the multi-field sub-fields, the projection of the per-hit
  * row take and the Lucene {@link FieldInfos}. All of it is a function of
  * the Lance schema at one manifest version plus the index settings
- * (primary key, multi-fields), so it is derived once and shared by every
+ * (primary key, mapping overrides), so it is derived once and shared by every
  * leaf over that version: the leaves of one request, and, through
  * {@link LanceWarmCache}, the leaves of every request against the same
  * snapshot.
@@ -173,7 +174,11 @@ public final class LanceFragmentSchema {
      * @param pkType      Arrow type family of the primary key; overridden
      *                    to {@link LancePrimaryKeyType#NONE} when
      *                    {@code intField} is empty
-     * @param multiFields attach-body multi-fields spec, nullable
+     * @param overrides   per-column mapping overrides from the index
+     *                    settings, nullable; carries the keyword
+     *                    sub-fields and the {@code type: keyword}
+     *                    overrides that force a Utf8 column with an FTS
+     *                    index onto the doc-values path
      * @param ftsColumns  Utf8 columns with an FTS index, from
      *                    {@link #resolveFtsColumns}
      */
@@ -181,13 +186,20 @@ public final class LanceFragmentSchema {
         Dataset dataset,
         String intField,
         LancePrimaryKeyType pkType,
-        Map<String, LinkedHashMap<String, String>> multiFields,
+        LanceOverrides overrides,
         Set<String> ftsColumns
     ) throws IOException {
         // Empty field name overrides pkType regardless of what the caller
         // passed in, so every accessor agrees on "no PK" without the
         // caller having to zip the two settings.
         LancePrimaryKeyType effectivePkType = intField.isEmpty() ? LancePrimaryKeyType.NONE : pkType;
+        Map<String, LinkedHashMap<String, String>> multiFields = overrides == null ? Map.of() : overrides.subFields();
+        // A `type: keyword` override maps the column to keyword, so the
+        // reader must serve it through SortedSetDocValues like any other
+        // keyword column; drop it from the FTS set before classification
+        // refines TEXT_FTS. The Lance inverted index on the column stays
+        // in place, it is just not consulted by this index.
+        Set<String> keywordOverridden = overrides == null ? Set.of() : overrides.keywordColumns();
 
         // Flatten the multi-fields spec into "<sub>" → "<base>" lookup so
         // getSortedDocValues("body.raw") can route to the base column's
@@ -258,7 +270,9 @@ public final class LanceFragmentSchema {
                     continue;
                 }
                 if (kind == ColumnKind.TEXT_FTS) {
-                    kind = ftsColumns.contains(field.getName()) ? ColumnKind.TEXT_FTS : ColumnKind.TEXT_KEYWORD;
+                    kind = ftsColumns.contains(field.getName()) && !keywordOverridden.contains(field.getName())
+                        ? ColumnKind.TEXT_FTS
+                        : ColumnKind.TEXT_KEYWORD;
                 }
                 columnKind.put(field.getName(), kind);
                 topLevelOrder.add(field.getName());

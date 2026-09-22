@@ -45,6 +45,7 @@ import org.lance.Dataset;
 import org.lance.Fragment;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -95,7 +96,7 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
             dataset,
             "",
             LanceEngineFactory.LancePrimaryKeyType.NONE,
-            Collections.emptyMap(),
+            LanceOverrides.EMPTY,
             fragmentIds
         );
         leaves = new ArrayList<>();

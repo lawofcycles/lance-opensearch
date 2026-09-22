@@ -11,7 +11,6 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
@@ -28,6 +27,7 @@ import org.lance.Dataset;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.lance.LanceCircuitBreaker;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -90,7 +90,7 @@ public class LanceShardColumnCacheTests extends OpenSearchTestCase {
     }
 
     private Lease acquire() throws Exception {
-        return cache.acquire(UUID, uri, StorageOptions.empty(), Optional.empty(), "", LancePrimaryKeyType.NONE, Collections.emptyMap());
+        return cache.acquire(UUID, uri, StorageOptions.empty(), Optional.empty(), "", LancePrimaryKeyType.NONE, LanceOverrides.EMPTY);
     }
 
     /** A reader without a store: every column loads into heap and is charged to {@code breaker}. */
@@ -607,7 +607,7 @@ public class LanceShardColumnCacheTests extends OpenSearchTestCase {
                 dataset,
                 "",
                 LancePrimaryKeyType.NONE,
-                Collections.emptyMap(),
+                LanceOverrides.EMPTY,
                 new ArrayList<>(allFragments)
             )
         ) {

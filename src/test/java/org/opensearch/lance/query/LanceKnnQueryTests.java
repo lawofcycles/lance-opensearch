@@ -9,7 +9,6 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -27,6 +26,7 @@ import org.lance.Fragment;
 import org.lance.ipc.Query;
 import org.lance.ipc.ScanOptions;
 import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -152,7 +152,7 @@ public class LanceKnnQueryTests extends OpenSearchTestCase {
             dataset,
             "",
             LanceEngineFactory.LancePrimaryKeyType.NONE,
-            Collections.emptyMap(),
+            LanceOverrides.EMPTY,
             fragmentIds
         );
     }

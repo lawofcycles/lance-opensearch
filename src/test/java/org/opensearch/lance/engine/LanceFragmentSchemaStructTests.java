@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Set;
 
 import org.lance.Dataset;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -39,7 +40,7 @@ public class LanceFragmentSchemaStructTests extends OpenSearchTestCase {
                 dataset,
                 "id",
                 LanceEngineFactory.LancePrimaryKeyType.LONG,
-                Collections.emptyMap(),
+                LanceOverrides.EMPTY,
                 Collections.emptySet()
             );
 

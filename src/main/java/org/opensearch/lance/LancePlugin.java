@@ -173,6 +173,20 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.IndexScope,
         Setting.Property.Final
     );
+    /**
+     * JSON stringified per-column mapping overrides, persisted by attach
+     * and namespace surface so derivation can re-apply them on every
+     * manifest version advance. Empty means no overrides declared. New
+     * attaches write this setting only; {@link #MULTI_FIELDS_SETTING}
+     * stays registered so indexes created before it existed keep
+     * opening.
+     */
+    public static final Setting<String> OVERRIDES_SETTING = Setting.simpleString(
+        LanceEngineFactory.OVERRIDES_SETTING,
+        "",
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
     public static final Setting<String> UNCOVERED_FRAGMENT_POLICY_SETTING = Setting.simpleString(
         "index.lance.uncovered_fragment_policy",
         "immediate",
@@ -662,6 +676,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             VERSION_SETTING,
             TAG_SETTING,
             MULTI_FIELDS_SETTING,
+            OVERRIDES_SETTING,
             UNCOVERED_FRAGMENT_POLICY_SETTING,
             NAMESPACE_POLL_CADENCE_SETTING,
             NAMESPACE_RESURFACE_GRACE_SETTING,

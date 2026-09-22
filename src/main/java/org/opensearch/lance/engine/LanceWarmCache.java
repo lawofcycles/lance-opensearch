@@ -34,6 +34,7 @@ import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
@@ -426,7 +427,8 @@ public final class LanceWarmCache implements Closeable {
      *                       resolved
      * @param pkField        primary key column, or empty
      * @param pkType         primary key type family
-     * @param multiFields    attach-body multi-fields, nullable
+     * @param overrides      per-column mapping overrides from the index
+     *                       settings, nullable
      */
     public Lease acquire(
         String indexUuid,
@@ -435,13 +437,13 @@ public final class LanceWarmCache implements Closeable {
         Optional<Long> version,
         String pkField,
         LancePrimaryKeyType pkType,
-        Map<String, LinkedHashMap<String, String>> multiFields
+        LanceOverrides overrides
     ) throws IOException {
         if (!enabled) {
             Dataset dataset = openDataset(tableUri, storageOptions, version);
             Snapshot transientSnapshot;
             try {
-                transientSnapshot = build(new SnapshotKey(indexUuid, dataset.version()), dataset, pkField, pkType, multiFields, false);
+                transientSnapshot = build(new SnapshotKey(indexUuid, dataset.version()), dataset, pkField, pkType, overrides, false);
             } catch (IOException | RuntimeException e) {
                 dataset.close();
                 throw e;
@@ -492,7 +494,7 @@ public final class LanceWarmCache implements Closeable {
             }
             Snapshot built;
             try {
-                built = build(key, dataset, pkField, pkType, multiFields, true);
+                built = build(key, dataset, pkField, pkType, overrides, true);
             } catch (IOException | RuntimeException e) {
                 dataset.close();
                 throw e;
@@ -519,12 +521,12 @@ public final class LanceWarmCache implements Closeable {
         Dataset dataset,
         String pkField,
         LancePrimaryKeyType pkType,
-        Map<String, LinkedHashMap<String, String>> multiFields,
+        LanceOverrides overrides,
         boolean cached
     ) throws IOException {
         snapshotBuilds.incrementAndGet();
         Set<String> ftsColumns = LanceFragmentSchema.resolveFtsColumns(dataset);
-        LanceFragmentSchema schema = LanceFragmentSchema.derive(dataset, pkField, pkType, multiFields, ftsColumns);
+        LanceFragmentSchema schema = LanceFragmentSchema.derive(dataset, pkField, pkType, overrides, ftsColumns);
         List<Fragment> lanceFragments = dataset.getFragments();
         List<FragmentMeta> fragments = new ArrayList<>(lanceFragments.size());
         for (Fragment fragment : lanceFragments) {
