@@ -191,7 +191,8 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
     }
 
     /** The one mapping every node leg agrees on, or the error to fail the build with. */
-    record MappingConsensus(String mappingJson, String error) {}
+    record MappingConsensus(String mappingJson, String error) {
+    }
 
     /**
      * Compare the mapping JSON each node leg re-derived from its clone.
