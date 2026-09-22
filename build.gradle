@@ -114,12 +114,25 @@ dependencies {
     // apache-client (httpcore, commons-logging) and netty-nio-client
     // stay out. Guava comes from the Calcite block above; slf4j-api and
     // reactive-streams come from the plugin's own declaration and the
-    // OpenSearch core classpath respectively. The impls-core REST client
-    // classes reference httpclient5, which is not bundled because the
-    // plugin never runs that path; thirdPartyAudit ignores those
-    // references below.
+    // OpenSearch core classpath respectively.
     implementation "org.lance:lance-namespace-glue:${lance_namespace_impls_version}"
     implementation "org.lance:lance-namespace-impls-core:${lance_namespace_impls_version}"
+    // Iceberg REST, Polaris, and Unity catalog implementations of the
+    // Lance Namespace interface, same 0.4.1 artifacts with the same
+    // lance-namespace 0.7.7 skew as glue above; the surface the plugin
+    // drives (initialize, listTables, listNamespaces, describeTable,
+    // their model classes and the errors package) is binary-compatible
+    // with the bundled 0.11.1 (method descriptors verified against both
+    // jars, plus offline initialisation tests through the factory).
+    // All three are thin REST clients over impls-core's RestClient,
+    // which runs on Apache HttpClient 5 — bundled below at the version
+    // impls-core pins, together with its httpcore5 runtime.
+    implementation "org.lance:lance-namespace-iceberg:${lance_namespace_impls_version}"
+    implementation "org.lance:lance-namespace-polaris:${lance_namespace_impls_version}"
+    implementation "org.lance:lance-namespace-unity:${lance_namespace_impls_version}"
+    implementation "org.apache.httpcomponents.client5:httpclient5:${httpclient5_version}"
+    implementation "org.apache.httpcomponents.core5:httpcore5:${httpcore5_version}"
+    implementation "org.apache.httpcomponents.core5:httpcore5-h2:${httpcore5_version}"
     implementation "software.amazon.awssdk:glue:${aws_sdk_version}"
     implementation "software.amazon.awssdk:aws-json-protocol:${aws_sdk_version}"
     implementation "software.amazon.awssdk:protocol-core:${aws_sdk_version}"
@@ -282,7 +295,10 @@ tasks.named("dependencyLicenses").configure {
     // The AWS SDK v2 modules the Glue client pulls in. All ship from the
     // same repository under the same Apache-2.0 license and notice.
     mapping from: /^(?:glue|aws-core|sdk-core|auth|regions|profiles|utils|annotations|http-client-spi|metrics-spi|endpoints-spi|identity-spi|http-auth.*|checksums.*|retries.*|json-utils|third-party-jackson-core|protocol-core|aws-json-protocol|url-connection-client)$/, to: 'aws-sdk'
-    mapping from: /^lance-namespace-(?:glue|impls-core)$/, to: 'lance-namespace-impls'
+    mapping from: /^lance-namespace-(?:glue|impls-core|iceberg|polaris|unity)$/, to: 'lance-namespace-impls'
+    // httpcore5 and httpcore5-h2 ship from the HttpComponents Core
+    // repository under one license and notice; httpclient5 has its own.
+    mapping from: /^httpcore5.*/, to: 'httpcore5'
 }
 
 // lance-core references API surface from libraries that are either provided
@@ -400,35 +416,11 @@ tasks.named('thirdPartyAudit').configure {
         'org.apache.tools.ant.taskdefs.compilers.DefaultCompilerAdapter',
         'org.apache.tools.ant.types.Path',
 
-        // Avatica remote JDBC HTTP client. The plugin never opens an Avatica connection.
-        'org.apache.hc.client5.http.SystemDefaultDnsResolver',
-        'org.apache.hc.client5.http.auth.AuthScope',
-        'org.apache.hc.client5.http.auth.Credentials',
-        'org.apache.hc.client5.http.auth.CredentialsProvider',
-        'org.apache.hc.client5.http.auth.KerberosConfig',
-        'org.apache.hc.client5.http.auth.KerberosConfig$Builder',
-        'org.apache.hc.client5.http.auth.UsernamePasswordCredentials',
-        'org.apache.hc.client5.http.classic.methods.HttpPost',
-        'org.apache.hc.client5.http.config.RequestConfig',
-        'org.apache.hc.client5.http.config.RequestConfig$Builder',
-        'org.apache.hc.client5.http.impl.auth.BasicAuthCache',
-        'org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider',
-        'org.apache.hc.client5.http.impl.classic.HttpClientBuilder',
-        'org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager',
-        'org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder',
-        'org.apache.hc.client5.http.routing.RoutingSupport',
-        'org.apache.hc.client5.http.ssl.HttpsSupport',
-        'org.apache.hc.client5.http.ssl.NoopHostnameVerifier',
+        // Avatica's remote JDBC HTTP client was compiled against a newer
+        // Apache HttpClient 5 than the 5.2.1 bundled for the catalog
+        // clients; this one class does not exist there. The plugin never
+        // opens an Avatica connection, so the reference never loads.
         'org.apache.hc.client5.http.ssl.TlsSocketStrategy',
-        'org.apache.hc.core5.http.ClassicHttpResponse',
-        'org.apache.hc.core5.http.HttpHost',
-        'org.apache.hc.core5.http.config.Lookup',
-        'org.apache.hc.core5.http.config.RegistryBuilder',
-        'org.apache.hc.core5.ssl.SSLContextBuilder',
-        'org.apache.hc.core5.ssl.SSLContexts',
-        'org.apache.hc.core5.util.Timeout',
-
-        // Optional OpenTelemetry metrics instrumentation in lance-core.
 
         // Optional OpenTelemetry metrics instrumentation in lance-core.
         'io.opentelemetry.api.GlobalOpenTelemetry',
@@ -451,36 +443,22 @@ tasks.named('thirdPartyAudit').configure {
         // actually uses; the rest live in adapter artifacts that we do not
         // bundle today.
 
-        // Apache HTTP client classes referenced by lance-namespace-apache-client
-        // only through the REST client path. DirectoryNamespace, the only Lance
-        // Namespace implementation the plugin exercises today, uses JNI to
-        // reach the Rust core and never touches these classes at runtime.
-        'org.apache.hc.client5.http.cookie.BasicCookieStore',
-        'org.apache.hc.client5.http.cookie.Cookie',
-        'org.apache.hc.client5.http.entity.mime.MultipartEntityBuilder',
-        'org.apache.hc.client5.http.impl.classic.CloseableHttpClient',
-        'org.apache.hc.client5.http.impl.classic.CloseableHttpResponse',
-        'org.apache.hc.client5.http.impl.classic.HttpClients',
-        'org.apache.hc.client5.http.impl.cookie.BasicClientCookie',
-        'org.apache.hc.client5.http.protocol.HttpClientContext',
-        'org.apache.hc.core5.http.ContentType',
-        'org.apache.hc.core5.http.Header',
-        'org.apache.hc.core5.http.HttpEntity',
-        'org.apache.hc.core5.http.HttpResponse',
-        'org.apache.hc.core5.http.io.entity.EntityUtils',
-        'org.apache.hc.core5.http.io.support.ClassicRequestBuilder',
+        // OpenAPI nullable-wrapper referenced by lance-namespace-apache-client's
+        // generated model setters. The models the plugin drives never set a
+        // JsonNullable field, so the wrapper library is not bundled.
         'org.openapitools.jackson.nullable.JsonNullable',
+
+        // Optional response-decompression and TLS providers referenced by
+        // the bundled httpclient5. Brotli decoding only loads when a
+        // response arrives brotli-encoded and Conscrypt only when selected
+        // as the TLS provider; neither is bundled, matching how the SDK's
+        // optional pieces are handled above.
+        'org.brotli.dec.BrotliInputStream',
+        'org.conscrypt.Conscrypt',
 
         // Internal helpers referenced by lance-core's shaded Guava on some JVMs.
         'org.lance.shaded.guava.util.concurrent.internal.InternalFutureFailureAccess',
         'org.lance.shaded.guava.util.concurrent.internal.InternalFutures',
-
-        // The lance-namespace-impls-core REST client reaches HTTP catalogs
-        // through Apache HttpClient 5. The plugin reaches REST catalogs
-        // through RestNamespace in lance-core (JNI) instead, so
-        // httpclient5 is not bundled and that code path never loads.
-        'org.apache.hc.client5.http.classic.methods.HttpUriRequestBase',
-        'org.apache.hc.core5.http.message.BasicHttpRequest',
 
         // Optional CRT-backed SigV4 signer in the AWS SDK's http-auth-aws.
         // The default signer is pure Java; aws-crt only loads when a
