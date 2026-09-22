@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 import org.opensearch.Version;
@@ -210,11 +211,7 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
         private static final ConstructingObjectParser<Entry, Void> ENTRY_PARSER = new ConstructingObjectParser<>(
             "lance_namespace_entry",
             false,
-            args -> new Entry(
-                (String) args[0],
-                StorageOptions.of((java.util.Map<String, String>) args[1]),
-                args[2] == null ? "" : (String) args[2]
-            )
+            args -> new Entry((String) args[0], StorageOptions.of((Map<String, String>) args[1]), args[2] == null ? "" : (String) args[2])
         );
 
         static {

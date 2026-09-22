@@ -5,6 +5,7 @@
 
 package org.opensearch.lance.rest;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -193,7 +194,7 @@ public class RestAttachAction extends BaseRestHandler {
      * picks the override back up if a later manifest restores it.
      */
     public static Derivation derive(Dataset dataset, LanceOverrides overrides, boolean lenient) throws Exception {
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields = overrides.subFields();
+        Map<String, LinkedHashMap<String, String>> multiFields = overrides.subFields();
         long rows = dataset.countRows();
         int fragments = dataset.getFragments().size();
 
@@ -215,7 +216,7 @@ public class RestAttachAction extends BaseRestHandler {
         LanceSchema lanceSchema = dataset.getLanceSchema();
         LanceOverrides effective = validateOverrides(overrides, lanceSchema, lenient, notes);
         multiFields = effective.subFields();
-        java.util.Map<String, String> dateOverrides = effective.dateColumns();
+        Map<String, String> dateOverrides = effective.dateColumns();
         java.util.Set<String> keywordOverrides = effective.keywordColumns();
         for (LanceField field : lanceSchema.fields()) {
             ArrowType type = field.getType();
@@ -580,12 +581,12 @@ public class RestAttachAction extends BaseRestHandler {
         if (overrides.isEmpty()) {
             return overrides;
         }
-        java.util.Map<String, LanceField> fieldsByName = new java.util.LinkedHashMap<>();
+        Map<String, LanceField> fieldsByName = new LinkedHashMap<>();
         for (LanceField field : lanceSchema.fields()) {
             fieldsByName.put(field.getName(), field);
         }
-        java.util.LinkedHashMap<String, LanceOverrides.Column> accepted = new java.util.LinkedHashMap<>();
-        for (java.util.Map.Entry<String, LanceOverrides.Column> entry : overrides.columns().entrySet()) {
+        LinkedHashMap<String, LanceOverrides.Column> accepted = new LinkedHashMap<>();
+        for (Map.Entry<String, LanceOverrides.Column> entry : overrides.columns().entrySet()) {
             String baseName = entry.getKey();
             LanceOverrides.Column column = entry.getValue();
             try {
@@ -639,7 +640,7 @@ public class RestAttachAction extends BaseRestHandler {
                                 + type
                         );
                     }
-                    for (java.util.Map.Entry<String, String> sub : column.subFields().entrySet()) {
+                    for (Map.Entry<String, String> sub : column.subFields().entrySet()) {
                         if (!"keyword".equals(sub.getValue())) {
                             throw new IllegalArgumentException(
                                 "sub-field [" + baseName + "." + sub.getKey() + "] type must be [keyword], got [" + sub.getValue() + "]"
