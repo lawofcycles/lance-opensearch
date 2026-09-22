@@ -40,7 +40,7 @@ public class LanceExplainIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            Response ok = explain(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}");
+            Response ok = explain(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
             assertEquals(RestStatus.OK.getStatus(), ok.getStatusLine().getStatusCode());
             String body = readAll(ok);
             assertEquals(indexName, stringPath(body, "index"));
@@ -51,7 +51,7 @@ public class LanceExplainIT extends LanceRestTestCase {
 
             ResponseException terms = expectThrows(
                 ResponseException.class,
-                () -> explain(indexName, "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"rating\"}}}}")
+                () -> explain(indexName, "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"id\"}}}}")
             );
             assertEquals(RestStatus.BAD_REQUEST.getStatus(), terms.getResponse().getStatusLine().getStatusCode());
             String reason = readAll(terms.getResponse());
@@ -60,7 +60,7 @@ public class LanceExplainIT extends LanceRestTestCase {
 
             ResponseException hits = expectThrows(
                 ResponseException.class,
-                () -> explain(indexName, "{\"size\":5,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}")
+                () -> explain(indexName, "{\"size\":5,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}")
             );
             assertEquals(RestStatus.BAD_REQUEST.getStatus(), hits.getResponse().getStatusLine().getStatusCode());
             assertTrue(readAll(hits.getResponse()).contains("size [5] (only 0)"));
@@ -74,7 +74,7 @@ public class LanceExplainIT extends LanceRestTestCase {
     public void testExplainUnknownIndexIs404() {
         ResponseException failure = expectThrows(
             ResponseException.class,
-            () -> explain("no-such-index", "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}")
+            () -> explain("no-such-index", "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}")
         );
         assertEquals(RestStatus.NOT_FOUND.getStatus(), failure.getResponse().getStatusLine().getStatusCode());
     }
@@ -87,7 +87,7 @@ public class LanceExplainIT extends LanceRestTestCase {
         try {
             ResponseException failure = expectThrows(
                 ResponseException.class,
-                () -> explain(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}")
+                () -> explain(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}")
             );
             assertEquals(RestStatus.BAD_REQUEST.getStatus(), failure.getResponse().getStatusLine().getStatusCode());
             assertTrue(readAll(failure.getResponse()).contains("is not a Lance index"));
