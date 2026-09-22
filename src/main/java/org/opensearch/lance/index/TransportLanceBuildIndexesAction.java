@@ -204,18 +204,30 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
             refreshAndRespond.run();
             return;
         }
-        client.admin()
-            .indices()
-            .preparePutMapping(indexName)
-            .setSource(mappingJson, MediaTypeRegistry.JSON)
-            .execute(ActionListener.wrap(ack -> refreshAndRespond.run(), e -> {
-                if (isTypeChangeRefusal(e)) {
-                    rebuildIndexWithMapping(indexName, mappingJson, refreshAndRespond, listener);
-                } else {
-                    LOGGER.warn("mapping re-derivation after node_local build failed for {}: {}", indexName, e.getMessage());
-                    refreshAndRespond.run();
-                }
-            }));
+        // The mapping update (and, on the type-change path below, the
+        // delete half of the rebuild) is plugin housekeeping that follows
+        // from the build the caller was already authorised for, so it
+        // runs under a stashed context with the plugin's internal header,
+        // the way the re-create call does. A role holding only
+        // indices:admin/lance/build_indexes and indices:admin/refresh
+        // must not need mapping or delete privileges for the first FTS
+        // build that flips a keyword column.
+        ThreadContext threadContext = client.threadPool().getThreadContext();
+        try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
+            threadContext.putHeader(LanceInternalHeaders.LANCE_INTERNAL_CREATE_INDEX, "true");
+            client.admin()
+                .indices()
+                .preparePutMapping(indexName)
+                .setSource(mappingJson, MediaTypeRegistry.JSON)
+                .execute(ActionListener.wrap(ack -> refreshAndRespond.run(), e -> {
+                    if (isTypeChangeRefusal(e)) {
+                        rebuildIndexWithMapping(indexName, mappingJson, refreshAndRespond, listener);
+                    } else {
+                        LOGGER.warn("mapping re-derivation after node_local build failed for {}: {}", indexName, e.getMessage());
+                        refreshAndRespond.run();
+                    }
+                }));
+        }
     }
 
     /**
@@ -260,14 +272,18 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
                 + "(the Lance source and the node-local clones are untouched)",
             indexName
         );
-        client.admin().indices().delete(new DeleteIndexRequest(indexName), ActionListener.wrap(deleted -> {
-            ThreadContext threadContext = client.threadPool().getThreadContext();
-            CreateIndexRequest create = new CreateIndexRequest(indexName).settings(settings.build()).mapping(mappingJson);
-            try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
-                threadContext.putHeader(LanceInternalHeaders.LANCE_INTERNAL_CREATE_INDEX, "true");
-                client.admin().indices().create(create, ActionListener.wrap(created -> refreshAndRespond.run(), listener::onFailure));
-            }
-        }, listener::onFailure));
+        ThreadContext threadContext = client.threadPool().getThreadContext();
+        try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
+            threadContext.putHeader(LanceInternalHeaders.LANCE_INTERNAL_CREATE_INDEX, "true");
+            client.admin().indices().delete(new DeleteIndexRequest(indexName), ActionListener.wrap(deleted -> {
+                ThreadContext createContext = client.threadPool().getThreadContext();
+                CreateIndexRequest create = new CreateIndexRequest(indexName).settings(settings.build()).mapping(mappingJson);
+                try (ThreadContext.StoredContext restored = createContext.stashContext()) {
+                    createContext.putHeader(LanceInternalHeaders.LANCE_INTERNAL_CREATE_INDEX, "true");
+                    client.admin().indices().create(create, ActionListener.wrap(created -> refreshAndRespond.run(), listener::onFailure));
+                }
+            }, listener::onFailure));
+        }
     }
 
     static LanceBuildIndexesResponse mergeNodeResponses(
