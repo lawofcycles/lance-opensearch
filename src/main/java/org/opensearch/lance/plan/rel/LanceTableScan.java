@@ -22,7 +22,7 @@ import java.util.List;
 /**
  * Scan of a Lance backed index, the leaf every plan over a Lance table
  * starts from. A plain scan for now: pushdown state (filters, projections,
- * aggregations pushed into the dataset scan) comes in later phases.
+ * aggregations pushed into the dataset scan) is not modelled yet.
  */
 public class LanceTableScan extends TableScan implements LanceRel {
 
@@ -49,11 +49,13 @@ public class LanceTableScan extends TableScan implements LanceRel {
 
     /**
      * Rows read stand in for predicted milliseconds until the cost model
-     * gets real coefficients; native and heap bytes are not modelled yet.
+     * gets real coefficients; native and heap bytes are not modelled yet,
+     * so both byte slots stay zero and the budget check in the cost
+     * ordering cannot fire on a bare scan.
      */
     @Override
     public RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
         double rows = estimateRowCount(mq);
-        return planner.getCostFactory().makeCost(rows, rows, 0);
+        return planner.getCostFactory().makeCost(rows, 0, 0);
     }
 }

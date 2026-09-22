@@ -42,7 +42,7 @@ public class LanceTableScanTests extends OpenSearchTestCase {
         RelOptCost cost = scan.computeSelfCost(scan.getCluster().getPlanner(), scan.getCluster().getMetadataQuery());
         assertNotNull(cost);
         assertEquals(100.0, cost.getRows(), 0.0);
-        assertEquals(100.0, cost.getCpu(), 0.0);
+        assertEquals(0.0, cost.getCpu(), 0.0);
         assertEquals(0.0, cost.getIo(), 0.0);
     }
 
