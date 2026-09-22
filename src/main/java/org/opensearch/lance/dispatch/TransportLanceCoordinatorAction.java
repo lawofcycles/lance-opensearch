@@ -1187,7 +1187,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * its sub-entries live under {@code fields}, not {@code properties}
      * — so the filter translator can tell the two dotted shapes apart:
      * struct children print as Lance nested field accesses, sub-fields
-     * stay on the Lucene doc value path.
+     * stay on the Lucene doc value path. A path crossing an entry of
+     * type {@code nested} (a {@code List<Struct>} column) does not
+     * resolve either: DataFusion has no {@code UNNEST} in a filter, so a
+     * nested child predicate cannot travel to Lance SQL and belongs on
+     * the Lucene side.
      */
     @SuppressWarnings("unchecked")
     private static Object resolveObjectPath(Map<String, Object> propertyMap, String name) {
@@ -1196,6 +1200,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         for (int s = 0; s < segments.length - 1; s++) {
             Object entry = current.get(segments[s]);
             if (!(entry instanceof Map)) {
+                return null;
+            }
+            if ("nested".equals(((Map<String, Object>) entry).get("type"))) {
                 return null;
             }
             Object nested = ((Map<String, Object>) entry).get("properties");

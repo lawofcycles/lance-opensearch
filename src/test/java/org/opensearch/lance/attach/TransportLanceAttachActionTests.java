@@ -27,7 +27,7 @@ public class TransportLanceAttachActionTests extends OpenSearchTestCase {
     private static final IndexCacheSizing DEFAULT_16_CPUS = NativeMemoryLimit.sizeIndexCache(19 * GIB, 16);
 
     private static Derivation derivation(long rows, Set<String> ftsColumns) {
-        return new Derivation("{}", "", "long", "", 3L, rows, 4, List.of(), ftsColumns, Set.of("rating"), Set.of());
+        return new Derivation("{}", "", "long", "", 3L, rows, 4, List.of(), ftsColumns, Set.of("rating"), Set.of(), Set.of());
     }
 
     public void testWarnsWhenTheEstimateExceedsTheShardShare() {

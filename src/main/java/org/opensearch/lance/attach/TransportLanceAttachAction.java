@@ -7,13 +7,22 @@ package org.opensearch.lance.attach;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
+import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.lance.Dataset;
 import org.lance.Fragment;
+import org.lance.ipc.LanceScanner;
+import org.lance.ipc.ScanOptions;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
@@ -188,13 +197,21 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             }
         }
         RestAttachAction.Derivation derivation;
-        long[] fragmentRows;
+        long[] fragmentDocs;
         try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions(), openVersion)) {
             derivation = RestAttachAction.derive(dataset, request.multiFields());
             List<Fragment> fragments = dataset.getFragments();
-            fragmentRows = new long[fragments.size()];
-            for (int i = 0; i < fragmentRows.length; i++) {
-                fragmentRows[i] = fragments.get(i).metadata().getPhysicalRows();
+            fragmentDocs = new long[fragments.size()];
+            for (int i = 0; i < fragmentDocs.length; i++) {
+                fragmentDocs[i] = fragments.get(i).metadata().getPhysicalRows();
+            }
+            if (!derivation.nestedColumns().isEmpty()) {
+                // The reader of a fragment with nested columns exposes
+                // rows plus nested elements as docs, so the Lucene bound
+                // arithmetic must count the elements too. One scan of the
+                // nested columns reads each row's element count from the
+                // list offsets.
+                addNestedElementCounts(dataset, derivation.nestedColumns(), fragments, fragmentDocs);
             }
         }
         warnIfInvertedIndexExceedsShardShare(indexName, derivation);
@@ -202,7 +219,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         boolean luceneBoundExceeded = checkLuceneBound(
             indexName,
             table,
-            fragmentRows,
+            fragmentDocs,
             maxDocs,
             clusterService.state().nodes().getDataNodes().size()
         );
@@ -219,37 +236,72 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
     }
 
     /**
-     * Whether the table has more physical rows than one Lucene reader may
-     * hold ({@code maxDocs}). Such a table attaches: the fragment path
-     * serves it in groups of fragments within the bound and the shard
-     * reader holds the leading fragments that fit, which one WARN says.
-     * A single fragment above the bound cannot be read by any reader, so
-     * that table is refused with 400.
+     * Add each fragment's nested element total to {@code fragmentDocs}
+     * (indexed like {@code fragments}). One scan of the whole table
+     * projecting the nested columns; the element count per row comes
+     * from the list offsets, and rows a deletion file hides are skipped
+     * by the scan, matching the reader's doc id layout.
      */
-    static boolean checkLuceneBound(String indexName, String table, long[] fragmentRows, long maxDocs, int dataNodes) {
-        long totalRows = 0L;
-        for (long rows : fragmentRows) {
-            if (rows > maxDocs) {
+    static void addNestedElementCounts(Dataset dataset, Set<String> nestedColumns, List<Fragment> fragments, long[] fragmentDocs)
+        throws Exception {
+        Map<Integer, Integer> indexOfFragment = new HashMap<>(fragments.size() * 2);
+        for (int i = 0; i < fragments.size(); i++) {
+            indexOfFragment.put(fragments.get(i).getId(), i);
+        }
+        ScanOptions options = new ScanOptions.Builder().columns(new ArrayList<>(nestedColumns)).withRowAddress(true).build();
+        try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                for (String column : nestedColumns) {
+                    ListVector list = (ListVector) root.getVector(column);
+                    for (int i = 0; i < root.getRowCount(); i++) {
+                        if (list.isNull(i)) {
+                            continue;
+                        }
+                        Integer index = indexOfFragment.get((int) (rowAddr.get(i) >>> 32));
+                        if (index != null) {
+                            fragmentDocs[index] += list.getElementEndIndex(i) - list.getElementStartIndex(i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Whether the table has more docs than one Lucene reader may hold
+     * ({@code maxDocs}); a fragment's docs are its physical rows plus,
+     * for tables with nested columns, its nested elements. Such a table
+     * attaches: the fragment path serves it in groups of fragments
+     * within the bound and the shard reader holds the leading fragments
+     * that fit, which one WARN says. A single fragment above the bound
+     * cannot be read by any reader, so that table is refused with 400.
+     */
+    static boolean checkLuceneBound(String indexName, String table, long[] fragmentDocs, long maxDocs, int dataNodes) {
+        long totalDocs = 0L;
+        for (long docs : fragmentDocs) {
+            if (docs > maxDocs) {
                 throw new OpenSearchStatusException(
                     "table ["
                         + table
                         + "] has a fragment of "
-                        + rows
-                        + " rows, above the bound of "
+                        + docs
+                        + " docs (rows plus nested elements), above the bound of "
                         + maxDocs
-                        + " rows per Lucene reader; no reader can hold it. Rewrite the table with smaller fragments",
+                        + " docs per Lucene reader; no reader can hold it. Rewrite the table with smaller fragments",
                     RestStatus.BAD_REQUEST
                 );
             }
-            totalRows += rows;
+            totalDocs += docs;
         }
-        if (totalRows <= maxDocs) {
+        if (totalDocs <= maxDocs) {
             return false;
         }
-        long readerRows = 0L;
-        int held = LanceDirectoryReader.leadingFragmentsWithinBound(fragmentRows, maxDocs);
+        long readerDocs = 0L;
+        int held = LanceDirectoryReader.leadingFragmentsWithinBound(fragmentDocs, maxDocs);
         for (int i = 0; i < held; i++) {
-            readerRows += fragmentRows[i];
+            readerDocs += fragmentDocs[i];
         }
         // The fragment path spreads the fragments round robin over the
         // data nodes and cuts each node's share into groups within the
@@ -258,24 +310,24 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         int nodes = Math.max(1, dataNodes);
         for (int node = 0; node < nodes; node++) {
             List<Long> share = new ArrayList<>();
-            for (int i = node; i < fragmentRows.length; i += nodes) {
-                share.add(fragmentRows[i]);
+            for (int i = node; i < fragmentDocs.length; i += nodes) {
+                share.add(fragmentDocs[i]);
             }
-            long[] shareRows = new long[share.size()];
-            for (int i = 0; i < shareRows.length; i++) {
-                shareRows[i] = share.get(i);
+            long[] shareDocs = new long[share.size()];
+            for (int i = 0; i < shareDocs.length; i++) {
+                shareDocs[i] = share.get(i);
             }
-            groups += LanceDirectoryReader.groupEnds(shareRows, maxDocs).length;
+            groups += LanceDirectoryReader.groupEnds(shareDocs, maxDocs).length;
         }
         LOG.warn(
-            "lance.attach: table [{}] has {} rows, above the bound of {} rows per Lucene reader; the shard reader of [{}] holds {} of {} rows; "
+            "lance.attach: table [{}] has {} docs, above the bound of {} docs per Lucene reader; the shard reader of [{}] holds {} of {} docs; "
                 + "searches run on the fragment path in {} groups over {} data nodes",
             table,
-            totalRows,
+            totalDocs,
             maxDocs,
             indexName,
-            readerRows,
-            totalRows,
+            readerDocs,
+            totalDocs,
             groups,
             nodes
         );

@@ -18,6 +18,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.mapper.MappedFieldType;
+import org.opensearch.index.mapper.ObjectMapper;
 import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.lance.mapper.LanceVectorFieldMapper;
@@ -397,18 +398,23 @@ public class LanceKnnQueryBuilder extends AbstractQueryBuilder<LanceKnnQueryBuil
             // date columns and ISO-8601 strings on non-date
             // columns route through the correct SQL literal form
             // for the pre-filter path. A dotted name only resolves
-            // when its parent path is an object mapper (a Struct
-            // child, which Lance's SQL parser reads as a nested
-            // field access); a multi-field sub-field (body.raw)
-            // returns null so the translator's dotted-path guard
-            // keeps it off the Lance SQL path.
+            // when its parent path is a plain object mapper (a
+            // Struct child, which Lance's SQL parser reads as a
+            // nested field access); a multi-field sub-field
+            // (body.raw) and a nested (List<Struct>) child return
+            // null so the translator's dotted-path guard keeps both
+            // off the Lance SQL path (DataFusion cannot address a
+            // list element in a filter).
             MappedFieldType mft = context.fieldMapper(name);
             if (mft == null) {
                 return null;
             }
             int dot = name.lastIndexOf('.');
-            if (dot > 0 && context.getObjectMapper(name.substring(0, dot)) == null) {
-                return null;
+            if (dot > 0) {
+                ObjectMapper parent = context.getObjectMapper(name.substring(0, dot));
+                if (parent == null || parent.nested().isNested()) {
+                    return null;
+                }
             }
             return mft.typeName();
         });
