@@ -5,7 +5,6 @@
 
 package org.opensearch.lance.dispatch;
 
-import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.time.ZoneId;
 import java.util.ArrayList;
@@ -43,7 +42,6 @@ import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.opensearch.common.Rounding;
 import org.opensearch.common.hash.MurmurHash3;
-import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.BigArrays;
@@ -53,7 +51,6 @@ import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.bytes.BytesArray;
-import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
@@ -3227,38 +3224,21 @@ public final class LanceAggregatePushdown {
         if (InternalOrder.isCountDesc(order)) {
             return new TopKSpec(level.keyKind(), -1, false, limit);
         }
-        if (!(order instanceof InternalOrder.Aggregation aggregation)) {
+        LanceAggregationSupport.AggregationOrder aggregationOrder = LanceAggregationSupport.aggregationOrder(order);
+        if (aggregationOrder == null) {
             return null;
         }
-        String path = aggregation.path().toString();
         for (Metric metric : level.metrics()) {
             boolean singleValue = switch (metric.kind()) {
                 case SUM, AVG, MIN, MAX, VALUE_COUNT -> true;
                 default -> false;
             };
-            if (singleValue && (metric.name().equals(path) || (metric.name() + ".value").equals(path))) {
-                Boolean ascending = orderAscending(order);
-                return ascending == null ? null : new TopKSpec(level.keyKind(), metric.slot(), ascending, limit);
+            if (singleValue
+                && (metric.name().equals(aggregationOrder.path()) || (metric.name() + ".value").equals(aggregationOrder.path()))) {
+                return new TopKSpec(level.keyKind(), metric.slot(), aggregationOrder.ascending(), limit);
             }
         }
         return null;
-    }
-
-    /**
-     * The direction of an aggregation order, read back from its wire
-     * form ({@code InternalOrder.Aggregation} exposes its path but not
-     * its direction).
-     */
-    private static Boolean orderAscending(BucketOrder order) {
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            order.writeTo(out);
-            try (StreamInput in = out.bytes().streamInput()) {
-                in.readByte();
-                return in.readBoolean();
-            }
-        } catch (IOException impossible) {
-            return null;
-        }
     }
 
     /**
