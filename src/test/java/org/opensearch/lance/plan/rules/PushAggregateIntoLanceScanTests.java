@@ -37,12 +37,13 @@ import java.util.List;
  */
 public class PushAggregateIntoLanceScanTests extends OpenSearchTestCase {
 
-    /** Runs the Volcano planner over {@code logical} with the pushdown rules registered. */
+    /**
+     * Runs the Volcano planner over {@code logical}; the pushdown rules
+     * are registered by {@code LancePlannerFactory.newCluster}, which
+     * built the cluster the tree lives in.
+     */
     static RelNode volcanoPlan(RelNode logical) {
         VolcanoPlanner planner = (VolcanoPlanner) logical.getCluster().getPlanner();
-        for (PushAggregateIntoLanceScan rule : PushAggregateIntoLanceScan.rules()) {
-            planner.addRule(rule);
-        }
         RelNode root = planner.changeTraits(logical, logical.getTraitSet().replace(LanceConvention.INSTANCE));
         planner.setRoot(root);
         return planner.findBestExp();
