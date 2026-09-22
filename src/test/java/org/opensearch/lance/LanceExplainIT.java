@@ -104,7 +104,7 @@ public class LanceExplainIT extends LanceRestTestCase {
                 () -> explain(indexName, "{\"size\":5,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}")
             );
             assertEquals(RestStatus.BAD_REQUEST.getStatus(), hits.getResponse().getStatusLine().getStatusCode());
-            assertTrue(readAll(hits.getResponse()).contains("size [5] (only 0)"));
+            assertTrue(readAll(hits.getResponse()).contains("size [5] (only 0 with aggregations)"));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));

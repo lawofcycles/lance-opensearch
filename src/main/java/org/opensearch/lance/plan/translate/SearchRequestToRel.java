@@ -6,6 +6,8 @@
 package org.opensearch.lance.plan.translate;
 
 import org.apache.calcite.plan.Convention;
+import org.apache.calcite.plan.RelOptCluster;
+import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.logical.LogicalFilter;
 import org.apache.calcite.rex.RexNode;
@@ -17,7 +19,10 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.rel.LanceFtsMatch;
+import org.opensearch.lance.plan.rel.LanceHitShape;
 import org.opensearch.lance.plan.rel.LanceKnnSearch;
+import org.opensearch.lance.plan.rel.LanceTopK;
+import org.opensearch.lance.plan.rules.SortResolution;
 import org.opensearch.lance.query.LanceFtsBoolQueryBuilder;
 import org.opensearch.lance.query.LanceFtsBoostQueryBuilder;
 import org.opensearch.lance.query.LanceFtsQueryBuilder;
@@ -29,38 +34,43 @@ import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
  * Translates one search request body to a logical {@link RelNode} over
  * the index's {@link org.opensearch.lance.plan.rel.LanceTableScan}.
  *
- * <p>The supported shapes are an aggregation request and a full text
- * or knn request. An aggregation request has {@code size} 0 and
- * carries aggregations {@link AggregationToRel} translates (metric
- * only trees, a chain of up to three bucket levels with metric
- * children, {@code composite} over {@code terms} / fixed length
- * {@code date_histogram} sources); its {@code query} clause translates
- * through {@link QueryToRex} and becomes a {@code Filter} directly
- * above the scan (an absent query and {@code match_all} add no
- * filter), so a bucket request plans as the aggregate over its key
- * projection over the filter over the scan. A full text or knn request
- * has a Lance FTS clause ({@code lance_match},
- * {@code lance_match_phrase}, {@code lance_multi_match},
- * {@code lance_fts_bool}, {@code lance_fts_boost}), a {@code bool}
- * whose {@code must} is exactly one such clause with scalar
- * {@code filter} / {@code must_not} companions, or a {@code lance_knn}
- * (optionally with its inner {@code filter}) at the top of the query
- * clause; it plans as {@link LanceFtsMatch} or {@link LanceKnnSearch}
- * over the scalar clauses' {@code Filter} over the scan, carries no
- * aggregations, and its {@code size} shapes the hit page rather than
- * the plan. Every other element throws
- * {@link UnsupportedOperationException} naming the first unsupported
- * element ({@code query type [match]}, {@code size [10] (only 0)},
- * {@code aggregation type [top_hits]}, {@code sort},
- * {@code post_filter}, {@code _source}, ...); the explain endpoint
- * returns the message in its 400 body, so the message shape is part of
- * the endpoint's contract.
+ * <p>Two request families are supported. An aggregation request has
+ * {@code size} 0 and carries aggregations {@link AggregationToRel}
+ * translates (metric only trees, a chain of up to three bucket levels
+ * with metric children, {@code composite} over {@code terms} / fixed
+ * length {@code date_histogram} sources); its {@code query} clause
+ * translates through {@link QueryToRex} and becomes a {@code Filter}
+ * directly above the scan (an absent query and {@code match_all} add
+ * no filter), so a bucket request plans as the aggregate over its key
+ * projection over the filter over the scan. A hits request has a
+ * positive {@code size} and no aggregations; its query root is the
+ * scalar {@code Filter} over the scan, or a {@link LanceFtsMatch} /
+ * {@link LanceKnnSearch} node for a Lance FTS clause
+ * ({@code lance_match}, {@code lance_match_phrase},
+ * {@code lance_multi_match}, {@code lance_fts_bool},
+ * {@code lance_fts_boost}), a {@code bool} whose {@code must} is
+ * exactly one such clause with scalar {@code filter} /
+ * {@code must_not} companions, or a {@code lance_knn} (optionally with
+ * its inner {@code filter}); over the root sit a
+ * {@link org.opensearch.lance.plan.rel.LanceTopK} carrying the sort
+ * collations, the page size and the {@code search_after} cursor, and a
+ * {@link org.opensearch.lance.plan.rel.LanceHitShape} naming the hit
+ * envelope. A full text or knn request with {@code size} 0 keeps the
+ * bare query tree (it asks for the count, not a page). Every other
+ * element throws {@link UnsupportedOperationException} naming the
+ * first unsupported element ({@code query type [match]},
+ * {@code size [10] (only 0 with aggregations)},
+ * {@code aggregation type [top_hits]}, {@code sort type
+ * [_geo_distance]}, {@code post_filter}, {@code _source}, ...); the
+ * explain endpoint returns the message in its 400 body, so the message
+ * shape is part of the endpoint's contract.
  *
  * <p>{@code timeout}, {@code track_total_hits} and the named writeable
  * envelope flags that only shape a response no plan produces yet are
@@ -85,12 +95,12 @@ public final class SearchRequestToRel {
         LanceShape shape = source == null ? null : detectLanceShape(source.query());
         validate(source, shape != null);
         RelBuilder relBuilder = scanBuilder(model, factory);
+        int size = source.size() < 0 ? 10 : source.size();
         if (shape != null) {
-            // A full text or knn request: size shapes the hit page, not
-            // the plan (hit projection and top-k are not planned yet),
-            // so it is ignored like timeout; aggregations over these
-            // shapes are refused by validate.
-            return lanceShapeRel(shape, model, relBuilder);
+            RelNode root = lanceShapeRel(shape, model, relBuilder);
+            // A size 0 full text or knn request keeps the bare query
+            // tree: it asks for the count, not a page.
+            return size == 0 ? root : hitsOver(root, source, size, model);
         }
         QueryBuilder query = source.query();
         if (query != null && !(query instanceof MatchAllQueryBuilder)) {
@@ -102,7 +112,45 @@ public final class SearchRequestToRel {
             RexNode predicate = RexUtil.flatten(relBuilder.getRexBuilder(), QueryToRex.translate(query, model, relBuilder));
             relBuilder.push(LogicalFilter.create(relBuilder.build(), predicate));
         }
-        return AggregationToRel.translate(source.aggregations(), model, relBuilder);
+        if (size == 0) {
+            return AggregationToRel.translate(source.aggregations(), model, relBuilder);
+        }
+        return hitsOver(relBuilder.build(), source, size, model);
+    }
+
+    /**
+     * The hits plan of a request asking for a page: the
+     * {@link LanceHitShape} envelope over the {@link LanceTopK} that
+     * orders and cuts the page over the query root. The sort clauses
+     * translate through {@link SortResolution#collationsOf}, throwing
+     * for a clause without a collation spelling (a geo distance or
+     * script sort, a nested sort, a sort mode, a literal missing
+     * value); an absent sort is an empty collation list, the score /
+     * row address ordered page. The hit envelope renders {@code _id},
+     * {@code _source} over the table columns, sort values when the
+     * request sorts, and a numeric score when nothing does (a sorted
+     * page reports {@code _score: null} unless {@code track_scores},
+     * which the envelope refuses today).
+     */
+    private static RelNode hitsOver(RelNode root, SearchSourceBuilder source, int size, LanceSchemas.IndexModel model) {
+        List<RelFieldCollation> collations = source.sorts() == null || source.sorts().isEmpty()
+            ? List.of()
+            : SortResolution.collationsOf(source.sorts(), root.getRowType(), model);
+        List<Object> searchAfter = source.searchAfter() == null ? null : Arrays.asList(source.searchAfter());
+        RelOptCluster cluster = root.getCluster();
+        LanceTopK topK = new LanceTopK(cluster, cluster.traitSetOf(Convention.NONE), root, collations, size, 0, searchAfter);
+        List<String> outputColumns = new ArrayList<>();
+        for (String name : root.getRowType().getFieldNames()) {
+            if (!name.startsWith("_")) {
+                outputColumns.add(name);
+            }
+        }
+        boolean sorted = !collations.isEmpty();
+        boolean scoreOrdered = !sorted;
+        for (RelFieldCollation collation : collations) {
+            scoreOrdered |= SortResolution.isScoreCollation(root.getRowType(), collation);
+        }
+        return new LanceHitShape(cluster, cluster.traitSetOf(Convention.NONE), topK, outputColumns, true, true, scoreOrdered, sorted);
     }
 
     /**
@@ -359,11 +407,13 @@ public final class SearchRequestToRel {
      * Checks every element of the body against the supported envelope.
      * The checks run in a fixed order (paging, hit shaping, then
      * aggregations) so the same body always names the same element; the
-     * query clause reports through its own translation. A body whose
-     * query clause is a full text or knn shape ({@code lanceShape})
-     * skips the {@code size} check (the page is not part of the plan
-     * yet) and refuses aggregations instead of requiring them, because
-     * no plan combines an aggregate with a full text or knn node.
+     * query clause reports through its own translation. A body with
+     * {@code size} 0 is an aggregation request (or, for a full text /
+     * knn shape, a count) and refuses sort and cursor elements; a body
+     * with a positive {@code size} is a hits request, refuses
+     * aggregations (no plan combines an aggregate with a page), and
+     * accepts {@code sort} and {@code search_after} (the cursor only
+     * together with a sort, matching the executor's dispatch gate).
      */
     private static void validate(SearchSourceBuilder source, boolean lanceShape) {
         if (source == null) {
@@ -373,14 +423,24 @@ public final class SearchRequestToRel {
             throw unsupported("from [" + source.from() + "]");
         }
         int size = source.size() < 0 ? 10 : source.size();
-        if (!lanceShape && size != 0) {
-            throw unsupported("size [" + size + "] (only 0)");
+        boolean hits = size != 0;
+        boolean hasAggregations = source.aggregations() != null && !source.aggregations().getAggregatorFactories().isEmpty();
+        if (lanceShape && hasAggregations) {
+            throw unsupported("aggregations with a full text or knn query");
         }
-        if (source.sorts() != null && !source.sorts().isEmpty()) {
+        if (hits && hasAggregations) {
+            throw unsupported("size [" + size + "] (only 0 with aggregations)");
+        }
+        if (!hits && source.sorts() != null && !source.sorts().isEmpty()) {
             throw unsupported("sort");
         }
         if (source.searchAfter() != null) {
-            throw unsupported("search_after");
+            if (!hits) {
+                throw unsupported("search_after");
+            }
+            if (source.sorts() == null || source.sorts().isEmpty()) {
+                throw unsupported("search_after without sort");
+            }
         }
         if (source.postFilter() != null) {
             throw unsupported("post_filter");
@@ -442,10 +502,9 @@ public final class SearchRequestToRel {
         if (source.profile()) {
             throw unsupported("profile");
         }
-        if (lanceShape) {
-            if (source.aggregations() != null && !source.aggregations().getAggregatorFactories().isEmpty()) {
-                throw unsupported("aggregations with a full text or knn query");
-            }
+        if (lanceShape || hits) {
+            // Aggregations were refused above; a hits request has no
+            // further envelope to check.
             return;
         }
         if (source.aggregations() == null || source.aggregations().getAggregatorFactories().isEmpty()) {
