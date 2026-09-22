@@ -7,10 +7,13 @@ package org.opensearch.lance.plan.translate;
 
 import com.carrotsearch.randomizedtesting.annotations.Name;
 import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
+import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.tools.RelBuilder;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
+import org.opensearch.lance.plan.rel.LanceAggregate;
+import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -102,6 +105,51 @@ public class QueryToRexFixtureTests extends OpenSearchTestCase {
             throw new AssertionError("missing plan fixture for [" + fixture + "]; the translator produced:\n" + actual, missing);
         }
         assertEquals("predicate of fixture [" + fixture + "]", expected, actual);
+    }
+
+    /**
+     * Every fixture query plans through the Volcano run and terminates:
+     * a supported query's filter is pushed into the scan (match_all
+     * pushes nothing), a refusal fixture refuses at translation.
+     */
+    public void testVolcanoPushesEveryFixturePredicate() throws IOException {
+        String query = resource(fixture + ".json");
+        String body = "{\"size\":0,\"aggs\":{\"c\":{\"value_count\":{\"field\":\"id\"}}}," + query.substring(query.indexOf('{') + 1);
+        SearchSourceBuilder source = PlanTestFixtures.parse(body);
+        boolean refusalFixture = resource(fixture + ".plan").startsWith("error: ");
+        LanceSchemas.IndexModel model = PlanTestFixtures.queryModel();
+        LancePlannerFactory factory = PlanTestFixtures.factory();
+        RelNode logical;
+        try {
+            logical = SearchRequestToRel.translate(source, model, factory);
+        } catch (UnsupportedOperationException refusal) {
+            assertTrue("only a refusal fixture may throw: " + refusal.getMessage(), refusalFixture);
+            return;
+        }
+        assertFalse("a refusal fixture must throw at translation", refusalFixture);
+        RelNode physical = factory.plan(logical);
+        assertTrue("the aggregate stays the root: " + physical, physical.stripped() instanceof LanceAggregate);
+        LanceTableScan scan = findScan(physical);
+        assertNotNull("the physical plan scans the table: " + physical, scan);
+        if (fixture.equals("match_all")) {
+            assertTrue("match_all pushes nothing: " + physical, scan.pushedFilter().isEmpty());
+        } else {
+            assertTrue("the filter must be pushed: " + physical, scan.pushedFilter().isPresent());
+        }
+    }
+
+    private static LanceTableScan findScan(RelNode node) {
+        RelNode stripped = node.stripped();
+        if (stripped instanceof LanceTableScan scan) {
+            return scan;
+        }
+        for (RelNode input : stripped.getInputs()) {
+            LanceTableScan found = findScan(input);
+            if (found != null) {
+                return found;
+            }
+        }
+        return null;
     }
 
     static RexNode predicate(SearchSourceBuilder source) {

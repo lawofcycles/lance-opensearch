@@ -51,6 +51,25 @@ public class LanceExplainIT extends LanceRestTestCase {
             String physical = stringPath(body, "physical");
             assertTrue("physical root is the scan with the pushed aggregate: " + physical, physical.startsWith("LanceTableScan("));
             assertTrue("physical plan names the pushed aggregate: " + physical, physical.contains("pushed=[[aggregate{"));
+            assertFalse("no filter is pushed without a query: " + physical, physical.contains("filter{"));
+
+            Response filtered = explain(
+                indexName,
+                "{\"size\":0,\"query\":{\"term\":{\"id\":3}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
+            );
+            assertEquals(RestStatus.OK.getStatus(), filtered.getStatusLine().getStatusCode());
+            String filteredBody = readAll(filtered);
+            String filteredLogical = stringPath(filteredBody, "logical");
+            assertTrue("logical plan carries the filter: " + filteredLogical, filteredLogical.contains("LogicalFilter"));
+            String filteredPhysical = stringPath(filteredBody, "physical");
+            assertTrue(
+                "filtered physical root is the scan: " + filteredPhysical,
+                filteredPhysical.startsWith("LanceTableScan(")
+            );
+            assertTrue("physical plan pushes the filter: " + filteredPhysical, filteredPhysical.contains("filter{"));
+            assertTrue("the pushed filter carries the SQL: " + filteredPhysical, filteredPhysical.contains("sql=id = 3"));
+            assertTrue("the aggregate rides the filtered scan: " + filteredPhysical, filteredPhysical.contains("aggregate{"));
+            assertFalse("the filter left the physical plan: " + filteredPhysical, filteredPhysical.contains("LogicalFilter"));
 
             Response bucket = explain(
                 indexName,
