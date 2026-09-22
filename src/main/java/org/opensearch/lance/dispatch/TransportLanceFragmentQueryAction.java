@@ -1287,7 +1287,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         }
         Set<String> ipColumns = LanceOverrides.of(indexMetadata.getSettings()).ipColumns();
         if (knn != null && QueryToRex.referencesAny(knn.filter(), ipColumns)) {
-            throw knnFilterRefusal("predicates on ip fields are evaluated over encoded doc values on the Lucene side");
+            throw knnFilterRefusal(knn, "predicates on ip fields are evaluated over encoded doc values on the Lucene side");
         }
         if (knn == null && rewritten instanceof BoolQueryBuilder bool && QueryToRex.referencesAny(bool, ipColumns)) {
             // An ip predicate has no Lance SQL form; keep the whole
@@ -1300,13 +1300,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             physical = plannerFactory.plan(SearchRequestToRel.translateQuery(rewritten, model, plannerFactory));
         } catch (UnsupportedOperationException unsupported) {
             if (knn != null) {
-                throw knnFilterRefusal(unsupported.getMessage());
+                throw knnFilterRefusal(knn, unsupported.getMessage());
             }
             return null;
         }
         if (!(physical instanceof LanceTableScan scan)) {
             if (knn != null) {
-                throw knnFilterRefusal("the filter has no Lance SQL form");
+                throw knnFilterRefusal(knn, "the filter has no Lance SQL form");
             }
             return null;
         }
@@ -1337,18 +1337,23 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             }
         }
         if (knn != null) {
-            throw knnFilterRefusal("the filter has no Lance SQL form");
+            throw knnFilterRefusal(knn, "the filter has no Lance SQL form");
         }
         return null;
     }
 
     /**
      * The 400 a filtered {@code lance_knn} answers when its filter
-     * cannot travel to the Lance scan, naming the filter clause so the
-     * caller sees which part was refused.
+     * cannot travel to the Lance scan, naming the filter clause's
+     * builder class so the caller sees which part was refused.
      */
-    private static IllegalArgumentException knnFilterRefusal(String reason) {
-        return new IllegalArgumentException("[lance_knn] filter is not supported as a Lance prefilter: " + reason);
+    private static IllegalArgumentException knnFilterRefusal(LanceKnnQueryBuilder knn, String reason) {
+        return new IllegalArgumentException(
+            "[lance_knn] filter type ["
+                + knn.filter().getClass().getSimpleName()
+                + "] is not supported by the pre-filter translator: "
+                + reason
+        );
     }
 
     /**
@@ -1369,7 +1374,16 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             renamedFields.put(renamed.from(), renamed.to());
         }
         String primaryKeyField = indexMetadata.getSettings().get("index.lance.primary_key_field", "");
-        return LanceSchemas.model(indexName, dataset.getSchema(), multiFields, renamedFields, primaryKeyField, reader::numDocs);
+        Set<String> dateOverrideColumns = LanceOverrides.of(indexMetadata.getSettings()).dateColumns().keySet();
+        return LanceSchemas.model(
+            indexName,
+            dataset.getSchema(),
+            multiFields,
+            renamedFields,
+            primaryKeyField,
+            dateOverrideColumns,
+            reader::numDocs
+        );
     }
 
     /**

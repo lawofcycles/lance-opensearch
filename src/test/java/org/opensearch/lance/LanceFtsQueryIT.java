@@ -1178,15 +1178,18 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             assertEquals(400, numeric.getResponse().getStatusLine().getStatusCode());
             assertTrue(readAll(numeric.getResponse()).contains("Can only use wildcard queries on keyword and text fields"));
 
-            // A multi-valued keyword column (list<utf8>) has no common
-            // type with the LIKE pattern; Lance refuses the scan as
-            // invalid input, which is answered as 400.
-            ResponseException list = expectThrows(
-                ResponseException.class,
-                () -> postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"wildcard\":{\"tags\":{\"value\":\"t*\"}}}}")
+            // A multi-valued keyword column (list<utf8>) has no Lance
+            // SQL form (the planner refuses a pattern on a non-Utf8
+            // column), so the wildcard runs over the column's Lucene
+            // doc values instead. Every row with a non-null tags list
+            // carries "t"-prefixed elements, so the hit set is the
+            // exists set: 600 rows minus the 100 whose tags are null.
+            String listWildcard = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"wildcard\":{\"tags\":{\"value\":\"t*\"}}}}")
             );
-            assertEquals(400, list.getResponse().getStatusLine().getStatusCode());
-            assertTrue(readAll(list.getResponse()).contains("List(Utf8)"));
+            String tagsExist = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"exists\":{\"field\":\"tags\"}}}"));
+            assertEquals(500, extractIntPath(tagsExist, "hits", "total", "value"));
+            assertEquals(extractIntPath(tagsExist, "hits", "total", "value"), extractIntPath(listWildcard, "hits", "total", "value"));
         }
     }
 

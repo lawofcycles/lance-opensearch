@@ -17,6 +17,8 @@ import org.apache.calcite.tools.RelBuilder;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.RegExp;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.time.DateFormatter;
+import org.opensearch.common.time.DateFormatters;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
@@ -96,7 +98,14 @@ public final class QueryToRex {
     public static RexNode translate(QueryBuilder query, LanceSchemas.IndexModel model, RelBuilder relBuilder) {
         return predicate(
             query,
-            new Context("", model.arrowSchema(), model.multiFields(), model.renamedFields(), model.primaryKeyField()),
+            new Context(
+                "",
+                model.arrowSchema(),
+                model.multiFields(),
+                model.renamedFields(),
+                model.primaryKeyField(),
+                model.dateOverrideColumns()
+            ),
             relBuilder
         );
     }
@@ -118,7 +127,7 @@ public final class QueryToRex {
     ) {
         return predicate(
             query,
-            new Context(" in filter of aggregation [" + aggregationName + "]", schema, multiFields, renamedFields, ""),
+            new Context(" in filter of aggregation [" + aggregationName + "]", schema, multiFields, renamedFields, "", Set.of()),
             relBuilder
         );
     }
@@ -126,7 +135,7 @@ public final class QueryToRex {
     /** Where a refusal happened ({@link #where} is empty for the request's query clause) and what fields resolve against. */
     private record Context(String where, Schema schema, Map<String, LinkedHashMap<String, String>> multiFields, Map<
         String,
-        String> renamedFields, String primaryKey) {
+        String> renamedFields, String primaryKey, Set<String> dateOverrides) {
     }
 
     private static RexNode predicate(QueryBuilder query, Context context, RelBuilder relBuilder) {
@@ -288,8 +297,14 @@ public final class QueryToRex {
     // Field resolution
     // ---------------------------------------------------------------
 
-    /** A field resolved to its Lance column or struct child: the reference expression and the Arrow type behind it. */
-    private record Target(String name, RexNode ref, ArrowType type) {
+    /**
+     * A field resolved to its Lance column or struct child: the
+     * reference expression, the Arrow type behind it, and whether the
+     * attach overrode the integer column as {@code date} (its
+     * epoch-millis literals then also accept the ISO-8601 strings the
+     * override serves).
+     */
+    private record Target(String name, RexNode ref, ArrowType type, boolean dateOnInteger) {
         boolean isDate() {
             return type instanceof ArrowType.Date || type instanceof ArrowType.Timestamp;
         }
@@ -338,7 +353,8 @@ public final class QueryToRex {
         if (index >= 0) {
             ArrowType type = schema.getFields().get(index).getType();
             requireSupportedScalar(type, columnName, field, context);
-            return new Target(columnName, relBuilder.field(index), type);
+            boolean dateOnInteger = type instanceof ArrowType.Int && context.dateOverrides().contains(columnName);
+            return new Target(columnName, relBuilder.field(index), type, dateOnInteger);
         }
         if (columnName.indexOf('.') >= 0) {
             Target nested = resolveStructPath(columnName, field, context, relBuilder);
@@ -382,7 +398,7 @@ public final class QueryToRex {
             current = child;
         }
         requireSupportedScalar(current.getType(), columnName, field, context);
-        return new Target(columnName, ref, current.getType());
+        return new Target(columnName, ref, current.getType(), false);
     }
 
     private static Field childOf(Field struct, String name) {
@@ -473,7 +489,7 @@ public final class QueryToRex {
             }
             return relBuilder.call(SqlStdOperatorTable.EQUALS, relBuilder.cast(reference, SqlTypeName.DOUBLE), relBuilder.literal(number));
         }
-        Long number = integral(value);
+        Long number = integral(target, value);
         if (number == null) {
             throw badValue(value, target, context);
         }
@@ -539,14 +555,14 @@ public final class QueryToRex {
         } else {
             value = relBuilder.cast(target.ref(), SqlTypeName.BIGINT);
             if (range.from() != null) {
-                Long from = integral(range.from());
+                Long from = integral(target, range.from());
                 if (from == null) {
                     throw badValue(range.from(), target, context);
                 }
                 lowerBound = relBuilder.literal(from);
             }
             if (range.to() != null) {
-                Long to = integral(range.to());
+                Long to = integral(target, range.to());
                 if (to == null) {
                     throw badValue(range.to(), target, context);
                 }
@@ -713,6 +729,36 @@ public final class QueryToRex {
             return true;
         }
         return text.equals("false") ? false : null;
+    }
+
+    /**
+     * Parses the ISO-8601 shapes a {@code date} override on an integer
+     * column accepts, so a string bound becomes the epoch millis the
+     * column stores. The same default format the {@code date} field
+     * type uses for query-time parsing; missing time components
+     * default to midnight UTC.
+     */
+    private static final DateFormatter DATE_OVERRIDE_PARSER = DateFormatter.forPattern("strict_date_optional_time");
+
+    /**
+     * The value as the integer column stores it: a whole number as is;
+     * on a {@code date} override column an ISO-8601 string parses to
+     * its epoch millis, because the override's column holds the millis
+     * as a plain integer while callers query it with date strings.
+     */
+    private static Long integral(Target target, Object value) {
+        Long number = integral(value);
+        if (number != null) {
+            return number;
+        }
+        if (target.dateOnInteger() && (value instanceof String || value instanceof BytesRef)) {
+            try {
+                return DateFormatters.from(DATE_OVERRIDE_PARSER.parse(text(value))).toInstant().toEpochMilli();
+            } catch (RuntimeException unparseable) {
+                return null;
+            }
+        }
+        return null;
     }
 
     /** A whole number, or null: a fractional value on an integer column has rounding rules the pushdown does not replicate. */

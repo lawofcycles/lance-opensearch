@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.LongSupplier;
 
 /**
@@ -52,15 +53,17 @@ public final class LanceSchemas {
      * Lance table uses now, so field resolution can refuse a stale name
      * with the rename instead of a generic unknown-field message), the
      * primary key column {@code ids} queries resolve against (empty
-     * when the index declared none), and the table / schema pair the
-     * {@code RelBuilder} resolves against. {@code multiFields} maps a
-     * base column to its declared sub-fields
+     * when the index declared none), the integer columns the attach
+     * overrode as {@code date} (their epoch-millis literals accept the
+     * ISO-8601 strings the override serves), and the table / schema
+     * pair the {@code RelBuilder} resolves against. {@code multiFields}
+     * maps a base column to its declared sub-fields
      * ({@code body -> {raw: keyword}}), empty when the attach declared
      * none.
      */
     public record IndexModel(String indexName, Schema arrowSchema, Map<String, LinkedHashMap<String, String>> multiFields, Map<
         String,
-        String> renamedFields, String primaryKeyField, LanceTable table, LanceSchema schema) {
+        String> renamedFields, String primaryKeyField, Set<String> dateOverrideColumns, LanceTable table, LanceSchema schema) {
     }
 
     /**
@@ -73,7 +76,7 @@ public final class LanceSchemas {
         Map<String, LinkedHashMap<String, String>> multiFields,
         LongSupplier rowCount
     ) {
-        return model(indexName, arrowSchema, multiFields, Map.of(), "", rowCount);
+        return model(indexName, arrowSchema, multiFields, Map.of(), "", Set.of(), rowCount);
     }
 
     /** The model with the mapping's recorded renames (stale name to live name). */
@@ -84,7 +87,7 @@ public final class LanceSchemas {
         Map<String, String> renamedFields,
         LongSupplier rowCount
     ) {
-        return model(indexName, arrowSchema, multiFields, renamedFields, "", rowCount);
+        return model(indexName, arrowSchema, multiFields, renamedFields, "", Set.of(), rowCount);
     }
 
     /**
@@ -98,16 +101,17 @@ public final class LanceSchemas {
         String primaryKeyField,
         LongSupplier rowCount
     ) {
-        return model(indexName, arrowSchema, multiFields, Map.of(), primaryKeyField, rowCount);
+        return model(indexName, arrowSchema, multiFields, Map.of(), primaryKeyField, Set.of(), rowCount);
     }
 
-    /** The model with both the recorded renames and the primary key column, as {@link #build} reads them. */
+    /** The model with the recorded renames, the primary key column and the date override columns, as {@link #build} reads them. */
     public static IndexModel model(
         String indexName,
         Schema arrowSchema,
         Map<String, LinkedHashMap<String, String>> multiFields,
         Map<String, String> renamedFields,
         String primaryKeyField,
+        Set<String> dateOverrideColumns,
         LongSupplier rowCount
     ) {
         LanceTable table = new LanceTable(indexName, arrowSchema, rowCount);
@@ -117,6 +121,7 @@ public final class LanceSchemas {
             multiFields,
             renamedFields,
             primaryKeyField,
+            dateOverrideColumns,
             table,
             new LanceSchema(Map.of(indexName, table))
         );
@@ -177,7 +182,7 @@ public final class LanceSchemas {
                 rows += fragmentRows;
             }
             final long total = rows;
-            return model(indexName, arrowSchema, multiFields, renamedFields, pkField, () -> total);
+            return model(indexName, arrowSchema, multiFields, renamedFields, pkField, overrides.dateColumns().keySet(), () -> total);
         }
     }
 }

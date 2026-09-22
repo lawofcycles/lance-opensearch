@@ -483,6 +483,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             target.multiFields(),
             target.renamedFields(),
             target.primaryKeyField(),
+            target.dateOverrideColumns(),
             () -> totalRows
         );
         FragmentQuerySpec spec = new FragmentQuerySpec(
@@ -1119,7 +1120,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                     overrides.subFields(),
                     renamedFields,
                     primaryKeyField,
-                    overrides.ipColumns()
+                    overrides.ipColumns(),
+                    overrides.dateColumns().keySet()
                 )
             );
         }
@@ -1375,13 +1377,15 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * enumeration, whose observed version then travels with every
      * per-node request so the executors read the same manifest.
      * {@code multiFields}, {@code renamedFields},
-     * {@code primaryKeyField} and {@code ipColumns} feed the planner
-     * model the per-target filter SQL derivation builds once the
-     * target's Arrow schema is known.
+     * {@code primaryKeyField}, {@code ipColumns} and
+     * {@code dateOverrideColumns} feed the planner model the per-target
+     * filter SQL derivation builds once the target's Arrow schema is
+     * known.
      */
     private record IndexTarget(String indexName, String tableUri, StorageOptions storageOptions, long pinnedVersion, Map<
         String,
-        LinkedHashMap<String, String>> multiFields, Map<String, String> renamedFields, String primaryKeyField, Set<String> ipColumns) {
+        LinkedHashMap<String, String>> multiFields, Map<String, String> renamedFields, String primaryKeyField, Set<String> ipColumns, Set<
+            String> dateOverrideColumns) {
 
         Optional<Long> pinnedVersionOrEmpty() {
             return pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();
