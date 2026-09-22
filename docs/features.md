@@ -208,7 +208,7 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 - The distance type is L2. `num_partitions` defaults to 1 for every vector type, matching the IVF_PQ build the plugin has always performed; `ivf_pq` keeps its previous defaults (`num_sub_vectors` 8, `num_bits` 8).
 - The preference persists inside the `index.lance.overrides` setting (under a top-level `indexes` key), so the re-derivation on manifest version advance carries it like the mapping overrides, and the namespace register applies it leniently per table (a table without the column skips it). FTS (inverted) indexes are not selected here; their options stay `fts_columns` / `tokenizer` / `with_position` on `build_indexes`.
 - `POST /_lance/build_indexes/{index}` accepts the same `indexes` object in its body as a one-shot override of the persisted preference for that build only; nothing is persisted. `optimize: true` merges whatever index exists regardless of its type.
-- `GET /_lance/stats` reports, per index, the Lance index types present per column under `indices.<index>.index_types` (`{"rating": ["ZoneMap"], "embedding": ["IVF_FLAT"]}`, read from `describeIndices` once per stats call), so an operator can verify the preference took effect.
+- `GET /_lance/stats` reports, per index, the Lance index types present per column under `indices.<index>.index_types` (`{"rating": ["ZoneMap"], "embedding": ["IVF_FLAT"]}`, read from `describeIndices` once per stats call), so an operator can verify the preference took effect. When the index has a reader wrapper installed (a security plugin's DLS/FLS wrapper), `index_types` is empty: Lance's index metadata does not pass through the wrapper, and the report must not reveal column names the wrapper hides.
 
 ## Aggregations
 
