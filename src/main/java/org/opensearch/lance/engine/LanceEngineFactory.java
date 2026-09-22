@@ -261,7 +261,6 @@ public final class LanceEngineFactory implements EngineFactory {
         String tagSetting = config.getIndexSettings().getSettings().get(TAG_SETTING, "");
         String tag = tagSetting.isEmpty() ? null : tagSetting;
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(config.getIndexSettings().getSettings());
-        LanceOverrides overrides = LanceOverrides.of(config.getIndexSettings().getSettings());
         String indexUuid = config.getIndexSettings().getIndex().getUUID();
         boolean nodeLocal = LanceLocalClones.isNodeLocal(config.getIndexSettings().getSettings());
         return new LanceReadOnlyEngine(
@@ -273,7 +272,6 @@ public final class LanceEngineFactory implements EngineFactory {
             pinnedVersion,
             tag,
             storageOptions,
-            overrides,
             warmCache,
             indexUuid,
             maxDocsPerReader,
@@ -305,14 +303,6 @@ public final class LanceEngineFactory implements EngineFactory {
         final String tag;
         final StorageOptions storageOptions;
         /**
-         * Per-column mapping overrides captured at attach time (base type
-         * overrides and keyword sub-fields). Empty when the operator
-         * declared none. Forwarded to the reader so keyword sub-fields
-         * become queryable through doc values and a keyword-overridden
-         * FTS column is served through SortedSetDocValues.
-         */
-        final LanceOverrides overrides;
-        /**
          * Snapshot cache the readers are built over, or {@code null} to open
          * a dataset per reader.
          */
@@ -339,7 +329,6 @@ public final class LanceEngineFactory implements EngineFactory {
             Optional<Long> pinnedVersion,
             String tag,
             StorageOptions storageOptions,
-            LanceOverrides overrides,
             LanceWarmCache warmCache,
             String indexUuid,
             LongSupplier maxDocsPerReader
@@ -353,7 +342,6 @@ public final class LanceEngineFactory implements EngineFactory {
                 pinnedVersion,
                 tag,
                 storageOptions,
-                overrides,
                 warmCache,
                 indexUuid,
                 maxDocsPerReader,
@@ -370,7 +358,6 @@ public final class LanceEngineFactory implements EngineFactory {
             Optional<Long> pinnedVersion,
             String tag,
             StorageOptions storageOptions,
-            LanceOverrides overrides,
             LanceWarmCache warmCache,
             String indexUuid,
             LongSupplier maxDocsPerReader,
@@ -384,7 +371,6 @@ public final class LanceEngineFactory implements EngineFactory {
             this.pinnedVersion = pinnedVersion;
             this.tag = tag;
             this.storageOptions = storageOptions;
-            this.overrides = overrides;
             this.warmCache = warmCache;
             this.indexUuid = indexUuid;
             this.maxDocsPerReader = maxDocsPerReader;
@@ -566,7 +552,7 @@ public final class LanceEngineFactory implements EngineFactory {
                     dataset,
                     field,
                     pkType,
-                    overrides,
+                    currentOverrides(),
                     requestBreaker(),
                     maxDocsPerReader.getAsLong()
                 );
@@ -600,9 +586,25 @@ public final class LanceEngineFactory implements EngineFactory {
             }
         }
 
+        /**
+         * The per-column mapping overrides as the index settings carry
+         * them now (base type overrides and keyword sub-fields). Read
+         * per reader open instead of captured at engine construction:
+         * the namespace poll rewrites {@code index.lance.overrides} when
+         * the Lance table renames an overridden column, and the reader
+         * opened for the new manifest version must classify columns and
+         * resolve sub-field paths through the rewritten keys.
+         * {@link org.opensearch.index.IndexSettings#getSettings} reflects
+         * dynamic setting updates, so the refresh after the rewrite sees
+         * the new value.
+         */
+        private LanceOverrides currentOverrides() {
+            return LanceOverrides.of(config().getIndexSettings().getSettings());
+        }
+
         private OpenSearchDirectoryReader openSnapshotReader(Directory directory, IndexCommit commit, Optional<Long> version)
             throws IOException {
-            LanceWarmCache.Lease lease = warmCache.acquire(indexUuid, tablePath, storageOptions, version, field, pkType, overrides);
+            LanceWarmCache.Lease lease = warmCache.acquire(indexUuid, tablePath, storageOptions, version, field, pkType, currentOverrides());
             // openForSnapshot releases the lease itself when it fails; from
             // its return on the reader owns the lease and releases it in
             // doClose, so only the wrap step needs the reader closed here.
@@ -963,7 +965,7 @@ public final class LanceEngineFactory implements EngineFactory {
                         own,
                         field,
                         pkType,
-                        overrides,
+                        currentOverrides(),
                         Collections.singletonList(fragmentId)
                     );
                 } catch (Throwable t) {
