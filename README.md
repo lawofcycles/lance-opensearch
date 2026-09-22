@@ -8,7 +8,7 @@ Lance is an open columnar table format designed for machine learning workloads: 
 
 Early draft. Not production ready. The read-side plumbing (namespace registration, mapping derivation, `_search` / GET / aggregation shapes, and the follow-forward refresh loop) works end to end against real Lance tables, but interfaces and settings are still shifting. Use it to explore the design or try it against your own Lance tables, not to run anything you depend on.
 
-Built against OpenSearch 3.8.0 with Lance 11.0.0.
+Built against OpenSearch 3.8.0 with Lance 12.0.0.
 
 ## What it does
 
