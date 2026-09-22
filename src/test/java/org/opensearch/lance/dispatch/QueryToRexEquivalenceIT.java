@@ -15,7 +15,8 @@ import java.util.Map;
 import java.util.function.Function;
 
 import org.lance.Dataset;
-import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.tools.RelBuilder;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -35,11 +36,10 @@ import org.opensearch.lance.attach.LanceAttachRequest;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
-import org.opensearch.lance.plan.rel.LanceTableScan;
-import org.opensearch.lance.plan.translate.SearchRequestToRel;
+import org.opensearch.lance.plan.substrait.RexToLanceSql;
+import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.lance.query.LanceKnnFilterTranslator;
 import org.opensearch.plugins.Plugin;
-import org.opensearch.search.aggregations.AggregationBuilders;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
 
@@ -134,20 +134,16 @@ public class QueryToRexEquivalenceIT extends OpenSearchSingleNodeTestCase {
             checkCount(index, dataset, model, QueryBuilders.termQuery("body.raw", "hello tok0 grp0 sp0 lance"));
             checkCount(index, dataset, model, new MatchNoneQueryBuilder());
 
-            // match_all plans as a bare scan with nothing pushed.
-            RelNode physical = plan(model, new SearchSourceBuilder().size(0).query(QueryBuilders.matchAllQuery()).aggregation(count()));
-            LanceTableScan scan = findScan(physical);
-            assertTrue("match_all pushes nothing: " + physical, scan.pushedFilter().isEmpty());
+            // match_all yields the true literal; the count agrees.
+            assertEquals("true", pushedSql(model, QueryBuilders.matchAllQuery()));
             assertEquals(currentHits(index, QueryBuilders.matchAllQuery()), dataset.countRows());
 
             // An unmapped field refuses at translation; the current path
             // answers the request through the Lucene fallback.
-            SearchSourceBuilder unmapped = new SearchSourceBuilder().size(0)
-                .query(QueryBuilders.termQuery("missing", 1))
-                .aggregation(count());
+            RelBuilder builder = relBuilder(model);
             UnsupportedOperationException refusal = expectThrows(
                 UnsupportedOperationException.class,
-                () -> SearchRequestToRel.translate(unmapped, model, factory())
+                () -> QueryToRex.translate(QueryBuilders.termQuery("missing", 1), model, builder)
             );
             assertEquals("field [missing] does not map to a Lance column", refusal.getMessage());
             assertEquals(0L, currentHits(index, QueryBuilders.termQuery("missing", 1)));
@@ -239,45 +235,35 @@ public class QueryToRexEquivalenceIT extends OpenSearchSingleNodeTestCase {
         assertEquals("count of " + query + " via [" + sql + "]", currentHits(index, query), dataset.countRows(sql));
     }
 
-    /** Plans {@code size 0, query, one value_count} and reads the SQL off the pushed filter of the physical scan. */
+    /**
+     * The SQL {@link QueryToRex} + {@link RexToLanceSql} produce for
+     * {@code query}, on the plan the request would build. This is what
+     * the filter pushdown would put onto the scan as its pushed SQL
+     * when the aggregate rule does not first absorb the filter into a
+     * pushed aggregate; the count equivalence check uses it to compare
+     * against the current path.
+     */
     private String pushedSql(LanceSchemas.IndexModel model, QueryBuilder query) {
-        RelNode physical = plan(model, new SearchSourceBuilder().size(0).query(query).aggregation(count()));
-        LanceTableScan scan = findScan(physical);
-        assertTrue("the filter must be pushed for " + query + ": " + physical, scan.pushedFilter().isPresent());
-        return scan.pushedFilter().orElseThrow().sql();
+        RelBuilder builder = relBuilder(model);
+        RexNode predicate = QueryToRex.translate(query, model, builder);
+        return RexToLanceSql.print(predicate, builder.build().getRowType())
+            .orElseThrow(() -> new AssertionError("the printer must accept " + query));
     }
 
-    private RelNode plan(LanceSchemas.IndexModel model, SearchSourceBuilder source) {
-        LancePlannerFactory factory = factory();
-        return factory.plan(SearchRequestToRel.translate(source, model, factory));
+    private RelBuilder relBuilder(LanceSchemas.IndexModel model) {
+        RelBuilder builder = factory().relBuilder(model.schema()).transform(config -> config.withSimplify(false));
+        builder.scan(LancePlannerFactory.SCHEMA_NAME, model.indexName());
+        return builder;
     }
 
     private static LancePlannerFactory factory() {
         return new LancePlannerFactory(1L << 30, 1L << 30);
     }
 
-    private static org.opensearch.search.aggregations.metrics.ValueCountAggregationBuilder count() {
-        return AggregationBuilders.count("c").field("id");
-    }
-
     private long currentHits(String index, QueryBuilder query) {
         SearchResponse response = client().search(new SearchRequest(index).source(new SearchSourceBuilder().size(0).query(query)))
             .actionGet();
         return response.getHits().getTotalHits().value();
-    }
-
-    private static LanceTableScan findScan(RelNode node) {
-        RelNode stripped = node.stripped();
-        if (stripped instanceof LanceTableScan scan) {
-            return scan;
-        }
-        for (RelNode input : stripped.getInputs()) {
-            LanceTableScan found = findScan(input);
-            if (found != null) {
-                return found;
-            }
-        }
-        return null;
     }
 
     // ---------------------------------------------------------------

@@ -61,14 +61,16 @@ public class LanceExplainIT extends LanceRestTestCase {
             String filteredBody = readAll(filtered);
             String filteredLogical = stringPath(filteredBody, "logical");
             assertTrue("logical plan carries the filter: " + filteredLogical, filteredLogical.contains("LogicalFilter"));
+            // The aggregate rule fires on Aggregate(Filter(scan)) and
+            // rebuilds the filter inside the pushed aggregate's input,
+            // so the physical root is the scan with only the aggregate
+            // visible as a pushed operation; the filter is absorbed.
             String filteredPhysical = stringPath(filteredBody, "physical");
+            assertTrue("filtered physical root is the scan: " + filteredPhysical, filteredPhysical.startsWith("LanceTableScan("));
             assertTrue(
-                "filtered physical root is the scan: " + filteredPhysical,
-                filteredPhysical.startsWith("LanceTableScan(")
+                "the aggregate is pushed onto the filtered scan: " + filteredPhysical,
+                filteredPhysical.contains("pushed=[[aggregate{")
             );
-            assertTrue("physical plan pushes the filter: " + filteredPhysical, filteredPhysical.contains("filter{"));
-            assertTrue("the pushed filter carries the SQL: " + filteredPhysical, filteredPhysical.contains("sql=id = 3"));
-            assertTrue("the aggregate rides the filtered scan: " + filteredPhysical, filteredPhysical.contains("aggregate{"));
             assertFalse("the filter left the physical plan: " + filteredPhysical, filteredPhysical.contains("LogicalFilter"));
 
             Response bucket = explain(

@@ -549,9 +549,7 @@ final class AggregationToRel {
             BucketSpec.Kind kind;
             if (builder instanceof FilterAggregationBuilder filter) {
                 kind = BucketSpec.Kind.FILTER;
-                predicates.add(
-                    QueryToRex.predicate(filter.getFilter(), filter.getName(), schema, multiFields, renamedFields, relBuilder)
-                );
+                predicates.add(QueryToRex.predicate(filter.getFilter(), filter.getName(), schema, multiFields, renamedFields, relBuilder));
                 keys.add(filter.getName());
             } else {
                 FiltersAggregationBuilder filters = (FiltersAggregationBuilder) builder;
@@ -563,9 +561,7 @@ final class AggregationToRel {
                     throw unsupported("more than " + MAX_MASK_CONDITIONS + " filters on aggregation [" + filters.getName() + "]");
                 }
                 for (FiltersAggregator.KeyedFilter keyed : filters.filters()) {
-                    predicates.add(
-                        QueryToRex.predicate(keyed.filter(), filters.getName(), schema, multiFields, renamedFields, relBuilder)
-                    );
+                    predicates.add(QueryToRex.predicate(keyed.filter(), filters.getName(), schema, multiFields, renamedFields, relBuilder));
                     keys.add(keyed.key());
                 }
                 otherBucketKey = filters.otherBucket() ? filters.otherBucketKey() : null;
