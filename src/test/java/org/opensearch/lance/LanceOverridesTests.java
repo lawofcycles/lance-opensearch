@@ -129,10 +129,7 @@ public class LanceOverridesTests extends OpenSearchTestCase {
     }
 
     public void testGeoPointOrderParsesAndRoundTrips() {
-        LanceOverrides overrides = LanceOverrides.parseAttachClauses(
-            Map.of("loc", Map.of("type", "geo_point", "order", "lon_lat")),
-            null
-        );
+        LanceOverrides overrides = LanceOverrides.parseAttachClauses(Map.of("loc", Map.of("type", "geo_point", "order", "lon_lat")), null);
         assertEquals("lon_lat", overrides.geoPointColumns().get("loc"));
         // Persist and re-read; the order must survive the round trip.
         assertEquals(overrides, LanceOverrides.parse(overrides.toJson()));

@@ -571,7 +571,10 @@ public final class LanceOverrides {
                     );
                 }
                 if (existing != null) {
-                    columns.put(baseName, new Column(existing.type(), existing.format(), existing.order(), new LinkedHashMap<>(entry.getValue())));
+                    columns.put(
+                        baseName,
+                        new Column(existing.type(), existing.format(), existing.order(), new LinkedHashMap<>(entry.getValue()))
+                    );
                 } else {
                     columns.put(baseName, new Column(null, null, null, new LinkedHashMap<>(entry.getValue())));
                 }
@@ -750,9 +753,7 @@ public final class LanceOverrides {
                 throw new IllegalArgumentException("[overrides." + baseName + ".order] must be a non-empty string");
             }
             if (!TYPE_GEO_POINT.equals(type)) {
-                throw new IllegalArgumentException(
-                    "[overrides." + baseName + ".order] is only accepted together with [type: geo_point]"
-                );
+                throw new IllegalArgumentException("[overrides." + baseName + ".order] is only accepted together with [type: geo_point]");
             }
             if (!ORDER_LAT_LON.equals(orderStr) && !ORDER_LON_LAT.equals(orderStr)) {
                 throw new IllegalArgumentException(

@@ -788,8 +788,7 @@ public class RestAttachAction extends BaseRestHandler {
                 // representation.
                 Field arrow = field.asArrowField();
                 ArrowType childType = arrow.getChildren().isEmpty() ? null : arrow.getChildren().get(0).getType();
-                fslShape = childType instanceof ArrowType.FloatingPoint fp
-                    && fp.getPrecision() == FloatingPointPrecision.DOUBLE;
+                fslShape = childType instanceof ArrowType.FloatingPoint fp && fp.getPrecision() == FloatingPointPrecision.DOUBLE;
             }
             if (!structShape && !fslShape) {
                 throw new IllegalArgumentException(
