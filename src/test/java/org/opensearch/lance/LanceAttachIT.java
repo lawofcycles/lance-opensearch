@@ -825,11 +825,14 @@ public class LanceAttachIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         ResponseException failure = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"type\":\"geo_point\"}}}")
+            () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"type\":\"text\"}}}")
         );
         assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
         String body = readAll(failure.getResponse());
-        assertTrue("expected message naming the accepted types: " + body, body.contains("[date], [keyword], [ip], [wildcard]"));
+        assertTrue(
+            "expected message naming the accepted types: " + body,
+            body.contains("[date], [keyword], [ip], [wildcard], [geo_point]")
+        );
     }
 
     public void testOverridesConflictsWithMultiFieldsRejected() throws Exception {
