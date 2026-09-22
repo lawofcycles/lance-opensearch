@@ -1,0 +1,2 @@
+Lance Namespace Implementations
+Copyright The Lance Authors

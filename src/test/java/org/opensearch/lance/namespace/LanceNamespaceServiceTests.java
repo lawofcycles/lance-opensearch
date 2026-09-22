@@ -240,6 +240,57 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
         }
     }
 
+    public void testGlueEntryDrivesInitializeWithSecretsAndReportsUnavailableOnFailure() throws Exception {
+        // The request path down to initialize for the glue type: the
+        // stub receives the config with the credential keys intact, a
+        // thrown initialize surfaces as the unavailable status, and the
+        // listing never shows the raw secret.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.initializeFailure = new IllegalStateException("The security token included in the request is invalid");
+        LanceNamespaceFactory.setInstantiatorForTests(type -> {
+            assertEquals(LanceNamespaceMetadata.Entry.TYPE_GLUE, type);
+            return recording;
+        });
+        try {
+            LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
+                new LanceNamespaceMetadata.Entry(
+                    "glue-tokyo",
+                    LanceNamespaceMetadata.Entry.TYPE_GLUE,
+                    null,
+                    StorageOptions.empty(),
+                    java.util.Map.of(
+                        "region",
+                        "ap-northeast-1",
+                        "catalog_id",
+                        "123456789012",
+                        "root",
+                        "s3://bucket/prefix",
+                        "access_key_id",
+                        "AKIA123",
+                        "secret_access_key",
+                        "sekrit"
+                    )
+                )
+            );
+            ClusterState state = ClusterState.builder(clusterService.state())
+                .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
+                .build();
+            ClusterServiceUtils.setState(clusterService, state);
+            java.util.Map<String, String> received = recording.initializeCalls.get(0);
+            assertEquals("sekrit", received.get("secret_access_key"));
+            assertEquals("AKIA123", received.get("access_key_id"));
+            assertEquals("ap-northeast-1", received.get("region"));
+            java.util.List<org.opensearch.lance.namespace.LanceNamespaceListResponse.NamespaceInfo> infos = service.namespaceInfos();
+            assertEquals("glue", infos.get(0).type());
+            assertTrue(infos.get(0).error(), infos.get(0).error().contains("security token"));
+            assertEquals("***", infos.get(0).config().get("secret_access_key"));
+            assertEquals("***", infos.get(0).config().get("access_key_id"));
+            assertEquals("123456789012", infos.get(0).config().get("catalog_id"));
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+    }
+
     public void testTableLocationStripsTrailingSlashAndHandlesMissingLocation() {
         org.lance.namespace.model.DescribeTableResponse response = new org.lance.namespace.model.DescribeTableResponse();
         assertNull(LanceNamespaceService.tableLocation(response));

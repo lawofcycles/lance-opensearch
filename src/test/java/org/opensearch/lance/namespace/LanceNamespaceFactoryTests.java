@@ -106,4 +106,27 @@ public class LanceNamespaceFactoryTests extends OpenSearchTestCase {
         IllegalStateException e = expectThrows(IllegalStateException.class, () -> LanceNamespaceFactory.create(entry, null));
         assertEquals("bad credentials", e.getMessage());
     }
+
+    public void testRealGlueDispatchInitialisesWithoutNetworkAccess() throws Exception {
+        // Without the seam, the glue type instantiates the bundled
+        // GlueNamespace, which was compiled against lance-namespace
+        // 0.7.7; loading and initialising it against the bundled 0.11.1
+        // interface proves the binary compatibility the dependency
+        // declaration relies on. An explicit region and static
+        // credentials keep the AWS client build fully offline.
+        LanceNamespaceFactory.resetInstantiatorForTests();
+        LanceNamespaceMetadata.Entry entry = new LanceNamespaceMetadata.Entry(
+            "glue-offline",
+            LanceNamespaceMetadata.Entry.TYPE_GLUE,
+            null,
+            StorageOptions.empty(),
+            Map.of("region", "us-east-1", "access_key_id", "test-access-key", "secret_access_key", "test-secret")
+        );
+        LanceNamespace created = LanceNamespaceFactory.create(entry, null);
+        assertTrue(
+            "expected the bundled GlueNamespace, saw " + created.getClass().getName(),
+            created instanceof org.lance.namespace.glue.GlueNamespace
+        );
+        ((java.io.Closeable) created).close();
+    }
 }
