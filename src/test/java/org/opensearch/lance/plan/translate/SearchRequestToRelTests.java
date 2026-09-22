@@ -90,8 +90,15 @@ public class SearchRequestToRelTests extends OpenSearchTestCase {
     }
 
     public void testValueCountTranslates() {
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.count("c").field("price"));
+        assertEquals("LogicalAggregate(group=[{}], c=[COUNT($1)])\n  LanceTableScan(table=[[lance, idx]])\n", translate(source));
+    }
+
+    public void testValueCountOnNonNullableColumnSimplifiesToCountStar() {
+        // Calcite's RelBuilder folds COUNT of a non nullable column to
+        // COUNT(*), which counts the same rows.
         SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.count("c").field("id"));
-        assertEquals("LogicalAggregate(group=[{}], c=[COUNT($0)])\n  LanceTableScan(table=[[lance, idx]])\n", translate(source));
+        assertEquals("LogicalAggregate(group=[{}], c=[COUNT()])\n  LanceTableScan(table=[[lance, idx]])\n", translate(source));
     }
 
     public void testExplicitMatchAllTranslates() {
