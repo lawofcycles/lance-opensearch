@@ -11,30 +11,23 @@ import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
-import org.opensearch.search.aggregations.AggregationBuilder;
-import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
-import org.opensearch.search.aggregations.metrics.MaxAggregationBuilder;
-import org.opensearch.search.aggregations.metrics.MinAggregationBuilder;
-import org.opensearch.search.aggregations.metrics.SumAggregationBuilder;
-import org.opensearch.search.aggregations.metrics.ValueCountAggregationBuilder;
-import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
-
-import java.util.Collection;
 
 /**
  * Translates one search request body to a logical {@link RelNode} over
  * the index's {@link org.opensearch.lance.plan.rel.LanceTableScan}.
  *
- * <p>The supported shape today is intentionally small: the query is
- * absent or {@code match_all}, {@code size} is 0, and the request
- * carries exactly one top level aggregation which is a metric
- * ({@code sum}, {@code avg}, {@code min}, {@code max},
- * {@code value_count}) over a numeric column. That shape becomes
- * {@code LogicalAggregate(LanceTableScan)}. Every other element throws
- * {@link UnsupportedOperationException} naming the first unsupported
- * element ({@code query type [term]}, {@code size [10] (only 0)},
- * {@code aggregation type [terms]}, {@code two top level aggregations},
+ * <p>The supported shape is an aggregation request over the whole
+ * table: the query is absent or {@code match_all}, {@code size} is 0,
+ * and the request carries aggregations
+ * {@link AggregationToRel} translates (metric only trees, a chain of
+ * up to three bucket levels with metric children, {@code composite}
+ * over {@code terms} / fixed length {@code date_histogram} sources).
+ * That shape becomes a
+ * {@link org.opensearch.lance.plan.rel.LanceAggregate} over the scan.
+ * Every other element throws {@link UnsupportedOperationException}
+ * naming the first unsupported element ({@code query type [term]},
+ * {@code size [10] (only 0)}, {@code aggregation type [top_hits]},
  * {@code sort}, {@code post_filter}, {@code _source}, ...); the explain
  * endpoint returns the message in its 400 body, so the message shape is
  * part of the endpoint's contract.
@@ -59,20 +52,22 @@ public final class SearchRequestToRel {
      *     element of the request
      */
     public static RelNode translate(SearchSourceBuilder source, LanceSchemas.IndexModel model, LancePlannerFactory factory) {
-        ValuesSourceAggregationBuilder<?> metric = validate(source);
-        RelBuilder relBuilder = factory.relBuilder(model.schema());
+        validate(source);
+        // Simplification is off so the group key expressions keep the
+        // shape the translator spells (a range condition stays
+        // `>= AND <` instead of folding into a SEARCH / Sarg), which the
+        // Substrait producer maps term by term.
+        RelBuilder relBuilder = factory.relBuilder(model.schema()).transform(config -> config.withSimplify(false));
         relBuilder.scan(LancePlannerFactory.SCHEMA_NAME, model.indexName());
-        AggregationToRel.metric(metric, model.arrowSchema(), model.multiFields(), relBuilder);
-        return relBuilder.build();
+        return AggregationToRel.translate(source.aggregations(), model, relBuilder);
     }
 
     /**
-     * Checks every element of the body against the supported shape and
-     * returns the single metric aggregation. The checks run in a fixed
-     * order (query, paging, hit shaping, then aggregations) so the same
-     * body always names the same element.
+     * Checks every element of the body against the supported envelope.
+     * The checks run in a fixed order (query, paging, hit shaping, then
+     * aggregations) so the same body always names the same element.
      */
-    private static ValuesSourceAggregationBuilder<?> validate(SearchSourceBuilder source) {
+    private static void validate(SearchSourceBuilder source) {
         if (source == null) {
             throw unsupported("empty body");
         }
@@ -154,28 +149,11 @@ public final class SearchRequestToRel {
             throw unsupported("profile");
         }
         if (source.aggregations() == null || source.aggregations().getAggregatorFactories().isEmpty()) {
-            throw unsupported("no aggregations (exactly one metric aggregation)");
+            throw unsupported("no aggregations");
         }
         if (!source.aggregations().getPipelineAggregatorFactories().isEmpty()) {
             throw unsupported("pipeline aggregation");
         }
-        Collection<AggregationBuilder> aggregations = source.aggregations().getAggregatorFactories();
-        if (aggregations.size() > 1) {
-            throw unsupported("two top level aggregations");
-        }
-        AggregationBuilder aggregation = aggregations.iterator().next();
-        if (!isSupportedMetric(aggregation)) {
-            throw unsupported("aggregation type [" + aggregation.getType() + "]");
-        }
-        return (ValuesSourceAggregationBuilder<?>) aggregation;
-    }
-
-    private static boolean isSupportedMetric(AggregationBuilder aggregation) {
-        return aggregation instanceof SumAggregationBuilder
-            || aggregation instanceof AvgAggregationBuilder
-            || aggregation instanceof MinAggregationBuilder
-            || aggregation instanceof MaxAggregationBuilder
-            || aggregation instanceof ValueCountAggregationBuilder;
     }
 
     private static UnsupportedOperationException unsupported(String element) {
