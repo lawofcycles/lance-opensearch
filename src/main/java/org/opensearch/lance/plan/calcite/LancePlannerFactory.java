@@ -12,6 +12,7 @@ import org.apache.calcite.plan.Contexts;
 import org.apache.calcite.plan.ConventionTraitDef;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptPlanner;
+import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgramBuilder;
 import org.apache.calcite.plan.volcano.VolcanoPlanner;
@@ -25,8 +26,10 @@ import org.apache.calcite.tools.RelBuilder;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.lance.plan.rel.LanceTableScan;
+import org.opensearch.lance.plan.rel.physical.LuceneHandoffExec;
 import org.opensearch.lance.plan.rules.FuseFtsWithFilter;
 import org.opensearch.lance.plan.rules.FuseKnnWithFilter;
+import org.opensearch.lance.plan.rules.LanceToLuceneConverterRule;
 import org.opensearch.lance.plan.rules.PushAggregateIntoLanceScan;
 import org.opensearch.lance.plan.rules.PushFilterIntoLanceScan;
 import org.opensearch.lance.plan.rules.PushSortLimitIntoLanceScan;
@@ -60,8 +63,9 @@ public final class LancePlannerFactory {
 
     /**
      * A fresh cluster over a Volcano planner costed by
-     * {@link LanceCostFactory}, with the pushdown rules registered. The
-     * type factory uses {@link LanceTypeSystem#INSTANCE} so timestamp
+     * {@link LanceCostFactory}, with the pushdown rules and the Lucene
+     * converter rules registered. The type factory uses
+     * {@link LanceTypeSystem#INSTANCE} so timestamp
      * precision above 3 and {@code DECIMAL(20, 0)} survive. Registering
      * the convention trait def is what makes conventions available to
      * the planner; the individual conventions need no explicit
@@ -86,6 +90,9 @@ public final class LancePlannerFactory {
         for (PushSortLimitIntoLanceScan rule : PushSortLimitIntoLanceScan.rules()) {
             planner.addRule(rule);
         }
+        for (RelOptRule rule : LanceToLuceneConverterRule.rules()) {
+            planner.addRule(rule);
+        }
         RelOptCluster cluster = RelOptCluster.create(planner, new RexBuilder(new SqlTypeFactoryImpl(LanceTypeSystem.INSTANCE)));
         cluster.setMetadataProvider(DefaultRelMetadataProvider.INSTANCE);
         return cluster;
@@ -93,25 +100,34 @@ public final class LancePlannerFactory {
 
     /**
      * Runs the Volcano planner over {@code logical} demanding
-     * {@link LanceConvention} at the root and returns the best physical
-     * plan. When no physical form exists (the Substrait producer
-     * refused every candidate, so no rule fired), or when the planner
-     * fails for any other reason, the logical plan itself is returned:
-     * the caller reads the root's type to see whether anything was
-     * pushed, and the fragment routing promises a Lucene aggregator
-     * fallback for every plan it does not push, so a planner failure
-     * must not surface as a request error.
+     * {@link LuceneConvention} at the root and returns the best
+     * physical plan. Both physical forms reach that root: a tree the
+     * pushdown rules folded into the scan arrives as a zero cost
+     * {@link LuceneHandoffExec} over the {@link LanceConvention} scan
+     * (unwrapped here, so the caller sees the scan itself and reads its
+     * pushed operations), and an aggregation or hits tree they could
+     * not fold arrives as the {@code LuceneAggregateExec} /
+     * {@code HeapTopKExec} alternative the converter rules produce,
+     * whose constant cost is pinned above the handoff so the Lance form
+     * wins whenever both exist. When neither form exists (a query tree
+     * without a top-k or aggregate that no rule fused), or when the
+     * planner fails for any other reason, the logical plan itself is
+     * returned: the caller reads the root's type to see what was
+     * planned, and the fragment routing promises a Lucene fallback for
+     * every plan it does not push, so a planner failure must not
+     * surface as a request error.
      */
     public RelNode plan(RelNode logical) {
         VolcanoPlanner planner = (VolcanoPlanner) logical.getCluster().getPlanner();
-        RelNode root = planner.changeTraits(logical, logical.getTraitSet().replace(LanceConvention.INSTANCE));
+        RelNode root = planner.changeTraits(logical, logical.getTraitSet().replace(LuceneConvention.INSTANCE));
         planner.setRoot(root);
         try {
-            return planner.findBestExp();
-        } catch (RelOptPlanner.CannotPlanException nothingPushed) {
+            RelNode best = planner.findBestExp();
+            return best instanceof LuceneHandoffExec handoff ? handoff.getInput() : best;
+        } catch (RelOptPlanner.CannotPlanException nothingPlanned) {
             return logical;
         } catch (RuntimeException plannerFailure) {
-            LOGGER.debug(
+            LOGGER.warn(
                 "lance.plan: Volcano planning failed, keeping the logical plan: {}: {}",
                 plannerFailure.getClass().getName(),
                 plannerFailure.getMessage()
