@@ -55,7 +55,9 @@ import org.opensearch.search.internal.ContextIndexSearcher;
  *
  * <p>Slices. The reader's leaves are the node's Lance fragments. When
  * {@link LanceFragmentSearchContext#getTargetMaxSliceCount()} is above
- * 1 the searcher is built with the executor's search pool and the
+ * 1 the searcher is built with the executor's intra request pool
+ * ({@code index_searcher}, never the SEARCH pool the request itself
+ * executes on, whose queue admits requests) and the
  * inherited {@link ContextIndexSearcher#slices} bundles the leaves
  * into at most that many slices by row count (whole leaves, no
  * partition inside a fragment). Every {@link CollectorManager} search
