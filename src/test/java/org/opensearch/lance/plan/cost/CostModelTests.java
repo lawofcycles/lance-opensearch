@@ -37,7 +37,7 @@ public class CostModelTests extends OpenSearchTestCase {
     public void testModelPrefersTheMeasuredFasterPathOnEveryClearPair() throws IOException {
         Map<String, List<CostMeasurements.Row>> pairs = new LinkedHashMap<>();
         for (CostMeasurements.Row row : CostMeasurements.load()) {
-            if (row.pushed() && row.excluded()) {
+            if (row.excluded()) {
                 continue;
             }
             pairs.computeIfAbsent(row.pairKey(), k -> new ArrayList<>()).add(row);

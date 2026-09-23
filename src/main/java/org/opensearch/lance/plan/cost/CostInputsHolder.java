@@ -29,6 +29,13 @@ import java.util.Objects;
  */
 public final class CostInputsHolder {
 
+    /**
+     * The local defaults, built once: the Volcano planner asks for a cost
+     * many times per plan and {@link CostInputs#local()} reads the CPU
+     * count on every call.
+     */
+    private static final CostInputs LOCAL_DEFAULTS = CostInputs.local();
+
     private CostInputs inputs;
 
     /** An empty holder; {@link #inputsOf} answers the local defaults until {@link #set} is called. */
@@ -41,12 +48,12 @@ public final class CostInputsHolder {
 
     /** The inputs set for this run, or the local defaults when none were. */
     public CostInputs get() {
-        return inputs != null ? inputs : CostInputs.local();
+        return inputs != null ? inputs : LOCAL_DEFAULTS;
     }
 
     /** The inputs of the run {@code planner} is executing; see the class comment for the fallbacks. */
     public static CostInputs inputsOf(RelOptPlanner planner) {
         CostInputsHolder holder = planner.getContext().unwrap(CostInputsHolder.class);
-        return holder != null ? holder.get() : CostInputs.local();
+        return holder != null ? holder.get() : LOCAL_DEFAULTS;
     }
 }

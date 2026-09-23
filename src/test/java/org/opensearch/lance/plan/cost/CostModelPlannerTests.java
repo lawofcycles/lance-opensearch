@@ -91,9 +91,10 @@ public class CostModelPlannerTests extends OpenSearchTestCase {
     }
 
     public void testTheSameTreeCostsDifferentlyUnderDifferentInputs() throws IOException {
-        // The planner factory is shared and stateless: two runs over the
-        // same logical shape with different inputs answer differently,
-        // and the inputs of one run never leak into the other.
+        // Every plan construction builds its own cluster and holder, so
+        // two runs of the same factory over the same logical shape with
+        // different inputs answer differently, and the inputs of one run
+        // never leak into the other.
         LancePlannerFactory factory = new LancePlannerFactory(1L << 30, 1L << 30);
         RelNode overS3 = factory.plan(PerfTableFixture.translate(PerfTableFixture.perf1b(), factory, TERMS_CATEGORY), PERF1B_FOUR_NODES_S3);
         RelNode localUnsliced = factory.plan(
