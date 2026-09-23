@@ -300,14 +300,24 @@ Execution placement is modelled with three Calcite conventions. A convention mar
 operator runs, and converting between them is an explicit, costed step:
 
 - The Lance convention: work the native scan computes (pushed aggregates, filters, full text,
-  vector search, ordered limited pages).
-- The Lucene convention: work executed by Lucene's aggregator and collector machinery over the
-  fragment leaf readers, plus the coordinator's fan-out and merge operators.
+  vector search, ordered limited pages). Its one physical operator is `LanceTableScan` carrying its
+  pushed operations (`plan/rel/LanceTableScan.java`, `plan/rel/PushedOperation.java`); the fragment
+  executor runs it as one Lance scan per fragment group, with the Substrait aggregate, the SQL
+  filter, the full text or vector query and the orderings and limit the operations spell.
+- The Lucene convention: work executed by Lucene's machinery over the fragment leaf readers, plus
+  the coordinator's distribution. Its operators live in `plan/rel/physical/`: `LuceneAggregateExec`
+  (the stock aggregators over the leaf readers, run by the fragment executor's aggregation phase),
+  `HeapTopKExec` (Lucene's top docs collector, run by the executor's hits phase),
+  `LuceneHandoffExec` (the zero cost conversion from a Lance scan, unwrapped by the planner factory
+  so callers see the scan itself), `FanOutExec` (one per node request per fragment group, run by
+  the coordinator's plan executor as the transport fan-out) and `MergeExec` (the reduce of the per
+  node answers, run by the plan executor as the merge reducer).
 - The shard-path convention: work answered by OpenSearch's regular shard search. Its single
   operator, `ShardPathFallbackExec`, is produced by `PlanToShardPathRule` for a request whose body
   holds an element only the shard path serves; the operator carries the reasons and its presence
   at the plan root is what routes the request there, so the shard fallback is a plan the planner
-  produces rather than a shape checklist in the dispatch filter.
+  produces rather than a shape checklist in the dispatch filter. The dispatch filter runs it by
+  forwarding the whole request to the stock `TransportSearchAction`.
 
 ```mermaid
 flowchart LR
@@ -332,9 +342,10 @@ Translators turn the search body into a logical tree; pushdown rules fold what L
 into the scan; converter rules produce the Lucene alternative for the same tree; and the Volcano
 planner picks by cost. A
 tree the planner cannot handle at all falls back to Lucene execution — a planner failure never
-surfaces as a request error. `GET /{index}/_lance/explain` runs exactly this pipeline without
-executing anything and prints both plans; it is the first tool to reach for when developing a
-rule.
+surfaces as a request error. `GET /{index}/_lance/explain` runs exactly the coordinator's
+planning entry without executing anything and prints the route, both plans, the per node
+`FragmentPlan` it would ship and the refinements a data node could still apply; it is the first
+tool to reach for when developing a rule.
 
 The cost the planner compares is predicted latency in milliseconds (the two other axes of
 `LanceCost`, native and heap bytes, are budgets checked as hard constraints and are not modelled
@@ -391,7 +402,8 @@ against what only it knows (a reader wrapper on the index service, the Lucene so
 mapping built, the resolution of the pushed aggregate against the mapping and the group bound) and
 downgrades where a pushed operation cannot run there. Downgrades go one way, from the Lance scan to
 Lucene; nothing is pushed on the data node that the coordinator did not push, so the plan the
-explain endpoint prints is the plan the coordinator ships, and `GET /_lance/stats` counts every
+explain endpoint prints is the plan the coordinator ships (the endpoint calls the same
+`RequestPlanner` entry with the same cost inputs and renders its result), and `GET /_lance/stats` counts every
 downgrade under `plan.refinements` by reason and, under `plan.executed`, how many requests each
 node answered through the Lance scan and through Lucene. The per node plan is a wire format internal to the
 plugin: every node is assumed to run the same plugin version, there is no version negotiation, and

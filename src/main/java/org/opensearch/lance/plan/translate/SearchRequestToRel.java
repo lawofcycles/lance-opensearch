@@ -76,7 +76,8 @@ import java.util.List;
  * {@code size [10] (only 0 with aggregations)},
  * {@code aggregation type [top_hits]}, {@code sort type
  * [_geo_distance]}, {@code post_filter}, {@code _source}, ...); the
- * explain endpoint returns the message in its 400 body, so the message
+ * explain endpoint reports the message of the element that kept a
+ * request's envelope on Lucene as {@code unplanned}, so the message
  * shape is part of the endpoint's contract.
  *
  * <p>{@code timeout}, {@code track_total_hits} and the named writeable
@@ -89,6 +90,14 @@ public final class SearchRequestToRel {
     private SearchRequestToRel() {}
 
     /**
+     * Translates one search body under the strict envelope
+     * ({@link #validate}): the tree of a request whose every element
+     * the planner spells, or {@link UnsupportedOperationException}
+     * naming the first element it does not. The planner's fixture tests
+     * pin plans through this entry; the coordinator and the explain
+     * endpoint translate through {@link #translateExecution}, which
+     * accepts the runtime envelope.
+     *
      * @param source the parsed search body; null stands for an empty
      *     body and is rejected as {@code empty body}
      * @param model the index's planner model from
@@ -128,6 +137,35 @@ public final class SearchRequestToRel {
     public record ExecutionShape(QueryBuilder query, QueryBuilder postFilter, List<SortBuilder<?>> sorts, Object[] searchAfter, int from,
         int fetch, AggregatorFactories.Builder aggregations, boolean planAggregations) {
 
+        /**
+         * The shape the coordinator plans a search body under:
+         * {@code size} defaults to 10 and {@code from} to 0 when the body
+         * leaves them unset, every executor fetches {@code from + size}
+         * rows, and the sort list is empty rather than null.
+         *
+         * @param source the parsed body; null stands for an empty body
+         *     (a {@code match_all} page of 10)
+         * @param query the top level query after the coordinator rewrite
+         * @param planAggregations whether the aggregation tree may plan
+         *     into the scan (the pushdown setting and the structural
+         *     allow list, both read by the caller)
+         */
+        public static ExecutionShape of(SearchSourceBuilder source, QueryBuilder query, boolean planAggregations) {
+            int size = source == null || source.size() < 0 ? 10 : source.size();
+            int from = source == null || source.from() < 0 ? 0 : source.from();
+            List<SortBuilder<?>> sorts = source == null || source.sorts() == null ? List.of() : source.sorts();
+            return new ExecutionShape(
+                query,
+                source == null ? null : source.postFilter(),
+                sorts,
+                source == null ? null : source.searchAfter(),
+                from,
+                from + size,
+                source == null ? null : source.aggregations(),
+                planAggregations
+            );
+        }
+
         public boolean hasAggregations() {
             return aggregations != null && !aggregations.getAggregatorFactories().isEmpty();
         }
@@ -138,11 +176,25 @@ public final class SearchRequestToRel {
     }
 
     /**
+     * The outcome of {@link #translateExecution}: the logical tree the
+     * planner runs over, and the element that kept the request's
+     * envelope off the tree when the tree is the query root alone (the
+     * translator's message, {@code sort type [_geo_distance]} or
+     * {@code aggregation type [top_hits]}, or the structural reason,
+     * {@code aggregations with a post_filter}); null when the envelope
+     * translated, or when the request has no envelope to translate (a
+     * count).
+     */
+    public record ExecutionTranslation(RelNode root, String unplanned) {
+    }
+
+    /**
      * Translates one request for execution on the fragment path. The
      * tree is the one {@link #translate} builds for the shapes the
-     * explain endpoint accepts, so the plan the coordinator ships is the
-     * plan explain prints; the envelope is the fragment runtime's rather
-     * than explain's. Elements that shape the fetch phase only
+     * strict envelope accepts, under the fragment runtime's envelope;
+     * the coordinator and the explain endpoint both translate here, so
+     * the plan the coordinator ships is the plan explain prints.
+     * Elements that shape the fetch phase only
      * ({@code _source}, {@code fields}, {@code track_scores},
      * {@code version}, ...) do not reach this method; {@code from} and
      * {@code post_filter} do and ride on the {@link LanceHitShape}.
@@ -160,38 +212,68 @@ public final class SearchRequestToRel {
      * the planned query.
      */
     public static RelNode translateForExecution(ExecutionShape shape, LanceSchemas.IndexModel model, LancePlannerFactory factory) {
+        return translateExecution(shape, model, factory).root();
+    }
+
+    /**
+     * {@link #translateForExecution} together with the element the
+     * translator refused, when one kept the envelope off the tree, so
+     * the explain endpoint can name why a request runs its envelope
+     * through Lucene. The tree is the same one
+     * {@link #translateForExecution} returns.
+     */
+    public static ExecutionTranslation translateExecution(
+        ExecutionShape shape,
+        LanceSchemas.IndexModel model,
+        LancePlannerFactory factory
+    ) {
         LanceShape lanceShape = detectLanceShape(shape.query());
         RelBuilder relBuilder = scanBuilder(model, factory);
         RelNode root = queryRoot(shape.query(), lanceShape, model, relBuilder);
         boolean hasAggregations = shape.hasAggregations();
         if (!shape.hits()) {
-            if (!hasAggregations || !shape.planAggregations() || lanceShape != null || shape.postFilter() != null) {
+            if (!hasAggregations) {
+                return new ExecutionTranslation(root, null);
+            }
+            if (lanceShape != null) {
+                return new ExecutionTranslation(root, "aggregations with a full text or knn query");
+            }
+            if (shape.postFilter() != null) {
                 // A pushed aggregate reports hits.total from its own
                 // count, which a post filter would have to narrow; the
                 // aggregators and the Lucene count serve that shape.
-                return root;
+                return new ExecutionTranslation(root, "aggregations with a post_filter");
+            }
+            if (!shape.planAggregations()) {
+                return new ExecutionTranslation(
+                    root,
+                    "aggregation tree outside the pushdown shapes, or lance.aggregation.pushdown is false"
+                );
             }
             if (!shape.aggregations().getPipelineAggregatorFactories().isEmpty()) {
-                return root;
+                return new ExecutionTranslation(root, "pipeline aggregation");
             }
             try {
-                return AggregationToRel.translate(shape.aggregations(), model, relBuilder);
+                return new ExecutionTranslation(AggregationToRel.translate(shape.aggregations(), model, relBuilder), null);
             } catch (UnsupportedOperationException notPlanned) {
-                return root;
+                return new ExecutionTranslation(root, notPlanned.getMessage());
             }
         }
         if (hasAggregations) {
             // No plan combines an aggregate with a page: the collector
             // and the aggregators both run over the planned query.
-            return root;
+            return new ExecutionTranslation(root, "size [" + shape.fetch() + "] (only 0 with aggregations)");
         }
         try {
-            return hitsOver(root, shape.sorts(), shape.searchAfter(), shape.fetch(), shape.postFilter(), shape.from(), model);
+            return new ExecutionTranslation(
+                hitsOver(root, shape.sorts(), shape.searchAfter(), shape.fetch(), shape.postFilter(), shape.from(), model),
+                null
+            );
         } catch (UnsupportedOperationException notPlanned) {
             // A sort clause without a collation spelling (geo distance,
             // script, nested, mode, literal missing): the Lucene
             // collector serves the page over the planned query.
-            return root;
+            return new ExecutionTranslation(root, notPlanned.getMessage());
         }
     }
 

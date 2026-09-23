@@ -20,8 +20,10 @@ import java.util.List;
 /**
  * GET /{index}/_lance/explain
  *
- * Explains the logical plan the planner builds for a search body
- * against a Lance-backed index without executing anything. The handler
+ * Explains the plan the fragment coordinator would execute for a search
+ * body against a Lance-backed index without executing anything: the
+ * route, the logical and physical trees, the per node plan and the
+ * refinements a data node could still apply. The handler
  * parses the body into a {@link SearchSourceBuilder} (the same parse
  * {@code _search} applies) and hands it to {@link LanceExplainAction};
  * resolving the index, reading its schema and translating happen in the

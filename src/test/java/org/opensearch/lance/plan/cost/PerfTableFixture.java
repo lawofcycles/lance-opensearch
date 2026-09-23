@@ -34,9 +34,10 @@ import java.util.Set;
  * A planner model shaped like the perf tables the cost model was fitted
  * on: the perf schema, a bitmap index on {@code category} reporting 200
  * distinct values, BTree indexes on the numeric columns, and a row count
- * and fragment count the test picks.
+ * and fragment count the test picks. Public so the planner tests outside
+ * this package can plan against the same statistics.
  */
-final class PerfTableFixture {
+public final class PerfTableFixture {
 
     private PerfTableFixture() {}
 
@@ -96,17 +97,17 @@ final class PerfTableFixture {
         );
     }
 
-    static LanceSchemas.IndexModel model(String indexName, long rows, int fragments) {
+    public static LanceSchemas.IndexModel model(String indexName, long rows, int fragments) {
         return LanceSchemas.model(indexName, SCHEMA, Map.of(), Map.of(), "", Set.of(), statistics(rows, fragments));
     }
 
     /** perf1b: one billion rows in 250 fragments. */
-    static LanceSchemas.IndexModel perf1b() {
+    public static LanceSchemas.IndexModel perf1b() {
         return model("perf1b", 1_000_000_000L, 250);
     }
 
     /** perf20m: twenty million rows in 80 fragments. */
-    static LanceSchemas.IndexModel perf20m() {
+    public static LanceSchemas.IndexModel perf20m() {
         return model("perf20m", 20_000_000L, 80);
     }
 

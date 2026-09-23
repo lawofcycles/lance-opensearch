@@ -16,6 +16,8 @@ Everything documented here is a shape that either falls through to the shard pat
 
 Cross-index metrics also hit the shard path today.
 
+`GET /{index}/_lance/explain` reports the first group (the elements the planner names as shard path reasons) as `route: shard_path`. The aggregation allow list and the cross-index check are applied by the dispatch filter outside the plan, so a body they send to the shard path explains as `route: fragment` with the fragment plan it would otherwise have.
+
 Against a table above the Lucene document bound (more than 2,147,483,519 physical rows, see [features.md](features.md#tables-above-the-lucene-document-bound)) these shapes are not routed to the shard path: its reader holds the leading fragments that fit, so the request would answer from part of the table. They are refused with 400 `illegal_argument_exception` (`table of index [...] has N rows, above the Lucene bound of B rows per reader; this request shape is served by the shard path and would see only M rows`). The dispatch filter reads the table's manifest to decide that, on the `lance_coordinator` pool, for every Lance-backed request it hands to the shard path.
 
 A request Lance refuses as invalid input (for example `lance_match_phrase` on an FTS index built without `with_position: true`) answers 400 `illegal_argument_exception` with Lance's message on the fragment path. On the shard path the same request answers 500: Lucene's query phase wraps the failure in `QueryPhaseExecutionException`, which OpenSearch reports as a server error, and the plugin does not intercept that phase. Lance's message is still in the response body.

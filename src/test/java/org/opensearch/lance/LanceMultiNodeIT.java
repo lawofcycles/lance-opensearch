@@ -198,6 +198,23 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                         "physical plan carries the pushed aggregate root on " + host + ": " + body,
                         body.contains("pushed=[[aggregate{")
                     );
+                    // The coordinator tree fans out to the three data
+                    // nodes of this cluster, and the fragment plan the
+                    // nodes would receive rides on the answer.
+                    Map<String, Object> parsed = parse(body);
+                    assertEquals("route on " + host + ": " + body, "fragment", parsed.get("route"));
+                    assertTrue(
+                        "the fan out width is the data node count on " + host + ": " + body,
+                        String.valueOf(parsed.get("physical")).contains("FanOutExec(fanOut=[3]")
+                    );
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> fragmentPlan = (Map<String, Object>) parsed.get("fragment_plan");
+                    assertNotNull("fragment plan on " + host + ": " + body, fragmentPlan);
+                    assertEquals("fragment plan kind on " + host + ": " + body, "PUSHED_SCAN", fragmentPlan.get("kind"));
+                    assertTrue(
+                        "fragment plan carries the aggregate on " + host + ": " + body,
+                        extractIntPath(parsed, "fragment_plan", "aggregate", "substrait_bytes") > 0
+                    );
                     answers.add(body);
                 }
             }

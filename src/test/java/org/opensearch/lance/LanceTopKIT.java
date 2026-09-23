@@ -15,7 +15,6 @@ import java.util.concurrent.TimeUnit;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
-import org.opensearch.client.ResponseException;
 import org.opensearch.core.rest.RestStatus;
 
 /**
@@ -142,15 +141,12 @@ public class LanceTopKIT extends LanceRestTestCase {
             // The stale name refuses the fold and the Lucene side serves
             // nothing behind it either: the sort answers with the
             // missing sentinel for every row, in stable id order.
-            String staleExplain = explainBody(indexName, "{\"size\":6,\"sort\":[{\"tag\":\"asc\"}]}");
-            assertTrue(stringPath(staleExplain, "physical").contains("topk{"));
-            ResponseException stale = expectThrows(ResponseException.class, () -> {
-                Request request = new Request("GET", "/" + indexName + "/_lance/explain");
-                request.setJsonEntity("{\"size\":6,\"sort\":[{\"label\":\"asc\"}]}");
-                client().performRequest(request);
-            });
-            assertEquals(RestStatus.BAD_REQUEST.getStatus(), stale.getResponse().getStatusLine().getStatusCode());
-            assertTrue(readAll(stale.getResponse()).contains("sort field [label] was renamed to [tag] in the Lance table"));
+            String liveExplain = explainBody(indexName, "{\"size\":6,\"sort\":[{\"tag\":\"asc\"}]}");
+            assertTrue(stringPath(liveExplain, "physical").contains("topk{"));
+            String staleExplain = explainBody(indexName, "{\"size\":6,\"sort\":[{\"label\":\"asc\"}]}");
+            assertFalse("the stale sort does not fold: " + staleExplain, stringPath(staleExplain, "physical").contains("topk{"));
+            assertEquals("LUCENE_TOPK", stringPath(staleExplain, "fragment_plan", "kind"));
+            assertEquals("sort field [label] was renamed to [tag] in the Lance table", stringPath(staleExplain, "unplanned"));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
@@ -186,16 +182,12 @@ public class LanceTopKIT extends LanceRestTestCase {
             // the key value itself.
             assertEquals(List.of("0", "6", "2", "1"), idsOf(directHits));
 
-            ResponseException refused = expectThrows(ResponseException.class, () -> {
-                Request request = new Request("GET", "/" + indexName + "/_lance/explain");
-                // match_all instead of the exists query: the geo struct
-                // column refuses scalar predicate translation first and
-                // would name the query, not the sort.
-                request.setJsonEntity("{\"size\":4," + sort + "}");
-                client().performRequest(request);
-            });
-            assertEquals(RestStatus.BAD_REQUEST.getStatus(), refused.getResponse().getStatusLine().getStatusCode());
-            assertTrue(readAll(refused.getResponse()).contains("sort type [_geo_distance]"));
+            // match_all instead of the exists query: the geo struct
+            // column refuses scalar predicate translation first and
+            // would name the query, not the sort.
+            String explained = explainBody(indexName, "{\"size\":4," + sort + "}");
+            assertEquals("LUCENE_TOPK", stringPath(explained, "fragment_plan", "kind"));
+            assertEquals("sort type [_geo_distance]", stringPath(explained, "unplanned"));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));

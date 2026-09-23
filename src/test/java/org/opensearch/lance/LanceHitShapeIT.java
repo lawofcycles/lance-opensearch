@@ -35,13 +35,15 @@ public class LanceHitShapeIT extends LanceRestTestCase {
 
             // The explain output shows the fold: the logical plan is the
             // hit shape over the top-k over the scan, the physical plan
-            // is the scan carrying the pushed page.
+            // is the coordinator's merge and fan out over the scan
+            // carrying the pushed page.
             String explained = explainBody(indexName, "{\"size\":3,\"sort\":[{\"count16\":\"desc\"}]}");
             String logical = stringPath(explained, "logical");
             assertTrue("logical plan carries the hit shape: " + logical, logical.contains("LanceHitShape"));
             assertTrue("logical plan carries the top-k: " + logical, logical.contains("LanceTopK"));
             String physical = stringPath(explained, "physical");
-            assertTrue("physical root is the scan: " + physical, physical.startsWith("LanceTableScan("));
+            assertTrue("the coordinator merge leads: " + physical, physical.startsWith("MergeExec("));
+            assertTrue("the per node plan is the scan: " + physical, physical.contains("LanceTableScan("));
             assertTrue("the page is pushed: " + physical, physical.contains("topk{"));
             assertTrue("the page carries its fetch: " + physical, physical.contains("fetch=3"));
 

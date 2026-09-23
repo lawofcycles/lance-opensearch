@@ -42,8 +42,6 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.query.QueryBuilder;
-import org.opensearch.index.query.QueryRewriteContext;
-import org.opensearch.index.query.Rewriteable;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LanceOverrides;
@@ -355,21 +353,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     }
 
     /**
-     * The coordinator rewrite of the top level query: the same
-     * shard-free {@code QueryRewriteContext} rewrite
-     * {@code TransportSearchAction} applies to a search body before its
-     * shard fan-out, so a query that folds itself away without a mapping
-     * ({@code wrapper}, a {@code bool} of one clause, ...) does so
-     * before it is planned, and the plan and the query the executors
-     * receive agree. Async rewrites (a {@code terms} lookup) are refused
-     * here as they are on the executors' shard-context rewrite.
+     * The coordinator rewrite of the top level query
+     * ({@link RequestPlanner#rewriteAtCoordinator}), so a query that
+     * folds itself away without a mapping does so before it is planned
+     * and the plan and the query the executors receive agree.
      */
     QueryBuilder rewriteAtCoordinator(QueryBuilder query, long nowInMillis) throws IOException {
-        if (query == null) {
-            return null;
-        }
-        QueryRewriteContext rewriteContext = indicesService.getRewriteContext(() -> nowInMillis);
-        return Rewriteable.rewrite(query, rewriteContext, true);
+        return RequestPlanner.rewriteAtCoordinator(indicesService, query, nowInMillis);
     }
 
     /**
@@ -541,7 +531,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 target.dateOverrideColumns(),
                 () -> totalRows
             );
-        RequestPlanner.Planned planned = RequestPlanner.plan(baseSpec.executionShape(), model, target.sqlExcludedColumns(), plannerFactory);
+        RequestPlanner.Planned planned = RequestPlanner.plan(
+            baseSpec.executionShape(),
+            model,
+            target.sqlExcludedColumns(),
+            plannerFactory,
+            RequestPlanner.clusterInputs(nodeList.size(), target.tableUri(), clusterService.getClusterSettings())
+        );
         FragmentQuerySpec spec = baseSpec.withPlan(planned.plan());
         if (allFragmentIds.isEmpty()) {
             if (spec.aggregations() == null) {
