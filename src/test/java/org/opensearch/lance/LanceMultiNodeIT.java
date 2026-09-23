@@ -209,6 +209,82 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testShippedPlanRunsOnEveryNodeAndStatsReportRefinements() throws Exception {
+        // The coordinator plans once and ships the per node plan over
+        // the transport layer to three executors in separate JVMs. A
+        // pushed aggregate, a pushed sorted page and a fused filtered
+        // knn each answer through the shipped plan (the executors run no
+        // planner), and every node's stats carry the plan.refinements
+        // counters, zero here because no node has a reader wrapper.
+        String suffix = "mn-plan-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        String tableUri = LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 12, 4);
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            String aggregated = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
+                )
+            );
+            assertEquals("ids 4..11 match: " + aggregated, 8, extractIntPath(aggregated, "hits", "total", "value"));
+            assertEquals("sum of 4..11: " + aggregated, 60.0, extractDoublePath(aggregated, "aggregations", "s", "value"), 0.0);
+
+            String page = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":3,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"sort\":[{\"id\":{\"order\":\"desc\"}}]}"
+                )
+            );
+            assertEquals(8, extractIntPath(page, "hits", "total", "value"));
+            assertEquals("the page is ordered across nodes: " + page, 11, extractIntPath(page, "hits", "hits", "0", "_source", "id"));
+            assertEquals(10, extractIntPath(page, "hits", "hits", "1", "_source", "id"));
+            assertEquals(9, extractIntPath(page, "hits", "hits", "2", "_source", "id"));
+
+            String nearest = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":2,\"query\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":[7,0,0,0,0,0,0,0],\"k\":2,"
+                        + "\"filter\":{\"range\":{\"id\":{\"gte\":8}}}}}}"
+                )
+            );
+            assertEquals("the prefilter keeps ids 8..11: " + nearest, 2, extractIntPath(nearest, "hits", "total", "value"));
+            assertEquals("nearest to 7 above the filter: " + nearest, 8, extractIntPath(nearest, "hits", "hits", "0", "_source", "id"));
+
+            Map<String, Object> stats = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+            @SuppressWarnings("unchecked")
+            Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
+            assertEquals("every node reports: " + stats, 3, nodes.size());
+            for (Map.Entry<String, Object> node : nodes.entrySet()) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> plan = (Map<String, Object>) ((Map<String, Object>) node.getValue()).get("plan");
+                assertNotNull("plan block on " + node.getKey() + ": " + stats, plan);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> refinements = (Map<String, Object>) plan.get("refinements");
+                assertEquals(
+                    "every reason is reported on " + node.getKey() + ": " + stats,
+                    Set.of("security_wrapper", "sort_field_type", "aggregate_resolution"),
+                    refinements.keySet()
+                );
+                for (Map.Entry<String, Object> reason : refinements.entrySet()) {
+                    assertEquals(
+                        "no downgrade without a reader wrapper on " + node.getKey() + ": " + stats,
+                        0,
+                        ((Number) reason.getValue()).intValue()
+                    );
+                }
+            }
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testNodeLocalPlacementBuildsAndCleansUpOnEveryNode() throws Exception {
         // node_local placement: the build fans out to all three data
         // nodes, each answers under its node id, every node can serve the
