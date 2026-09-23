@@ -27,6 +27,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.rel.physical.LuceneHandoffExec;
+import org.opensearch.lance.plan.rules.CoordinatorLayerRules;
 import org.opensearch.lance.plan.rules.FuseFtsWithFilter;
 import org.opensearch.lance.plan.rules.FuseKnnWithFilter;
 import org.opensearch.lance.plan.rules.LanceToLuceneConverterRule;
@@ -91,6 +92,9 @@ public final class LancePlannerFactory {
             planner.addRule(rule);
         }
         for (RelOptRule rule : LanceToLuceneConverterRule.rules()) {
+            planner.addRule(rule);
+        }
+        for (RelOptRule rule : CoordinatorLayerRules.rules()) {
             planner.addRule(rule);
         }
         RelOptCluster cluster = RelOptCluster.create(planner, new RexBuilder(new SqlTypeFactoryImpl(LanceTypeSystem.INSTANCE)));

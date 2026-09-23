@@ -52,6 +52,7 @@ import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.rel.PushedOperation;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
+import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.script.Script;
 import org.opensearch.search.aggregations.AggregationBuilder;
@@ -2357,10 +2358,10 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
         String filterSql;
         try {
             LanceSchemas.IndexModel model = LanceSchemas.build(metadata, getInstanceFromNode(LanceWarmCache.class));
-            filterSql = TransportLanceCoordinatorAction.resolveScanFilterSql(
+            filterSql = PlanExecutor.resolveScanFilterSql(
                 query,
                 model,
-                TransportLanceCoordinatorAction.sqlExcludedColumns(LanceOverrides.of(metadata.getSettings())),
+                PlanExecutor.sqlExcludedColumns(LanceOverrides.of(metadata.getSettings())),
                 new LancePlannerFactory(1L << 30, 1L << 30)
             );
         } catch (java.io.IOException e) {

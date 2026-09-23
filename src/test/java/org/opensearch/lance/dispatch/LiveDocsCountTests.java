@@ -20,10 +20,11 @@ import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
+import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
- * {@link TransportLanceFragmentQueryAction#countLiveDocs} against a reader
+ * {@link PlanExecutor#countLiveDocs} against a reader
  * whose {@code getLiveDocs()} hides documents that {@code numDocs()} still
  * counts. That is the shape the security plugin's DLS leaf reader has, and
  * it is why {@link IndexSearcher#count} with {@link MatchAllDocsQuery}
@@ -50,7 +51,7 @@ public class LiveDocsCountTests extends OpenSearchTestCase {
                 IndexSearcher searcher = new IndexSearcher(wrapped);
                 // The shortcut reads numDocs, which the wrapper leaves unfiltered.
                 assertEquals(total, searcher.count(MatchAllDocsQuery.INSTANCE));
-                assertEquals(3L, TransportLanceFragmentQueryAction.countLiveDocs(wrapped.leaves()));
+                assertEquals(3L, PlanExecutor.countLiveDocs(wrapped.leaves()));
             }
             // A Bits that is not a FixedBitSet takes the per-doc loop.
             Bits evenOnly = new Bits() {
@@ -65,7 +66,7 @@ public class LiveDocsCountTests extends OpenSearchTestCase {
                 }
             };
             try (DirectoryReader wrapped = new LiveDocsOverridingReader(DirectoryReader.open(dir), evenOnly)) {
-                assertEquals(4L, TransportLanceFragmentQueryAction.countLiveDocs(wrapped.leaves()));
+                assertEquals(4L, PlanExecutor.countLiveDocs(wrapped.leaves()));
             }
         }
     }
@@ -80,7 +81,7 @@ public class LiveDocsCountTests extends OpenSearchTestCase {
                 }
             }
             try (DirectoryReader reader = DirectoryReader.open(dir)) {
-                assertEquals(5L, TransportLanceFragmentQueryAction.countLiveDocs(reader.leaves()));
+                assertEquals(5L, PlanExecutor.countLiveDocs(reader.leaves()));
             }
         }
     }

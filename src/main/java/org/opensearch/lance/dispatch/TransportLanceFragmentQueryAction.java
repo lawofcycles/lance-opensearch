@@ -13,30 +13,21 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.Executor;
-import java.util.concurrent.atomic.AtomicLong;
 
-import org.apache.arrow.vector.UInt8Vector;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.ReaderUtil;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
-import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.Collector;
 import org.apache.lucene.search.CollectorManager;
-import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
@@ -44,7 +35,6 @@ import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
-import org.apache.lucene.search.SimpleCollector;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopFieldCollector;
@@ -53,14 +43,9 @@ import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.search.TopScoreDocCollectorManager;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.ByteBuffersDirectory;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.FixedBitSet;
-import org.apache.calcite.rel.RelNode;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ipc.ColumnOrdering;
-import org.lance.ipc.LanceScanner;
-import org.lance.ipc.ScanOptions;
 import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
@@ -80,14 +65,12 @@ import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.MapperService;
-import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.Rewriteable;
 import org.opensearch.index.search.NestedHelper;
 import org.opensearch.indices.IndicesService;
-import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
@@ -102,26 +85,18 @@ import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
-import org.opensearch.lance.plan.calcite.LanceSchemas;
+import org.opensearch.lance.plan.execute.PlanExecutor;
+import org.opensearch.lance.plan.execute.PlanExecutor.MatchedCount;
 import org.opensearch.lance.plan.rel.LanceTableScan;
-import org.opensearch.lance.plan.rel.LanceTopK;
-import org.opensearch.lance.plan.rel.PushedOperation;
-import org.opensearch.lance.plan.rel.PushedOperation.PushedAggregate;
-import org.opensearch.lance.plan.rel.PushedOperation.PushedFts;
-import org.opensearch.lance.plan.rel.PushedOperation.PushedKnn;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedTopK;
-import org.opensearch.lance.plan.rules.SortResolution;
-import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.query.FtsAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
-import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.lance.query.LanceHintingWeight;
 import org.opensearch.lance.query.LanceInvalidInput;
 import org.opensearch.lance.query.LanceKnnQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.script.ScriptService;
-import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.aggregations.Aggregation;
 import org.opensearch.search.aggregations.Aggregator;
@@ -132,7 +107,6 @@ import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.MultiBucketCollector;
 import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer;
 import org.opensearch.search.aggregations.SearchContextAggregations;
-import org.opensearch.search.approximate.ApproximateScoreQuery;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.SortAndFormats;
@@ -283,12 +257,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      */
     private final LanceWarmCache warmCache;
     /**
-     * Builds the Volcano planner an aggregation request is routed
-     * through: when the pushdown rule fires, the physical plan is the
-     * scan carrying the Substrait bytes and the request skips the
-     * Lucene aggregators. The budgets mirror the explain action's.
+     * Runs the planner facing side of a request: an aggregation
+     * request is routed through the Volcano planner and, when the
+     * pushdown rule fires, executes as the scan carrying the Substrait
+     * bytes instead of the Lucene aggregators; a planned query or
+     * sorted page resolves to the pushed Lance scan the same way. The
+     * planner budgets mirror the explain action's.
      */
-    private final LancePlannerFactory plannerFactory;
+    private final PlanExecutor planExecutor;
 
     @Inject
     public TransportLanceFragmentQueryAction(
@@ -315,7 +291,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.get(clusterService.getSettings()),
             LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.getKey()
         );
-        this.plannerFactory = new LancePlannerFactory(nativeBudgetBytes, Runtime.getRuntime().maxMemory());
+        this.planExecutor = new PlanExecutor(new LancePlannerFactory(nativeBudgetBytes, Runtime.getRuntime().maxMemory()));
     }
 
     @Override
@@ -352,7 +328,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // TaskCancelledException itself so the coordinator
             // recognises it, and log it at debug: it is the expected
             // outcome of a cancellation, not a failure of this node.
-            TaskCancelledException cancelled = findCancelled(e);
+            TaskCancelledException cancelled = LanceCancellation.findCancelled(e);
             if (cancelled != null) {
                 LOGGER.debug(
                     "fragment query for [{}] on [{}] was cancelled: {}",
@@ -399,22 +375,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 concurrencyLimit.release();
             }
         }
-    }
-
-    /**
-     * The {@link TaskCancelledException} in the cause chain of
-     * {@code e}, or {@code null} when the chain has none.
-     */
-    static TaskCancelledException findCancelled(Throwable e) {
-        for (Throwable t = e; t != null; t = t.getCause()) {
-            if (t instanceof TaskCancelledException cancelled) {
-                return cancelled;
-            }
-            if (t.getCause() == t) {
-                break;
-            }
-        }
-        return null;
     }
 
     /**
@@ -824,7 +784,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // fold goes through the Lucene collector.
                 LanceTableScan plannedTopK = hasSecurityWrapper || sortAndFormats == null
                     ? null
-                    : resolvePlannedTopK(request, qsc, indexMetadata, dataset, multiFields, searcher.getIndexReader(), sortAndFormats);
+                    : planExecutor.plannedTopK(
+                        request,
+                        qsc,
+                        indexMetadata,
+                        dataset,
+                        multiFields,
+                        searcher.getIndexReader(),
+                        sortAndFormats
+                    );
                 HitsPage hits;
                 if (plannedTopK != null) {
                     PushedTopK pushedTopK = plannedTopK.pushedTopK().orElseThrow();
@@ -833,7 +801,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         request,
                         pushedTopK.toScanOrderings(),
                         pushedTopK.fetch(),
-                        plannedScanFilter(plannedTopK, pushedTopK),
+                        PlanExecutor.plannedScanFilter(plannedTopK, pushedTopK),
                         sortAndFormats,
                         searcher.getIndexReader(),
                         effectiveFragmentIds,
@@ -894,7 +862,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         : MatchedCount.exact(result.totalRows());
                 } else {
                     aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query, lanceWeight);
-                    matched = computeMatched(dataset, request, searcher, countQuery, hasSecurityWrapper, ftsWeight, cancellation);
+                    matched = PlanExecutor.computeMatched(
+                        dataset,
+                        request,
+                        searcher,
+                        countQuery,
+                        hasSecurityWrapper,
+                        ftsWeight,
+                        cancellation
+                    );
                 }
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debug(
@@ -1023,31 +999,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (!LanceAggregationSupport.isPushdownCandidate(request.aggregations())) {
             return null;
         }
-        RelNode logical;
-        try {
-            LanceSchemas.IndexModel model = LanceSchemas.model(request.indexName(), dataset.getSchema(), multiFields, reader::numDocs);
-            logical = SearchRequestToRel.translateAggregations(request.aggregations(), model, plannerFactory);
-        } catch (UnsupportedOperationException unsupported) {
-            return null;
-        }
-        RelNode physical = plannerFactory.plan(logical);
-        if (!(physical instanceof LanceTableScan scan)) {
-            return null;
-        }
-        PushedAggregate pushed = scan.pushedAggregate().orElse(null);
-        if (pushed == null) {
-            return null;
-        }
-        int maxGroups = LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
-        return LanceAggregateResults.resolve(
-            pushed.aggregate(),
-            pushed.substrait(),
-            request.aggregations(),
-            dataset.getSchema(),
-            multiFields,
-            qsc,
-            maxGroups
-        );
+        return planExecutor.plannedAggregate(request, dataset, multiFields, qsc, reader);
     }
 
     /**
@@ -1083,20 +1035,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
-     * Result of {@link #computeMatched}: the number of matching rows
-     * on this node, and whether counting stopped at the request's
-     * {@code trackTotalHitsUpTo} bound so {@code value} is only a
-     * lower bound of the true count.
-     */
-    record MatchedCount(long value, boolean lowerBound) {
-        static final MatchedCount NOT_TRACKED = new MatchedCount(0L, false);
-
-        static MatchedCount exact(long value) {
-            return new MatchedCount(value, false);
-        }
-    }
-
-    /**
      * Strip any scan-limit hint from a Lance-backed Query so it can
      * be reused for match-count purposes.
      *
@@ -1104,7 +1042,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * embed an optional top-k inside the {@link Query} instance
      * itself: the fragment scan uses that hint to stop early during
      * the hits phase. The same instance is also what
-     * {@link #computeMatched} hands to {@code IndexSearcher.count}
+     * {@link PlanExecutor#computeMatched} hands to {@code IndexSearcher.count}
      * when there is no cheaper counting path (scoring queries, or
      * scan-filter queries wrapped by post_filter). Counting the top
      * {@code size} rows instead of every matched row would collapse
@@ -1145,7 +1083,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *       that fall back to doc values on a reader without points)
      *       has to load every referenced column through the doc value
      *       path before it can match a single row, whereas the Lance
-     *       scan reads only {@code _rowaddr}. {@link #computeMatched}
+     *       scan reads only {@code _rowaddr}. {@link PlanExecutor#computeMatched}
      *       already trusts the same SQL for {@code hits.total}, so the
      *       two stay consistent by construction.</li>
      *   <li>{@link LanceFragmentQueryRequest#query()} — the top-level
@@ -1160,7 +1098,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *       must_not} clauses all translate to Lance SQL, and a
      *       {@code lance_knn} with an inner {@code filter}, are planned
      *       through {@link SearchRequestToRel#translateQuery} and the
-     *       fuse rules first (see {@link #resolvePlannedLanceQuery}):
+     *       fuse rules first (see {@link PlanExecutor#plannedLanceQuery}):
      *       the pushed operation's SQL rides on the
      *       {@link LanceFtsQuery} / {@link LanceKnnQuery} as the scan's
      *       prefilter, so Lance evaluates the scalar predicate before
@@ -1207,7 +1145,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // path does the same Rewriteable.rewrite call in
             // QueryShardContext.toQuery before invoking doToQuery.
             QueryBuilder rewritten = Rewriteable.rewrite(request.query(), qsc, true);
-            Query planned = resolvePlannedLanceQuery(
+            Query planned = planExecutor.plannedLanceQuery(
                 rewritten,
                 qsc,
                 hasSecurityWrapper,
@@ -1238,305 +1176,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             return base;
         }
         return MatchAllDocsQuery.INSTANCE;
-    }
-
-    /**
-     * Resolve the two query shapes the planner folds into the Lance
-     * dataset scan: a {@code bool} whose {@code must} is exactly one
-     * Lance FTS clause with scalar {@code filter} / {@code must_not}
-     * companions, and a {@code lance_knn} with an inner {@code filter}.
-     * {@link SearchRequestToRel#translateQuery} builds the
-     * {@code LanceFtsMatch} / {@code LanceKnnSearch} tree, the Volcano
-     * run fires the fuse rules, and the pushed operation's filter SQL
-     * rides on the {@link LanceFtsQuery} / {@link LanceKnnQuery} whose
-     * Weight hands it to the scan as a prefilter. The clause's own
-     * Lucene query is still built through {@code toQuery}, so the
-     * mapping validation (field types, vector dimension) and the
-     * clause boost behave exactly as on the unplanned path.
-     *
-     * <p>Returns null for every shape the planner does not fold — a
-     * bare FTS clause (the plain {@code toQuery} path already builds
-     * the same scan and attaches the top-k), an unfiltered
-     * {@code lance_knn}, a scalar tree, a bool the shape detection or
-     * the scalar translation refuses, and any FTS shape under a reader
-     * wrapper (the collapse would move clauses out of the wrapper's
-     * view) — and the caller keeps the Lucene composition.
-     *
-     * <p>A {@code lance_knn} whose inner filter does not plan (the
-     * translator refuses a clause, a field is unmapped or ip mapped,
-     * or the predicate has no SQL spelling) throws
-     * {@link IllegalArgumentException} and answers 400: the filter is
-     * a prefilter by contract and silently dropping it would return
-     * wrong nearest rows. The knn shape resolves under a reader
-     * wrapper too, because the inner filter is the caller's own
-     * predicate, applied before DLS narrows the hits on the Lucene
-     * side.
-     */
-    private Query resolvePlannedLanceQuery(
-        QueryBuilder rewritten,
-        QueryShardContext qsc,
-        boolean hasSecurityWrapper,
-        int scanLimit,
-        LanceFragmentQueryRequest request,
-        IndexMetadata indexMetadata,
-        Dataset dataset,
-        Map<String, LinkedHashMap<String, String>> multiFields,
-        IndexReader reader
-    ) throws IOException {
-        boolean knnShape = rewritten instanceof LanceKnnQueryBuilder;
-        if (!knnShape && !(rewritten instanceof BoolQueryBuilder)) {
-            return null;
-        }
-        if (!knnShape && hasSecurityWrapper) {
-            return null;
-        }
-        LanceKnnQueryBuilder knn = knnShape ? (LanceKnnQueryBuilder) rewritten : null;
-        if (knn != null && knn.filter() == null) {
-            return null;
-        }
-        Set<String> excludedColumns = TransportLanceCoordinatorAction.sqlExcludedColumns(LanceOverrides.of(indexMetadata.getSettings()));
-        if (knn != null && QueryToRex.referencesAny(knn.filter(), excludedColumns)) {
-            throw knnFilterRefusal(knn, "predicates on ip and geo_point fields are evaluated over encoded doc values on the Lucene side");
-        }
-        if (knn == null && rewritten instanceof BoolQueryBuilder bool && QueryToRex.referencesAny(bool, excludedColumns)) {
-            // An ip or geo predicate has no Lance SQL form; keep the
-            // whole bool on the Lucene composition.
-            return null;
-        }
-        RelNode physical;
-        try {
-            LanceSchemas.IndexModel model = plannerQueryModel(request.indexName(), indexMetadata, dataset, multiFields, reader);
-            physical = plannerFactory.plan(SearchRequestToRel.translateQuery(rewritten, model, plannerFactory));
-        } catch (UnsupportedOperationException unsupported) {
-            if (knn != null) {
-                throw knnFilterRefusal(knn, unsupported.getMessage());
-            }
-            return null;
-        }
-        if (!(physical instanceof LanceTableScan scan)) {
-            if (knn != null) {
-                throw knnFilterRefusal(knn, "the filter has no Lance SQL form");
-            }
-            return null;
-        }
-        PushedFts pushedFts = scan.pushedFts().orElse(null);
-        if (pushedFts != null) {
-            Query clause = pushedFts.fts().ftsClause().toQuery(qsc);
-            if (clause instanceof LanceFtsQuery fts) {
-                LanceFtsQuery pushed = fts.withScanFilterSql(pushedFts.filterSql());
-                int ftsScanLimit = scanLimit == LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED ? LanceFtsQuery.SCAN_LIMIT_UNBOUNDED : scanLimit;
-                return ftsScanLimit == LanceFtsQuery.SCAN_LIMIT_UNBOUNDED ? pushed : pushed.withScanLimit(ftsScanLimit);
-            }
-            if (clause instanceof BoostQuery boosted && boosted.getQuery() instanceof LanceFtsQuery fts) {
-                // The boosted clause keeps its BoostQuery wrapper and
-                // the scan stays unbounded, like the top-level boosted
-                // FTS path.
-                return new BoostQuery(fts.withScanFilterSql(pushedFts.filterSql()), boosted.getBoost());
-            }
-            return null;
-        }
-        PushedKnn pushedKnn = scan.pushedKnn().orElse(null);
-        if (pushedKnn != null) {
-            Query clause = pushedKnn.knn().knnClause().toQuery(qsc);
-            if (clause instanceof LanceKnnQuery knnQuery) {
-                return knnQuery.withScanFilterSql(pushedKnn.filterSql());
-            }
-            if (clause instanceof BoostQuery boosted && boosted.getQuery() instanceof LanceKnnQuery knnQuery) {
-                return new BoostQuery(knnQuery.withScanFilterSql(pushedKnn.filterSql()), boosted.getBoost());
-            }
-        }
-        if (knn != null) {
-            throw knnFilterRefusal(knn, "the filter has no Lance SQL form");
-        }
-        return null;
-    }
-
-    /**
-     * The 400 a filtered {@code lance_knn} answers when its filter
-     * cannot travel to the Lance scan, naming the filter clause's
-     * builder class so the caller sees which part was refused.
-     */
-    private static IllegalArgumentException knnFilterRefusal(LanceKnnQueryBuilder knn, String reason) {
-        return new IllegalArgumentException(
-            "[lance_knn] filter type ["
-                + knn.filter().getClass().getSimpleName()
-                + "] is not supported by the pre-filter translator: "
-                + reason
-        );
-    }
-
-    /**
-     * The planner's model of the index for query clause translation:
-     * the Arrow schema from the open dataset, the attach's multi field
-     * spec, the mapping's recorded renames, and the primary key column
-     * {@code ids} queries resolve against.
-     */
-    private static LanceSchemas.IndexModel plannerQueryModel(
-        String indexName,
-        IndexMetadata indexMetadata,
-        Dataset dataset,
-        Map<String, LinkedHashMap<String, String>> multiFields,
-        IndexReader reader
-    ) {
-        Map<String, String> renamedFields = new LinkedHashMap<>();
-        for (LanceMappingMeta.RenamedField renamed : LanceMappingMeta.renamedFields(indexMetadata.mapping())) {
-            renamedFields.put(renamed.from(), renamed.to());
-        }
-        String primaryKeyField = indexMetadata.getSettings().get("index.lance.primary_key_field", "");
-        Set<String> dateOverrideColumns = LanceOverrides.of(indexMetadata.getSettings()).dateColumns().keySet();
-        return LanceSchemas.model(
-            indexName,
-            dataset.getSchema(),
-            multiFields,
-            renamedFields,
-            primaryKeyField,
-            dateOverrideColumns,
-            reader::numDocs
-        );
-    }
-
-    /**
-     * Plan a sorted hits page through the planner: the query root from
-     * {@link SearchRequestToRel#translateQuery}, the sort clauses as
-     * the {@link LanceTopK}'s collations, and the Volcano run firing
-     * {@code PushSortLimitIntoLanceScan}. Returns the scan carrying
-     * the {@link PushedTopK} (and, for a scalar page, the pushed
-     * filter whose SQL the ordered scan evaluates) when the planner
-     * folded the page, or null when the shape stays on the Lucene
-     * collector.
-     *
-     * <p>The guards mirror what the fold can reproduce. {@code size}
-     * must be positive with no {@code post_filter} and no aggregations
-     * (both need the full match set on the Lucene side). Every Lucene
-     * {@link org.apache.lucene.search.SortField} OpenSearch built must
-     * be one of the two plain field-data shapes, because
-     * {@link #sortValueFrom} types the page's sort values from them;
-     * an {@code ip} format is excluded because address order is not
-     * the stored strings' order. The shape must be scalar: a non-null
-     * {@link LanceFragmentQueryRequest#filterSql()} (the coordinator
-     * translated the whole tree), no query, or {@code match_all};
-     * FTS and knn order by score, which the fold serves through the
-     * scan limit instead (see {@link #resolveScanFilterTopK}). A
-     * {@code search_after} whose cursor equals a sort field's missing
-     * sentinel stays on Lucene: the strict SQL bound cannot tell the
-     * sentinel from a stored value.
-     */
-    private LanceTableScan resolvePlannedTopK(
-        LanceFragmentQueryRequest request,
-        QueryShardContext qsc,
-        IndexMetadata indexMetadata,
-        Dataset dataset,
-        Map<String, LinkedHashMap<String, String>> multiFields,
-        IndexReader reader,
-        SortAndFormats sortAndFormats
-    ) {
-        if (request.size() <= 0 || request.postFilter() != null) {
-            return null;
-        }
-        if (request.aggregations() != null && !request.aggregations().getAggregatorFactories().isEmpty()) {
-            return null;
-        }
-        org.apache.lucene.search.SortField[] sortFields = sortAndFormats.sort.getSort();
-        if (sortFields.length != request.sorts().size()) {
-            return null;
-        }
-        for (org.apache.lucene.search.SortField sortField : sortFields) {
-            if (sortField instanceof org.apache.lucene.search.SortedNumericSortField numeric) {
-                switch (numeric.getNumericType()) {
-                    case INT, LONG, FLOAT, DOUBLE -> {
-                    }
-                    default -> {
-                        return null;
-                    }
-                }
-            } else if (!(sortField instanceof org.apache.lucene.search.SortedSetSortField)) {
-                return null;
-            }
-        }
-        for (DocValueFormat format : sortAndFormats.formats) {
-            if (format == DocValueFormat.IP) {
-                return null;
-            }
-        }
-        boolean scalarShape = request.filterSql() != null
-            || request.query() == null
-            || request.query() instanceof org.opensearch.index.query.MatchAllQueryBuilder;
-        if (!scalarShape) {
-            return null;
-        }
-        Object[] searchAfter = request.searchAfter();
-        if (searchAfter != null && (searchAfter.length != sortFields.length || cursorHitsMissingSentinel(searchAfter, sortFields))) {
-            return null;
-        }
-        try {
-            LanceSchemas.IndexModel model = plannerQueryModel(request.indexName(), indexMetadata, dataset, multiFields, reader);
-            QueryBuilder rewritten = request.query() == null ? null : Rewriteable.rewrite(request.query(), qsc, true);
-            RelNode root = SearchRequestToRel.translateQuery(rewritten, model, plannerFactory);
-            List<org.apache.calcite.rel.RelFieldCollation> collations = SortResolution.collationsOf(
-                request.sorts(),
-                root.getRowType(),
-                model
-            );
-            LanceTopK topK = new LanceTopK(
-                root.getCluster(),
-                root.getCluster().traitSetOf(org.apache.calcite.plan.Convention.NONE),
-                root,
-                collations,
-                request.size(),
-                0,
-                searchAfter == null ? null : Arrays.asList(searchAfter)
-            );
-            RelNode physical = plannerFactory.plan(topK);
-            if (physical instanceof LanceTableScan scan) {
-                PushedTopK pushed = scan.pushedTopK().orElse(null);
-                if (pushed != null && !pushed.toScanOrderings().isEmpty()) {
-                    return scan;
-                }
-            }
-            return null;
-        } catch (UnsupportedOperationException | IOException notPlanned) {
-            // A sort clause without a collation spelling (geo distance,
-            // script, nested, mode, literal missing) or a query the
-            // translator refuses: the Lucene collector serves it.
-            return null;
-        }
-    }
-
-    /**
-     * Whether a {@code search_after} value equals the missing-value
-     * sentinel its sort field reports for null rows. A client paging
-     * past a null row feeds the sentinel back; the strict SQL bound
-     * compares stored values only, so such a cursor stays on the
-     * Lucene comparator, which knows the sentinel.
-     */
-    private static boolean cursorHitsMissingSentinel(Object[] searchAfter, org.apache.lucene.search.SortField[] sortFields) {
-        for (int i = 0; i < searchAfter.length; i++) {
-            Object missing = sortFields[i].getMissingValue();
-            if (missing instanceof Number sentinel
-                && searchAfter[i] instanceof Number cursor
-                && Double.compare(sentinel.doubleValue(), cursor.doubleValue()) == 0) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * The filter of the ordered Lance scan: the pushed filter's SQL
-     * (the query the page cuts) ANDed with the {@code search_after}
-     * cursor bound, either alone when the other is absent, null when
-     * the page is an unfiltered first page.
-     */
-    private static String plannedScanFilter(LanceTableScan scan, PushedTopK pushedTopK) {
-        String filterSql = scan.pushedFilter().map(PushedOperation.PushedFilter::sql).orElse(null);
-        String cursorSql = pushedTopK.cursorSql();
-        if (filterSql == null) {
-            return cursorSql;
-        }
-        if (cursorSql == null) {
-            return filterSql;
-        }
-        return "(" + filterSql + ") AND (" + cursorSql + ")";
     }
 
     /**
@@ -1571,7 +1210,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * the coordinator is asking for. Using it directly here is safe.
      *
      * <p>{@code hits.total.value} is served by
-     * {@link #computeMatched}, which for the scalar-filter shape
+     * {@link PlanExecutor#computeMatched}, which for the scalar-filter shape
      * dispatches straight to {@link Dataset#countRows(String)} and
      * therefore is not affected by the scan clip.
      *
@@ -1622,7 +1261,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * count-only request ({@code size: 0} without aggregations, with
      * or without post_filter) reads no doc values at all, and running
      * the materialising scan for it would replace the cheaper bounded
-     * count scan {@link #computeMatched} uses.
+     * count scan {@link PlanExecutor#computeMatched} uses.
      */
     private boolean hintsHelpBeforeScoring(LanceFragmentQueryRequest request) {
         if (resolveScanFilterTopK(request) != LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED) {
@@ -1792,7 +1431,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * hands its own top-docs collector managers ({@code
      * IndexSearcher.TOTAL_HITS_THRESHOLD}, which is private there).
      * Only the {@code TopDocs.totalHits} accounting depends on it;
-     * this class reads {@code hits.total} from {@link #computeMatched}
+     * this class reads {@code hits.total} from {@link PlanExecutor#computeMatched}
      * and never from the collector, so the value just keeps the
      * Weight-driven page identical to the Query-driven one.
      */
@@ -2263,7 +1902,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * <p>Split out from {@link #openWrappedReader} so the caller in
      * {@link #execute} can inspect whether a wrapper is installed
      * without also opening the reader. This is what lets
-     * {@link #computeMatched} count from the wrapped reader's
+     * {@link PlanExecutor#computeMatched} count from the wrapped reader's
      * liveDocs whenever a wrapper is present, so a DLS/FLS reader
      * wrapper can restrict {@code hits.total.value} the same way it
      * restricts the returned hits.
@@ -2306,7 +1945,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * <p>{@code readerWrapper} is the value returned by
      * {@link #resolveReaderWrapper}. Passing it in rather than
      * resolving it here lets {@link #execute} record whether a
-     * wrapper is installed so {@link #computeMatched} can route
+     * wrapper is installed so {@link PlanExecutor#computeMatched} can route
      * counts through the searcher whenever a wrapper may restrict
      * the visible document set. A {@code null} wrapper means no
      * wrapper is installed (empty cluster, no security plugin) and
@@ -2370,543 +2009,5 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             }
             throw e;
         }
-    }
-
-    /**
-     * Number of live documents across {@code leaves}, read from each
-     * leaf's {@link LeafReader#getLiveDocs()} rather than
-     * {@link LeafReader#numDocs()}. The two agree for a plain reader;
-     * they differ under a DLS wrapper, which is why the caller uses
-     * this instead of the {@link MatchAllDocsQuery} count shortcut.
-     */
-    static long countLiveDocs(List<LeafReaderContext> leaves) {
-        long total = 0L;
-        for (LeafReaderContext ctx : leaves) {
-            LeafReader leaf = ctx.reader();
-            Bits liveDocs = leaf.getLiveDocs();
-            if (liveDocs == null) {
-                total += leaf.numDocs();
-            } else if (liveDocs instanceof FixedBitSet bits) {
-                total += bits.cardinality();
-            } else {
-                int maxDoc = leaf.maxDoc();
-                for (int doc = 0; doc < maxDoc; doc++) {
-                    if (liveDocs.get(doc)) {
-                        total++;
-                    }
-                }
-            }
-        }
-        return total;
-    }
-
-    /**
-     * Number of documents {@code query} matches on {@code searcher},
-     * counted by collecting every doc its scorer yields. The searcher
-     * hands the scorer each leaf's {@link LeafReader#getLiveDocs()} as
-     * accepted docs, so a reader wrapper's filtered liveDocs apply.
-     *
-     * <p>{@link org.apache.lucene.search.IndexSearcher#count(Query)} is
-     * not used because its {@code TotalHitCountCollector} asks
-     * {@link Weight#count(LeafReaderContext)} first and takes that
-     * answer without scoring: {@link MatchAllDocsQuery} answers
-     * {@link LeafReader#numDocs()}, which the security plugin's DLS
-     * leaf reader leaves at the unfiltered value, and other Weights
-     * answer from index statistics that predate the wrapper as well.
-     * The collector below never consults {@code Weight.count}, so the
-     * only thing that decides the count is the scorer intersected with
-     * the liveDocs.
-     *
-     * <p>The counter is a plain {@code long[]}: {@code search(Query, Collector)}
-     * of {@link LanceFragmentIndexSearcher} visits every leaf on the
-     * calling thread whatever the searcher's slice count (a single
-     * collector cannot be shared between slices), so the collector is
-     * never touched by two threads. Counting through a
-     * {@link org.apache.lucene.search.CollectorManager} would run the
-     * slices in parallel and need one counter per slice.
-     */
-    static long countThroughLiveDocs(LanceFragmentIndexSearcher searcher, Query query) throws IOException {
-        long[] total = new long[1];
-        searcher.search(query, new SimpleCollector() {
-            @Override
-            public void collect(int doc) {
-                total[0]++;
-            }
-
-            @Override
-            public ScoreMode scoreMode() {
-                return ScoreMode.COMPLETE_NO_SCORES;
-            }
-        });
-        return total[0];
-    }
-
-    /**
-     * Determine the number of rows in this node's fragment subset
-     * that satisfy the query, counted as far as the request's
-     * {@link LanceFragmentQueryRequest#trackTotalHitsUpTo()} asks.
-     * Uses Lance's metadata-only counting whenever the query is a
-     * pure filter shape the coordinator has already translated to
-     * Lance SQL ({@link LanceFragmentQueryRequest#filterSql()}):
-     * <ul>
-     *   <li>No filter: sum {@link org.lance.Fragment#countRows()}
-     *       across the assigned fragments (Lance metadata, no
-     *       scan).</li>
-     *   <li>Filter set, no fragment list: use
-     *       {@link Dataset#countRows(String)}.</li>
-     *   <li>Filter set, fragment list: {@link #countScalarFilter},
-     *       which asks Lance to count the matches of the listed
-     *       fragments natively when the request wants an accurate
-     *       total and otherwise scans at most
-     *       {@code trackTotalHitsUpTo + 1} rows to decide between an
-     *       exact count and a lower bound.</li>
-     * </ul>
-     * The first two read Lance metadata or run one native count, so
-     * they are cheap regardless of the match count and are reported
-     * exact; the {@code track_total_hits} bound then only affects how
-     * the coordinator presents them.
-     *
-     * <p>A bare {@link LanceFtsQuery} is counted from the Weight the
-     * caller built for the request when that Weight's scan has run
-     * (hits or aggregations were collected) and either was unbounded
-     * or returned fewer rows than its {@code scanLimit}, since then
-     * the scan saw every match. Otherwise the count comes from a
-     * dedicated Lance scan that yields no payload columns
-     * ({@link #countFtsHitsDirectly}), limited to
-     * {@code trackTotalHitsUpTo + 1} rows unless the request asked for
-     * an accurate total: reaching the limit proves there are more than
-     * {@code trackTotalHitsUpTo} matches, which is all the
-     * {@code gte} relation needs, and stops the scan from walking a
-     * posting list whose length is what makes large FTS results slow.
-     *
-     * <p>For every other scoring shape (knn, a bool mixing FTS with
-     * other scoring clauses, post_filter over any query) the
-     * coordinator leaves filterSql null and only ships the
-     * {@link QueryBuilder}. We cannot express those in Lance SQL, so
-     * we ask Lucene through
-     * {@link org.apache.lucene.search.IndexSearcher#count(Query)}
-     * and report the exact number.
-     *
-     * <p>The {@code hasSecurityWrapper} flag overrides every
-     * Lance-side fast path. A non-null reader wrapper on
-     * {@link IndexService} indicates that DLS/FLS or another
-     * reader-level transform may restrict the visible document
-     * set; Lance's metadata-only counts and its native filter scan
-     * see the raw Dataset, not the wrapper's view, so serving
-     * {@code hits.total.value} from Lance would over-count and
-     * disagree with the hits the same request returns. Whenever a
-     * wrapper is installed the count is taken from the wrapped
-     * leaves' {@link LeafReader#getLiveDocs()} instead, either
-     * directly ({@link #countLiveDocs}, for {@code match_all}) or by
-     * collecting the query's scorer under those liveDocs
-     * ({@link #countThroughLiveDocs}), so the count matches the hits,
-     * and {@code _count} (which takes this same path) agrees with
-     * {@code _search}.
-     */
-    private MatchedCount computeMatched(
-        Dataset dataset,
-        LanceFragmentQueryRequest request,
-        LanceFragmentIndexSearcher searcher,
-        Query luceneQuery,
-        boolean hasSecurityWrapper,
-        LanceFtsQuery.LanceFtsWeight ftsWeight,
-        LanceCancellation cancellation
-    ) throws Exception {
-        int upTo = request.trackTotalHitsUpTo();
-        if (upTo == SearchContext.TRACK_TOTAL_HITS_DISABLED) {
-            // track_total_hits: false. The coordinator leaves
-            // hits.total out of the response, so no count is needed.
-            return MatchedCount.NOT_TRACKED;
-        }
-        if (hasSecurityWrapper) {
-            // A reader wrapper is installed on the IndexService,
-            // most likely the security plugin's DLS/FLS wrapper.
-            // Invariant of this branch: the count is derived from
-            // the wrapped leaves' getLiveDocs(), either read directly
-            // (countLiveDocs) or applied by the searcher while it
-            // drives a scorer (countThroughLiveDocs). Nothing here
-            // may read Lance metadata (Dataset.countRows,
-            // Fragment.countRows), run a Lance count scan, or use a
-            // Lucene shortcut that answers from LeafReader.numDocs():
-            // all of those see the rows before the wrapper and would
-            // report hidden rows in hits.total.value while the hits
-            // themselves are filtered.
-            //
-            // The track_total_hits bound is not applied here. Both
-            // paths below count every match, so the value is exact,
-            // and exact is within the contract for any bound. For an
-            // FTS query the Lance scan runs a second time here (the
-            // hits phase's LanceFtsWeight and its shardHits are not
-            // reused). That repeat is accepted: it is the only count
-            // path that sees the wrapper's view, and DLS correctness
-            // outranks the saving.
-            //
-            // match_all is counted from the liveDocs bitset. The
-            // security plugin's DLS leaf reader swaps in filtered
-            // liveDocs but leaves numDocs() at the unfiltered value,
-            // and numDocs() is exactly what MatchAllDocsQuery's
-            // Weight.count answers, so IndexSearcher.count must not
-            // be used for it. MatchAllQueryBuilder produces an
-            // ApproximateScoreQuery around the MatchAllDocsQuery;
-            // once the hits phase has run, ContextIndexSearcher.rewrite
-            // has called setContext on that instance and its rewrite
-            // returns itself instead of the wrapped query, so unwrap
-            // it explicitly before the ConstantScoreQuery
-            // normalisation (which mirrors the first two lines of
-            // IndexSearcher.count and catches a constant_score /
-            // boost / bool-filter wrapper around match_all).
-            Query normalised = luceneQuery instanceof ApproximateScoreQuery approximate ? approximate.getOriginalQuery() : luceneQuery;
-            normalised = searcher.rewrite(new ConstantScoreQuery(normalised));
-            if (normalised instanceof ConstantScoreQuery csq) {
-                normalised = csq.getQuery();
-            }
-            if (normalised instanceof MatchAllDocsQuery) {
-                return MatchedCount.exact(countLiveDocs(searcher.getIndexReader().leaves()));
-            }
-            return MatchedCount.exact(countThroughLiveDocs(searcher, luceneQuery));
-        }
-        List<Integer> fragmentIds = request.fragmentIdsOrNull();
-        String filterSql = request.filterSql();
-        boolean hasScoringQuery = request.query() != null && filterSql == null;
-        boolean hasPostFilter = request.postFilter() != null;
-        if (hasScoringQuery && !hasPostFilter && luceneQuery instanceof LanceFtsQuery fts) {
-            // Pure FTS shape (no post_filter, no other scoring
-            // clause). A collapsed bool query arrives here as the
-            // same LanceFtsQuery carrying its scalar clauses as
-            // scanFilterSql, which every count path below applies
-            // too.
-            if (ftsWeight != null) {
-                // The request's own Weight has scanned already when
-                // hits or aggregations were collected. Its count is
-                // the true total when the scan saw every match of
-                // this executor's fragments: an unbounded scan, or a
-                // bounded scan that came back short of its limit
-                // before the fragment filter (Lance returns exactly
-                // min(limit, matches) rows).
-                long scanned = ftsWeight.hitCount();
-                if (scanned >= 0 && ftsWeight.complete()) {
-                    return MatchedCount.exact(scanned);
-                }
-            }
-            if (upTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
-                return MatchedCount.exact(countFtsHitsDirectly(dataset, fts, fragmentIds, 0L, cancellation).own());
-            }
-            long limit = (long) upTo + 1L;
-            FtsHitCount counted = countFtsHitsDirectly(dataset, fts, fragmentIds, limit, cancellation);
-            // The bound is judged on the rows Lance returned before the
-            // fragment filter. On a subset executor the own share of a
-            // filled scan is a fraction of the limit and says nothing
-            // about how many matches were cut off; the scan filling up
-            // does, and it fills up on every executor at once, so each
-            // reports a lower bound and the coordinator answers gte.
-            return new MatchedCount(counted.own(), counted.scanned() >= limit);
-        }
-        if (hasScoringQuery || hasPostFilter) {
-            // post_filter narrows hits.total.value below what
-            // filterSql / countRows would return, so ask Lucene
-            // directly against the AND-combined query. knn also
-            // lands here (its LanceKnnQuery is not the LanceFtsQuery
-            // branch above); Lucene serves the count via the shared
-            // shard-level nearest scan the Weight already cached.
-            return MatchedCount.exact(searcher.count(luceneQuery));
-        }
-        if (filterSql == null) {
-            if (fragmentIds == null) {
-                return MatchedCount.exact(dataset.countRows());
-            }
-            long total = 0L;
-            List<Fragment> allFragments = dataset.getFragments();
-            for (Fragment fragment : allFragments) {
-                if (fragmentIds.contains(fragment.getId())) {
-                    total += fragment.countRows();
-                }
-            }
-            return MatchedCount.exact(total);
-        }
-        if (fragmentIds == null) {
-            return MatchedCount.exact(dataset.countRows(filterSql));
-        }
-        return countScalarFilter(dataset, filterSql, fragmentIds, upTo, cancellation);
-    }
-
-    /**
-     * Count the rows of {@code fragmentIds} that match the scalar
-     * filter {@code filterSql}, honouring the {@code track_total_hits}
-     * bound {@code upTo}.
-     *
-     * <p>The coordinator always hands an executor its fragment list,
-     * so every scalar-filter count of the fragment path arrives here.
-     * The scan asks Lance for zero payload columns and no row address
-     * or row id, so nothing but a row count crosses from Lance to
-     * Java. The fragment list is passed to Lance: for a scalar filter
-     * it only narrows the fragments the filtered read opens (unlike
-     * an FTS scan, where a fragment list turns into a prefilter over
-     * {@code _rowid}), so there is no reason to scan the whole table
-     * and sort the rows by fragment here.
-     *
-     * <ul>
-     *   <li>{@code upTo == TRACK_TOTAL_HITS_ACCURATE}
-     *       ({@code track_total_hits: true}, which is also what
-     *       {@code _count} sends): {@link LanceScanner#countRows()}.
-     *       Lance puts a {@code count(*)} on top of the filtered read
-     *       and runs it across its own thread pool; the result comes
-     *       back as one number. Pulling the same rows through
-     *       {@code scanBatches()} instead would hand every match to
-     *       this search thread one batch at a time, which for a
-     *       filter that matches most of a large table costs seconds
-     *       of a single core.</li>
-     *   <li>Otherwise: one scan with {@code limit(upTo + 1)}, whose
-     *       returned rows are counted. Lance plans the limit as a
-     *       node above the filtered read, so the read stops once
-     *       {@code upTo + 1} rows are through; at most that many rows
-     *       reach Java. Reaching the limit proves the executor holds
-     *       more than {@code upTo} matches, which is all the
-     *       coordinator needs for {@code gte}, so the result is then
-     *       a lower bound; coming back short means every match was
-     *       seen and the count is exact. Because the scan is already
-     *       restricted to the executor's fragments, every returned
-     *       row is the executor's own and the returned count itself
-     *       is compared with the limit. (The FTS counterpart judges
-     *       on the rows before its fragment filter because that scan
-     *       runs over the whole table.)</li>
-     * </ul>
-     *
-     * <p>{@link LanceScanner#countRows()} is not used for the bounded
-     * case: Lance applies its {@code count(*)} before the limit node,
-     * so the limit would be ignored and the count would be exact at
-     * full cost, which is what the bound exists to avoid.
-     *
-     * <p>{@link #NATIVE_SCALAR_COUNTS} and {@link #BOUNDED_SCALAR_COUNT_SCANS}
-     * record which of the two paths ran, so a test can tell a native
-     * count from a batch loop that happens to return the same number.
-     */
-    static MatchedCount countScalarFilter(Dataset dataset, String filterSql, List<Integer> fragmentIds, int upTo) throws Exception {
-        return countScalarFilter(dataset, filterSql, fragmentIds, upTo, LanceCancellation.NONE);
-    }
-
-    /**
-     * {@link #countScalarFilter(Dataset, String, List, int)} whose bounded
-     * scan stops once {@code cancellation} reports a cancelled task. The
-     * native count of an exact request runs inside Lance in one call and
-     * has no batch boundary to stop at.
-     */
-    static MatchedCount countScalarFilter(
-        Dataset dataset,
-        String filterSql,
-        List<Integer> fragmentIds,
-        int upTo,
-        LanceCancellation cancellation
-    ) throws Exception {
-        ScanOptions.Builder builder = countOnlyScan(filterSql, fragmentIds);
-        if (upTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
-            cancellation.checkCancelled();
-            try (LanceScanner scanner = dataset.newScan(builder.build())) {
-                long counted = scanner.countRows();
-                NATIVE_SCALAR_COUNTS.incrementAndGet();
-                return MatchedCount.exact(counted);
-            }
-        }
-        long limit = (long) upTo + 1L;
-        long counted = countRows(dataset, builder.limit(limit).build(), cancellation);
-        BOUNDED_SCALAR_COUNT_SCANS.incrementAndGet();
-        return new MatchedCount(counted, counted >= limit);
-    }
-
-    /**
-     * Number of scalar filter counts {@link #countScalarFilter} answered
-     * through {@link LanceScanner#countRows()} since the class loaded.
-     */
-    static final AtomicLong NATIVE_SCALAR_COUNTS = new AtomicLong();
-
-    /**
-     * Number of scalar filter counts {@link #countScalarFilter} answered
-     * by a scan limited to {@code upTo + 1} rows since the class loaded.
-     */
-    static final AtomicLong BOUNDED_SCALAR_COUNT_SCANS = new AtomicLong();
-
-    /**
-     * Scan options for a count-only scalar filter scan over
-     * {@code fragmentIds}: no columns, no row address, no row id.
-     */
-    private static ScanOptions.Builder countOnlyScan(String filterSql, List<Integer> fragmentIds) {
-        return new ScanOptions.Builder().filter(filterSql)
-            .fragmentIds(fragmentIds)
-            .columns(Collections.emptyList())
-            .withRowAddress(false)
-            .withRowId(false);
-    }
-
-    /**
-     * Count FTS hits without materialising scores or payload columns.
-     *
-     * <p>Lance's inverted-index scanner can walk the posting list
-     * once and stream row counts when we ask for zero columns and
-     * no row address / row id. This is the count-only counterpart
-     * of {@code Dataset.countRows(sqlFilter)} for scalar filters.
-     * Without this path an FTS count goes through
-     * {@code IndexSearcher.count(luceneQuery)}, which triggers
-     * {@link LanceFtsQuery}'s Weight to materialise every match's
-     * row address and score into a sparse array (see
-     * {@code LanceFtsQuery.scorerSupplier}). The Weight is
-     * necessary for the hits phase, but only wastes work for a
-     * pure count.
-     *
-     * <p>The Lance SDK has no {@code Dataset.countRows(FullTextQuery)}
-     * overload today, so this method assembles a scan that yields
-     * zero payload columns; the batches carry only the row count
-     * that the aggregator returns via {@code getRowCount()}. When
-     * {@code fragmentIds} is null or covers every fragment of the
-     * dataset that is the whole scan, and Lance answers it from the
-     * inverted index alone.
-     *
-     * <p>A proper subset (one executor of a multi node fan out) is
-     * not passed to Lance either, because a fragment list makes Lance
-     * read {@code _rowid} over the listed fragments as a prefilter
-     * (see {@link LanceFtsQuery#restrictToFragmentsUnlessAll}).
-     * Instead the scan runs over the whole table with
-     * {@code withRowAddress(true)} and the rows whose fragment id
-     * (upper 32 bits of {@code _rowaddr}) is in {@code fragmentIds}
-     * are counted here, next to the number of rows Lance returned
-     * before that filter:
-     * <ul>
-     *   <li>{@code limit > 0} (the {@code track_total_hits} bound,
-     *       passed as {@code upTo + 1}): one scan with that limit.
-     *       Every executor sees the same {@code min(total, upTo + 1)}
-     *       rows and counts its own fragments' share. The caller
-     *       compares {@link FtsHitCount#scanned()} with the limit to
-     *       decide whether the share is exact or a lower bound: when
-     *       the scan filled its limit the table has more than
-     *       {@code upTo} matches and every executor reports a lower
-     *       bound, whatever its share. The shares themselves need
-     *       not sum to {@code upTo + 1}, since a tie in score at the
-     *       limit lets each executor's scan pick a different row.</li>
-     *   <li>{@code limit == 0} ({@code track_total_hits: true}): a
-     *       probe scan with {@code limit(effectiveSubsetProbeLimit)}
-     *       for the rows the executor's fragments hold. When it
-     *       comes back short every match has been seen and the
-     *       executor's share is the exact count. When it fills up the
-     *       probe is discarded and the count-only scan above runs with
-     *       the {@code fragmentIds} restriction, paying the prefilter
-     *       read for that one shape.</li>
-     * </ul>
-     *
-     * <p>A prefilter carried by {@code fts} (the scalar clauses of a
-     * collapsed bool query) is passed the same way the hits scan
-     * passes it, so the count covers exactly the rows the hits phase
-     * can return.
-     *
-     * <p>{@code limit} caps the rows the scan returns; {@code 0}
-     * means no cap. Even with no payload columns the scan's cost
-     * grows with the number of matches (Lance scores and ranks every
-     * posting before it can emit rows), so a caller that only needs
-     * to know whether more than {@code n} rows match passes
-     * {@code n + 1} and stops the scan there.
-     */
-    static FtsHitCount countFtsHitsDirectly(Dataset dataset, LanceFtsQuery fts, List<Integer> fragmentIds, long limit) throws Exception {
-        return countFtsHitsDirectly(dataset, fts, fragmentIds, limit, LanceCancellation.NONE);
-    }
-
-    /** {@link #countFtsHitsDirectly(Dataset, LanceFtsQuery, List, long)} whose scans stop once {@code cancellation} reports a cancelled task. */
-    static FtsHitCount countFtsHitsDirectly(
-        Dataset dataset,
-        LanceFtsQuery fts,
-        List<Integer> fragmentIds,
-        long limit,
-        LanceCancellation cancellation
-    ) throws Exception {
-        boolean subset = fragmentIds != null && !LanceFtsQuery.coversAllFragments(fragmentIds, dataset);
-        if (!subset) {
-            ScanOptions.Builder builder = countOnlyScan(fts);
-            if (limit > 0) {
-                builder = builder.limit(limit);
-            }
-            return FtsHitCount.whole(countRows(dataset, builder.build(), cancellation));
-        }
-        Set<Integer> own = new HashSet<>(fragmentIds);
-        if (limit > 0) {
-            return countOwnRows(dataset, rowAddressScan(fts).limit(limit).build(), own, cancellation);
-        }
-        long subsetRows = 0L;
-        for (Fragment fragment : dataset.getFragments()) {
-            if (own.contains(fragment.getId())) {
-                subsetRows += fragment.countRows();
-            }
-        }
-        long probeLimit = LanceFtsQuery.effectiveSubsetProbeLimit(subsetRows);
-        FtsHitCount probe = countOwnRows(dataset, rowAddressScan(fts).limit(probeLimit).build(), own, cancellation);
-        if (probe.scanned() < probeLimit) {
-            return probe;
-        }
-        return FtsHitCount.whole(
-            countRows(dataset, LanceFtsQuery.restrictToFragmentsUnlessAll(countOnlyScan(fts), fragmentIds, dataset).build(), cancellation)
-        );
-    }
-
-    /** Scan options for a count-only FTS scan: no columns, no row address, no row id. */
-    private static ScanOptions.Builder countOnlyScan(LanceFtsQuery fts) {
-        ScanOptions.Builder builder = new ScanOptions.Builder().fullTextQuery(fts.fullTextQuery())
-            .columns(Collections.emptyList())
-            .withRowAddress(false)
-            .withRowId(false);
-        if (fts.scanFilterSql() != null) {
-            builder = builder.filter(fts.scanFilterSql()).prefilter(true);
-        }
-        return builder;
-    }
-
-    /** Scan options for an FTS scan that returns {@code _rowaddr} only. */
-    private static ScanOptions.Builder rowAddressScan(LanceFtsQuery fts) {
-        return countOnlyScan(fts).withRowAddress(true);
-    }
-
-    private static long countRows(Dataset dataset, ScanOptions options, LanceCancellation cancellation) throws Exception {
-        long total = 0L;
-        try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
-            while (reader.loadNextBatch()) {
-                cancellation.checkCancelled();
-                total += reader.getVectorSchemaRoot().getRowCount();
-            }
-        }
-        return total;
-    }
-
-    /**
-     * Result of {@link #countFtsHitsDirectly}: the rows Lance returned
-     * for the scan before any fragment filter ({@code scanned}), and
-     * how many of them belong to the fragments the executor holds
-     * ({@code own}). The two are equal when the scan was already
-     * restricted to those fragments or covered the whole table on an
-     * executor that holds every fragment.
-     */
-    record FtsHitCount(long scanned, long own) {
-        /** A scan whose every returned row belongs to the executor. */
-        static FtsHitCount whole(long rows) {
-            return new FtsHitCount(rows, rows);
-        }
-    }
-
-    /**
-     * Read {@code options} against {@code dataset} and count the rows
-     * whose fragment id is in {@code own} next to every row returned.
-     */
-    private static FtsHitCount countOwnRows(Dataset dataset, ScanOptions options, Set<Integer> own, LanceCancellation cancellation)
-        throws Exception {
-        long scanned = 0L;
-        long kept = 0L;
-        try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
-            while (reader.loadNextBatch()) {
-                cancellation.checkCancelled();
-                VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
-                int rows = root.getRowCount();
-                scanned += rows;
-                for (int i = 0; i < rows; i++) {
-                    if (own.contains((int) (rowAddr.get(i) >>> 32))) {
-                        kept++;
-                    }
-                }
-            }
-        }
-        return new FtsHitCount(scanned, kept);
     }
 }

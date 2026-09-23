@@ -18,10 +18,13 @@ import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
+import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.LanceFtsMatch;
 import org.opensearch.lance.plan.rel.LanceHitShape;
 import org.opensearch.lance.plan.rel.LanceKnnSearch;
 import org.opensearch.lance.plan.rel.LanceTopK;
+import org.opensearch.lance.plan.rel.physical.FanOutExec;
+import org.opensearch.lance.plan.rel.physical.MergeExec;
 import org.opensearch.lance.plan.rules.SortResolution;
 import org.opensearch.lance.query.LanceFtsBoolQueryBuilder;
 import org.opensearch.lance.query.LanceFtsBoostQueryBuilder;
@@ -116,6 +119,48 @@ public final class SearchRequestToRel {
             return AggregationToRel.translate(source.aggregations(), model, relBuilder);
         }
         return hitsOver(relBuilder.build(), source, size, model);
+    }
+
+    /**
+     * The coordinator layer over a per-node plan: a {@link MergeExec}
+     * whose reduce kind matches what the plan produces, over a
+     * {@link FanOutExec} of {@code fanOut} per-node requests cut by
+     * {@link FanOutExec.Partitioning#EQUAL_FRAGMENT_GROUPS}, over the
+     * plan itself. The per-node tree {@link #translate} builds is
+     * untouched; the wrapper only adds the two distributed operators
+     * so the fan-out and the reduce are plan nodes the Volcano run
+     * lowers (through the coordinator layer converters) and the
+     * executor traverses, instead of a hand written path outside the
+     * planner's view. An aggregation plan ({@link LanceAggregate}
+     * root) reduces through the stock aggregation reduce, a hits plan
+     * ({@link LanceHitShape} root) merges the per-node pages, and a
+     * count plan (any other root: the bare query tree of a
+     * {@code size} 0 full text or knn request, a {@code Filter}, or
+     * the scan itself) sums the per-node counts.
+     */
+    public static RelNode withCoordinatorLayer(RelNode perNodePlan, int fanOut) {
+        MergeExec.ReduceKind reduceKind;
+        if (perNodePlan instanceof LanceAggregate) {
+            reduceKind = MergeExec.ReduceKind.AGGREGATE_INTERNAL;
+        } else if (perNodePlan instanceof LanceHitShape) {
+            reduceKind = MergeExec.ReduceKind.HITS_TOP_K;
+        } else {
+            reduceKind = MergeExec.ReduceKind.COUNT_SUM;
+        }
+        return withCoordinatorLayer(perNodePlan, reduceKind, fanOut);
+    }
+
+    /** {@link #withCoordinatorLayer(RelNode, int)} with the reduce kind the caller derived from the request shape. */
+    public static RelNode withCoordinatorLayer(RelNode perNodePlan, MergeExec.ReduceKind reduceKind, int fanOut) {
+        RelOptCluster cluster = perNodePlan.getCluster();
+        FanOutExec fanOutExec = new FanOutExec(
+            cluster,
+            cluster.traitSetOf(Convention.NONE),
+            perNodePlan,
+            fanOut,
+            FanOutExec.Partitioning.EQUAL_FRAGMENT_GROUPS
+        );
+        return new MergeExec(cluster, cluster.traitSetOf(Convention.NONE), fanOutExec, reduceKind);
     }
 
     /**

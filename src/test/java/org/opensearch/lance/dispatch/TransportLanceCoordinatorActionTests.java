@@ -28,10 +28,12 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.lance.LancePlugin;
-import org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.FragmentFanOut;
-import org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.FragmentFanOut.Outcome;
-import org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.FragmentGroup;
-import org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.RankedHit;
+import org.opensearch.lance.plan.execute.FragmentFanOut;
+import org.opensearch.lance.plan.execute.FragmentFanOut.Outcome;
+import org.opensearch.lance.plan.execute.MergeReducer;
+import org.opensearch.lance.plan.execute.MergeReducer.RankedHit;
+import org.opensearch.lance.plan.execute.PlanExecutor;
+import org.opensearch.lance.plan.execute.PlanExecutor.FragmentGroup;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
@@ -511,7 +513,7 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
         perNode.put(NODE_A, List.of(0, 2, 4));
         perNode.put(NODE_B, List.of(1, 3, 5));
 
-        List<FragmentGroup> groups = TransportLanceCoordinatorAction.splitByRows(perNode, ids, rows, 1000L);
+        List<FragmentGroup> groups = PlanExecutor.splitByRows(perNode, ids, rows, 1000L);
 
         assertEquals(2, groups.size());
         assertEquals(NODE_A, groups.get(0).node());
@@ -532,7 +534,7 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
         perNode.put(NODE_A, List.of(0, 2, 3, 5));
         perNode.put(NODE_B, List.of(1, 4));
 
-        List<FragmentGroup> groups = TransportLanceCoordinatorAction.splitByRows(perNode, ids, rows, 100L);
+        List<FragmentGroup> groups = PlanExecutor.splitByRows(perNode, ids, rows, 100L);
 
         assertEquals(4, groups.size());
         assertEquals(List.of(0), groups.get(0).fragmentIds());
@@ -559,7 +561,7 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
         Map<DiscoveryNode, List<Integer>> perNode = new LinkedHashMap<>();
         perNode.put(NODE_A, List.of(0, 1, 2));
 
-        List<FragmentGroup> groups = TransportLanceCoordinatorAction.splitByRows(perNode, List.of(0, 1, 2), List.of(10L, 500L, 10L), 100L);
+        List<FragmentGroup> groups = PlanExecutor.splitByRows(perNode, List.of(0, 1, 2), List.of(10L, 500L, 10L), 100L);
 
         assertEquals(3, groups.size());
         assertEquals(List.of(0), groups.get(0).fragmentIds());
@@ -597,8 +599,8 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
         List<RankedHit> groupTwo = List.of(hit(3), hit(2));
         List<RankedHit> groupThree = List.of(hit(5), hit(4));
 
-        List<SearchHit> fromWhole = TransportLanceCoordinatorAction.mergeHits(List.of(whole), sorts);
-        List<SearchHit> fromGroups = TransportLanceCoordinatorAction.mergeHits(List.of(groupOne, groupTwo, groupThree), sorts);
+        List<SearchHit> fromWhole = MergeReducer.mergeHits(List.of(whole), sorts);
+        List<SearchHit> fromGroups = MergeReducer.mergeHits(List.of(groupOne, groupTwo, groupThree), sorts);
 
         assertEquals(ids(fromWhole), ids(fromGroups));
         assertEquals(List.of("5", "4", "3", "2", "1", "0"), ids(fromGroups));
@@ -606,13 +608,13 @@ public class TransportLanceCoordinatorActionTests extends OpenSearchTestCase {
         // hits.total: exact counts add up; under a bound each group scans
         // up to bound + 1 rows, so a sum past the bound reads gte at the
         // bound, as one response that filled the bound would.
-        TotalHits exact = TransportLanceCoordinatorAction.totalHits(2 + 2 + 2, false, SearchContext.TRACK_TOTAL_HITS_ACCURATE);
+        TotalHits exact = MergeReducer.totalHits(2 + 2 + 2, false, SearchContext.TRACK_TOTAL_HITS_ACCURATE);
         assertEquals(6L, exact.value());
         assertEquals(TotalHits.Relation.EQUAL_TO, exact.relation());
-        TotalHits bounded = TransportLanceCoordinatorAction.totalHits(2 + 2 + 2, false, 4);
+        TotalHits bounded = MergeReducer.totalHits(2 + 2 + 2, false, 4);
         assertEquals(4L, bounded.value());
         assertEquals(TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO, bounded.relation());
-        TotalHits oneGroupFilled = TransportLanceCoordinatorAction.totalHits(3 + 1, true, 4);
+        TotalHits oneGroupFilled = MergeReducer.totalHits(3 + 1, true, 4);
         assertEquals(bounded, oneGroupFilled);
     }
 

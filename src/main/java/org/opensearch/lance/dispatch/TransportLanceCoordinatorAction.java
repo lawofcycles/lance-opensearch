@@ -5,40 +5,30 @@
 
 package org.opensearch.lance.dispatch;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.Executor;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReferenceArray;
-import java.util.function.Consumer;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.arrow.vector.types.pojo.Schema;
-import org.apache.calcite.rel.type.RelDataType;
-import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.tools.RelBuilder;
 import org.apache.lucene.search.TotalHits;
 import org.lance.Dataset;
 import org.lance.Fragment;
-import org.opensearch.OpenSearchTimeoutException;
-import org.opensearch.action.ActionRunnable;
 import org.opensearch.action.admin.cluster.node.tasks.cancel.CancelTasksRequest;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchResponseSections;
 import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.action.support.ActionFilters;
-import org.opensearch.action.support.GroupedActionListener;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -50,13 +40,8 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.Index;
-import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.core.tasks.TaskId;
-import org.opensearch.index.query.MatchAllQueryBuilder;
-import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
@@ -67,29 +52,25 @@ import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
-import org.opensearch.lance.plan.lancesql.RexToLanceSql;
-import org.opensearch.lance.plan.translate.QueryToRex;
+import org.opensearch.lance.plan.execute.FragmentFanOut;
+import org.opensearch.lance.plan.execute.MergeReducer;
+import org.opensearch.lance.plan.execute.PlanExecutor;
+import org.opensearch.lance.plan.rel.physical.MergeExec;
+import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.SearchService;
-import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.AggregatorFactories;
-import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.internal.SearchContext;
-import org.opensearch.search.sort.FieldSortBuilder;
-import org.opensearch.search.sort.ScoreSortBuilder;
 import org.opensearch.search.sort.SortBuilder;
-import org.opensearch.search.sort.SortOrder;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.ReceiveTimeoutTransportException;
-import org.opensearch.transport.TransportException;
 import org.opensearch.transport.TransportRequestOptions;
-import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -153,6 +134,12 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * filter SQL at plan time; the budgets mirror the explain action's.
      */
     private final LancePlannerFactory plannerFactory;
+    /**
+     * Runs the coordinator plan: the {@code MergeExec (FanOutExec
+     * (per node plan))} tree built per target executes as the per-node
+     * fan-out and the reduce of the gathered responses.
+     */
+    private final PlanExecutor planExecutor;
 
     /**
      * Requests that reach this action over the transport layer (a
@@ -185,6 +172,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.getKey()
         );
         this.plannerFactory = new LancePlannerFactory(nativeBudgetBytes, Runtime.getRuntime().maxMemory());
+        this.planExecutor = new PlanExecutor(plannerFactory);
     }
 
     /**
@@ -323,7 +311,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         );
         boolean versionRequested = source != null && Boolean.TRUE.equals(source.version());
         boolean seqNoAndPrimaryTermRequested = source != null && Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
-        MergeState merged = new MergeState(
+        MergeReducer merged = new MergeReducer(
+            clusterService,
+            bigArrays,
+            scriptService,
             aggregations,
             sorts,
             from,
@@ -398,7 +389,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         FragmentQuerySpec spec,
         FanOutPolicy policy,
         SearchSourceBuilder source,
-        MergeState merged,
+        MergeReducer merged,
         long startMillis,
         ActionListener<SearchResponse> listener
     ) {
@@ -430,7 +421,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * across the data-node list, and issue one
      * {@link LanceFragmentQueryAction} per node, or several per node
      * when the node's fragments hold more rows than one Lucene reader
-     * may (see {@link #splitByRows}). The target's filter SQL is
+     * may (see {@link PlanExecutor#splitByRows}). The target's filter SQL is
      * derived here, once per target while its dataset is open, because
      * the planner's model needs the Arrow schema and the SQL literal
      * encoding depends on the target's own columns: two indices in the
@@ -444,7 +435,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         FragmentQuerySpec baseSpec,
         SearchSourceBuilder source,
         FanOutPolicy policy,
-        MergeState merged,
+        MergeReducer merged,
         ActionListener<Void> done
     ) throws Exception {
         List<Integer> allFragmentIds;
@@ -487,7 +478,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             () -> totalRows
         );
         FragmentQuerySpec spec = new FragmentQuerySpec(
-            resolveScanFilterSql(source == null ? null : source.query(), model, target.sqlExcludedColumns(), plannerFactory),
+            PlanExecutor.resolveScanFilterSql(source == null ? null : source.query(), model, target.sqlExcludedColumns(), plannerFactory),
             baseSpec.query(),
             baseSpec.postFilter(),
             baseSpec.sorts(),
@@ -517,17 +508,17 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // via topLevelReduce. Same wire format as any other
             // fan-out; the only novel case is the reader being
             // shaped to maxDoc=0.
-            dispatchEmptyAggregationRun(target, observedVersion, nodeList.get(0), spec, policy, merged, done);
+            dispatchEmptyAggregationRun(model, target, observedVersion, nodeList.get(0), spec, policy, merged, done);
             return;
         }
 
-        Map<DiscoveryNode, List<Integer>> perNode = groupFragmentsByNode(allFragmentIds, nodeList);
+        Map<DiscoveryNode, List<Integer>> perNode = PlanExecutor.groupFragmentsByNode(allFragmentIds, nodeList);
         // A node's fragments go out in one request unless their rows
         // would not fit one Lucene reader on the executor; then the node
         // gets one request per group of fragments that fits. Every table
         // under the bound (the usual case) keeps one request per node.
         long maxDocs = clusterService.getClusterSettings().get(LancePlugin.MAX_DOCS_PER_READER_SETTING);
-        List<FragmentGroup> groups = splitByRows(perNode, allFragmentIds, allFragmentRows, maxDocs);
+        List<PlanExecutor.FragmentGroup> groups = PlanExecutor.splitByRows(perNode, allFragmentIds, allFragmentRows, maxDocs);
 
         // Responses land in the slot of the request they answer, so the
         // merge sees them in fan-out (node id, then group) order rather
@@ -544,36 +535,75 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // allow_partial_search_results the request answers from the
         // other nodes and says so with timed_out: true, the contract
         // of the shard path's timeout.
-        FragmentFanOut fanOut = newFanOut(groups.size(), target, policy, merged, done);
-        FragmentFanOut.Sender sender = sender(policy.task(), policy.timeout());
+        //
+        // Dispatch goes through TransportService so remote data nodes
+        // receive the requests. For the local node this still executes
+        // in-process because TransportService's request handler
+        // dispatch is loopback aware, but any other node in the
+        // cluster picks up its slice through the network.
+        planExecutor.execute(
+            coordinatorPlan(model, spec, groups.size()),
+            fanOutContext(groups, target, observedVersion, spec, policy),
+            merged,
+            target.indexName(),
+            done
+        );
+    }
 
-        int slot = 0;
-        for (FragmentGroup group : groups) {
-            final int slotIndex = slot++;
-            DiscoveryNode nodeTarget = group.node();
+    /**
+     * The coordinator plan of one target: the {@code MergeExec}
+     * whose reduce kind matches the request shape (the stock
+     * aggregation reduce for a request carrying aggregations, the
+     * hit page merge for one asking for hits, the count sum for a
+     * {@code size} 0 request without aggregations), over the
+     * {@code FanOutExec} of the per-node requests, over the target's
+     * bare scan. The per-node plan detail below the fan-out is owned
+     * by the fragment executors, which plan their own requests
+     * against the open dataset; the coordinator's tree mirrors the
+     * distribution and the reduce, which is what it executes. A
+     * schema with a column no Calcite type spells (a geo_point over
+     * FixedSizeList) refuses the scan's row type; a one column
+     * values placeholder stands in for the scan then, because the
+     * per-node subtree carries no execution detail here anyway.
+     */
+    private RelNode coordinatorPlan(LanceSchemas.IndexModel model, FragmentQuerySpec spec, int fanOut) {
+        boolean hasAggregations = spec.aggregations() != null && !spec.aggregations().getAggregatorFactories().isEmpty();
+        MergeExec.ReduceKind reduceKind = hasAggregations ? MergeExec.ReduceKind.AGGREGATE_INTERNAL
+            : spec.effectiveSize() > 0 ? MergeExec.ReduceKind.HITS_TOP_K
+            : MergeExec.ReduceKind.COUNT_SUM;
+        RelNode perNode;
+        try {
+            RelBuilder relBuilder = plannerFactory.relBuilder(model.schema());
+            relBuilder.scan(LancePlannerFactory.SCHEMA_NAME, model.indexName());
+            perNode = relBuilder.build();
+        } catch (UnsupportedOperationException unsupportedColumn) {
+            perNode = plannerFactory.relBuilder(model.schema()).values(new String[] { "row" }, 0).build();
+        }
+        return SearchRequestToRel.withCoordinatorLayer(perNode, reduceKind, fanOut);
+    }
+
+    /**
+     * Everything the fan-out execution needs beyond the plan: the
+     * groups, the transport payload of each (built and logged as the
+     * request leaves), the sender under the request's task and
+     * timeout, the pools, and the listener a node that will not
+     * answer is reported through.
+     */
+    private PlanExecutor.FanOutContext fanOutContext(
+        List<PlanExecutor.FragmentGroup> groups,
+        IndexTarget target,
+        long observedVersion,
+        FragmentQuerySpec spec,
+        FanOutPolicy policy
+    ) {
+        return new PlanExecutor.FanOutContext(groups, group -> {
             List<Integer> fragmentsForNode = group.fragmentIds();
-            LanceFragmentQueryRequest fragmentRequest = new LanceFragmentQueryRequest(
-                target.tableUri(),
-                target.indexName(),
-                target.storageOptions(),
-                observedVersion,
-                spec.filterSql(),
-                spec.query(),
-                spec.postFilter(),
-                spec.sorts(),
-                spec.searchAfter(),
-                spec.effectiveSize(),
-                spec.aggregations(),
-                fragmentsForNode,
-                spec.trackScores(),
-                spec.trackTotalHitsUpTo()
-            );
             if (group.groupCount() == 1) {
                 LOGGER.info(
                     "lance.dispatch: fan-out index [{}] table [{}] to node [{}] with fragments {}",
                     target.indexName(),
                     target.tableUri(),
-                    nodeTarget.getId(),
+                    group.node().getId(),
                     fragmentsForNode
                 );
             } else {
@@ -581,88 +611,17 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                     "lance.dispatch: fan-out index [{}] table [{}] to node [{}] with fragments {} (group {} of {}, {} rows)",
                     target.indexName(),
                     target.tableUri(),
-                    nodeTarget.getId(),
+                    group.node().getId(),
                     fragmentsForNode,
                     group.groupIndex() + 1,
                     group.groupCount(),
                     group.rows()
                 );
             }
-            // Dispatch through TransportService so remote data nodes
-            // receive the request. For the local node this still
-            // executes in-process because TransportService's request
-            // handler dispatch is loopback aware, but any other node
-            // in the cluster picks up its slice through the network.
-            fanOut.send(sender, slotIndex, nodeTarget, fragmentRequest);
-        }
-    }
-
-    /**
-     * The fragments of one per-node request: a node's fragments, or the
-     * {@code groupIndex}th of {@code groupCount} contiguous groups of them
-     * when they do not fit one Lucene reader together, with the physical
-     * rows of the group.
-     */
-    record FragmentGroup(DiscoveryNode node, List<Integer> fragmentIds, long rows, int groupIndex, int groupCount) {
-    }
-
-    /**
-     * Cut every node's fragment list of {@code perNode} into contiguous
-     * groups whose physical rows fit in {@code maxDocs}, in the order of
-     * the map and of each list ({@link LanceDirectoryReader#groupEnds}).
-     * {@code fragmentIds} and {@code fragmentRows} are the table's
-     * fragments and their physical rows in the same order; a fragment id
-     * the rows are not known for counts as zero rows. A node whose
-     * fragments fit yields one group, so a table under the bound fans
-     * out exactly as before: one request per node.
-     */
-    static List<FragmentGroup> splitByRows(
-        Map<DiscoveryNode, List<Integer>> perNode,
-        List<Integer> fragmentIds,
-        List<Long> fragmentRows,
-        long maxDocs
-    ) {
-        Map<Integer, Long> rowsById = new HashMap<>(fragmentIds.size());
-        for (int i = 0; i < fragmentIds.size(); i++) {
-            rowsById.put(fragmentIds.get(i), fragmentRows.get(i));
-        }
-        List<FragmentGroup> groups = new ArrayList<>(perNode.size());
-        for (Map.Entry<DiscoveryNode, List<Integer>> assignment : perNode.entrySet()) {
-            List<Integer> nodeFragments = assignment.getValue();
-            long[] rows = new long[nodeFragments.size()];
-            for (int i = 0; i < rows.length; i++) {
-                rows[i] = rowsById.getOrDefault(nodeFragments.get(i), 0L);
-            }
-            int[] ends = LanceDirectoryReader.groupEnds(rows, maxDocs);
-            int start = 0;
-            for (int g = 0; g < ends.length; g++) {
-                long groupRows = 0L;
-                for (int i = start; i < ends[g]; i++) {
-                    groupRows += rows[i];
-                }
-                groups.add(
-                    new FragmentGroup(assignment.getKey(), List.copyOf(nodeFragments.subList(start, ends[g])), groupRows, g, ends.length)
-                );
-                start = ends[g];
-            }
-        }
-        return groups;
-    }
-
-    /**
-     * The fan-out of one target under {@code policy}: the merge absorbs
-     * the responses that arrived into {@code merged} and marks the
-     * response timed out when a node did not answer; a node that did
-     * not answer is logged and its executor task cancelled.
-     */
-    private FragmentFanOut newFanOut(int size, IndexTarget target, FanOutPolicy policy, MergeState merged, ActionListener<Void> done) {
-        return new FragmentFanOut(
-            size,
+            return fragmentRequest(target, observedVersion, spec, fragmentsForNode);
+        },
+            sender(policy.task(), policy.timeout()),
             threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL),
-            outcome -> merged.absorbTargetResponses(target, outcome.responses(), outcome.incompleteNodes() > 0),
-            done,
-            policy.allowPartialSearchResults(),
-            policy.task(),
             // The generic pool, not lance_coordinator: its queue is
             // unbounded, so the log line and the cancel of a node that
             // timed out never take the coordinator pool's queue slot the
@@ -670,35 +629,71 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // would otherwise refuse the merge on a small pool and turn
             // a timeout into a 429).
             threadPool.generic(),
-            (node, request, cause) -> {
-                String nodeId = node == null ? "?" : node.getId();
-                String fragments = request == null
-                    ? "?"
-                    : (request.fragmentIds().isEmpty() ? "all" : String.valueOf(request.fragmentIds().size()));
-                if (cause instanceof ReceiveTimeoutTransportException) {
-                    LOGGER.warn(
-                        "lance.dispatch: node [{}] did not answer the fragment request for index [{}] ({} fragments) within [{}]; "
-                            + "cancelling its executor task",
-                        nodeId,
-                        target.indexName(),
-                        fragments,
-                        policy.timeout()
-                    );
-                    cancelExecutorTask(policy.task(), node, request);
-                } else {
-                    // The executor's task was cancelled on that node,
-                    // through _tasks/_cancel or because this request's
-                    // task was cancelled; nothing left to stop there.
-                    LOGGER.debug(
-                        "lance.dispatch: the fragment query task on node [{}] for index [{}] ({} fragments) was cancelled: {}",
-                        nodeId,
-                        target.indexName(),
-                        fragments,
-                        cause.getMessage()
-                    );
-                }
-            }
+            incompleteNodeListener(target, policy),
+            policy.allowPartialSearchResults(),
+            policy.task()
         );
+    }
+
+    /** The transport payload of one per-node request. */
+    private LanceFragmentQueryRequest fragmentRequest(
+        IndexTarget target,
+        long observedVersion,
+        FragmentQuerySpec spec,
+        List<Integer> fragmentsForNode
+    ) {
+        return new LanceFragmentQueryRequest(
+            target.tableUri(),
+            target.indexName(),
+            target.storageOptions(),
+            observedVersion,
+            spec.filterSql(),
+            spec.query(),
+            spec.postFilter(),
+            spec.sorts(),
+            spec.searchAfter(),
+            spec.effectiveSize(),
+            spec.aggregations(),
+            fragmentsForNode,
+            spec.trackScores(),
+            spec.trackTotalHitsUpTo()
+        );
+    }
+
+    /**
+     * How a node that did not answer is reported: a timeout is logged
+     * and its executor task cancelled; a cancelled executor only needs
+     * the debug line, nothing is left to stop there.
+     */
+    private FragmentFanOut.IncompleteNodeListener incompleteNodeListener(IndexTarget target, FanOutPolicy policy) {
+        return (node, request, cause) -> {
+            String nodeId = node == null ? "?" : node.getId();
+            String fragments = request == null
+                ? "?"
+                : (request.fragmentIds().isEmpty() ? "all" : String.valueOf(request.fragmentIds().size()));
+            if (cause instanceof ReceiveTimeoutTransportException) {
+                LOGGER.warn(
+                    "lance.dispatch: node [{}] did not answer the fragment request for index [{}] ({} fragments) within [{}]; "
+                        + "cancelling its executor task",
+                    nodeId,
+                    target.indexName(),
+                    fragments,
+                    policy.timeout()
+                );
+                cancelExecutorTask(policy.task(), node, request);
+            } else {
+                // The executor's task was cancelled on that node,
+                // through _tasks/_cancel or because this request's
+                // task was cancelled; nothing left to stop there.
+                LOGGER.debug(
+                    "lance.dispatch: the fragment query task on node [{}] for index [{}] ({} fragments) was cancelled: {}",
+                    nodeId,
+                    target.indexName(),
+                    fragments,
+                    cause.getMessage()
+                );
+            }
+        };
     }
 
     /**
@@ -712,380 +707,38 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * ran, no data" shape.
      */
     private void dispatchEmptyAggregationRun(
+        LanceSchemas.IndexModel model,
         IndexTarget target,
         long observedVersion,
         DiscoveryNode host,
         FragmentQuerySpec spec,
         FanOutPolicy policy,
-        MergeState merged,
+        MergeReducer merged,
         ActionListener<Void> done
     ) {
-        LanceFragmentQueryRequest fragmentRequest = new LanceFragmentQueryRequest(
-            target.tableUri(),
-            target.indexName(),
-            target.storageOptions(),
-            observedVersion,
-            spec.filterSql(),
-            spec.query(),
-            spec.postFilter(),
-            spec.sorts(),
-            spec.searchAfter(),
-            spec.effectiveSize(),
-            spec.aggregations(),
-            Collections.emptyList(),
-            spec.trackScores(),
-            spec.trackTotalHitsUpTo()
-        );
         LOGGER.info(
             "lance.dispatch: fan-out index [{}] table [{}] empty aggregation run on node [{}]",
             target.indexName(),
             target.tableUri(),
             host.getId()
         );
-        FragmentFanOut fanOut = newFanOut(1, target, policy, merged, done);
-        fanOut.send(sender(policy.task(), policy.timeout()), 0, host, fragmentRequest);
-    }
-
-    /**
-     * The per-node requests of one fan-out and the delivery of their
-     * responses to the merge.
-     *
-     * <p>Responses arrive on the transport thread that read them
-     * ({@link TransportResponseHandler#executor()} is
-     * {@link ThreadPool.Names#SAME}), so the transport layer never has
-     * to queue a response on a thread pool and can never reject one.
-     * A rejected response would close the channel it came on and fail
-     * every other request in flight on that channel, and the request
-     * whose response was dropped would never complete. On that thread
-     * a response is only stored in its slot and counted; nothing of
-     * Lance, Lucene or the reduce runs there.
-     *
-     * <p>When the last node has answered, the merge of the ordered
-     * responses is submitted to the coordinator pool. Every way the
-     * merge can fail to run or to finish reaches {@code done} exactly
-     * once: the pool rejecting the merge, the merge throwing, a node
-     * failing, and {@link #send} throwing before a request left the
-     * node all end in {@link ActionListener#onFailure}; the last
-     * response's merge completing ends in
-     * {@link ActionListener#onResponse}. A pool rejection is passed
-     * through as the pool's {@code OpenSearchRejectedExecutionException}
-     * so the client sees HTTP 429.
-     *
-     * <p>A node whose answer will not come counts as answered with an
-     * empty slot: its request timed out
-     * ({@link ReceiveTimeoutTransportException}, the transport layer
-     * has dropped the handler and a late answer is discarded there), or
-     * its executor task was cancelled and it answered
-     * {@link TaskCancelledException}. The {@link IncompleteNodeListener}
-     * is told once per such node. With partial results allowed the
-     * merge then runs over the responses that did arrive and the
-     * {@link Outcome} carries the count of missing nodes; otherwise the
-     * fan-out fails with {@link OpenSearchTimeoutException} (HTTP 504)
-     * carrying the transport exception as its cause, once every node
-     * has answered or timed out.
-     *
-     * <p>A cancelled coordinator task ends the fan-out with
-     * {@link TaskCancelledException} in place of the merge (and in
-     * place of any other failure), whatever the nodes answered. The
-     * task's state is read at the moment {@code done} is completed, so
-     * a cancellation that lands between a node's failure and the
-     * completion still wins.
-     */
-    static final class FragmentFanOut {
-
-        /** How a per-node request leaves the coordinator; {@code TransportService::sendChildRequest} outside tests. */
-        interface Sender {
-            void send(DiscoveryNode node, LanceFragmentQueryRequest request, TransportResponseHandler<LanceFragmentQueryResponse> handler);
-        }
-
-        /**
-         * Told about a node whose answer will not come, with the
-         * exception that said so. {@code node} and {@code request} are
-         * those {@link #send} was called with for the slot, null when
-         * the slot was never sent.
-         */
-        interface IncompleteNodeListener {
-            void onIncomplete(DiscoveryNode node, LanceFragmentQueryRequest request, TransportException cause);
-        }
-
-        /**
-         * What the merge receives: the responses that arrived, in slot
-         * order, and how many nodes did not answer (0 when every node
-         * did).
-         */
-        record Outcome(List<LanceFragmentQueryResponse> responses, int incompleteNodes) {
-        }
-
-        private final int size;
-        private final Executor notifyExecutor;
-        private final AtomicReferenceArray<LanceFragmentQueryResponse> slots;
-        private final AtomicReferenceArray<DiscoveryNode> nodes;
-        private final AtomicReferenceArray<LanceFragmentQueryRequest> requests;
-        private final AtomicInteger incompleteNodes = new AtomicInteger();
-        private final boolean allowPartialResults;
-        private final CancellableTask task;
-        private final IncompleteNodeListener incompleteListener;
-        private final GroupedActionListener<LanceFragmentQueryResponse> gathered;
-
-        /**
-         * A fan-out that allows partial results, runs under no task and
-         * tells nobody about a node that did not answer.
-         */
-        FragmentFanOut(int size, Executor mergeExecutor, Consumer<Outcome> merge, ActionListener<Void> done) {
-            this(size, mergeExecutor, merge, done, true, null, Runnable::run, (node, request, cause) -> {});
-        }
-
-        /**
-         * @param size                number of per-node requests
-         * @param mergeExecutor       pool the merge runs on once every response is in
-         * @param merge               consumes the responses in slot order
-         * @param done                completed once, after the merge or on the first failure
-         * @param allowPartialResults whether a node that did not answer leaves its slot empty (true) or fails the fan-out (false)
-         * @param task                the coordinator task, or null; a cancelled task ends the fan-out with TaskCancelledException
-         * @param notifyExecutor      pool the incomplete listener runs on, off the transport thread; a pool with an
-         *                            unbounded queue, so a notification never takes a queue slot from the merge
-         * @param incompleteListener  told once about every node that did not answer
-         */
-        FragmentFanOut(
-            int size,
-            Executor mergeExecutor,
-            Consumer<Outcome> merge,
-            ActionListener<Void> done,
-            boolean allowPartialResults,
-            CancellableTask task,
-            Executor notifyExecutor,
-            IncompleteNodeListener incompleteListener
-        ) {
-            this.size = size;
-            this.notifyExecutor = notifyExecutor;
-            this.slots = new AtomicReferenceArray<>(size);
-            this.nodes = new AtomicReferenceArray<>(size);
-            this.requests = new AtomicReferenceArray<>(size);
-            this.allowPartialResults = allowPartialResults;
-            this.task = task;
-            this.incompleteListener = incompleteListener;
-            // The task's state is read here, at the completion of done,
-            // and not where the failure or the merge result was produced:
-            // a cancellation that lands in between still ends the request
-            // as cancelled.
-            ActionListener<Void> once = ActionListener.notifyOnce(ActionListener.wrap(v -> {
-                if (isCancelled()) {
-                    done.onFailure(cancelled());
-                } else {
-                    done.onResponse(v);
-                }
-            }, e -> done.onFailure(cancelledOr(e))));
-            this.gathered = new GroupedActionListener<>(ActionListener.wrap(responses -> {
-                // ActionRunnable routes a throwing merge and a
-                // rejected submit (AbstractRunnable.onRejection
-                // defaults to onFailure) to once.onFailure, and a
-                // completed merge to once.onResponse.
-                mergeExecutor.execute(ActionRunnable.run(once, () -> {
-                    ensureNotCancelled();
-                    List<LanceFragmentQueryResponse> ordered = new ArrayList<>(size);
-                    for (int i = 0; i < size; i++) {
-                        LanceFragmentQueryResponse response = slots.get(i);
-                        if (response != null) {
-                            ordered.add(response);
-                        }
-                    }
-                    merge.accept(new Outcome(ordered, incompleteNodes.get()));
-                }));
-            }, once::onFailure), size);
-        }
-
-        /**
-         * Send the request for {@code slot}. A synchronous failure of
-         * the sender (the node is gone, the request does not serialise,
-         * the coordinator task has been cancelled and refuses new
-         * children) counts as that node's failure so the fan-out still
-         * completes once the other nodes have answered.
-         */
-        void send(Sender sender, int slot, DiscoveryNode node, LanceFragmentQueryRequest request) {
-            nodes.set(slot, node);
-            requests.set(slot, request);
-            try {
-                sender.send(node, request, handler(slot));
-            } catch (Exception e) {
-                gathered.onFailure(e);
-            }
-        }
-
-        /** The response handler for {@code slot}. */
-        TransportResponseHandler<LanceFragmentQueryResponse> handler(int slot) {
-            return new TransportResponseHandler<>() {
-                @Override
-                public LanceFragmentQueryResponse read(StreamInput in) throws IOException {
-                    return new LanceFragmentQueryResponse(in);
-                }
-
-                @Override
-                public void handleResponse(LanceFragmentQueryResponse response) {
-                    slots.set(slot, response);
-                    gathered.onResponse(response);
-                }
-
-                @Override
-                public void handleException(TransportException exp) {
-                    if (!isIncomplete(exp)) {
-                        gathered.onFailure(exp);
-                        return;
-                    }
-                    incompleteNodes.incrementAndGet();
-                    notifyIncomplete(nodes.get(slot), requests.get(slot), exp);
-                    if (allowPartialResults) {
-                        gathered.onResponse(null);
-                    } else {
-                        gathered.onFailure(timedOut(nodes.get(slot), exp));
-                    }
-                }
-
-                @Override
-                public String executor() {
-                    return ThreadPool.Names.SAME;
-                }
-            };
-        }
-
-        /**
-         * Tell the listener about a node that will not answer, on the
-         * notify pool: this runs from the transport thread that delivered
-         * the exception (or the timeout handler's thread), and the
-         * listener formats a log line and sends a cancel request, neither
-         * of which belongs on a transport thread. The node is counted as
-         * incomplete before this is called, so a pool that refuses the
-         * runnable only costs the log line and the cancel of that
-         * executor, which the timeout has already detached from the
-         * request; the fan-out itself completes as before.
-         */
-        private void notifyIncomplete(DiscoveryNode node, LanceFragmentQueryRequest request, TransportException cause) {
-            try {
-                notifyExecutor.execute(() -> {
-                    try {
-                        incompleteListener.onIncomplete(node, request, cause);
-                    } catch (Exception e) {
-                        LOGGER.warn(
-                            "lance.dispatch: the incomplete node listener failed for node [{}]",
-                            node == null ? "?" : node.getId(),
-                            e
-                        );
-                    }
-                });
-            } catch (Exception rejected) {
-                LOGGER.warn(
-                    "lance.dispatch: could not report node [{}] as incomplete on the coordinator pool: {}",
-                    node == null ? "?" : node.getId(),
-                    rejected.toString()
-                );
-            }
-        }
-
-        /**
-         * Whether {@code exp} says the node's answer will not come: the
-         * request timed out, or the executor's task was cancelled (the
-         * exception then arrives wrapped in the transport layer's
-         * {@code RemoteTransportException}).
-         */
-        static boolean isIncomplete(TransportException exp) {
-            return exp instanceof ReceiveTimeoutTransportException || TransportLanceFragmentQueryAction.findCancelled(exp) != null;
-        }
-
-        private static OpenSearchTimeoutException timedOut(DiscoveryNode node, TransportException cause) {
-            return new OpenSearchTimeoutException(
-                "lance fragment request to node [" + (node == null ? "?" : node.getId()) + "] did not complete in time",
-                cause
-            );
-        }
-
-        private boolean isCancelled() {
-            return task != null && task.isCancelled();
-        }
-
-        private TaskCancelledException cancelled() {
-            return new TaskCancelledException("cancelled task with reason: " + task.getReasonCancelled());
-        }
-
-        private void ensureNotCancelled() {
-            if (isCancelled()) {
-                throw cancelled();
-            }
-        }
-
-        /** {@code e}, or a {@link TaskCancelledException} carrying it when the coordinator task has been cancelled. */
-        private Exception cancelledOr(Exception e) {
-            if (isCancelled()) {
-                TaskCancelledException cancelled = cancelled();
-                cancelled.addSuppressed(e);
-                return cancelled;
-            }
-            return e;
-        }
-    }
-
-    /**
-     * Round-robin fragment ids across the sorted data-node list.
-     * Empty per-node bucket entries are omitted so downstream
-     * dispatch code only sees nodes that actually own work. The map
-     * iterates in {@code nodeList} order so the fan-out is
-     * deterministic.
-     */
-    private static Map<DiscoveryNode, List<Integer>> groupFragmentsByNode(List<Integer> fragmentIds, List<DiscoveryNode> nodeList) {
-        Map<DiscoveryNode, List<Integer>> result = new LinkedHashMap<>();
-        for (int i = 0; i < fragmentIds.size(); i++) {
-            DiscoveryNode node = nodeList.get(i % nodeList.size());
-            result.computeIfAbsent(node, k -> new ArrayList<>()).add(fragmentIds.get(i));
-        }
-        return result;
-    }
-
-    /**
-     * Derive the Lance SQL of the top-level query for metadata-only
-     * row counting and the scan-filter hits path, through the planner's
-     * translator and printer so the SQL spelling has one source.
-     * Returns {@code null} when the query is match_all, absent, cannot
-     * be expressed (match, knn, an unmapped field, a construct without
-     * a SQL spelling), or references an {@code ip} or {@code geo_point}
-     * override column, whose Lucene form (encoded doc values) differs
-     * from what the Lance column stores. In those cases the per-node
-     * executor falls back to the Lucene tree and
-     * {@link org.apache.lucene.search.IndexSearcher#count}.
-     */
-    static String resolveScanFilterSql(
-        QueryBuilder query,
-        LanceSchemas.IndexModel model,
-        Set<String> sqlExcludedColumns,
-        LancePlannerFactory factory
-    ) {
-        if (query == null || query instanceof MatchAllQueryBuilder) {
-            return null;
-        }
-        if (QueryToRex.referencesAny(query, sqlExcludedColumns)) {
-            return null;
-        }
-        try {
-            RelBuilder relBuilder = factory.relBuilder(model.schema()).transform(config -> config.withSimplify(false));
-            relBuilder.scan(LancePlannerFactory.SCHEMA_NAME, model.indexName());
-            RelDataType rowType = relBuilder.peek().getRowType();
-            RexNode predicate = QueryToRex.translate(query, model, relBuilder);
-            return RexToLanceSql.print(predicate, rowType).orElse(null);
-        } catch (UnsupportedOperationException unsupported) {
-            // Query shape outside the translator's set (match, knn,
-            // an unmapped field, ...). No filter push-down; the
-            // per-node hits path and computeMatched fall back to
-            // Lucene.
-            return null;
-        }
-    }
-
-    /**
-     * The override columns whose predicates never travel to Lance SQL:
-     * {@code ip} (raw strings versus encoded doc values) and
-     * {@code geo_point} (children hidden by the mapping).
-     */
-    static Set<String> sqlExcludedColumns(LanceOverrides overrides) {
-        Set<String> excluded = new java.util.LinkedHashSet<>(overrides.ipColumns());
-        excluded.addAll(overrides.geoPointColumns().keySet());
-        return excluded;
+        List<PlanExecutor.FragmentGroup> groups = List.of(new PlanExecutor.FragmentGroup(host, Collections.emptyList(), 0L, 0, 1));
+        planExecutor.execute(
+            coordinatorPlan(model, spec, 1),
+            new PlanExecutor.FanOutContext(
+                groups,
+                group -> fragmentRequest(target, observedVersion, spec, group.fragmentIds()),
+                sender(policy.task(), policy.timeout()),
+                threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL),
+                threadPool.generic(),
+                incompleteNodeListener(target, policy),
+                policy.allowPartialSearchResults(),
+                policy.task()
+            ),
+            merged,
+            target.indexName(),
+            done
+        );
     }
 
     private static int resolveSize(SearchSourceBuilder source) {
@@ -1131,7 +784,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                     overrides.subFields(),
                     renamedFields,
                     primaryKeyField,
-                    sqlExcludedColumns(overrides),
+                    PlanExecutor.sqlExcludedColumns(overrides),
                     overrides.dateColumns().keySet()
                 )
             );
@@ -1198,183 +851,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         }
     }
 
-    /**
-     * Merge the per-node hit lists into one list ordered the way a
-     * single executor would have ordered the union.
-     *
-     * <p>Each inner list is one node's response, already sorted by
-     * that node's executor and cut to {@code from + size}, with the
-     * Lance row address of every hit. The merge re-sorts the union
-     * with a comparator built from {@code sorts}:
-     * <ul>
-     *   <li>no sort clause, or a single {@code _score} clause: score
-     *       descending ({@link SearchHit#getScore()});</li>
-     *   <li>a {@code _score} clause among others: the raw sort value
-     *       at that position (the executor stores the score there;
-     *       {@link SearchHit#getScore()} is NaN when the request did
-     *       not set {@code track_scores}), in the clause's order;</li>
-     *   <li>a {@code _doc} clause: row address in the clause's order.
-     *       On a single reader over the whole table doc id order is
-     *       fragment order then offset, which is row address order,
-     *       so this is what the clause means there; the per-node doc
-     *       ids the executors report as sort values only order docs
-     *       within one node;</li>
-     *   <li>any other clause: {@link SearchHit#getRawSortValues()} at
-     *       that position, compared as {@link Comparable} in the
-     *       clause's order. The executor already substituted the
-     *       {@code missing} sentinel for numeric fields, so a null
-     *       only arrives for keyword fields; it sorts last unless the
-     *       clause says {@code "missing": "_first"}, the same default
-     *       OpenSearch's comparator sources apply.</li>
-     * </ul>
-     * Hits that compare equal are ordered by index (the order of the
-     * request's targets) and then by row address ascending. Lucene's
-     * collectors break ties by doc id ascending, so every executor
-     * returns the tied rows of its fragments in row address order and
-     * the lowest addresses of the whole table are always among the
-     * per-node pages; sorting the union by the same key therefore
-     * yields the page one reader over the whole table would produce,
-     * whatever the number of nodes.
-     *
-     * <p>{@code search_after} needs no handling here: each executor
-     * already applied the cursor to its own hits, so every hit in
-     * every inner list is past the cursor and the merged order is the
-     * correct continuation.
-     */
-    static List<SearchHit> mergeHits(List<List<RankedHit>> perNodeHits, List<SortBuilder<?>> sorts) {
-        List<RankedHit> ranked = new ArrayList<>();
-        for (List<RankedHit> nodeHits : perNodeHits) {
-            ranked.addAll(nodeHits);
-        }
-        if (ranked.size() > 1) {
-            ranked.sort(hitComparator(sorts));
-        }
-        List<SearchHit> out = new ArrayList<>(ranked.size());
-        for (RankedHit r : ranked) {
-            out.add(r.hit());
-        }
-        return out;
-    }
-
-    /**
-     * A per-node hit with what the merge needs to place it: the
-     * ordinal of the index it came from in the request's target list
-     * and its Lance row address ({@code fragmentId << 32 | offset}).
-     * Row addresses are unique within one table, so the pair is a
-     * total order over every hit of the request.
-     */
-    record RankedHit(SearchHit hit, int target, long rowAddr) {
-    }
-
-    private static Comparator<RankedHit> hitComparator(List<SortBuilder<?>> sorts) {
-        Comparator<RankedHit> tieBreak = Comparator.comparingInt(RankedHit::target).thenComparingLong(RankedHit::rowAddr);
-        if (sorts == null || sorts.isEmpty()) {
-            return Comparator.<RankedHit>comparingDouble(r -> -scoreOf(r.hit())).thenComparing(tieBreak);
-        }
-        Comparator<RankedHit> comparator = null;
-        for (int i = 0; i < sorts.size(); i++) {
-            SortBuilder<?> sort = sorts.get(i);
-            Comparator<RankedHit> clause = clauseComparator(sort, i);
-            comparator = comparator == null ? clause : comparator.thenComparing(clause);
-        }
-        return comparator.thenComparing(tieBreak);
-    }
-
-    private static Comparator<RankedHit> clauseComparator(SortBuilder<?> sort, int index) {
-        boolean descending = sort.order() == SortOrder.DESC;
-        if (sort instanceof ScoreSortBuilder) {
-            Comparator<RankedHit> byScore = (a, b) -> Float.compare(scoreAt(a.hit(), index), scoreAt(b.hit(), index));
-            return descending ? byScore.reversed() : byScore;
-        }
-        boolean nullsFirst = false;
-        if (sort instanceof FieldSortBuilder field) {
-            if (FieldSortBuilder.DOC_FIELD_NAME.equals(field.getFieldName())) {
-                Comparator<RankedHit> byRowAddr = Comparator.comparingLong(RankedHit::rowAddr);
-                return descending ? byRowAddr.reversed() : byRowAddr;
-            }
-            nullsFirst = "_first".equals(field.missing());
-        }
-        final boolean nullsFirstFinal = nullsFirst;
-        return (a, b) -> {
-            Object left = rawSortValue(a.hit(), index);
-            Object right = rawSortValue(b.hit(), index);
-            if (left == null || right == null) {
-                if (left == null && right == null) {
-                    return 0;
-                }
-                // Missing placement is absolute (first or last in
-                // the response), not relative to the clause
-                // direction, so it is decided before the
-                // direction flip below.
-                return (left == null) == nullsFirstFinal ? -1 : 1;
-            }
-            int cmp = compareValues(left, right);
-            return descending ? -cmp : cmp;
-        };
-    }
-
-    private static float scoreOf(SearchHit hit) {
-        float score = hit.getScore();
-        // NaN would sort above every real score under Float.compare;
-        // treat "no score" as the lowest score instead.
-        return Float.isNaN(score) ? Float.NEGATIVE_INFINITY : score;
-    }
-
-    /**
-     * Score for a {@code _score} sort clause: the raw sort value at
-     * the clause position when the executor recorded one, else
-     * {@link SearchHit#getScore()}.
-     */
-    private static float scoreAt(SearchHit hit, int index) {
-        Object raw = rawSortValue(hit, index);
-        if (raw instanceof Number number) {
-            return number.floatValue();
-        }
-        return scoreOf(hit);
-    }
-
-    private static Object rawSortValue(SearchHit hit, int index) {
-        Object[] raw = hit.getRawSortValues();
-        if (raw == null || index >= raw.length) {
-            return null;
-        }
-        return raw[index];
-    }
-
-    /**
-     * Compare two non-null raw sort values. The executors type a
-     * given clause identically on every node (the type comes from
-     * the field mapping), so the common case is two values of the
-     * same {@link Comparable} class. Mixed numeric widths, which can
-     * only happen when two indexes in one request map a field
-     * differently, are compared by value. Any other pair has no
-     * defined order and would silently scramble the page, so it is
-     * refused.
-     */
-    @SuppressWarnings({ "unchecked", "rawtypes" })
-    static int compareValues(Object left, Object right) {
-        if (left.getClass() == right.getClass() && left instanceof Comparable) {
-            return ((Comparable) left).compareTo(right);
-        }
-        if (left instanceof Number l && right instanceof Number r) {
-            if (isIntegral(l) && isIntegral(r)) {
-                return Long.compare(l.longValue(), r.longValue());
-            }
-            return Double.compare(l.doubleValue(), r.doubleValue());
-        }
-        throw new IllegalStateException(
-            "cannot merge sort values of types [" + left.getClass().getName() + "] and [" + right.getClass().getName() + "]"
-        );
-    }
-
-    private static boolean isIntegral(Number n) {
-        return n instanceof Long || n instanceof Integer || n instanceof Short || n instanceof Byte;
-    }
-
     private SearchResponse emptyResponse(long took) {
         SearchHits hits = new SearchHits(new SearchHit[0], new TotalHits(0, TotalHits.Relation.EQUAL_TO), Float.NaN);
         SearchResponseSections sections = new SearchResponseSections(hits, null, null, false, false, null, 1);
-        // Same rationale as MergeState.buildResponse: report a
+        // Same rationale as MergeReducer.buildResponse: report a
         // single logical unit rather than 0 shards so clients that
         // check {@code _shards.total >= 1} keep parsing correctly.
         return new SearchResponse(sections, null, 1, 1, 0, took, ShardSearchFailure.EMPTY_ARRAY, SearchResponse.Clusters.EMPTY);
@@ -1422,276 +902,5 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     private record FragmentQuerySpec(String filterSql, org.opensearch.index.query.QueryBuilder query,
         org.opensearch.index.query.QueryBuilder postFilter, List<org.opensearch.search.sort.SortBuilder<?>> sorts, Object[] searchAfter,
         int effectiveSize, AggregatorFactories.Builder aggregations, boolean trackScores, int trackTotalHitsUpTo) {
-    }
-
-    /**
-     * Mutable accumulator that folds every fan-out result into the
-     * final response state. Not thread-safe: guarded by the
-     * sequential index loop.
-     */
-    private final class MergeState {
-
-        private final AggregatorFactories.Builder aggregationsRequested;
-        // Sort clauses of the request; drive the cross-node hit merge
-        // in buildResponse. Empty means score order.
-        private final List<SortBuilder<?>> sorts;
-        // Requested pagination window. `perNodeSize` on the wire is
-        // `from + size` so every per-node executor already returned
-        // enough hits for us to skip the first `from` and keep `size`.
-        private final int from;
-        private final int size;
-        // Whether the request asked for _version / _seq_no /
-        // _primary_term envelope fields on hits. Fragment path has
-        // no per-doc version accounting (Lance datasets are
-        // append/rewrite, not per-doc versioned), so populated
-        // values are constant: version=1, seqNo=0, primaryTerm=1.
-        // The flags exist so the coordinator only stamps hits when
-        // the caller explicitly asked, matching shard path
-        // behaviour where these fields default off.
-        private final boolean versionRequested;
-        private final boolean seqNoAndPrimaryTermRequested;
-        // track_total_hits bound the executors counted up to; decides
-        // the hits.total relation in buildResponse.
-        private final int trackTotalHitsUpTo;
-        private long totalMatched = 0L;
-        // Set when any executor stopped counting at the bound, so the
-        // summed total is a lower bound even if it did not exceed
-        // trackTotalHitsUpTo itself.
-        private boolean matchedIsLowerBound = false;
-        // Set when a node of any target did not answer in time: the
-        // response is built from the nodes that did, says timed_out,
-        // and reports hits.total as a lower bound.
-        private boolean timedOut = false;
-        // One entry per per-node response, in fan-out order (target
-        // order, then node id order within a target). Each inner list
-        // is already sorted by the executor and cut to from + size,
-        // and carries the target ordinal and row address the merge
-        // breaks ties on.
-        private final List<List<RankedHit>> perNodeHits = new ArrayList<>();
-        // Ordinal of the target whose responses absorbTargetResponses
-        // is absorbing; targets arrive one after another in request
-        // order, so this is the position of the target in the
-        // request's index list.
-        private int targetOrdinal = -1;
-        private final List<InternalAggregations> perNodeAggregations = new ArrayList<>();
-
-        MergeState(
-            AggregatorFactories.Builder aggregationsRequested,
-            List<SortBuilder<?>> sorts,
-            int from,
-            int size,
-            boolean versionRequested,
-            boolean seqNoAndPrimaryTermRequested,
-            int trackTotalHitsUpTo
-        ) {
-            this.aggregationsRequested = aggregationsRequested;
-            this.sorts = sorts;
-            this.from = from;
-            this.size = size;
-            this.versionRequested = versionRequested;
-            this.seqNoAndPrimaryTermRequested = seqNoAndPrimaryTermRequested;
-            this.trackTotalHitsUpTo = trackTotalHitsUpTo;
-        }
-
-        void absorbTargetResponses(IndexTarget target, List<LanceFragmentQueryResponse> responses, boolean incomplete) {
-            timedOut |= incomplete;
-            // Every hit needs a SearchShardTarget so the response
-            // envelope carries the {@code _index} key that clients
-            // expect. Fragment path has no shard concept, so we
-            // synthesise one entry keyed on the resolved index
-            // metadata; the shard id is always 0 (single-shard).
-            IndexMetadata indexMetadata = clusterService.state().metadata().index(target.indexName());
-            SearchShardTarget shardTarget = indexMetadata == null
-                ? null
-                : new SearchShardTarget(
-                    clusterService.localNode().getId(),
-                    new ShardId(indexMetadata.getIndex(), 0),
-                    /* clusterAlias */ null,
-                    org.opensearch.action.OriginalIndices.NONE
-                );
-            targetOrdinal++;
-            for (LanceFragmentQueryResponse response : responses) {
-                totalMatched += response.matched();
-                matchedIsLowerBound |= response.matchedIsLowerBound();
-                // Keep each node's list intact; the sort merge and
-                // the from/size cut run in buildResponse once every
-                // node of every target has answered.
-                List<SearchHit> hits = response.hits();
-                long[] rowAddrs = response.rowAddrs();
-                List<RankedHit> nodeHits = new ArrayList<>(hits.size());
-                for (int i = 0; i < hits.size(); i++) {
-                    SearchHit hit = hits.get(i);
-                    stampEnvelope(hit, shardTarget);
-                    nodeHits.add(new RankedHit(hit, targetOrdinal, rowAddrs[i]));
-                }
-                perNodeHits.add(nodeHits);
-                if (response.aggregations() != null) {
-                    perNodeAggregations.add(response.aggregations());
-                }
-            }
-        }
-
-        /**
-         * Attach the shard target and, if requested, the constant
-         * version / seq_no / primary_term envelope values to a
-         * per-node hit. Runs on the coordinator because per-node
-         * responses do not know the index name and because the
-         * request-level flags live on {@link SearchSourceBuilder}
-         * which is not shipped over the wire in full.
-         */
-        private void stampEnvelope(SearchHit hit, SearchShardTarget shardTarget) {
-            if (shardTarget != null) {
-                hit.shard(shardTarget);
-            }
-            if (versionRequested) {
-                hit.version(1L);
-            }
-            if (seqNoAndPrimaryTermRequested) {
-                hit.setSeqNo(0L);
-                hit.setPrimaryTerm(1L);
-            }
-        }
-
-        /**
-         * {@code hits.total} of the merged response; see
-         * {@link TransportLanceCoordinatorAction#totalHits(long, boolean, int)}.
-         * When a node did not answer, the count of the nodes that did is
-         * a lower bound of the true count whatever the tracking mode, so
-         * the relation is {@code gte}; the value stays as composed (the
-         * sum, or the bound when the sum passed it).
-         */
-        private TotalHits totalHits() {
-            TotalHits total = TransportLanceCoordinatorAction.totalHits(totalMatched, matchedIsLowerBound, trackTotalHitsUpTo);
-            if (total == null || !timedOut) {
-                return total;
-            }
-            return new TotalHits(total.value(), TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
-        }
-
-        SearchResponse buildResponse(long startMillis) {
-            long took = System.currentTimeMillis() - startMillis;
-            // Merge the per-node sorted lists into one ordered list,
-            // then apply from/size so the response reflects the
-            // requested pagination window. Every node returned up to
-            // from + size hits, so the merged list always holds the
-            // global top from + size.
-            List<SearchHit> hits = mergeHits(perNodeHits, sorts);
-            SearchHit[] paged;
-            if (hits.size() <= from) {
-                paged = new SearchHit[0];
-            } else {
-                int end = Math.min(hits.size(), from + size);
-                paged = hits.subList(from, end).toArray(new SearchHit[0]);
-            }
-            // max_score is the largest per-hit score in the paged
-            // window, matching shard path behaviour. The old
-            // hard-coded 1.0f flattened the response for
-            // function_score / script_score / FTS queries where
-            // real scores can range far above 1.0. NaN when no
-            // hits survive paging, or when every hit carries NaN
-            // (e.g. sort without track_scores).
-            float maxScore = Float.NaN;
-            for (SearchHit hit : paged) {
-                float score = hit.getScore();
-                if (Float.isNaN(score)) {
-                    continue;
-                }
-                if (Float.isNaN(maxScore) || score > maxScore) {
-                    maxScore = score;
-                }
-            }
-            SearchHits searchHits = new SearchHits(paged, totalHits(), maxScore);
-            InternalAggregations aggregations = null;
-            if (aggregationsRequested != null && !perNodeAggregations.isEmpty()) {
-                // Feed every per-node InternalAggregations tree into the
-                // stock reduce path so cross-node reduction lives in
-                // OpenSearch's aggregator code rather than in the Lance
-                // plugin: nodes ship InternalAggregations, the
-                // coordinator calls topLevelReduce.
-                InternalAggregation.ReduceContext ctx = InternalAggregation.ReduceContext.forFinalReduction(
-                    bigArrays,
-                    scriptService,
-                    /* multiBucketConsumer */ n -> {},
-                    org.opensearch.search.aggregations.pipeline.PipelineAggregator.PipelineTree.EMPTY
-                );
-                aggregations = InternalAggregations.topLevelReduce(perNodeAggregations, ctx);
-            }
-            // timed_out is the only trace of a node that did not answer:
-            // the fragment path reports one logical unit under _shards,
-            // so there is no failed shard to count; the coordinator's
-            // WARN log names the node, the fragment count and the
-            // timeout. Aggregations are the reduce of the nodes that
-            // answered, as on the shard path.
-            SearchResponseSections sections = new SearchResponseSections(searchHits, aggregations, null, timedOut, false, null, 1);
-            // Hide the Lance fragment fan-out from the response
-            // shape. The user's mental model is one logical dataset,
-            // not N shards; reporting fragmentCount here would leak
-            // the Lucene-shard concept back into the API surface
-            // that shard-free dispatch is meant to remove. total /
-            // successful stay at 1 (single logical unit) so clients
-            // scripts that expect at least one successful shard
-            // continue to parse cleanly. The physical distribution
-            // is still observable through the coordinator's INFO
-            // logs and, in the future, dedicated telemetry.
-            return new SearchResponse(
-                sections,
-                null,
-                /* totalShards */ 1,
-                /* successfulShards */ 1,
-                /* skippedShards */ 0,
-                took,
-                ShardSearchFailure.EMPTY_ARRAY,
-                SearchResponse.Clusters.EMPTY
-            );
-        }
-    }
-
-    /**
-     * {@code hits.total} under the request's {@code track_total_hits}
-     * contract, composed the way
-     * {@code SearchPhaseController.TopDocsStats#getTotalHits} does it
-     * for shard results. {@code null} (no {@code total} block in the
-     * response) when tracking is disabled. For {@code track_total_hits:
-     * true} the summed per-node count is exact. With an integer bound
-     * the relation is {@code gte} when the sum exceeds the bound or any
-     * executor stopped counting at it, and the value is then the bound
-     * itself, never the sum: each executor counts its own fragments'
-     * share of one scan limited to {@code bound + 1} rows, and because
-     * Lance picks among tied rows differently on every executor, the
-     * shares can add up to less than the bound even though every scan
-     * filled. Clients read {@code gte} with the bound as "more than the
-     * bound" (the shard path never reports a smaller value with
-     * {@code gte}), so the sum is only reported when it is exact.
-     *
-     * @param totalMatched sum of the per-node matched counts
-     * @param matchedIsLowerBound whether any executor stopped counting
-     *        at the bound
-     * @param trackTotalHitsUpTo the bound the request asked for, or one
-     *        of the {@link SearchContext} tracking constants
-     */
-    static TotalHits totalHits(long totalMatched, boolean matchedIsLowerBound, int trackTotalHitsUpTo) {
-        if (trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_DISABLED) {
-            return null;
-        }
-        if (trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
-            if (matchedIsLowerBound) {
-                // An executor may only stop counting under an integer
-                // bound; a lower bound with an accurate request is an
-                // executor contract bug. The value is still reported as
-                // gte so the response does not claim an exactness it
-                // does not have.
-                LOGGER.warn(
-                    "lance.dispatch: executor reported hits.total as a lower bound [{}] although track_total_hits requested "
-                        + "an accurate count; reporting gte",
-                    totalMatched
-                );
-                return new TotalHits(totalMatched, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
-            }
-            return new TotalHits(totalMatched, TotalHits.Relation.EQUAL_TO);
-        }
-        if (matchedIsLowerBound || totalMatched > trackTotalHitsUpTo) {
-            return new TotalHits(trackTotalHitsUpTo, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
-        }
-        return new TotalHits(totalMatched, TotalHits.Relation.EQUAL_TO);
     }
 }

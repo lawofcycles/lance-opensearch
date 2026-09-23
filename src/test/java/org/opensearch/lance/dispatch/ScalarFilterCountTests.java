@@ -13,6 +13,7 @@ import org.lance.Dataset;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -52,30 +53,23 @@ public class ScalarFilterCountTests extends OpenSearchTestCase {
      * Both counters are read before and after so a batch loop that
      * returns the right number still fails the exact case.
      */
-    private static TransportLanceFragmentQueryAction.MatchedCount count(Dataset dataset, String filter, List<Integer> fragmentIds, int upTo)
-        throws Exception {
-        long nativeBefore = TransportLanceFragmentQueryAction.NATIVE_SCALAR_COUNTS.get();
-        long boundedBefore = TransportLanceFragmentQueryAction.BOUNDED_SCALAR_COUNT_SCANS.get();
-        TransportLanceFragmentQueryAction.MatchedCount result = TransportLanceFragmentQueryAction.countScalarFilter(
-            dataset,
-            filter,
-            fragmentIds,
-            upTo
-        );
-        long nativeCalls = TransportLanceFragmentQueryAction.NATIVE_SCALAR_COUNTS.get() - nativeBefore;
-        long boundedScans = TransportLanceFragmentQueryAction.BOUNDED_SCALAR_COUNT_SCANS.get() - boundedBefore;
+    private static PlanExecutor.MatchedCount count(Dataset dataset, String filter, List<Integer> fragmentIds, int upTo) throws Exception {
+        long nativeBefore = PlanExecutor.NATIVE_SCALAR_COUNTS.get();
+        long boundedBefore = PlanExecutor.BOUNDED_SCALAR_COUNT_SCANS.get();
+        PlanExecutor.MatchedCount result = PlanExecutor.countScalarFilter(dataset, filter, fragmentIds, upTo);
+        long nativeCalls = PlanExecutor.NATIVE_SCALAR_COUNTS.get() - nativeBefore;
+        long boundedScans = PlanExecutor.BOUNDED_SCALAR_COUNT_SCANS.get() - boundedBefore;
         boolean accurate = upTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE;
         assertEquals("native countRows calls for upTo " + upTo, accurate ? 1L : 0L, nativeCalls);
         assertEquals("limited count scans for upTo " + upTo, accurate ? 0L : 1L, boundedScans);
         return result;
     }
 
-    private static TransportLanceFragmentQueryAction.MatchedCount count(Dataset dataset, List<Integer> fragmentIds, int upTo)
-        throws Exception {
+    private static PlanExecutor.MatchedCount count(Dataset dataset, List<Integer> fragmentIds, int upTo) throws Exception {
         return count(dataset, FILTER, fragmentIds, upTo);
     }
 
-    private static void assertCount(long value, boolean lowerBound, TransportLanceFragmentQueryAction.MatchedCount actual) {
+    private static void assertCount(long value, boolean lowerBound, PlanExecutor.MatchedCount actual) {
         assertEquals("value", value, actual.value());
         assertEquals("lowerBound", lowerBound, actual.lowerBound());
     }
@@ -87,8 +81,8 @@ public class ScalarFilterCountTests extends OpenSearchTestCase {
             assertCount(expected, false, count(dataset, ALL, SearchContext.TRACK_TOTAL_HITS_ACCURATE));
             // A subset executor counts only its own fragments, and the
             // subsets add up to the whole.
-            TransportLanceFragmentQueryAction.MatchedCount a = count(dataset, NODE_A, SearchContext.TRACK_TOTAL_HITS_ACCURATE);
-            TransportLanceFragmentQueryAction.MatchedCount b = count(dataset, NODE_B, SearchContext.TRACK_TOTAL_HITS_ACCURATE);
+            PlanExecutor.MatchedCount a = count(dataset, NODE_A, SearchContext.TRACK_TOTAL_HITS_ACCURATE);
+            PlanExecutor.MatchedCount b = count(dataset, NODE_B, SearchContext.TRACK_TOTAL_HITS_ACCURATE);
             assertCount(0L, false, a);
             assertCount(8L, false, b);
             assertCount(4L, false, count(dataset, List.of(1), SearchContext.TRACK_TOTAL_HITS_ACCURATE));
