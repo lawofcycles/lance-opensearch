@@ -66,12 +66,15 @@ public final class LanceNamespaceService {
     private final AllowedTableRoots allowedRoots;
     /**
      * Per-node cache of the runtime {@link LanceNamespace} handles
-     * keyed by registration name. Rebuilt from cluster state on every
+     * keyed by registration name, each wrapped in a
+     * {@link LanceNamespaceHandle} so a removed registration's native
+     * release waits for the poll or preview call still using it.
+     * Rebuilt from cluster state on every
      * {@link #onClusterStateChanged} callback so a fresh node that
      * joins mid-life still sees the registrations that were already
      * in the cluster's {@link LanceNamespaceMetadata}.
      */
-    private final Map<String, LanceNamespace> namespaceCache = new ConcurrentHashMap<>();
+    private final Map<String, LanceNamespaceHandle> namespaceCache = new ConcurrentHashMap<>();
     /**
      * Registration names whose catalog is currently unusable, mapped
      * to the initialise or poll error. An entry here surfaces as
@@ -272,12 +275,13 @@ public final class LanceNamespaceService {
         // object-store roots), which must not run on the applier thread;
         // the poll and the tables preview build handles on the generic
         // pool through ensureHandle instead. Closing a handle releases
-        // native resources, so that leaves the applier thread too.
+        // native resources and waits for the poll or preview call that
+        // may still be using it, so that leaves the applier thread too.
         for (String name : namespaceCache.keySet()) {
             if (desired.contains(name)) {
                 continue;
             }
-            LanceNamespace removed = namespaceCache.remove(name);
+            LanceNamespaceHandle removed = namespaceCache.remove(name);
             if (removed != null) {
                 threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> closeQuietly(name, removed));
             }
@@ -307,8 +311,8 @@ public final class LanceNamespaceService {
      * AWS SDK client, whose credential providers resolve lazily on the
      * first call.
      */
-    private LanceNamespace ensureHandle(LanceNamespaceMetadata.Entry entry) {
-        LanceNamespace cached = namespaceCache.get(entry.name());
+    private LanceNamespaceHandle ensureHandle(LanceNamespaceMetadata.Entry entry) {
+        LanceNamespaceHandle cached = namespaceCache.get(entry.name());
         if (cached != null) {
             return cached;
         }
@@ -318,7 +322,7 @@ public final class LanceNamespaceService {
                 return cached;
             }
             try {
-                LanceNamespace created = LanceNamespaceFactory.create(entry, LanceRegistry.allocator());
+                LanceNamespaceHandle created = new LanceNamespaceHandle(LanceNamespaceFactory.create(entry, LanceRegistry.allocator()));
                 namespaceCache.put(entry.name(), created);
                 unavailable.remove(entry.name());
                 warnedInitFailure.remove(entry.name());
@@ -334,13 +338,11 @@ public final class LanceNamespaceService {
         }
     }
 
-    private static void closeQuietly(String name, LanceNamespace handle) {
-        if (handle instanceof AutoCloseable closeable) {
-            try {
-                closeable.close();
-            } catch (Exception e) {
-                LOG.debug("closing namespace handle {} failed: {}", name, e.getMessage());
-            }
+    private static void closeQuietly(String name, LanceNamespaceHandle handle) {
+        try {
+            handle.close();
+        } catch (Exception e) {
+            LOG.debug("closing namespace handle {} failed: {}", name, e.getMessage());
         }
     }
 
@@ -388,12 +390,14 @@ public final class LanceNamespaceService {
         // call to the generic pool, and only the poll (cluster manager
         // only) builds handles otherwise, so a preview served by a
         // follower node cannot rely on a pre-built cache entry.
-        LanceNamespace handle = ensureHandle(entry);
+        LanceNamespaceHandle handle = ensureHandle(entry);
         if (handle == null) {
             return Optional.empty();
         }
         Set<String> names = new TreeSet<>();
-        for (LanceCatalogEnumerator.CatalogTable table : LanceCatalogEnumerator.enumerateTables(handle, entry)) {
+        for (LanceCatalogEnumerator.CatalogTable table : handle.call(
+            namespace -> LanceCatalogEnumerator.enumerateTables(namespace, entry)
+        )) {
             names.add(table.name());
         }
         return Optional.of(names);
@@ -450,14 +454,16 @@ public final class LanceNamespaceService {
         indexAdopter.adoptUntrackedIndexes(state);
         LanceNamespaceMetadata metadata = currentMetadata(state);
         for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
-            LanceNamespace handle = ensureHandle(entry);
+            LanceNamespaceHandle handle = ensureHandle(entry);
             if (handle == null) {
                 // initialise failed; ensureHandle recorded the error and
                 // will retry on the next poll.
                 continue;
             }
             try {
-                for (LanceCatalogEnumerator.CatalogTable table : LanceCatalogEnumerator.enumerateTables(handle, entry)) {
+                for (LanceCatalogEnumerator.CatalogTable table : handle.call(
+                    namespace -> LanceCatalogEnumerator.enumerateTables(namespace, entry)
+                )) {
                     syncCatalogTable(entry, handle, table);
                 }
                 unavailable.remove(entry.name());
@@ -511,7 +517,11 @@ public final class LanceNamespaceService {
      * surfaces, because for these types the register call had no root
      * the allowlist could gate.
      */
-    private void syncCatalogTable(LanceNamespaceMetadata.Entry entry, LanceNamespace handle, LanceCatalogEnumerator.CatalogTable table) {
+    private void syncCatalogTable(
+        LanceNamespaceMetadata.Entry entry,
+        LanceNamespaceHandle handle,
+        LanceCatalogEnumerator.CatalogTable table
+    ) {
         String indexName = table.name();
         if (LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(entry.type())) {
             runSyncCycle(entry.rootUri() + "/" + indexName + ".lance", indexName, entry.storageOptions(), null, entry.overridesJson());
@@ -519,7 +529,7 @@ public final class LanceNamespaceService {
         }
         DescribeTableResponse described;
         try {
-            described = handle.describeTable(new DescribeTableRequest().id(table.id()));
+            described = handle.call(namespace -> namespace.describeTable(new DescribeTableRequest().id(table.id())));
         } catch (Exception e) {
             LOG.warn("describe_table failed for {} in namespace {}: {}", indexName, entry.name(), e.getMessage());
             return;
