@@ -16,15 +16,11 @@ This document explains the release strategy for artifacts in this organization, 
 
 ### Release Branching
 
-Given the current major release of 1.0, projects in this organization maintain the following active branches.
+The plugin is at version 0.1.0 and has not reached its first minor release, so the repository maintains a single branch.
 
-* **main**: The next _major_ release. This is the branch where all merges take place and code moves fast.
-* **1.x**: The next _minor_ release. Once a change is merged into `main`, decide whether to backport it to `1.x`.
-* **1.0**: The _current_ release. In between minor releases, only hotfixes (e.g. security) are backported to `1.0`.
+* **main**: Every change merges here, and every release before 1.0 is cut from here by tagging the release commit. There is nothing to backport.
 
-Label PRs with the next major version label (e.g. `2.0.0`) and merge changes into `main`. Label PRs that you believe need to be backported as `1.x` and `1.0`. Backport PRs by checking out the versioned branch, cherry-pick changes and open a PR against each target backport branch.
-
-This repository currently has only `main`; no release branch has been cut yet.
+When the first minor release is cut, the repository adopts the organization's branching: a release branch (for example `1.x` for the next minor, `1.0` for the current release) is created from `main`, `main` continues as the next major, and pull requests that need to reach a release branch are labelled `backport <branch>` so the backport workflow (see [Workflows to enable after the repository moves](#workflows-to-enable-after-the-repository-moves)) opens the backport pull request. Until then no release branch exists and no backport label is in use.
 
 ### Feature Branches
 
@@ -32,7 +28,7 @@ Do not create branches in the upstream repo, use your fork, for the exception of
 
 ## Release Labels
 
-Repositories create consistent release labels, such as `v1.0.0`, `v1.1.0` and `v2.0.0`, as well as `backport`. Use release labels to target an issue or a PR for a given release. See [MAINTAINERS](MAINTAINERS.md) for more information on triaging issues.
+Repositories create consistent release labels, such as `v0.1.0`, `v0.2.0` and `v1.0.0`, as well as `backport` once release branches exist. Use release labels to target an issue or a PR for a given release. See [MAINTAINERS](MAINTAINERS.md) for more information on triaging issues.
 
 ## Releasing
 

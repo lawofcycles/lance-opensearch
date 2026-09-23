@@ -10,5 +10,7 @@ This document contains a list of maintainers in this repo. See [opensearch-proje
 
 ## Emeritus
 
+None yet.
+
 | Maintainer | GitHub ID | Affiliation |
 |------------|-----------|-------------|
