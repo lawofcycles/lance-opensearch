@@ -184,7 +184,7 @@ final class NestedDocValues {
                                     numericValues.get(path)[ordinal] = ((BitVector) child).get(e);
                                     numericPresent.get(path).set(ordinal);
                                 } else {
-                                    numericValues.get(path)[ordinal] = LanceFragmentLeafReader.readAsLong(child, e);
+                                    numericValues.get(path)[ordinal] = LanceColumnLoader.readAsLong(child, e);
                                     numericPresent.get(path).set(ordinal);
                                 }
                             }

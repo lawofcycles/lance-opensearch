@@ -286,14 +286,14 @@ final class LanceStoredFields extends StoredFields {
     /**
      * Decode one cell of a take-scan batch into the representation
      * {@link #materialiseStoredFields} renders from. Numeric columns
-     * go through {@link LanceFragmentLeafReader#readAsLong} so the value carries the same
+     * go through {@link LanceColumnLoader#readAsLong} so the value carries the same
      * encoding as the doc value path (sortable-int / sortable-long for
      * floats, epoch millis for dates and timestamps, raw bit pattern
      * for UInt64); booleans become {@link Boolean}; Utf8 becomes
      * {@link String}; List&lt;Utf8&gt; becomes {@code String[]}; Binary
      * / LargeBinary become {@code byte[]}. A column that is not in
      * {@link #columnKind} (only the appended PK can be) is decoded by
-     * vector type: Utf8 as a string, anything {@link LanceFragmentLeafReader#readAsLong}
+     * vector type: Utf8 as a string, anything {@link LanceColumnLoader#readAsLong}
      * understands as a long, otherwise {@code null}. Arrow nulls
      * return {@code null}.
      */
@@ -313,16 +313,16 @@ final class LanceStoredFields extends StoredFields {
                 return new String(vc.get(i), StandardCharsets.UTF_8);
             }
             try {
-                return LanceFragmentLeafReader.readAsLong(vector, i);
+                return LanceColumnLoader.readAsLong(vector, i);
             } catch (IllegalStateException unsupported) {
                 return null;
             }
         }
         return switch (kind) {
-            case NUMERIC -> LanceFragmentLeafReader.readAsLong(vector, i);
+            case NUMERIC -> LanceColumnLoader.readAsLong(vector, i);
             case BOOLEAN -> ((BitVector) vector).get(i) == 1;
             case TEXT_FTS, TEXT_KEYWORD -> new String(((VarCharVector) vector).get(i), StandardCharsets.UTF_8);
-            case GEO_POINT -> LanceFragmentLeafReader.decodeGeoPoint(geoPointColumns.get(name), vector, i);
+            case GEO_POINT -> LanceColumnLoader.decodeGeoPoint(geoPointColumns.get(name), vector, i);
             case KEYWORD_ARRAY -> {
                 ListVector list = (ListVector) vector;
                 VarCharVector elements = (VarCharVector) list.getDataVector();
