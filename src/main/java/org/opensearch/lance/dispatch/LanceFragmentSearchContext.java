@@ -346,8 +346,9 @@ public final class LanceFragmentSearchContext extends SearchContext {
      * pruning, which the Lance leaf reader never offers
      * ({@code terms(field)} is null). {@code rare_terms}, whose
      * constructor seeds itself from {@code indexShard().shardId()},
-     * is not on the {@link LanceAggregationSupport} whitelist and
-     * goes to the shard path.
+     * is refused by the coordinator's translator
+     * ({@code AggregationToRel.checkExecutable}) before a request
+     * reaches this context.
      */
     @Override
     public IndexShard indexShard() {

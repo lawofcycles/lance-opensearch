@@ -59,13 +59,18 @@ import org.opensearch.transport.client.Client;
  * <p>The filter owns three responsibilities:
  * <ul>
  *   <li>Recognise whether the request is fragment-dispatchable
- *       ({@link #allLanceBacked} plus {@link #isDispatchable} plus
- *       {@link LanceAggregationSupport#isSupported}). The shape
- *       decision is planned: {@link SearchRequestToRel#translateDispatch}
+ *       ({@link #allLanceBacked} plus {@link #isDispatchable}). The
+ *       shape decision is planned: {@link SearchRequestToRel#translateDispatch}
  *       marks a body holding an element the fragment executor cannot
  *       answer correctly — suggester, highlighter — and the planner
  *       answers such a body with a {@link ShardPathFallbackExec}
- *       root, which routes the request to the shard path.</li>
+ *       root, which routes the request to the shard path. The
+ *       aggregation tree plays no part in the decision: every
+ *       aggregation type goes to the fragment path, where the
+ *       coordinator's translator either pushes it into the Lance
+ *       scan, leaves it to the Lucene aggregators over the fragment
+ *       leaves, or refuses it with 400 naming the builder
+ *       ({@code AggregationToRel.checkExecutable}).</li>
  *   <li>Delegate the request to {@link LanceCoordinatorAction} via
  *       {@link Client#execute(org.opensearch.action.ActionType,
  *       org.opensearch.action.ActionRequest, ActionListener)} on the
@@ -77,8 +82,8 @@ import org.opensearch.transport.client.Client;
  *       request fails with the pool's rejection (HTTP 429).</li>
  *   <li>Fall through to the standard shard fan-out via
  *       {@code chain.proceed} for anything else (a target that is not
- *       Lance backed, alone or next to Lance backed ones, and
- *       unsupported query or aggregation shapes). The shard path still
+ *       Lance backed, alone or next to Lance backed ones, and a body
+ *       holding a suggester or a highlighter). The shard path still
  *       exists as a
  *       safety net for shapes the fragment executor has not yet
  *       taken over; it is never used because of load. A Lance-backed
@@ -191,14 +196,6 @@ public class LanceDispatchActionFilter implements ActionFilter {
             // executor does not serve. Fall through so the standard
             // path can still answer.
             planExecutor.executeShardPath(dispatchPlan, () -> proceedOnShardPath(task, action, request, listener, chain, concrete));
-            return;
-        }
-
-        if (!LanceAggregationSupport.isSupported(searchRequest.source())) {
-            // Aggregation shape the fragment executor has not taken
-            // over yet (a script, a type off the allow list, a filter
-            // bucket over a Lance query).
-            proceedOnShardPath(task, action, request, listener, chain, concrete);
             return;
         }
 
@@ -458,8 +455,9 @@ public class LanceDispatchActionFilter implements ActionFilter {
      * node ships the {@link QueryBuilder} across the wire and
      * re-parses it via {@code QueryShardContext.toQuery}, so the
      * dispatch decision never depends on the planner spelling the
-     * query itself; sort clauses; and aggregations that pass
-     * {@link LanceAggregationSupport#isSupported}. The rejected
+     * query itself; sort clauses; and every aggregation tree (the
+     * coordinator's translator decides per tree between the pushed
+     * scan, the Lucene aggregators and a 400). The rejected
      * elements and their rationale live on
      * {@link org.opensearch.lance.plan.rel.ShardPathReason}.
      */
