@@ -386,6 +386,43 @@ planning entry without executing anything and prints the route, both plans, the 
 `FragmentPlan` it would ship and the refinements a data node could still apply; it is the first
 tool to reach for when developing a rule.
 
+Two request demandable traits sit next to the convention in every operator's trait set
+(`plan/traits/`). `Accuracy` says whether an operator's figures are exact or come from a sketch:
+`EXACT` for every hit page, every count and every aggregate whose metrics are sums, averages,
+extremes, value counts, stats or bucket counts; `APPROXIMATE` for an aggregate carrying a
+`cardinality` (HyperLogLog++), `percentiles` or `percentile_ranks` (t-digest) metric, which the
+pushed Lance scan and the Lucene aggregators compute as the same sketches, so both physical forms
+of such a tree declare the same value (`LanceAggregate.accuracy()`). `TieStability` says whether
+the order of rows that compare equal under the request's sort is reproducible between two calls:
+`STABLE_ROWADDR` for a bare scan, a page without a sort over a scalar query and the shard path
+fallback (Lance row address order, which is Lucene doc order over the whole table reader);
+`STABLE_KEY` for a page ordered by a stored column, with or without a further tie breaker, on the
+pushed scan and on `HeapTopKExec` alike (`LanceTopK.tieStability()`); `UNSTABLE` for a page cut in
+score order out of a full text or knn scan, whose equal scores land in whatever order the
+scanner's batches arrive, and for aggregate outputs, whose group rows have no order contract.
+`LuceneHandoffExec`, `FanOutExec` and `MergeExec` inherit their input's values: the handoff moves
+rows unchanged, the fan-out moves per node rows, and the merge sums exact counts into an exact
+count, reduces sketches into a sketch and keeps the per node pages' tie order. Each stable value
+satisfies a demand for itself and for `UNSTABLE`; `EXACT` satisfies a demand for either accuracy.
+Neither trait has an enforcer (nothing raises a sketch to an exact figure or makes a score order
+reproducible after the fact), so a demand no operator meets is refused rather than converted.
+
+Two request elements demand a trait (`RequestPlanner.requirementOf`). An explicit
+`track_total_hits` (an integer bound or `true`) demands `Accuracy.EXACT` at the root: the count the
+response reports must be exact within the bound, which every plan meets except an aggregate over
+a sketch metric, so `track_total_hits: 500` next to a `cardinality` aggregation is refused with a
+400 whose message names the trait, where the request used to answer a sketch under an exact
+count. A `search_after` cursor over a page the tree carries demands `TieStability.STABLE_KEY`: a
+cursor continues from the sort values of the previous page's last hit, so the rows on either side
+of it must be the same rows on every call; a cursor over a full text page ordered by score alone
+is refused with a 400 naming the trait, while a cursor over a column sort (a single column folded
+into the scan, or a column with a tie breaker on the heap page) plans as before. The planner
+factory runs the Volcano pass once for the convention, and only when the cheapest plan does not
+declare the demanded values asks the same cluster again with them on the root, so a costlier plan
+that meets the demand wins over a cheaper one that does not, and `CannotPlanException` on that
+second root is what becomes the 400. The data node refinements do not read the traits; each
+downgrade keeps them by construction (`FragmentPlanRefiner`).
+
 The cost the planner compares is predicted latency in milliseconds (the two other axes of
 `LanceCost`, native and heap bytes, are budgets checked as hard constraints and are not modelled
 yet). For an aggregation over a table of a million rows or more, the pushed scan and the Lucene
@@ -485,8 +522,9 @@ route through the planner, then hits, full text and vector translation, then the
 convention operators with fan-out and merge as plan operators, then the shard-path fallback as a
 plan operator, then the cost model fitted to the measured aggregation shapes, then the two stage
 planning that ships the per node plan from the coordinator and the node local refinement of the
-plan on column store warmth, and ahead: accuracy and tie-stability as planner
-traits a request can demand. The CHANGELOG tracks what has landed.
+plan on column store warmth, then accuracy and tie-stability as planner traits a request can
+demand, and ahead: the traits printed by the explain endpoint. The CHANGELOG tracks what has
+landed.
 
 ## Memory
 

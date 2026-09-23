@@ -12,6 +12,7 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.SingleRel;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
+import org.opensearch.lance.plan.traits.TieStability;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -105,6 +106,35 @@ public final class LanceTopK extends SingleRel {
     /** The same node with {@code newCollations} in place of the current sort order. */
     public LanceTopK withCollations(List<RelFieldCollation> newCollations) {
         return new LanceTopK(getCluster(), getTraitSet(), getInput(), newCollations, fetch, offset, searchAfter);
+    }
+
+    /**
+     * The {@link TieStability} either physical form of this page
+     * declares, read from the collations over the input row type. A
+     * page whose last collation is a stored column is
+     * {@link TieStability#STABLE_KEY}: the pushed scan orders by the
+     * column through a Lance ordering and Lucene's collector through
+     * the same column's doc values, and both resolve ties the same way
+     * on every call, so a cursor typed against the column continues
+     * from the same rows. A page ordered by score alone ({@code _score}
+     * descending or {@code _distance} ascending, or no collation over a
+     * full text / knn input) is {@link TieStability#UNSTABLE}: equal
+     * scores land in whatever order the scanner's batches arrive. A
+     * page with no collation over a scalar input is
+     * {@link TieStability#STABLE_ROWADDR}, the scan's own row address
+     * order. The value is a property of the page, not of the form that
+     * cuts it, so {@code LanceTableScan.withPushedTopK} and
+     * {@code HeapTopKExec} both read it from here.
+     */
+    public TieStability tieStability() {
+        List<String> fieldNames = getRowType().getFieldNames();
+        if (collations.isEmpty()) {
+            boolean scored = fieldNames.contains(LanceFtsMatch.SCORE_FIELD) || fieldNames.contains(LanceKnnSearch.DISTANCE_FIELD);
+            return scored ? TieStability.UNSTABLE : TieStability.STABLE_ROWADDR;
+        }
+        String last = fieldNames.get(collations.get(collations.size() - 1).getFieldIndex());
+        boolean scoreOrdered = LanceFtsMatch.SCORE_FIELD.equals(last) || LanceKnnSearch.DISTANCE_FIELD.equals(last);
+        return scoreOrdered ? TieStability.UNSTABLE : TieStability.STABLE_KEY;
     }
 
     @Override

@@ -18,6 +18,8 @@ import org.opensearch.lance.plan.rel.physical.FanOutExec;
 import org.opensearch.lance.plan.rel.physical.HeapTopKExec;
 import org.opensearch.lance.plan.rel.physical.LuceneAggregateExec;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
+import org.opensearch.lance.plan.traits.Accuracy;
+import org.opensearch.lance.plan.traits.TieStability;
 import org.opensearch.lance.plan.translate.PlanTestFixtures;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
 import org.opensearch.lance.query.LanceKnnQueryBuilder;
@@ -26,7 +28,9 @@ import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.hamcrest.Matchers.containsString;
@@ -540,5 +544,127 @@ public class RequestPlannerTests extends OpenSearchTestCase {
         // A fully planned request has nothing unplanned.
         assertNull(plan("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}").unplanned());
         assertNull(plan("{\"size\":5,\"sort\":[{\"rating\":\"desc\"}]}").unplanned());
+    }
+
+    private static ExecutionShape runtimeShape(String json) throws IOException {
+        SearchSourceBuilder source = PlanTestFixtures.parse(json);
+        return ExecutionShape.of(source, source.query());
+    }
+
+    private static RequestPlanner.Planned planRuntime(String json, LanceSchemas.IndexModel model) throws IOException {
+        return RequestPlanner.plan(runtimeShape(json), model, NO_EXCLUDED, PlanTestFixtures.factory());
+    }
+
+    private static LanceSchemas.IndexModel modelOf(long rows) {
+        LinkedHashMap<String, String> bodySubs = new LinkedHashMap<>();
+        bodySubs.put("raw", "keyword");
+        return LanceSchemas.model("idx", PlanTestFixtures.SCHEMA, Map.of("body", bodySubs), () -> rows);
+    }
+
+    public void testTrackTotalHitsDemandsAnExactCountAndThePushedScanMeetsIt() throws IOException {
+        // An explicit bound, above and below the table's rows: the demand
+        // is EXACT either way, the pushed scan declares EXACT, and the
+        // plan is what the same body without the bound plans. Whether
+        // the response then reports relation eq (the total is within the
+        // bound) or gte is the merge reducer's work over the exact count.
+        String bounded =
+            "{\"size\":0,\"track_total_hits\":100,\"query\":{\"term\":{\"rating\":5}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}";
+        for (long rows : new long[] { 200L, 10L }) {
+            ExecutionShape shape = runtimeShape(bounded);
+            assertTrue(shape.exactCount());
+            assertEquals(100, shape.trackTotalHitsUpTo());
+            RequestPlanner.Planned planned = planRuntime(bounded, modelOf(rows));
+            assertEquals("rows=" + rows, FragmentPlan.Kind.PUSHED_SCAN, planned.plan().kind());
+            assertNotNull(planned.plan().aggregate());
+            assertSame(Accuracy.EXACT, planned.perNode().getTraitSet().getTrait(Accuracy.Def.INSTANCE));
+            assertNull(planned.unplanned());
+        }
+        // A count shape under the bound: the count plan over the pushed
+        // filter, whose scan is exact as well.
+        RequestPlanner.Planned count = planRuntime(
+            "{\"size\":0,\"track_total_hits\":100,\"query\":{\"term\":{\"rating\":5}}}",
+            modelOf(200L)
+        );
+        assertEquals(FragmentPlan.Kind.LUCENE_COUNT, count.plan().kind());
+        assertEquals("rating = 5", count.plan().filterSql());
+        assertSame(Accuracy.EXACT, count.perNode().getTraitSet().getTrait(Accuracy.Def.INSTANCE));
+        // true is a demand as well; false and the default are not.
+        assertTrue(runtimeShape("{\"size\":0,\"track_total_hits\":true}").exactCount());
+        assertFalse(runtimeShape("{\"size\":0,\"track_total_hits\":false}").exactCount());
+        assertFalse(runtimeShape("{\"size\":0}").exactCount());
+        assertFalse(runtimeShape("{\"size\":0,\"track_total_hits\":10000}").exactCount());
+    }
+
+    public void testTrackTotalHitsOverASketchMetricIsRefusedNamingTheTrait() throws IOException {
+        String cardinality = "{\"size\":0,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"category\"}}}}";
+        // Without the bound the tree plans on the aggregators.
+        assertEquals(FragmentPlan.Kind.LUCENE_AGGREGATE, planRuntime(cardinality, PlanTestFixtures.model()).plan().kind());
+        for (String body : new String[] {
+            "{\"size\":0,\"track_total_hits\":500,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"category\"}}}}",
+            "{\"size\":0,\"track_total_hits\":true,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"price\"}}}}" }) {
+            IllegalArgumentException refused = expectThrows(
+                IllegalArgumentException.class,
+                () -> planRuntime(body, PlanTestFixtures.model())
+            );
+            assertThat(body, refused.getMessage(), containsString("plan_failed"));
+            assertThat(body, refused.getMessage(), containsString("track_total_hits requires Accuracy [exact]"));
+            assertThat(body, refused.getMessage(), containsString("Accuracy [approximate]"));
+        }
+    }
+
+    public void testSearchAfterOnAScoredFullTextPageIsRefusedNamingTheTrait() throws IOException {
+        // A cursor needs a reproducible tie order; a page in score order
+        // has none on either physical form.
+        String body =
+            "{\"size\":5,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"sort\":[\"_score\"],\"search_after\":[0.5]}";
+        IllegalArgumentException refused = expectThrows(IllegalArgumentException.class, () -> planRuntime(body, PlanTestFixtures.model()));
+        assertThat(refused.getMessage(), containsString("plan_failed"));
+        assertThat(refused.getMessage(), containsString("search_after requires TieStability [stable_key]"));
+        assertThat(refused.getMessage(), containsString("TieStability [unstable]"));
+        // The same page without the cursor plans into the scan.
+        RequestPlanner.Planned page = planRuntime(
+            "{\"size\":5,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"sort\":[\"_score\"]}",
+            PlanTestFixtures.model()
+        );
+        assertEquals(FragmentPlan.Kind.PUSHED_SCAN, page.plan().kind());
+    }
+
+    public void testSearchAfterOnAKeywordSortWithATieBreakerPlansAStableKeyPage() throws IOException {
+        // Two collations with a cursor never fold into the scan; the heap
+        // page over the pushed clause declares STABLE_KEY and meets the
+        // cursor's demand.
+        String body = "{\"size\":5,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},"
+            + "\"sort\":[{\"category\":\"asc\"},{\"id\":\"asc\"}],\"search_after\":[\"c0\",3]}";
+        RequestPlanner.Planned planned = planRuntime(body, PlanTestFixtures.model());
+        assertTrue(planned.perNode().toString(), planned.perNode() instanceof HeapTopKExec);
+        assertEquals(FragmentPlan.Kind.LUCENE_TOPK, planned.plan().kind());
+        assertSame(TieStability.STABLE_KEY, planned.perNode().getTraitSet().getTrait(TieStability.Def.INSTANCE));
+        assertNull(planned.unplanned());
+
+        // A single column cursor folds into the scan as before, also
+        // STABLE_KEY; the coordinator layer over it keeps the value.
+        RequestPlanner.Planned pushed = planRuntime(
+            "{\"size\":5,\"sort\":[{\"rating\":\"asc\"}],\"search_after\":[7]}",
+            PlanTestFixtures.model()
+        );
+        assertEquals(FragmentPlan.Kind.PUSHED_SCAN, pushed.plan().kind());
+        assertEquals("(rating > 7 OR rating IS NULL)", pushed.plan().topK().cursorSql());
+        assertSame(TieStability.STABLE_KEY, pushed.perNode().getTraitSet().getTrait(TieStability.Def.INSTANCE));
+        RelNode coordinator = pushed.coordinatorPlan(runtimeShape("{\"size\":5,\"sort\":[{\"rating\":\"asc\"}],\"search_after\":[7]}"), 2);
+        assertSame(TieStability.STABLE_KEY, coordinator.getTraitSet().getTrait(TieStability.Def.INSTANCE));
+        assertSame(Accuracy.EXACT, coordinator.getTraitSet().getTrait(Accuracy.Def.INSTANCE));
+    }
+
+    public void testSearchAfterWithAnUnplannedSortPlacesNoDemand() throws IOException {
+        // The sort has no collation spelling, so the tree is the query
+        // root alone and the executor's collector builds the page and
+        // the cursor; the planner has no page to judge and refuses
+        // nothing.
+        String body = "{\"size\":5,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},"
+            + "\"sort\":[{\"rating\":{\"order\":\"desc\",\"mode\":\"min\"}}],\"search_after\":[3]}";
+        RequestPlanner.Planned planned = planRuntime(body, PlanTestFixtures.model());
+        assertEquals(FragmentPlan.Kind.LUCENE_TOPK, planned.plan().kind());
+        assertNotNull(planned.unplanned());
+        assertTrue(planned.perNode() instanceof LanceTableScan);
     }
 }

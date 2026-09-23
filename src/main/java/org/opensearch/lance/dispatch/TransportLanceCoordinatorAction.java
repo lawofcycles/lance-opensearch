@@ -1070,7 +1070,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // min_score and terminate_after apply inside Lucene's
             // collectors on the executor, so a request carrying either is
             // not planned as a pushed aggregate or a pushed page (see
-            // ExecutionShape.collectorKnobs).
+            // ExecutionShape.collectorKnobs). The track_total_hits bound
+            // travels so the planner can demand an exact count.
             return new ExecutionShape(
                 query,
                 postFilter,
@@ -1080,7 +1081,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 effectiveSize,
                 aggregations,
                 minScore != null || terminateAfter > 0,
-                !rescores.isEmpty() || collapse != null
+                !rescores.isEmpty() || collapse != null,
+                trackTotalHitsUpTo
             );
         }
     }

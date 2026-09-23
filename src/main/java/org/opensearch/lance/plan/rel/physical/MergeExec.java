@@ -16,6 +16,8 @@ import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.opensearch.lance.plan.calcite.LuceneConvention;
 import org.opensearch.lance.plan.calcite.LuceneRel;
+import org.opensearch.lance.plan.traits.Accuracy;
+import org.opensearch.lance.plan.traits.TieStability;
 
 import java.util.List;
 import java.util.Objects;
@@ -29,7 +31,14 @@ import java.util.Objects;
  * type: the reduce combines rows of the shape the per-node subtree
  * produced, it does not reshape them. The runtime counterpart is the
  * coordinator's merge the {@code PlanExecutor} drives once every
- * per-node response is in.
+ * per-node response is in. The merge preserves its input's
+ * {@link Accuracy} and {@link TieStability}: summing exact counts and
+ * reducing exact buckets stays {@code EXACT}, reducing sketches stays
+ * {@code APPROXIMATE}, and the merged page keeps the tie order of the
+ * per node pages (a {@code STABLE_KEY} page per node merges by the same
+ * sort values into a {@code STABLE_KEY} page, an {@code UNSTABLE} page
+ * stays {@code UNSTABLE}), so the constructor reads both from the
+ * input's trait set.
  */
 public final class MergeExec extends SingleRel implements LuceneRel {
 
@@ -50,12 +59,13 @@ public final class MergeExec extends SingleRel implements LuceneRel {
     /**
      * @param traits {@link LuceneConvention#INSTANCE} for the physical
      *     form, {@code Convention.NONE} for the logical form the
-     *     translator wrapper builds
+     *     translator wrapper builds; the accuracy and tie stability are
+     *     taken from {@code input}
      * @param input the {@link FanOutExec} whose gathered answers reduce here
      * @param reduceKind which reduce combines them
      */
     public MergeExec(RelOptCluster cluster, RelTraitSet traits, RelNode input, ReduceKind reduceKind) {
-        super(cluster, traits, input);
+        super(cluster, FanOutExec.inheriting(traits, input), input);
         this.reduceKind = Objects.requireNonNull(reduceKind, "reduceKind");
     }
 

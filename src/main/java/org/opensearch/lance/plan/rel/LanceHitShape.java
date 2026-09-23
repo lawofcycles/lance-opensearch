@@ -41,6 +41,14 @@ import java.util.Objects;
  * filter narrows it. {@code from} is the number of leading hits the
  * coordinator skips; the top-k below already fetches {@code from}
  * plus the page, so the node only records it.
+ *
+ * <p>The node is logical and carries the trait defs' defaults. The
+ * physical form that stands in for the whole hits plan (the scan with
+ * the page pushed, or {@code HeapTopKExec}) declares
+ * {@link org.opensearch.lance.plan.traits.Accuracy#EXACT} and the
+ * {@link org.opensearch.lance.plan.traits.TieStability} of the
+ * {@link LanceTopK} below ({@link LanceTopK#tieStability()}); the
+ * envelope renders rows, it does not reorder them.
  */
 public final class LanceHitShape extends SingleRel {
 

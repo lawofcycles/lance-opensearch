@@ -24,6 +24,8 @@ import org.opensearch.lance.plan.rel.LanceHitShape;
 import org.opensearch.lance.plan.rel.LanceKnnSearch;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.rel.LanceTopK;
+import org.opensearch.lance.plan.traits.Accuracy;
+import org.opensearch.lance.plan.traits.TieStability;
 
 import java.util.List;
 import java.util.Objects;
@@ -42,6 +44,13 @@ import java.util.Objects;
  * {@code TransportLanceFragmentQueryAction}; no executor traverses
  * this node yet, it makes the fallback visible to the Volcano
  * planner's cost comparison.
+ *
+ * <p>The node declares {@link Accuracy#EXACT} (a collector page is the
+ * rows themselves) and the {@link TieStability} of the page it cuts
+ * ({@link LanceTopK#tieStability()}): {@code STABLE_KEY} under a
+ * column sort, with or without a further tie breaker, {@code UNSTABLE}
+ * for a page in score order over a full text or knn query, where equal
+ * scores have no reproducible order.
  */
 public final class HeapTopKExec extends SingleRel implements LuceneRel {
 
@@ -49,7 +58,8 @@ public final class HeapTopKExec extends SingleRel implements LuceneRel {
     private final LanceHitShape hitShape;
 
     /**
-     * @param traitSet must carry {@link LuceneConvention#INSTANCE}
+     * @param traitSet must carry {@link LuceneConvention#INSTANCE}; the
+     *     accuracy and tie stability are replaced by the node's own
      * @param input the bare scan whose fragment readers the collector
      *     runs over
      * @param topK the top-k the node stands in for, its input rebuilt
@@ -58,8 +68,8 @@ public final class HeapTopKExec extends SingleRel implements LuceneRel {
      *     when the plan carried none
      */
     public HeapTopKExec(RelOptCluster cluster, RelTraitSet traitSet, RelNode input, LanceTopK topK, LanceHitShape hitShape) {
-        super(cluster, traitSet, input);
-        this.topK = Objects.requireNonNull(topK, "topK");
+        super(cluster, traitSet.plus(Accuracy.EXACT).plus(Objects.requireNonNull(topK, "topK").tieStability()), input);
+        this.topK = topK;
         this.hitShape = hitShape;
     }
 

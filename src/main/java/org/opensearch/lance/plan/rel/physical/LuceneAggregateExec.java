@@ -25,6 +25,8 @@ import org.opensearch.lance.plan.cost.CostInputsHolder;
 import org.opensearch.lance.plan.cost.CostModel;
 import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.LanceTableScan;
+import org.opensearch.lance.plan.traits.Accuracy;
+import org.opensearch.lance.plan.traits.TieStability;
 
 import java.util.List;
 import java.util.Objects;
@@ -42,21 +44,30 @@ import java.util.Objects;
  * {@code TransportLanceFragmentQueryAction}; no executor traverses
  * this node yet, it makes the fallback visible to the Volcano
  * planner's cost comparison.
+ *
+ * <p>The node declares the wrapped aggregate's {@link Accuracy}
+ * ({@link LanceAggregate#accuracy()}: {@code APPROXIMATE} with a
+ * {@code cardinality}, {@code percentiles} or {@code percentile_ranks}
+ * metric, because the aggregators compute the same sketches the pushed
+ * scan does, {@code EXACT} otherwise) and
+ * {@link TieStability#UNSTABLE}: the order of its group rows is no
+ * contract, the executor keys the buckets.
  */
 public final class LuceneAggregateExec extends SingleRel implements LuceneRel {
 
     private final LanceAggregate aggregate;
 
     /**
-     * @param traitSet must carry {@link LuceneConvention#INSTANCE}
+     * @param traitSet must carry {@link LuceneConvention#INSTANCE}; the
+     *     accuracy and tie stability are replaced by the node's own
      * @param input the bare scan whose fragment readers the
      *     aggregators run over
      * @param aggregate the aggregate the node stands in for, its input
      *     rebuilt to the concrete tree
      */
     public LuceneAggregateExec(RelOptCluster cluster, RelTraitSet traitSet, RelNode input, LanceAggregate aggregate) {
-        super(cluster, traitSet, input);
-        this.aggregate = Objects.requireNonNull(aggregate, "aggregate");
+        super(cluster, traitSet.plus(Objects.requireNonNull(aggregate, "aggregate").accuracy()).plus(TieStability.UNSTABLE), input);
+        this.aggregate = aggregate;
     }
 
     /** The aggregate the node stands in for, with its concrete input tree. */

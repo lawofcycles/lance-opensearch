@@ -286,6 +286,59 @@ public class LanceExplainIT extends LanceRestTestCase {
         }
     }
 
+    public void testExplainRefusesATraitDemandNoPlanMeets() throws Exception {
+        String suffix = "explain-trait-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            attach(tableUri);
+
+            // An explicit track_total_hits demands an exact count of the
+            // plan root; a cardinality metric is a sketch on the pushed
+            // scan and on the aggregators alike, so no plan meets the
+            // demand and the body is refused naming the trait. The same
+            // body without the bound plans on the aggregators, and the
+            // bound over an exact metric plans as before.
+            String sketch = "{\"size\":0,\"track_total_hits\":500,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"id\"}}}}";
+            ResponseException refused = expectThrows(ResponseException.class, () -> explain(indexName, sketch));
+            assertEquals(RestStatus.BAD_REQUEST.getStatus(), refused.getResponse().getStatusLine().getStatusCode());
+            String reason = readAll(refused.getResponse());
+            assertTrue("the message names the demand: " + reason, reason.contains("track_total_hits requires Accuracy [exact]"));
+            assertTrue("the message names what the plan offers: " + reason, reason.contains("Accuracy [approximate]"));
+
+            String unbounded = explainOk(indexName, "{\"size\":0,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"id\"}}}}");
+            assertEquals("LUCENE_AGGREGATE", fragmentPlanOf(unbounded).get("kind"));
+            String exact = explainOk(indexName, "{\"size\":0,\"track_total_hits\":500,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
+            assertEquals("PUSHED_SCAN", fragmentPlanOf(exact).get("kind"));
+
+            // The search endpoint plans through the same entry, so it
+            // refuses the same body the same way.
+            ResponseException searchRefused = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", sketch));
+            assertEquals(RestStatus.BAD_REQUEST.getStatus(), searchRefused.getResponse().getStatusLine().getStatusCode());
+            assertTrue(readAll(searchRefused.getResponse()).contains("track_total_hits requires Accuracy [exact]"));
+
+            // A search_after cursor over a page in score order has no
+            // reproducible tie order on either form and is refused
+            // naming TieStability; the same page without the cursor
+            // folds into the scan.
+            String scoredCursor = "{\"size\":2,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},"
+                + "\"sort\":[\"_score\"],\"search_after\":[0.5]}";
+            ResponseException cursorRefused = expectThrows(ResponseException.class, () -> explain(indexName, scoredCursor));
+            assertEquals(RestStatus.BAD_REQUEST.getStatus(), cursorRefused.getResponse().getStatusLine().getStatusCode());
+            assertTrue(readAll(cursorRefused.getResponse()).contains("search_after requires TieStability [stable_key]"));
+            String scored = explainOk(
+                indexName,
+                "{\"size\":2,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"sort\":[\"_score\"]}"
+            );
+            assertEquals("PUSHED_SCAN", fragmentPlanOf(scored).get("kind"));
+        } finally {
+            deleteQuietly(indexName);
+        }
+    }
+
     public void testExplainAcceptsTheRuntimeEnvelopeAndReportsTheShardPathRoute() throws Exception {
         String suffix = "explain-env-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));

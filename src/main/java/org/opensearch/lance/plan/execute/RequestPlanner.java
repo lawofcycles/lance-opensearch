@@ -21,6 +21,10 @@ import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.cost.CostInputs;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
+import org.opensearch.lance.plan.traits.Accuracy;
+import org.opensearch.lance.plan.traits.PlanRequirement;
+import org.opensearch.lance.plan.traits.TieStability;
+import org.opensearch.lance.plan.traits.UnmetPlanRequirementException;
 import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
@@ -51,6 +55,15 @@ import java.util.Set;
  * prefilter by contract and silently dropping it would return wrong
  * nearest rows, so the request is refused with the 400 the executor
  * used to answer.
+ *
+ * <p>Two request elements select no plan structure but a trait the plan
+ * root must declare ({@code requirementOf}): an explicit
+ * {@code track_total_hits} demands {@link Accuracy#EXACT}, a
+ * {@code search_after} cursor over a planned page demands
+ * {@link TieStability#STABLE_KEY}. The Volcano run is asked to meet the
+ * demand; when no plan of the request does, the request is refused with
+ * a 400 whose message names the trait, instead of an executor returning
+ * an answer the request cannot rely on.
  */
 public final class RequestPlanner {
 
@@ -149,7 +162,10 @@ public final class RequestPlanner {
      * @param sqlExcludedColumns the override columns whose predicates
      *     never travel to Lance SQL
      * @throws IllegalArgumentException for a filtered {@code lance_knn}
-     *     whose filter cannot travel to the Lance scan (answers 400)
+     *     whose filter cannot travel to the Lance scan, and for a request
+     *     whose trait requirement ({@code requirementOf}) no plan meets:
+     *     the message starts with {@code plan_failed} and names the
+     *     demanded trait and what the plan offers (both answer 400)
      */
     public static Planned plan(
         ExecutionShape shape,
@@ -184,7 +200,13 @@ public final class RequestPlanner {
             return luceneFallback(shape, model, factory, unsupported.getMessage());
         }
         RelNode logical = translation.root();
-        RelNode physical = factory.plan(logical, inputs);
+        PlanRequirement requirement = requirementOf(shape, translation);
+        RelNode physical;
+        try {
+            physical = factory.plan(logical, inputs, requirement);
+        } catch (UnmetPlanRequirementException unmet) {
+            throw new IllegalArgumentException(unmet.getMessage(), unmet);
+        }
         FragmentPlan plan = FragmentPlan.of(physical, shape.hasAggregations(), shape.hits(), inputs);
         if (filteredKnn != null && (plan.lanceClause() == null || plan.filterSql() == null)) {
             throw knnFilterRefusal(filteredKnn, "the filter has no Lance SQL form");
@@ -193,6 +215,49 @@ public final class RequestPlanner {
             LOGGER.debug("lance.plan: index [{}] planned [{}]\n{}", model.indexName(), plan, RelOptUtil.toString(physical));
         }
         return new Planned(plan, logical, physical, translation.unplanned());
+    }
+
+    /**
+     * The traits the request demands of the plan root, derived from the
+     * request elements the planner does not spell as plan structure.
+     *
+     * <p>{@link Accuracy#EXACT} when the request asks for an exact
+     * {@code hits.total} ({@link ExecutionShape#exactCount()}: an
+     * explicit {@code track_total_hits} bound or {@code true}). Every
+     * plan whose root reports the count is exact today (the pushed scan
+     * counts rows, the Lucene collector counts documents); the demand
+     * refuses the one shape whose root is a sketch, an aggregate with a
+     * {@code cardinality} or {@code percentiles} metric, which both
+     * physical forms declare {@link Accuracy#APPROXIMATE}. The plumbing
+     * is in place for other exactness demands (a checksum of the stored
+     * fields against a downstream oracle, say); this is the only
+     * concrete one.
+     *
+     * <p>{@link TieStability#STABLE_KEY} when the request carries a
+     * {@code search_after} cursor and the tree carries the page
+     * ({@code translation.unplanned()} is null on a hits shape): a
+     * cursor continues from the sort values of the previous page's last
+     * hit, so the rows on either side of it must be the same rows on
+     * every call, which a page ordered by a stored column guarantees
+     * and a page in score order does not. The demand is not placed when
+     * the envelope stayed on Lucene (a sort without a collation
+     * spelling, a {@code collapse}): the tree is then the query root
+     * alone and its order is not the page's; the executor's collector
+     * builds the page and the cursor from the request's own sort. A
+     * cursor over a row address ordered page would demand
+     * {@link TieStability#STABLE_ROWADDR}, but no request spells that
+     * sort today ({@code _rowaddr} is not a sort field), so the cursor
+     * always demands the key order.
+     */
+    static PlanRequirement requirementOf(ExecutionShape shape, ExecutionTranslation translation) {
+        PlanRequirement requirement = PlanRequirement.NONE;
+        if (shape.exactCount()) {
+            requirement = requirement.withAccuracy(Accuracy.EXACT, "track_total_hits");
+        }
+        if (shape.hasCursor() && shape.hits() && translation.unplanned() == null) {
+            requirement = requirement.withTieStability(TieStability.STABLE_KEY, "search_after");
+        }
+        return requirement;
     }
 
     /**

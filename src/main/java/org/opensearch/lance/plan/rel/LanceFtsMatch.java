@@ -43,6 +43,16 @@ import java.util.Objects;
  * when it builds the Lucene-side query for the pushed scan. The row
  * type is the input's plus the {@code _score} column the Lance FTS
  * scan returns.
+ *
+ * <p>The node is logical and carries the trait defs' defaults; a page
+ * cut in its score order declares
+ * {@link org.opensearch.lance.plan.traits.TieStability#UNSTABLE} on
+ * whichever physical form cuts it (see {@link LanceTopK#tieStability()}),
+ * because the Lance scanner returns equal scores in whatever order its
+ * batches arrive, so a {@code search_after} cursor over a bare full
+ * text page is refused at plan time. Its figures are exact
+ * ({@link org.opensearch.lance.plan.traits.Accuracy#EXACT}): the match
+ * count and the BM25 scores are computed, not sketched.
  */
 public final class LanceFtsMatch extends SingleRel {
 

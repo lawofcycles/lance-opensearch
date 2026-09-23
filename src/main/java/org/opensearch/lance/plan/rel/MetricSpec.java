@@ -33,7 +33,13 @@ import java.util.StringJoiner;
 public record MetricSpec(String aggregationName, Kind kind, double[] percents, double[] values, Double sigma, Long precisionThreshold,
     Boolean keyed, String format) {
 
-    /** The metric aggregation kinds the planner models. */
+    /**
+     * The metric aggregation kinds the planner models. {@link #CARDINALITY},
+     * {@link #PERCENTILES} and {@link #PERCENTILE_RANKS} are sketches
+     * (HyperLogLog++, a t-digest), so an aggregate carrying one declares
+     * {@link org.opensearch.lance.plan.traits.Accuracy#APPROXIMATE}
+     * ({@link LanceAggregate#accuracy()}); the rest are exact.
+     */
     public enum Kind {
         SUM,
         AVG,

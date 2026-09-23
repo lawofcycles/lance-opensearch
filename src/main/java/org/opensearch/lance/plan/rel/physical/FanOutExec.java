@@ -16,6 +16,9 @@ import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.opensearch.lance.plan.calcite.LuceneConvention;
 import org.opensearch.lance.plan.calcite.LuceneRel;
+import org.opensearch.lance.plan.traits.Accuracy;
+import org.opensearch.lance.plan.traits.PlanRequirement;
+import org.opensearch.lance.plan.traits.TieStability;
 
 import java.util.List;
 import java.util.Objects;
@@ -29,7 +32,10 @@ import java.util.Objects;
  * fragments are cut into those requests ({@link #partitioning()}).
  * The runtime counterpart is the fragment fan-out the
  * {@code PlanExecutor} drives: one transport request per group, the
- * responses gathered for the {@link MergeExec} above.
+ * responses gathered for the {@link MergeExec} above. The fan-out
+ * preserves its input's {@link Accuracy} and {@link TieStability}:
+ * it moves the per node rows without changing their figures or their
+ * order, so the constructor reads both from the input's trait set.
  */
 public final class FanOutExec extends SingleRel implements LuceneRel {
 
@@ -50,15 +56,22 @@ public final class FanOutExec extends SingleRel implements LuceneRel {
     /**
      * @param traits {@link LuceneConvention#INSTANCE} for the physical
      *     form, {@code Convention.NONE} for the logical form the
-     *     translator wrapper builds
+     *     translator wrapper builds; the accuracy and tie stability are
+     *     taken from {@code input}
      * @param input the per-node subtree every fragment group runs
      * @param fanOut how many per-node requests leave the coordinator
      * @param partitioning how the fragments are cut into the requests
      */
     public FanOutExec(RelOptCluster cluster, RelTraitSet traits, RelNode input, int fanOut, Partitioning partitioning) {
-        super(cluster, traits, input);
+        super(cluster, inheriting(traits, input), input);
         this.fanOut = fanOut;
         this.partitioning = Objects.requireNonNull(partitioning, "partitioning");
+    }
+
+    /** {@code traits} with the {@link Accuracy} and {@link TieStability} of {@code input}. */
+    static RelTraitSet inheriting(RelTraitSet traits, RelNode input) {
+        return traits.plus(PlanRequirement.declaredAccuracy(input.getTraitSet()))
+            .plus(PlanRequirement.declaredTieStability(input.getTraitSet()));
     }
 
     /** How many per-node requests leave the coordinator. */

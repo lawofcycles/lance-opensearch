@@ -64,7 +64,10 @@ import java.util.Optional;
  * either: the filter narrows the page after the query matched, so a
  * scan that cut the page first would come back short. The rules
  * terminate because the output scan carries pushed operations, and
- * every operand requires the bare scan.
+ * every operand requires the bare scan. The pushed scan derives its
+ * {@code TieStability} from the page it carries
+ * ({@link LanceTopK#tieStability()}), so the rule sets no trait of its
+ * own.
  */
 public final class PushSortLimitIntoLanceScan extends RelRule<PushSortLimitIntoLanceScan.Config> {
 
