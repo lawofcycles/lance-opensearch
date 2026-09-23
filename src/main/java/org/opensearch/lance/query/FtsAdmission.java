@@ -326,9 +326,7 @@ public final class FtsAdmission {
      * {@link #SCAN_BUFFER_FACTOR}.
      */
     static long scanBufferEstimateBytes(long rows, Shape shape) {
-        long returnedRows = shape.unbounded()
-            ? (long) (Math.max(0L, rows) * UNBOUNDED_MATCH_RATIO)
-            : Math.max(0L, shape.boundedScanRows());
+        long returnedRows = shape.unbounded() ? (long) (Math.max(0L, rows) * UNBOUNDED_MATCH_RATIO) : Math.max(0L, shape.boundedScanRows());
         return (long) (returnedRows * HITS_SCAN_ROW_BYTES * SCAN_BUFFER_FACTOR);
     }
 

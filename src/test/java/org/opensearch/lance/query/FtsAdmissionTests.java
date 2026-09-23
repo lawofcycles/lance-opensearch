@@ -184,7 +184,10 @@ public class FtsAdmissionTests extends OpenSearchTestCase {
 
         // One byte less and the estimate no longer fits.
         FtsAdmission.setMemoryProbeForTests(() -> 8 * GB + estimate - 1);
-        CircuitBreakingException rejection = expectThrows(CircuitBreakingException.class, () -> FtsAdmission.admit("demo", 1_000L, UNBOUNDED));
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> FtsAdmission.admit("demo", 1_000L, UNBOUNDED)
+        );
         assertTrue(rejection.getMessage(), rejection.getMessage().contains(FtsAdmission.LABEL));
     }
 
