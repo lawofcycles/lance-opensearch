@@ -1262,7 +1262,9 @@ public class LanceAggregationIT extends LanceRestTestCase {
         }
         Request request = new Request("POST", path);
         request.setJsonEntity(body);
-        request.setOptions(RequestOptions.DEFAULT.toBuilder().setWarningsHandler(WarningsHandler.PERMISSIVE));
+        RequestOptions.Builder options = RequestOptions.DEFAULT.toBuilder();
+        options.setWarningsHandler(WarningsHandler.PERMISSIVE);
+        request.setOptions(options);
         return client().performRequest(request);
     }
 
@@ -1531,9 +1533,12 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 400,
                 "buckets_path aggregation does not exist for aggregation [ab]: nosuch>s"
             );
+            assertEquals("the validation refusals left no fan-out line", fanOutBefore + requests, fanOutLogLines(index));
             // A script that does not compile fails the reduce on the
             // coordinator on both paths: the status is the script
             // exception's and the body carries the compiler's message.
+            // The fragment path fans out before its reduce fails, so this
+            // request leaves a fan-out line.
             String brokenScript = "{\"size\":0,\"aggs\":{"
                 + byCategory.replace(
                     "\"s\":{\"sum\":{\"field\":\"id\"}}",
@@ -1542,7 +1547,8 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 )
                 + "}}";
             assertSameRefusalAsShardPath(index, brokenScript, 400, "compile error");
-            assertEquals("the refusals left no fan-out line", fanOutBefore + requests, fanOutLogLines(index));
+            requests++;
+            assertEquals("the failed reduce followed one fan-out", fanOutBefore + requests, fanOutLogLines(index));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + index));
