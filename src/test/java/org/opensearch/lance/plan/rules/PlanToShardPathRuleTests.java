@@ -72,18 +72,15 @@ public class PlanToShardPathRuleTests extends OpenSearchTestCase {
         );
     }
 
-    public void testSiblingPipelineAggregationFallsBack() throws IOException {
-        assertFallsBack(
-            "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}},\"ab\":{\"avg_bucket\":{\"buckets_path\":\"by>_count\"}}}}",
-            ShardPathReason.PIPELINE_AGG
+    public void testPipelineAggregationsAreDispatchable() throws IOException {
+        // Sibling and parent pipelines run on the coordinator's final
+        // reduce over the executors' trees, so neither routes away.
+        assertDispatchable(
+            "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}},\"ab\":{\"avg_bucket\":{\"buckets_path\":\"by>_count\"}}}}"
         );
-    }
-
-    public void testNestedParentPipelineAggregationFallsBack() throws IOException {
-        assertFallsBack(
+        assertDispatchable(
             "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"},"
-                + "\"aggs\":{\"c\":{\"sum\":{\"field\":\"id\"}},\"cs\":{\"cumulative_sum\":{\"buckets_path\":\"c\"}}}}}}",
-            ShardPathReason.PIPELINE_AGG
+                + "\"aggs\":{\"c\":{\"sum\":{\"field\":\"id\"}},\"cs\":{\"cumulative_sum\":{\"buckets_path\":\"c\"}}}}}}"
         );
     }
 
@@ -145,9 +142,6 @@ public class PlanToShardPathRuleTests extends OpenSearchTestCase {
             "{\"size\":0,\"suggest\":{\"s\":{\"text\":\"hello\",\"term\":{\"field\":\"body\"}}},\"highlight\":{\"fields\":{\"body\":{}}},"
                 + "\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}},\"ab\":{\"avg_bucket\":{\"buckets_path\":\"by>_count\"}}}}"
         );
-        assertEquals(
-            List.of(ShardPathReason.SUGGEST, ShardPathReason.HIGHLIGHT, ShardPathReason.PIPELINE_AGG),
-            SearchRequestToRel.shardPathReasons(source)
-        );
+        assertEquals(List.of(ShardPathReason.SUGGEST, ShardPathReason.HIGHLIGHT), SearchRequestToRel.shardPathReasons(source));
     }
 }

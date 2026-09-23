@@ -276,11 +276,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     /**
      * Resolve the request, enumerate fragments per Lance-backed
      * index, and issue one per-node {@link LanceFragmentQueryAction}
-     * fan-out per index. Multi-index requests without aggregations
-     * are handled by running one fan-out per index sequentially and
-     * merging the partial results at the end; multi-index requests
-     * that carry metrics are filtered out earlier by the filter
-     * because per-index metric merge is not yet implemented.
+     * fan-out per index. A request over several Lance-backed indexes
+     * runs one fan-out per index sequentially; the {@link MergeReducer}
+     * merges the hit pages across the indexes and reduces their
+     * aggregation trees together, as the shard path reduces the trees
+     * of the shards of several indexes.
      */
     private void executeCoordinated(CancellableTask task, SearchRequest searchRequest, ActionListener<SearchResponse> listener)
         throws Exception {

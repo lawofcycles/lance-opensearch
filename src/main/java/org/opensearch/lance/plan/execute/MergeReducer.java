@@ -41,7 +41,8 @@ import java.util.Set;
  * response state: the runtime of a
  * {@link org.opensearch.lance.plan.rel.physical.MergeExec}, driven by
  * {@link PlanExecutor}. Per-node aggregation trees reduce through the
- * stock {@link InternalAggregations#topLevelReduce}, per-node hit
+ * stock {@link InternalAggregations#topLevelReduce} under the final
+ * reduce context carrying the request's pipeline aggregators, per-node hit
  * pages merge by the request's sort ({@link #mergeHits}), and per-node
  * match counts sum under the request's {@code track_total_hits}
  * contract ({@link #totalHits}). Not thread-safe: guarded by the
@@ -314,12 +315,22 @@ public final class MergeReducer {
             // stock reduce path so cross-node reduction lives in
             // OpenSearch's aggregator code rather than in the Lance
             // plugin: nodes ship InternalAggregations, the
-            // coordinator calls topLevelReduce.
+            // coordinator calls topLevelReduce. The context is the
+            // final one, with the request's pipeline tree, as
+            // SearchService.aggReduceContextBuilder builds it for the
+            // shard path's SearchPhaseController: topLevelReduce then
+            // runs the parent pipelines (cumulative_sum, derivative,
+            // bucket_sort, ...) inside each reduced tree and the
+            // sibling pipelines (avg_bucket, stats_bucket, ...) over
+            // the reduced top level, once, over the merged buckets.
+            // The executors never ran them: the aggregators they build
+            // from the same factories are the bucket and metric ones,
+            // and their slice level reduce is a partial one.
             InternalAggregation.ReduceContext ctx = InternalAggregation.ReduceContext.forFinalReduction(
                 bigArrays,
                 scriptService,
                 /* multiBucketConsumer */ n -> {},
-                org.opensearch.search.aggregations.pipeline.PipelineAggregator.PipelineTree.EMPTY
+                aggregationsRequested.buildPipelineTree()
             );
             aggregations = InternalAggregations.topLevelReduce(perNodeAggregations, ctx);
         }
