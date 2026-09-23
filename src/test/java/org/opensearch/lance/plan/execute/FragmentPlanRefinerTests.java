@@ -342,7 +342,7 @@ public class FragmentPlanRefinerTests extends OpenSearchTestCase {
         LancePlannerFactory factory = PlanTestFixtures.factory();
         CostInputs unsliced = new CostInputs(1, StorageKind.LOCAL, 64, 32, 1);
         SearchSourceBuilder source = PlanTestFixtures.parse("{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}");
-        ExecutionShape shape = new ExecutionShape(source.query(), null, List.of(), null, 0, 0, source.aggregations(), true);
+        ExecutionShape shape = new ExecutionShape(source.query(), null, List.of(), null, 0, 0, source.aggregations(), true, false);
         RelNode logical = SearchRequestToRel.translateForExecution(shape, PerfTableFixture.perf1b(), factory);
         RelNode physical = factory.plan(logical, unsliced);
         assertTrue("the pushed scan wins locally without slicing: " + physical, physical instanceof LanceTableScan);
