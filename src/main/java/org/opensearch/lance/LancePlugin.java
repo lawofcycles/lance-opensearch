@@ -442,13 +442,12 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
 
     /**
-     * Whether an unbounded full-text shape (sort by a field,
-     * aggregations, {@code size 0}, {@code _count},
-     * {@code track_total_hits: true}) is admitted only when the node's
-     * free physical memory can hold the estimated native rebuild of the
-     * inverted index document set. {@code false} admits every shape,
-     * restoring the behaviour that let a large enough scan end the node
-     * with a kernel OOM kill. Dynamic. See {@link FtsAdmission}.
+     * Whether a full-text shape is admitted only when the node's free
+     * physical memory can hold the estimated native rebuild of the
+     * inverted index document set plus the scan buffers. {@code false}
+     * admits every shape, restoring the behaviour that let a large
+     * enough scan end the node with a kernel OOM kill. Dynamic. See
+     * {@link FtsAdmission}.
      */
     public static final Setting<Boolean> FTS_ADMISSION_ENABLED_SETTING = Setting.boolSetting(
         "lance.fts.admission.enabled",
@@ -467,6 +466,23 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         FtsAdmission.DEFAULT_HEADROOM,
         ByteSizeValue.ZERO,
         new ByteSizeValue(Long.MAX_VALUE),
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Whether a bounded full-text top-k page is judged by the same
+     * admission estimate as the unbounded shapes. Lance rebuilds the
+     * inverted index document set for a bounded page just as it does
+     * for an unbounded scan when the index does not fit the index
+     * cache shard, so a large enough table can end the node with a
+     * kernel OOM kill even at {@code size: 10}. {@code false} restores
+     * the pass-through for bounded pages. Dynamic. See
+     * {@link FtsAdmission}.
+     */
+    public static final Setting<Boolean> FTS_ADMISSION_BOUNDED_SHAPES_GATED_SETTING = Setting.boolSetting(
+        "lance.fts.admission.bounded_shapes_gated",
+        true,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -724,6 +740,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             FTS_SUBSET_PROBE_MIN_ROWS_SETTING,
             FTS_ADMISSION_ENABLED_SETTING,
             FTS_ADMISSION_HEADROOM_SETTING,
+            FTS_ADMISSION_BOUNDED_SHAPES_GATED_SETTING,
             TEST_INDEX_CACHE_SHARD_SHARE_SETTING,
             AGGREGATION_PUSHDOWN_SETTING,
             AGGREGATION_PUSHDOWN_PARALLELISM_SETTING,
@@ -1055,6 +1072,9 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         clusterService.getClusterSettings().addSettingsUpdateConsumer(FTS_ADMISSION_ENABLED_SETTING, FtsAdmission::setEnabled);
         FtsAdmission.setHeadroom(FTS_ADMISSION_HEADROOM_SETTING.get(environment.settings()));
         clusterService.getClusterSettings().addSettingsUpdateConsumer(FTS_ADMISSION_HEADROOM_SETTING, FtsAdmission::setHeadroom);
+        FtsAdmission.setBoundedShapesGated(FTS_ADMISSION_BOUNDED_SHAPES_GATED_SETTING.get(environment.settings()));
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(FTS_ADMISSION_BOUNDED_SHAPES_GATED_SETTING, FtsAdmission::setBoundedShapesGated);
         FtsAdmission.setIndexCacheShardShareOverride(TEST_INDEX_CACHE_SHARD_SHARE_SETTING.get(environment.settings()));
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(TEST_INDEX_CACHE_SHARD_SHARE_SETTING, FtsAdmission::setIndexCacheShardShareOverride);

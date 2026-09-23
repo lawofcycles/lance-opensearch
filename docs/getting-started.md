@@ -656,16 +656,17 @@ lance.fts.subset_probe_limit: 1000000     # default; cap of the probe limit
 
 The effective probe limit is `min(subset_probe_limit, max(subset_probe_min_rows, floor(covered rows * subset_probe_ratio)))`. When the lookup returns that many rows the node discards them and repeats the scan restricted to its fragments. The ratio is where the two paths cost the same: the whole-table lookup makes every node receive every match and drop the rows of other nodes, about 0.5 to 0.9 µs per received row, while the restricted scan makes Lance read `_rowid` over the node's fragments first, about 21 ns per covered row (139 ms for 6.7M rows at 20M rows). The two are equal when the matches are about 3 percent of the covered rows. On a 20M row table over 3 nodes the limit is 200,000, so a term with 500,000 matches takes the restricted scan and a term with a few hits stays on the index-only lookup. Raise the ratio when the restricted scan is slower than the lookup on your hardware, lower the floor or the cap when the per-node heap for the probe rows matters.
 
-### Admission control for unbounded full-text shapes
+### Admission control for full-text shapes
 
-An unbounded full-text shape (sort by a field, aggregations, `size 0`, `_count`, `track_total_hits: true`) over an inverted index that does not fit one index cache shard makes Lance rebuild the index's document set in native memory for the scan, about 52 bytes per row, outside the JVM and outside every budget the plugin accounts. Each executor therefore estimates that rebuild before the scan starts and answers 429 `circuit_breaking_exception` (label `lance_fts_admission`) when the node's free physical memory minus a headroom cannot hold it, instead of letting the kernel kill the node. Two dynamic cluster settings control it:
+A full-text scan over an inverted index that does not fit one index cache shard makes Lance rebuild the index's document set in native memory, about 52 bytes per row, outside the JVM and outside every budget the plugin accounts — for a bounded top-k page just as for an unbounded shape (sort by a field, aggregations, `size 0`, `_count`, `track_total_hits: true`), because the rebuild does not shrink with the page size. Each executor therefore estimates that rebuild plus the scan's expected buffers before the scan starts and answers 429 `circuit_breaking_exception` (label `lance_fts_admission`) when the node's available physical memory (the kernel's `MemAvailable` on Linux, the free physical memory elsewhere) minus a headroom cannot hold it, instead of letting the kernel kill the node. Three dynamic cluster settings control it:
 
 ```
-lance.fts.admission.enabled: true     # default; false admits every shape
-lance.fts.admission.headroom: 8gb     # default; free memory kept out of reach of the scan
+lance.fts.admission.enabled: true              # default; false admits every shape
+lance.fts.admission.headroom: 8gb              # default; available memory kept out of reach of the scan
+lance.fts.admission.bounded_shapes_gated: true # default; false admits bounded top-k pages ungated
 ```
 
-The 429 message names the estimate, the index cache shard share, the available memory and these two settings. Bounded top-k pages (no sort, no aggregations, no `post_filter`) are not gated. `GET /_lance/stats` reports the decisions under `fts.admission`.
+The 429 message names the estimate, the index cache shard share, the available memory and the settings to relax. `GET /_lance/stats` reports the decisions under `fts.admission`.
 
 ### Aggregations computed inside the scan
 

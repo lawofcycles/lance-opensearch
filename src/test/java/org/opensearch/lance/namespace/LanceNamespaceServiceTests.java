@@ -12,7 +12,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.lance.namespace.model.DescribeTableResponse;
 
@@ -32,6 +34,7 @@ import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.client.NoOpClient;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.threadpool.ThreadPoolStats;
 
 /**
  * Unit tests for {@link LanceNamespaceService}. Registration state
@@ -530,6 +533,75 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
         } finally {
             LanceNamespaceFactory.resetInstantiatorForTests();
         }
+    }
+
+    public void testUnregisterWaitsForTheListingInFlightBeforeReleasingTheHandle() throws Exception {
+        // The applier hands a removed registration's handle to the
+        // generic pool for closing while the preview (or the poll) may
+        // still be inside listTables on another thread. The release
+        // must wait for that call to return; on a real
+        // DirectoryNamespace the alternative is a SIGSEGV.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.tables = Set.of("orders");
+        recording.listTablesGate = new CountDownLatch(1);
+        LanceNamespaceFactory.setInstantiatorForTests(type -> recording);
+        AtomicReference<Optional<Set<String>>> listed = new AtomicReference<>();
+        AtomicReference<Throwable> listingFailure = new AtomicReference<>();
+        Thread lister = new Thread(() -> {
+            try {
+                listed.set(service.listTables("cat"));
+            } catch (Throwable t) {
+                listingFailure.set(t);
+            }
+        });
+        try {
+            LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
+                new LanceNamespaceMetadata.Entry(
+                    "cat",
+                    LanceNamespaceMetadata.Entry.TYPE_REST,
+                    null,
+                    StorageOptions.empty(),
+                    Map.of("uri", "http://catalog.example:8080")
+                )
+            );
+            ClusterState registered = ClusterState.builder(clusterService.state())
+                .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
+                .build();
+            ClusterServiceUtils.setState(clusterService, registered);
+            lister.start();
+            assertTrue("listTables never reached the stub", recording.listTablesEntered.await(30, TimeUnit.SECONDS));
+
+            // Unregister while the listing is held open.
+            ClusterState unregistered = ClusterState.builder(registered)
+                .metadata(Metadata.builder(registered.metadata()).removeCustom(LanceNamespaceMetadata.TYPE))
+                .version(registered.version() + 1)
+                .build();
+            ClusterServiceUtils.setState(clusterService, unregistered);
+            // The close task is on the generic pool, parked behind the
+            // listing; the stub has not been released.
+            assertBusy(() -> assertTrue("expected the close task on the generic pool", genericActiveThreads() >= 1));
+            assertEquals(0, recording.closeCalls.get());
+
+            recording.listTablesGate.countDown();
+            lister.join(30_000);
+            assertNull(listingFailure.get());
+            assertEquals(Optional.of(Set.of("orders")), listed.get());
+            assertBusy(() -> assertEquals(1, recording.closeCalls.get()));
+            assertFalse("the handle was released while listTables was in flight", recording.closedWhileListing);
+        } finally {
+            recording.listTablesGate.countDown();
+            lister.join(30_000);
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+    }
+
+    private long genericActiveThreads() {
+        for (ThreadPoolStats.Stats stats : threadPool.stats()) {
+            if (ThreadPool.Names.GENERIC.equals(stats.getName())) {
+                return stats.getActive();
+            }
+        }
+        return 0;
     }
 
     /** NoOpClient that records the action names driven through it. */
