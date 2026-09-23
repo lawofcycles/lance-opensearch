@@ -395,10 +395,16 @@ public final class LanceNamespaceService {
             return Optional.empty();
         }
         Set<String> names = new TreeSet<>();
-        for (LanceCatalogEnumerator.CatalogTable table : handle.call(
-            namespace -> LanceCatalogEnumerator.enumerateTables(namespace, entry)
-        )) {
-            names.add(table.name());
+        try {
+            for (LanceCatalogEnumerator.CatalogTable table : handle.call(
+                namespace -> LanceCatalogEnumerator.enumerateTables(namespace, entry)
+            )) {
+                names.add(table.name());
+            }
+        } catch (LanceNamespaceHandle.ReleasedException e) {
+            // The registration was removed between the metadata read
+            // above and the call: answer as for an unregistered path.
+            return Optional.empty();
         }
         return Optional.of(names);
     }
@@ -467,6 +473,10 @@ public final class LanceNamespaceService {
                     syncCatalogTable(entry, handle, table);
                 }
                 unavailable.remove(entry.name());
+            } catch (LanceNamespaceHandle.ReleasedException e) {
+                // The registration was removed after this cycle read the
+                // metadata; there is nothing to report against it.
+                LOG.debug("namespace {} was unregistered during the poll cycle", entry.name());
             } catch (Exception e) {
                 // A listing failure (unreachable endpoint, revoked
                 // credentials after a successful initialise) marks the
@@ -530,6 +540,9 @@ public final class LanceNamespaceService {
         DescribeTableResponse described;
         try {
             described = handle.call(namespace -> namespace.describeTable(new DescribeTableRequest().id(table.id())));
+        } catch (LanceNamespaceHandle.ReleasedException e) {
+            // The registration was removed mid-cycle; nothing to surface.
+            return;
         } catch (Exception e) {
             LOG.warn("describe_table failed for {} in namespace {}: {}", indexName, entry.name(), e.getMessage());
             return;

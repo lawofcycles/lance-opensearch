@@ -32,7 +32,7 @@ import org.opensearch.common.CheckedFunction;
  * {@link #close} takes the write side, which waits for every in-flight
  * call to return before the native release runs, and releases once.
  * A call that arrives after the release fails with
- * {@link IllegalStateException} rather than reaching native code.
+ * {@link ReleasedException} rather than reaching native code.
  */
 final class LanceNamespaceHandle {
 
@@ -49,15 +49,26 @@ final class LanceNamespaceHandle {
     }
 
     /**
+     * Thrown by {@link #call} once the handle has been released: the
+     * registration behind it was removed while the caller was between
+     * looking the handle up and using it.
+     */
+    static final class ReleasedException extends IllegalStateException {
+        ReleasedException() {
+            super("namespace handle already released");
+        }
+    }
+
+    /**
      * Run {@code call} against the namespace while holding it open.
      *
-     * @throws IllegalStateException if the handle has been released
+     * @throws ReleasedException if the handle has been released
      */
     <T> T call(CheckedFunction<LanceNamespace, T, Exception> call) throws Exception {
         lock.readLock().lock();
         try {
             if (closed) {
-                throw new IllegalStateException("namespace handle already released");
+                throw new ReleasedException();
             }
             return call.apply(namespace);
         } finally {

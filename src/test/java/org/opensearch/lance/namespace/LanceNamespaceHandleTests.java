@@ -113,8 +113,8 @@ public class LanceNamespaceHandleTests extends OpenSearchTestCase {
         handle.close();
         assertEquals(1, recording.closeCalls.get());
         int listingsBefore = recording.listTablesIds.size();
-        IllegalStateException e = expectThrows(
-            IllegalStateException.class,
+        LanceNamespaceHandle.ReleasedException e = expectThrows(
+            LanceNamespaceHandle.ReleasedException.class,
             () -> handle.call(namespace -> namespace.listTables(new ListTablesRequest()))
         );
         assertTrue(e.getMessage(), e.getMessage().contains("released"));
@@ -129,7 +129,10 @@ public class LanceNamespaceHandleTests extends OpenSearchTestCase {
         handle.close();
         assertTrue(handle.isClosed());
         assertEquals(0, recording.closeCalls.get());
-        expectThrows(IllegalStateException.class, () -> handle.call(namespace -> namespace.listTables(new ListTablesRequest())));
+        expectThrows(
+            LanceNamespaceHandle.ReleasedException.class,
+            () -> handle.call(namespace -> namespace.listTables(new ListTablesRequest()))
+        );
     }
 
     /** Forwards the listing calls to a recording stub without exposing AutoCloseable. */
