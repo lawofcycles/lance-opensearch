@@ -20,6 +20,15 @@ import org.lance.ipc.ColumnOrdering;
  * {@link PushedFilter}, {@link PushedFts}, {@link PushedKnn} and
  * {@link PushedTopK}; the project kind joins when its pushdown rule
  * lands.
+ *
+ * <p>A scan carries at most one query kind ({@link PushedAggregate},
+ * {@link PushedFilter}, {@link PushedFts} or {@link PushedKnn}) and
+ * optionally a {@link PushedTopK} that cuts the page of that query.
+ * {@link PushedTopK} combines with any query kind other than
+ * {@link PushedAggregate}, which consumes every matching row. The five
+ * permits are mutually exclusive except for that one top-k
+ * combination, and every {@code LanceTableScan.withPushed*} method
+ * refuses the tree that would violate the invariant.
  */
 public sealed interface PushedOperation permits PushedOperation.PushedAggregate, PushedOperation.PushedFilter, PushedOperation.PushedFts,
     PushedOperation.PushedKnn, PushedOperation.PushedTopK {
