@@ -619,16 +619,16 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals(List.of("2-2", "2-0", "1-2", "1-0", "0-2", "0-0"), hitIds(before));
 
             updateClusterSetting("lance.test.index_cache_shard_share", "1b");
-            updateClusterSetting("lance.fts.admission.headroom", "1pb");
+            updateClusterSetting("lance.admission.headroom", "1pb");
             try {
                 ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", sorted));
                 int status = failure.getResponse().getStatusLine().getStatusCode();
                 String body = readAll(failure.getResponse());
                 assertEquals("expected 429, saw " + status + ": " + body, RestStatus.TOO_MANY_REQUESTS.getStatus(), status);
                 assertTrue("expected circuit_breaking_exception: " + body, body.contains("circuit_breaking_exception"));
-                assertTrue("expected the admission label: " + body, body.contains("lance_fts_admission"));
+                assertTrue("expected the admission label: " + body, body.contains("lance_admission"));
             } finally {
-                updateClusterSetting("lance.fts.admission.headroom", null);
+                updateClusterSetting("lance.admission.headroom", null);
                 updateClusterSetting("lance.test.index_cache_shard_share", null);
             }
             String after = readAll(postJson("/" + indexName + "/_search", sorted));

@@ -316,6 +316,24 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.planExecuted = Collections.unmodifiableMap(new LinkedHashMap<>(planExecuted));
     }
 
+    /**
+     * {@code counts} in the gate's kind order (the wire does not keep
+     * the order of a map), any key the gate does not name last.
+     */
+    private static Map<String, Long> inKindOrder(Map<String, Long> counts) {
+        Map<String, Long> ordered = new LinkedHashMap<>();
+        for (ScanAdmission.Kind kind : ScanAdmission.Kind.values()) {
+            Long count = counts.get(kind.key());
+            if (count != null) {
+                ordered.put(kind.key(), count);
+            }
+        }
+        for (Map.Entry<String, Long> entry : counts.entrySet()) {
+            ordered.putIfAbsent(entry.getKey(), entry.getValue());
+        }
+        return Collections.unmodifiableMap(ordered);
+    }
+
     public LanceNodeStats(StreamInput in) throws IOException {
         this.cacheEnabled = in.readBoolean();
         this.snapshotCount = in.readVInt();
@@ -338,7 +356,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.indexCacheShards = in.readVInt();
         this.indexCacheShardShareBytes = in.readVLong();
         this.ftsSubsetProbeLimit = in.readVInt();
-        this.admissionRejections = Collections.unmodifiableMap(in.readOrderedMap(StreamInput::readString, StreamInput::readVLong));
+        this.admissionRejections = inKindOrder(in.readMap(StreamInput::readString, StreamInput::readVLong));
         this.admissionLastEstimateBytes = in.readVLong();
         this.admissionLastKind = in.readString();
         this.admissionAvailableBytes = in.readVLong();
