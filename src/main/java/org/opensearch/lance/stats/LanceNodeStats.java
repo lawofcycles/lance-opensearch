@@ -73,6 +73,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     private final long ftsAdmissionRejections;
     private final long ftsAdmissionLastEstimateBytes;
     private final long ftsAdmissionAvailableBytes;
+    private final long ftsAdmissionRetainedBytes;
 
     private final String warmUpMode;
     private final List<LanceWarmUpStatus> warmUps;
@@ -219,6 +220,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             0L,
             0L,
             0L,
+            0L,
             "none",
             List.of(),
             List.of(),
@@ -255,6 +257,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         long ftsAdmissionRejections,
         long ftsAdmissionLastEstimateBytes,
         long ftsAdmissionAvailableBytes,
+        long ftsAdmissionRetainedBytes,
         String warmUpMode,
         List<LanceWarmUpStatus> warmUps,
         List<IndexReaderStats> indices,
@@ -288,6 +291,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.ftsAdmissionRejections = ftsAdmissionRejections;
         this.ftsAdmissionLastEstimateBytes = ftsAdmissionLastEstimateBytes;
         this.ftsAdmissionAvailableBytes = ftsAdmissionAvailableBytes;
+        this.ftsAdmissionRetainedBytes = ftsAdmissionRetainedBytes;
         this.warmUpMode = warmUpMode;
         this.warmUps = List.copyOf(warmUps);
         this.indices = List.copyOf(indices);
@@ -323,6 +327,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.ftsAdmissionRejections = in.readVLong();
         this.ftsAdmissionLastEstimateBytes = in.readVLong();
         this.ftsAdmissionAvailableBytes = in.readVLong();
+        this.ftsAdmissionRetainedBytes = in.readVLong();
         this.warmUpMode = in.readString();
         int warmUpCount = in.readVInt();
         List<LanceWarmUpStatus> read = new ArrayList<>(warmUpCount);
@@ -364,6 +369,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         out.writeVLong(ftsAdmissionRejections);
         out.writeVLong(ftsAdmissionLastEstimateBytes);
         out.writeVLong(ftsAdmissionAvailableBytes);
+        out.writeVLong(ftsAdmissionRetainedBytes);
         out.writeString(warmUpMode);
         out.writeVInt(warmUps.size());
         for (LanceWarmUpStatus warmUp : warmUps) {
@@ -417,6 +423,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.field("rejections", ftsAdmissionRejections);
         builder.field("last_estimate_bytes", ftsAdmissionLastEstimateBytes);
         builder.field("available_bytes", ftsAdmissionAvailableBytes);
+        builder.field("retained_bytes", ftsAdmissionRetainedBytes);
         builder.endObject();
         builder.endObject();
 
@@ -613,6 +620,15 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         return ftsAdmissionAvailableBytes;
     }
 
+    /**
+     * Memory earlier admitted full text scans left in the process that
+     * the node's next admission decision adds to the available memory
+     * (zero while a gated request is in flight or a full text scan runs).
+     */
+    public long ftsAdmissionRetainedBytes() {
+        return ftsAdmissionRetainedBytes;
+    }
+
     /** Value of {@code lance.attach.warm_indexes} on the node. */
     public String warmUpMode() {
         return warmUpMode;
@@ -660,6 +676,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && ftsAdmissionRejections == other.ftsAdmissionRejections
             && ftsAdmissionLastEstimateBytes == other.ftsAdmissionLastEstimateBytes
             && ftsAdmissionAvailableBytes == other.ftsAdmissionAvailableBytes
+            && ftsAdmissionRetainedBytes == other.ftsAdmissionRetainedBytes
             && warmUpMode.equals(other.warmUpMode)
             && warmUps.equals(other.warmUps)
             && indices.equals(other.indices)
@@ -697,6 +714,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             ftsAdmissionRejections,
             ftsAdmissionLastEstimateBytes,
             ftsAdmissionAvailableBytes,
+            ftsAdmissionRetainedBytes,
             warmUpMode,
             warmUps,
             indices,

@@ -110,12 +110,19 @@ public final class LanceHitsAccounting implements Releasable {
         return reserved.get();
     }
 
-    /** Return every byte still reserved; the request is over. */
+    /**
+     * Return every byte still reserved; the request is over. Also tells
+     * the admission gate that the request this thread admitted, if any,
+     * has ended ({@link FtsAdmission#requestEnded}): the executor closes
+     * the search context that owns this instance on the thread it ran
+     * the gate on, whether the request succeeded or failed.
+     */
     @Override
     public void close() {
         long outstanding = reserved.getAndSet(0L);
         if (outstanding != 0L) {
             breaker.addWithoutBreaking(-outstanding);
         }
+        FtsAdmission.requestEnded();
     }
 }

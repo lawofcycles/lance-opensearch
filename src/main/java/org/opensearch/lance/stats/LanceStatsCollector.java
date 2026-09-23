@@ -125,7 +125,11 @@ public final class LanceStatsCollector {
         int probeLimit = LanceFtsQuery.subsetProbeLimit();
         long admissionRejections = FtsAdmission.rejections();
         long admissionLastEstimate = FtsAdmission.lastEstimateBytes();
-        long admissionAvailable = Math.max(0L, FtsAdmission.availablePhysicalMemoryBytes());
+        // One reading serves both figures, so the reported credit is the
+        // one a decision made at the reported available memory would use.
+        long admissionAvailableReading = FtsAdmission.availablePhysicalMemoryBytes();
+        long admissionAvailable = Math.max(0L, admissionAvailableReading);
+        long admissionRetained = FtsAdmission.retainedCreditBytes(admissionAvailableReading);
         long heapFallbackBytes = HeapFallbackStats.bytes();
         long heapFallbackRejections = HeapFallbackStats.rejections();
         String warmUpMode = indexWarmer == null ? "none" : indexWarmer.mode().settingValue();
@@ -171,6 +175,7 @@ public final class LanceStatsCollector {
                 admissionRejections,
                 admissionLastEstimate,
                 admissionAvailable,
+                admissionRetained,
                 warmUpMode,
                 warmUps,
                 indices,
@@ -207,6 +212,7 @@ public final class LanceStatsCollector {
             admissionRejections,
             admissionLastEstimate,
             admissionAvailable,
+            admissionRetained,
             warmUpMode,
             warmUps,
             indices,

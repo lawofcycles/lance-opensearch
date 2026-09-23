@@ -505,6 +505,23 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
 
     /**
+     * Test override of the available memory readings the full-text
+     * admission gate judges on: a list of byte sizes handed out one per
+     * reading, the last one repeating. Empty (the default) reads the
+     * kernel's {@code MemAvailable}. It exists so the integration tests
+     * can script what an admitted scan leaves behind (the reading at
+     * the admission and the reading at the scan's completion) and
+     * prove the retained credit; do not set it on a real node. Dynamic.
+     */
+    public static final Setting<List<String>> TEST_FTS_ADMISSION_AVAILABLE_MEMORY_SETTING = Setting.listSetting(
+        "lance.test.fts_admission_available_memory",
+        List.of(),
+        raw -> ByteSizeValue.parseBytesSizeValue(raw, "lance.test.fts_admission_available_memory").getStringRep(),
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * Whether a {@code size: 0} aggregation request whose shape the
      * scan can compute (metrics including stats, cardinality and tdigest
      * percentiles; {@code terms} / {@code histogram} / {@code date_histogram}
@@ -742,6 +759,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             FTS_ADMISSION_HEADROOM_SETTING,
             FTS_ADMISSION_BOUNDED_SHAPES_GATED_SETTING,
             TEST_INDEX_CACHE_SHARD_SHARE_SETTING,
+            TEST_FTS_ADMISSION_AVAILABLE_MEMORY_SETTING,
             AGGREGATION_PUSHDOWN_SETTING,
             AGGREGATION_PUSHDOWN_PARALLELISM_SETTING,
             AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING,
@@ -1078,6 +1096,9 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         FtsAdmission.setIndexCacheShardShareOverride(TEST_INDEX_CACHE_SHARD_SHARE_SETTING.get(environment.settings()));
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(TEST_INDEX_CACHE_SHARD_SHARE_SETTING, FtsAdmission::setIndexCacheShardShareOverride);
+        FtsAdmission.setAvailableMemoryOverride(TEST_FTS_ADMISSION_AVAILABLE_MEMORY_SETTING.get(environment.settings()));
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(TEST_FTS_ADMISSION_AVAILABLE_MEMORY_SETTING, FtsAdmission::setAvailableMemoryOverride);
 
         // The percentiles bin count and the terms top-k slack are read
         // by the aggregation pushdown when it plans a request, from the
