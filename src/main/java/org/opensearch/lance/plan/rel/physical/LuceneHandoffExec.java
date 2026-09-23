@@ -26,11 +26,15 @@ import java.util.List;
  * entirely into the Lance scan could never satisfy a
  * {@link LuceneConvention} root and the planner would refuse exactly
  * the plans it should prefer. The node moves no rows and does no work,
- * so its cost is zero: a fully pushed scan plus this handoff always
- * costs less than the same tree behind {@link LuceneAggregateExec} or
- * {@link HeapTopKExec}, whose constant cost carries a deliberate
- * offset. {@code LancePlannerFactory.plan} unwraps the node from the
- * root before returning, so callers see the pushed scan itself.
+ * so its cost is zero: the cost of a plan folded into the Lance scan is
+ * the scan's own, which the planner compares against the same tree
+ * behind {@link LuceneAggregateExec} or {@link HeapTopKExec}. Over a
+ * small table, and for every hits tree, those operators carry a
+ * deliberate constant offset so the pushed form wins; over a table in
+ * the fitted cost model's range the aggregation forms compete on
+ * predicted milliseconds. {@code LancePlannerFactory.plan} unwraps the
+ * node from the root before returning, so callers see the pushed scan
+ * itself.
  */
 public final class LuceneHandoffExec extends ConverterImpl implements LuceneRel {
 

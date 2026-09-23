@@ -24,6 +24,8 @@ import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.apache.calcite.tools.RelBuilder;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.lance.plan.cost.CostInputs;
+import org.opensearch.lance.plan.cost.CostInputsHolder;
 import org.opensearch.lance.plan.metadata.LanceRelMetadataProvider;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.rel.physical.LuceneHandoffExec;
@@ -77,7 +79,10 @@ public final class LancePlannerFactory {
      * everything else.
      */
     public RelOptCluster newCluster() {
-        VolcanoPlanner planner = new VolcanoPlanner(costFactory, Contexts.empty());
+        // The holder travels in the planner's context so every
+        // operator's computeSelfCost can read the run's CostInputs; plan
+        // fills it before the first cost is computed.
+        VolcanoPlanner planner = new VolcanoPlanner(costFactory, Contexts.of(new CostInputsHolder()));
         planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
         for (PushAggregateIntoLanceScan rule : PushAggregateIntoLanceScan.rules()) {
             planner.addRule(rule);
@@ -109,17 +114,35 @@ public final class LancePlannerFactory {
     }
 
     /**
+     * {@link #plan(RelNode, CostInputs)} with {@link CostInputs#local()}:
+     * one node, local storage, this JVM's CPUs and the parallelism
+     * settings at their defaults. What a data node uses to plan the
+     * request it received, and what explain and the unit tests use
+     * when they have no cluster to describe.
+     */
+    public RelNode plan(RelNode logical) {
+        return plan(logical, CostInputs.local());
+    }
+
+    /**
      * Runs the Volcano planner over {@code logical} demanding
      * {@link LuceneConvention} at the root and returns the best
-     * physical plan. Both physical forms reach that root: a tree the
-     * pushdown rules folded into the scan arrives as a zero cost
-     * {@link LuceneHandoffExec} over the {@link LanceConvention} scan
-     * (unwrapped here, so the caller sees the scan itself and reads its
-     * pushed operations), and an aggregation or hits tree they could
-     * not fold arrives as the {@code LuceneAggregateExec} /
-     * {@code HeapTopKExec} alternative the converter rules produce,
-     * whose constant cost is pinned above the handoff so the Lance form
-     * wins whenever both exist. A tree the translator marked with a
+     * physical plan, costing the alternatives under {@code inputs}
+     * (the fan out width, the storage kind and the parallelism the
+     * request will run with; see {@link CostInputs}). Both physical
+     * forms reach that root: a tree the pushdown rules folded into the
+     * scan arrives as a zero cost {@link LuceneHandoffExec} over the
+     * {@link LanceConvention} scan (unwrapped here, so the caller sees
+     * the scan itself and reads its pushed operations), and an
+     * aggregation or hits tree arrives as the {@code LuceneAggregateExec}
+     * / {@code HeapTopKExec} alternative the converter rules produce
+     * when one exists. For an aggregation over a table in the fitted
+     * cost model's range the two forms compete on predicted
+     * milliseconds, so the answer depends on the table size, the node
+     * count and the storage kind; for a smaller table, and for every
+     * hits tree, the Lucene operator's constant is pinned above the
+     * handoff so the Lance form wins whenever both exist. A tree the
+     * translator marked with a
      * {@link org.opensearch.lance.plan.rel.LanceShardPathShape} has no
      * form under either of those conventions; for such a tree the
      * planner is asked again with {@link ShardPathConvention} demanded
@@ -134,8 +157,12 @@ public final class LancePlannerFactory {
      * every plan it does not push, so a planner failure must not
      * surface as a request error.
      */
-    public RelNode plan(RelNode logical) {
+    public RelNode plan(RelNode logical, CostInputs inputs) {
         VolcanoPlanner planner = (VolcanoPlanner) logical.getCluster().getPlanner();
+        CostInputsHolder holder = planner.getContext().unwrap(CostInputsHolder.class);
+        if (holder != null) {
+            holder.set(inputs);
+        }
         RelNode root = planner.changeTraits(logical, logical.getTraitSet().replace(LuceneConvention.INSTANCE));
         planner.setRoot(root);
         try {

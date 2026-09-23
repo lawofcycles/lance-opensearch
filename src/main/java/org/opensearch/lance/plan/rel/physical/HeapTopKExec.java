@@ -18,6 +18,7 @@ import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.opensearch.lance.plan.calcite.LuceneConvention;
 import org.opensearch.lance.plan.calcite.LuceneRel;
+import org.opensearch.lance.plan.cost.CostModel;
 import org.opensearch.lance.plan.rel.LanceFtsMatch;
 import org.opensearch.lance.plan.rel.LanceHitShape;
 import org.opensearch.lance.plan.rel.LanceKnnSearch;
@@ -94,18 +95,41 @@ public final class HeapTopKExec extends SingleRel implements LuceneRel {
     }
 
     /**
-     * A constant until the cost model gets real coefficients: the tiny
-     * cost plus one unit in every slot. The offset keeps this
+     * A constant, the tiny cost plus one unit in every slot, over a
+     * table below the fitted model's range
+     * ({@link CostModel#usesFittedModel}). The offset keeps this
      * alternative strictly above the zero cost of
      * {@link LuceneHandoffExec}, so whenever the top-k pushdown rule
      * folds the same tree into the Lance scan, the Lance plan costs
      * less and the Volcano planner never has to break a tie between
      * the two conventions.
+     *
+     * <p>Over a table in the range the bare scan below costs nothing,
+     * so the page bound row estimate moves up here: the constant plus
+     * the rows this operator returns, which is at least what the
+     * pushed top-k scan of the same tree reports as its own cost. The
+     * hits shapes have no measured pushed versus heap comparison, so
+     * the order between the two forms is kept as it was, with the
+     * pushed form ahead by the constant.
      */
     @Override
     public RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
         RelOptCostFactory factory = planner.getCostFactory();
-        return factory.makeTinyCost().plus(factory.makeCost(1, 1, 1));
+        RelOptCost constant = factory.makeTinyCost().plus(factory.makeCost(1, 1, 1));
+        LanceTableScan scan = scanBelow(topK);
+        if (scan != null && CostModel.usesFittedModel(scan.getTable().getRowCount())) {
+            return constant.plus(factory.makeCost(estimateRowCount(mq), 0, 0));
+        }
+        return constant;
+    }
+
+    /** The concrete scan at the bottom of the wrapped top-k's rebuilt query tree, null if the tree is not concrete. */
+    private static LanceTableScan scanBelow(LanceTopK topK) {
+        RelNode node = topK.getInput();
+        while (node instanceof Filter || node instanceof LanceFtsMatch || node instanceof LanceKnnSearch) {
+            node = node.getInput(0);
+        }
+        return node instanceof LanceTableScan scan ? scan : null;
     }
 
     /**
