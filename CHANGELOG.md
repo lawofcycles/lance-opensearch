@@ -78,6 +78,7 @@ Inspired by [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Documentation
 
+- The getting-started walkthrough's "Prepare a Lance table" step gains Option C: a Python script that writes the sample table straight to an S3 bucket with explicit `storage_options` credentials, wired to the existing `storage_options` attach path in step 4. Both the new S3 flow and the existing local flow are verified end to end against the walkthrough text.
 - Clarify in docs that the reader route already uses Lance's DataFusion-backed SIMD aggregation and Zone Map / BTree / Bitmap pruning; the analytics route adds a cross-plugin shared runtime, PPL / SQL entry points and richer aggregation trees, not those two capabilities.
 - README trimmed to overview, status, build, and pointers into `docs/`. Feature reference lives in `docs/features.md`, known limitations in `docs/limitations.md`, and the walkthrough in `docs/getting-started.md`.
 - `docs/features.md` Query plan (preview) section documents both supported shapes (aggregation requests and hits requests) and the envelope subset the explain endpoint accepts. The explain envelope is stricter than the runtime hits envelope: `from > 0`, `post_filter`, `_source`, `stored_fields`, `docvalue_fields`, `fields`, `script_fields`, `highlight`, `suggest`, `collapse`, `rescore`, `min_score`, `terminate_after`, `track_scores`, `version`, `explain`, `seq_no_primary_term`, `indices_boost`, `pit`, `slice` and `profile` unconditionally answer 400 on `_lance/explain`, whereas the runtime hits path accepts several of them.

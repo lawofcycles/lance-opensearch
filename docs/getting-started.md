@@ -7,6 +7,7 @@ Walkthrough for building the plugin, installing it into OpenSearch, and driving 
 - JDK 21
 - Docker (only for the Docker install path; native install has no Docker requirement)
 - Python 3.10+ with `pip install pylance` (only for the sample-table script; skip if you already have a Lance table)
+- AWS credentials and an S3 bucket you can write to (only for the S3 sample-table path, Option C in step 3)
 
 `JAVA_HOME` should point at a JDK 21 install for the build. Every shell snippet below assumes that is done.
 
@@ -74,7 +75,7 @@ Start OpenSearch normally. Confirm the plugin loaded with the same `_cat/plugins
 
 ## 3. Prepare a Lance table
 
-You need at least one Lance table on a path the OpenSearch process can read. Two options:
+You need at least one Lance table on a path or object store URI the OpenSearch process can read. Three options:
 
 ### Option A: use your own table
 
@@ -82,7 +83,7 @@ Any Lance table works. The plugin derives the mapping from the Arrow schema. Sup
 
 Place the table under the directory you mounted in step 2. The rest of this walkthrough assumes it is at `/tables/demo.lance` and has these columns:
 
-- `id: int32` — used as the primary key
+- `id: int32` — used as the primary key; the column carries `lance-schema:unenforced-primary-key` field metadata and is non-nullable (without that metadata the table attaches fine but `GET /<index>/_doc/<id>` returns 404)
 - `body: string` with a Lance FTS index — matched by the `match` query
 - `title: string` with a Lance FTS index — used together with `body` by the `lance_multi_match` / `lance_fts_boost` / `lance_fts_bool` examples
 - `embedding: fixed_size_list<float>[8]` — used by the `lance_knn` query
@@ -98,7 +99,10 @@ import pyarrow as pa
 import lance
 
 schema = pa.schema([
-    pa.field("id", pa.int32()),
+    # the metadata marks `id` as the table's primary key so `GET /demo/_doc/<id>`
+    # works; Lance requires the PK column to be non-nullable
+    pa.field("id", pa.int32(), nullable=False,
+             metadata={"lance-schema:unenforced-primary-key": "true"}),
     pa.field("body", pa.string()),
     pa.field("title", pa.string()),
     pa.field("rating", pa.int32()),
@@ -128,6 +132,73 @@ print(f"wrote {dataset.count_rows()} rows to {dataset.uri}")
 ```
 
 Run it once. The plugin will pick the table up on its next poll cycle.
+
+### Option C: create the sample table on S3
+
+If your Lance tables live in an object store — written there by Ray, Spark, or any other Lance writer — the plugin attaches them in place; nothing is copied down to local disk. This option writes the same 16-row sample table straight to an S3 bucket so you can walk that flow end to end. The rest of the walkthrough is identical to Options A and B: the only difference is that the attach body in step 4 carries the `s3://` URI and a `storage_options` map instead of a filesystem path.
+
+You need AWS credentials with write access to a bucket (exported as the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment variables, plus `AWS_SESSION_TOKEN` when they are temporary), the bucket's region in `AWS_REGION`, and the same Python environment as Option B (`pip install pylance pyarrow`). If your credentials live in an AWS CLI profile, `eval "$(aws configure export-credentials --profile <profile> --format env)"` exports them. The `storage_options` keys below follow Lance's Rust `object_store` names — the same names step 4 uses on the attach body.
+
+```python
+# save as make_demo_table_s3.py; requires `pip install pylance pyarrow`
+import os
+import pyarrow as pa
+import lance
+
+schema = pa.schema([
+    # same primary key declaration as Option B
+    pa.field("id", pa.int32(), nullable=False,
+             metadata={"lance-schema:unenforced-primary-key": "true"}),
+    pa.field("body", pa.string()),
+    pa.field("title", pa.string()),
+    pa.field("rating", pa.int32()),
+    pa.field("embedding", pa.list_(pa.float32(), 8)),
+])
+
+rows = 16
+data = {
+    "id": list(range(rows)),
+    "body": [
+        f"hello lance {i}" if i % 2 == 0 else f"quick brown fox {i}"
+        for i in range(rows)
+    ],
+    "title": [
+        f"sunny morning {i}" if i % 2 == 0 else f"cloudy morning {i}"
+        for i in range(rows)
+    ],
+    "rating": [(i % 5) + 1 for i in range(rows)],
+    "embedding": [[float(i)] + [0.0] * 7 for i in range(rows)],
+}
+
+storage_options = {
+    "aws_region": os.environ["AWS_REGION"],
+    "aws_access_key_id": os.environ["AWS_ACCESS_KEY_ID"],
+    "aws_secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
+}
+if "AWS_SESSION_TOKEN" in os.environ:
+    storage_options["aws_session_token"] = os.environ["AWS_SESSION_TOKEN"]
+
+table = pa.table(data, schema=schema)
+dataset = lance.write_dataset(
+    table,
+    "s3://<bucket>/tables/demo.lance",
+    mode="create",
+    storage_options=storage_options,
+)
+dataset.create_scalar_index("body", index_type="INVERTED")
+dataset.create_scalar_index("title", index_type="INVERTED")
+print(f"wrote {dataset.count_rows()} rows to {dataset.uri}")
+```
+
+Replace `<bucket>` with your bucket name and run it once. Confirm the table landed:
+
+```
+aws s3 ls s3://<bucket>/tables/demo.lance/
+```
+
+You should see the Lance table layout — `_indices/`, `_transactions/`, `_versions/`, and `data/` prefixes.
+
+There is no directory to mount into the container and nothing for the namespace poll to watch, so in step 4 skip the namespace registration and attach the table by URI, passing `"table": "s3://<bucket>/tables/demo.lance"` together with the same `storage_options` map you gave the script (see "Point at S3, GCS, or Azure with storage_options" in step 4). From step 5 on, every query shape behaves exactly as it does against the local table.
 
 ## 4. Register the namespace
 
@@ -165,7 +236,7 @@ The call is idempotent; a second attach on the same table returns `already_attac
 
 ### Point at S3, GCS, or Azure with storage_options
 
-For tables that live in an object store, add a `storage_options` map on either the attach body or the namespace body. Keys follow Lance's Rust `object_store` names, so what you write is exactly what Lance receives.
+For tables that live in an object store, add a `storage_options` map on either the attach body or the namespace body. If you created the sample table on S3 with Option C in step 3, this is the path that attaches it: put the script's `s3://` URI in `table` and pass the same credential keys you gave the script. Keys follow Lance's Rust `object_store` names, so what you write is exactly what Lance receives.
 
 ```
 curl -X POST http://localhost:9200/_lance/attach \
