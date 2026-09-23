@@ -1152,13 +1152,16 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * {@code f}, ts {@code 2024-01-01 + id days}, categories c0 to c2).
      * The exact shapes (stats, extended_stats, range, date_range,
      * missing, filter, filters, nested) have to answer the same as the
-     * aggregators and as the single shard path; cardinality and tdigest
-     * percentiles, which the pushdown builds from the distinct values
-     * and a bin histogram, have to land within their tolerance of the
-     * shard path's single sketch: a relative 1 % for the count, and for
-     * the percentiles 3 % of the value range, the tolerance the single
-     * node IT allows two tdigests of the same data. Every request has to
-     * leave a pushdown line on all three data nodes.
+     * aggregators and as the single shard path. The sketch shapes have
+     * to land within their tolerance of the shard path's single sketch:
+     * a relative 1 % for a cardinality count, and for the percentiles
+     * 3 % of the value range, the tolerance the single node IT allows
+     * two tdigests of the same data. The tdigest percentiles build
+     * through the pushdown's bin histogram; a shape carrying a
+     * cardinality runs through the fragment path aggregators instead
+     * (the planner refuses to push it because the pushed form is
+     * slower), so only the exact shapes and the percentiles shape leave
+     * a pushdown line on the data nodes.
      */
     @SuppressWarnings("unchecked")
     public void testWiderAggregationPushdownAcrossThreeNodes() throws Exception {
@@ -1222,9 +1225,11 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 } finally {
                     updateClusterSetting("lance.aggregation.pushdown", null);
                 }
-                // The pushdown answered on every data node for each of the
-                // requests above (the shard path and the aggregator run
-                // leave no such line).
+                // The pushdown answered on every data node for the exact
+                // shapes and the percentiles shape (the shard path and
+                // the aggregator run leave no such line); the three
+                // sketch shapes carrying a cardinality ran through the
+                // aggregators and left none.
                 assertBusy(() -> {
                     Set<String> nodes = new HashSet<>();
                     int lines = 0;
@@ -1235,7 +1240,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                         }
                     }
                     assertEquals("pushdown answers logged on " + nodes, dataNodeCount(), nodes.size());
-                    assertEquals("one pushdown line per data node per request", (exact.size() + sketches.size()) * fragments, lines);
+                    assertEquals("one pushdown line per data node per pushed request", (exact.size() + 1) * fragments, lines);
                 });
             } finally {
                 updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", null);
