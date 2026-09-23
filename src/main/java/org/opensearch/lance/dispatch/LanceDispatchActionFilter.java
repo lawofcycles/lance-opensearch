@@ -7,7 +7,13 @@ package org.opensearch.lance.dispatch;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.calcite.rel.RelNode;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
@@ -32,9 +38,13 @@ import org.opensearch.index.query.DisMaxQueryBuilder;
 import org.opensearch.index.query.NestedQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.engine.LanceEngineFactory;
-import org.opensearch.search.aggregations.AggregationBuilder;
-import org.opensearch.search.aggregations.AggregatorFactories;
+import org.opensearch.lance.plan.calcite.LancePlannerFactory;
+import org.opensearch.lance.plan.calcite.LanceSchemas;
+import org.opensearch.lance.plan.execute.PlanExecutor;
+import org.opensearch.lance.plan.rel.physical.ShardPathFallbackExec;
+import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
@@ -50,13 +60,16 @@ import org.opensearch.transport.client.Client;
  * <ul>
  *   <li>Recognise whether the request is fragment-dispatchable
  *       ({@link #allLanceBacked} plus {@link #isDispatchable} plus
- *       {@link LanceAggregationSupport#isSupported}) — reject shapes
- *       the fragment executor cannot answer correctly: suggester,
- *       highlighter, score-only {@code search_after}, {@code
- *       collapse}, {@code rescore}, pipeline aggregations, {@code
- *       min_score}, {@code terminate_after}, {@code stored_fields},
- *       {@code docvalue_fields}, {@code explain}, and cross-index
- *       metrics.</li>
+ *       {@link LanceAggregationSupport#isSupported}). The shape
+ *       decision is planned: {@link SearchRequestToRel#translateDispatch}
+ *       marks a body holding an element the fragment executor cannot
+ *       answer correctly — suggester, highlighter, score-only
+ *       {@code search_after}, {@code collapse}, {@code rescore},
+ *       pipeline aggregations, {@code min_score},
+ *       {@code terminate_after}, {@code stored_fields},
+ *       {@code docvalue_fields}, {@code explain} — and the planner
+ *       answers such a body with a {@link ShardPathFallbackExec}
+ *       root, which routes the request to the shard path.</li>
  *   <li>Delegate the request to {@link LanceCoordinatorAction} via
  *       {@link Client#execute(org.opensearch.action.ActionType,
  *       org.opensearch.action.ActionRequest, ActionListener)} on the
@@ -95,6 +108,21 @@ public class LanceDispatchActionFilter implements ActionFilter {
     private final IndexNameExpressionResolver indexNameExpressionResolver;
     private final Client client;
     private final ThreadPool threadPool;
+    private final PlanExecutor planExecutor;
+
+    /**
+     * The planner model the dispatch decision plans against. The
+     * decision depends only on the request body's envelope, never on
+     * the target's schema, so one synthetic single-column model serves
+     * every request and no Lance dataset is opened on the transport
+     * thread this filter runs on.
+     */
+    private static final LanceSchemas.IndexModel DISPATCH_MODEL = LanceSchemas.model(
+        "dispatch",
+        new Schema(List.of(new Field("id", FieldType.nullable(new ArrowType.Int(64, true)), null))),
+        Map.of(),
+        () -> 0L
+    );
 
     public LanceDispatchActionFilter(
         ClusterService clusterService,
@@ -106,6 +134,11 @@ public class LanceDispatchActionFilter implements ActionFilter {
         this.indexNameExpressionResolver = indexNameExpressionResolver;
         this.client = client;
         this.threadPool = threadPool;
+        long nativeBudgetBytes = NativeMemoryLimit.parse(
+            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.get(clusterService.getSettings()),
+            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.getKey()
+        );
+        this.planExecutor = new PlanExecutor(new LancePlannerFactory(nativeBudgetBytes, Runtime.getRuntime().maxMemory()));
     }
 
     @Override
@@ -154,12 +187,14 @@ public class LanceDispatchActionFilter implements ActionFilter {
             return;
         }
 
-        if (!isDispatchable(searchRequest)) {
-            // search_after / highlighter / suggester / post_filter,
-            // or a top-level query builder outside the fragment
-            // executor's supported shape. Fall through so the
+        RelNode dispatchPlan = planDispatch(searchRequest);
+        if (!isDispatchable(dispatchPlan)) {
+            // The planner answered the body with a shard path fallback:
+            // it carries an element (suggest, highlighter, collapse,
+            // rescore, a pipeline aggregation, min_score, ...) the
+            // fragment executor does not serve. Fall through so the
             // standard path can still answer.
-            proceedOnShardPath(task, action, request, listener, chain, concrete);
+            planExecutor.executeShardPath(dispatchPlan, () -> proceedOnShardPath(task, action, request, listener, chain, concrete));
             return;
         }
 
@@ -418,174 +453,40 @@ public class LanceDispatchActionFilter implements ActionFilter {
     }
 
     /**
-     * Decide whether the fragment executor can answer this request.
+     * Plan the request's dispatch decision. The body translates
+     * through {@link SearchRequestToRel#translateDispatch}, which marks
+     * a body holding an element only the shard path serves with the
+     * shard path shape node, and the Volcano run lowers that shape to
+     * the {@link ShardPathFallbackExec} operator carrying the fallback
+     * reasons; a body without such an element plans to the Lance scan.
+     * Planning is pure computation over the already-parsed body — no
+     * Lance dataset is opened and no I/O runs — so it is safe on the
+     * transport thread this filter runs on.
      *
-     * <p>Rejected shapes (fall through to shard path):
-     * <ul>
-     *   <li>{@code suggest}, {@code highlighter} — need FTS
-     *       positional / candidate APIs Lance does not surface
-     *       yet.</li>
-     *   <li>{@code search_after} without {@code sort} — the per-fragment
-     *       executor drives {@link
-     *       org.apache.lucene.search.IndexSearcher#searchAfter} which
-     *       requires a matching Sort. Without one the shard path's
-     *       score-order search_after is used instead.</li>
-     * </ul>
-     *
-     * <p>Accepted shapes (fragment path answers end-to-end):
-     * <ul>
-     *   <li>any top-level query the local {@link
-     *       org.opensearch.index.query.QueryShardContext} can translate
-     *       (match on {@code lance_text}, knn on {@code lance_knn},
-     *       term / terms / range / exists / bool combinations, ...).
-     *       The receiving node ships the {@link QueryBuilder} across
-     *       the wire and re-parses it via {@code
-     *       QueryShardContext.toQuery}, so per-node mapping
-     *       decisions apply. The coordinator additionally translates
-     *       pure-filter shapes into Lance SQL for metadata-only row
-     *       counting, but the accept/reject decision does not
-     *       depend on that translation succeeding.</li>
-     *   <li>sort clauses — the per-node executor drives {@link
-     *       org.apache.lucene.search.IndexSearcher#search(org.apache.lucene.search.Query,
-     *       int, org.apache.lucene.search.Sort)} and each hit carries
-     *       its sort values back for the coordinator merge.</li>
-     *   <li>aggregations that pass {@link
-     *       LanceAggregationSupport#isSupported}.</li>
-     * </ul>
+     * <p>Accepted shapes (fragment path answers end-to-end) include
+     * any top-level query the local {@link
+     * org.opensearch.index.query.QueryShardContext} can translate
+     * (match on {@code lance_text}, knn on {@code lance_knn}, term /
+     * terms / range / exists / bool combinations, ...): the receiving
+     * node ships the {@link QueryBuilder} across the wire and
+     * re-parses it via {@code QueryShardContext.toQuery}, so the
+     * dispatch decision never depends on the planner spelling the
+     * query itself; sort clauses; and aggregations that pass
+     * {@link LanceAggregationSupport#isSupported}. The rejected
+     * elements and their rationale live on
+     * {@link org.opensearch.lance.plan.rel.ShardPathReason}.
      */
-    private boolean isDispatchable(SearchRequest searchRequest) {
-        SearchSourceBuilder source = searchRequest.source();
-        if (source == null) {
-            return true;
-        }
-        if (source.suggest() != null || source.highlighter() != null) {
-            return false;
-        }
-        // search_after depends on sort — Lucene's searchAfter takes a
-        // FieldDoc whose fields correspond to the Sort clauses. A
-        // score-order search_after is a shard-path shape.
-        if (source.searchAfter() != null && (source.sorts() == null || source.sorts().isEmpty())) {
-            return false;
-        }
-        // collapse groups hits by a field and can materialise
-        // inner_hits per group. The fragment executor does not
-        // synthesise the CollapsingTopDocsCollector state, so hits
-        // come back ungrouped and inner_hits disappear silently.
-        // Send to the shard path instead of returning wrong hits.
-        if (source.collapse() != null) {
-            return false;
-        }
-        // rescore layers a second-pass query on top of the first
-        // Sort/TopDocs window. The fragment executor drives a plain
-        // IndexSearcher.search and never runs the rescorer, so
-        // scores stay at their first-pass values. Send to the shard
-        // path so users get either the rescored order or a proper
-        // error, not silent scores.
-        if (source.rescores() != null && !source.rescores().isEmpty()) {
-            return false;
-        }
-        // Pipeline aggregations (sibling like avg_bucket / bucket_sort
-        // and parent like cumulative_sum) hit an
-        // "Already been replayed" IllegalStateException in the
-        // coordinator merge because the fragment path replays the
-        // InternalAggregations tree in a way the pipeline aggregators
-        // don't expect. Route to the shard path where the standard
-        // reduce loop handles them.
-        if (source.aggregations() != null && hasPipelineAggregation(source.aggregations())) {
-            return false;
-        }
-        // min_score filters hits by score threshold. The fragment
-        // executor's hits + matched counting comes from Lance
-        // metadata (or Lucene count), which sees every doc that
-        // matches the query regardless of score. Passing the
-        // request through would return hits above the threshold
-        // but still report matched as the pre-filter total, so
-        // send to the shard path where the built-in
-        // MinScoreCollector actually clips.
-        if (source.minScore() != null) {
-            return false;
-        }
-        // terminate_after cuts the collector short after N docs on
-        // each shard. Fragment path does not thread the terminate
-        // count into its scan, so both hits.total.value and the
-        // terminated_early flag would be silently wrong. Shard
-        // path implements it directly via
-        // EarlyTerminatingCollector.
-        if (source.terminateAfter() > 0) {
-            return false;
-        }
-        // track_total_hits (default 10,000 bound, `true`, `false`, or
-        // an integer) is implemented by the fragment path: the
-        // coordinator ships the bound to every executor, executors
-        // stop counting past it, and the coordinator composes the
-        // `eq` / `gte` relation or drops hits.total the way the shard
-        // path's SearchPhaseController does. _count, which sends
-        // track_total_hits: true with size 0, therefore takes this
-        // path too.
-        //
-        // stored_fields projects a specific list of stored fields
-        // per hit (or "_none_" to hide _source entirely). The
-        // fragment executor materialises hits by copying the raw
-        // _source bytes emitted by LanceFragmentLeafReader; the
-        // stored_fields context is dropped, so a request that asks
-        // for a stored field subset (or explicitly hides _source
-        // with "_none_") gets the full _source back. Route to the
-        // shard path where the fetch phase applies the projection.
-        if (source.storedFields() != null) {
-            return false;
-        }
-        // docvalue_fields loads named doc values into hits.fields.
-        // The fragment executor does not populate hits.fields, so a
-        // request that asks for docvalue_fields would come back
-        // without them at all. Route to the shard path.
-        if (source.docValueFields() != null && !source.docValueFields().isEmpty()) {
-            return false;
-        }
-        // explain returns a per-hit scoring explanation. The
-        // fragment executor drives IndexSearcher.search but never
-        // calls searcher.explain, so a request with "explain":true
-        // would come back without any _explanation field on the
-        // hits. Route to the shard path.
-        if (Boolean.TRUE.equals(source.explain())) {
-            return false;
-        }
-        return true;
+    private RelNode planDispatch(SearchRequest searchRequest) {
+        LancePlannerFactory plannerFactory = planExecutor.plannerFactory();
+        return plannerFactory.plan(SearchRequestToRel.translateDispatch(searchRequest.source(), DISPATCH_MODEL, plannerFactory));
     }
 
     /**
-     * Returns {@code true} if the aggregation tree contains any
-     * pipeline aggregator, either at the top level (sibling pipelines
-     * such as {@code avg_bucket}) or nested inside a bucket
-     * aggregation (parent pipelines such as {@code cumulative_sum}
-     * or {@code bucket_sort}).
+     * Whether the fragment executor can answer the planned request: a
+     * {@link ShardPathFallbackExec} root is the planner's decision
+     * that only the standard shard search path serves it.
      */
-    private static boolean hasPipelineAggregation(AggregatorFactories.Builder aggs) {
-        if (aggs == null) {
-            return false;
-        }
-        if (!aggs.getPipelineAggregatorFactories().isEmpty()) {
-            return true;
-        }
-        for (AggregationBuilder child : aggs.getAggregatorFactories()) {
-            if (containsPipeline(child)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean containsPipeline(AggregationBuilder agg) {
-        if (agg == null) {
-            return false;
-        }
-        if (!agg.getPipelineAggregations().isEmpty()) {
-            return true;
-        }
-        for (AggregationBuilder child : agg.getSubAggregations()) {
-            if (containsPipeline(child)) {
-                return true;
-            }
-        }
-        return false;
+    private static boolean isDispatchable(RelNode dispatchPlan) {
+        return !(dispatchPlan instanceof ShardPathFallbackExec);
     }
 }
