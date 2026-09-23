@@ -55,11 +55,11 @@ flowchart TD
     subgraph coord ["Coordinating node"]
         RE["REST layer"]
         DF["Dispatch filter<br/>(fragment path vs shard path)"]
+        PL["Calcite planner<br/>(push into Lance scan, or not)"]
         CO["Fragment coordinator<br/>(plan-driven fan-out and merge)"]
     end
     subgraph data ["Each data node"]
-        EX["Fragment executor"]
-        PL["Calcite planner<br/>(push into Lance scan, or not)"]
+        EX["Fragment executor<br/>(refines the shipped plan: downgrade only)"]
         LU["Lucene aggregators / collectors<br/>over fragment leaf readers"]
         LN["Lance native scan<br/>(DataFusion, FTS / vector indexes)"]
     end
@@ -69,10 +69,10 @@ flowchart TD
     RE --> AT
     RE --> DF
     DF --> CO
-    CO --> EX
-    EX --> PL
-    PL --> LN
-    PL --> LU
+    CO -- "plan once per target" --> PL
+    CO -- "per node plan on the wire" --> EX
+    EX --> LN
+    EX --> LU
     LN --> ST
     LU --> ST
     AT --> ST
@@ -99,15 +99,18 @@ across the data nodes, and merges the per-node answers. The shard path is stock 
 Lance-backed reader, kept as the correctness fallback for request shapes the fragment path does
 not serve.
 
-The query planner, built on Apache Calcite, decides per node how a request's work executes:
-folded into the Lance native scan, or run through Lucene's machinery over the fragment readers.
-The choice is a costed plan comparison, not a hand-maintained list of shapes.
+The query planner, built on Apache Calcite, decides once per request, on the coordinating node,
+how the work executes on every data node: folded into the Lance native scan, or run through
+Lucene's machinery over the fragment readers. The choice is a costed plan comparison, not a
+hand-maintained list of shapes, and the chosen per node plan travels with each fragment request.
 [Planner design](#planner-design) explains why.
 
-The fragment executor on each data node carries the plan out: it issues Lance scans (with pushed
-aggregates, filters, FTS or vector work encoded into them) or runs the stock Lucene aggregators
-and collectors over per-fragment leaf readers, and returns the same wire types a stock shard
-would, so the coordinator's reduce cannot tell which route answered.
+The fragment executor on each data node carries the shipped plan out: it applies the guards only
+the data node can judge (a reader wrapper, the Lucene sort field types, the aggregate's resolution
+against the mapping), which may move a pushed operation back to Lucene but never push one, then
+issues Lance scans (with pushed aggregates, filters, FTS or vector work encoded into them) or runs
+the stock Lucene aggregators and collectors over per-fragment leaf readers, and returns the same
+wire types a stock shard would, so the coordinator's reduce cannot tell which route answered.
 
 Storage stays entirely on the Lance side: the table lives in an object store or on a filesystem,
 and per-table credentials travel with the registration so one cluster addresses many buckets.
@@ -136,7 +139,7 @@ src/main/java/org/opensearch/lance/
 │   ├── metadata/    #   table statistics from Lance metadata; Calcite metadata handlers
 │   ├── lancesql/    #   predicate -> Lance (DataFusion) SQL printer
 │   ├── substrait/   #   aggregate -> Substrait bytes
-│   ├── execute/     #   plan executor: fan-out, merge, per-node route resolution
+│   ├── execute/     #   coordinator planning, the shipped per node plan, its refinement, fan-out, merge
 │   └── explain/     #   the _lance/explain endpoint
 ├── query/           # the lance_* query builders and their Lucene query forms
 ├── refs/            # the _lance/refs endpoint (tags and branches)
@@ -214,20 +217,24 @@ sequenceDiagram
     participant C as Client
     participant F as Dispatch filter
     participant CO as Fragment coordinator
+    participant P as Calcite planner (coordinator)
     participant EX as Fragment executor (per data node)
-    participant P as Calcite planner
     participant L as Lance
     C->>F: _search (size 0, terms agg)
     F->>CO: dispatchable: fragment path
-    Note over CO: plan executor drives the fan-out:<br/>fragments grouped across data nodes
-    CO->>EX: one request per node (its fragment share)
-    EX->>P: translate + plan
+    CO->>P: rewrite, translate, plan once per target
     alt aggregate folds into the scan
-        P-->>EX: scan carrying the pushed aggregate
+        P-->>CO: scan carrying the pushed aggregate
+    else fold refused (shape, setting)
+        P-->>CO: Lucene-side aggregate operator
+    end
+    Note over CO: plan executor drives the fan-out:<br/>fragments grouped across data nodes
+    CO->>EX: one request per node (its fragment share + the per node plan)
+    EX->>EX: refine: reader wrapper, sort field types,<br/>aggregate resolution (downgrade only)
+    alt plan still carries the pushed aggregate
         EX->>L: native scan (Substrait aggregate + SQL filter)
         L-->>EX: one row per group
-    else fold refused (shape, security wrapper, setting)
-        P-->>EX: Lucene-side aggregate operator
+    else Lucene plan
         EX->>EX: stock aggregators over fragment leaf readers
     end
     EX-->>CO: per-node aggregation results (stock wire format)
@@ -246,15 +253,17 @@ one request per data node and reduce the answers with OpenSearch's stock reducti
 no shard copy to take a share of the work — it builds its context from cluster state — which is
 what makes the fragment distribution independent of the shard allocation.
 
-On each node the executor translates the request into the planner's algebra and plans it. When
-the aggregate folds, the executor hands Lance a scan carrying the aggregate encoded as Substrait
+The coordinator translates the request into the planner's algebra once per target and plans it;
+the per node physical form travels with every fragment request as a `FragmentPlan`. When the
+aggregate folds, the executor hands Lance a scan carrying the aggregate encoded as Substrait
 and the filter printed as Lance SQL; DataFusion computes the groups natively and the executor
 rebuilds the exact aggregation objects the Lucene route would have produced. When the fold is
-refused — an unsupported function, a security plugin's reader wrapper (DLS / FLS applies to
-Lucene readers, so anything wrapper-sensitive must stay on the Lucene route), or the pushdown
-setting turned off — the same plan run yields the Lucene alternative and the stock aggregators
-run over the fragment readers. The response is identical either way; only where the grouping
-happened differs.
+refused — an unsupported function, or the pushdown setting turned off — the same plan run yields
+the Lucene alternative and the stock aggregators run over the fragment readers. The executor adds
+what only the data node knows: a security plugin's reader wrapper (DLS / FLS applies to Lucene
+readers, so anything wrapper-sensitive must stay on the Lucene route) or a mapping the pushed
+aggregate does not resolve against move the aggregate to the aggregators there. The response is
+identical either way; only where the grouping happened differs.
 
 The shard path remains the third route: stock OpenSearch, one node reading the whole table
 through a Lance-backed directory reader. It exists for correctness on shapes the fragment path
@@ -269,11 +278,13 @@ column ordering, the pushdown folds the whole page into one ordered, limited nat
 the cursor spelled as a strict SQL bound — nothing sorts on the Java heap. Full text and vector
 clauses join as query roots (not filters): scalar companions of the enclosing `bool` fold in as a
 prefilter, evaluated before the index lookup or the vector top-k cutoff, because a post-filter
-would return fewer than k hits. When the fold is refused (a `_score` sort mixed with a column, an
-unresolvable sort type, a cursor at a missing-value sentinel), the plan's Lucene alternative
-collects the page through the stock top-docs collector over the fragment readers, exactly as a
-shard would. Either way the hit envelope (`_source`, `_id`, sort values) is materialised through
-the fragment readers' stored-fields path.
+would return fewer than k hits. When the fold is refused at the coordinator (a `_score` sort mixed
+with a column, a `post_filter`, a sort clause without a collation spelling), the plan's Lucene
+alternative collects the page through the stock top-docs collector over the fragment readers,
+exactly as a shard would; the executor moves a pushed page to that collector itself when the
+mapping's Lucene sort field type cannot type the page's sort values, when a cursor sits at a
+missing-value sentinel, or when a reader wrapper is installed. Either way the hit envelope
+(`_source`, `_id`, sort values) is materialised through the fragment readers' stored-fields path.
 
 ## Planner design
 
@@ -361,20 +372,38 @@ value estimate). Zone maps (`getZonemapStats`) are read lazily on the first requ
 and memoised with the version. The result is cached per `(table URI, manifest version)`, so a
 version pays the collection on its first request and every later request reads the entry; the
 entry goes when the snapshot cache closes that version, and a table that follows its manifest
-keeps at most the current and the previous version. The cache is per node and the coordinator
-and data node roles fill it separately: the coordinator from the dataset it opens to enumerate
-fragments, a data node from the warm cache snapshot it plans against. `GET /_lance/stats` reports
+keeps at most the current and the previous version. The cache is per node and is filled by the coordinator role from the dataset it opens to
+enumerate fragments (and by the explain endpoint from the warm cache snapshot it plans against);
+the data nodes run no planner. `GET /_lance/stats` reports
 the entry count and the accumulated collection time under `plan.statistics`. The Calcite side
 reads the statistics through `LanceTable.getStatistic()` (row count) and through Lance's own
 `RowCount` and `DistinctRowCount` metadata handlers for the scan, chained in front of Calcite's
 defaults.
 
+Planning happens in two stages. Stage one runs on the coordinating node: the request's query is
+rewritten with the same shard-free rewrite the shard path applies, the whole body is translated
+once through the same entry the explain endpoint uses, the Volcano run chooses the per node
+physical form, and that form is written down as a `FragmentPlan` (the Lance SQL of the scalar
+predicate, the full text or knn clause the executor builds its Lance query from, and the pushed
+page or the pushed aggregate with its Substrait bytes) that every fragment request of the target
+carries. Stage two runs on each data node, without a planner: the executor checks the shipped plan
+against what only it knows (a reader wrapper on the index service, the Lucene sort field types the
+mapping built, the resolution of the pushed aggregate against the mapping and the group bound) and
+downgrades where a pushed operation cannot run there. Downgrades go one way, from the Lance scan to
+Lucene; nothing is pushed on the data node that the coordinator did not push, so the plan the
+explain endpoint prints is the plan the coordinator ships, and `GET /_lance/stats` counts every
+downgrade under `plan.refinements` by reason. The per node plan is a wire format internal to the
+plugin: every node is assumed to run the same plugin version, there is no version negotiation, and
+a fragment request between nodes of different plugin versions fails rather than falling back to the
+shard path, so a rolling upgrade is not supported for the fragment path.
+
 The planner was delivered in phases, and the later ones are still in flight: first the
 foundations (dependencies, schema, conventions, cost, the explain endpoint), then the aggregation
 route through the planner, then hits, full text and vector translation, then the Lucene
 convention operators with fan-out and merge as plan operators, then the shard-path fallback as a
-plan operator, then the cost model fitted to the measured aggregation shapes, and ahead: node
-local refinement of the plan on column store warmth, and accuracy and tie-stability as planner
+plan operator, then the cost model fitted to the measured aggregation shapes, then the two stage
+planning that ships the per node plan from the coordinator, and ahead: node local refinement of the
+plan on column store warmth, and accuracy and tie-stability as planner
 traits a request can demand. The CHANGELOG tracks what has landed.
 
 ## Storage and follow-forward
