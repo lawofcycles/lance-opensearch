@@ -55,6 +55,7 @@ Inspired by [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - `index.lance.tag` is now a dynamic index setting. Operators can repoint the tag on a running index with `PUT /{index}/_settings` and the next namespace poll refreshes the reader onto the version the new tag points at (empty reverts to latest-follow), so detach and reattach are no longer needed to move an index between tags.
+- `LanceTableScan.withPushedFilter` and `withPushedAggregate` refuse a scan already carrying any other pushed operation, matching `withPushedFts` and `withPushedKnn`. The rule side already enforces the "at most one query kind, optionally combined with a top-k" invariant through bare scan operand predicates; the scan API side used to accept a filter or aggregate on top of a scan another rule had pushed. The `PushedOperation` sealed interface javadoc now states the mutual exclusion invariant so any new permit implementor sees it.
 
 ### Fixed
 
@@ -77,6 +78,7 @@ Inspired by [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Documentation
 
 - README trimmed to overview, status, build, and pointers into `docs/`. Feature reference lives in `docs/features.md`, known limitations in `docs/limitations.md`, and the walkthrough in `docs/getting-started.md`.
+- `docs/features.md` Query plan (preview) section documents both supported shapes (aggregation requests and hits requests) and the envelope subset the explain endpoint accepts. The explain envelope is stricter than the runtime hits envelope: `from > 0`, `post_filter`, `_source`, `stored_fields`, `docvalue_fields`, `fields`, `script_fields`, `highlight`, `suggest`, `collapse`, `rescore`, `min_score`, `terminate_after`, `track_scores`, `version`, `explain`, `seq_no_primary_term`, `indices_boost`, `pit`, `slice` and `profile` unconditionally answer 400 on `_lance/explain`, whereas the runtime hits path accepts several of them.
 
 ### Maintenance
 

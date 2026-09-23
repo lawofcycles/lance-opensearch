@@ -113,7 +113,10 @@ public class LanceTableScan extends TableScan implements LanceRel {
      * row type becomes the aggregate's and the plan above no longer
      * contains the aggregate. {@code aggregate} is the node the rule
      * matched with its input rebuilt to the concrete tree; {@code bytes}
-     * is what the Substrait producer encoded for it.
+     * is what the Substrait producer encoded for it. Refuses when the
+     * scan already carries any pushed operation: the push rule matches
+     * bare scans, and an aggregate consumes every matching row, so it
+     * combines with nothing.
      */
     public LanceTableScan withPushedAggregate(LanceAggregate aggregate, ByteBuffer bytes) {
         if (pushedAggregate().isPresent()) {
@@ -122,17 +125,19 @@ public class LanceTableScan extends TableScan implements LanceRel {
         if (pushedTopK().isPresent()) {
             throw new IllegalStateException("a pushed aggregate does not combine with a pushed top-k");
         }
-        ImmutableList<PushedOperation> pushed = ImmutableList.<PushedOperation>builder()
-            .addAll(pushedOperations)
-            .add(new PushedAggregate(aggregate, bytes))
-            .build();
-        return new LanceTableScan(getCluster(), getTraitSet(), table, pushed);
+        if (!pushedOperations.isEmpty()) {
+            throw new IllegalStateException("the scan already carries a pushed operation: " + pushedOperations);
+        }
+        return new LanceTableScan(getCluster(), getTraitSet(), table, ImmutableList.of(new PushedAggregate(aggregate, bytes)));
     }
 
     /**
      * The same scan with {@code condition} pushed as its filter,
      * spelled as {@code sql} for the executor's
-     * {@code ScanOptions.filter}. The row type does not change.
+     * {@code ScanOptions.filter}. The row type does not change. Refuses
+     * when the scan already carries any pushed operation: the push
+     * rule matches bare scans, so a filter never combines with an
+     * already pushed query kind or top-k.
      */
     public LanceTableScan withPushedFilter(RexNode condition, String sql) {
         if (pushedFilter().isPresent()) {
@@ -141,11 +146,10 @@ public class LanceTableScan extends TableScan implements LanceRel {
         if (pushedTopK().isPresent()) {
             throw new IllegalStateException("a filter cannot push below a pushed top-k, which already cut the page");
         }
-        ImmutableList<PushedOperation> pushed = ImmutableList.<PushedOperation>builder()
-            .addAll(pushedOperations)
-            .add(new PushedFilter(condition, sql))
-            .build();
-        return new LanceTableScan(getCluster(), getTraitSet(), table, pushed);
+        if (!pushedOperations.isEmpty()) {
+            throw new IllegalStateException("the scan already carries a pushed operation: " + pushedOperations);
+        }
+        return new LanceTableScan(getCluster(), getTraitSet(), table, ImmutableList.of(new PushedFilter(condition, sql)));
     }
 
     /**

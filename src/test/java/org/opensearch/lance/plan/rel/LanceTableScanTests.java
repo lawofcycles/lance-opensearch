@@ -11,6 +11,7 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rex.RexNode;
 import org.opensearch.lance.plan.calcite.LanceConvention;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchema;
@@ -150,5 +151,134 @@ public class LanceTableScanTests extends OpenSearchTestCase {
 
         IllegalStateException second = expectThrows(IllegalStateException.class, () -> pushed.withPushedKnn(knn, null));
         assertTrue(second.getMessage().contains("already carries"));
+    }
+
+    public void testWithPushedFilterRefusesAScanCarryingAnotherPush() throws Exception {
+        // Aggregate-carrying scan refuses a filter push.
+        RelNode logical = PlanTestFixtures.translate(
+            PlanTestFixtures.parse("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}")
+        );
+        LanceAggregate aggregate = (LanceAggregate) logical;
+        LanceTableScan bare = (LanceTableScan) aggregate.getInput();
+        LanceTableScan aggregatePushed = bare.withPushedAggregate(
+            aggregate,
+            LanceSubstraitProducer.toLanceAggregate(aggregate).orElseThrow()
+        );
+        RexNode condition = bare.getCluster()
+            .getRexBuilder()
+            .makeCall(
+                org.apache.calcite.sql.fun.SqlStdOperatorTable.IS_NOT_NULL,
+                bare.getCluster().getRexBuilder().makeInputRef(bare.getRowType().getFieldList().get(1).getType(), 1)
+            );
+        IllegalStateException overAggregate = expectThrows(
+            IllegalStateException.class,
+            () -> aggregatePushed.withPushedFilter(condition, "rating IS NOT NULL")
+        );
+        assertTrue(overAggregate.getMessage(), overAggregate.getMessage().contains("already carries a pushed operation"));
+
+        // FTS-carrying scan refuses a filter push.
+        LanceTableScan bareFts = (LanceTableScan) PlanTestFixtures.factory()
+            .relBuilder(PlanTestFixtures.model().schema())
+            .scan(LancePlannerFactory.SCHEMA_NAME, "idx")
+            .build();
+        LanceFtsMatch fts = new LanceFtsMatch(
+            bareFts.getCluster(),
+            bareFts.getCluster().traitSetOf(org.apache.calcite.plan.Convention.NONE),
+            bareFts,
+            LanceFtsMatch.Kind.MATCH,
+            List.of("body"),
+            new LanceMatchQueryBuilder("body", "hello")
+        );
+        LanceTableScan ftsPushed = bareFts.withPushedFts(fts, null);
+        RexNode ftsCondition = bareFts.getCluster()
+            .getRexBuilder()
+            .makeCall(
+                org.apache.calcite.sql.fun.SqlStdOperatorTable.IS_NOT_NULL,
+                bareFts.getCluster().getRexBuilder().makeInputRef(bareFts.getRowType().getFieldList().get(1).getType(), 1)
+            );
+        IllegalStateException overFts = expectThrows(
+            IllegalStateException.class,
+            () -> ftsPushed.withPushedFilter(ftsCondition, "rating IS NOT NULL")
+        );
+        assertTrue(overFts.getMessage(), overFts.getMessage().contains("already carries a pushed operation"));
+
+        // KNN-carrying scan refuses a filter push.
+        LanceTableScan bareKnn = (LanceTableScan) PlanTestFixtures.factory()
+            .relBuilder(PlanTestFixtures.model().schema())
+            .scan(LancePlannerFactory.SCHEMA_NAME, "idx")
+            .build();
+        LanceKnnSearch knn = new LanceKnnSearch(
+            bareKnn.getCluster(),
+            bareKnn.getCluster().traitSetOf(org.apache.calcite.plan.Convention.NONE),
+            bareKnn,
+            new LanceKnnQueryBuilder("embedding", new float[] { 0.1f, 0.2f }, 3)
+        );
+        LanceTableScan knnPushed = bareKnn.withPushedKnn(knn, null);
+        RexNode knnCondition = bareKnn.getCluster()
+            .getRexBuilder()
+            .makeCall(
+                org.apache.calcite.sql.fun.SqlStdOperatorTable.IS_NOT_NULL,
+                bareKnn.getCluster().getRexBuilder().makeInputRef(bareKnn.getRowType().getFieldList().get(1).getType(), 1)
+            );
+        IllegalStateException overKnn = expectThrows(
+            IllegalStateException.class,
+            () -> knnPushed.withPushedFilter(knnCondition, "rating IS NOT NULL")
+        );
+        assertTrue(overKnn.getMessage(), overKnn.getMessage().contains("already carries a pushed operation"));
+    }
+
+    public void testWithPushedAggregateRefusesAScanCarryingAnotherPush() throws Exception {
+        RelNode logical = PlanTestFixtures.translate(
+            PlanTestFixtures.parse("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}")
+        );
+        LanceAggregate aggregate = (LanceAggregate) logical;
+        LanceTableScan bare = (LanceTableScan) aggregate.getInput();
+        java.nio.ByteBuffer bytes = LanceSubstraitProducer.toLanceAggregate(aggregate).orElseThrow();
+
+        // Filter-carrying scan refuses an aggregate push.
+        RexNode condition = bare.getCluster()
+            .getRexBuilder()
+            .makeCall(
+                org.apache.calcite.sql.fun.SqlStdOperatorTable.IS_NOT_NULL,
+                bare.getCluster().getRexBuilder().makeInputRef(bare.getRowType().getFieldList().get(1).getType(), 1)
+            );
+        LanceTableScan filterPushed = bare.withPushedFilter(condition, "rating IS NOT NULL");
+        IllegalStateException overFilter = expectThrows(
+            IllegalStateException.class,
+            () -> filterPushed.withPushedAggregate(aggregate, bytes)
+        );
+        assertTrue(overFilter.getMessage(), overFilter.getMessage().contains("already carries a pushed operation"));
+
+        // FTS-carrying scan refuses an aggregate push.
+        LanceTableScan bareFts = (LanceTableScan) PlanTestFixtures.factory()
+            .relBuilder(PlanTestFixtures.model().schema())
+            .scan(LancePlannerFactory.SCHEMA_NAME, "idx")
+            .build();
+        LanceFtsMatch fts = new LanceFtsMatch(
+            bareFts.getCluster(),
+            bareFts.getCluster().traitSetOf(org.apache.calcite.plan.Convention.NONE),
+            bareFts,
+            LanceFtsMatch.Kind.MATCH,
+            List.of("body"),
+            new LanceMatchQueryBuilder("body", "hello")
+        );
+        LanceTableScan ftsPushed = bareFts.withPushedFts(fts, null);
+        IllegalStateException overFts = expectThrows(IllegalStateException.class, () -> ftsPushed.withPushedAggregate(aggregate, bytes));
+        assertTrue(overFts.getMessage(), overFts.getMessage().contains("already carries a pushed operation"));
+
+        // KNN-carrying scan refuses an aggregate push.
+        LanceTableScan bareKnn = (LanceTableScan) PlanTestFixtures.factory()
+            .relBuilder(PlanTestFixtures.model().schema())
+            .scan(LancePlannerFactory.SCHEMA_NAME, "idx")
+            .build();
+        LanceKnnSearch knn = new LanceKnnSearch(
+            bareKnn.getCluster(),
+            bareKnn.getCluster().traitSetOf(org.apache.calcite.plan.Convention.NONE),
+            bareKnn,
+            new LanceKnnQueryBuilder("embedding", new float[] { 0.1f, 0.2f }, 3)
+        );
+        LanceTableScan knnPushed = bareKnn.withPushedKnn(knn, null);
+        IllegalStateException overKnn = expectThrows(IllegalStateException.class, () -> knnPushed.withPushedAggregate(aggregate, bytes));
+        assertTrue(overKnn.getMessage(), overKnn.getMessage().contains("already carries a pushed operation"));
     }
 }
