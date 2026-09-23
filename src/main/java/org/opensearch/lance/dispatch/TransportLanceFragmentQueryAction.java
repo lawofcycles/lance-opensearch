@@ -53,7 +53,10 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.index.mapper.KeywordFieldMapper;
+import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
+import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.Rewriteable;
@@ -1442,13 +1445,19 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
 
     /**
      * The request's {@code collapse} as a {@link CollapseContext} built
-     * against the node's mapping ({@code CollapseBuilder.build}: the
-     * field has to be mapped, a keyword or a number, with doc values;
-     * each refusal keeps the message core gives), or {@code null}
-     * without one. With a {@code search_after} cursor the sort has to be
-     * the collapse field alone, the check {@code SearchService.parseSource}
-     * applies with its message; the shard path reports it as a search
-     * exception (500), here it is the client's error and answers 400.
+     * against the node's mapping with the checks of
+     * {@code CollapseBuilder.build} and its messages: the field has to be
+     * mapped, a keyword or a number, with doc values. The one check not
+     * applied is the one refusing {@code inner_hits} on a field that is
+     * not indexed: every Lance derived field is mapped {@code index:
+     * false} (the fragment path answers its term queries from the Lance
+     * scan and the shard path from doc values), so the group searches of
+     * the expansion can pin a collapse value on it, which is all the
+     * check guards on a plain index. {@code null} without a collapse.
+     * With a {@code search_after} cursor the sort has to be the collapse
+     * field alone, the check {@code SearchService.parseSource} applies
+     * with its message; the shard path reports it as a search exception
+     * (500), here it is the client's error and answers 400.
      */
     private static CollapseContext resolveCollapse(
         LanceFragmentQueryRequest request,
@@ -1467,7 +1476,19 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 );
             }
         }
-        return request.collapse().build(qsc);
+        String field = request.collapse().getField();
+        MappedFieldType fieldType = qsc.fieldMapper(field);
+        if (fieldType == null) {
+            throw new IllegalArgumentException("no mapping found for `" + field + "` in order to collapse on");
+        }
+        if (fieldType.unwrap() instanceof KeywordFieldMapper.KeywordFieldType == false
+            && fieldType.unwrap() instanceof NumberFieldMapper.NumberFieldType == false) {
+            throw new IllegalArgumentException("unknown type for collapse field `" + field + "`, only keywords and numbers are accepted");
+        }
+        if (fieldType.hasDocValues() == false) {
+            throw new IllegalArgumentException("cannot collapse on field `" + field + "` without `doc_values`");
+        }
+        return new CollapseContext(field, fieldType, request.collapse().getInnerHits());
     }
 
     /**

@@ -421,10 +421,14 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             return listener;
         }
         return ActionListener.wrap(
-            response -> new CollapseExpansion(client, clusterService.localNode().getId(), searchRequest, collapse, policy.task()).expand(
-                response,
-                listener
-            ),
+            response -> new CollapseExpansion(
+                client,
+                clusterService.localNode().getId(),
+                searchRequest,
+                collapse,
+                policy.task(),
+                threadPool.info(LancePlugin.LANCE_COORDINATOR_THREAD_POOL).getMax()
+            ).expand(response, listener),
             listener::onFailure
         );
     }

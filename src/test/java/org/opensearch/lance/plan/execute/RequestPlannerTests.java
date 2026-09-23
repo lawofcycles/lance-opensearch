@@ -138,7 +138,7 @@ public class RequestPlannerTests extends OpenSearchTestCase {
             "{\"size\":10,\"query\":{\"term\":{\"rating\":5}},\"collapse\":{\"field\":\"category\"}}",
             "{\"size\":10,\"query\":{\"term\":{\"rating\":5}},\"sort\":[{\"price\":\"desc\"}],\"collapse\":{\"field\":\"category\"}}" }) {
             SearchSourceBuilder source = PlanTestFixtures.parse(body);
-            ExecutionShape shape = ExecutionShape.of(source, source.query(), true);
+            ExecutionShape shape = ExecutionShape.of(source, source.query());
             assertTrue(body, shape.secondPass());
             RequestPlanner.Planned planned = RequestPlanner.plan(shape, PlanTestFixtures.model(), NO_EXCLUDED, PlanTestFixtures.factory());
             assertEquals(body, FragmentPlan.Kind.LUCENE_TOPK, planned.plan().kind());
@@ -148,7 +148,7 @@ public class RequestPlannerTests extends OpenSearchTestCase {
         }
         // The same bodies without the second pass push their page.
         SearchSourceBuilder plain = PlanTestFixtures.parse("{\"size\":10,\"query\":{\"term\":{\"rating\":5}}}");
-        ExecutionShape plainShape = ExecutionShape.of(plain, plain.query(), true);
+        ExecutionShape plainShape = ExecutionShape.of(plain, plain.query());
         assertFalse(plainShape.secondPass());
         assertEquals(
             FragmentPlan.Kind.PUSHED_SCAN,
@@ -165,7 +165,7 @@ public class RequestPlannerTests extends OpenSearchTestCase {
                 + "\"rescore\":{\"window_size\":50,\"query\":{\"rescore_query\":{\"term\":{\"rating\":5}}}}}"
         );
         FragmentPlan plan = RequestPlanner.plan(
-            ExecutionShape.of(source, source.query(), true),
+            ExecutionShape.of(source, source.query()),
             PlanTestFixtures.model(),
             NO_EXCLUDED,
             PlanTestFixtures.factory()

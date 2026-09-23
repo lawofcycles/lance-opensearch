@@ -54,13 +54,30 @@ final class CollapseExpansion {
     private final SearchRequest searchRequest;
     private final CollapseBuilder collapse;
     private final CancellableTask task;
+    private final int defaultConcurrency;
 
-    CollapseExpansion(NodeClient client, String localNodeId, SearchRequest searchRequest, CollapseBuilder collapse, CancellableTask task) {
+    /**
+     * @param defaultConcurrency how many group searches run at once when
+     *     the body sets no {@code max_concurrent_group_searches}: the size
+     *     of the {@code lance_coordinator} pool, so the group searches,
+     *     each of which enters that pool through the dispatch filter, do
+     *     not fill its queue by themselves (the multi search's own
+     *     default is sized for the search pool)
+     */
+    CollapseExpansion(
+        NodeClient client,
+        String localNodeId,
+        SearchRequest searchRequest,
+        CollapseBuilder collapse,
+        CancellableTask task,
+        int defaultConcurrency
+    ) {
         this.client = client;
         this.localNodeId = localNodeId;
         this.searchRequest = searchRequest;
         this.collapse = collapse;
         this.task = task;
+        this.defaultConcurrency = Math.max(1, defaultConcurrency);
     }
 
     /**
@@ -76,9 +93,9 @@ final class CollapseExpansion {
             return;
         }
         MultiSearchRequest multiRequest = new MultiSearchRequest();
-        if (collapse.getMaxConcurrentGroupRequests() > 0) {
-            multiRequest.maxConcurrentSearchRequests(collapse.getMaxConcurrentGroupRequests());
-        }
+        multiRequest.maxConcurrentSearchRequests(
+            collapse.getMaxConcurrentGroupRequests() > 0 ? collapse.getMaxConcurrentGroupRequests() : defaultConcurrency
+        );
         SearchSourceBuilder source = searchRequest.source();
         for (SearchHit hit : hits) {
             BoolQueryBuilder groupQuery = new BoolQueryBuilder();

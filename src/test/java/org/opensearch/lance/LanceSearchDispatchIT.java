@@ -782,7 +782,11 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertSameHitsAsShardPath(indexName, fts);
 
             // inner_hits: one group search per collapsed hit with the
-            // block's size, sort and source filter.
+            // block's size, sort and source filter. The shard path
+            // refuses inner_hits on every Lance field (core wants the
+            // collapse field indexed, and the derived mapping says index:
+            // false), so the expansion is compared with the group search
+            // it issues instead of with the shard path's answer.
             String innerHits = "{\"size\":10,\"query\":{\"range\":{\"id\":{\"gte\":1}}},\"sort\":[{\"id\":\"asc\"}],"
                 + "\"collapse\":{\"field\":\"category\",\"inner_hits\":{\"name\":\"top\",\"size\":2,\"sort\":[{\"id\":\"desc\"}],"
                 + "\"_source\":[\"id\"]}}}";
@@ -797,13 +801,35 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             @SuppressWarnings("unchecked")
             List<Map<String, Object>> firstInnerRows = (List<Map<String, Object>>) firstInnerHits.get("hits");
             assertEquals(List.of("1-3", "1-2"), idsOf(firstInnerRows));
-            assertSameHitsAsShardPath(indexName, innerHits);
+            String groupSearch = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":2,\"sort\":[{\"id\":\"desc\"}],\"_source\":[\"id\"],\"query\":{\"bool\":{"
+                        + "\"filter\":[{\"match\":{\"category\":\"c1\"}}],\"must\":[{\"range\":{\"id\":{\"gte\":1}}}]}}}"
+                )
+            );
+            assertEquals(fullHitsOf(groupSearch), firstInnerRows);
+            assertEquals(totalOf(groupSearch), castMap(firstInnerHits.get("total")));
+            ConcurrentResult shardPathInnerHits = postForStatus("/" + indexName + "/_search", onShardPath(innerHits));
+            assertEquals(shardPathInnerHits.body(), 400, shardPathInnerHits.status());
+            assertTrue(shardPathInnerHits.body(), shardPathInnerHits.body().contains("only indexed field can retrieve `inner_hits`"));
 
-            // max_concurrent_group_searches bounds the expansion; the
-            // answer does not change.
+            // max_concurrent_group_searches bounds the expansion; every
+            // bucket (id % 4) still expands to its three rows.
             String bounded = "{\"size\":10,\"collapse\":{\"field\":\"bucket\",\"max_concurrent_group_searches\":1,"
                 + "\"inner_hits\":{\"name\":\"rows\",\"size\":3}}}";
-            assertSameHitsAsShardPath(indexName, bounded);
+            List<Map<String, Object>> buckets = hitsOf(readAll(postJson("/" + indexName + "/_search", bounded)));
+            assertEquals(4, buckets.size());
+            for (Map<String, Object> bucket : buckets) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> rows = (Map<String, Object>) ((Map<String, Object>) bucket.get("inner_hits")).get("rows");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> rowsHits = (Map<String, Object>) rows.get("hits");
+                assertEquals(bucket.toString(), 3, ((Number) castMap(rowsHits.get("total")).get("value")).intValue());
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> rowList = (List<Map<String, Object>>) rowsHits.get("hits");
+                assertEquals(bucket.toString(), 3, rowList.size());
+            }
 
             // search_after on the collapse field itself.
             String cursor =

@@ -288,12 +288,16 @@ public final class MergeReducer {
         // max_score follows the shard path's TopDocsCollectorContext: a
         // score ordered page (no sort, or a leading descending _score
         // clause) reports its top score, a sort with track_scores the
-        // largest score of the paged window, and any other sort NaN,
+        // largest score of the merged window, and any other sort NaN,
         // although its hits carry a score when a _score clause sits
-        // among the sort clauses. NaN also when no hit survives paging.
+        // among the sort clauses. The window is read before the from
+        // cut, as the shard path reads each shard's top docs before the
+        // coordinator skips from (a rescored page reports the best
+        // rescored score whatever from is). NaN also when no hit
+        // survives the merge.
         float maxScore = Float.NaN;
         if (scoreOrdered(sorts) || trackScores) {
-            for (SearchHit hit : paged) {
+            for (SearchHit hit : hits) {
                 float score = hit.getScore();
                 if (Float.isNaN(score)) {
                     continue;

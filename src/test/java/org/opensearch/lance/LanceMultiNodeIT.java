@@ -842,19 +842,25 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             String innerHits = "{\"size\":10,\"sort\":[{\"id\":\"asc\"}],\"collapse\":{\"field\":\"bucket\","
                 + "\"inner_hits\":{\"name\":\"rows\",\"size\":2,\"sort\":[{\"id\":\"desc\"}]}}}";
             Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", innerHits)));
-            Map<String, Object> shardPath = parse(
-                readAll(postJson("/" + indexName + "/_search", LanceRestTestCase.onShardPath(innerHits)))
-            );
             assertEquals(List.of(0, 1, 2, 3), sourceIds(fragmentPath));
-            assertEquals(hitIdsOf(shardPath), hitIdsOf(fragmentPath));
-            for (int i = 0; i < hitList(fragmentPath).size(); i++) {
-                assertEquals(innerHits, hitList(shardPath).get(i).get("inner_hits"), hitList(fragmentPath).get(i).get("inner_hits"));
-            }
+            // Bucket 0 holds ids 0, 4 and 8, one on each node; its inner
+            // hits are the group search the expansion issues. The shard
+            // path refuses inner_hits on a Lance field (mapped index:
+            // false), so the group search is the reference.
             @SuppressWarnings("unchecked")
             Map<String, Object> firstGroup = (Map<String, Object>) ((Map<String, Object>) hitList(fragmentPath).get(0).get("inner_hits"))
                 .get("rows");
-            // Bucket 0 holds ids 0, 4 and 8, on three different nodes.
             assertEquals(3, extractIntPath(firstGroup, "hits", "total", "value"));
+            assertEquals(List.of(8, 4), sourceIds(firstGroup));
+            Map<String, Object> groupSearch = parse(
+                readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":2,\"sort\":[{\"id\":\"desc\"}],\"query\":{\"bool\":{\"filter\":[{\"match\":{\"bucket\":0}}]}}}"
+                    )
+                )
+            );
+            assertEquals(hitList(groupSearch), hitList(firstGroup));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
