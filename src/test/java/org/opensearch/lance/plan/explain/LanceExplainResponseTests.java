@@ -147,16 +147,16 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
     public void testShardPathRouteCarriesTheReasonsAndNoFragmentPlan() throws IOException {
         LanceExplainResponse response = LanceExplainResponse.shardPath(
             "demo",
-            List.of(ShardPathReason.COLLAPSE, ShardPathReason.RESCORE),
-            "LanceShardPathShape(reasons=[[COLLAPSE, RESCORE]])\n  LanceTableScan\n",
-            "ShardPathFallbackExec(reasons=[[COLLAPSE, RESCORE]])\n  LanceTableScan\n"
+            List.of(ShardPathReason.SUGGEST, ShardPathReason.HIGHLIGHT),
+            "LanceShardPathShape(reasons=[[SUGGEST, HIGHLIGHT]])\n  LanceTableScan\n",
+            "ShardPathFallbackExec(reasons=[[SUGGEST, HIGHLIGHT]])\n  LanceTableScan\n"
         );
         assertEquals(response, roundTrip(response));
         assertNull(response.fragmentPlan());
         assertNull(response.unplanned());
         Map<String, Object> json = json(response);
         assertEquals("shard_path", json.get("route"));
-        assertEquals(List.of("COLLAPSE", "RESCORE"), json.get("reasons"));
+        assertEquals(List.of("SUGGEST", "HIGHLIGHT"), json.get("reasons"));
         assertFalse(json.containsKey("fragment_plan"));
         assertFalse(json.containsKey("unplanned"));
         assertFalse("the data node refines nothing on the shard path", json.containsKey("refinements_possible"));

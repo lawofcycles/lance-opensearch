@@ -642,6 +642,212 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         }
     }
 
+    public void testRescoreRunsOnTheFragmentPath() throws Exception {
+        // The executor collects the largest rescore window through the
+        // Lucene collector, runs each rescorer over it and cuts the page;
+        // every shape is compared with the shard path's answer to the
+        // same body. Twelve rows over three fragments: body scores are
+        // distinct (BM25 grows with id), category is c<id % 3>.
+        String suffix = "rescore-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeBucketedInterleavedTable(scratchDir, tableName, 3, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // A scalar first pass (every hit scores 1.0) re scored by a
+            // full text query: the rescored window sorts by BM25 and the
+            // rows past the window keep their first pass score.
+            String scalarThenFts = "{\"size\":5,\"query\":{\"range\":{\"id\":{\"gte\":2}}},"
+                + "\"rescore\":{\"window_size\":10,\"query\":{\"rescore_query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}}}}}";
+            long executedBefore = fragmentRequestsExecuted();
+            String scalarThenFtsBody = readAll(postJson("/" + indexName + "/_search", scalarThenFts));
+            assertEquals("the fragment path served the request", executedBefore + 1, fragmentRequestsExecuted());
+            assertEquals(10, extractIntPath(scalarThenFtsBody, "hits", "total", "value"));
+            assertEquals(List.of("2-3", "1-3", "0-3", "2-2", "1-2"), idsOf(hitsOf(scalarThenFtsBody)));
+            assertSameHitsAsShardPath(indexName, scalarThenFts);
+
+            // A full text first pass re scored by a scalar query under
+            // explicit weights: rows of category c1 gain the rescore
+            // weight, the others keep the weighted first pass score.
+            String ftsThenScalar = "{\"size\":6,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}},"
+                + "\"rescore\":{\"window_size\":12,\"query\":{\"rescore_query\":{\"term\":{\"category\":\"c1\"}},"
+                + "\"query_weight\":0.5,\"rescore_query_weight\":2.0}}}";
+            String ftsThenScalarBody = readAll(postJson("/" + indexName + "/_search", ftsThenScalar));
+            assertEquals(12, extractIntPath(ftsThenScalarBody, "hits", "total", "value"));
+            assertSameHitsAsShardPath(indexName, ftsThenScalar);
+
+            // A window smaller than the page: the three top rows are re
+            // scored, the rest of the page is not.
+            String smallWindow = "{\"size\":8,\"query\":{\"match_all\":{}},"
+                + "\"rescore\":{\"window_size\":3,\"query\":{\"rescore_query\":{\"term\":{\"category\":\"c2\"}}}}}";
+            String smallWindowBody = readAll(postJson("/" + indexName + "/_search", smallWindow));
+            assertEquals(8, fullHitsOf(smallWindowBody).size());
+            assertSameHitsAsShardPath(indexName, smallWindow);
+
+            // Two rescorers in a row, the second over the first's scores.
+            String chained = "{\"size\":5,\"query\":{\"match_all\":{}},\"rescore\":["
+                + "{\"window_size\":12,\"query\":{\"rescore_query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}}}},"
+                + "{\"window_size\":4,\"query\":{\"rescore_query\":{\"term\":{\"category\":\"c0\"}},\"rescore_query_weight\":10}}]}";
+            assertSameHitsAsShardPath(indexName, chained);
+
+            // score_mode max with weights on both sides.
+            String maxMode = "{\"size\":5,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}},"
+                + "\"rescore\":{\"window_size\":12,\"query\":{\"rescore_query\":{\"term\":{\"bucket\":1}},"
+                + "\"query_weight\":0.3,\"rescore_query_weight\":1.5,\"score_mode\":\"max\"}}}";
+            assertSameHitsAsShardPath(indexName, maxMode);
+
+            // from skips the leading rescored rows.
+            String paged = "{\"from\":2,\"size\":3,\"query\":{\"match_all\":{}},"
+                + "\"rescore\":{\"window_size\":12,\"query\":{\"rescore_query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}}}}}";
+            assertSameHitsAsShardPath(indexName, paged);
+
+            // The refusals core applies, with its messages.
+            ConcurrentResult sorted = postForStatus(
+                "/" + indexName + "/_search",
+                "{\"size\":2,\"sort\":[{\"id\":\"asc\"}],\"query\":{\"match_all\":{}},"
+                    + "\"rescore\":{\"query\":{\"rescore_query\":{\"match_all\":{}}}}}"
+            );
+            assertEquals(sorted.body(), 400, sorted.status());
+            assertTrue(sorted.body(), sorted.body().contains("Cannot use [sort] option in conjunction with [rescore]."));
+            ConcurrentResult scrolled = postForStatus(
+                "/" + indexName + "/_search?scroll=1m",
+                "{\"size\":2,\"query\":{\"match_all\":{}},\"rescore\":{\"query\":{\"rescore_query\":{\"match_all\":{}}}}}"
+            );
+            assertEquals(scrolled.body(), 400, scrolled.status());
+            assertTrue(scrolled.body(), scrolled.body().contains("using [rescore] is not allowed in a scroll context"));
+            ConcurrentResult wideWindow = postForStatus(
+                "/" + indexName + "/_search",
+                "{\"size\":2,\"query\":{\"match_all\":{}},\"rescore\":{\"window_size\":10001,\"query\":{\"rescore_query\":{\"match_all\":{}}}}}"
+            );
+            assertEquals(wideWindow.body(), 400, wideWindow.status());
+            assertTrue(wideWindow.body(), wideWindow.body().contains("Rescore window [10001] is too large."));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testCollapseRunsOnTheFragmentPath() throws Exception {
+        // The executor collects one hit per distinct value through the
+        // collapsing collector and the coordinator keeps one per value
+        // across executors, expanding inner_hits with one search per
+        // group; every shape is compared with the shard path's answer.
+        // Twelve rows: category c<id % 3>, bucket id % 4, body scores
+        // grow with id.
+        String suffix = "collapse-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeBucketedInterleavedTable(scratchDir, tableName, 3, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // Keyword field under match_all: the first row of every
+            // category in doc order, hits.total counts every row and the
+            // collapse value rides as the field's doc value.
+            String keyword = "{\"size\":10,\"query\":{\"match_all\":{}},\"collapse\":{\"field\":\"category\"}}";
+            long executedBefore = fragmentRequestsExecuted();
+            String keywordBody = readAll(postJson("/" + indexName + "/_search", keyword));
+            assertEquals("the fragment path served the request", executedBefore + 1, fragmentRequestsExecuted());
+            assertEquals(12, extractIntPath(keywordBody, "hits", "total", "value"));
+            assertEquals(List.of("0-0", "1-0", "2-0"), idsOf(hitsOf(keywordBody)));
+            assertTrue(
+                "the collapse value is a field of the hit: " + keywordBody,
+                keywordBody.contains("\"fields\":{\"category\":[\"c0\"]}")
+            );
+            assertSameHitsAsShardPath(indexName, keyword);
+
+            // Numeric field with a sort on another field: the highest id
+            // of each bucket.
+            String numeric = "{\"size\":10,\"sort\":[{\"id\":\"desc\"}],\"collapse\":{\"field\":\"bucket\"}}";
+            String numericBody = readAll(postJson("/" + indexName + "/_search", numeric));
+            assertEquals(List.of("2-3", "1-3", "0-3", "2-2"), idsOf(hitsOf(numericBody)));
+            assertSameHitsAsShardPath(indexName, numeric);
+
+            // from skips leading groups; a full text first pass picks the
+            // best scored row of every category.
+            String paged = "{\"from\":1,\"size\":2,\"sort\":[{\"ts\":\"desc\"}],\"collapse\":{\"field\":\"category\"}}";
+            assertSameHitsAsShardPath(indexName, paged);
+            String fts =
+                "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}},\"collapse\":{\"field\":\"category\"}}";
+            String ftsBody = readAll(postJson("/" + indexName + "/_search", fts));
+            assertEquals(List.of("2-3", "1-3", "0-3"), idsOf(hitsOf(ftsBody)));
+            assertSameHitsAsShardPath(indexName, fts);
+
+            // inner_hits: one group search per collapsed hit with the
+            // block's size, sort and source filter.
+            String innerHits = "{\"size\":10,\"query\":{\"range\":{\"id\":{\"gte\":1}}},\"sort\":[{\"id\":\"asc\"}],"
+                + "\"collapse\":{\"field\":\"category\",\"inner_hits\":{\"name\":\"top\",\"size\":2,\"sort\":[{\"id\":\"desc\"}],"
+                + "\"_source\":[\"id\"]}}}";
+            String innerHitsBody = readAll(postJson("/" + indexName + "/_search", innerHits));
+            List<Map<String, Object>> collapsed = hitsOf(innerHitsBody);
+            assertEquals(List.of("1-0", "2-0", "0-1"), idsOf(collapsed));
+            @SuppressWarnings("unchecked")
+            Map<String, Object> firstInner = (Map<String, Object>) ((Map<String, Object>) collapsed.get(0).get("inner_hits")).get("top");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> firstInnerHits = (Map<String, Object>) firstInner.get("hits");
+            assertEquals(4, ((Number) castMap(firstInnerHits.get("total")).get("value")).intValue());
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> firstInnerRows = (List<Map<String, Object>>) firstInnerHits.get("hits");
+            assertEquals(List.of("1-3", "1-2"), idsOf(firstInnerRows));
+            assertSameHitsAsShardPath(indexName, innerHits);
+
+            // max_concurrent_group_searches bounds the expansion; the
+            // answer does not change.
+            String bounded = "{\"size\":10,\"collapse\":{\"field\":\"bucket\",\"max_concurrent_group_searches\":1,"
+                + "\"inner_hits\":{\"name\":\"rows\",\"size\":3}}}";
+            assertSameHitsAsShardPath(indexName, bounded);
+
+            // search_after on the collapse field itself.
+            String cursor =
+                "{\"size\":2,\"sort\":[{\"category\":\"asc\"}],\"search_after\":[\"c0\"],\"collapse\":{\"field\":\"category\"}}";
+            String cursorBody = readAll(postJson("/" + indexName + "/_search", cursor));
+            assertEquals(List.of("1-0", "2-0"), idsOf(hitsOf(cursorBody)));
+            assertSameHitsAsShardPath(indexName, cursor);
+
+            // The refusals core applies, with its messages.
+            ConcurrentResult text = postForStatus("/" + indexName + "/_search", "{\"size\":2,\"collapse\":{\"field\":\"body\"}}");
+            assertEquals(text.body(), 400, text.status());
+            assertTrue(text.body(), text.body().contains("unknown type for collapse field `body`, only keywords and numbers are accepted"));
+            ConcurrentResult unmapped = postForStatus("/" + indexName + "/_search", "{\"size\":2,\"collapse\":{\"field\":\"nope\"}}");
+            assertEquals(unmapped.body(), 400, unmapped.status());
+            assertTrue(unmapped.body(), unmapped.body().contains("no mapping found for `nope` in order to collapse on"));
+            ConcurrentResult withRescore = postForStatus(
+                "/" + indexName + "/_search",
+                "{\"size\":2,\"collapse\":{\"field\":\"category\"},\"rescore\":{\"query\":{\"rescore_query\":{\"match_all\":{}}}}}"
+            );
+            assertEquals(withRescore.body(), 400, withRescore.status());
+            assertTrue(withRescore.body(), withRescore.body().contains("cannot use `collapse` in conjunction with `rescore`"));
+            ConcurrentResult otherSortCursor = postForStatus(
+                "/" + indexName + "/_search",
+                "{\"size\":2,\"sort\":[{\"id\":\"asc\"}],\"search_after\":[3],\"collapse\":{\"field\":\"category\"}}"
+            );
+            assertEquals(otherSortCursor.body(), 400, otherSortCursor.status());
+            assertTrue(
+                otherSortCursor.body(),
+                otherSortCursor.body()
+                    .contains("collapse field and sort field must be the same when use `collapse` in conjunction with `search_after`")
+            );
+            ConcurrentResult scrolled = postForStatus(
+                "/" + indexName + "/_search?scroll=1m",
+                "{\"size\":2,\"collapse\":{\"field\":\"category\"}}"
+            );
+            assertEquals(scrolled.body(), 400, scrolled.status());
+            assertTrue(scrolled.body(), scrolled.body().contains("cannot use `collapse` in a scroll context"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     /**
      * Assert that {@code body} answers the same {@code hits} (total,
      * max_score and every rendered hit key), the same

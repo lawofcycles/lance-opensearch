@@ -243,8 +243,8 @@ sequenceDiagram
 
 The dispatch filter checks that every target index is Lance-backed and the request shape is one
 the fragment executor answers correctly. That shape decision is itself a plan: the translator
-marks a body holding an element only the shard path serves (suggesters, highlighters, collapse,
-rescore, pipeline aggregations and the rest of the list in
+marks a body holding an element only the shard path serves (suggesters, highlighters, pipeline
+aggregations and the rest of the list in
 [limitations.md](limitations.md)) with a shard-path shape node naming each element as a reason,
 the planner lowers it to the shard-path convention's fallback operator, and a plan with that
 operator at its root proceeds unchanged onto the shard path. The coordinator never

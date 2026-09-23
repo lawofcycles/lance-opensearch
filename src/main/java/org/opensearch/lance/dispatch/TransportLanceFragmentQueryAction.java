@@ -29,6 +29,7 @@ import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.ByteBuffersDirectory;
@@ -90,12 +91,16 @@ import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.MultiBucketCollector;
 import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer;
 import org.opensearch.search.aggregations.SearchContextAggregations;
+import org.opensearch.search.collapse.CollapseContext;
 import org.opensearch.search.fetch.subphase.FetchDocValuesContext;
 import org.opensearch.search.fetch.subphase.FetchFieldsContext;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
+import org.opensearch.search.rescore.RescoreContext;
+import org.opensearch.search.rescore.RescorerBuilder;
 import org.opensearch.search.searchafter.SearchAfterBuilder;
 import org.opensearch.search.sort.SortAndFormats;
+import org.opensearch.search.sort.SortBuilder;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
@@ -719,6 +724,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
 
                 SortAndFormats sortAndFormats = resolveSort(request, qsc);
                 FieldDoc searchAfter = resolveSearchAfter(request, sortAndFormats);
+                // The second pass of the request, built against this
+                // node's mapping before the page is collected: the
+                // rescorers size the first pass and run over it, the
+                // collapse replaces the top docs collector, and both
+                // reach the fetch phase through the context (rescore
+                // explanations, the collapse field as a doc value field).
+                List<RescoreContext> rescorers = resolveRescorers(request, sortAndFormats, indexService.getIndexSettings(), qsc);
+                CollapseContext collapse = resolveCollapse(request, sortAndFormats, searchAfter, qsc);
+                searchContext.withSecondPass(rescorers, collapse);
                 searchContext.withProjection(
                     request.projection().fetchSource(),
                     request.projection().storedFields(),
@@ -891,22 +905,44 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         effectiveFragmentIds,
                         cancellation
                     );
+                } else if (collapse != null) {
+                    // One hit per distinct value of the collapse field,
+                    // from the collapsing collector over the executor's
+                    // fragments; the planner keeps a collapse request off
+                    // the pushed page and the scan stays unbounded, since
+                    // the groups are found among every match.
+                    page = FragmentHitsPages.viaCollapsingCollector(
+                        searcher,
+                        hitsQuery,
+                        hitsQuery == query ? lanceWeight : null,
+                        collapse,
+                        sortAndFormats,
+                        searchAfter,
+                        request.size(),
+                        knobs,
+                        request.trackTotalHitsUpTo()
+                    );
                 } else {
                     // The shared Weight drives the hits phase only when
                     // hitsQuery is the very query it was created for;
                     // with a post_filter the hits query is a conjunction
-                    // Lucene has to build its own Weight for.
+                    // Lucene has to build its own Weight for. With
+                    // rescorers the first pass collects the largest
+                    // window and the rescorers cut it back to the page.
                     page = FragmentHitsPages.viaIndexSearcher(
                         searcher,
                         hitsQuery,
                         hitsQuery == query ? lanceWeight : null,
                         sortAndFormats,
                         searchAfter,
-                        request.size(),
+                        request.firstPassSize(),
                         request.trackScores(),
                         knobs,
                         request.trackTotalHitsUpTo()
                     );
+                    if (!rescorers.isEmpty()) {
+                        page = FragmentHitsPages.rescore(page, rescorers, searcher, request.size());
+                    }
                 }
                 Boolean terminatedEarly = page.terminatedEarly();
                 InternalAggregations aggregations;
@@ -1238,7 +1274,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * after the scan the same way a post_filter would. {@code min_score}
      * and {@code terminate_after} keep it unbounded too: the collectors
      * that apply them also count the matches, and a scan clipped to
-     * {@code size} rows would clip that count.
+     * {@code size} rows would clip that count. A {@code collapse} keeps
+     * it unbounded because its groups are found among every match, and
+     * a {@code rescore} raises the clip to the rescorers' window.
      *
      * <p>The coordinator already folds the top-level {@code from} into
      * {@code size} before shipping the request (see
@@ -1268,7 +1306,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (request.postFilter() != null) {
             return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
         }
-        int size = request.size();
+        if (request.collapse() != null) {
+            // The collapsing collector picks one hit per group among
+            // every match; a scan clipped to the page would hide the
+            // groups past the clip.
+            return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
+        }
+        // With rescorers the first pass collects the largest window, so
+        // the clip is the window, not the page.
+        int size = request.firstPassSize();
         if (size <= 0) {
             // size:0 count-only shape never enters
             // the Lucene hits phase, and computeMatched serves the
@@ -1310,7 +1356,10 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         }
         boolean hasAggregations = request.aggregations() != null && !request.aggregations().getAggregatorFactories().isEmpty();
         boolean sortsAPage = request.size() > 0 && !request.sorts().isEmpty();
-        return hasAggregations || sortsAPage;
+        // The collapsing collector reads the collapse field's doc values
+        // (keyword ordinals included) for every hit it groups.
+        boolean collapsesAPage = request.size() > 0 && request.collapse() != null;
+        return hasAggregations || sortsAPage || collapsesAPage;
     }
 
     /**
@@ -1345,7 +1394,80 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (request.sorts().isEmpty()) {
             return null;
         }
-        return org.opensearch.search.sort.SortBuilder.buildSort(request.sorts(), qsc).orElse(null);
+        return SortBuilder.buildSort(request.sorts(), qsc).orElse(null);
+    }
+
+    /**
+     * The request's rescorers as {@link RescoreContext}s built against
+     * the node's mapping ({@link RescorerBuilder#buildContext}), in body
+     * order; empty without {@code rescore}. The two checks
+     * {@code DefaultSearchContext.preProcess} applies come first, with
+     * its messages: a rescore next to a sort that builds a Lucene sort
+     * (a lone descending {@code _score} builds none and passes, as
+     * there), and a window above {@code index.max_rescore_window}.
+     */
+    private static List<RescoreContext> resolveRescorers(
+        LanceFragmentQueryRequest request,
+        SortAndFormats sortAndFormats,
+        IndexSettings indexSettings,
+        QueryShardContext qsc
+    ) throws IOException {
+        if (request.rescores().isEmpty()) {
+            return List.of();
+        }
+        if (sortAndFormats != null) {
+            throw new IllegalArgumentException("Cannot use [sort] option in conjunction with [rescore].");
+        }
+        int maxWindow = indexSettings.getMaxRescoreWindow();
+        List<RescoreContext> rescorers = new ArrayList<>(request.rescores().size());
+        for (RescorerBuilder<?> rescore : request.rescores()) {
+            RescoreContext rescoreContext = rescore.buildContext(qsc);
+            if (rescoreContext.getWindowSize() > maxWindow) {
+                throw new IllegalArgumentException(
+                    "Rescore window ["
+                        + rescoreContext.getWindowSize()
+                        + "] is too large. "
+                        + "It must be less than ["
+                        + maxWindow
+                        + "]. This prevents allocating massive heaps for storing the results "
+                        + "to be rescored. This limit can be set by changing the ["
+                        + IndexSettings.MAX_RESCORE_WINDOW_SETTING.getKey()
+                        + "] index level setting."
+                );
+            }
+            rescorers.add(rescoreContext);
+        }
+        return rescorers;
+    }
+
+    /**
+     * The request's {@code collapse} as a {@link CollapseContext} built
+     * against the node's mapping ({@code CollapseBuilder.build}: the
+     * field has to be mapped, a keyword or a number, with doc values;
+     * each refusal keeps the message core gives), or {@code null}
+     * without one. With a {@code search_after} cursor the sort has to be
+     * the collapse field alone, the check {@code SearchService.parseSource}
+     * applies with its message; the shard path reports it as a search
+     * exception (500), here it is the client's error and answers 400.
+     */
+    private static CollapseContext resolveCollapse(
+        LanceFragmentQueryRequest request,
+        SortAndFormats sortAndFormats,
+        FieldDoc searchAfter,
+        QueryShardContext qsc
+    ) {
+        if (request.collapse() == null) {
+            return null;
+        }
+        if (searchAfter != null) {
+            SortField[] sort = sortAndFormats.sort.getSort();
+            if (sort.length != 1 || !request.collapse().getField().equals(sort[0].getField())) {
+                throw new IllegalArgumentException(
+                    "collapse field and sort field must be the same when use `collapse` in conjunction with `search_after`"
+                );
+            }
+        }
+        return request.collapse().build(qsc);
     }
 
     /**

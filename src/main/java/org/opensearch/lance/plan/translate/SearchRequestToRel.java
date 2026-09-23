@@ -136,14 +136,33 @@ public final class SearchRequestToRel {
      * collectors on the executor, so neither the page nor the aggregate
      * is pushed into the Lance scan for such a request: the query root
      * alone is planned and the collector and the aggregators run over
-     * it. Whether an aggregation tree plans into the scan is otherwise
-     * not a request element: the translator accepts or refuses the
-     * tree's shape and the cost model, fed the routing settings through
+     * it. {@code secondPass} says whether the request carries a
+     * {@code rescore} or a {@code collapse}: both work over the Lucene
+     * collector's page (the rescorers need its Lucene scores, the
+     * collapse is a collector of its own), so the page is never pushed
+     * into the Lance scan for such a request either. Whether an
+     * aggregation tree plans into the scan is otherwise not a request
+     * element: the translator accepts or refuses the tree's shape and
+     * the cost model, fed the routing settings through
      * {@code CostInputs}, chooses between the pushed scan and the Lucene
      * operator.
      */
     public record ExecutionShape(QueryBuilder query, QueryBuilder postFilter, List<SortBuilder<?>> sorts, Object[] searchAfter, int from,
-        int fetch, AggregatorFactories.Builder aggregations, boolean collectorKnobs) {
+        int fetch, AggregatorFactories.Builder aggregations, boolean collectorKnobs, boolean secondPass) {
+
+        /** A shape without a {@code rescore} or a {@code collapse}. */
+        public ExecutionShape(
+            QueryBuilder query,
+            QueryBuilder postFilter,
+            List<SortBuilder<?>> sorts,
+            Object[] searchAfter,
+            int from,
+            int fetch,
+            AggregatorFactories.Builder aggregations,
+            boolean collectorKnobs
+        ) {
+            this(query, postFilter, sorts, searchAfter, from, fetch, aggregations, collectorKnobs, false);
+        }
 
         /**
          * The shape the coordinator plans a search body under:
@@ -160,6 +179,8 @@ public final class SearchRequestToRel {
             int from = source == null || source.from() < 0 ? 0 : source.from();
             List<SortBuilder<?>> sorts = source == null || source.sorts() == null ? List.of() : source.sorts();
             boolean collectorKnobs = source != null && (source.minScore() != null || source.terminateAfter() > 0);
+            boolean secondPass = source != null
+                && (source.collapse() != null || (source.rescores() != null && !source.rescores().isEmpty()));
             return new ExecutionShape(
                 query,
                 source == null ? null : source.postFilter(),
@@ -168,7 +189,8 @@ public final class SearchRequestToRel {
                 from,
                 from + size,
                 source == null ? null : source.aggregations(),
-                collectorKnobs
+                collectorKnobs,
+                secondPass
             );
         }
 
@@ -270,6 +292,13 @@ public final class SearchRequestToRel {
             // No plan combines an aggregate with a page: the collector
             // and the aggregators both run over the planned query.
             return new ExecutionTranslation(root, "size [" + shape.fetch() + "] (only 0 with aggregations)");
+        }
+        if (shape.secondPass()) {
+            // A rescore re scores the Lucene scores of the first pass
+            // and a collapse is a collector of its own: neither has a
+            // page the Lance scan could produce, so the collector runs
+            // over the planned query.
+            return new ExecutionTranslation(root, "rescore or collapse (a second pass over the Lucene collector's page)");
         }
         try {
             return new ExecutionTranslation(
@@ -471,12 +500,6 @@ public final class SearchRequestToRel {
         }
         if (source.highlighter() != null) {
             reasons.add(ShardPathReason.HIGHLIGHT);
-        }
-        if (source.collapse() != null) {
-            reasons.add(ShardPathReason.COLLAPSE);
-        }
-        if (source.rescores() != null && !source.rescores().isEmpty()) {
-            reasons.add(ShardPathReason.RESCORE);
         }
         if (source.aggregations() != null && hasPipelineAggregation(source.aggregations())) {
             reasons.add(ShardPathReason.PIPELINE_AGG);

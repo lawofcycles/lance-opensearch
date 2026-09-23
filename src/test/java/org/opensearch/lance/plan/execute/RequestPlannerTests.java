@@ -128,6 +128,53 @@ public class RequestPlannerTests extends OpenSearchTestCase {
         assertEquals("rating = 5", plan.filterSql());
     }
 
+    public void testRescoreAndCollapseKeepThePageOnTheCollector() throws IOException {
+        // A rescore needs the Lucene scores of the first pass and a
+        // collapse is a collector of its own, so neither page is pushed
+        // into the Lance scan, whatever the sort; the query part still
+        // travels and the explain names the second pass.
+        for (String body : new String[] {
+            "{\"size\":10,\"query\":{\"term\":{\"rating\":5}},\"rescore\":{\"window_size\":20,\"query\":{\"rescore_query\":{\"match_all\":{}}}}}",
+            "{\"size\":10,\"query\":{\"term\":{\"rating\":5}},\"collapse\":{\"field\":\"category\"}}",
+            "{\"size\":10,\"query\":{\"term\":{\"rating\":5}},\"sort\":[{\"price\":\"desc\"}],\"collapse\":{\"field\":\"category\"}}" }) {
+            SearchSourceBuilder source = PlanTestFixtures.parse(body);
+            ExecutionShape shape = ExecutionShape.of(source, source.query(), true);
+            assertTrue(body, shape.secondPass());
+            RequestPlanner.Planned planned = RequestPlanner.plan(shape, PlanTestFixtures.model(), NO_EXCLUDED, PlanTestFixtures.factory());
+            assertEquals(body, FragmentPlan.Kind.LUCENE_TOPK, planned.plan().kind());
+            assertNull(body, planned.plan().topK());
+            assertEquals(body, "rating = 5", planned.plan().filterSql());
+            assertEquals(body, "rescore or collapse (a second pass over the Lucene collector's page)", planned.unplanned());
+        }
+        // The same bodies without the second pass push their page.
+        SearchSourceBuilder plain = PlanTestFixtures.parse("{\"size\":10,\"query\":{\"term\":{\"rating\":5}}}");
+        ExecutionShape plainShape = ExecutionShape.of(plain, plain.query(), true);
+        assertFalse(plainShape.secondPass());
+        assertEquals(
+            FragmentPlan.Kind.PUSHED_SCAN,
+            RequestPlanner.plan(plainShape, PlanTestFixtures.model(), NO_EXCLUDED, PlanTestFixtures.factory()).plan().kind()
+        );
+    }
+
+    public void testFullTextRescoreKeepsTheClauseWithoutAScanLimitPage() throws IOException {
+        // The first pass of a rescored full text page runs through the
+        // Lucene collector over the pushed clause; the clause travels,
+        // the page does not.
+        SearchSourceBuilder source = PlanTestFixtures.parse(
+            "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},"
+                + "\"rescore\":{\"window_size\":50,\"query\":{\"rescore_query\":{\"term\":{\"rating\":5}}}}}"
+        );
+        FragmentPlan plan = RequestPlanner.plan(
+            ExecutionShape.of(source, source.query(), true),
+            PlanTestFixtures.model(),
+            NO_EXCLUDED,
+            PlanTestFixtures.factory()
+        ).plan();
+        assertEquals(FragmentPlan.Kind.LUCENE_TOPK, plan.kind());
+        assertTrue(plan.lanceClause() instanceof LanceMatchQueryBuilder);
+        assertNull(plan.topK());
+    }
+
     public void testCountShapesCarryTheFilterOnly() throws IOException {
         FragmentPlan filtered = plan("{\"size\":0,\"query\":{\"term\":{\"rating\":5}}}").plan();
         assertEquals(FragmentPlan.Kind.LUCENE_COUNT, filtered.kind());
