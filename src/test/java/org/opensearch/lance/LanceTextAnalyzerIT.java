@@ -88,12 +88,14 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
                 extractIntPath(stockMatch, "hits", "total", "value")
             );
 
-            // Phrase order over the analyzed tokens: `dogs running`
-            // stems to `dog run`, consecutive only in row 0.
+            // Phrase order over the analyzed tokens: `running quickly`
+            // stems to `run quickli`, consecutive only in row 0 (`dogs
+            // running` would also hit row 1, whose tokens are `dog run
+            // across wide field`).
             String phrase = readAll(
                 postJson(
                     "/" + indexName + "/_search",
-                    "{\"size\":10,\"query\":{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"dogs running\"}}}"
+                    "{\"size\":10,\"query\":{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"running quickly\"}}}"
                 )
             );
             assertEquals("phrase must hit row 0 only: " + phrase, 1, extractIntPath(phrase, "hits", "total", "value"));
