@@ -6,7 +6,10 @@
 package org.opensearch.lance.execute;
 
 import java.nio.ByteBuffer;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Executor;
 
 import org.apache.arrow.vector.FieldVector;
@@ -29,7 +32,9 @@ import org.opensearch.lance.execute.GroupAggregationState.MetricBatch;
 import org.opensearch.lance.execute.GroupAggregationState.MetricState;
 import org.opensearch.lance.execute.GroupAggregationState.Partial;
 import org.opensearch.lance.execute.GroupAggregationState.TopKGroups;
+import org.opensearch.lance.plan.metadata.TableStatistics;
 import org.opensearch.lance.plan.substrait.LanceSubstraitProducer;
+import org.opensearch.lance.query.ScanAdmission;
 
 import static org.opensearch.lance.execute.ArrowRowValues.asLong;
 import static org.opensearch.lance.execute.ArrowRowValues.doubleKeyOf;
@@ -134,23 +139,87 @@ final class AggregateScanRunner {
         Executor executor,
         LanceCancellation cancellation
     ) throws Exception {
+        return run(dataset, fragmentIds, filterSql, parallelism, executor, cancellation, Long.MAX_VALUE);
+    }
+
+    /**
+     * As {@link #run(Dataset, List, String, int, Executor, LanceCancellation)},
+     * with {@code heapRoomBytes} the room left in the request breaker
+     * the admission gate compares the group state's heap with.
+     */
+    Scanned run(
+        Dataset dataset,
+        List<Integer> fragmentIds,
+        String filterSql,
+        int parallelism,
+        Executor executor,
+        LanceCancellation cancellation,
+        long heapRoomBytes
+    ) throws Exception {
         List<List<Integer>> fragmentGroups = FragmentGroupScan.splitContiguous(fragmentIds, parallelism);
+        // The parallel scans hold their read queues and decoded batches
+        // in native memory outside every breaker; the gate refuses the
+        // aggregate with 429 before the first scan when the node cannot
+        // hold the estimate. The rows are those of the fragments the
+        // scans cover, from the planner's table statistics (0, and an
+        // estimate of the batches alone, when they are unavailable).
+        ScanAdmission.admitAggregateScan(
+            dataset.uri(),
+            dataset,
+            filterSql,
+            fragmentGroups.size(),
+            scannedRows(dataset, fragmentIds),
+            resolved.projectedRowBytes(),
+            resolved.estimatedGroups(),
+            resolved.allMetrics().size(),
+            heapRoomBytes
+        );
         FragmentGroupScan scans = new FragmentGroupScan(executor, parallelism, cancellation);
         ScanPlan main = new ScanPlan(resolved.substrait(), null, 0d, 0d, 0d);
-        Partial merged = mergePartials(scans.runGroups(fragmentGroups, group -> scan(dataset, group, filterSql, main, cancellation)));
-        int scanCount = fragmentGroups.size();
-        for (Metric metric : resolved.allMetrics()) {
-            if (!metric.isPercentiles()) {
-                continue;
+        // The gate credits memory earlier scans left behind only while
+        // no gated scan runs.
+        ScanAdmission.scanStarted();
+        try {
+            Partial merged = mergePartials(scans.runGroups(fragmentGroups, group -> scan(dataset, group, filterSql, main, cancellation)));
+            int scanCount = fragmentGroups.size();
+            for (Metric metric : resolved.allMetrics()) {
+                if (!metric.isPercentiles()) {
+                    continue;
+                }
+                ScanPlan bins = binScan(metric, merged);
+                if (bins == null) {
+                    continue;
+                }
+                merged.merge(mergePartials(scans.runGroups(fragmentGroups, group -> scan(dataset, group, filterSql, bins, cancellation))));
+                scanCount += fragmentGroups.size();
             }
-            ScanPlan bins = binScan(metric, merged);
-            if (bins == null) {
-                continue;
-            }
-            merged.merge(mergePartials(scans.runGroups(fragmentGroups, group -> scan(dataset, group, filterSql, bins, cancellation))));
-            scanCount += fragmentGroups.size();
+            return new Scanned(merged, scanCount);
+        } finally {
+            ScanAdmission.scanFinished();
         }
-        return new Scanned(merged, scanCount);
+    }
+
+    /**
+     * Live rows of {@code fragmentIds} (null: every fragment) from the
+     * planner's statistics of {@code dataset}, 0 when they are not
+     * available.
+     */
+    private static long scannedRows(Dataset dataset, List<Integer> fragmentIds) {
+        Optional<TableStatistics> statistics = ScanAdmission.statisticsOf(dataset);
+        if (statistics.isEmpty()) {
+            return 0L;
+        }
+        if (fragmentIds == null) {
+            return statistics.get().rowCount();
+        }
+        Set<Integer> wanted = new HashSet<>(fragmentIds);
+        long rows = 0L;
+        for (TableStatistics.FragmentStats fragment : statistics.get().fragments()) {
+            if (wanted.contains(fragment.id())) {
+                rows += fragment.rows();
+            }
+        }
+        return rows;
     }
 
     /**

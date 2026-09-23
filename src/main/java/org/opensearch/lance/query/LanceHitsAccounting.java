@@ -6,6 +6,7 @@
 package org.opensearch.lance.query;
 
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.lucene.search.IndexSearcher;
@@ -56,6 +57,13 @@ public final class LanceHitsAccounting implements Releasable {
 
     private final CircuitBreaker breaker;
     private final AtomicLong reserved = new AtomicLong();
+    /**
+     * Whether the admission gate counted this request in flight (one
+     * of its gated paths was admitted with a non zero estimate); set by
+     * {@link #markAdmitted}, cleared by {@link #clearAdmitted} when the
+     * request ends, so a request counts once however many paths it runs.
+     */
+    private final AtomicBoolean admitted = new AtomicBoolean();
 
     public LanceHitsAccounting(CircuitBreaker breaker) {
         this.breaker = Objects.requireNonNull(breaker, "breaker must not be null");
@@ -111,11 +119,37 @@ public final class LanceHitsAccounting implements Releasable {
     }
 
     /**
+     * The room left in the request breaker for the heap terms the
+     * admission gate judges: its limit minus what it holds, or
+     * {@link Long#MAX_VALUE} for a breaker without a limit (the
+     * {@link NoopCircuitBreaker} of a searcher outside the fragment
+     * path).
+     */
+    public long breakerRoomBytes() {
+        long limit = breaker.getLimit();
+        if (limit <= 0L) {
+            return Long.MAX_VALUE;
+        }
+        return Math.max(0L, limit - breaker.getUsed());
+    }
+
+    /** Mark this request as counted in flight by the admission gate; {@code true} the first time. */
+    boolean markAdmitted() {
+        return admitted.compareAndSet(false, true);
+    }
+
+    /** Clear the in flight mark; {@code true} when it was set. */
+    boolean clearAdmitted() {
+        return admitted.getAndSet(false);
+    }
+
+    /**
      * Return every byte still reserved; the request is over. Also tells
-     * the admission gate that the request this thread admitted, if any,
-     * has ended ({@link FtsAdmission#requestEnded}): the executor closes
-     * the search context that owns this instance on the thread it ran
-     * the gate on, whether the request succeeded or failed.
+     * the admission gate that this request has ended
+     * ({@link ScanAdmission#requestEnded(LanceHitsAccounting)}): the
+     * gated paths of the request were counted in flight on this
+     * instance, and the executor closes the search context that owns it
+     * whether the request succeeded or failed.
      */
     @Override
     public void close() {
@@ -123,6 +157,6 @@ public final class LanceHitsAccounting implements Releasable {
         if (outstanding != 0L) {
             breaker.addWithoutBreaking(-outstanding);
         }
-        FtsAdmission.requestEnded();
+        ScanAdmission.requestEnded(this);
     }
 }

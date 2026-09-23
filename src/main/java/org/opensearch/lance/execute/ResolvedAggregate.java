@@ -9,6 +9,9 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.opensearch.lance.execute.AggregateSpecResolver.Column;
 import org.opensearch.lance.execute.AggregateSpecResolver.Composite;
 import org.opensearch.lance.execute.AggregateSpecResolver.KeyKind;
 import org.opensearch.lance.execute.AggregateSpecResolver.Level;
@@ -17,6 +20,7 @@ import org.opensearch.lance.execute.AggregateSpecResolver.Source;
 import org.opensearch.lance.execute.AggregateSpecResolver.TopKSpec;
 import org.opensearch.lance.execute.LanceAggregateResults.MetricSlot;
 import org.opensearch.lance.execute.LanceAggregateResults.PushedShape;
+import org.opensearch.lance.query.ScanAdmission;
 
 /**
  * What {@link AggregateSpecResolver#resolve} produced for one pushed
@@ -35,7 +39,51 @@ import org.opensearch.lance.execute.LanceAggregateResults.PushedShape;
  * result state.
  */
 record ResolvedAggregate(PushedShape shape, ByteBuffer substrait, List<Level> levels, Composite composite, List<Metric> topMetrics, List<
-    Metric> allMetrics, int percentilesBins, TopKSpec topK) {
+    Metric> allMetrics, int percentilesBins, TopKSpec topK, long estimatedGroups) {
+
+    /** As the full constructor with one estimated group, the metrics only and composite shapes' bound. */
+    ResolvedAggregate(
+        PushedShape shape,
+        ByteBuffer substrait,
+        List<Level> levels,
+        Composite composite,
+        List<Metric> topMetrics,
+        List<Metric> allMetrics,
+        int percentilesBins,
+        TopKSpec topK
+    ) {
+        this(shape, substrait, levels, composite, topMetrics, allMetrics, percentilesBins, topK, 1L);
+    }
+
+    /**
+     * Heap bytes per row of the scan's projection: the key columns and
+     * the measure columns as their Arrow types size them, for the
+     * admission gate's estimate of the batches in flight.
+     */
+    long projectedRowBytes() {
+        long bytes = 0L;
+        if (composite != null) {
+            for (Source source : composite.sources()) {
+                bytes += columnBytes(source.column());
+            }
+        } else {
+            for (Level level : levels) {
+                bytes += columnBytes(level.column());
+            }
+        }
+        for (Metric metric : allMetrics) {
+            bytes += columnBytes(metric.column());
+        }
+        // The count column every main scan row carries.
+        return bytes + Long.BYTES;
+    }
+
+    private static long columnBytes(Column column) {
+        if (column == null) {
+            return Long.BYTES;
+        }
+        return ScanAdmission.columnWidthBytes(new Field(column.name(), FieldType.nullable(column.type()), null));
+    }
 
     int keyCount() {
         return composite != null ? composite.sources().size() : levels.size();

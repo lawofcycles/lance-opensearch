@@ -33,7 +33,7 @@ import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.rel.physical.FanOutExec;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
 import org.opensearch.lance.plan.rel.physical.ShardPathFallbackExec;
-import org.opensearch.lance.query.FtsAdmission;
+import org.opensearch.lance.query.ScanAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.search.approximate.ApproximateScoreQuery;
 import org.opensearch.search.internal.ContextIndexSearcher;
@@ -732,11 +732,11 @@ public final class PlanExecutor {
         // The admission gate credits memory earlier scans left behind
         // only while no full text scan runs; a count-only scan reloads
         // the inverted index the same way the hits scan does.
-        FtsAdmission.scanStarted();
+        ScanAdmission.scanStarted();
         try {
             return countFtsHitsDirectlyUnguarded(dataset, fts, fragmentIds, limit, cancellation);
         } finally {
-            FtsAdmission.scanFinished();
+            ScanAdmission.scanFinished();
         }
     }
 

@@ -20,7 +20,7 @@ import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
-import org.opensearch.lance.query.FtsAdmission;
+import org.opensearch.lance.query.ScanAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
 
 /**
@@ -123,13 +123,14 @@ public final class LanceStatsCollector {
         int indexCacheShards = sizing == null ? 0 : sizing.shards();
         long indexCacheShardShare = sizing == null ? 0L : sizing.shardShareBytes();
         int probeLimit = LanceFtsQuery.subsetProbeLimit();
-        long admissionRejections = FtsAdmission.rejections();
-        long admissionLastEstimate = FtsAdmission.lastEstimateBytes();
+        Map<String, Long> admissionRejections = ScanAdmission.rejectionsByKind();
+        long admissionLastEstimate = ScanAdmission.lastEstimateBytes();
+        String admissionLastKind = ScanAdmission.lastKind();
         // One reading serves both figures, so the reported credit is the
         // one a decision made at the reported available memory would use.
-        long admissionAvailableReading = FtsAdmission.availablePhysicalMemoryBytes();
+        long admissionAvailableReading = ScanAdmission.availablePhysicalMemoryBytes();
         long admissionAvailable = Math.max(0L, admissionAvailableReading);
-        long admissionRetained = FtsAdmission.retainedCreditBytes(admissionAvailableReading);
+        long admissionRetained = ScanAdmission.retainedCreditBytes(admissionAvailableReading);
         long heapFallbackBytes = HeapFallbackStats.bytes();
         long heapFallbackRejections = HeapFallbackStats.rejections();
         String warmUpMode = indexWarmer == null ? "none" : indexWarmer.mode().settingValue();
@@ -174,6 +175,7 @@ public final class LanceStatsCollector {
                 probeLimit,
                 admissionRejections,
                 admissionLastEstimate,
+                admissionLastKind,
                 admissionAvailable,
                 admissionRetained,
                 warmUpMode,
@@ -211,6 +213,7 @@ public final class LanceStatsCollector {
             probeLimit,
             admissionRejections,
             admissionLastEstimate,
+            admissionLastKind,
             admissionAvailable,
             admissionRetained,
             warmUpMode,

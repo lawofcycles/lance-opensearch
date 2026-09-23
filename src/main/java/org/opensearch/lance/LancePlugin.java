@@ -50,7 +50,7 @@ import org.opensearch.lance.namespace.LanceNamespaceService;
 import org.opensearch.lance.namespace.TransportLanceNamespaceListAction;
 import org.opensearch.lance.plan.explain.LanceExplainAction;
 import org.opensearch.lance.plan.explain.TransportLanceExplainAction;
-import org.opensearch.lance.query.FtsAdmission;
+import org.opensearch.lance.query.ScanAdmission;
 import org.opensearch.lance.query.LanceFtsBoolQueryBuilder;
 import org.opensearch.lance.query.LanceFtsBoostQueryBuilder;
 import org.opensearch.lance.query.LanceFtsQuery;
@@ -442,28 +442,31 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
 
     /**
-     * Whether a full-text shape is admitted only when the node's free
-     * physical memory can hold the estimated native rebuild of the
-     * inverted index document set plus the scan buffers. {@code false}
-     * admits every shape, restoring the behaviour that let a large
-     * enough scan end the node with a kernel OOM kill. Dynamic. See
-     * {@link FtsAdmission}.
+     * Whether a native scan or index load of the fragment path is
+     * admitted only when the node's available physical memory can hold
+     * the gate's estimate of what Lance will allocate for it (a full
+     * text document set rebuild, a scalar or vector index load, the row
+     * addresses and buffers of a filter scan, the parallel scans of a
+     * pushed aggregate). {@code false} admits every shape, restoring
+     * the behaviour that let a large enough table end the node with a
+     * kernel OOM kill. Dynamic. See {@link ScanAdmission}.
      */
-    public static final Setting<Boolean> FTS_ADMISSION_ENABLED_SETTING = Setting.boolSetting(
-        "lance.fts.admission.enabled",
+    public static final Setting<Boolean> ADMISSION_ENABLED_SETTING = Setting.boolSetting(
+        "lance.admission.enabled",
         true,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
 
     /**
-     * Free physical memory the admission gate keeps out of reach of an
-     * unbounded full-text scan: the scan is admitted when its document
-     * set estimate fits {@code MemAvailable - headroom}. Dynamic.
+     * Available physical memory the admission gate keeps out of reach
+     * of a gated scan: the scan is admitted when its estimate fits
+     * {@code MemAvailable - headroom} plus the memory earlier admitted
+     * scans retained. Dynamic.
      */
-    public static final Setting<ByteSizeValue> FTS_ADMISSION_HEADROOM_SETTING = Setting.byteSizeSetting(
-        "lance.fts.admission.headroom",
-        FtsAdmission.DEFAULT_HEADROOM,
+    public static final Setting<ByteSizeValue> ADMISSION_HEADROOM_SETTING = Setting.byteSizeSetting(
+        "lance.admission.headroom",
+        ScanAdmission.DEFAULT_HEADROOM,
         ByteSizeValue.ZERO,
         new ByteSizeValue(Long.MAX_VALUE),
         Setting.Property.NodeScope,
@@ -471,29 +474,30 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
 
     /**
-     * Whether a bounded full-text top-k page is judged by the same
-     * admission estimate as the unbounded shapes. Lance rebuilds the
-     * inverted index document set for a bounded page just as it does
-     * for an unbounded scan when the index does not fit the index
-     * cache shard, so a large enough table can end the node with a
-     * kernel OOM kill even at {@code size: 10}. {@code false} restores
-     * the pass-through for bounded pages. Dynamic. See
-     * {@link FtsAdmission}.
+     * Whether a bounded top-k page (a full text page, a filter page
+     * with a scan limit) is judged by the same admission estimate as
+     * the unbounded shapes. Lance rebuilds the inverted index document
+     * set and materialises the scalar index result for a bounded page
+     * just as it does for an unbounded scan, so a large enough table
+     * can end the node with a kernel OOM kill even at {@code size: 10}.
+     * {@code false} restores the pass-through for bounded pages (a
+     * filter page is then judged on its limit). Dynamic. See
+     * {@link ScanAdmission}.
      */
-    public static final Setting<Boolean> FTS_ADMISSION_BOUNDED_SHAPES_GATED_SETTING = Setting.boolSetting(
-        "lance.fts.admission.bounded_shapes_gated",
+    public static final Setting<Boolean> ADMISSION_BOUNDED_SHAPES_GATED_SETTING = Setting.boolSetting(
+        "lance.admission.bounded_shapes_gated",
         true,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
 
     /**
-     * Test override of the index cache shard share the full-text
-     * admission gate compares its estimate with. Zero (the default)
-     * reads the installed Session's sizing. It exists so the
-     * integration tests can declare a small fixture table's inverted
-     * index as not fitting the cache; do not change it on a real node.
-     * Dynamic.
+     * Test override of the index cache shard share the admission gate
+     * compares its estimates with (an estimate at or below the share is
+     * zero). Zero (the default) reads the installed Session's sizing.
+     * It exists so the integration tests can declare a small fixture
+     * table's indexes and scans as not fitting the cache; do not change
+     * it on a real node. Dynamic.
      */
     public static final Setting<ByteSizeValue> TEST_INDEX_CACHE_SHARD_SHARE_SETTING = Setting.byteSizeSetting(
         "lance.test.index_cache_shard_share",
@@ -505,18 +509,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
 
     /**
-     * Test override of the available memory readings the full-text
-     * admission gate judges on: a list of byte sizes handed out one per
-     * reading, the last one repeating. Empty (the default) reads the
-     * kernel's {@code MemAvailable}. It exists so the integration tests
-     * can script what an admitted scan leaves behind (the reading at
-     * the admission and the reading at the scan's completion) and
-     * prove the retained credit; do not set it on a real node. Dynamic.
+     * Test override of the available memory readings the admission gate
+     * judges on: a list of byte sizes handed out one per reading, the
+     * last one repeating. Empty (the default) reads the kernel's
+     * {@code MemAvailable}. It exists so the integration tests can
+     * script what an admitted scan leaves behind (the reading at the
+     * admission and the reading at the scan's completion) and prove the
+     * retained credit; do not set it on a real node. Dynamic.
      */
-    public static final Setting<List<String>> TEST_FTS_ADMISSION_AVAILABLE_MEMORY_SETTING = Setting.listSetting(
-        "lance.test.fts_admission_available_memory",
+    public static final Setting<List<String>> TEST_ADMISSION_AVAILABLE_MEMORY_SETTING = Setting.listSetting(
+        "lance.test.admission_available_memory",
         List.of(),
-        raw -> ByteSizeValue.parseBytesSizeValue(raw, "lance.test.fts_admission_available_memory").getStringRep(),
+        raw -> ByteSizeValue.parseBytesSizeValue(raw, "lance.test.admission_available_memory").getStringRep(),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -776,11 +780,11 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             FTS_SUBSET_PROBE_LIMIT_SETTING,
             FTS_SUBSET_PROBE_RATIO_SETTING,
             FTS_SUBSET_PROBE_MIN_ROWS_SETTING,
-            FTS_ADMISSION_ENABLED_SETTING,
-            FTS_ADMISSION_HEADROOM_SETTING,
-            FTS_ADMISSION_BOUNDED_SHAPES_GATED_SETTING,
+            ADMISSION_ENABLED_SETTING,
+            ADMISSION_HEADROOM_SETTING,
+            ADMISSION_BOUNDED_SHAPES_GATED_SETTING,
             TEST_INDEX_CACHE_SHARD_SHARE_SETTING,
-            TEST_FTS_ADMISSION_AVAILABLE_MEMORY_SETTING,
+            TEST_ADMISSION_AVAILABLE_MEMORY_SETTING,
             AGGREGATION_PUSHDOWN_SETTING,
             AGGREGATION_PUSHDOWN_PARALLELISM_SETTING,
             AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING,
@@ -1106,21 +1110,23 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(FTS_SUBSET_PROBE_MIN_ROWS_SETTING, LanceFtsQuery::setSubsetProbeMinRows);
 
-        // The full-text admission gate reads its parameters from the
-        // same kind of static holder.
-        FtsAdmission.setEnabled(FTS_ADMISSION_ENABLED_SETTING.get(environment.settings()));
-        clusterService.getClusterSettings().addSettingsUpdateConsumer(FTS_ADMISSION_ENABLED_SETTING, FtsAdmission::setEnabled);
-        FtsAdmission.setHeadroom(FTS_ADMISSION_HEADROOM_SETTING.get(environment.settings()));
-        clusterService.getClusterSettings().addSettingsUpdateConsumer(FTS_ADMISSION_HEADROOM_SETTING, FtsAdmission::setHeadroom);
-        FtsAdmission.setBoundedShapesGated(FTS_ADMISSION_BOUNDED_SHAPES_GATED_SETTING.get(environment.settings()));
+        // The admission gate reads its parameters from the same kind of
+        // static holder, and its estimators read index sizes and
+        // cardinalities from the node's planner statistics cache.
+        ScanAdmission.setEnabled(ADMISSION_ENABLED_SETTING.get(environment.settings()));
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(ADMISSION_ENABLED_SETTING, ScanAdmission::setEnabled);
+        ScanAdmission.setHeadroom(ADMISSION_HEADROOM_SETTING.get(environment.settings()));
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(ADMISSION_HEADROOM_SETTING, ScanAdmission::setHeadroom);
+        ScanAdmission.setBoundedShapesGated(ADMISSION_BOUNDED_SHAPES_GATED_SETTING.get(environment.settings()));
         clusterService.getClusterSettings()
-            .addSettingsUpdateConsumer(FTS_ADMISSION_BOUNDED_SHAPES_GATED_SETTING, FtsAdmission::setBoundedShapesGated);
-        FtsAdmission.setIndexCacheShardShareOverride(TEST_INDEX_CACHE_SHARD_SHARE_SETTING.get(environment.settings()));
+            .addSettingsUpdateConsumer(ADMISSION_BOUNDED_SHAPES_GATED_SETTING, ScanAdmission::setBoundedShapesGated);
+        ScanAdmission.setIndexCacheShardShareOverride(TEST_INDEX_CACHE_SHARD_SHARE_SETTING.get(environment.settings()));
         clusterService.getClusterSettings()
-            .addSettingsUpdateConsumer(TEST_INDEX_CACHE_SHARD_SHARE_SETTING, FtsAdmission::setIndexCacheShardShareOverride);
-        FtsAdmission.setAvailableMemoryOverride(TEST_FTS_ADMISSION_AVAILABLE_MEMORY_SETTING.get(environment.settings()));
+            .addSettingsUpdateConsumer(TEST_INDEX_CACHE_SHARD_SHARE_SETTING, ScanAdmission::setIndexCacheShardShareOverride);
+        ScanAdmission.setAvailableMemoryOverride(TEST_ADMISSION_AVAILABLE_MEMORY_SETTING.get(environment.settings()));
         clusterService.getClusterSettings()
-            .addSettingsUpdateConsumer(TEST_FTS_ADMISSION_AVAILABLE_MEMORY_SETTING, FtsAdmission::setAvailableMemoryOverride);
+            .addSettingsUpdateConsumer(TEST_ADMISSION_AVAILABLE_MEMORY_SETTING, ScanAdmission::setAvailableMemoryOverride);
+        ScanAdmission.setTableStatistics(warmCache.tableStatistics());
 
         // The percentiles bin count and the terms top-k slack are read
         // by the aggregation pushdown when it plans a request, from the
@@ -1229,6 +1235,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // cache allocator before the Session goes away.
         LanceWarmCache cache = warmCache;
         if (cache != null) {
+            ScanAdmission.setTableStatistics(null);
             cache.close();
             warmCache = null;
         }

@@ -666,7 +666,7 @@ public final class LanceFtsQuery extends Query {
             // behind only while no scan runs, and samples what this
             // scan leaves behind when it is the admitted one; both
             // hang off these two calls.
-            FtsAdmission.scanStarted();
+            ScanAdmission.scanStarted();
             try {
                 if (scanLimit != SCAN_LIMIT_UNBOUNDED) {
                     // Top k over the whole table; each executor keeps its
@@ -710,7 +710,7 @@ public final class LanceFtsQuery extends Query {
                     complete = true;
                 }
             } finally {
-                FtsAdmission.scanFinished();
+                ScanAdmission.scanFinished();
             }
             ShardScan fresh = new ShardScan(hits, complete, List.copyOf(issued));
             // Whichever thread wins the CAS installs the result; losers

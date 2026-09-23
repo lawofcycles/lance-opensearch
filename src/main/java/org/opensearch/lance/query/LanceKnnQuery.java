@@ -109,6 +109,26 @@ public final class LanceKnnQuery extends Query {
         this.scanFilterSql = scanFilterSql;
     }
 
+    /** The vector column the nearest scan searches. */
+    public String column() {
+        return column;
+    }
+
+    /** The number of nearest rows requested. */
+    public int k() {
+        return k;
+    }
+
+    /** The partitions the nearest scan probes, or {@code null} for Lance's default. */
+    public Integer nprobes() {
+        return nprobes;
+    }
+
+    /** The refine factor of the nearest scan, or {@code null} for none. */
+    public Integer refineFactor() {
+        return refineFactor;
+    }
+
     /**
      * Return a copy of this query whose Lance nearest scan is
      * prefiltered by {@code newScanFilterSql} ({@code null} removes the
@@ -270,8 +290,21 @@ public final class LanceKnnQuery extends Query {
             // First scan on this shard is where Lance loads the vector
             // index into native memory. Refuse to start it if the
             // breaker has already tripped so we do not push the cache
-            // past its budget mid-query.
+            // past its budget mid-query, and refuse it with 429 when the
+            // admission gate's estimate of the partition loads does not
+            // fit the node's available memory (the loads of an index
+            // heavier than the cache shard land outside every breaker).
             LanceCircuitBreaker.checkAndTrip("lance_knn_query");
+            ScanAdmission.admitVectorSearch(
+                leaf.dataset().uri(),
+                leaf.dataset(),
+                column,
+                k,
+                nprobes == null ? 0 : nprobes,
+                refineFactor == null ? 0 : refineFactor,
+                ScanAdmission.vectorDimension(leaf.dataset().getSchema().getFields(), column),
+                accounting
+            );
             Map<Integer, LanceFragmentHits> fresh = new HashMap<>();
             org.lance.ipc.Query.Builder qb = new org.lance.ipc.Query.Builder().setColumn(column).setKey(vector).setK(k);
             if (nprobes != null) {
@@ -302,6 +335,9 @@ public final class LanceKnnQuery extends Query {
                 options.filter(scanFilterSql);
                 options.prefilter(true);
             }
+            // The gate credits memory earlier scans left behind only
+            // while no gated scan runs.
+            ScanAdmission.scanStarted();
             try (LanceScanner scanner = leaf.dataset().newScan(options.build()); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     cancellation.checkCancelled();
@@ -321,6 +357,8 @@ public final class LanceKnnQuery extends Query {
                 throw e;
             } catch (Exception e) {
                 throw new IOException(e);
+            } finally {
+                ScanAdmission.scanFinished();
             }
             // Whichever thread wins the CAS installs the map; losers
             // reuse it and drop the buffers of their own scan.

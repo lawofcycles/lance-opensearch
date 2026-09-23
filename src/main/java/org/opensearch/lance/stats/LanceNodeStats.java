@@ -19,7 +19,7 @@ import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.ToXContentFragment;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceMappingMeta;
-import org.opensearch.lance.query.FtsAdmission;
+import org.opensearch.lance.query.ScanAdmission;
 
 /**
  * One node's view of the plugin's caches at the moment
@@ -31,8 +31,12 @@ import org.opensearch.lance.query.FtsAdmission;
  * counter or gauge read from the owning component.
  *
  * <p>Rendered as the {@code snapshots}, {@code column_store},
- * {@code native_memory}, {@code fts}, {@code warm_up}, {@code plan} and
- * {@code indices} objects of one node in {@code GET /_lance/stats}.
+ * {@code native_memory}, {@code fts}, {@code admission}, {@code warm_up},
+ * {@code plan} and {@code indices} objects of one node in
+ * {@code GET /_lance/stats}. {@code admission} carries the admission
+ * gate's settings in force, its rejections per kind, the estimate and
+ * kind of its last decision, the node's available memory and the memory
+ * earlier admitted scans retained;
  * {@code warm_up} carries the mode in force and one
  * {@link LanceWarmUpStatus} per Lance-backed index the node has seen
  * since it started; {@code plan.statistics} the planner's table
@@ -70,10 +74,17 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     private final long indexCacheShardShareBytes;
 
     private final int ftsSubsetProbeLimit;
-    private final long ftsAdmissionRejections;
-    private final long ftsAdmissionLastEstimateBytes;
-    private final long ftsAdmissionAvailableBytes;
-    private final long ftsAdmissionRetainedBytes;
+    /**
+     * Scans the node's admission gate refused since it started, keyed by
+     * kind ({@code fts}, {@code scalar_index}, {@code vector_index},
+     * {@code filter_scan}, {@code aggregate_scan}, {@code column_load});
+     * every kind present, zero when it never refused.
+     */
+    private final Map<String, Long> admissionRejections;
+    private final long admissionLastEstimateBytes;
+    private final String admissionLastKind;
+    private final long admissionAvailableBytes;
+    private final long admissionRetainedBytes;
 
     private final String warmUpMode;
     private final List<LanceWarmUpStatus> warmUps;
@@ -217,8 +228,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             indexCacheShards,
             indexCacheShardShareBytes,
             ftsSubsetProbeLimit,
+            ScanAdmission.rejectionsByKind(),
             0L,
-            0L,
+            "none",
             0L,
             0L,
             "none",
@@ -254,10 +266,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         int indexCacheShards,
         long indexCacheShardShareBytes,
         int ftsSubsetProbeLimit,
-        long ftsAdmissionRejections,
-        long ftsAdmissionLastEstimateBytes,
-        long ftsAdmissionAvailableBytes,
-        long ftsAdmissionRetainedBytes,
+        Map<String, Long> admissionRejections,
+        long admissionLastEstimateBytes,
+        String admissionLastKind,
+        long admissionAvailableBytes,
+        long admissionRetainedBytes,
         String warmUpMode,
         List<LanceWarmUpStatus> warmUps,
         List<IndexReaderStats> indices,
@@ -288,10 +301,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.indexCacheShards = indexCacheShards;
         this.indexCacheShardShareBytes = indexCacheShardShareBytes;
         this.ftsSubsetProbeLimit = ftsSubsetProbeLimit;
-        this.ftsAdmissionRejections = ftsAdmissionRejections;
-        this.ftsAdmissionLastEstimateBytes = ftsAdmissionLastEstimateBytes;
-        this.ftsAdmissionAvailableBytes = ftsAdmissionAvailableBytes;
-        this.ftsAdmissionRetainedBytes = ftsAdmissionRetainedBytes;
+        this.admissionRejections = Collections.unmodifiableMap(new LinkedHashMap<>(admissionRejections));
+        this.admissionLastEstimateBytes = admissionLastEstimateBytes;
+        this.admissionLastKind = admissionLastKind;
+        this.admissionAvailableBytes = admissionAvailableBytes;
+        this.admissionRetainedBytes = admissionRetainedBytes;
         this.warmUpMode = warmUpMode;
         this.warmUps = List.copyOf(warmUps);
         this.indices = List.copyOf(indices);
@@ -324,10 +338,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.indexCacheShards = in.readVInt();
         this.indexCacheShardShareBytes = in.readVLong();
         this.ftsSubsetProbeLimit = in.readVInt();
-        this.ftsAdmissionRejections = in.readVLong();
-        this.ftsAdmissionLastEstimateBytes = in.readVLong();
-        this.ftsAdmissionAvailableBytes = in.readVLong();
-        this.ftsAdmissionRetainedBytes = in.readVLong();
+        this.admissionRejections = Collections.unmodifiableMap(in.readOrderedMap(StreamInput::readString, StreamInput::readVLong));
+        this.admissionLastEstimateBytes = in.readVLong();
+        this.admissionLastKind = in.readString();
+        this.admissionAvailableBytes = in.readVLong();
+        this.admissionRetainedBytes = in.readVLong();
         this.warmUpMode = in.readString();
         int warmUpCount = in.readVInt();
         List<LanceWarmUpStatus> read = new ArrayList<>(warmUpCount);
@@ -366,10 +381,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         out.writeVInt(indexCacheShards);
         out.writeVLong(indexCacheShardShareBytes);
         out.writeVInt(ftsSubsetProbeLimit);
-        out.writeVLong(ftsAdmissionRejections);
-        out.writeVLong(ftsAdmissionLastEstimateBytes);
-        out.writeVLong(ftsAdmissionAvailableBytes);
-        out.writeVLong(ftsAdmissionRetainedBytes);
+        out.writeMap(admissionRejections, StreamOutput::writeString, StreamOutput::writeVLong);
+        out.writeVLong(admissionLastEstimateBytes);
+        out.writeString(admissionLastKind);
+        out.writeVLong(admissionAvailableBytes);
+        out.writeVLong(admissionRetainedBytes);
         out.writeString(warmUpMode);
         out.writeVInt(warmUps.size());
         for (LanceWarmUpStatus warmUp : warmUps) {
@@ -417,13 +433,19 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
         builder.startObject("fts");
         builder.field("subset_probe_limit", ftsSubsetProbeLimit);
+        builder.endObject();
+
         builder.startObject("admission");
-        builder.field("enabled", FtsAdmission.enabled());
-        builder.field("headroom_bytes", FtsAdmission.headroomBytes());
-        builder.field("rejections", ftsAdmissionRejections);
-        builder.field("last_estimate_bytes", ftsAdmissionLastEstimateBytes);
-        builder.field("available_bytes", ftsAdmissionAvailableBytes);
-        builder.field("retained_bytes", ftsAdmissionRetainedBytes);
+        builder.field("enabled", ScanAdmission.enabled());
+        builder.field("headroom_bytes", ScanAdmission.headroomBytes());
+        builder.field("available_bytes", admissionAvailableBytes);
+        builder.field("retained_bytes", admissionRetainedBytes);
+        builder.field("last_estimate_bytes", admissionLastEstimateBytes);
+        builder.field("last_kind", admissionLastKind);
+        builder.startObject("rejections");
+        for (Map.Entry<String, Long> rejection : admissionRejections.entrySet()) {
+            builder.field(rejection.getKey(), rejection.getValue());
+        }
         builder.endObject();
         builder.endObject();
 
@@ -601,14 +623,28 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         return ftsSubsetProbeLimit;
     }
 
-    /** Unbounded full-text scans this node's admission gate refused since it started. */
-    public long ftsAdmissionRejections() {
-        return ftsAdmissionRejections;
+    /** Scans this node's admission gate refused since it started, per kind; every kind present. */
+    public Map<String, Long> admissionRejections() {
+        return admissionRejections;
     }
 
-    /** Document set estimate of the node's last admission decision, admitted or not. */
-    public long ftsAdmissionLastEstimateBytes() {
-        return ftsAdmissionLastEstimateBytes;
+    /** Refusals over every kind. */
+    public long admissionRejectionsTotal() {
+        long total = 0L;
+        for (long count : admissionRejections.values()) {
+            total += count;
+        }
+        return total;
+    }
+
+    /** Estimate of the node's last admission decision, admitted or not. */
+    public long admissionLastEstimateBytes() {
+        return admissionLastEstimateBytes;
+    }
+
+    /** Kind of the node's last admission decision, {@code none} before the first. */
+    public String admissionLastKind() {
+        return admissionLastKind;
     }
 
     /**
@@ -616,17 +652,17 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * ({@code MemAvailable} on Linux, the free physical memory elsewhere),
      * before the headroom is subtracted.
      */
-    public long ftsAdmissionAvailableBytes() {
-        return ftsAdmissionAvailableBytes;
+    public long admissionAvailableBytes() {
+        return admissionAvailableBytes;
     }
 
     /**
-     * Memory earlier admitted full text scans left in the process that
-     * the node's next admission decision adds to the available memory
-     * (zero while a gated request is in flight or a full text scan runs).
+     * Memory earlier admitted scans left in the process that the node's
+     * next admission decision adds to the available memory (zero while a
+     * gated request is in flight or a gated scan runs).
      */
-    public long ftsAdmissionRetainedBytes() {
-        return ftsAdmissionRetainedBytes;
+    public long admissionRetainedBytes() {
+        return admissionRetainedBytes;
     }
 
     /** Value of {@code lance.attach.warm_indexes} on the node. */
@@ -673,10 +709,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && indexCacheShards == other.indexCacheShards
             && indexCacheShardShareBytes == other.indexCacheShardShareBytes
             && ftsSubsetProbeLimit == other.ftsSubsetProbeLimit
-            && ftsAdmissionRejections == other.ftsAdmissionRejections
-            && ftsAdmissionLastEstimateBytes == other.ftsAdmissionLastEstimateBytes
-            && ftsAdmissionAvailableBytes == other.ftsAdmissionAvailableBytes
-            && ftsAdmissionRetainedBytes == other.ftsAdmissionRetainedBytes
+            && admissionRejections.equals(other.admissionRejections)
+            && admissionLastEstimateBytes == other.admissionLastEstimateBytes
+            && admissionLastKind.equals(other.admissionLastKind)
+            && admissionAvailableBytes == other.admissionAvailableBytes
+            && admissionRetainedBytes == other.admissionRetainedBytes
             && warmUpMode.equals(other.warmUpMode)
             && warmUps.equals(other.warmUps)
             && indices.equals(other.indices)
@@ -711,10 +748,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             indexCacheShards,
             indexCacheShardShareBytes,
             ftsSubsetProbeLimit,
-            ftsAdmissionRejections,
-            ftsAdmissionLastEstimateBytes,
-            ftsAdmissionAvailableBytes,
-            ftsAdmissionRetainedBytes,
+            admissionRejections,
+            admissionLastEstimateBytes,
+            admissionLastKind,
+            admissionAvailableBytes,
+            admissionRetainedBytes,
             warmUpMode,
             warmUps,
             indices,
