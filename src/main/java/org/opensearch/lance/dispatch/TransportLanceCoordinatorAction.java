@@ -560,16 +560,26 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * bare scan. The per-node plan detail below the fan-out is owned
      * by the fragment executors, which plan their own requests
      * against the open dataset; the coordinator's tree mirrors the
-     * distribution and the reduce, which is what it executes.
+     * distribution and the reduce, which is what it executes. A
+     * schema with a column no Calcite type spells (a geo_point over
+     * FixedSizeList) refuses the scan's row type; a one column
+     * values placeholder stands in for the scan then, because the
+     * per-node subtree carries no execution detail here anyway.
      */
     private RelNode coordinatorPlan(LanceSchemas.IndexModel model, FragmentQuerySpec spec, int fanOut) {
         boolean hasAggregations = spec.aggregations() != null && !spec.aggregations().getAggregatorFactories().isEmpty();
         MergeExec.ReduceKind reduceKind = hasAggregations ? MergeExec.ReduceKind.AGGREGATE_INTERNAL
             : spec.effectiveSize() > 0 ? MergeExec.ReduceKind.HITS_TOP_K
             : MergeExec.ReduceKind.COUNT_SUM;
-        RelBuilder relBuilder = plannerFactory.relBuilder(model.schema());
-        relBuilder.scan(LancePlannerFactory.SCHEMA_NAME, model.indexName());
-        return SearchRequestToRel.withCoordinatorLayer(relBuilder.build(), reduceKind, fanOut);
+        RelNode perNode;
+        try {
+            RelBuilder relBuilder = plannerFactory.relBuilder(model.schema());
+            relBuilder.scan(LancePlannerFactory.SCHEMA_NAME, model.indexName());
+            perNode = relBuilder.build();
+        } catch (UnsupportedOperationException unsupportedColumn) {
+            perNode = plannerFactory.relBuilder(model.schema()).values(new String[] { "row" }, 0).build();
+        }
+        return SearchRequestToRel.withCoordinatorLayer(perNode, reduceKind, fanOut);
     }
 
     /**
