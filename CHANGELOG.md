@@ -2,6 +2,8 @@
 
 Inspired by [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+Unreleased entries are recorded as fragments under [`changelog/unreleased/`](changelog/unreleased/README.md), one file per pull request, rather than written into this file. At release time `python3 scripts/assemble-changelog.py --version X.Y.Z --date YYYY-MM-DD` concatenates them into a new release block below `## [Unreleased]`.
+
 ## [Unreleased]
 
 ### Features
