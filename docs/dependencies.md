@@ -232,8 +232,8 @@ shape it.
 - The core policy grants every codebase, plugin jars included, read, write
   and delete under `path.data`, `path.logs`, `path.repo` and
   `java.io.tmpdir`. The JNI extraction (both loaders write a temporary
-  file under `java.io.tmpdir`), the `node_local` clone directories under
-  `path.data` and the text analyzer backfill spool need no plugin grant.
+  file under `java.io.tmpdir`) and the `node_local` clone directories under
+  `path.data` need no plugin grant.
 - The Lance native library reads and writes table files and opens object
   store connections itself, outside the JVM. The agent never sees those
   operations, so no `FilePermission` in the plugin policy widens or

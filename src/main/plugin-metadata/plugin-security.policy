@@ -4,8 +4,8 @@
 // Java agent, and the agent checks every protection domain on the stack up
 // to the nearest AccessController.doPrivileged frame. The core policy already
 // grants every codebase read, write and delete under path.data, path.logs,
-// path.repo and java.io.tmpdir, so the Lance JNI extraction, the node_local
-// clone directories and the text_analyzer backfill spool need no grant here.
+// path.repo and java.io.tmpdir, so the Lance JNI extraction and the
+// node_local clone directories need no grant here.
 // The Lance native library reads and writes table files itself, outside the
 // JVM, so the agent never sees those operations; the lance.allowed_table_roots
 // setting is what limits which paths a table may be opened from.
