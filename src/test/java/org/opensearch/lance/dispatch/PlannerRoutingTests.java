@@ -8,7 +8,6 @@ package org.opensearch.lance.dispatch;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.nio.file.Path;
-import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -51,9 +50,7 @@ import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.plan.rel.PushedOperation;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
-import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.plugins.Plugin;
-import org.opensearch.script.Script;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregationBuilders;
 import org.opensearch.search.aggregations.AggregatorFactories;
@@ -61,12 +58,10 @@ import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.InternalMultiBucketAggregation;
-import org.opensearch.search.aggregations.PipelineAggregatorBuilders;
 import org.opensearch.search.aggregations.bucket.InternalSingleBucketAggregation;
 import org.opensearch.search.aggregations.bucket.composite.CompositeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.composite.CompositeValuesSourceBuilder;
 import org.opensearch.search.aggregations.bucket.composite.DateHistogramValuesSourceBuilder;
-import org.opensearch.search.aggregations.bucket.composite.HistogramValuesSourceBuilder;
 import org.opensearch.search.aggregations.bucket.composite.InternalComposite;
 import org.opensearch.search.aggregations.bucket.composite.TermsValuesSourceBuilder;
 import org.opensearch.search.aggregations.bucket.filter.FiltersAggregator;
@@ -74,7 +69,6 @@ import org.opensearch.search.aggregations.bucket.filter.InternalFilter;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
 import org.opensearch.search.aggregations.bucket.histogram.InternalHistogram;
-import org.opensearch.search.aggregations.bucket.terms.IncludeExclude;
 import org.opensearch.search.aggregations.bucket.terms.LongTerms;
 import org.opensearch.search.aggregations.bucket.terms.StringTerms;
 import org.opensearch.search.aggregations.metrics.InternalAvg;
@@ -82,7 +76,6 @@ import org.opensearch.search.aggregations.metrics.InternalCardinality;
 import org.opensearch.search.aggregations.metrics.InternalTDigestPercentileRanks;
 import org.opensearch.search.aggregations.metrics.InternalTDigestPercentiles;
 import org.opensearch.search.aggregations.metrics.Percentile;
-import org.opensearch.search.aggregations.metrics.PercentilesMethod;
 import org.opensearch.search.sort.SortOrder;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
 import org.opensearch.threadpool.ThreadPool;
@@ -117,309 +110,6 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
         return Settings.builder().put(super.nodeSettings()).put(LancePlugin.FRAGMENT_PATH_SLICES_SETTING.getKey(), 1).build();
     }
 
-    public void testStructuralAllowList() {
-        assertTrue(candidate(AggregationBuilders.sum("s").field("rating"), AggregationBuilders.avg("a").field("rating")));
-        assertTrue(
-            candidate(AggregationBuilders.terms("c").field("category").subAggregation(AggregationBuilders.max("m").field("rating")))
-        );
-        assertTrue(candidate(AggregationBuilders.terms("c").field("category").order(BucketOrder.key(false))));
-        assertTrue(candidate(AggregationBuilders.histogram("h").field("rating").interval(100)));
-        assertTrue(candidate(AggregationBuilders.dateHistogram("d").field("ts").fixedInterval(DateHistogramInterval.days(30))));
-        assertTrue(candidate(AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(DateHistogramInterval.MONTH)));
-        assertTrue(candidate(AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(new DateHistogramInterval("1w"))));
-        assertTrue(candidate(AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(DateHistogramInterval.QUARTER)));
-        assertTrue(candidate(AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(DateHistogramInterval.SECOND)));
-
-        assertFalse("no aggregations", LanceAggregationSupport.isPushdownCandidate(null));
-        assertFalse("no aggregations", LanceAggregationSupport.isPushdownCandidate(AggregatorFactories.builder()));
-        assertFalse(
-            "two buckets",
-            candidate(AggregationBuilders.terms("c").field("category"), AggregationBuilders.terms("f").field("flag"))
-        );
-        // Nested buckets: one chain of up to three levels, metrics beside
-        // the nested bucket at every level.
-        assertTrue(
-            "bucket under bucket",
-            candidate(AggregationBuilders.terms("c").field("category").subAggregation(AggregationBuilders.terms("t").field("tags")))
-        );
-        assertTrue(
-            "three levels with metrics at each",
-            candidate(
-                AggregationBuilders.terms("c")
-                    .field("category")
-                    .subAggregation(AggregationBuilders.avg("a").field("rating"))
-                    .subAggregation(
-                        AggregationBuilders.terms("f")
-                            .field("flag")
-                            .subAggregation(AggregationBuilders.max("m").field("id"))
-                            .subAggregation(
-                                AggregationBuilders.histogram("h")
-                                    .field("rating")
-                                    .interval(100)
-                                    .subAggregation(AggregationBuilders.sum("s").field("id"))
-                            )
-                    )
-            )
-        );
-        assertTrue(
-            "date_histogram under terms",
-            candidate(
-                AggregationBuilders.terms("c")
-                    .field("category")
-                    .subAggregation(AggregationBuilders.dateHistogram("d").field("ts").fixedInterval(DateHistogramInterval.days(30)))
-            )
-        );
-        assertFalse(
-            "four levels",
-            candidate(
-                AggregationBuilders.terms("a")
-                    .field("category")
-                    .subAggregation(
-                        AggregationBuilders.terms("b")
-                            .field("flag")
-                            .subAggregation(
-                                AggregationBuilders.terms("c")
-                                    .field("rating")
-                                    .subAggregation(AggregationBuilders.histogram("d").field("id").interval(10))
-                            )
-                    )
-            )
-        );
-        assertFalse(
-            "two nested buckets side by side",
-            candidate(
-                AggregationBuilders.terms("c")
-                    .field("category")
-                    .subAggregation(AggregationBuilders.terms("f").field("flag"))
-                    .subAggregation(AggregationBuilders.terms("r").field("rating"))
-            )
-        );
-        assertFalse(
-            "nested bucket outside the allow list",
-            candidate(
-                AggregationBuilders.terms("c")
-                    .field("category")
-                    .subAggregation(AggregationBuilders.terms("r").field("rating").order(BucketOrder.count(true)))
-            )
-        );
-        assertFalse(
-            "nested bucket with a pipeline",
-            candidate(
-                AggregationBuilders.terms("c")
-                    .field("category")
-                    .subAggregation(
-                        AggregationBuilders.terms("r")
-                            .field("rating")
-                            .subAggregation(AggregationBuilders.sum("s").field("id"))
-                            .subAggregation(PipelineAggregatorBuilders.bucketScript("bs", Map.of("x", "s"), new Script("params.x")))
-                    )
-            )
-        );
-        // Composite: terms and fixed interval date_histogram sources,
-        // metric children only.
-        assertTrue(
-            "composite over terms sources",
-            candidate(
-                composite("cr", new TermsValuesSourceBuilder("c").field("category"), new TermsValuesSourceBuilder("r").field("rating"))
-                    .subAggregation(AggregationBuilders.avg("a").field("id"))
-            )
-        );
-        assertTrue(
-            "composite with a descending source and a date source",
-            candidate(
-                composite(
-                    "cd",
-                    new TermsValuesSourceBuilder("c").field("category").order(SortOrder.DESC),
-                    new DateHistogramValuesSourceBuilder("d").field("ts").fixedInterval(DateHistogramInterval.days(30))
-                ).size(5).aggregateAfter(Map.of("c", "c1", "d", 1704067200000L))
-            )
-        );
-        assertFalse(
-            "composite missing_bucket",
-            candidate(composite("c", new TermsValuesSourceBuilder("c").field("category").missingBucket(true)))
-        );
-        assertFalse(
-            "composite calendar interval",
-            candidate(composite("d", new DateHistogramValuesSourceBuilder("d").field("ts").calendarInterval(DateHistogramInterval.MONTH)))
-        );
-        assertFalse(
-            "composite date source with time zone",
-            candidate(
-                composite(
-                    "d",
-                    new DateHistogramValuesSourceBuilder("d").field("ts")
-                        .fixedInterval(DateHistogramInterval.days(30))
-                        .timeZone(ZoneId.of("+09:00"))
-                )
-            )
-        );
-        assertFalse(
-            "composite histogram source",
-            candidate(composite("h", new HistogramValuesSourceBuilder("h").field("rating").interval(100)))
-        );
-        assertFalse(
-            "composite script source",
-            candidate(composite("s", new TermsValuesSourceBuilder("s").script(new Script("doc['rating'].value"))))
-        );
-        assertFalse(
-            "composite with a bucket child",
-            candidate(
-                composite("c", new TermsValuesSourceBuilder("c").field("category")).subAggregation(
-                    AggregationBuilders.terms("r").field("rating")
-                )
-            )
-        );
-        assertFalse(
-            "composite under a bucket",
-            candidate(
-                AggregationBuilders.terms("c")
-                    .field("category")
-                    .subAggregation(composite("r", new TermsValuesSourceBuilder("r").field("rating")))
-            )
-        );
-        assertFalse("script", candidate(AggregationBuilders.sum("s").script(new Script("doc['rating'].value"))));
-        assertFalse("missing", candidate(AggregationBuilders.sum("s").field("rating").missing(0)));
-        assertFalse("count asc", candidate(AggregationBuilders.terms("c").field("category").order(BucketOrder.count(true))));
-        assertTrue(
-            "order by sub aggregation",
-            candidate(
-                AggregationBuilders.terms("c")
-                    .field("category")
-                    .order(BucketOrder.aggregation("a", false))
-                    .subAggregation(AggregationBuilders.avg("a").field("rating"))
-            )
-        );
-        assertFalse(
-            "compound order beyond the key tie breaker",
-            candidate(
-                AggregationBuilders.terms("c")
-                    .field("category")
-                    .order(List.of(BucketOrder.aggregation("a", false), BucketOrder.count(false)))
-                    .subAggregation(AggregationBuilders.avg("a").field("rating"))
-            )
-        );
-        assertFalse("min_doc_count 0", candidate(AggregationBuilders.terms("c").field("category").minDocCount(0)));
-        assertFalse("include", candidate(AggregationBuilders.terms("c").field("category").includeExclude(new IncludeExclude("c1", null))));
-        assertFalse("histogram offset", candidate(AggregationBuilders.histogram("h").field("rating").interval(100).offset(5)));
-        assertFalse(
-            "histogram extended bounds",
-            candidate(AggregationBuilders.histogram("h").field("rating").interval(100).extendedBounds(0, 2000))
-        );
-        assertFalse(
-            "calendar interval with time zone",
-            candidate(
-                AggregationBuilders.dateHistogram("d")
-                    .field("ts")
-                    .calendarInterval(DateHistogramInterval.MONTH)
-                    .timeZone(ZoneId.of("+09:00"))
-            )
-        );
-        assertFalse(
-            "calendar interval with offset",
-            candidate(AggregationBuilders.dateHistogram("d").field("ts").calendarInterval(DateHistogramInterval.DAY).offset("1h"))
-        );
-        assertFalse(
-            "time zone",
-            candidate(
-                AggregationBuilders.dateHistogram("d")
-                    .field("ts")
-                    .fixedInterval(DateHistogramInterval.days(30))
-                    .timeZone(ZoneId.of("+09:00"))
-            )
-        );
-        assertFalse(
-            "pipeline aggregation",
-            LanceAggregationSupport.isPushdownCandidate(
-                AggregatorFactories.builder()
-                    .addAggregator(
-                        AggregationBuilders.terms("c").field("category").subAggregation(AggregationBuilders.sum("s").field("rating"))
-                    )
-                    .addPipelineAggregator(PipelineAggregatorBuilders.maxBucket("mb", "c>s"))
-            )
-        );
-        assertFalse(
-            "pipeline under the bucket",
-            candidate(
-                AggregationBuilders.terms("c")
-                    .field("category")
-                    .subAggregation(AggregationBuilders.sum("s").field("rating"))
-                    .subAggregation(PipelineAggregatorBuilders.bucketScript("bs", Map.of("x", "s"), new Script("params.x")))
-            )
-        );
-    }
-
-    public void testStructuralAllowListForTheWiderShapes() {
-        // Metrics the scan computes outright, and the sketch metrics.
-        assertTrue(candidate(AggregationBuilders.stats("s").field("rating")));
-        assertTrue(candidate(AggregationBuilders.extendedStats("e").field("rating").sigma(3)));
-        assertTrue(candidate(AggregationBuilders.cardinality("c").field("category").precisionThreshold(100)));
-        assertTrue(candidate(AggregationBuilders.percentiles("p").field("rating")));
-        assertTrue(candidate(AggregationBuilders.percentiles("p").field("rating").percentiles(10, 50).compression(200)));
-        assertTrue(candidate(AggregationBuilders.percentileRanks("pr", new double[] { 100, 500 }).field("rating")));
-        assertFalse("hdr percentiles", candidate(AggregationBuilders.percentiles("p").field("rating").method(PercentilesMethod.HDR)));
-        assertFalse(
-            "hdr percentile ranks",
-            candidate(AggregationBuilders.percentileRanks("pr", new double[] { 100 }).field("rating").method(PercentilesMethod.HDR))
-        );
-        assertFalse("stats with missing", candidate(AggregationBuilders.stats("s").field("rating").missing(0)));
-        assertTrue(
-            "sketch metrics under a bucket",
-            candidate(
-                AggregationBuilders.terms("c")
-                    .field("category")
-                    .subAggregation(AggregationBuilders.cardinality("u").field("rating"))
-                    .subAggregation(AggregationBuilders.percentiles("p").field("id"))
-            )
-        );
-        // Range, date_range, missing, filter, filters as bucket levels.
-        assertTrue(candidate(AggregationBuilders.range("r").field("rating").addUnboundedTo(300).addRange(300, 700).addUnboundedFrom(700)));
-        assertTrue(candidate(AggregationBuilders.dateRange("d").field("ts").addUnboundedTo("2024-03-01").addUnboundedFrom("2024-03-01")));
-        assertFalse("range without ranges", candidate(AggregationBuilders.range("r").field("rating")));
-        assertTrue(candidate(AggregationBuilders.missing("m").field("category")));
-        assertTrue(candidate(AggregationBuilders.filter("f", new RangeQueryBuilder("rating").gte(500))));
-        assertTrue(candidate(AggregationBuilders.filter("f", new MatchAllQueryBuilder())));
-        assertTrue(
-            candidate(
-                AggregationBuilders.filters(
-                    "fs",
-                    new FiltersAggregator.KeyedFilter("low", new RangeQueryBuilder("rating").lt(200)),
-                    new FiltersAggregator.KeyedFilter("c0", new TermQueryBuilder("category", "c0"))
-                ).otherBucket(true)
-            )
-        );
-        assertTrue(candidate(AggregationBuilders.filters("fs", new TermsQueryBuilder("category", "c0", "c2"), new MatchAllQueryBuilder())));
-        assertFalse(
-            "filters over a Lance query",
-            candidate(
-                AggregationBuilders.filters("fs", new TermQueryBuilder("category", "c0"), new LanceMatchQueryBuilder("body", "hello"))
-            )
-        );
-        assertFalse("filter over a Lance query", candidate(AggregationBuilders.filter("f", new LanceMatchQueryBuilder("body", "hello"))));
-        assertTrue(
-            "metrics and a nested bucket under a range",
-            candidate(
-                AggregationBuilders.range("r")
-                    .field("rating")
-                    .addUnboundedTo(500)
-                    .addUnboundedFrom(500)
-                    .subAggregation(AggregationBuilders.stats("s").field("id"))
-                    .subAggregation(AggregationBuilders.terms("c").field("category"))
-            )
-        );
-        assertTrue(
-            "filters under terms under missing",
-            candidate(
-                AggregationBuilders.missing("m")
-                    .field("category")
-                    .subAggregation(
-                        AggregationBuilders.terms("f")
-                            .field("flag")
-                            .subAggregation(AggregationBuilders.filters("fs", new RangeQueryBuilder("rating").gte(500)))
-                    )
-            )
-        );
-    }
-
     public void testWiderShapesPlanAgainstTheTableSchema() throws Exception {
         String indexName = "pushdown-plan-wider";
         String tableUri = attach(indexName);
@@ -429,10 +119,10 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
             Map<String, LinkedHashMap<String, String>> noMultiFields = Map.of();
             assertNotNull("stats on integer", planned(dataset, noMultiFields, qsc, AggregationBuilders.stats("s").field("rating")));
             assertNull("stats on keyword", planned(dataset, noMultiFields, qsc, AggregationBuilders.stats("s").field("category")));
-            // Cardinality passes the structural gate but the planner's
-            // pushdown rule rejects any tree carrying it (the pushed
-            // form is slower than the aggregator), so the routing
-            // answers null and the aggregators run.
+            // The planner pushes a cardinality like any other tree but
+            // prices the pushed form above the Lucene operator (it is
+            // slower than the aggregator), so the routing answers null
+            // and the aggregators run.
             assertNull(
                 "cardinality on keyword",
                 planned(dataset, noMultiFields, qsc, AggregationBuilders.cardinality("c").field("category"))
@@ -2192,14 +1882,6 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
         return new CompositeAggregationBuilder(name, List.of(sources));
     }
 
-    private static boolean candidate(AggregationBuilder... builders) {
-        AggregatorFactories.Builder tree = AggregatorFactories.builder();
-        for (AggregationBuilder builder : builders) {
-            tree.addAggregator(builder);
-        }
-        return LanceAggregationSupport.isPushdownCandidate(tree);
-    }
-
     private static LanceAggregateResults planned(
         Dataset dataset,
         Map<String, LinkedHashMap<String, String>> multiFields,
@@ -2221,8 +1903,8 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
 
     /**
      * The full routing decision as the coordinator makes it and the
-     * executor completes it: the structural gate, the translator, the
-     * Volcano planner with the pushdown rule, and the executor's
+     * executor completes it: the translator, the Volcano planner with
+     * the pushdown rule and the cost model, and the executor's
      * resolution against the mapping. Null when any of them refuses, in
      * which case the aggregators answer.
      */
@@ -2233,13 +1915,13 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
         AggregatorFactories.Builder tree,
         int maxGroups
     ) {
-        if (!LanceAggregationSupport.isPushdownCandidate(tree)) {
+        if (tree == null || tree.getAggregatorFactories().isEmpty()) {
             return null;
         }
         LancePlannerFactory factory = new LancePlannerFactory(1L << 30, 1L << 30);
         LanceSchemas.IndexModel model = LanceSchemas.model("idx", dataset.getSchema(), multiFields, () -> 600L);
         RelNode logical = SearchRequestToRel.translateForExecution(
-            new ExecutionShape(new MatchAllQueryBuilder(), null, List.of(), null, 0, 0, tree, true, false),
+            new ExecutionShape(new MatchAllQueryBuilder(), null, List.of(), null, 0, 0, tree, false),
             model,
             factory
         );

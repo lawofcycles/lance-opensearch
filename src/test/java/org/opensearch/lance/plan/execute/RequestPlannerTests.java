@@ -40,11 +40,11 @@ public class RequestPlannerTests extends OpenSearchTestCase {
 
     private static final Set<String> NO_EXCLUDED = Set.of();
 
-    private static ExecutionShape shape(String json, boolean planAggregations) throws IOException {
-        return shape(PlanTestFixtures.parse(json), planAggregations);
+    private static ExecutionShape shape(String json) throws IOException {
+        return shape(PlanTestFixtures.parse(json));
     }
 
-    private static ExecutionShape shape(SearchSourceBuilder source, boolean planAggregations) {
+    private static ExecutionShape shape(SearchSourceBuilder source) {
         int size = source.size() < 0 ? 10 : source.size();
         int from = Math.max(0, source.from());
         return new ExecutionShape(
@@ -55,17 +55,16 @@ public class RequestPlannerTests extends OpenSearchTestCase {
             from,
             size == 0 ? 0 : from + size,
             source.aggregations(),
-            planAggregations,
             false
         );
     }
 
     private static RequestPlanner.Planned plan(String json) throws IOException {
-        return plan(json, true, NO_EXCLUDED);
+        return plan(json, NO_EXCLUDED);
     }
 
-    private static RequestPlanner.Planned plan(String json, boolean planAggregations, Set<String> excluded) throws IOException {
-        return RequestPlanner.plan(shape(json, planAggregations), PlanTestFixtures.model(), excluded, PlanTestFixtures.factory());
+    private static RequestPlanner.Planned plan(String json, Set<String> excluded) throws IOException {
+        return RequestPlanner.plan(shape(json), PlanTestFixtures.model(), excluded, PlanTestFixtures.factory());
     }
 
     public void testAggregationOverScalarFilterIsAPushedScan() throws IOException {
@@ -92,10 +91,14 @@ public class RequestPlannerTests extends OpenSearchTestCase {
     }
 
     public void testAggregationWithThePushdownOffKeepsTheFilterOnALucenePlan() throws IOException {
-        FragmentPlan plan = plan(
-            "{\"size\":0,\"query\":{\"term\":{\"rating\":5}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}",
-            false,
-            NO_EXCLUDED
+        // The setting is a cost input: the pushed scan costs infinity, the
+        // Lucene operator wins, and the filter's SQL still travels.
+        FragmentPlan plan = RequestPlanner.plan(
+            shape("{\"size\":0,\"query\":{\"term\":{\"rating\":5}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}"),
+            PlanTestFixtures.model(),
+            NO_EXCLUDED,
+            PlanTestFixtures.factory(),
+            CostInputs.local().withPushdownEnabled(false)
         ).plan();
         assertEquals(FragmentPlan.Kind.LUCENE_AGGREGATE, plan.kind());
         assertNull(plan.aggregate());
@@ -262,7 +265,7 @@ public class RequestPlannerTests extends OpenSearchTestCase {
     public void testFilteredKnnOverAnExcludedColumnIsRefused() throws IOException {
         String body = "{\"size\":5,\"query\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":[0.1,0.2],\"k\":5,"
             + "\"filter\":{\"term\":{\"category\":\"c0\"}}}}}";
-        IllegalArgumentException refused = expectThrows(IllegalArgumentException.class, () -> plan(body, true, Set.of("category")));
+        IllegalArgumentException refused = expectThrows(IllegalArgumentException.class, () -> plan(body, Set.of("category")));
         assertThat(refused.getMessage(), containsString("predicates on ip and geo_point fields"));
     }
 
@@ -283,7 +286,7 @@ public class RequestPlannerTests extends OpenSearchTestCase {
     }
 
     public void testQueryOverAnExcludedColumnIsALucenePlanWithoutAQueryPart() throws IOException {
-        FragmentPlan plan = plan("{\"size\":10,\"query\":{\"term\":{\"category\":\"c0\"}}}", true, Set.of("category")).plan();
+        FragmentPlan plan = plan("{\"size\":10,\"query\":{\"term\":{\"category\":\"c0\"}}}", Set.of("category")).plan();
         assertEquals(FragmentPlan.Kind.LUCENE_TOPK, plan.kind());
         assertNull(plan.filterSql());
     }
@@ -299,16 +302,16 @@ public class RequestPlannerTests extends OpenSearchTestCase {
 
     public void testCoordinatorPlanWrapsThePerNodePlanWithTheReduceTheShapeSelects() throws IOException {
         String aggregation = "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}";
-        RelNode plan = plan(aggregation).coordinatorPlan(shape(aggregation, true), 3);
+        RelNode plan = plan(aggregation).coordinatorPlan(shape(aggregation), 3);
         assertTrue(plan instanceof MergeExec);
         assertEquals(MergeExec.ReduceKind.AGGREGATE_INTERNAL, ((MergeExec) plan).reduceKind());
         assertTrue(((MergeExec) plan).getInput() instanceof FanOutExec);
         assertEquals(3, ((FanOutExec) ((MergeExec) plan).getInput()).fanOut());
 
         String hits = "{\"size\":10}";
-        assertEquals(MergeExec.ReduceKind.HITS_TOP_K, ((MergeExec) plan(hits).coordinatorPlan(shape(hits, true), 1)).reduceKind());
+        assertEquals(MergeExec.ReduceKind.HITS_TOP_K, ((MergeExec) plan(hits).coordinatorPlan(shape(hits), 1)).reduceKind());
         String count = "{\"size\":0}";
-        assertEquals(MergeExec.ReduceKind.COUNT_SUM, ((MergeExec) plan(count).coordinatorPlan(shape(count, true), 1)).reduceKind());
+        assertEquals(MergeExec.ReduceKind.COUNT_SUM, ((MergeExec) plan(count).coordinatorPlan(shape(count), 1)).reduceKind());
     }
 
     public void testLuceneAggregateExecRootReadsTheFilterUnderIt() throws IOException {
@@ -331,9 +334,9 @@ public class RequestPlannerTests extends OpenSearchTestCase {
         // on a single thread: the fitted cost model sends the first to
         // the aggregators and keeps the second on the pushed scan.
         String terms = "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}";
-        ExecutionShape shape = shape(terms, true);
+        ExecutionShape shape = shape(terms);
         LancePlannerFactory factory = PlanTestFixtures.factory();
-        CostInputs fourNodesOverS3 = CostInputs.forCluster(4, "s3://bench/perf1b.lance", 16, 8, 8);
+        CostInputs fourNodesOverS3 = CostInputs.forCluster(4, "s3://bench/perf1b.lance", 16, 8, 8, true, CostInputs.DEFAULT_MAX_GROUPS);
         RequestPlanner.Planned overS3 = RequestPlanner.plan(shape, PerfTableFixture.perf1b(), NO_EXCLUDED, factory, fourNodesOverS3);
         assertEquals(FragmentPlan.Kind.LUCENE_AGGREGATE, overS3.plan().kind());
         assertNull(overS3.plan().aggregate());
@@ -356,6 +359,54 @@ public class RequestPlannerTests extends OpenSearchTestCase {
             RequestPlanner.plan(shape, PerfTableFixture.perf1b(), NO_EXCLUDED, factory, CostInputs.local()).plan(),
             RequestPlanner.plan(shape, PerfTableFixture.perf1b(), NO_EXCLUDED, factory).plan()
         );
+    }
+
+    public void testRoutingSettingsReachThePlanAsCostInputs() throws IOException {
+        // The coordinator no longer pre decides what the planner sees:
+        // lance.aggregation.pushdown and pushdown_max_groups travel in
+        // the CostInputs and the plan kind follows them, with nothing
+        // named as unplanned because the translator accepted the tree.
+        String terms = "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}";
+        String sum = "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}";
+        LancePlannerFactory factory = PlanTestFixtures.factory();
+        // One local node collecting on a single thread, where the
+        // keyword terms measured faster pushed.
+        CostInputs local = CostInputs.forCluster(1, "/data/perf20m.lance", 16, 8, 1, true, CostInputs.DEFAULT_MAX_GROUPS);
+
+        RequestPlanner.Planned pushed = RequestPlanner.plan(shape(terms), PerfTableFixture.perf20m(), NO_EXCLUDED, factory, local);
+        assertEquals(FragmentPlan.Kind.PUSHED_SCAN, pushed.plan().kind());
+
+        RequestPlanner.Planned off = RequestPlanner.plan(
+            shape(terms),
+            PerfTableFixture.perf20m(),
+            NO_EXCLUDED,
+            factory,
+            local.withPushdownEnabled(false)
+        );
+        assertEquals(FragmentPlan.Kind.LUCENE_AGGREGATE, off.plan().kind());
+        assertTrue("the Lucene operator answers: " + off.perNode(), off.perNode() instanceof LuceneAggregateExec);
+        assertNull("the setting is a cost input, not a refusal", off.unplanned());
+
+        // terms(category) estimates 200 groups from the bitmap index of
+        // the perf fixture; a bound of 1 sends it to the aggregators and
+        // leaves the one group metric tree on the pushed scan.
+        RequestPlanner.Planned bounded = RequestPlanner.plan(
+            shape(terms),
+            PerfTableFixture.perf20m(),
+            NO_EXCLUDED,
+            factory,
+            local.withMaxGroups(1L)
+        );
+        assertEquals(FragmentPlan.Kind.LUCENE_AGGREGATE, bounded.plan().kind());
+        assertNull("the bound is a cost input, not a refusal", bounded.unplanned());
+        RequestPlanner.Planned oneGroup = RequestPlanner.plan(
+            shape(sum),
+            PerfTableFixture.perf20m(),
+            NO_EXCLUDED,
+            factory,
+            local.withMaxGroups(1L)
+        );
+        assertEquals(FragmentPlan.Kind.PUSHED_SCAN, oneGroup.plan().kind());
     }
 
     public void testUnplannedNamesTheElementThatKeptTheEnvelopeOnLucene() throws IOException {

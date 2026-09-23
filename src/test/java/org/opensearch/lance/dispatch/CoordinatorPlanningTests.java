@@ -83,17 +83,20 @@ public class CoordinatorPlanningTests extends OpenSearchSingleNodeTestCase {
         // The plan of the rewritten query carries the term's Lance SQL;
         // the wrapper itself has no relational form and would have left
         // the whole query to Lucene.
+        ClusterService clusterService = getInstanceFromNode(ClusterService.class);
         FragmentPlan planned = FragmentRequests.plan(
-            getInstanceFromNode(ClusterService.class).state().metadata().index(indexName),
+            clusterService.state().metadata().index(indexName),
             getInstanceFromNode(LanceWarmCache.class),
-            new ExecutionShape(rewritten, null, List.of(), null, 0, 10, null, false, false)
+            new ExecutionShape(rewritten, null, List.of(), null, 0, 10, null, false),
+            clusterService
         );
         assertEquals(FragmentPlan.Kind.PUSHED_SCAN, planned.kind());
         assertEquals("category = 'c0'", planned.filterSql());
         FragmentPlan unplanned = FragmentRequests.plan(
-            getInstanceFromNode(ClusterService.class).state().metadata().index(indexName),
+            clusterService.state().metadata().index(indexName),
             getInstanceFromNode(LanceWarmCache.class),
-            new ExecutionShape(wrapped, null, List.of(), null, 0, 10, null, false, false)
+            new ExecutionShape(wrapped, null, List.of(), null, 0, 10, null, false),
+            clusterService
         );
         assertEquals(FragmentPlan.Kind.LUCENE_TOPK, unplanned.kind());
         assertNull(unplanned.filterSql());

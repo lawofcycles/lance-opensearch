@@ -51,7 +51,6 @@ public class FragmentPlanTests extends OpenSearchTestCase {
             0,
             size,
             source.aggregations(),
-            true,
             false
         );
         RelNode logical = SearchRequestToRel.translateForExecution(shape, PlanTestFixtures.model(), PlanTestFixtures.factory());

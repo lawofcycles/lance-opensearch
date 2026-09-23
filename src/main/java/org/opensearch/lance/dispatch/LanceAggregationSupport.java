@@ -6,12 +6,9 @@
 package org.opensearch.lance.dispatch;
 
 import java.io.IOException;
-import java.util.Collection;
 
 import org.opensearch.common.Rounding;
 import org.opensearch.common.io.stream.BytesStreamOutput;
-import org.opensearch.common.xcontent.XContentType;
-import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
@@ -21,9 +18,7 @@ import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.search.aggregations.AggregationBuilder;
-import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.BucketOrder;
-import org.opensearch.search.aggregations.InternalOrder;
 import org.opensearch.search.aggregations.bucket.composite.CompositeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.composite.CompositeValuesSourceBuilder;
 import org.opensearch.search.aggregations.bucket.composite.DateHistogramValuesSourceBuilder;
@@ -34,10 +29,8 @@ import org.opensearch.search.aggregations.bucket.filter.FiltersAggregationBuilde
 import org.opensearch.search.aggregations.bucket.filter.FiltersAggregator;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
-import org.opensearch.search.aggregations.bucket.histogram.Histogram;
 import org.opensearch.search.aggregations.bucket.histogram.HistogramAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.missing.MissingAggregationBuilder;
-import org.opensearch.search.aggregations.bucket.range.AbstractRangeBuilder;
 import org.opensearch.search.aggregations.bucket.range.DateRangeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
@@ -111,13 +104,6 @@ public final class LanceAggregationSupport {
     public static final int MAX_MASK_CONDITIONS = 62;
 
     private LanceAggregationSupport() {}
-
-    /**
-     * Deepest bucket level the pushdown builds: {@code terms > terms >
-     * terms}. Every level multiplies the number of key combinations,
-     * and the scan returns one row per combination.
-     */
-    static final int MAX_PUSHDOWN_BUCKET_DEPTH = 3;
 
     /**
      * @return true if the request either has no aggregations or has
@@ -290,69 +276,6 @@ public final class LanceAggregationSupport {
     }
 
     /**
-     * Structural half of the decision to run an aggregation tree as a
-     * Substrait group by inside the Lance scan instead of through the
-     * Lucene aggregators. Field types are not known here; the executor
-     * checks them against the table schema in
-     * {@code LanceAggregateResults}. The tree qualifies when it is one
-     * of the following, with no pipeline aggregations anywhere:
-     * <ul>
-     *   <li>metric aggregations only ({@link #isPushdownMetric});</li>
-     *   <li>one bucket aggregation ({@link #isPushdownBucket}) whose
-     *       children are metrics plus at most one further bucket
-     *       aggregation of the same kind, down to
-     *       {@link #MAX_PUSHDOWN_BUCKET_DEPTH} levels. Two bucket
-     *       aggregations side by side would need two group bys;</li>
-     *   <li>one {@code composite} ({@link #isPushdownComposite}) whose
-     *       children are all metrics.</li>
-     * </ul>
-     */
-    public static boolean isPushdownCandidate(AggregatorFactories.Builder aggregations) {
-        if (aggregations == null || aggregations.getAggregatorFactories().isEmpty()) {
-            return false;
-        }
-        if (!aggregations.getPipelineAggregatorFactories().isEmpty()) {
-            return false;
-        }
-        Collection<AggregationBuilder> top = aggregations.getAggregatorFactories();
-        boolean allMetrics = true;
-        for (AggregationBuilder builder : top) {
-            if (!isPushdownMetric(builder)) {
-                allMetrics = false;
-                break;
-            }
-        }
-        if (allMetrics) {
-            return true;
-        }
-        if (top.size() != 1) {
-            return false;
-        }
-        AggregationBuilder root = top.iterator().next();
-        if (root instanceof CompositeAggregationBuilder composite) {
-            return isPushdownComposite(composite);
-        }
-        return isPushdownBucketTree(root, 1);
-    }
-
-    private static boolean isPushdownBucketTree(AggregationBuilder bucket, int depth) {
-        if (depth > MAX_PUSHDOWN_BUCKET_DEPTH || !isPushdownBucket(bucket) || !bucket.getPipelineAggregations().isEmpty()) {
-            return false;
-        }
-        boolean nestedBucketSeen = false;
-        for (AggregationBuilder sub : bucket.getSubAggregations()) {
-            if (isPushdownMetric(sub)) {
-                continue;
-            }
-            if (nestedBucketSeen || !isPushdownBucketTree(sub, depth + 1)) {
-                return false;
-            }
-            nestedBucketSeen = true;
-        }
-        return true;
-    }
-
-    /**
      * A {@code composite} whose sources are all {@link #isPushdownCompositeSource}
      * and whose children are all metrics. {@code size} and {@code after}
      * are applied by the executor to the sorted group rows.
@@ -450,77 +373,6 @@ public final class LanceAggregationSupport {
         return config == null || config instanceof PercentilesConfig.TDigest;
     }
 
-    /**
-     * One bucket level the pushdown builds: {@code terms} ordered by
-     * {@code _count} descending, by {@code _key}, or by one sub
-     * aggregation (the executor honours the last for a single terms
-     * level ordering on its own single value metric child and falls
-     * back to the aggregators otherwise), with the default
-     * {@code min_doc_count} and no {@code include} / {@code exclude};
-     * {@code histogram} with {@code offset} 0 and no bounds;
-     * {@code date_histogram} with a {@code fixed_interval} or a
-     * {@code calendar_interval} that {@link #calendarUnit} knows,
-     * {@code offset} 0, no bounds and no time zone; {@code range} and
-     * {@code date_range} with one to {@link #MAX_MASK_CONDITIONS}
-     * ranges; {@code missing}; {@code filter} and {@code filters} (one to
-     * that many filters) whose every query is a scalar filter
-     * ({@link #isFilterQuerySupported}) the executor can spell as a
-     * Substrait predicate. The remaining options ({@code size},
-     * {@code shard_size}, {@code keyed}, {@code min_doc_count} on the
-     * histograms, {@code order} on the histograms, {@code other_bucket}
-     * on {@code filters}) are honoured by the result the executor builds
-     * or by the coordinator's reduce.
-     */
-    static boolean isPushdownBucket(AggregationBuilder builder) {
-        if (builder instanceof FilterAggregationBuilder filter) {
-            return isFilterQuerySupported(filter.getFilter());
-        }
-        if (builder instanceof FiltersAggregationBuilder filters) {
-            if (filters.filters().isEmpty() || filters.filters().size() > MAX_MASK_CONDITIONS) {
-                return false;
-            }
-            for (FiltersAggregator.KeyedFilter keyed : filters.filters()) {
-                if (!isFilterQuerySupported(keyed.filter())) {
-                    return false;
-                }
-            }
-            return true;
-        }
-        if (!(builder instanceof ValuesSourceAggregationBuilder<?> valuesSource) || !hasPlainFieldSource(valuesSource)) {
-            return false;
-        }
-        if (builder instanceof TermsAggregationBuilder terms) {
-            return (InternalOrder.isCountDesc(terms.order())
-                || InternalOrder.isKeyOrder(terms.order())
-                || aggregationOrder(terms.order()) != null)
-                && terms.minDocCount() == 1L
-                && terms.shardMinDocCount() == 0L
-                && terms.includeExclude() == null;
-        }
-        if (builder instanceof HistogramAggregationBuilder histogram) {
-            return histogram.offset() == 0d
-                && histogram.interval() > 0d
-                && histogram.minBound() == Double.POSITIVE_INFINITY
-                && histogram.maxBound() == Double.NEGATIVE_INFINITY
-                && !mentionsHardBounds(histogram);
-        }
-        if (builder instanceof DateHistogramAggregationBuilder dateHistogram) {
-            boolean fixed = dateHistogram.getFixedInterval() != null && dateHistogram.getCalendarInterval() == null;
-            boolean calendar = dateHistogram.getCalendarInterval() != null
-                && dateHistogram.getFixedInterval() == null
-                && calendarUnit(dateHistogram) != null;
-            return (fixed || calendar)
-                && dateHistogram.offset() == 0L
-                && dateHistogram.extendedBounds() == null
-                && dateHistogram.hardBounds() == null
-                && dateHistogram.timeZone() == null;
-        }
-        if (builder instanceof AbstractRangeBuilder<?, ?> range) {
-            return !range.ranges().isEmpty() && range.ranges().size() <= MAX_MASK_CONDITIONS;
-        }
-        return builder instanceof MissingAggregationBuilder;
-    }
-
     /** A terms order on one sub aggregation: its path and direction. */
     public record AggregationOrder(String path, boolean ascending) {
     }
@@ -602,21 +454,5 @@ public final class LanceAggregationSupport {
             && builder.script() == null
             && builder.missing() == null
             && builder.userValueTypeHint() == null;
-    }
-
-    /**
-     * {@link HistogramAggregationBuilder} exposes no getter for
-     * {@code hard_bounds} (only the setter; {@code extendedBounds()} is
-     * protected and the bounds fields are private), so the check goes
-     * through the builder's own JSON rendering, which writes the
-     * {@code hard_bounds} key only when the option was set. It is the
-     * last condition of {@link #isPushdownBucket}, and
-     * {@link #isPushdownCandidate} runs once per executor request as
-     * the rule registry's structural gate, so the render happens at
-     * most once per request and only for a histogram that passed every
-     * other condition.
-     */
-    private static boolean mentionsHardBounds(HistogramAggregationBuilder histogram) {
-        return Strings.toString(XContentType.JSON, histogram).contains("\"" + Histogram.HARD_BOUNDS_FIELD.getPreferredName() + "\"");
     }
 }

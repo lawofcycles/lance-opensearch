@@ -161,11 +161,12 @@ public class LanceExplainIT extends LanceRestTestCase {
                 filteredBucketPhysical.contains("LuceneAggregateExec(")
             );
 
-            // A cardinality metric never folds into the scan (the
-            // pushed form is slower than the aggregator), so the
-            // physical plan shows the Lucene aggregate operator over
-            // the bare scan and the fragment plan runs the aggregators;
-            // the cost chose, nothing was refused.
+            // A cardinality metric folds into the scan like any other
+            // tree but the pushed form is priced above the aggregator
+            // (it is slower), so the physical plan shows the Lucene
+            // aggregate operator over the bare scan and the fragment
+            // plan runs the aggregators; the cost chose, nothing was
+            // refused.
             String cardinalityBody = explainOk(indexName, "{\"size\":0,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"id\"}}}}");
             String cardinalityLogical = stringPath(cardinalityBody, "logical");
             assertTrue(
@@ -229,19 +230,57 @@ public class LanceExplainIT extends LanceRestTestCase {
             assertEquals("LUCENE_AGGREGATE", fragmentPlanOf(pageWithAggregations).get("kind"));
             assertEquals("size [5] (only 0 with aggregations)", stringPath(pageWithAggregations, "unplanned"));
 
-            // An aggregation off the pushdown shapes (top_hits) never
-            // reaches the translator: the aggregators run over the bare
-            // scan and the answer names the structural reason. The
-            // dispatch filter's allow list, which sends this body to the
-            // shard path, is not part of the plan and not of the route.
+            // An aggregation off the pushdown shapes (top_hits) reaches
+            // the translator, which refuses it by name: the aggregators
+            // run over the bare scan. The dispatch filter's allow list,
+            // which sends this body to the shard path, is not part of
+            // the plan and not of the route.
             String topHits = explainOk(indexName, "{\"size\":0,\"aggs\":{\"t\":{\"top_hits\":{\"size\":1}}}}");
             assertEquals("fragment", stringPath(topHits, "route"));
             assertEquals("LUCENE_AGGREGATE", fragmentPlanOf(topHits).get("kind"));
-            assertEquals(
-                "aggregation tree outside the pushdown shapes, or lance.aggregation.pushdown is false",
-                stringPath(topHits, "unplanned")
-            );
+            assertEquals("aggregation type [top_hits]", stringPath(topHits, "unplanned"));
             assertFalse("nothing is pushed into the scan: " + topHits, stringPath(topHits, "physical").contains("pushed=[["));
+        } finally {
+            deleteQuietly(indexName);
+        }
+    }
+
+    public void testExplainShowsThePushdownSettingAsACostDecision() throws Exception {
+        String suffix = "explain-setting-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String sum = "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+        try {
+            attach(tableUri);
+
+            // lance.aggregation.pushdown is a cost input: off, the pushed
+            // scan costs infinity and the Lucene operator answers the
+            // shape; nothing is refused, so no element is named as
+            // unplanned. Back on, the pushed scan wins again.
+            Request disable = new Request("PUT", "/_cluster/settings");
+            disable.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":false}}");
+            client().performRequest(disable);
+            try {
+                String off = explainOk(indexName, sum);
+                String offPhysical = stringPath(off, "physical");
+                assertTrue(
+                    "the Lucene operator answers with the pushdown off: " + offPhysical,
+                    offPhysical.contains("LuceneAggregateExec(")
+                );
+                assertFalse("nothing is pushed into the scan: " + offPhysical, offPhysical.contains("pushed=[["));
+                assertEquals("LUCENE_AGGREGATE", fragmentPlanOf(off).get("kind"));
+                assertFalse("the cost chose, nothing was refused: " + off, parseJson(off).containsKey("unplanned"));
+            } finally {
+                Request enable = new Request("PUT", "/_cluster/settings");
+                enable.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":null}}");
+                client().performRequest(enable);
+            }
+            String on = explainOk(indexName, sum);
+            assertTrue("the pushed scan answers with the pushdown on: " + on, stringPath(on, "physical").contains("pushed=[[aggregate{"));
+            assertEquals("PUSHED_SCAN", fragmentPlanOf(on).get("kind"));
         } finally {
             deleteQuietly(indexName);
         }

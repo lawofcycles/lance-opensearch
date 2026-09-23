@@ -335,15 +335,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // Per-index fan-out results, collected sequentially. The plan
         // is derived per target inside runIndexLoop, against the
         // target's own schema; the spec built here carries no plan yet.
-        // min_score and terminate_after apply inside Lucene's collectors
-        // on the executor, so a request carrying either is not planned
-        // as a pushed aggregate or a pushed page (see
-        // ExecutionShape.collectorKnobs).
-        boolean collectorKnobs = minScore != null || terminateAfter > 0;
-        boolean planAggregations = aggregations != null
-            && !collectorKnobs
-            && clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_SETTING)
-            && LanceAggregationSupport.isPushdownCandidate(aggregations);
         FragmentQuerySpec spec = new FragmentQuerySpec(
             null,
             query,
@@ -353,7 +344,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             from,
             perNodeSize,
             aggregations,
-            planAggregations,
             source != null && source.trackScores(),
             trackTotalHitsUpTo,
             minScore,
@@ -983,8 +973,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * even as new wire-format fields are added.
      */
     private record FragmentQuerySpec(FragmentPlan plan, QueryBuilder query, QueryBuilder postFilter, List<SortBuilder<?>> sorts,
-        Object[] searchAfter, int from, int effectiveSize, AggregatorFactories.Builder aggregations, boolean planAggregations,
-        boolean trackScores, int trackTotalHitsUpTo, Float minScore, int terminateAfter, HitProjection projection) {
+        Object[] searchAfter, int from, int effectiveSize, AggregatorFactories.Builder aggregations, boolean trackScores,
+        int trackTotalHitsUpTo, Float minScore, int terminateAfter, HitProjection projection) {
 
         /** The same spec carrying the plan derived for one target. */
         FragmentQuerySpec withPlan(FragmentPlan targetPlan) {
@@ -997,7 +987,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 from,
                 effectiveSize,
                 aggregations,
-                planAggregations,
                 trackScores,
                 trackTotalHitsUpTo,
                 minScore,
@@ -1008,6 +997,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
         /** What the planner reads of the request. */
         ExecutionShape executionShape() {
+            // min_score and terminate_after apply inside Lucene's
+            // collectors on the executor, so a request carrying either is
+            // not planned as a pushed aggregate or a pushed page (see
+            // ExecutionShape.collectorKnobs).
             return new ExecutionShape(
                 query,
                 postFilter,
@@ -1016,7 +1009,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 from,
                 effectiveSize,
                 aggregations,
-                planAggregations,
                 minScore != null || terminateAfter > 0
             );
         }
