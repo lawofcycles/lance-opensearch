@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -58,6 +59,8 @@ import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.namespace.AllowedTableRoots;
 import org.opensearch.lance.namespace.LanceNamespaceService;
 import org.opensearch.lance.rest.RestAttachAction;
+import org.opensearch.tasks.CancellableTask;
+import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.Client;
@@ -162,16 +165,28 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
     @Override
     protected void clusterManagerOperation(LanceAttachRequest request, ClusterState state, ActionListener<LanceAttachResponse> listener)
         throws Exception {
+        clusterManagerOperation(null, request, state, listener);
+    }
+
+    @Override
+    protected void clusterManagerOperation(
+        Task task,
+        LanceAttachRequest request,
+        ClusterState state,
+        ActionListener<LanceAttachResponse> listener
+    ) throws Exception {
         // The state handed in here is not used: nothing before the
         // create depends on cluster state (allowlist and derivation
         // read the request and the table), and the one read that does,
         // the existing-index check, happens after the create has
         // failed with ResourceAlreadyExistsException, which this state
         // predates. verifyExistingLanceIndex reads a fresher state then.
-        attach(request, listener);
+        BooleanSupplier cancelled = task instanceof CancellableTask cancellable ? cancellable::isCancelled : () -> false;
+        attach(request, cancelled, listener);
     }
 
-    private void attach(LanceAttachRequest request, ActionListener<LanceAttachResponse> listener) throws Exception {
+    private void attach(LanceAttachRequest request, BooleanSupplier cancelled, ActionListener<LanceAttachResponse> listener)
+        throws Exception {
         String table = request.table();
         if (!allowedRoots.allows(table)) {
             throw new OpenSearchStatusException(
@@ -205,7 +220,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                 }
             }
         }
-        ensureAnalyzerDerivedColumns(request, openVersion);
+        LanceAttachResponse.Backfill backfill = ensureAnalyzerDerivedColumns(request, openVersion, cancelled);
         RestAttachAction.Derivation derivation;
         long[] fragmentDocs;
         try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions(), openVersion)) {
@@ -242,6 +257,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             request.tag(),
             request.indexPlacement(),
             luceneBoundExceeded,
+            backfill,
             listener
         );
     }
@@ -259,11 +275,18 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
      * when the column flips to the analyzer mode. A snapshot pinned by
      * {@code version} or {@code tag} cannot be written, so every
      * derived column must already exist there.
+     *
+     * @return what the async backfill is about to do, for the attach
+     *     response; {@code null} when no async backfill was started
      */
-    private void ensureAnalyzerDerivedColumns(LanceAttachRequest request, Optional<Long> openVersion) throws Exception {
+    private LanceAttachResponse.Backfill ensureAnalyzerDerivedColumns(
+        LanceAttachRequest request,
+        Optional<Long> openVersion,
+        BooleanSupplier cancelled
+    ) throws Exception {
         Map<String, LanceOverrides.Column> textAnalyzer = request.overrides().textAnalyzerColumns();
         if (textAnalyzer.isEmpty()) {
-            return;
+            return null;
         }
         Map<String, Analyzer> resolved = new LinkedHashMap<>();
         for (Map.Entry<String, LanceOverrides.Column> entry : textAnalyzer.entrySet()) {
@@ -315,17 +338,37 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                     }
                 }
             }
-            return;
+            return null;
         }
+        int threads = clusterService.getClusterSettings().get(LancePlugin.ATTACH_BACKFILL_THREADS_SETTING);
         if (request.asyncDerive()) {
             String table = request.table();
+            // Size the work before answering: the response tells the
+            // operator about how much the table grows and on how many
+            // threads, and the estimate reads one sample batch per
+            // column, which is cheap next to the attach's own scans.
+            long estimatedBytes = 0L;
+            try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions())) {
+                for (String base : LanceTextAnalyzerBackfill.missingDerivedColumns(dataset, textAnalyzer).keySet()) {
+                    estimatedBytes += LanceTextAnalyzerBackfill.estimateDerivedBytes(dataset, base);
+                }
+            }
+            // The attach task is done once the response leaves, so an
+            // async backfill cannot be cancelled through it; it runs to
+            // completion or fails on its own.
+            LanceTextAnalyzerBackfill.Options asyncOptions = new LanceTextAnalyzerBackfill.Options(
+                threadPool.generic(),
+                threads,
+                () -> false
+            );
             threadPool.generic().execute(() -> {
                 try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions())) {
                     LanceTextAnalyzerBackfill.Ensured ensured = LanceTextAnalyzerBackfill.ensureDerivedColumns(
                         dataset,
                         textAnalyzer,
                         resolved::get,
-                        LanceRegistry.allocator()
+                        LanceRegistry.allocator(),
+                        asyncOptions
                     );
                     LOG.info(
                         "async text_analyzer backfill finished for table {}: created {}, already present {}",
@@ -337,15 +380,17 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                     LOG.warn("async text_analyzer backfill failed for table {}; re-attach to retry", table, e);
                 }
             });
-            return;
+            return new LanceAttachResponse.Backfill(estimatedBytes, "none", threads);
         }
         try (Dataset dataset = LanceRegistry.openDataset(request.table(), request.storageOptions())) {
+            LanceTextAnalyzerBackfill.Options options = new LanceTextAnalyzerBackfill.Options(threadPool.generic(), threads, cancelled);
             try {
-                LanceTextAnalyzerBackfill.ensureDerivedColumns(dataset, textAnalyzer, resolved::get, LanceRegistry.allocator());
+                LanceTextAnalyzerBackfill.ensureDerivedColumns(dataset, textAnalyzer, resolved::get, LanceRegistry.allocator(), options);
             } catch (IllegalArgumentException e) {
                 throw new OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST, e);
             }
         }
+        return null;
     }
 
     /**
@@ -495,6 +540,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         Optional<String> tag,
         Optional<String> indexPlacement,
         boolean luceneBoundExceeded,
+        LanceAttachResponse.Backfill backfill,
         ActionListener<LanceAttachResponse> listener
     ) {
         Settings.Builder settings = Settings.builder()
@@ -542,7 +588,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                     if (pinnedVersion.isEmpty()) {
                         namespaceService.registerAttachedIndex(indexName, table, derivation.version(), storageOptions, tag.orElse(null));
                     }
-                    listener.onResponse(response(indexName, table, derivation, false, luceneBoundExceeded));
+                    listener.onResponse(response(indexName, table, derivation, false, luceneBoundExceeded, backfill));
                 }
 
                 @Override
@@ -555,7 +601,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                     // for the same table before claiming success; otherwise
                     // attach would silently take credit for an unrelated
                     // index.
-                    verifyExistingLanceIndex(indexName, table, derivation, storageOptions, luceneBoundExceeded, listener);
+                    verifyExistingLanceIndex(indexName, table, derivation, storageOptions, luceneBoundExceeded, backfill, listener);
                 }
             });
         }
@@ -567,6 +613,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         RestAttachAction.Derivation derivation,
         StorageOptions storageOptions,
         boolean luceneBoundExceeded,
+        LanceAttachResponse.Backfill backfill,
         ActionListener<LanceAttachResponse> listener
     ) {
         // This runs on the elected cluster manager, whose applied state
@@ -625,7 +672,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                 existingTag.isEmpty() ? null : existingTag
             );
         }
-        listener.onResponse(response(indexName, table, derivation, true, luceneBoundExceeded));
+        listener.onResponse(response(indexName, table, derivation, true, luceneBoundExceeded, backfill));
     }
 
     private static LanceAttachResponse response(
@@ -633,7 +680,8 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         String table,
         RestAttachAction.Derivation derivation,
         boolean alreadyAttached,
-        boolean luceneBoundExceeded
+        boolean luceneBoundExceeded,
+        LanceAttachResponse.Backfill backfill
     ) {
         return new LanceAttachResponse(
             indexName,
@@ -645,7 +693,8 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             derivation.mappingJson(),
             derivation.notes(),
             alreadyAttached,
-            luceneBoundExceeded
+            luceneBoundExceeded,
+            backfill
         );
     }
 

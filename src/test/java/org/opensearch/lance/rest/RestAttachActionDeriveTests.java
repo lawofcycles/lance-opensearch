@@ -506,7 +506,8 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
                 dataset,
                 overrides.textAnalyzerColumns(),
                 name -> english,
-                LanceRegistry.allocator()
+                LanceRegistry.allocator(),
+                LanceTextAnalyzerBackfill.Options.inline()
             );
             RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides);
             String mapping = derivation.mappingJson();
