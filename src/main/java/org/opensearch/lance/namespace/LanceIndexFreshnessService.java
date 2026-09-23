@@ -252,7 +252,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         String indexName = indexShard.shardId().getIndexName();
         Tracked entry = tracked.get(indexName);
         if (entry == null) {
-            Settings settings = indexShard.indexSettings().getSettings();
+            Settings settings = indexShard.indexSettings().getIndexMetadata().getSettings();
             if (settings.getAsLong(LanceEngineFactory.VERSION_SETTING, -1L) >= 0) {
                 return Outcome.notChecked(indexName, "the index is pinned to index.lance.version and never advances");
             }
@@ -516,7 +516,9 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
 
         @Override
         public Settings settings() {
-            return shard.indexSettings().getSettings();
+            // The index's own settings (current after a dynamic update),
+            // not the merged node and index view the shard also holds.
+            return shard.indexSettings().getIndexMetadata().getSettings();
         }
 
         /**

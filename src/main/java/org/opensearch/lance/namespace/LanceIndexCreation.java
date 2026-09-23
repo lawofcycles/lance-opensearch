@@ -45,7 +45,14 @@ final class LanceIndexCreation {
         Settings carried
     ) {
         Settings.Builder settings = Settings.builder();
-        settings.put(carried.filter(key -> key.startsWith("index.lance.")));
+        // Copied key by key: the previous settings may be the shard's
+        // merged node and index settings, and the node's secure settings
+        // must not travel into a CreateIndex request.
+        for (String key : carried.keySet()) {
+            if (key.startsWith("index.lance.")) {
+                settings.put(key, carried.get(key));
+            }
+        }
         settings.put("index.number_of_shards", 1)
             .put("index.number_of_replicas", 0)
             .put(LanceEngineFactory.TABLE_SETTING, table)

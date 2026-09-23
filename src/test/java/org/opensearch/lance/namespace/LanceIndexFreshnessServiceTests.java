@@ -29,6 +29,7 @@ import org.opensearch.action.admin.indices.delete.DeleteIndexAction;
 import org.opensearch.action.admin.indices.mapping.put.PutMappingAction;
 import org.opensearch.action.admin.indices.mapping.put.PutMappingRequest;
 import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.common.settings.MockSecureSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentHelper;
@@ -208,7 +209,17 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
 
     public void testTypeChangeRebuildsTheIndex() throws Exception {
         String tableUri = writeTable("rebuild");
-        Settings settings = Settings.builder().put("index.lance.uncovered_fragment_policy", "immediate").build();
+        // The shard's settings view carries the node's secure settings
+        // (the keystore seed) next to the index settings; the recreate
+        // must copy the index.lance.* keys and nothing else.
+        MockSecureSettings secure = new MockSecureSettings();
+        secure.setString("keystore.seed", "seed");
+        Settings settings = Settings.builder()
+            .put("index.lance.uncovered_fragment_policy", "immediate")
+            .put("index.number_of_shards", 1)
+            .put("index.refresh_interval", "5s")
+            .setSecureSettings(secure)
+            .build();
         FakeShard shard = FakeShard.overTable("rebuild", tableUri, settings);
         LanceIndexFreshnessService.Tracked entry = service.track(shard);
         service.check(entry);
@@ -234,6 +245,14 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
             "the previous index's lance settings are carried",
             "immediate",
             create.settings().get("index.lance.uncovered_fragment_policy")
+        );
+        assertFalse(
+            "no secure setting travels with the create: " + create.settings().keySet(),
+            create.settings().keySet().contains("keystore.seed")
+        );
+        assertFalse(
+            "only index.lance.* keys are carried: " + create.settings().keySet(),
+            create.settings().hasValue("index.refresh_interval")
         );
         assertTrue("the new mapping is the derived one", create.mappings().contains("\"properties\""));
         assertEquals(1, service.stats().rebuilds());
