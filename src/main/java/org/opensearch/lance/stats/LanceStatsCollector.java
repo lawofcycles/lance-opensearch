@@ -170,7 +170,9 @@ public final class LanceStatsCollector {
                 warmUpMode,
                 warmUps,
                 indices,
-                cloneStats
+                cloneStats,
+                0,
+                0L
             );
         }
         ColumnStore store = warmCache.columnStore();
@@ -202,7 +204,9 @@ public final class LanceStatsCollector {
             warmUpMode,
             warmUps,
             indices,
-            cloneStats
+            cloneStats,
+            warmCache.tableStatistics().size(),
+            warmCache.tableStatistics().collectMillisTotal()
         );
     }
 }

@@ -38,6 +38,7 @@ import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
+import org.opensearch.lance.plan.metadata.TableStatisticsCache;
 
 /**
  * Node scoped cache of everything a fragment path request needs to know
@@ -379,6 +380,7 @@ public final class LanceWarmCache implements Closeable {
     }
 
     private final ColumnStore columnStore;
+    private final TableStatisticsCache tableStatistics = new TableStatisticsCache();
     private final int maxSnapshots;
     private volatile boolean enabled;
     /** Guarded by {@code this}. */
@@ -639,10 +641,26 @@ public final class LanceWarmCache implements Closeable {
         }
         if (snapshot.cached && !keyServedByAnother(snapshot)) {
             columnStore.dropSnapshot(snapshot.key);
+            releaseTableStatistics(snapshot);
         }
         snapshot.closeNow();
         snapshotCloses.incrementAndGet();
         LOGGER.debug("closed snapshot {}", snapshot.key);
+    }
+
+    /**
+     * Drop the planner's table statistics of the version this snapshot
+     * read: the statistics cache keys on the dataset's URI and version,
+     * so the entry the plan construction filled while it held a lease
+     * on this snapshot goes when the snapshot does. Read before the
+     * dataset closes, because the URI comes from the open dataset.
+     */
+    private void releaseTableStatistics(Snapshot snapshot) {
+        try {
+            tableStatistics.release(snapshot.dataset.uri(), snapshot.version());
+        } catch (RuntimeException e) {
+            LOGGER.debug("could not release the table statistics of snapshot {}", snapshot.key, e);
+        }
     }
 
     /**
@@ -718,6 +736,17 @@ public final class LanceWarmCache implements Closeable {
         return columnStore;
     }
 
+    /**
+     * The node's cache of planner table statistics, keyed on (table URI,
+     * manifest version). Filled by the plan construction from the
+     * dataset of the snapshot it holds, and by the coordinator from the
+     * dataset it opens to enumerate fragments; an entry is dropped when
+     * the snapshot of its version closes.
+     */
+    public TableStatisticsCache tableStatistics() {
+        return tableStatistics;
+    }
+
     /** Off-heap bytes the column store holds, for the circuit breaker sampler. */
     public long columnCacheBytes() {
         return columnStore.allocatedBytes();
@@ -780,6 +809,7 @@ public final class LanceWarmCache implements Closeable {
             snapshot.retired.set(true);
             closeSnapshot(snapshot);
         }
+        tableStatistics.clear();
         columnStore.close();
     }
 }

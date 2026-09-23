@@ -50,11 +50,14 @@ import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
+import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.execute.FragmentFanOut;
 import org.opensearch.lance.plan.execute.MergeReducer;
 import org.opensearch.lance.plan.execute.PlanExecutor;
+import org.opensearch.lance.plan.metadata.TableStatistics;
+import org.opensearch.lance.plan.metadata.TableStatisticsCache;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.script.ScriptService;
@@ -135,6 +138,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      */
     private final LancePlannerFactory plannerFactory;
     /**
+     * This node's planner table statistics, keyed on (table URI,
+     * manifest version); the fan-out fills the entry of the version it
+     * enumerates fragments from, collecting from the dataset it has
+     * open, and every later request on the same version reads it.
+     */
+    private final TableStatisticsCache tableStatistics;
+    /**
      * Runs the coordinator plan: the {@code MergeExec (FanOutExec
      * (per node plan))} tree built per target executes as the per-node
      * fan-out and the reduce of the gathered responses.
@@ -157,7 +167,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         ActionFilters actionFilters,
         BigArrays bigArrays,
         ScriptService scriptService,
-        NodeClient client
+        NodeClient client,
+        LanceWarmCache warmCache
     ) {
         super(LanceCoordinatorAction.NAME, transportService, actionFilters, SearchRequest::new, LancePlugin.LANCE_COORDINATOR_THREAD_POOL);
         this.transportService = transportService;
@@ -172,6 +183,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.getKey()
         );
         this.plannerFactory = new LancePlannerFactory(nativeBudgetBytes, Runtime.getRuntime().maxMemory());
+        this.tableStatistics = warmCache.tableStatistics();
         this.planExecutor = new PlanExecutor(plannerFactory);
     }
 
@@ -449,10 +461,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // key their LanceWarmCache snapshot on it without asking Lance
         // for the latest version themselves.
         long observedVersion;
-        // The Arrow schema and total rows the planner model reads for
-        // the filter SQL derivation below, captured while the dataset
-        // is open.
+        // The Arrow schema and the table statistics the planner model
+        // reads for the filter SQL derivation below, captured while the
+        // dataset is open. The statistics come from this node's cache
+        // under the observed version and are collected from the open
+        // dataset only on the first request of that version.
         Schema arrowSchema;
+        TableStatistics statistics = null;
         long tableRows = 0L;
         try (Dataset dataset = LanceRegistry.openDataset(target.tableUri(), target.storageOptions(), target.pinnedVersionOrEmpty())) {
             observedVersion = dataset.version();
@@ -466,17 +481,35 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             for (Long rows : allFragmentRows) {
                 tableRows += rows;
             }
+            try {
+                statistics = tableStatistics.forDataset(dataset);
+            } catch (RuntimeException e) {
+                // Statistics are an input to plan quality, not to
+                // correctness: the model falls back to the physical
+                // row count rather than failing the search.
+                LOGGER.warn("lance.dispatch: table statistics of [{}] unavailable, planning without them", target.indexName(), e);
+            }
         }
         final long totalRows = tableRows;
-        LanceSchemas.IndexModel model = LanceSchemas.model(
-            target.indexName(),
-            arrowSchema,
-            target.multiFields(),
-            target.renamedFields(),
-            target.primaryKeyField(),
-            target.dateOverrideColumns(),
-            () -> totalRows
-        );
+        LanceSchemas.IndexModel model = statistics != null
+            ? LanceSchemas.model(
+                target.indexName(),
+                arrowSchema,
+                target.multiFields(),
+                target.renamedFields(),
+                target.primaryKeyField(),
+                target.dateOverrideColumns(),
+                statistics
+            )
+            : LanceSchemas.model(
+                target.indexName(),
+                arrowSchema,
+                target.multiFields(),
+                target.renamedFields(),
+                target.primaryKeyField(),
+                target.dateOverrideColumns(),
+                () -> totalRows
+            );
         FragmentQuerySpec spec = new FragmentQuerySpec(
             PlanExecutor.resolveScanFilterSql(source == null ? null : source.query(), model, target.sqlExcludedColumns(), plannerFactory),
             baseSpec.query(),

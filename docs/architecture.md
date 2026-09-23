@@ -132,6 +132,7 @@ src/main/java/org/opensearch/lance/
 │   ├── translate/   #   search body -> logical plan
 │   ├── rel/         #   logical nodes; rel/physical/ holds the Lucene-side operators
 │   ├── rules/       #   pushdown, fuse and converter rules
+│   ├── metadata/    #   table statistics from Lance metadata; Calcite metadata handlers
 │   ├── lancesql/    #   predicate -> Lance (DataFusion) SQL printer
 │   ├── substrait/   #   aggregate -> Substrait bytes
 │   ├── execute/     #   plan executor: fan-out, merge, per-node route resolution
@@ -322,6 +323,24 @@ tree the planner cannot handle at all falls back to Lucene execution — a plann
 surfaces as a request error. `GET /{index}/_lance/explain` runs exactly this pipeline without
 executing anything and prints both plans; it is the first tool to reach for when developing a
 rule.
+
+The statistics the planner reads come from Lance table metadata, not from scanning rows. Once per
+manifest version a node collects, from the open dataset, the fragment list with each fragment's
+live row count and data file count (`getFragmentStatistics`), the physical rows behind them (the
+difference is the deleted row count), the indexes on the table with their type, fragment coverage
+and size (`getIndexes`), and per index the figures Lance's `getIndexStatistics` reports (indexed
+and unindexed rows; for a bitmap index the number of bitmaps, which is the column's distinct
+value estimate). Zone maps (`getZonemapStats`) are read lazily on the first request for a column
+and memoised with the version. The result is cached per `(table URI, manifest version)`, so a
+version pays the collection on its first request and every later request reads the entry; the
+entry goes when the snapshot cache closes that version, and a table that follows its manifest
+keeps at most the current and the previous version. The cache is per node and the coordinator
+and data node roles fill it separately: the coordinator from the dataset it opens to enumerate
+fragments, a data node from the warm cache snapshot it plans against. `GET /_lance/stats` reports
+the entry count and the accumulated collection time under `plan.statistics`. The Calcite side
+reads the statistics through `LanceTable.getStatistic()` (row count) and through Lance's own
+`RowCount` and `DistinctRowCount` metadata handlers for the scan, chained in front of Calcite's
+defaults.
 
 The planner was delivered in phases, and the later ones are still in flight: first the
 foundations (dependencies, schema, conventions, cost, the explain endpoint), then the aggregation

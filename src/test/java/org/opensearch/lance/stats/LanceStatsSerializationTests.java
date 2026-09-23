@@ -96,7 +96,9 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 ),
                 new LanceNodeStats.IndexReaderStats("small", 120L, 120L, 14L, false, Map.of("rating", List.of("BTree", "Bitmap")))
             ),
-            List.of(new LanceNodeStats.LocalCloneStats("cloned", 4321L, 9L))
+            List.of(new LanceNodeStats.LocalCloneStats("cloned", 4321L, 9L)),
+            5,
+            123L
         );
     }
 
@@ -134,6 +136,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"indexes\":[{\"name\":\"rating_idx\",\"type\":\"BTree\",\"column\":\"rating\",\"state\":\"done\",\"seconds\":0.4},"
                     + "{\"name\":\"body_idx\",\"type\":\"Inverted\",\"column\":\"body\",\"state\":\"failed\",\"seconds\":1.25,"
                     + "\"detail\":\"boom\"}]}]},"
+                    + "\"plan\":{\"statistics\":{\"tables\":5,\"collect_millis_total\":123}},"
                     + "\"indices\":{\"big\":{\"rows\":3000000000,\"shard_reader_rows\":2000000000,\"nested_docs\":0,"
                     + "\"lucene_bound_exceeded\":true,\"index_types\":{},"
                     + "\"renamed_fields\":[{\"from\":\"ts\",\"to\":\"event_ts\",\"lance_field_id\":1}]},"
@@ -216,6 +219,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         assertTrue("a live host reports available memory: " + stats.ftsAdmissionAvailableBytes(), stats.ftsAdmissionAvailableBytes() > 0L);
         assertEquals("none", stats.warmUpMode());
         assertTrue(stats.warmUps().isEmpty());
+        assertEquals(0, stats.planStatisticsTables());
+        assertEquals(0L, stats.planStatisticsCollectMillisTotal());
     }
 
     public void testCollectorReadsTheWarmCache() throws Exception {
@@ -259,6 +264,46 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             LanceNodeStats released = collector.collect();
             assertEquals("the retired snapshot closed with its last lease", 0, released.snapshotCount());
             assertEquals(0, released.retiredSnapshotCount());
+        }
+    }
+
+    public void testCollectorReadsThePlanStatisticsCache() throws Exception {
+        String uri = LanceTableFactory.writeHintFixtureTable(createTempDir(), "plan-stats-" + getTestName(), 2, 50);
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            LanceWarmCache cache = new LanceWarmCache(allocator, 1024L * 1024, 8, true)
+        ) {
+            LanceStatsCollector collector = new LanceStatsCollector(cache, () -> 0L, () -> null);
+            LanceNodeStats empty = collector.collect();
+            assertEquals(0, empty.planStatisticsTables());
+            assertEquals(0L, empty.planStatisticsCollectMillisTotal());
+            try (
+                LanceWarmCache.Lease lease = cache.acquire(
+                    "uuid",
+                    uri,
+                    StorageOptions.empty(),
+                    Optional.empty(),
+                    "",
+                    LancePrimaryKeyType.NONE,
+                    LanceOverrides.EMPTY
+                )
+            ) {
+                cache.tableStatistics().forDataset(lease.snapshot().dataset());
+                LanceNodeStats held = collector.collect();
+                assertEquals(1, held.planStatisticsTables());
+                assertTrue(
+                    "one collection counts at least one millisecond: " + held.planStatisticsCollectMillisTotal(),
+                    held.planStatisticsCollectMillisTotal() >= 1L
+                );
+                cache.tableStatistics().forDataset(lease.snapshot().dataset());
+                assertEquals(
+                    "a cache hit collects nothing",
+                    held.planStatisticsCollectMillisTotal(),
+                    collector.collect().planStatisticsCollectMillisTotal()
+                );
+                cache.retire("uuid", lease.snapshot().version() + 1);
+            }
+            assertEquals("the entry went with its snapshot", 0, collector.collect().planStatisticsTables());
         }
     }
 }
