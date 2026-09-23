@@ -142,8 +142,9 @@ public final class LanceEngineFactory implements EngineFactory {
     /**
      * Pin the Lance manifest version an index reads. Non-negative values pin
      * the dataset to that version; the default {@code -1L} means "follow the
-     * latest version" and lets {@link org.opensearch.lance.namespace.LanceNamespaceService}'s
-     * poll advance the reader as new fragments land.
+     * latest version" and lets the freshness check of
+     * {@link org.opensearch.lance.namespace.LanceIndexFreshnessService}
+     * advance the reader as new fragments land.
      */
     public static final String VERSION_SETTING = "index.lance.version";
     /**
@@ -151,7 +152,8 @@ public final class LanceEngineFactory implements EngineFactory {
      * {@link #VERSION_SETTING}, which is an immutable pin, a tag can be
      * moved to another version on the Lance side; the engine resolves the
      * tag to a version every time it opens or refreshes the reader, and
-     * {@link org.opensearch.lance.namespace.LanceNamespaceService}'s poll
+     * the freshness check of
+     * {@link org.opensearch.lance.namespace.LanceIndexFreshnessService}
      * triggers that refresh when the resolved version differs from the
      * served one. Empty (the default) means the index does not follow a
      * tag. Attach refuses a body that sets both this and
@@ -593,7 +595,7 @@ public final class LanceEngineFactory implements EngineFactory {
          * The per-column mapping overrides as the index settings carry
          * them now (base type overrides and keyword sub-fields). Read
          * per reader open instead of captured at engine construction:
-         * the namespace poll rewrites {@code index.lance.overrides} when
+         * the freshness check rewrites {@code index.lance.overrides} when
          * the Lance table renames an overridden column, and the reader
          * opened for the new manifest version must classify columns and
          * resolve sub-field paths through the rewritten keys.

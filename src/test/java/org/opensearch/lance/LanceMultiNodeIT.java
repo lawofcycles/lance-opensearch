@@ -2138,6 +2138,37 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 checksBefore.get(managerName),
                 checksAfter.get(managerName)
             );
+
+            // The keyword to lance_text rebuild is issued from the holder
+            // too: it deletes the index and creates it again through the
+            // manager, with the internal create header travelling in the
+            // request's thread context.
+            String keywordTable = "kw-" + suffix;
+            LanceTableFactory.writeKeywordOnlyTable(scratchDir, keywordTable, 5);
+            String keywordUri = scratchDir.resolve(keywordTable + ".lance").toString();
+            Response attachKeyword = postJson("/_lance/attach", "{\"table\":\"" + keywordUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attachKeyword.getStatusLine().getStatusCode());
+            client().performRequest(new Request("GET", "/_cluster/health/" + keywordTable + "?wait_for_status=green&timeout=30s"));
+            String keywordHolder = readAll(client().performRequest(new Request("GET", "/_cat/shards/" + keywordTable + "?h=node"))).trim();
+            assertNotEquals(managerName, keywordHolder);
+            String build = readAll(postJson("/_lance/build_indexes/" + keywordTable, "{\"fts_columns\":[\"label\"]}"));
+            assertTrue("the FTS index is built: " + build, build.contains("\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]"));
+            assertBusy(() -> {
+                try {
+                    String mapping = readAll(client().performRequest(new Request("GET", "/" + keywordTable + "/_mapping")));
+                    assertTrue("label flipped to lance_text: " + mapping, mapping.contains("\"label\":{\"type\":\"lance_text\""));
+                } catch (ResponseException e) {
+                    throw new AssertionError("index temporarily unavailable during the rebuild: " + e.getMessage(), e);
+                }
+            }, 30, TimeUnit.SECONDS);
+            client().performRequest(new Request("GET", "/_cluster/health/" + keywordTable + "?wait_for_status=green&timeout=30s"));
+            String match = readAll(
+                postJson("/" + keywordTable + "/_search", "{\"query\":{\"lance_match\":{\"field\":\"label\",\"query\":\"3\"}}}")
+            );
+            assertEquals("the rebuilt index answers full text queries: " + match, 1, extractIntPath(match, "hits", "total", "value"));
+            try {
+                client().performRequest(new Request("DELETE", "/" + keywordTable));
+            } catch (Exception ignored) {}
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));

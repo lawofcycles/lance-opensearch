@@ -679,7 +679,7 @@ public final class LanceWarmCache implements Closeable {
 
     /**
      * Retire every snapshot of {@code indexUuid} whose version is not
-     * {@code currentVersion}: the namespace poll saw the table (or its
+     * {@code currentVersion}: the freshness check saw the table (or its
      * tag) move there, so requests will key on the new version from now
      * on. Snapshots nobody references close at once; the others close
      * when their last lease is released.
