@@ -38,6 +38,7 @@ import org.opensearch.lance.query.LanceMultiMatchQueryBuilder;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.sort.SortBuilder;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -102,13 +103,110 @@ public final class SearchRequestToRel {
         validate(source, shape != null);
         RelBuilder relBuilder = scanBuilder(model, factory);
         int size = source.size() < 0 ? 10 : source.size();
+        RelNode root = queryRoot(source.query(), shape, model, relBuilder);
         if (shape != null) {
-            RelNode root = lanceShapeRel(shape, model, relBuilder);
             // A size 0 full text or knn request keeps the bare query
             // tree: it asks for the count, not a page.
-            return size == 0 ? root : hitsOver(root, source, size, model);
+            return size == 0 ? root : hitsOver(root, source.sorts(), source.searchAfter(), size, null, 0, model);
         }
-        QueryBuilder query = source.query();
+        if (size == 0) {
+            return AggregationToRel.translate(source.aggregations(), model, relBuilder);
+        }
+        return hitsOver(relBuilder.build(), source.sorts(), source.searchAfter(), size, null, 0, model);
+    }
+
+    /**
+     * The request elements the coordinator plans a fragment request
+     * from: the top level query after the coordinator rewrite, the
+     * {@code post_filter}, the sort clauses and cursor, the leading hits
+     * skipped ({@code from}), the rows every executor returns
+     * ({@code fetch}, the request's {@code from + size}; 0 for a count
+     * or aggregation request), the aggregations, and whether the
+     * aggregation tree may plan into the scan at all (the pushdown
+     * setting and the structural allow list, both read by the caller).
+     */
+    public record ExecutionShape(QueryBuilder query, QueryBuilder postFilter, List<SortBuilder<?>> sorts, Object[] searchAfter, int from,
+        int fetch, AggregatorFactories.Builder aggregations, boolean planAggregations) {
+
+        public boolean hasAggregations() {
+            return aggregations != null && !aggregations.getAggregatorFactories().isEmpty();
+        }
+
+        public boolean hits() {
+            return fetch > 0;
+        }
+    }
+
+    /**
+     * Translates one request for execution on the fragment path. The
+     * tree is the one {@link #translate} builds for the shapes the
+     * explain endpoint accepts, so the plan the coordinator ships is the
+     * plan explain prints; the envelope is the fragment runtime's rather
+     * than explain's. Elements that shape the fetch phase only
+     * ({@code _source}, {@code fields}, {@code track_scores},
+     * {@code version}, ...) do not reach this method; {@code from} and
+     * {@code post_filter} do and ride on the {@link LanceHitShape}.
+     *
+     * <p>The query clause must translate: a query outside the
+     * translator's vocabulary throws {@link UnsupportedOperationException}
+     * naming the element, and the caller decides between a Lucene plan
+     * over the request's own builder and a refusal (a filtered knn).
+     * Every other element is best effort, the way the fragment executor
+     * used to decide it per part: an aggregation tree the translator
+     * refuses, a sort clause without a collation spelling, a page next
+     * to aggregations, aggregations next to a {@code post_filter}, or
+     * aggregations over a full text or knn root return the query root
+     * alone, and the executor runs that envelope through Lucene over
+     * the planned query.
+     */
+    public static RelNode translateForExecution(ExecutionShape shape, LanceSchemas.IndexModel model, LancePlannerFactory factory) {
+        LanceShape lanceShape = detectLanceShape(shape.query());
+        RelBuilder relBuilder = scanBuilder(model, factory);
+        RelNode root = queryRoot(shape.query(), lanceShape, model, relBuilder);
+        boolean hasAggregations = shape.hasAggregations();
+        if (!shape.hits()) {
+            if (!hasAggregations || !shape.planAggregations() || lanceShape != null || shape.postFilter() != null) {
+                // A pushed aggregate reports hits.total from its own
+                // count, which a post filter would have to narrow; the
+                // aggregators and the Lucene count serve that shape.
+                return root;
+            }
+            if (!shape.aggregations().getPipelineAggregatorFactories().isEmpty()) {
+                return root;
+            }
+            try {
+                return AggregationToRel.translate(shape.aggregations(), model, relBuilder);
+            } catch (UnsupportedOperationException notPlanned) {
+                return root;
+            }
+        }
+        if (hasAggregations) {
+            // No plan combines an aggregate with a page: the collector
+            // and the aggregators both run over the planned query.
+            return root;
+        }
+        try {
+            return hitsOver(root, shape.sorts(), shape.searchAfter(), shape.fetch(), shape.postFilter(), shape.from(), model);
+        } catch (UnsupportedOperationException notPlanned) {
+            // A sort clause without a collation spelling (geo distance,
+            // script, nested, mode, literal missing): the Lucene
+            // collector serves the page over the planned query.
+            return root;
+        }
+    }
+
+    /**
+     * The query root over the scan the builder holds, left on the
+     * builder as well: the {@link LanceFtsMatch} / {@link LanceKnnSearch}
+     * node of a detected shape, the {@code Filter} of a scalar query, or
+     * the bare scan for an absent or {@code match_all} query.
+     */
+    private static RelNode queryRoot(QueryBuilder query, LanceShape shape, LanceSchemas.IndexModel model, RelBuilder relBuilder) {
+        if (shape != null) {
+            RelNode root = lanceShapeRel(shape, model, relBuilder);
+            relBuilder.push(root);
+            return root;
+        }
         if (query != null && !(query instanceof MatchAllQueryBuilder)) {
             // The filter is created directly rather than through
             // RelBuilder.filter so a constant predicate (match_none)
@@ -118,10 +216,7 @@ public final class SearchRequestToRel {
             RexNode predicate = RexUtil.flatten(relBuilder.getRexBuilder(), QueryToRex.translate(query, model, relBuilder));
             relBuilder.push(LogicalFilter.create(relBuilder.build(), predicate));
         }
-        if (size == 0) {
-            return AggregationToRel.translate(source.aggregations(), model, relBuilder);
-        }
-        return hitsOver(relBuilder.build(), source, size, model);
+        return relBuilder.peek();
     }
 
     /**
@@ -178,15 +273,26 @@ public final class SearchRequestToRel {
      * {@code _source} over the table columns, sort values when the
      * request sorts, and a numeric score when nothing does (a sorted
      * page reports {@code _score: null} unless {@code track_scores},
-     * which the envelope refuses today).
+     * which the explain envelope refuses). {@code fetch} is the rows
+     * every executor returns ({@code from + size} at runtime, the
+     * request's {@code size} for explain), {@code postFilter} and
+     * {@code from} ride on the hit shape.
      */
-    private static RelNode hitsOver(RelNode root, SearchSourceBuilder source, int size, LanceSchemas.IndexModel model) {
-        List<RelFieldCollation> collations = source.sorts() == null || source.sorts().isEmpty()
+    private static RelNode hitsOver(
+        RelNode root,
+        List<SortBuilder<?>> sorts,
+        Object[] searchAfterValues,
+        int fetch,
+        QueryBuilder postFilter,
+        int from,
+        LanceSchemas.IndexModel model
+    ) {
+        List<RelFieldCollation> collations = sorts == null || sorts.isEmpty()
             ? List.of()
-            : SortResolution.collationsOf(source.sorts(), root.getRowType(), model);
-        List<Object> searchAfter = source.searchAfter() == null ? null : Arrays.asList(source.searchAfter());
+            : SortResolution.collationsOf(sorts, root.getRowType(), model);
+        List<Object> searchAfter = searchAfterValues == null ? null : Arrays.asList(searchAfterValues);
         RelOptCluster cluster = root.getCluster();
-        LanceTopK topK = new LanceTopK(cluster, cluster.traitSetOf(Convention.NONE), root, collations, size, 0, searchAfter);
+        LanceTopK topK = new LanceTopK(cluster, cluster.traitSetOf(Convention.NONE), root, collations, fetch, 0, searchAfter);
         List<String> outputColumns = new ArrayList<>();
         for (String name : root.getRowType().getFieldNames()) {
             if (!name.startsWith("_")) {
@@ -198,7 +304,18 @@ public final class SearchRequestToRel {
         for (RelFieldCollation collation : collations) {
             scoreOrdered |= SortResolution.isScoreCollation(root.getRowType(), collation);
         }
-        return new LanceHitShape(cluster, cluster.traitSetOf(Convention.NONE), topK, outputColumns, true, true, scoreOrdered, sorted);
+        return new LanceHitShape(
+            cluster,
+            cluster.traitSetOf(Convention.NONE),
+            topK,
+            outputColumns,
+            true,
+            true,
+            scoreOrdered,
+            sorted,
+            postFilter,
+            from
+        );
     }
 
     /**
@@ -214,16 +331,7 @@ public final class SearchRequestToRel {
      * unsupported element, exactly as {@link #translate}.
      */
     public static RelNode translateQuery(QueryBuilder query, LanceSchemas.IndexModel model, LancePlannerFactory factory) {
-        RelBuilder relBuilder = scanBuilder(model, factory);
-        LanceShape shape = detectLanceShape(query);
-        if (shape != null) {
-            return lanceShapeRel(shape, model, relBuilder);
-        }
-        if (query != null && !(query instanceof MatchAllQueryBuilder)) {
-            RexNode predicate = RexUtil.flatten(relBuilder.getRexBuilder(), QueryToRex.translate(query, model, relBuilder));
-            relBuilder.push(LogicalFilter.create(relBuilder.build(), predicate));
-        }
-        return relBuilder.build();
+        return queryRoot(query, detectLanceShape(query), model, scanBuilder(model, factory));
     }
 
     /**
@@ -533,28 +641,6 @@ public final class SearchRequestToRel {
             return LanceFtsMatch.Kind.FTS_BOOST;
         }
         throw unsupported("full text clause [" + ftsClause.getWriteableName() + "]");
-    }
-
-    /**
-     * Translates an aggregation tree alone, without the request body
-     * envelope checks: the fragment query routing has already gated the
-     * envelope (size 0, no post_filter, a scalar or absent query whose
-     * filter travels as Lance SQL outside the plan) and holds only the
-     * builders. Throws {@link UnsupportedOperationException} naming the
-     * first unsupported element, exactly as {@link #translate}.
-     */
-    public static RelNode translateAggregations(
-        AggregatorFactories.Builder aggregations,
-        LanceSchemas.IndexModel model,
-        LancePlannerFactory factory
-    ) {
-        if (aggregations == null || aggregations.getAggregatorFactories().isEmpty()) {
-            throw unsupported("no aggregations");
-        }
-        if (!aggregations.getPipelineAggregatorFactories().isEmpty()) {
-            throw unsupported("pipeline aggregation");
-        }
-        return AggregationToRel.translate(aggregations, model, scanBuilder(model, factory));
     }
 
     /**

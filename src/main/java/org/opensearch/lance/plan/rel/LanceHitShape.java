@@ -13,6 +13,7 @@ import org.apache.calcite.rel.SingleRel;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.opensearch.index.query.QueryBuilder;
 
 import java.util.List;
 import java.util.Objects;
@@ -32,6 +33,14 @@ import java.util.Objects;
  * synthetic column per rendered part: {@code _id}, {@code _source},
  * {@code _score} and {@code _sort} (the per-hit sort values), each
  * present when its flag is on.
+ *
+ * <p>{@code postFilter} is the request's {@code post_filter}, a
+ * predicate applied to the page after the query matched and outside
+ * the aggregations' view; a page under a post filter cannot fold into
+ * the Lance scan, because the scan would cut the page before the
+ * filter narrows it. {@code from} is the number of leading hits the
+ * coordinator skips; the top-k below already fetches {@code from}
+ * plus the page, so the node only records it.
  */
 public final class LanceHitShape extends SingleRel {
 
@@ -40,6 +49,8 @@ public final class LanceHitShape extends SingleRel {
     private final boolean includeId;
     private final boolean includeScore;
     private final boolean includeSortValues;
+    private final QueryBuilder postFilter;
+    private final int from;
 
     /**
      * @param outputColumns the table columns {@code _source} renders
@@ -58,12 +69,36 @@ public final class LanceHitShape extends SingleRel {
         boolean includeScore,
         boolean includeSortValues
     ) {
+        this(cluster, traitSet, input, outputColumns, includeSource, includeId, includeScore, includeSortValues, null, 0);
+    }
+
+    /**
+     * @param postFilter the request's {@code post_filter}, or null
+     * @param from the leading hits the coordinator skips, 0 for the first page
+     */
+    public LanceHitShape(
+        RelOptCluster cluster,
+        RelTraitSet traitSet,
+        RelNode input,
+        List<String> outputColumns,
+        boolean includeSource,
+        boolean includeId,
+        boolean includeScore,
+        boolean includeSortValues,
+        QueryBuilder postFilter,
+        int from
+    ) {
         super(cluster, traitSet, input);
         this.outputColumns = List.copyOf(Objects.requireNonNull(outputColumns, "outputColumns"));
         this.includeSource = includeSource;
         this.includeId = includeId;
         this.includeScore = includeScore;
         this.includeSortValues = includeSortValues;
+        this.postFilter = postFilter;
+        if (from < 0) {
+            throw new IllegalArgumentException("from must not be negative, got " + from);
+        }
+        this.from = from;
     }
 
     /** The table columns {@code _source} renders, in schema order. */
@@ -91,6 +126,16 @@ public final class LanceHitShape extends SingleRel {
         return includeSortValues;
     }
 
+    /** The request's {@code post_filter}, or null when it carries none. */
+    public QueryBuilder postFilter() {
+        return postFilter;
+    }
+
+    /** The leading hits the coordinator skips; 0 for the first page. */
+    public int from() {
+        return from;
+    }
+
     @Override
     public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
         return new LanceHitShape(
@@ -101,7 +146,9 @@ public final class LanceHitShape extends SingleRel {
             includeSource,
             includeId,
             includeScore,
-            includeSortValues
+            includeSortValues,
+            postFilter,
+            from
         );
     }
 
@@ -125,13 +172,15 @@ public final class LanceHitShape extends SingleRel {
         return builder.build();
     }
 
-    /** Prints the columns and the flags, so the digest and the explain output carry them. */
+    /** Prints the columns and the flags (and the post filter and offset when set), so the digest and the explain output carry them. */
     @Override
     public RelWriter explainTerms(RelWriter pw) {
         return super.explainTerms(pw).item("columns", outputColumns)
             .item("source", includeSource)
             .item("id", includeId)
             .item("score", includeScore)
-            .item("sortValues", includeSortValues);
+            .item("sortValues", includeSortValues)
+            .itemIf("postFilter", postFilter == null ? null : LanceFtsMatch.compactJson(postFilter), postFilter != null)
+            .itemIf("from", from, from > 0);
     }
 }

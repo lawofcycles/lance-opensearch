@@ -8,75 +8,39 @@ package org.opensearch.lance.plan.execute;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
-import org.apache.calcite.plan.Convention;
-import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
-import org.apache.calcite.rel.type.RelDataType;
-import org.apache.calcite.rex.RexNode;
-import org.apache.calcite.tools.RelBuilder;
-import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.SimpleCollector;
-import org.apache.lucene.search.SortField;
-import org.apache.lucene.search.SortedNumericSortField;
-import org.apache.lucene.search.SortedSetSortField;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
-import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.index.query.BoolQueryBuilder;
-import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
-import org.opensearch.index.query.QueryShardContext;
-import org.opensearch.index.query.Rewriteable;
-import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LanceOverrides;
-import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.dispatch.LanceFragmentQueryRequest;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceDirectoryReader;
-import org.opensearch.lance.execute.LanceAggregateResults;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
-import org.opensearch.lance.plan.calcite.LanceSchemas;
-import org.opensearch.lance.plan.lancesql.RexToLanceSql;
-import org.opensearch.lance.plan.rel.LanceTableScan;
-import org.opensearch.lance.plan.rel.LanceTopK;
-import org.opensearch.lance.plan.rel.PushedOperation;
-import org.opensearch.lance.plan.rel.PushedOperation.PushedAggregate;
-import org.opensearch.lance.plan.rel.PushedOperation.PushedFts;
-import org.opensearch.lance.plan.rel.PushedOperation.PushedKnn;
-import org.opensearch.lance.plan.rel.PushedOperation.PushedTopK;
 import org.opensearch.lance.plan.rel.physical.FanOutExec;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
 import org.opensearch.lance.plan.rel.physical.ShardPathFallbackExec;
-import org.opensearch.lance.plan.rules.SortResolution;
-import org.opensearch.lance.plan.translate.QueryToRex;
-import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.query.LanceFtsQuery;
-import org.opensearch.lance.query.LanceKnnQuery;
-import org.opensearch.lance.query.LanceKnnQueryBuilder;
-import org.opensearch.lance.query.LanceScanFilterQuery;
-import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.approximate.ApproximateScoreQuery;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
-import org.opensearch.search.sort.SortAndFormats;
 import org.opensearch.tasks.CancellableTask;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -84,7 +48,6 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicLong;
@@ -92,24 +55,18 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
- * Executes the planner's physical operators. The coordinator side
- * traverses a {@code MergeExec (FanOutExec (per node plan))} tree
+ * Executes the planner's physical operators on the coordinator side:
+ * it traverses a {@code MergeExec (FanOutExec (per node plan))} tree
  * ({@link #execute}): the {@link FanOutExec} runs as one
  * {@link FragmentFanOut} of per-node transport requests over the
  * fragment groups its partitioning cut, and the {@link MergeExec}
  * runs as the {@link MergeReducer} absorption of the gathered
- * responses. The fragment side resolves what a per-node request
- * executes: the pushed full text / knn scan of a planned query
- * ({@link #plannedLanceQuery}), the ordered, limited Lance scan of a
- * planned sorted page ({@link #plannedTopK}), the Substrait aggregate
- * scan of a planned aggregation ({@link #plannedAggregate}), the
- * Lance SQL of a scalar filter ({@link #resolveScanFilterSql}), and
- * the matched-count route of the scan ({@link #computeMatched} with
- * the count-only scans below it). The Lucene collector and aggregator
- * bodies stay with the transport actions; this class owns the planner
- * facing decisions and the Lance-side scans they lead to, so the
- * hand-rolled routing branches the transport actions used to carry
- * live behind the planner's operators instead.
+ * responses. The per node plan below the fan-out travels to the
+ * fragment executors as a {@link FragmentPlan}; what they need beyond
+ * that plan is the matched-count route of the scan
+ * ({@link #computeMatched} with the count-only scans below it), which
+ * this class owns as well. The Lucene collector and aggregator bodies
+ * stay with the transport actions.
  */
 public final class PlanExecutor {
 
@@ -289,420 +246,6 @@ public final class PlanExecutor {
         return groups;
     }
 
-    // ------------------------------------------------------------------
-    // Fragment side: the planned scan operators.
-    // ------------------------------------------------------------------
-
-    /**
-     * Resolve the two query shapes the planner folds into the Lance
-     * dataset scan: a {@code bool} whose {@code must} is exactly one
-     * Lance FTS clause with scalar {@code filter} / {@code must_not}
-     * companions, and a {@code lance_knn} with an inner {@code filter}.
-     * {@link SearchRequestToRel#translateQuery} builds the
-     * {@code LanceFtsMatch} / {@code LanceKnnSearch} tree, the Volcano
-     * run fires the fuse rules, and the pushed operation's filter SQL
-     * rides on the {@link LanceFtsQuery} / {@link LanceKnnQuery} whose
-     * Weight hands it to the scan as a prefilter. The clause's own
-     * Lucene query is still built through {@code toQuery}, so the
-     * mapping validation (field types, vector dimension) and the
-     * clause boost behave exactly as on the unplanned path.
-     *
-     * <p>Returns null for every shape the planner does not fold — a
-     * bare FTS clause (the plain {@code toQuery} path already builds
-     * the same scan and attaches the top-k), an unfiltered
-     * {@code lance_knn}, a scalar tree, a bool the shape detection or
-     * the scalar translation refuses, and any FTS shape under a reader
-     * wrapper (the collapse would move clauses out of the wrapper's
-     * view) — and the caller keeps the Lucene composition.
-     *
-     * <p>A {@code lance_knn} whose inner filter does not plan (the
-     * translator refuses a clause, a field is unmapped or ip mapped,
-     * or the predicate has no SQL spelling) throws
-     * {@link IllegalArgumentException} and answers 400: the filter is
-     * a prefilter by contract and silently dropping it would return
-     * wrong nearest rows. The knn shape resolves under a reader
-     * wrapper too, because the inner filter is the caller's own
-     * predicate, applied before DLS narrows the hits on the Lucene
-     * side.
-     */
-    public Query plannedLanceQuery(
-        QueryBuilder rewritten,
-        QueryShardContext qsc,
-        boolean hasSecurityWrapper,
-        int scanLimit,
-        LanceFragmentQueryRequest request,
-        IndexMetadata indexMetadata,
-        Dataset dataset,
-        Map<String, LinkedHashMap<String, String>> multiFields,
-        IndexReader reader
-    ) throws IOException {
-        boolean knnShape = rewritten instanceof LanceKnnQueryBuilder;
-        if (!knnShape && !(rewritten instanceof BoolQueryBuilder)) {
-            return null;
-        }
-        if (!knnShape && hasSecurityWrapper) {
-            return null;
-        }
-        LanceKnnQueryBuilder knn = knnShape ? (LanceKnnQueryBuilder) rewritten : null;
-        if (knn != null && knn.filter() == null) {
-            return null;
-        }
-        Set<String> excludedColumns = sqlExcludedColumns(LanceOverrides.of(indexMetadata.getSettings()));
-        if (knn != null && QueryToRex.referencesAny(knn.filter(), excludedColumns)) {
-            throw knnFilterRefusal(knn, "predicates on ip and geo_point fields are evaluated over encoded doc values on the Lucene side");
-        }
-        if (knn == null && rewritten instanceof BoolQueryBuilder bool && QueryToRex.referencesAny(bool, excludedColumns)) {
-            // An ip or geo predicate has no Lance SQL form; keep the
-            // whole bool on the Lucene composition.
-            return null;
-        }
-        RelNode physical;
-        try {
-            LanceSchemas.IndexModel model = queryModel(request.indexName(), indexMetadata, dataset, multiFields, reader);
-            physical = plannerFactory.plan(SearchRequestToRel.translateQuery(rewritten, model, plannerFactory));
-        } catch (UnsupportedOperationException unsupported) {
-            if (knn != null) {
-                throw knnFilterRefusal(knn, unsupported.getMessage());
-            }
-            return null;
-        }
-        if (!(physical instanceof LanceTableScan scan)) {
-            if (knn != null) {
-                throw knnFilterRefusal(knn, "the filter has no Lance SQL form");
-            }
-            return null;
-        }
-        PushedFts pushedFts = scan.pushedFts().orElse(null);
-        if (pushedFts != null) {
-            Query clause = pushedFts.fts().ftsClause().toQuery(qsc);
-            if (clause instanceof LanceFtsQuery fts) {
-                LanceFtsQuery pushed = fts.withScanFilterSql(pushedFts.filterSql());
-                int ftsScanLimit = scanLimit == LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED ? LanceFtsQuery.SCAN_LIMIT_UNBOUNDED : scanLimit;
-                return ftsScanLimit == LanceFtsQuery.SCAN_LIMIT_UNBOUNDED ? pushed : pushed.withScanLimit(ftsScanLimit);
-            }
-            if (clause instanceof BoostQuery boosted && boosted.getQuery() instanceof LanceFtsQuery fts) {
-                // The boosted clause keeps its BoostQuery wrapper and
-                // the scan stays unbounded, like the top-level boosted
-                // FTS path.
-                return new BoostQuery(fts.withScanFilterSql(pushedFts.filterSql()), boosted.getBoost());
-            }
-            return null;
-        }
-        PushedKnn pushedKnn = scan.pushedKnn().orElse(null);
-        if (pushedKnn != null) {
-            Query clause = pushedKnn.knn().knnClause().toQuery(qsc);
-            if (clause instanceof LanceKnnQuery knnQuery) {
-                return knnQuery.withScanFilterSql(pushedKnn.filterSql());
-            }
-            if (clause instanceof BoostQuery boosted && boosted.getQuery() instanceof LanceKnnQuery knnQuery) {
-                return new BoostQuery(knnQuery.withScanFilterSql(pushedKnn.filterSql()), boosted.getBoost());
-            }
-        }
-        if (knn != null) {
-            throw knnFilterRefusal(knn, "the filter has no Lance SQL form");
-        }
-        return null;
-    }
-
-    /**
-     * The 400 a filtered {@code lance_knn} answers when its filter
-     * cannot travel to the Lance scan, naming the filter clause's
-     * builder class so the caller sees which part was refused.
-     */
-    private static IllegalArgumentException knnFilterRefusal(LanceKnnQueryBuilder knn, String reason) {
-        return new IllegalArgumentException(
-            "[lance_knn] filter type ["
-                + knn.filter().getClass().getSimpleName()
-                + "] is not supported by the pre-filter translator: "
-                + reason
-        );
-    }
-
-    /**
-     * The planner's model of the index for query clause translation:
-     * the Arrow schema from the open dataset, the attach's multi field
-     * spec, the mapping's recorded renames, and the primary key column
-     * {@code ids} queries resolve against.
-     */
-    public static LanceSchemas.IndexModel queryModel(
-        String indexName,
-        IndexMetadata indexMetadata,
-        Dataset dataset,
-        Map<String, LinkedHashMap<String, String>> multiFields,
-        IndexReader reader
-    ) {
-        Map<String, String> renamedFields = new LinkedHashMap<>();
-        for (LanceMappingMeta.RenamedField renamed : LanceMappingMeta.renamedFields(indexMetadata.mapping())) {
-            renamedFields.put(renamed.from(), renamed.to());
-        }
-        String primaryKeyField = indexMetadata.getSettings().get("index.lance.primary_key_field", "");
-        Set<String> dateOverrideColumns = LanceOverrides.of(indexMetadata.getSettings()).dateColumns().keySet();
-        return LanceSchemas.model(
-            indexName,
-            dataset.getSchema(),
-            multiFields,
-            renamedFields,
-            primaryKeyField,
-            dateOverrideColumns,
-            reader::numDocs
-        );
-    }
-
-    /**
-     * Plan a sorted hits page through the planner: the query root from
-     * {@link SearchRequestToRel#translateQuery}, the sort clauses as
-     * the {@link LanceTopK}'s collations, and the Volcano run firing
-     * {@code PushSortLimitIntoLanceScan}. Returns the scan carrying
-     * the {@link PushedTopK} (and, for a scalar page, the pushed
-     * filter whose SQL the ordered scan evaluates) when the planner
-     * folded the page, or null when the shape stays on the Lucene
-     * collector.
-     *
-     * <p>The guards mirror what the fold can reproduce. {@code size}
-     * must be positive with no {@code post_filter} and no aggregations
-     * (both need the full match set on the Lucene side). Every Lucene
-     * {@link SortField} OpenSearch built must be one of the two plain
-     * field-data shapes, because the executor types the page's sort
-     * values from them; an {@code ip} format is excluded because
-     * address order is not the stored strings' order. The shape must
-     * be scalar: a non-null
-     * {@link LanceFragmentQueryRequest#filterSql()} (the coordinator
-     * translated the whole tree), no query, or {@code match_all};
-     * FTS and knn order by score, which the fold serves through the
-     * scan limit instead. A {@code search_after} whose cursor equals a
-     * sort field's missing sentinel stays on Lucene: the strict SQL
-     * bound cannot tell the sentinel from a stored value.
-     */
-    public LanceTableScan plannedTopK(
-        LanceFragmentQueryRequest request,
-        QueryShardContext qsc,
-        IndexMetadata indexMetadata,
-        Dataset dataset,
-        Map<String, LinkedHashMap<String, String>> multiFields,
-        IndexReader reader,
-        SortAndFormats sortAndFormats
-    ) {
-        if (request.size() <= 0 || request.postFilter() != null) {
-            return null;
-        }
-        if (request.aggregations() != null && !request.aggregations().getAggregatorFactories().isEmpty()) {
-            return null;
-        }
-        SortField[] sortFields = sortAndFormats.sort.getSort();
-        if (sortFields.length != request.sorts().size()) {
-            return null;
-        }
-        for (SortField sortField : sortFields) {
-            if (sortField instanceof SortedNumericSortField numeric) {
-                switch (numeric.getNumericType()) {
-                    case INT, LONG, FLOAT, DOUBLE -> {
-                    }
-                    default -> {
-                        return null;
-                    }
-                }
-            } else if (!(sortField instanceof SortedSetSortField)) {
-                return null;
-            }
-        }
-        for (DocValueFormat format : sortAndFormats.formats) {
-            if (format == DocValueFormat.IP) {
-                return null;
-            }
-        }
-        boolean scalarShape = request.filterSql() != null || request.query() == null || request.query() instanceof MatchAllQueryBuilder;
-        if (!scalarShape) {
-            return null;
-        }
-        Object[] searchAfter = request.searchAfter();
-        if (searchAfter != null && (searchAfter.length != sortFields.length || cursorHitsMissingSentinel(searchAfter, sortFields))) {
-            return null;
-        }
-        try {
-            LanceSchemas.IndexModel model = queryModel(request.indexName(), indexMetadata, dataset, multiFields, reader);
-            QueryBuilder rewritten = request.query() == null ? null : Rewriteable.rewrite(request.query(), qsc, true);
-            RelNode root = SearchRequestToRel.translateQuery(rewritten, model, plannerFactory);
-            List<RelFieldCollation> collations = SortResolution.collationsOf(request.sorts(), root.getRowType(), model);
-            LanceTopK topK = new LanceTopK(
-                root.getCluster(),
-                root.getCluster().traitSetOf(Convention.NONE),
-                root,
-                collations,
-                request.size(),
-                0,
-                searchAfter == null ? null : Arrays.asList(searchAfter)
-            );
-            RelNode physical = plannerFactory.plan(topK);
-            if (physical instanceof LanceTableScan scan) {
-                PushedTopK pushed = scan.pushedTopK().orElse(null);
-                if (pushed != null && !pushed.toScanOrderings().isEmpty()) {
-                    return scan;
-                }
-            }
-            return null;
-        } catch (UnsupportedOperationException | IOException notPlanned) {
-            // A sort clause without a collation spelling (geo distance,
-            // script, nested, mode, literal missing) or a query the
-            // translator refuses: the Lucene collector serves it.
-            return null;
-        }
-    }
-
-    /**
-     * Whether a {@code search_after} value equals the missing-value
-     * sentinel its sort field reports for null rows. A client paging
-     * past a null row feeds the sentinel back; the strict SQL bound
-     * compares stored values only, so such a cursor stays on the
-     * Lucene comparator, which knows the sentinel.
-     */
-    private static boolean cursorHitsMissingSentinel(Object[] searchAfter, SortField[] sortFields) {
-        for (int i = 0; i < searchAfter.length; i++) {
-            Object missing = sortFields[i].getMissingValue();
-            if (missing instanceof Number sentinel
-                && searchAfter[i] instanceof Number cursor
-                && Double.compare(sentinel.doubleValue(), cursor.doubleValue()) == 0) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * The filter of the ordered Lance scan: the pushed filter's SQL
-     * (the query the page cuts) ANDed with the {@code search_after}
-     * cursor bound, either alone when the other is absent, null when
-     * the page is an unfiltered first page.
-     */
-    public static String plannedScanFilter(LanceTableScan scan, PushedTopK pushedTopK) {
-        String filterSql = scan.pushedFilter().map(PushedOperation.PushedFilter::sql).orElse(null);
-        String cursorSql = pushedTopK.cursorSql();
-        if (filterSql == null) {
-            return cursorSql;
-        }
-        if (cursorSql == null) {
-            return filterSql;
-        }
-        return "(" + filterSql + ") AND (" + cursorSql + ")";
-    }
-
-    /**
-     * What one planned aggregation executes with: the resolved executor
-     * state and the Lance SQL its scans filter by, from
-     * {@link #scanFilterSql}.
-     */
-    public record PlannedAggregate(LanceAggregateResults results, String scanFilterSql) {
-    }
-
-    /**
-     * The filter SQL of a pushed scan's aggregate or query scan: the
-     * pushed aggregate's own filter when the planned tree carried the
-     * query filter under the aggregate, else the pushed filter's SQL,
-     * else {@code requestFilterSql}, the coordinator's translation of
-     * the query that arrived next to the plan. A plan built from the
-     * aggregation tree alone carries no filter of its own, so the
-     * request's SQL stands; a plan built from the whole search body
-     * carries it inside the pushed aggregate and the two spell the same
-     * predicate.
-     */
-    public static String scanFilterSql(LanceTableScan scan, String requestFilterSql) {
-        Optional<PushedAggregate> aggregate = scan.pushedAggregate();
-        if (aggregate.isPresent() && aggregate.get().filterSql() != null) {
-            return aggregate.get().filterSql();
-        }
-        Optional<PushedOperation.PushedFilter> filter = scan.pushedFilter();
-        if (filter.isPresent()) {
-            return filter.get().sql();
-        }
-        return requestFilterSql;
-    }
-
-    /**
-     * Plan the request's aggregation tree into the Lance scan: the
-     * translator accepts the tree, the Volcano run fires the pushdown
-     * rule, and {@link LanceAggregateResults#resolve} pairs the
-     * request's builders with the pushed aggregate's Substrait bytes.
-     * The scan filter is {@link #scanFilterSql} of the pushed scan and
-     * the request's SQL. Returns null when the translator refuses the
-     * tree or the planner does not fold it, in which case the Lucene
-     * aggregators run; the caller has already checked the request
-     * envelope (the pushdown setting, {@code size} 0, no
-     * {@code post_filter}, a scalar query, no reader wrapper, the
-     * aggregation allow list).
-     */
-    public PlannedAggregate plannedAggregate(
-        LanceFragmentQueryRequest request,
-        Dataset dataset,
-        Map<String, LinkedHashMap<String, String>> multiFields,
-        QueryShardContext qsc,
-        IndexReader reader
-    ) {
-        RelNode logical;
-        try {
-            LanceSchemas.IndexModel model = LanceSchemas.model(request.indexName(), dataset.getSchema(), multiFields, reader::numDocs);
-            logical = SearchRequestToRel.translateAggregations(request.aggregations(), model, plannerFactory);
-        } catch (UnsupportedOperationException unsupported) {
-            return null;
-        }
-        RelNode physical = plannerFactory.plan(logical);
-        if (!(physical instanceof LanceTableScan scan)) {
-            return null;
-        }
-        PushedAggregate pushed = scan.pushedAggregate().orElse(null);
-        if (pushed == null) {
-            return null;
-        }
-        int maxGroups = LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
-        LanceAggregateResults results = LanceAggregateResults.resolve(
-            pushed.aggregate(),
-            pushed.substrait(),
-            request.aggregations(),
-            dataset.getSchema(),
-            multiFields,
-            qsc,
-            maxGroups
-        );
-        return results == null ? null : new PlannedAggregate(results, scanFilterSql(scan, request.filterSql()));
-    }
-
-    /**
-     * Derive the Lance SQL of the top-level query for metadata-only
-     * row counting and the scan-filter hits path, through the planner's
-     * translator and printer so the SQL spelling has one source.
-     * Returns {@code null} when the query is match_all, absent, cannot
-     * be expressed (match, knn, an unmapped field, a construct without
-     * a SQL spelling), or references an {@code ip} or {@code geo_point}
-     * override column, whose Lucene form (encoded doc values) differs
-     * from what the Lance column stores. In those cases the per-node
-     * executor falls back to the Lucene tree and
-     * {@link org.apache.lucene.search.IndexSearcher#count}.
-     */
-    public static String resolveScanFilterSql(
-        QueryBuilder query,
-        LanceSchemas.IndexModel model,
-        Set<String> sqlExcludedColumns,
-        LancePlannerFactory factory
-    ) {
-        if (query == null || query instanceof MatchAllQueryBuilder) {
-            return null;
-        }
-        if (QueryToRex.referencesAny(query, sqlExcludedColumns)) {
-            return null;
-        }
-        try {
-            RelBuilder relBuilder = factory.relBuilder(model.schema()).transform(config -> config.withSimplify(false));
-            relBuilder.scan(LancePlannerFactory.SCHEMA_NAME, model.indexName());
-            RelDataType rowType = relBuilder.peek().getRowType();
-            RexNode predicate = QueryToRex.translate(query, model, relBuilder);
-            return RexToLanceSql.print(predicate, rowType).orElse(null);
-        } catch (UnsupportedOperationException unsupported) {
-            // Query shape outside the translator's set (match, knn,
-            // an unmapped field, ...). No filter push-down; the
-            // per-node hits path and computeMatched fall back to
-            // Lucene.
-            return null;
-        }
-    }
-
     /**
      * The override columns whose predicates never travel to Lance SQL:
      * {@code ip} (raw strings versus encoded doc values) and
@@ -808,8 +351,9 @@ public final class PlanExecutor {
      * that satisfy the query, counted as far as the request's
      * {@link LanceFragmentQueryRequest#trackTotalHitsUpTo()} asks.
      * Uses Lance's metadata-only counting whenever the query is a
-     * pure filter shape the coordinator has already translated to
-     * Lance SQL ({@link LanceFragmentQueryRequest#filterSql()}):
+     * pure filter shape the coordinator's plan spells as Lance SQL
+     * ({@code filterSql}, the plan's scalar filter; null for a scoring
+     * query, an absent query or {@code match_all}):
      * <ul>
      *   <li>No filter: sum {@link Fragment#countRows()}
      *       across the assigned fragments (Lance metadata, no
@@ -868,6 +412,7 @@ public final class PlanExecutor {
     public static MatchedCount computeMatched(
         Dataset dataset,
         LanceFragmentQueryRequest request,
+        String filterSql,
         ContextIndexSearcher searcher,
         Query luceneQuery,
         boolean hasSecurityWrapper,
@@ -928,7 +473,6 @@ public final class PlanExecutor {
             return MatchedCount.exact(countThroughLiveDocs(searcher, luceneQuery));
         }
         List<Integer> fragmentIds = request.fragmentIdsOrNull();
-        String filterSql = request.filterSql();
         boolean hasScoringQuery = request.query() != null && filterSql == null;
         boolean hasPostFilter = request.postFilter() != null;
         if (hasScoringQuery && !hasPostFilter && luceneQuery instanceof LanceFtsQuery fts) {

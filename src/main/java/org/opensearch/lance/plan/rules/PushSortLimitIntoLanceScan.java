@@ -59,9 +59,12 @@ import java.util.Optional;
  *
  * <p>Whenever a collation, the cursor or the chain does not fit, the
  * rule does not transform: the {@link LanceTopK} stays in the plan and
- * the executor answers the shape through the Lucene collector. The
- * rules terminate because the output scan carries pushed operations,
- * and every operand requires the bare scan.
+ * the executor answers the shape through the Lucene collector. A
+ * {@link LanceHitShape} carrying a {@code post_filter} never folds
+ * either: the filter narrows the page after the query matched, so a
+ * scan that cut the page first would come back short. The rules
+ * terminate because the output scan carries pushed operations, and
+ * every operand requires the bare scan.
  */
 public final class PushSortLimitIntoLanceScan extends RelRule<PushSortLimitIntoLanceScan.Config> {
 
@@ -121,6 +124,13 @@ public final class PushSortLimitIntoLanceScan extends RelRule<PushSortLimitIntoL
         int next = 0;
         LanceHitShape hitShape = call.rel(0) instanceof LanceHitShape shape ? shape : null;
         if (hitShape != null) {
+            if (hitShape.postFilter() != null) {
+                // The post filter narrows the page after the query
+                // matched; a scan that cut the page first would return
+                // fewer than the requested rows. Lucene's collector
+                // applies the conjunction and cuts afterwards.
+                return;
+            }
             next = 1;
         }
         LanceTopK topK = call.rel(next);
