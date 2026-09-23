@@ -171,6 +171,12 @@ public class LanceExplainIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
+            // The collector logs its duration at debug; raise the
+            // level for the run so the node log carries the line.
+            Request debug = new Request("PUT", "/_cluster/settings");
+            debug.setJsonEntity("{\"transient\":{\"logger.org.opensearch.lance.plan.metadata\":\"DEBUG\"}}");
+            client().performRequest(debug);
+
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
@@ -197,6 +203,11 @@ public class LanceExplainIT extends LanceRestTestCase {
             String again = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
             assertEquals(tables, extractIntPath(again, "nodes", nodeId, "plan", "statistics", "tables"));
         } finally {
+            try {
+                Request reset = new Request("PUT", "/_cluster/settings");
+                reset.setJsonEntity("{\"transient\":{\"logger.org.opensearch.lance.plan.metadata\":null}}");
+                client().performRequest(reset);
+            } catch (Exception ignored) {}
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
