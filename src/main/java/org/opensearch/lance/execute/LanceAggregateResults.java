@@ -131,10 +131,6 @@ public final class LanceAggregateResults {
     }
 
     /**
-     * Aggregations plus the row total of the fragments this node
-     * scanned, and the number of Lance scans that produced them.
-     */
-    /**
      * What one pushed aggregation returned: the node's aggregations,
      * the row total over every group and the number of Lance scans it
      * took (fragment groups times rounds).

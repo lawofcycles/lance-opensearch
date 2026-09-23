@@ -14,7 +14,6 @@ import java.util.Map;
 import java.util.function.Function;
 
 import org.apache.lucene.util.BytesRef;
-
 import org.apache.lucene.util.PriorityQueue;
 import org.opensearch.common.util.Comparators;
 import org.opensearch.lance.execute.AggregateSpecResolver.Child;
@@ -28,6 +27,7 @@ import org.opensearch.lance.execute.GroupAggregationState.Group;
 import org.opensearch.lance.execute.GroupAggregationState.GroupState;
 import org.opensearch.lance.execute.GroupAggregationState.GroupTable;
 import org.opensearch.lance.execute.GroupAggregationState.Partial;
+import org.opensearch.lance.execute.LanceAggregateResults.Result;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregation;
@@ -53,7 +53,6 @@ import org.opensearch.search.aggregations.bucket.terms.LongTerms;
 import org.opensearch.search.aggregations.bucket.terms.StringTerms;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregator;
-import org.opensearch.lance.execute.LanceAggregateResults.Result;
 import static org.opensearch.lance.execute.AggregateSpecResolver.metadata;
 import static org.opensearch.lance.execute.AggregateSpecResolver.thresholds;
 
