@@ -56,6 +56,12 @@ import java.util.List;
  *
  * <p>The rules terminate: every operand requires the bare scan, and
  * the output is a {@link LuceneConvention} node no operand matches.
+ * The rules set no {@code Accuracy} or {@code TieStability}: each
+ * output operator derives both from the tree it wraps in its
+ * constructor ({@code LuceneAggregateExec} from the aggregate's
+ * metrics, {@code HeapTopKExec} from the page's collations), the same
+ * way the pushed scan derives them from its pushed operations, so the
+ * two forms of one tree always declare the same values.
  *
  * <p>{@link Handoff} is the third piece: the dedicated converter that
  * lets a plan the pushdown rules folded entirely into the Lance scan

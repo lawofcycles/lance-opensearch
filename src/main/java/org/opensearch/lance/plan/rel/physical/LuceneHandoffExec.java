@@ -16,6 +16,9 @@ import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.opensearch.lance.plan.calcite.LanceConvention;
 import org.opensearch.lance.plan.calcite.LuceneConvention;
 import org.opensearch.lance.plan.calcite.LuceneRel;
+import org.opensearch.lance.plan.traits.Accuracy;
+import org.opensearch.lance.plan.traits.PlanRequirement;
+import org.opensearch.lance.plan.traits.TieStability;
 
 import java.util.List;
 
@@ -34,16 +37,27 @@ import java.util.List;
  * the fitted cost model's range the aggregation forms compete on
  * predicted milliseconds. {@code LancePlannerFactory.plan} unwraps the
  * node from the root before returning, so callers see the pushed scan
- * itself.
+ * itself. The node inherits its input's {@link Accuracy} and
+ * {@link TieStability}: the constructor reads both from the input's
+ * trait set, so the converter rule and {@link #copy} alike never
+ * change what the scan below declares.
  */
 public final class LuceneHandoffExec extends ConverterImpl implements LuceneRel {
 
     /**
-     * @param traits must carry {@link LuceneConvention#INSTANCE}
+     * @param traits must carry {@link LuceneConvention#INSTANCE}; the
+     *     {@link Accuracy} and {@link TieStability} are taken from
+     *     {@code input}, whatever {@code traits} carries for them
      * @param input the Lance convention subtree whose rows pass through
      */
     public LuceneHandoffExec(RelOptCluster cluster, RelTraitSet traits, RelNode input) {
-        super(cluster, ConventionTraitDef.INSTANCE, traits, input);
+        super(
+            cluster,
+            ConventionTraitDef.INSTANCE,
+            traits.plus(PlanRequirement.declaredAccuracy(input.getTraitSet()))
+                .plus(PlanRequirement.declaredTieStability(input.getTraitSet())),
+            input
+        );
     }
 
     @Override

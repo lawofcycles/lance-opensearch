@@ -29,6 +29,8 @@ import org.opensearch.lance.plan.rel.PushedOperation.PushedFilter;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedFts;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedKnn;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedTopK;
+import org.opensearch.lance.plan.traits.Accuracy;
+import org.opensearch.lance.plan.traits.TieStability;
 import org.lance.ipc.ColumnOrdering;
 
 import java.nio.ByteBuffer;
@@ -50,6 +52,13 @@ import java.util.Optional;
  * metric over a table below the fitted model's range carries the
  * placeholder penalty described there, so the Lucene operator wins both
  * comparisons without any rule refusing to push.
+ *
+ * <p>The scan declares the two request demandable traits from its
+ * pushed operations ({@code accuracyOf}, {@code tieStabilityOf}): a
+ * bare scan is {@link Accuracy#EXACT} and
+ * {@link TieStability#STABLE_ROWADDR}, and every {@code withPushed*}
+ * method re derives both, so a rule that folds a node into the scan
+ * never has to set them.
  */
 public class LanceTableScan extends TableScan implements LanceRel {
 
@@ -71,8 +80,49 @@ public class LanceTableScan extends TableScan implements LanceRel {
     }
 
     private LanceTableScan(RelOptCluster cluster, RelTraitSet traitSet, RelOptTable table, ImmutableList<PushedOperation> pushed) {
-        super(cluster, traitSet, ImmutableList.of(), table);
+        super(cluster, traitSet.plus(accuracyOf(pushed)).plus(tieStabilityOf(pushed)), ImmutableList.of(), table);
         this.pushedOperations = pushed;
+    }
+
+    /**
+     * The {@link Accuracy} a scan carrying {@code pushed} declares:
+     * that of the pushed aggregate ({@link LanceAggregate#accuracy()},
+     * {@code APPROXIMATE} for a sketch metric) when one is pushed,
+     * {@link Accuracy#EXACT} for every other scan: rows, a page and a
+     * count out of the Lance scan are what the table holds.
+     */
+    static Accuracy accuracyOf(List<PushedOperation> pushed) {
+        for (PushedOperation operation : pushed) {
+            if (operation instanceof PushedAggregate aggregate) {
+                return aggregate.aggregate().accuracy();
+            }
+        }
+        return Accuracy.EXACT;
+    }
+
+    /**
+     * The {@link TieStability} a scan carrying {@code pushed} declares.
+     * A pushed page answers for its order ({@link LanceTopK#tieStability()}:
+     * {@code STABLE_KEY} under a column ordering, {@code UNSTABLE} in
+     * score order, {@code STABLE_ROWADDR} for an unsorted scalar page).
+     * Without a page, a pushed full text or knn scan returns its rows in
+     * score order ({@link TieStability#UNSTABLE}), a pushed aggregate
+     * returns group rows whose order is no contract (the executor keys
+     * the buckets, so {@link TieStability#UNSTABLE} as well), and a bare
+     * or filtered scan returns rows in row address order
+     * ({@link TieStability#STABLE_ROWADDR}).
+     */
+    static TieStability tieStabilityOf(List<PushedOperation> pushed) {
+        boolean noRowAddressOrder = false;
+        for (PushedOperation operation : pushed) {
+            if (operation instanceof PushedTopK topK) {
+                return topK.topK().tieStability();
+            }
+            if (operation instanceof PushedFts || operation instanceof PushedKnn || operation instanceof PushedAggregate) {
+                noRowAddressOrder = true;
+            }
+        }
+        return noRowAddressOrder ? TieStability.UNSTABLE : TieStability.STABLE_ROWADDR;
     }
 
     /** The pushed operations, in push order; empty for a bare scan. */

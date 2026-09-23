@@ -16,6 +16,7 @@ import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.util.ImmutableBitSet;
 import org.opensearch.lance.plan.substrait.LanceAggregateSpecs;
+import org.opensearch.lance.plan.traits.Accuracy;
 
 import java.util.List;
 
@@ -134,6 +135,29 @@ public class LanceAggregate extends Aggregate implements LanceAggregateSpecs {
     @Override
     public MetricSpec metric(int callIndex) {
         return metricSpecs.get(callIndex);
+    }
+
+    /**
+     * The {@link Accuracy} either physical form of this aggregate
+     * declares: {@link Accuracy#APPROXIMATE} when at least one metric is
+     * a sketch ({@code cardinality}, {@code percentiles},
+     * {@code percentile_ranks}), {@link Accuracy#EXACT} otherwise. The
+     * pushed Lance scan and the Lucene aggregators compute the same
+     * sketches, so the value is a property of the tree, not of the form
+     * that runs it; both {@code LanceTableScan.withPushedAggregate} and
+     * {@code LuceneAggregateExec} read it from here.
+     */
+    public Accuracy accuracy() {
+        for (MetricSpec metric : metricSpecs) {
+            switch (metric.kind()) {
+                case CARDINALITY, PERCENTILES, PERCENTILE_RANKS -> {
+                    return Accuracy.APPROXIMATE;
+                }
+                default -> {
+                }
+            }
+        }
+        return Accuracy.EXACT;
     }
 
     /**

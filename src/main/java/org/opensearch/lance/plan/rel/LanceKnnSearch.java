@@ -36,6 +36,15 @@ import java.util.Objects;
  * its mapping validation when it builds the Lucene-side query for the
  * pushed scan. The row type is the input's plus the {@code _distance}
  * column the nearest scan returns.
+ *
+ * <p>The node is logical and carries the trait defs' defaults; a page
+ * cut in its distance order declares
+ * {@link org.opensearch.lance.plan.traits.TieStability#UNSTABLE} on
+ * whichever physical form cuts it (see {@link LanceTopK#tieStability()}),
+ * because equal distances have no reproducible order out of the
+ * nearest scan. Its figures are exact
+ * ({@link org.opensearch.lance.plan.traits.Accuracy#EXACT}): the
+ * distances are computed, not sketched.
  */
 public final class LanceKnnSearch extends SingleRel {
 

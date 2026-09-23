@@ -20,6 +20,8 @@ import org.apache.calcite.sql.type.SqlTypeName;
 import org.opensearch.lance.plan.calcite.ShardPathConvention;
 import org.opensearch.lance.plan.calcite.ShardPathRel;
 import org.opensearch.lance.plan.rel.ShardPathReason;
+import org.opensearch.lance.plan.traits.Accuracy;
+import org.opensearch.lance.plan.traits.TieStability;
 
 import java.util.List;
 import java.util.Objects;
@@ -39,20 +41,24 @@ import java.util.Objects;
  * path answers with, one synthetic column for the hits block and one
  * for the aggregations block, matching the logical
  * {@link org.opensearch.lance.plan.rel.LanceShardPathShape} it stands
- * in for.
+ * in for. The node declares {@link Accuracy#EXACT} and
+ * {@link TieStability#STABLE_ROWADDR}: the shard path answers what
+ * OpenSearch answers over the whole table reader, exact figures in
+ * Lucene doc order, which is the table's row address order.
  */
 public final class ShardPathFallbackExec extends SingleRel implements ShardPathRel {
 
     private final List<ShardPathReason> reasons;
 
     /**
-     * @param traitSet must carry {@link ShardPathConvention#INSTANCE}
+     * @param traitSet must carry {@link ShardPathConvention#INSTANCE};
+     *     the accuracy and tie stability are replaced by the node's own
      * @param input the index's bare scan
      * @param reasons the request elements only the shard path serves;
      *     never empty
      */
     public ShardPathFallbackExec(RelOptCluster cluster, RelTraitSet traitSet, RelNode input, List<ShardPathReason> reasons) {
-        super(cluster, traitSet, input);
+        super(cluster, traitSet.plus(Accuracy.EXACT).plus(TieStability.STABLE_ROWADDR), input);
         this.reasons = List.copyOf(Objects.requireNonNull(reasons, "reasons"));
         if (this.reasons.isEmpty()) {
             throw new IllegalArgumentException("a shard path fallback needs at least one reason");

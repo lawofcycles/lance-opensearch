@@ -38,6 +38,13 @@ import java.util.Objects;
  * path answers with, one synthetic column for the hits block and one
  * for the aggregations block; nothing consumes it today, it exists so
  * the logical and physical forms agree.
+ *
+ * <p>The node is logical and carries the trait defs' defaults; its
+ * physical form declares
+ * {@link org.opensearch.lance.plan.traits.Accuracy#EXACT} and
+ * {@link org.opensearch.lance.plan.traits.TieStability#STABLE_ROWADDR},
+ * because the shard path answers what OpenSearch answers over the whole
+ * table reader.
  */
 public final class LanceShardPathShape extends SingleRel {
 
