@@ -10,7 +10,8 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.lucene.util.BytesRef;
-import org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.RankedHit;
+import org.opensearch.lance.plan.execute.MergeReducer;
+import org.opensearch.lance.plan.execute.MergeReducer.RankedHit;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.sort.FieldSortBuilder;
@@ -20,7 +21,7 @@ import org.opensearch.search.sort.SortOrder;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
- * {@link TransportLanceCoordinatorAction#mergeHits} over per-node hit
+ * {@link MergeReducer#mergeHits} over per-node hit
  * lists. Each inner list stands for one node's response: already sorted
  * by that node's executor, carrying the raw sort values Lucene's
  * {@code FieldDoc.fields} produced and the row address of every hit.
@@ -35,7 +36,7 @@ public class CoordinatorHitMergeTests extends OpenSearchTestCase {
         List<RankedHit> nodeA = List.of(scored("a1", 3.0f, 0L), scored("a2", 1.0f, 1L));
         List<RankedHit> nodeB = List.of(scored("b1", 2.5f, 2L), scored("b2", 0.5f, 3L));
 
-        List<SearchHit> merged = TransportLanceCoordinatorAction.mergeHits(List.of(nodeA, nodeB), Collections.emptyList());
+        List<SearchHit> merged = MergeReducer.mergeHits(List.of(nodeA, nodeB), Collections.emptyList());
 
         assertEquals(List.of("a1", "b1", "a2", "b2"), ids(merged));
     }
@@ -47,7 +48,7 @@ public class CoordinatorHitMergeTests extends OpenSearchTestCase {
         List<RankedHit> nodeB = List.of(sorted("1", 1L, 1L), sorted("4", 4L, 4L), sorted("7", 7L, 7L));
         List<SortBuilder<?>> sorts = List.of(new FieldSortBuilder("id").order(SortOrder.ASC));
 
-        List<SearchHit> merged = TransportLanceCoordinatorAction.mergeHits(List.of(nodeA, nodeB), sorts);
+        List<SearchHit> merged = MergeReducer.mergeHits(List.of(nodeA, nodeB), sorts);
 
         assertEquals(List.of("0", "1", "3", "4", "6", "7"), ids(merged));
     }
@@ -62,7 +63,7 @@ public class CoordinatorHitMergeTests extends OpenSearchTestCase {
             new FieldSortBuilder("id").order(SortOrder.DESC)
         );
 
-        List<SearchHit> merged = TransportLanceCoordinatorAction.mergeHits(List.of(nodeA, nodeB), sorts);
+        List<SearchHit> merged = MergeReducer.mergeHits(List.of(nodeA, nodeB), sorts);
 
         assertEquals(List.of("b-even-4", "a-even-2", "b-odd-3", "a-odd-1"), ids(merged));
     }
@@ -74,19 +75,19 @@ public class CoordinatorHitMergeTests extends OpenSearchTestCase {
         List<RankedHit> nodeA = List.of(sorted("a-b", 0L, new BytesRef("b")), sorted("a-null", 1L, new Object[] { null }));
         List<RankedHit> nodeB = List.of(sorted("b-a", 2L, new BytesRef("a")), sorted("b-c", 3L, new BytesRef("c")));
 
-        List<SearchHit> defaultAsc = TransportLanceCoordinatorAction.mergeHits(
+        List<SearchHit> defaultAsc = MergeReducer.mergeHits(
             List.of(nodeA, nodeB),
             List.of(new FieldSortBuilder("category").order(SortOrder.ASC))
         );
         assertEquals(List.of("b-a", "a-b", "b-c", "a-null"), ids(defaultAsc));
 
-        List<SearchHit> lastDesc = TransportLanceCoordinatorAction.mergeHits(
+        List<SearchHit> lastDesc = MergeReducer.mergeHits(
             List.of(nodeA, nodeB),
             List.of(new FieldSortBuilder("category").order(SortOrder.DESC).missing("_last"))
         );
         assertEquals(List.of("b-c", "a-b", "b-a", "a-null"), ids(lastDesc));
 
-        List<SearchHit> firstAsc = TransportLanceCoordinatorAction.mergeHits(
+        List<SearchHit> firstAsc = MergeReducer.mergeHits(
             List.of(nodeA, nodeB),
             List.of(new FieldSortBuilder("category").order(SortOrder.ASC).missing("_first"))
         );
@@ -104,21 +105,15 @@ public class CoordinatorHitMergeTests extends OpenSearchTestCase {
         List<SortBuilder<?>> sorts = List.of(new FieldSortBuilder("id").order(SortOrder.DESC));
 
         List<String> expected = List.of("0-0", "0-1", "1-0", "1-1", "2-0");
-        assertEquals(expected, ids(TransportLanceCoordinatorAction.mergeHits(List.of(nodeA, nodeB, nodeC), sorts)));
-        assertEquals(expected, ids(TransportLanceCoordinatorAction.mergeHits(List.of(nodeC, nodeA, nodeB), sorts)));
-        assertEquals(expected, ids(TransportLanceCoordinatorAction.mergeHits(List.of(nodeB, nodeC, nodeA), sorts)));
+        assertEquals(expected, ids(MergeReducer.mergeHits(List.of(nodeA, nodeB, nodeC), sorts)));
+        assertEquals(expected, ids(MergeReducer.mergeHits(List.of(nodeC, nodeA, nodeB), sorts)));
+        assertEquals(expected, ids(MergeReducer.mergeHits(List.of(nodeB, nodeC, nodeA), sorts)));
 
         // Equal scores behave the same way on the score-only path.
         List<RankedHit> scoredA = List.of(scored("1-0", 1.0f, rowAddr(1, 0)), scored("1-1", 1.0f, rowAddr(1, 1)));
         List<RankedHit> scoredB = List.of(scored("0-7", 1.0f, rowAddr(0, 7)));
-        assertEquals(
-            List.of("0-7", "1-0", "1-1"),
-            ids(TransportLanceCoordinatorAction.mergeHits(List.of(scoredA, scoredB), Collections.emptyList()))
-        );
-        assertEquals(
-            List.of("0-7", "1-0", "1-1"),
-            ids(TransportLanceCoordinatorAction.mergeHits(List.of(scoredB, scoredA), Collections.emptyList()))
-        );
+        assertEquals(List.of("0-7", "1-0", "1-1"), ids(MergeReducer.mergeHits(List.of(scoredA, scoredB), Collections.emptyList())));
+        assertEquals(List.of("0-7", "1-0", "1-1"), ids(MergeReducer.mergeHits(List.of(scoredB, scoredA), Collections.emptyList())));
     }
 
     public void testTiedTopPageIsTheSameForAnyFragmentToNodeAssignment() {
@@ -154,7 +149,7 @@ public class CoordinatorHitMergeTests extends OpenSearchTestCase {
                 }
                 perNode.add(nodeHits.subList(0, Math.min(4, nodeHits.size())));
             }
-            List<SearchHit> merged = TransportLanceCoordinatorAction.mergeHits(perNode, Collections.emptyList());
+            List<SearchHit> merged = MergeReducer.mergeHits(perNode, Collections.emptyList());
             assertEquals(assignment.toString(), expected, ids(merged.subList(0, 4)));
         }
     }
@@ -169,7 +164,7 @@ public class CoordinatorHitMergeTests extends OpenSearchTestCase {
         RankedHit b2 = sorted("b2", 3L, 3.0f, 12L);
         List<SortBuilder<?>> sorts = List.of(new ScoreSortBuilder(), new FieldSortBuilder("id").order(SortOrder.ASC));
 
-        List<SearchHit> merged = TransportLanceCoordinatorAction.mergeHits(List.of(List.of(a1, a2), List.of(b2, b1)), sorts);
+        List<SearchHit> merged = MergeReducer.mergeHits(List.of(List.of(a1, a2), List.of(b2, b1)), sorts);
 
         assertEquals(List.of("b2", "b1", "a1", "a2"), ids(merged));
     }
@@ -183,15 +178,12 @@ public class CoordinatorHitMergeTests extends OpenSearchTestCase {
         List<RankedHit> nodeB = List.of(sorted("0-0", rowAddr(0, 0), 0), sorted("0-1", rowAddr(0, 1), 1));
         List<SortBuilder<?>> sorts = List.of(new FieldSortBuilder(FieldSortBuilder.DOC_FIELD_NAME));
 
-        List<SearchHit> merged = TransportLanceCoordinatorAction.mergeHits(List.of(nodeA, nodeB), sorts);
+        List<SearchHit> merged = MergeReducer.mergeHits(List.of(nodeA, nodeB), sorts);
 
         assertEquals(List.of("0-0", "0-1", "1-0", "1-1"), ids(merged));
 
         List<SortBuilder<?>> descending = List.of(new FieldSortBuilder(FieldSortBuilder.DOC_FIELD_NAME).order(SortOrder.DESC));
-        assertEquals(
-            List.of("1-1", "1-0", "0-1", "0-0"),
-            ids(TransportLanceCoordinatorAction.mergeHits(List.of(nodeA, nodeB), descending))
-        );
+        assertEquals(List.of("1-1", "1-0", "0-1", "0-0"), ids(MergeReducer.mergeHits(List.of(nodeA, nodeB), descending)));
     }
 
     public void testTiesAcrossIndexesFollowTargetOrder() {
@@ -202,11 +194,11 @@ public class CoordinatorHitMergeTests extends OpenSearchTestCase {
         RankedHit second = new RankedHit(hit("second", 1.0f), 1, rowAddr(0, 0));
         assertEquals(
             List.of("first", "second"),
-            ids(TransportLanceCoordinatorAction.mergeHits(List.of(List.of(second), List.of(first)), Collections.emptyList()))
+            ids(MergeReducer.mergeHits(List.of(List.of(second), List.of(first)), Collections.emptyList()))
         );
         assertEquals(
             List.of("first", "second"),
-            ids(TransportLanceCoordinatorAction.mergeHits(List.of(List.of(first), List.of(second)), Collections.emptyList()))
+            ids(MergeReducer.mergeHits(List.of(List.of(first), List.of(second)), Collections.emptyList()))
         );
     }
 
@@ -217,24 +209,21 @@ public class CoordinatorHitMergeTests extends OpenSearchTestCase {
         List<RankedHit> nodeB = List.of(sorted("b1", 1L, new BytesRef("x")));
         List<SortBuilder<?>> sorts = List.of(new FieldSortBuilder("id"));
 
-        IllegalStateException e = expectThrows(
-            IllegalStateException.class,
-            () -> TransportLanceCoordinatorAction.mergeHits(List.of(nodeA, nodeB), sorts)
-        );
+        IllegalStateException e = expectThrows(IllegalStateException.class, () -> MergeReducer.mergeHits(List.of(nodeA, nodeB), sorts));
         assertTrue(e.getMessage(), e.getMessage().contains("java.lang.Long") && e.getMessage().contains("BytesRef"));
 
         // Mixed numeric widths are still compared by value.
         assertEquals(
             List.of("i", "l"),
-            ids(TransportLanceCoordinatorAction.mergeHits(List.of(List.of(sorted("l", 0L, 5L)), List.of(sorted("i", 1L, 3))), sorts))
+            ids(MergeReducer.mergeHits(List.of(List.of(sorted("l", 0L, 5L)), List.of(sorted("i", 1L, 3))), sorts))
         );
     }
 
     public void testEmptyAndSingleNodeInputs() {
-        assertTrue(TransportLanceCoordinatorAction.mergeHits(Collections.emptyList(), Collections.emptyList()).isEmpty());
-        assertTrue(TransportLanceCoordinatorAction.mergeHits(List.of(Collections.emptyList()), Collections.emptyList()).isEmpty());
+        assertTrue(MergeReducer.mergeHits(Collections.emptyList(), Collections.emptyList()).isEmpty());
+        assertTrue(MergeReducer.mergeHits(List.of(Collections.emptyList()), Collections.emptyList()).isEmpty());
         List<RankedHit> only = List.of(sorted("x", 0L, 1L), sorted("y", 1L, 2L));
-        assertEquals(List.of("x", "y"), ids(TransportLanceCoordinatorAction.mergeHits(List.of(only), List.of(new FieldSortBuilder("id")))));
+        assertEquals(List.of("x", "y"), ids(MergeReducer.mergeHits(List.of(only), List.of(new FieldSortBuilder("id")))));
     }
 
     private static long rowAddr(int fragment, int offset) {

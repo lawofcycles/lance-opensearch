@@ -20,7 +20,8 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
 import org.opensearch.lance.attach.LanceAttachRequest;
 import org.opensearch.lance.attach.LanceAttachResponse;
-import org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.RankedHit;
+import org.opensearch.lance.plan.execute.MergeReducer;
+import org.opensearch.lance.plan.execute.MergeReducer.RankedHit;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.search.SearchHit;
@@ -236,13 +237,13 @@ public class FragmentExecutorRowAddressTests extends OpenSearchSingleNodeTestCas
         List<List<RankedHit>> order = new ArrayList<>(perFragment);
         for (int attempt = 0; attempt < 6; attempt++) {
             Collections.shuffle(order, random());
-            List<SearchHit> merged = TransportLanceCoordinatorAction.mergeHits(order, sorts);
+            List<SearchHit> merged = MergeReducer.mergeHits(order, sorts);
             assertEquals(whole, ids(merged.subList(0, size)));
         }
         // Two nodes, fragments 0 and 2 on one and fragment 1 on the other.
         LanceFragmentQueryResponse first = run(tableUri, indexName, query, null, sorts, size, List.of(0, 2));
         LanceFragmentQueryResponse second = run(tableUri, indexName, query, null, sorts, size, List.of(1));
-        List<SearchHit> merged = TransportLanceCoordinatorAction.mergeHits(List.of(ranked(second), ranked(first)), sorts);
+        List<SearchHit> merged = MergeReducer.mergeHits(List.of(ranked(second), ranked(first)), sorts);
         assertEquals(whole, ids(merged.subList(0, size)));
     }
 

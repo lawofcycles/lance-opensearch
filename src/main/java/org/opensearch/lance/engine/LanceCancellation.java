@@ -88,4 +88,25 @@ public final class LanceCancellation {
             throw new TaskCancelledException("cancelled task with reason: " + task.getReasonCancelled());
         }
     }
+
+    /**
+     * The {@link TaskCancelledException} in the cause chain of
+     * {@code e}, or {@code null} when the chain has none. A cancelled
+     * scan or collection often surfaces wrapped in the
+     * {@code IOException} the Lucene Weight and reader contracts force
+     * on the loops, or in the transport layer's remote exception; the
+     * callers that decide "was this a cancellation" walk the chain
+     * with this helper.
+     */
+    public static TaskCancelledException findCancelled(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof TaskCancelledException cancelled) {
+                return cancelled;
+            }
+            if (t.getCause() == t) {
+                break;
+            }
+        }
+        return null;
+    }
 }

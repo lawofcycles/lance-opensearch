@@ -14,6 +14,7 @@ import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.query.LanceFtsQuery;
+import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -45,12 +46,11 @@ public class FtsSubsetCountTests extends OpenSearchTestCase {
         uri = LanceTableFactory.writeInterleavedTable(scratchDir, "count-" + getTestName(), 3, 4);
     }
 
-    private static TransportLanceFragmentQueryAction.FtsHitCount count(Dataset dataset, List<Integer> fragmentIds, long limit)
-        throws Exception {
-        return TransportLanceFragmentQueryAction.countFtsHitsDirectly(dataset, new LanceFtsQuery("body", "lance"), fragmentIds, limit);
+    private static PlanExecutor.FtsHitCount count(Dataset dataset, List<Integer> fragmentIds, long limit) throws Exception {
+        return PlanExecutor.countFtsHitsDirectly(dataset, new LanceFtsQuery("body", "lance"), fragmentIds, limit);
     }
 
-    private static void assertCount(long scanned, long own, TransportLanceFragmentQueryAction.FtsHitCount actual) {
+    private static void assertCount(long scanned, long own, PlanExecutor.FtsHitCount actual) {
         assertEquals("scanned", scanned, actual.scanned());
         assertEquals("own", own, actual.own());
     }
@@ -73,8 +73,8 @@ public class FtsSubsetCountTests extends OpenSearchTestCase {
             // fragments 1 and 2. Each executor's share is below the
             // limit, but scanned is the limit on both, which is what
             // the executor compares with the bound.
-            TransportLanceFragmentQueryAction.FtsHitCount a = count(dataset, NODE_A, 5L);
-            TransportLanceFragmentQueryAction.FtsHitCount b = count(dataset, NODE_B, 5L);
+            PlanExecutor.FtsHitCount a = count(dataset, NODE_A, 5L);
+            PlanExecutor.FtsHitCount b = count(dataset, NODE_B, 5L);
             assertCount(5L, 1L, a);
             assertCount(5L, 4L, b);
             assertEquals(Math.min(TOTAL, 5L), a.own() + b.own());
