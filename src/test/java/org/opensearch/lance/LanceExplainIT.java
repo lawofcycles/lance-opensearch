@@ -228,6 +228,20 @@ public class LanceExplainIT extends LanceRestTestCase {
             String pageWithAggregations = explainOk(indexName, "{\"size\":5,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
             assertEquals("LUCENE_AGGREGATE", fragmentPlanOf(pageWithAggregations).get("kind"));
             assertEquals("size [5] (only 0 with aggregations)", stringPath(pageWithAggregations, "unplanned"));
+
+            // An aggregation off the pushdown shapes (top_hits) never
+            // reaches the translator: the aggregators run over the bare
+            // scan and the answer names the structural reason. The
+            // dispatch filter's allow list, which sends this body to the
+            // shard path, is not part of the plan and not of the route.
+            String topHits = explainOk(indexName, "{\"size\":0,\"aggs\":{\"t\":{\"top_hits\":{\"size\":1}}}}");
+            assertEquals("fragment", stringPath(topHits, "route"));
+            assertEquals("LUCENE_AGGREGATE", fragmentPlanOf(topHits).get("kind"));
+            assertEquals(
+                "aggregation tree outside the pushdown shapes, or lance.aggregation.pushdown is false",
+                stringPath(topHits, "unplanned")
+            );
+            assertFalse("nothing is pushed into the scan: " + topHits, stringPath(topHits, "physical").contains("pushed=[["));
         } finally {
             deleteQuietly(indexName);
         }

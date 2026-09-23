@@ -12,6 +12,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryRewriteContext;
+import org.opensearch.index.query.Rewriteable;
+import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
@@ -24,6 +27,7 @@ import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionTranslation;
 import org.opensearch.lance.query.LanceKnnQueryBuilder;
 
+import java.io.IOException;
 import java.util.Objects;
 import java.util.Set;
 
@@ -78,6 +82,29 @@ public final class RequestPlanner {
                 : MergeExec.ReduceKind.COUNT_SUM;
             return SearchRequestToRel.withCoordinatorLayer(perNode, reduceKind, fanOut);
         }
+    }
+
+    /**
+     * The coordinator rewrite of the top level query: the same shard
+     * free {@link QueryRewriteContext} rewrite {@code TransportSearchAction}
+     * applies to a search body before its shard fan out, so a query that
+     * folds itself away without a mapping ({@code wrapper}, a {@code bool}
+     * of one clause, ...) does so before it is planned, and the plan and
+     * the query the executors receive agree. Async rewrites (a
+     * {@code terms} lookup) are refused here as they are on the executors'
+     * shard context rewrite. The coordinator and the explain endpoint
+     * both rewrite here, so the two plan the same query.
+     *
+     * @param query the top level query, or null for none
+     * @param nowInMillis the request's clock for {@code now} in ranges
+     */
+    public static QueryBuilder rewriteAtCoordinator(IndicesService indicesService, QueryBuilder query, long nowInMillis)
+        throws IOException {
+        if (query == null) {
+            return null;
+        }
+        QueryRewriteContext rewriteContext = indicesService.getRewriteContext(() -> nowInMillis);
+        return Rewriteable.rewrite(query, rewriteContext, true);
     }
 
     /**

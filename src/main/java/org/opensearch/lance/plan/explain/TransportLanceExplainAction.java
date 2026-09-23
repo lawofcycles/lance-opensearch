@@ -18,7 +18,6 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryRewriteContext;
-import org.opensearch.index.query.Rewriteable;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
@@ -58,7 +57,8 @@ import java.util.List;
  * the {@code ShardPathFallbackExec} root and the reasons; nothing else
  * is planned for it. Every other body takes the fragment route: the
  * query is rewritten with the shard free {@link QueryRewriteContext}
- * the coordinator applies, the {@link ExecutionShape} is built the way
+ * the coordinator applies ({@link RequestPlanner#rewriteAtCoordinator}),
+ * the {@link ExecutionShape} is built the way
  * the coordinator builds it (the pushdown setting and the structural
  * allow list decide whether the aggregation tree may plan into the
  * scan), and {@link RequestPlanner#plan} runs with the same
@@ -151,7 +151,11 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
         }
 
         LanceOverrides overrides = LanceOverrides.of(metadata.getSettings());
-        QueryBuilder query = rewriteAtCoordinator(source == null ? null : source.query());
+        QueryBuilder query = RequestPlanner.rewriteAtCoordinator(
+            indicesService,
+            source == null ? null : source.query(),
+            System.currentTimeMillis()
+        );
         boolean planAggregations = source != null
             && source.aggregations() != null
             && clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_SETTING)
@@ -180,22 +184,5 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
     /** The data nodes a search would fan out to, at least one so a cluster without them still explains. */
     private int dataNodes() {
         return Math.max(1, clusterService.state().nodes().getDataNodes().size());
-    }
-
-    /**
-     * The coordinator's rewrite of the top level query: the shard free
-     * {@link QueryRewriteContext} rewrite {@code TransportSearchAction}
-     * applies before its shard fan out, so a query that folds itself
-     * away without a mapping ({@code wrapper}, a {@code bool} of one
-     * clause) is planned in its rewritten form, as the coordinator plans
-     * it.
-     */
-    private QueryBuilder rewriteAtCoordinator(QueryBuilder query) throws IOException {
-        if (query == null) {
-            return null;
-        }
-        long nowInMillis = System.currentTimeMillis();
-        QueryRewriteContext rewriteContext = indicesService.getRewriteContext(() -> nowInMillis);
-        return Rewriteable.rewrite(query, rewriteContext, true);
     }
 }
