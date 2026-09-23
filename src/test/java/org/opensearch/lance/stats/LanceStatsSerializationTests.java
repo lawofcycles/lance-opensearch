@@ -67,6 +67,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             1_000_000,
             7L,
             832L,
+            6_442_450_944L,
             "metadata",
             List.of(
                 new LanceWarmUpStatus(
@@ -127,7 +128,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"native_memory\":{\"estimated_bytes\":5000,\"session_bytes\":900,\"column_store_bytes\":4096,"
                     + "\"index_cache_capacity\":17179869183,\"index_cache_shards\":2,\"index_cache_shard_share\":8589934591},"
                     + "\"fts\":{\"subset_probe_limit\":1000000,\"admission\":{\"enabled\":true,\"headroom_bytes\":8589934592,"
-                    + "\"rejections\":7,\"last_estimate_bytes\":832}},"
+                    + "\"rejections\":7,\"last_estimate_bytes\":832,\"available_bytes\":6442450944}},"
                     + "\"warm_up\":{\"mode\":\"metadata\",\"tables\":[{\"index\":\"perf\",\"table\":\"s3://bucket/perf.lance\","
                     + "\"version\":8,\"mode\":\"metadata\",\"state\":\"done\",\"started_at\":\"2023-11-14T22:13:20Z\",\"seconds\":3.46,"
                     + "\"indexes\":[{\"name\":\"rating_idx\",\"type\":\"BTree\",\"column\":\"rating\",\"state\":\"done\",\"seconds\":0.4},"
@@ -178,7 +179,12 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             String json = builder.toString();
             assertTrue(json, json.startsWith("{\"nodes\":{\"node-1\":{\"name\":\"node-1\",\"snapshots\":{"));
             assertTrue(json, json.contains("\"fts\":{\"subset_probe_limit\":1000000,\"admission\":{"));
-            assertTrue(json, json.contains("\"rejections\":7,\"last_estimate_bytes\":832}},\"warm_up\":{\"mode\":\"metadata\""));
+            assertTrue(
+                json,
+                json.contains(
+                    "\"rejections\":7,\"last_estimate_bytes\":832,\"available_bytes\":6442450944}},\"warm_up\":{\"mode\":\"metadata\""
+                )
+            );
             assertTrue(json, json.endsWith("\"local_clones\":{\"cloned\":{\"local_clone_bytes\":4321,\"source_version\":9}}}}}"));
         }
     }
@@ -207,6 +213,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         assertEquals(0, stats.indexCacheShards());
         assertEquals(0L, stats.indexCacheShardShareBytes());
         assertEquals(LanceFtsQuery.subsetProbeLimit(), stats.ftsSubsetProbeLimit());
+        assertTrue("a live host reports available memory: " + stats.ftsAdmissionAvailableBytes(), stats.ftsAdmissionAvailableBytes() > 0L);
         assertEquals("none", stats.warmUpMode());
         assertTrue(stats.warmUps().isEmpty());
     }
