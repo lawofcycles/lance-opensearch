@@ -711,6 +711,27 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Setting.Property.Dynamic
     );
 
+    /**
+     * How many threads tokenize at once while a {@code type:
+     * text_analyzer} attach backfills a derived tokens column. The
+     * backfill streams the source column through the declared analyzer
+     * into one {@code AddColumns} commit; the scan and the commit are
+     * Lance's own threads, and the analyzer is Java, one batch per task
+     * on the generic pool with this many running at a time. Half the
+     * processors by default, so a backfill leaves cores for the node's
+     * searches; 1 tokenizes on one core. Also bounds the backfill's
+     * memory: twice this many batches of source text and tokens are in
+     * flight. Dynamic: read when an attach starts its backfill.
+     */
+    public static final Setting<Integer> ATTACH_BACKFILL_THREADS_SETTING = Setting.intSetting(
+        "lance.attach.backfill_threads",
+        Math.max(1, NativeMemoryLimit.availableCpus() / 2),
+        1,
+        1024,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
@@ -750,6 +771,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             FRAGMENT_PATH_PARALLELISM_SETTING,
             FRAGMENT_PATH_SLICES_SETTING,
             ATTACH_WARM_INDEXES_SETTING,
+            ATTACH_BACKFILL_THREADS_SETTING,
             MAX_DOCS_PER_READER_SETTING
         );
     }

@@ -13,7 +13,9 @@ import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.test.OpenSearchTestCase;
@@ -148,6 +150,31 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
         assertEquals(original.notes(), restored.notes());
         assertEquals(original.alreadyAttached(), restored.alreadyAttached());
         assertEquals(original.luceneBoundExceeded(), restored.luceneBoundExceeded());
+        assertNull(restored.backfill());
+
+        // The backfill object of a derive: async attach travels too.
+        LanceAttachResponse withBackfill = new LanceAttachResponse(
+            "demo",
+            "/tmp/demo.lance",
+            3L,
+            1000L,
+            4,
+            "id",
+            "{\"properties\":{\"id\":{\"type\":\"long\"}}}",
+            List.of(),
+            false,
+            false,
+            new LanceAttachResponse.Backfill(123_456_789L, "none", 8)
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            withBackfill.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                restored = new LanceAttachResponse(in);
+            }
+        }
+        assertEquals(withBackfill.backfill(), restored.backfill());
+        String json = Strings.toString(MediaTypeRegistry.JSON, restored);
+        assertTrue(json, json.contains("\"backfill\":{\"estimated_bytes\":123456789,\"spool_path\":\"none\",\"threads\":8}"));
     }
 
     private static LanceAttachRequest roundTrip(LanceAttachRequest original) throws Exception {

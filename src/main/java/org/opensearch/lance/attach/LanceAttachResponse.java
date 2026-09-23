@@ -13,6 +13,7 @@ import java.util.List;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.ToXContentObject;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -37,6 +38,40 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
     // the shard reader serves part of it and searches run in fragment
     // groups; rendered only when true.
     private final boolean luceneBoundExceeded;
+    // What the text_analyzer backfill started by a `derive: async`
+    // attach is going to do; null when the attach started none.
+    private final Backfill backfill;
+
+    /**
+     * The {@code backfill} object of a {@code derive: async} attach:
+     * about how many bytes the derived tokens columns add to the table
+     * ({@code estimated_bytes}), where the backfill spools ({@code
+     * spool_path}, {@code "none"} because it streams into the table
+     * without a local spool), and how many threads tokenize
+     * ({@code threads}).
+     */
+    public record Backfill(long estimatedBytes, String spoolPath, int threads) implements Writeable, ToXContentObject {
+
+        public Backfill(StreamInput in) throws IOException {
+            this(in.readVLong(), in.readString(), in.readVInt());
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeVLong(estimatedBytes);
+            out.writeString(spoolPath);
+            out.writeVInt(threads);
+        }
+
+        @Override
+        public XContentBuilder toXContent(XContentBuilder b, Params params) throws IOException {
+            b.startObject();
+            b.field("estimated_bytes", estimatedBytes);
+            b.field("spool_path", spoolPath);
+            b.field("threads", threads);
+            return b.endObject();
+        }
+    }
 
     public LanceAttachResponse(
         String index,
@@ -50,6 +85,34 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
         boolean alreadyAttached,
         boolean luceneBoundExceeded
     ) {
+        this(
+            index,
+            table,
+            version,
+            rows,
+            fragments,
+            derivedKeyField,
+            derivedMappingJson,
+            notes,
+            alreadyAttached,
+            luceneBoundExceeded,
+            null
+        );
+    }
+
+    public LanceAttachResponse(
+        String index,
+        String table,
+        long version,
+        long rows,
+        int fragments,
+        String derivedKeyField,
+        String derivedMappingJson,
+        List<String> notes,
+        boolean alreadyAttached,
+        boolean luceneBoundExceeded,
+        Backfill backfill
+    ) {
         this.index = index;
         this.table = table;
         this.version = version;
@@ -60,6 +123,7 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
         this.notes = List.copyOf(notes);
         this.alreadyAttached = alreadyAttached;
         this.luceneBoundExceeded = luceneBoundExceeded;
+        this.backfill = backfill;
     }
 
     public LanceAttachResponse(StreamInput in) throws IOException {
@@ -74,6 +138,7 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
         this.notes = in.readStringList();
         this.alreadyAttached = in.readBoolean();
         this.luceneBoundExceeded = in.readBoolean();
+        this.backfill = in.readOptionalWriteable(Backfill::new);
     }
 
     @Override
@@ -88,6 +153,7 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
         out.writeStringCollection(notes);
         out.writeBoolean(alreadyAttached);
         out.writeBoolean(luceneBoundExceeded);
+        out.writeOptionalWriteable(backfill);
     }
 
     public String index() {
@@ -130,6 +196,11 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
         return luceneBoundExceeded;
     }
 
+    /** The backfill a {@code derive: async} attach started, or {@code null}. */
+    public Backfill backfill() {
+        return backfill;
+    }
+
     @Override
     public XContentBuilder toXContent(XContentBuilder b, Params params) throws IOException {
         b.startObject();
@@ -148,6 +219,9 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
         b.field("already_attached", alreadyAttached);
         if (luceneBoundExceeded) {
             b.field("lucene_bound_exceeded", true);
+        }
+        if (backfill != null) {
+            b.field("backfill", backfill);
         }
         return b.endObject();
     }

@@ -6,14 +6,18 @@
 package org.opensearch.lance.attach;
 
 import java.io.IOException;
+import java.util.Map;
 import java.util.Optional;
 
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.tasks.CancellableTask;
+import org.opensearch.tasks.Task;
 
 /**
  * Request for {@link LanceAttachAction}: the parsed body of
@@ -127,6 +131,22 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         out.writeString(overrides.toJson());
         out.writeOptionalString(indexPlacement);
         out.writeBoolean(asyncDerive);
+    }
+
+    /**
+     * A cancellable task, so {@code POST _tasks/<id>/_cancel} on a
+     * blocking ({@code derive: sync}) attach stops its text_analyzer
+     * backfill between two batches; the pending {@code AddColumns}
+     * then commits nothing.
+     */
+    @Override
+    public Task createTask(long id, String type, String action, TaskId parentTaskId, Map<String, String> headers) {
+        return new CancellableTask(id, type, action, "lance attach " + table, parentTaskId, headers) {
+            @Override
+            public boolean shouldCancelChildrenOnCancellation() {
+                return true;
+            }
+        };
     }
 
     @Override
