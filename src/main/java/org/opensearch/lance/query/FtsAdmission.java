@@ -23,6 +23,7 @@ import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.monitor.os.OsProbe;
+import org.opensearch.secure_sm.AccessController;
 
 /**
  * Admission control for unbounded full-text scans.
@@ -154,14 +155,22 @@ public final class FtsAdmission {
 
     /** {@code MemAvailable} in bytes, {@code -1} when it cannot be read. */
     private static long memAvailableBytes() {
-        if (!Files.isReadable(PROC_MEMINFO)) {
-            return -1L;
-        }
-        try {
-            return parseMemAvailableBytes(Files.readAllLines(PROC_MEMINFO));
-        } catch (IOException e) {
-            return -1L;
-        }
+        // The agent's permission check intersects every protection
+        // domain on the stack, and the server domain has no grant for
+        // /proc/meminfo (its policy lists specific /proc paths only).
+        // doPrivileged cuts the walk at this frame so the plugin's own
+        // file grant decides, the way the bundled cloud plugins read
+        // their credentials files.
+        return AccessController.doPrivileged(() -> {
+            if (!Files.isReadable(PROC_MEMINFO)) {
+                return -1L;
+            }
+            try {
+                return parseMemAvailableBytes(Files.readAllLines(PROC_MEMINFO));
+            } catch (IOException | SecurityException e) {
+                return -1L;
+            }
+        });
     }
 
     /**
