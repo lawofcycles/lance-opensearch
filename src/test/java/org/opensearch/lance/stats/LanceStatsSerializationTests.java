@@ -100,8 +100,17 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             List.of(new LanceNodeStats.LocalCloneStats("cloned", 4321L, 9L)),
             5,
             123L,
-            planRefinements(2L, 0L, 1L)
+            planRefinements(2L, 0L, 1L),
+            planExecuted(7L, 4L)
         );
+    }
+
+    /** The executed counters in the collector's key order. */
+    private static Map<String, Long> planExecuted(long pushedScan, long lucene) {
+        Map<String, Long> counts = new LinkedHashMap<>();
+        counts.put("pushed_scan", pushedScan);
+        counts.put("lucene", lucene);
+        return counts;
     }
 
     /** The refinement counters in the collector's key order, one per reason. */
@@ -148,7 +157,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "{\"name\":\"body_idx\",\"type\":\"Inverted\",\"column\":\"body\",\"state\":\"failed\",\"seconds\":1.25,"
                     + "\"detail\":\"boom\"}]}]},"
                     + "\"plan\":{\"statistics\":{\"tables\":5,\"collect_millis_total\":123},"
-                    + "\"refinements\":{\"security_wrapper\":2,\"sort_field_type\":0,\"aggregate_resolution\":1}},"
+                    + "\"refinements\":{\"security_wrapper\":2,\"sort_field_type\":0,\"aggregate_resolution\":1},"
+                    + "\"executed\":{\"pushed_scan\":7,\"lucene\":4}},"
                     + "\"indices\":{\"big\":{\"rows\":3000000000,\"shard_reader_rows\":2000000000,\"nested_docs\":0,"
                     + "\"lucene_bound_exceeded\":true,\"index_types\":{},"
                     + "\"renamed_fields\":[{\"from\":\"ts\",\"to\":\"event_ts\",\"lance_field_id\":1}]},"
@@ -238,6 +248,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             List.of("security_wrapper", "sort_field_type", "aggregate_resolution"),
             List.copyOf(stats.planRefinements().keySet())
         );
+        assertEquals(List.of("pushed_scan", "lucene"), List.copyOf(stats.planExecuted().keySet()));
     }
 
     public void testCollectorReadsTheWarmCache() throws Exception {

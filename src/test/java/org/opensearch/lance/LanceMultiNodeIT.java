@@ -212,10 +212,14 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     public void testShippedPlanRunsOnEveryNodeAndStatsReportRefinements() throws Exception {
         // The coordinator plans once and ships the per node plan over
         // the transport layer to three executors in separate JVMs. A
-        // pushed aggregate, a pushed sorted page and a fused filtered
-        // knn each answer through the shipped plan (the executors run no
-        // planner), and every node's stats carry the plan.refinements
-        // counters, zero here because no node has a reader wrapper.
+        // pushed aggregate and a pushed sorted page run as the Lance
+        // scan on every node (plan.executed.pushed_scan advances on each
+        // of the three, which only the pushed scan branch of the
+        // executor does, so a node that rebuilt the request from its
+        // builders instead of reading the shipped plan would not move
+        // it), a fused filtered knn answers through the shipped clause,
+        // and every node's plan.refinements stay at zero because no node
+        // has a reader wrapper.
         String suffix = "mn-plan-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -225,6 +229,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
+            Map<String, Long> beforeAggregate = planExecutedByNode("pushed_scan");
+            assertEquals("every node reports: " + beforeAggregate, 3, beforeAggregate.size());
             String aggregated = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -233,6 +239,14 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             );
             assertEquals("ids 4..11 match: " + aggregated, 8, extractIntPath(aggregated, "hits", "total", "value"));
             assertEquals("sum of 4..11: " + aggregated, 60.0, extractDoublePath(aggregated, "aggregations", "s", "value"), 0.0);
+            Map<String, Long> afterAggregate = planExecutedByNode("pushed_scan");
+            for (Map.Entry<String, Long> node : beforeAggregate.entrySet()) {
+                assertEquals(
+                    "the pushed aggregate ran as the Lance scan on " + node.getKey() + ": " + afterAggregate,
+                    node.getValue() + 1L,
+                    (long) afterAggregate.get(node.getKey())
+                );
+            }
 
             String page = readAll(
                 postJson(
@@ -244,7 +258,16 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals("the page is ordered across nodes: " + page, 11, extractIntPath(page, "hits", "hits", "0", "_source", "id"));
             assertEquals(10, extractIntPath(page, "hits", "hits", "1", "_source", "id"));
             assertEquals(9, extractIntPath(page, "hits", "hits", "2", "_source", "id"));
+            Map<String, Long> afterPage = planExecutedByNode("pushed_scan");
+            for (Map.Entry<String, Long> node : afterAggregate.entrySet()) {
+                assertEquals(
+                    "the pushed sorted page ran as the Lance scan on " + node.getKey() + ": " + afterPage,
+                    node.getValue() + 1L,
+                    (long) afterPage.get(node.getKey())
+                );
+            }
 
+            Map<String, Long> beforeKnn = planExecutedByNode("lucene");
             String nearest = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -254,6 +277,16 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             );
             assertEquals("the prefilter keeps ids 8..11: " + nearest, 2, extractIntPath(nearest, "hits", "total", "value"));
             assertEquals("nearest to 7 above the filter: " + nearest, 8, extractIntPath(nearest, "hits", "hits", "0", "_source", "id"));
+            // The knn page is cut by the scan's own order, so Lucene's
+            // collector runs it over the fused Lance query.
+            Map<String, Long> afterKnn = planExecutedByNode("lucene");
+            for (Map.Entry<String, Long> node : beforeKnn.entrySet()) {
+                assertEquals(
+                    "the knn page ran through the collector on " + node.getKey() + ": " + afterKnn,
+                    node.getValue() + 1L,
+                    (long) afterKnn.get(node.getKey())
+                );
+            }
 
             Map<String, Object> stats = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
             @SuppressWarnings("unchecked")
@@ -283,6 +316,20 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
         }
+    }
+
+    /** {@code plan.executed.<key>} of every node, keyed by node id. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Long> planExecutedByNode(String key) throws IOException {
+        Map<String, Object> stats = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
+        Map<String, Long> counts = new HashMap<>();
+        for (Map.Entry<String, Object> node : nodes.entrySet()) {
+            Map<String, Object> plan = (Map<String, Object>) ((Map<String, Object>) node.getValue()).get("plan");
+            Map<String, Object> executed = (Map<String, Object>) plan.get("executed");
+            counts.put(node.getKey(), ((Number) executed.get(key)).longValue());
+        }
+        return counts;
     }
 
     public void testNodeLocalPlacementBuildsAndCleansUpOnEveryNode() throws Exception {

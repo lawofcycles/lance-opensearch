@@ -392,7 +392,8 @@ mapping built, the resolution of the pushed aggregate against the mapping and th
 downgrades where a pushed operation cannot run there. Downgrades go one way, from the Lance scan to
 Lucene; nothing is pushed on the data node that the coordinator did not push, so the plan the
 explain endpoint prints is the plan the coordinator ships, and `GET /_lance/stats` counts every
-downgrade under `plan.refinements` by reason. The per node plan is a wire format internal to the
+downgrade under `plan.refinements` by reason and, under `plan.executed`, how many requests each
+node answered through the Lance scan and through Lucene. The per node plan is a wire format internal to the
 plugin: every node is assumed to run the same plugin version, there is no version negotiation, and
 a fragment request between nodes of different plugin versions fails rather than falling back to the
 shard path, so a rolling upgrade is not supported for the fragment path.

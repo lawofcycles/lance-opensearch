@@ -10,27 +10,50 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 
+import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.Float4Vector;
+import org.apache.arrow.vector.Float8Vector;
+import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.ReaderUtil;
+import org.apache.lucene.index.StoredFieldVisitor;
+import org.apache.lucene.search.CollectorManager;
 import org.apache.lucene.search.FieldDoc;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.Sort;
+import org.apache.lucene.search.SortField;
+import org.apache.lucene.search.SortedNumericSortField;
+import org.apache.lucene.search.SortedSetSortField;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopFieldCollector;
 import org.apache.lucene.search.TopFieldCollectorManager;
 import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.search.TopScoreDocCollectorManager;
 import org.apache.lucene.search.Weight;
+import org.apache.lucene.util.BytesRef;
 import org.lance.Dataset;
 import org.lance.ipc.ColumnOrdering;
+import org.lance.ipc.LanceScanner;
+import org.lance.ipc.ScanOptions;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.tasks.TaskCancelledException;
+import org.opensearch.index.mapper.Uid;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.lance.plan.execute.FragmentPlan;
@@ -86,14 +109,14 @@ final class FragmentHitsPages {
      * Run the top-{@code size} query on the shared
      * {@link ContextIndexSearcher} and materialise every hit through
      * OpenSearch's stock stored-fields path
-     * ({@link org.opensearch.lance.engine.LanceFragmentLeafReader#materialiseStoredFields}).
+     * ({@link LanceFragmentLeafReader#materialiseStoredFields}).
      * The reader is built by the caller so hits and aggregations
      * share one Lucene scan of the fragment subset.
      *
      * <p>The score is the real Lucene score (BM25 for Lance FTS,
      * cosine for Lance knn, 1.0 for {@link MatchAllDocsQuery}).
      * Sort clauses go through the
-     * standard {@link org.apache.lucene.search.IndexSearcher#search(Query, int, org.apache.lucene.search.Sort)}
+     * standard {@link IndexSearcher#search(Query, int, Sort)}
      * call and per-hit sort values are captured for the coordinator's
      * merge phase.
      *
@@ -102,18 +125,18 @@ final class FragmentHitsPages {
      * defaults to computing sort values only, leaving
      * {@link ScoreDoc#score} at {@link Float#NaN}. When the caller
      * asks for {@code track_scores:true} the 4 / 5 argument
-     * {@link org.apache.lucene.search.IndexSearcher#search(Query, int, org.apache.lucene.search.Sort, boolean)}
+     * {@link IndexSearcher#search(Query, int, Sort, boolean)}
      * / {@code searchAfter} overloads compute scores alongside the
      * sort, so hits come back with numeric {@code _score} values
      * and the coordinator's {@code max_score} sees real numbers.
      * The score-only path ({@code sortAndFormats == null}) already
      * collects scores through
-     * {@link org.apache.lucene.search.IndexSearcher#search(Query, int)}
+     * {@link IndexSearcher#search(Query, int)}
      * and ignores this flag.
      *
      * <p>When {@code sharedWeight} is non-null the collectors run
-     * through {@link LanceFragmentIndexSearcher#search(Weight, org.apache.lucene.search.CollectorManager)}
-     * with that Weight instead of letting {@link org.apache.lucene.search.IndexSearcher}
+     * through {@link LanceFragmentIndexSearcher#search(Weight, CollectorManager)}
+     * with that Weight instead of letting {@link IndexSearcher}
      * create one from {@code query}; the collector managers, the
      * {@code numHits} cap and the total-hits threshold are the ones
      * the stock {@code search} / {@code searchAfter} overloads build
@@ -168,7 +191,7 @@ final class FragmentHitsPages {
             SearchHit hit = new SearchHit(i, visitor.idString(), Collections.emptyMap(), Collections.emptyMap());
             hit.score(scoreDoc.score);
             if (visitor.source != null) {
-                hit.sourceRef(new org.opensearch.core.common.bytes.BytesArray(visitor.source));
+                hit.sourceRef(new BytesArray(visitor.source));
             }
             if (sortAndFormats != null && scoreDoc instanceof FieldDoc fieldDoc) {
                 hit.sortValues(fieldDoc.fields, sortAndFormats.formats);
@@ -180,7 +203,7 @@ final class FragmentHitsPages {
     }
 
     /**
-     * Total-hits threshold {@link org.apache.lucene.search.IndexSearcher}
+     * Total-hits threshold {@link IndexSearcher}
      * hands its own top-docs collector managers ({@code
      * IndexSearcher.TOTAL_HITS_THRESHOLD}, which is private there).
      * Only the {@code TopDocs.totalHits} accounting depends on it;
@@ -191,7 +214,7 @@ final class FragmentHitsPages {
     private static final int TOTAL_HITS_THRESHOLD = 1000;
 
     /**
-     * {@code numHits} cap {@link org.apache.lucene.search.IndexSearcher#searchAfter}
+     * {@code numHits} cap {@link IndexSearcher#searchAfter}
      * applies before building a collector: a top-docs collector
      * rejects {@code numHits > maxDoc} and {@code numHits < 1}, so the
      * result is clamped to {@code [1, max(1, maxDoc)]} whatever
@@ -204,7 +227,7 @@ final class FragmentHitsPages {
     /**
      * Sorted top-{@code size} page driven by a caller-built
      * {@link Weight}: the same steps as
-     * {@link org.apache.lucene.search.IndexSearcher#searchAfter(ScoreDoc, Query, int, org.apache.lucene.search.Sort, boolean)}
+     * {@link IndexSearcher#searchAfter(ScoreDoc, Query, int, Sort, boolean)}
      * ({@code Sort.rewrite}, {@link TopFieldCollectorManager} with the
      * stock threshold, score population when {@code trackScores})
      * with the Weight substituted for the Query.
@@ -233,7 +256,7 @@ final class FragmentHitsPages {
 
     /**
      * Fill {@link ScoreDoc#score} of a sorted page from {@code weight},
-     * the way {@link TopFieldCollector#populateScores(ScoreDoc[], org.apache.lucene.search.IndexSearcher, Query)}
+     * the way {@link TopFieldCollector#populateScores(ScoreDoc[], IndexSearcher, Query)}
      * does, except that the caller's Weight is used instead of a new
      * one created from the Query (which for a Lance-backed query
      * would run the native scan again). Docs are visited in doc id
@@ -275,18 +298,18 @@ final class FragmentHitsPages {
      * dispatch reader exposes is Lance-backed) are skipped and fall
      * back to the per-doc path.
      */
-    private static void prefetchHitRows(org.apache.lucene.index.IndexReader reader, ScoreDoc[] scoreDocs) throws IOException {
+    private static void prefetchHitRows(IndexReader reader, ScoreDoc[] scoreDocs) throws IOException {
         if (scoreDocs.length == 0) {
             return;
         }
-        List<org.apache.lucene.index.LeafReaderContext> leaves = reader.leaves();
-        java.util.Map<Integer, List<Integer>> docsByLeaf = new java.util.TreeMap<>();
+        List<LeafReaderContext> leaves = reader.leaves();
+        Map<Integer, List<Integer>> docsByLeaf = new TreeMap<>();
         for (ScoreDoc scoreDoc : scoreDocs) {
-            int leafIndex = org.apache.lucene.index.ReaderUtil.subIndex(scoreDoc.doc, leaves);
+            int leafIndex = ReaderUtil.subIndex(scoreDoc.doc, leaves);
             int localDoc = scoreDoc.doc - leaves.get(leafIndex).docBase;
             docsByLeaf.computeIfAbsent(leafIndex, k -> new ArrayList<>()).add(localDoc);
         }
-        for (java.util.Map.Entry<Integer, List<Integer>> entry : docsByLeaf.entrySet()) {
+        for (Map.Entry<Integer, List<Integer>> entry : docsByLeaf.entrySet()) {
             LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(leaves.get(entry.getKey()).reader());
             if (lance == null) {
                 continue;
@@ -317,7 +340,7 @@ final class FragmentHitsPages {
      * Lucene hits phase uses, so the response shape is identical.
      *
      * <p>Sort values are read from the projected columns and typed the
-     * way the request's Lucene {@link org.apache.lucene.search.SortField}s
+     * way the request's Lucene {@link SortField}s
      * would type them (see {@link #sortValueFrom}) so
      * {@link SearchHit#sortValues} formats them identically and
      * clients can feed them back as {@code search_after}. Arrow nulls
@@ -332,13 +355,13 @@ final class FragmentHitsPages {
         int fetch,
         String filterSql,
         SortAndFormats sortAndFormats,
-        org.apache.lucene.index.IndexReader reader,
+        IndexReader reader,
         List<Integer> fragmentIds,
         LanceCancellation cancellation
     ) throws IOException {
-        org.apache.lucene.search.SortField[] sortFields = sortAndFormats.sort.getSort();
-        java.util.Map<Integer, LanceFragmentLeafReader> leafByFragment = new java.util.HashMap<>();
-        for (org.apache.lucene.index.LeafReaderContext ctx : reader.leaves()) {
+        SortField[] sortFields = sortAndFormats.sort.getSort();
+        Map<Integer, LanceFragmentLeafReader> leafByFragment = new HashMap<>();
+        for (LeafReaderContext ctx : reader.leaves()) {
             LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(ctx.reader());
             if (lance != null) {
                 leafByFragment.put(lance.fragmentId(), lance);
@@ -350,7 +373,7 @@ final class FragmentHitsPages {
                 sortColumns.add(ordering.getColumnName());
             }
         }
-        org.lance.ipc.ScanOptions.Builder builder = new org.lance.ipc.ScanOptions.Builder().fragmentIds(fragmentIds)
+        ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(fragmentIds)
             .columns(sortColumns)
             .setColumnOrderings(orderings)
             .limit(fetch)
@@ -362,15 +385,12 @@ final class FragmentHitsPages {
         // order Lance returned them, which is the response order.
         List<long[]> addresses = new ArrayList<>(fetch);
         List<Object[]> sortValues = new ArrayList<>(fetch);
-        try (
-            org.lance.ipc.LanceScanner scanner = dataset.newScan(builder.build());
-            org.apache.arrow.vector.ipc.ArrowReader arrowReader = scanner.scanBatches()
-        ) {
+        try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader arrowReader = scanner.scanBatches()) {
             while (arrowReader.loadNextBatch()) {
                 cancellation.checkCancelled();
-                org.apache.arrow.vector.VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
-                org.apache.arrow.vector.UInt8Vector rowAddr = (org.apache.arrow.vector.UInt8Vector) root.getVector("_rowaddr");
-                org.apache.arrow.vector.FieldVector[] vectors = new org.apache.arrow.vector.FieldVector[orderings.size()];
+                VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
+                UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
+                FieldVector[] vectors = new FieldVector[orderings.size()];
                 for (int o = 0; o < vectors.length; o++) {
                     vectors[o] = root.getVector(orderings.get(o).getColumnName());
                 }
@@ -394,7 +414,7 @@ final class FragmentHitsPages {
         // rows; the leaf's stored-fields and prefetch paths are keyed by
         // doc id, so each offset maps through docOfRow (identity unless
         // the table has nested columns).
-        java.util.Map<Integer, List<Integer>> docsByFragment = new java.util.HashMap<>();
+        Map<Integer, List<Integer>> docsByFragment = new HashMap<>();
         for (long[] address : addresses) {
             LanceFragmentLeafReader lance = leafByFragment.get((int) address[0]);
             if (lance == null) {
@@ -402,7 +422,7 @@ final class FragmentHitsPages {
             }
             docsByFragment.computeIfAbsent((int) address[0], k -> new ArrayList<>()).add(lance.docOfRow((int) address[1]));
         }
-        for (java.util.Map.Entry<Integer, List<Integer>> entry : docsByFragment.entrySet()) {
+        for (Map.Entry<Integer, List<Integer>> entry : docsByFragment.entrySet()) {
             LanceFragmentLeafReader lance = leafByFragment.get(entry.getKey());
             if (lance == null) {
                 continue;
@@ -432,7 +452,7 @@ final class FragmentHitsPages {
             SearchHit hit = new SearchHit(out.size(), visitor.idString(), Collections.emptyMap(), Collections.emptyMap());
             hit.score(score);
             if (visitor.source != null) {
-                hit.sourceRef(new org.opensearch.core.common.bytes.BytesArray(visitor.source));
+                hit.sourceRef(new BytesArray(visitor.source));
             }
             hit.sortValues(sortValues.get(i), sortAndFormats.formats);
             rowAddrs[out.size()] = (address[0] << 32) | address[1];
@@ -443,12 +463,12 @@ final class FragmentHitsPages {
 
     /**
      * Read one sort value from a projected column the way Lucene's
-     * comparator for the matching {@link org.apache.lucene.search.SortField}
+     * comparator for the matching {@link SortField}
      * would report it, so {@link SearchHit#sortValues} formats it
      * identically to the Lucene hits path and clients can feed it
-     * back as {@code search_after}. {@link org.apache.lucene.search.SortedSetSortField}
-     * (keyword) yields a {@link org.apache.lucene.util.BytesRef};
-     * {@link org.apache.lucene.search.SortedNumericSortField} yields
+     * back as {@code search_after}. {@link SortedSetSortField}
+     * (keyword) yields a {@link BytesRef};
+     * {@link SortedNumericSortField} yields
      * {@code Integer} / {@code Long} / {@code Float} / {@code Double}
      * according to its numeric type (OpenSearch maps byte, short,
      * integer and boolean to INT; long, date and unsigned_long to
@@ -460,28 +480,28 @@ final class FragmentHitsPages {
      * missing-value object OpenSearch installed on the SortField for
      * the request's {@code missing} / order combination.
      */
-    private static Object sortValueFrom(org.apache.arrow.vector.FieldVector vector, int i, org.apache.lucene.search.SortField sortField) {
-        if (sortField instanceof org.apache.lucene.search.SortedSetSortField) {
+    private static Object sortValueFrom(FieldVector vector, int i, SortField sortField) {
+        if (sortField instanceof SortedSetSortField) {
             if (vector.isNull(i)) {
                 return null;
             }
-            return new org.apache.lucene.util.BytesRef(((org.apache.arrow.vector.VarCharVector) vector).get(i));
+            return new BytesRef(((VarCharVector) vector).get(i));
         }
         if (vector.isNull(i)) {
             return sortField.getMissingValue();
         }
-        org.apache.lucene.search.SortedNumericSortField numeric = (org.apache.lucene.search.SortedNumericSortField) sortField;
+        SortedNumericSortField numeric = (SortedNumericSortField) sortField;
         return switch (numeric.getNumericType()) {
-            case FLOAT -> ((org.apache.arrow.vector.Float4Vector) vector).get(i);
-            case DOUBLE -> ((org.apache.arrow.vector.Float8Vector) vector).get(i);
+            case FLOAT -> ((Float4Vector) vector).get(i);
+            case DOUBLE -> ((Float8Vector) vector).get(i);
             case INT -> (int) integralValue(vector, i);
             case LONG -> integralValue(vector, i);
             default -> throw new IllegalStateException("unsupported sort field type " + numeric.getNumericType());
         };
     }
 
-    private static long integralValue(org.apache.arrow.vector.FieldVector vector, int i) {
-        if (vector instanceof org.apache.arrow.vector.BitVector bits) {
+    private static long integralValue(FieldVector vector, int i) {
+        if (vector instanceof BitVector bits) {
             return bits.get(i);
         }
         return LanceFragmentLeafReader.readAsLong(vector, i);
@@ -495,13 +515,13 @@ final class FragmentHitsPages {
      * per doc; the two capture fields are reset by the visitor
      * itself on each {@code document} call.
      */
-    private static final class HitVisitor extends org.apache.lucene.index.StoredFieldVisitor {
+    private static final class HitVisitor extends StoredFieldVisitor {
 
         private byte[] source;
         private byte[] idBytes;
 
         @Override
-        public Status needsField(org.apache.lucene.index.FieldInfo fieldInfo) {
+        public Status needsField(FieldInfo fieldInfo) {
             String name = fieldInfo.name;
             if ("_id".equals(name) || "_source".equals(name)) {
                 return Status.YES;
@@ -510,7 +530,7 @@ final class FragmentHitsPages {
         }
 
         @Override
-        public void binaryField(org.apache.lucene.index.FieldInfo fieldInfo, byte[] value) {
+        public void binaryField(FieldInfo fieldInfo, byte[] value) {
             if ("_id".equals(fieldInfo.name)) {
                 idBytes = value;
             } else if ("_source".equals(fieldInfo.name)) {
@@ -522,7 +542,7 @@ final class FragmentHitsPages {
             if (idBytes == null) {
                 return "";
             }
-            return org.opensearch.index.mapper.Uid.decodeId(idBytes);
+            return Uid.decodeId(idBytes);
         }
     }
 }

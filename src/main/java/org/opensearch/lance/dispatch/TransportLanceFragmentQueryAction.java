@@ -824,8 +824,16 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // the Lucene collector, with the scan limit the query
                 // carries.
                 FragmentPlan.TopK pushedTopK = effective.topK();
+                boolean pushedPage = pushedTopK != null && !pushedTopK.orderings().isEmpty();
+                boolean pushedAggregate = refined.aggregate() != null;
+                // Which branch runs the refined plan, for plan.executed
+                // in the stats: the Lance scan (an ordered page or a
+                // Substrait aggregate) or Lucene's collector and
+                // aggregators. Counted before the scans run so a failing
+                // scan still shows which path the node took.
+                FragmentPlanRefiner.recordExecuted(pushedPage || pushedAggregate);
                 FragmentHitsPages.HitsPage hits;
-                if (pushedTopK != null && !pushedTopK.orderings().isEmpty()) {
+                if (pushedPage) {
                     hits = FragmentHitsPages.viaLanceSortedScan(
                         dataset,
                         request,
@@ -854,7 +862,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 }
                 InternalAggregations aggregations;
                 MatchedCount matched;
-                if (refined.aggregate() != null) {
+                if (pushedAggregate) {
                     // The scan groups and aggregates on the Lance side and
                     // also yields the row total, so neither the Lucene
                     // aggregators nor computeMatched run for this request.

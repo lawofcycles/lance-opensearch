@@ -54,7 +54,12 @@ import java.util.function.Function;
  *
  * <p>Every downgrade is counted per reason in {@link #refinementCounts}
  * for {@code GET /_lance/stats}, and the caller logs the planned and
- * the executed plan.
+ * the executed plan. The caller also reports which branch ran the
+ * refined plan through {@link #recordExecuted}: the Lance scan
+ * (an ordered, limited scan or a Substrait aggregate scan) or Lucene's
+ * collector and aggregators; {@link #executedCounts} exposes both
+ * counters so a test can tell that a data node executed the shipped
+ * plan rather than rebuilding the request from its builders.
  */
 public final class FragmentPlanRefiner {
 
@@ -100,6 +105,14 @@ public final class FragmentPlanRefiner {
     }
 
     private static final Map<Reason, LongAdder> COUNTS = new ConcurrentHashMap<>();
+
+    /** The key under {@code plan.executed} of a request the Lance scan answered. */
+    public static final String EXECUTED_PUSHED_SCAN = "pushed_scan";
+    /** The key under {@code plan.executed} of a request Lucene's collector and aggregators answered. */
+    public static final String EXECUTED_LUCENE = "lucene";
+
+    private static final LongAdder EXECUTED_PUSHED = new LongAdder();
+    private static final LongAdder EXECUTED_ON_LUCENE = new LongAdder();
 
     /** Applies the guards to {@code planned}, counting every reason that fired. */
     public Refined refine(FragmentPlan planned, Inputs in) {
@@ -191,6 +204,29 @@ public final class FragmentPlanRefiner {
             }
         }
         return false;
+    }
+
+    /**
+     * Records which branch executed a refined plan: {@code pushedScan}
+     * when the Lance scan answered the page or the aggregate, false
+     * when Lucene's collector and aggregators ran (a pushed page without
+     * orderings included, since the collector cuts it over the scan's
+     * own order).
+     */
+    public static void recordExecuted(boolean pushedScan) {
+        if (pushedScan) {
+            EXECUTED_PUSHED.increment();
+        } else {
+            EXECUTED_ON_LUCENE.increment();
+        }
+    }
+
+    /** Requests executed since the node started, keyed by {@link #EXECUTED_PUSHED_SCAN} and {@link #EXECUTED_LUCENE}. */
+    public static Map<String, Long> executedCounts() {
+        Map<String, Long> counts = new LinkedHashMap<>();
+        counts.put(EXECUTED_PUSHED_SCAN, EXECUTED_PUSHED.sum());
+        counts.put(EXECUTED_LUCENE, EXECUTED_ON_LUCENE.sum());
+        return counts;
     }
 
     /** Downgrades since the node started, keyed by {@link Reason#statsKey()}, every reason present. */

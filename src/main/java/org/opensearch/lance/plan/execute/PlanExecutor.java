@@ -248,12 +248,19 @@ public final class PlanExecutor {
 
     /**
      * The override columns whose predicates never travel to Lance SQL:
-     * {@code ip} (raw strings versus encoded doc values) and
-     * {@code geo_point} (children hidden by the mapping).
+     * {@code ip} (raw strings versus encoded doc values),
+     * {@code geo_point} (children hidden by the mapping), and the derived
+     * tokens column of every {@code text_analyzer} override (a Lance
+     * column the OpenSearch mapping does not expose: a query naming it
+     * would count through Lance while the Lucene side answers no
+     * documents, and {@code hits.total} would disagree with the hits).
      */
     public static Set<String> sqlExcludedColumns(LanceOverrides overrides) {
         Set<String> excluded = new LinkedHashSet<>(overrides.ipColumns());
         excluded.addAll(overrides.geoPointColumns().keySet());
+        for (Map.Entry<String, LanceOverrides.Column> entry : overrides.textAnalyzerColumns().entrySet()) {
+            excluded.add(LanceOverrides.derivedColumnName(entry.getKey(), entry.getValue()));
+        }
         return excluded;
     }
 
