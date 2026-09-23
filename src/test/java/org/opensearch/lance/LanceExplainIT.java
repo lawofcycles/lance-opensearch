@@ -180,28 +180,36 @@ public class LanceExplainIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
+            // Nothing has planned against this table yet: the entry
+            // count and the collect time are what other tests left
+            // behind (zero on a fresh node).
+            String before = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+            @SuppressWarnings("unchecked")
+            Map<String, Object> nodes = (Map<String, Object>) parseJson(before).get("nodes");
+            String nodeId = nodes.keySet().iterator().next();
+            int tablesBefore = extractIntPath(before, "nodes", nodeId, "plan", "statistics", "tables");
+            int millisBefore = extractIntPath(before, "nodes", nodeId, "plan", "statistics", "collect_millis_total");
+            assertTrue("the baseline is a counter: " + before, tablesBefore >= 0 && millisBefore >= 0);
+
             Response ok = explain(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
             assertEquals(RestStatus.OK.getStatus(), ok.getStatusLine().getStatusCode());
 
             // The plan construction collected the table's statistics
-            // under the snapshot's version and the node's stats report
-            // the cache entry and the time spent collecting.
+            // under the snapshot's version: one more entry, and the
+            // collect time grew (a collection counts at least one
+            // millisecond however fast it ran).
             String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
-            @SuppressWarnings("unchecked")
-            Map<String, Object> nodes = (Map<String, Object>) parseJson(stats).get("nodes");
-            String nodeId = nodes.keySet().iterator().next();
             int tables = extractIntPath(stats, "nodes", nodeId, "plan", "statistics", "tables");
-            assertTrue("at least the explained table is cached: " + stats, tables >= 1);
-            assertTrue(
-                "collect time is reported: " + stats,
-                extractIntPath(stats, "nodes", nodeId, "plan", "statistics", "collect_millis_total") >= 0
-            );
+            int millis = extractIntPath(stats, "nodes", nodeId, "plan", "statistics", "collect_millis_total");
+            assertEquals("the explained table is cached: " + stats, tablesBefore + 1, tables);
+            assertTrue("the first explain collected: " + millisBefore + " -> " + millis, millis > millisBefore);
 
             // A second explain of the same version reads the cached
-            // entry: the entry count does not grow.
+            // entry: neither the entry count nor the collect time moves.
             explain(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
             String again = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
             assertEquals(tables, extractIntPath(again, "nodes", nodeId, "plan", "statistics", "tables"));
+            assertEquals(millis, extractIntPath(again, "nodes", nodeId, "plan", "statistics", "collect_millis_total"));
         } finally {
             try {
                 Request reset = new Request("PUT", "/_cluster/settings");

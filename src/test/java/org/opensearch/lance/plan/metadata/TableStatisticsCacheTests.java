@@ -62,7 +62,7 @@ public class TableStatisticsCacheTests extends OpenSearchTestCase {
             assertEquals(200L, first.rowCount());
             assertSame(first, cache.peek(dataset.uri(), dataset.version()));
             assertNull(cache.peek(dataset.uri(), dataset.version() + 1));
-            assertTrue(cache.collectMillisTotal() >= 0L);
+            assertTrue("one collection counts at least one millisecond: " + cache.collectMillisTotal(), cache.collectMillisTotal() >= 1L);
         }
         try (Dataset reopened = open()) {
             assertSame(
@@ -72,6 +72,15 @@ public class TableStatisticsCacheTests extends OpenSearchTestCase {
             );
             assertEquals(1L, cache.collectCount());
         }
+    }
+
+    public void testWholeMillisRoundsUpAndCountsAtLeastOne() {
+        assertEquals(1L, TableStatisticsCache.wholeMillis(0L));
+        assertEquals(1L, TableStatisticsCache.wholeMillis(1L));
+        assertEquals(1L, TableStatisticsCache.wholeMillis(999_999L));
+        assertEquals(1L, TableStatisticsCache.wholeMillis(1_000_000L));
+        assertEquals(2L, TableStatisticsCache.wholeMillis(1_000_001L));
+        assertEquals(3L, TableStatisticsCache.wholeMillis(2_500_000L));
     }
 
     public void testVersionAdvanceAddsAnEntryAndKeepsOnePreviousGeneration() {

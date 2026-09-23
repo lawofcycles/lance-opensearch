@@ -274,7 +274,9 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             LanceWarmCache cache = new LanceWarmCache(allocator, 1024L * 1024, 8, true)
         ) {
             LanceStatsCollector collector = new LanceStatsCollector(cache, () -> 0L, () -> null);
-            assertEquals(0, collector.collect().planStatisticsTables());
+            LanceNodeStats empty = collector.collect();
+            assertEquals(0, empty.planStatisticsTables());
+            assertEquals(0L, empty.planStatisticsCollectMillisTotal());
             try (
                 LanceWarmCache.Lease lease = cache.acquire(
                     "uuid",
@@ -289,7 +291,16 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 cache.tableStatistics().forDataset(lease.snapshot().dataset());
                 LanceNodeStats held = collector.collect();
                 assertEquals(1, held.planStatisticsTables());
-                assertTrue(held.planStatisticsCollectMillisTotal() >= 0L);
+                assertTrue(
+                    "one collection counts at least one millisecond: " + held.planStatisticsCollectMillisTotal(),
+                    held.planStatisticsCollectMillisTotal() >= 1L
+                );
+                cache.tableStatistics().forDataset(lease.snapshot().dataset());
+                assertEquals(
+                    "a cache hit collects nothing",
+                    held.planStatisticsCollectMillisTotal(),
+                    collector.collect().planStatisticsCollectMillisTotal()
+                );
                 cache.retire("uuid", lease.snapshot().version() + 1);
             }
             assertEquals("the entry went with its snapshot", 0, collector.collect().planStatisticsTables());

@@ -100,7 +100,7 @@ public final class TableStatisticsCache {
                 }
                 long startNanos = System.nanoTime();
                 TableStatistics collected = TableStatisticsCollector.collect(dataset);
-                collectMillisTotal.addAndGet((System.nanoTime() - startNanos) / 1_000_000L);
+                collectMillisTotal.addAndGet(wholeMillis(System.nanoTime() - startNanos));
                 collects.incrementAndGet();
                 put(key, collected);
                 return collected;
@@ -108,6 +108,15 @@ public final class TableStatisticsCache {
         } finally {
             collectLocks.remove(key, lock);
         }
+    }
+
+    /**
+     * {@code nanos} as milliseconds rounded up, so a collection that
+     * finished inside a millisecond still counts as one: the total is a
+     * counter of time spent that must grow with every collection.
+     */
+    static long wholeMillis(long nanos) {
+        return Math.max(1L, (nanos + 999_999L) / 1_000_000L);
     }
 
     /** The cached entry for {@code (tableUri, version)}, or {@code null}; does not collect. */
@@ -177,7 +186,7 @@ public final class TableStatisticsCache {
         return hits.get();
     }
 
-    /** Milliseconds spent collecting, summed over every collection. */
+    /** Milliseconds spent collecting, summed over every collection; each collection counts at least one. */
     public long collectMillisTotal() {
         return collectMillisTotal.get();
     }
