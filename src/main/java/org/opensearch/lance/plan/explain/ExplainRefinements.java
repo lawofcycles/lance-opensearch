@@ -25,13 +25,18 @@ import java.util.Set;
  * survives orders by an {@code ip} override column, whose Lucene sort
  * field carries the {@code ip} format the executor's guard refuses.
  *
- * <p>This is a prediction; the data node decides. Two of the executor's
+ * <p>This is a prediction; the data node decides. Three of the executor's
  * guards depend on inputs only it has and are not predicted here: a
  * {@code search_after} cursor equal to a sort field's missing value
  * sentinel (the sentinel comes from the Lucene sort field the mapping
- * builds), and {@link FragmentPlanRefiner.Reason#AGGREGATE_RESOLUTION}
+ * builds, part of {@link FragmentPlanRefiner.Reason#SORT_FIELD_TYPE}),
+ * {@link FragmentPlanRefiner.Reason#AGGREGATE_RESOLUTION}
  * (the resolution of the pushed aggregate against the mapping and the
- * node's {@code lance.aggregation.pushdown_max_groups}).
+ * node's {@code lance.aggregation.pushdown_max_groups}), and
+ * {@link FragmentPlanRefiner.Reason#COLUMN_STORE_WARM} (whether the
+ * node's column store holds the columns the Lucene aggregators would
+ * read and whether they are predicted cheaper than the pushed scan
+ * there).
  */
 final class ExplainRefinements {
 
