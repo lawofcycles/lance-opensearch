@@ -198,6 +198,23 @@ public class FtsAdmissionTests extends OpenSearchTestCase {
         assertEquals(123L, FtsAdmission.availablePhysicalMemoryBytes());
     }
 
+    public void testScriptedReadingsAreHandedOutOnePerReadWithTheLastRepeating() {
+        FtsAdmission.setMemoryProbeForTests(() -> 123L);
+        FtsAdmission.setAvailableMemoryOverride(List.of("2000b", "1000b"));
+        assertEquals(2000L, FtsAdmission.availablePhysicalMemoryBytes());
+        assertEquals(1000L, FtsAdmission.availablePhysicalMemoryBytes());
+        assertEquals(1000L, FtsAdmission.availablePhysicalMemoryBytes());
+        // The resident set is unknown while the script is in force, so
+        // neither the cap nor the guard reads the host.
+        FtsAdmission.setResidentSetProbeForTests(() -> 500 * GB);
+        FtsAdmission.setNativeLimitProbeForTests(() -> 1L);
+        assertEquals(Long.MIN_VALUE, FtsAdmission.residentSetExcessBytes());
+        // An empty list clears the override and the probe answers again.
+        FtsAdmission.setAvailableMemoryOverride(List.of());
+        assertEquals(123L, FtsAdmission.availablePhysicalMemoryBytes());
+        assertTrue(FtsAdmission.residentSetExcessBytes() > 0L);
+    }
+
     public void testParseMemAvailableConvertsTheKernelValueToBytes() {
         // A warm node: MemFree near zero while MemAvailable holds the
         // reclaimable page cache. The gate must read the latter.

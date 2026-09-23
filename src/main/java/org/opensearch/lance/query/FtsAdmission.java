@@ -8,6 +8,7 @@ package org.opensearch.lance.query;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
@@ -149,6 +150,14 @@ public final class FtsAdmission {
     private static volatile LongSupplier memoryProbe = FtsAdmission::readAvailablePhysicalMemory;
     private static volatile LongSupplier residentSetProbe = FtsAdmission::readResidentSetBytes;
     private static volatile LongSupplier nativeLimitProbe = FtsAdmission::readNativeMemoryLimit;
+
+    /**
+     * Scripted available memory readings installed by
+     * {@code lance.test.fts_admission_available_memory}: handed out one
+     * per reading, the last one repeating; {@code null} when no override
+     * is in force. Guarded by {@link #LOCK}.
+     */
+    private static ArrayDeque<Long> availableMemoryOverride;
 
     /** Full-text scans this node refused since it started. */
     private static final AtomicLong REJECTIONS = new AtomicLong();
@@ -342,6 +351,54 @@ public final class FtsAdmission {
         shardShareOverrideBytes = value.getBytes();
     }
 
+    /**
+     * Install the {@code lance.test.fts_admission_available_memory}
+     * override: the readings the gate hands out in place of
+     * {@code MemAvailable}, one per read with the last one repeating.
+     * While the override is in force the resident set is not consulted
+     * (its readings would describe the host, not the script). An empty
+     * list clears the override.
+     */
+    public static void setAvailableMemoryOverride(List<String> readings) {
+        ArrayDeque<Long> queue = null;
+        if (readings != null && !readings.isEmpty()) {
+            queue = new ArrayDeque<>(readings.size());
+            for (String reading : readings) {
+                queue.addLast(ByteSizeValue.parseBytesSizeValue(reading, "lance.test.fts_admission_available_memory").getBytes());
+            }
+        }
+        synchronized (LOCK) {
+            availableMemoryOverride = queue;
+        }
+    }
+
+    /**
+     * One available memory reading: the next scripted value while the
+     * test override is in force, else the probe.
+     */
+    private static long readAvailableMemoryNow() {
+        synchronized (LOCK) {
+            ArrayDeque<Long> queue = availableMemoryOverride;
+            if (queue != null && !queue.isEmpty()) {
+                return queue.size() > 1 ? queue.pollFirst() : queue.peekFirst();
+            }
+        }
+        return memoryProbe.getAsLong();
+    }
+
+    /**
+     * One resident set reading, {@code -1} (unknown) while the test
+     * override of the available memory is in force.
+     */
+    private static long readResidentSetNow() {
+        synchronized (LOCK) {
+            if (availableMemoryOverride != null) {
+                return -1L;
+            }
+        }
+        return residentSetProbe.getAsLong();
+    }
+
     /** Cumulative rejection count, for {@code GET /_lance/stats}. */
     public static long rejections() {
         return REJECTIONS.get();
@@ -360,7 +417,7 @@ public final class FtsAdmission {
      * in {@code GET /_lance/stats}.
      */
     public static long availablePhysicalMemoryBytes() {
-        return memoryProbe.getAsLong();
+        return readAvailableMemoryNow();
     }
 
     /**
@@ -372,14 +429,15 @@ public final class FtsAdmission {
      * {@code GET /_lance/stats}.
      */
     public static long retainedCreditBytes() {
-        return retainedCreditBytes(memoryProbe.getAsLong());
+        return retainedCreditBytes(readAvailableMemoryNow());
     }
 
     /**
      * {@link #retainedCreditBytes()} at the given {@code MemAvailable}
-     * reading, so a decision and its message use one sample.
+     * reading, so a decision and its message, or the stats collector's
+     * two figures, use one sample.
      */
-    static long retainedCreditBytes(long availableNowBytes) {
+    public static long retainedCreditBytes(long availableNowBytes) {
         long credit;
         synchronized (LOCK) {
             credit = inFlight == 0 && activeScans == 0 ? POOL.creditBytes(availableNowBytes) : 0L;
@@ -399,7 +457,7 @@ public final class FtsAdmission {
      * {@code /proc}, no breaker installed), which never blocks.
      */
     static long residentSetExcessBytes() {
-        long rss = residentSetProbe.getAsLong();
+        long rss = readResidentSetNow();
         long limit = nativeLimitProbe.getAsLong();
         if (rss < 0L || limit < 0L) {
             return Long.MIN_VALUE;
@@ -639,7 +697,7 @@ public final class FtsAdmission {
      */
     public static void admit(String indexName, long rows, Shape shape) {
         long shardShare = shardShareBytes();
-        long availableNow = memoryProbe.getAsLong();
+        long availableNow = readAvailableMemoryNow();
         long credit = retainedCreditBytes(availableNow);
         Decision decision = decide(rows, scanBufferEstimateBytes(rows, shape), shardShare, availableNow, enabled, headroomBytes, credit);
         LAST_ESTIMATE_BYTES.set(decision.estimateBytes());
@@ -656,7 +714,7 @@ public final class FtsAdmission {
             );
         }
         if (decision.estimateBytes() > 0L) {
-            long residentNow = residentSetProbe.getAsLong();
+            long residentNow = readResidentSetNow();
             synchronized (LOCK) {
                 if (Boolean.TRUE.equals(ADMITTED_ON_THREAD.get())) {
                     // The previous request on this thread never reported
@@ -712,8 +770,8 @@ public final class FtsAdmission {
         if (!sample) {
             return;
         }
-        long availableNow = memoryProbe.getAsLong();
-        long residentNow = residentSetProbe.getAsLong();
+        long availableNow = readAvailableMemoryNow();
+        long residentNow = readResidentSetNow();
         synchronized (LOCK) {
             if (activeScans == 0 && inFlight == 1) {
                 POOL.scanCompleted(availableNow, residentNow);
@@ -814,6 +872,7 @@ public final class FtsAdmission {
             POOL.reset();
             inFlight = 0;
             activeScans = 0;
+            availableMemoryOverride = null;
         }
     }
 
