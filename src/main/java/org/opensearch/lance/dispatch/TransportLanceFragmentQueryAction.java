@@ -15,6 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executor;
+import java.util.function.Predicate;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -729,6 +730,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 );
                 CollectorKnobs knobs = FragmentHitsPages.knobsOf(request);
                 int maxGroups = LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
+                // The column store guard asks whether this node holds the
+                // columns the aggregators would read for every fragment
+                // of this request; without a cached snapshot no store
+                // serves the reader and the question has no answer.
+                ColumnStore columnStore = snapshot.isCached() ? warmCache.columnStore() : null;
+                Predicate<List<String>> columnsResident = columnStore == null
+                    ? null
+                    : columns -> columns.stream().allMatch(column -> columnStore.holds(snapshot.key(), column, effectiveFragmentIds));
                 FragmentPlanRefiner.Refined refined = refiner.refine(
                     planned,
                     new FragmentPlanRefiner.Inputs(
@@ -743,7 +752,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                             multiFields,
                             qsc,
                             maxGroups
-                        )
+                        ),
+                        columnsResident
                     )
                 );
                 FragmentPlan effective = refined.plan();
