@@ -54,6 +54,7 @@ import org.lance.ipc.ScanOptions;
 import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
+import org.opensearch.lance.query.ScanAdmission;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceKnnQuery;
@@ -473,10 +474,33 @@ final class FragmentHitsPages {
         if (filterSql != null) {
             builder = builder.filter(filterSql);
         }
+        // The sorted page reads the sort columns of every row the
+        // filter keeps (Lance's top-k sorts after the scan), so it is
+        // gated as a filter scan over the node's fragments whose row
+        // width is the row address plus the sort columns; a filter
+        // without one is a scan of every row.
+        long nodeRows = 0L;
+        for (LeafReaderContext ctx : leafByFragment.values()) {
+            nodeRows += ctx.reader().maxDoc();
+        }
+        long rowWidth = ScanAdmission.ROW_ADDRESS_BYTES;
+        for (String sortColumn : sortColumns) {
+            rowWidth += ScanAdmission.columnWidthBytes(dataset.getSchema().getFields(), sortColumn);
+        }
+        ScanAdmission.admitExecutorFilterScan(
+            request.indexName(),
+            dataset,
+            filterSql == null ? "" : filterSql,
+            nodeRows,
+            fetch,
+            rowWidth,
+            "sorted page scan"
+        );
         // Ordered (fragment id, row offset, raw sort values) triples in
         // the order Lance returned them, which is the response order.
         List<long[]> addresses = new ArrayList<>(fetch);
         List<Object[]> sortValues = new ArrayList<>(fetch);
+        ScanAdmission.scanStarted();
         try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader arrowReader = scanner.scanBatches()) {
             while (arrowReader.loadNextBatch()) {
                 cancellation.checkCancelled();
@@ -500,6 +524,8 @@ final class FragmentHitsPages {
             throw e;
         } catch (Exception e) {
             throw new IOException(e);
+        } finally {
+            ScanAdmission.scanFinished();
         }
         // The decoded offsets are physical rows; the leaf's doc ids map
         // through docOfRow (identity unless the table has nested

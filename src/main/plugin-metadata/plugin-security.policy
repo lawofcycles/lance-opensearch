@@ -22,9 +22,9 @@ grant {
   // the wildcard is required.
   permission java.lang.RuntimePermission "loadLibrary.*";
 
-  // org.opensearch.lance.query.FtsAdmission reads MemAvailable from
-  // /proc/meminfo to size full text scans; the core policy grants
-  // /proc/self/status (which FtsAdmission also reads) to every codebase but
+  // org.opensearch.lance.query.ScanAdmission reads MemAvailable from
+  // /proc/meminfo to judge native scans; the core policy grants
+  // /proc/self/status (which ScanAdmission also reads) to every codebase but
   // not /proc/meminfo. Read only, inside doPrivileged, so only the plugin's
   // own domain is consulted.
   permission java.io.FilePermission "/proc/meminfo", "read";

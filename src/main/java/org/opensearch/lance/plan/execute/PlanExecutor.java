@@ -33,7 +33,7 @@ import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.rel.physical.FanOutExec;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
 import org.opensearch.lance.plan.rel.physical.ShardPathFallbackExec;
-import org.opensearch.lance.query.FtsAdmission;
+import org.opensearch.lance.query.ScanAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.search.approximate.ApproximateScoreQuery;
 import org.opensearch.search.internal.ContextIndexSearcher;
@@ -537,10 +537,27 @@ public final class PlanExecutor {
             }
             return MatchedCount.exact(total);
         }
-        if (fragmentIds == null) {
-            return MatchedCount.exact(dataset.countRows(filterSql));
+        // The count evaluates the filter through its scalar index and
+        // materialises the matching row addresses the same way the hits
+        // scan does; the gate judges it as a filter scan before it runs.
+        ScanAdmission.admitExecutorFilterScan(
+            dataset.uri(),
+            dataset,
+            filterSql,
+            ScanAdmission.fragmentRows(dataset, fragmentIds),
+            0L,
+            ScanAdmission.ROW_ADDRESS_BYTES,
+            "filtered count scan"
+        );
+        ScanAdmission.scanStarted();
+        try {
+            if (fragmentIds == null) {
+                return MatchedCount.exact(dataset.countRows(filterSql));
+            }
+            return countScalarFilter(dataset, filterSql, fragmentIds, upTo, cancellation);
+        } finally {
+            ScanAdmission.scanFinished();
         }
-        return countScalarFilter(dataset, filterSql, fragmentIds, upTo, cancellation);
     }
 
     /**
@@ -732,11 +749,11 @@ public final class PlanExecutor {
         // The admission gate credits memory earlier scans left behind
         // only while no full text scan runs; a count-only scan reloads
         // the inverted index the same way the hits scan does.
-        FtsAdmission.scanStarted();
+        ScanAdmission.scanStarted();
         try {
             return countFtsHitsDirectlyUnguarded(dataset, fts, fragmentIds, limit, cancellation);
         } finally {
-            FtsAdmission.scanFinished();
+            ScanAdmission.scanFinished();
         }
     }
 

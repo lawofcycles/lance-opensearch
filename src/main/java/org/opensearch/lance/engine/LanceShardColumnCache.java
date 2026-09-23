@@ -35,6 +35,7 @@ import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.tasks.TaskCancelledException;
+import org.opensearch.lance.query.ScanAdmission;
 
 /**
  * Per-{@link LanceDirectoryReader} coordinator that reads a single
@@ -230,6 +231,10 @@ public final class LanceShardColumnCache {
             requestBreaker.addEstimateBytesAndMaybeBreak(bytes, HEAP_LABEL_PREFIX + column);
         } catch (CircuitBreakingException refused) {
             HeapFallbackStats.rejected();
+            // The charge is the admission gate's column_load kind: the
+            // breaker judged it before the allocation, the gate records
+            // the estimate and the refusal in its stats.
+            ScanAdmission.recordColumnLoad(bytes, true);
             CircuitBreakingException reported = new CircuitBreakingException(
                 refused.getMessage()
                     + "; the heap copy of column ["
@@ -249,6 +254,7 @@ public final class LanceShardColumnCache {
         }
         heapBytesCharged.addAndGet(bytes);
         HeapFallbackStats.charged(bytes);
+        ScanAdmission.recordColumnLoad(bytes, false);
     }
 
     /** Give back {@code bytes} charged by {@link #chargeHeap} for a load that did not complete. */

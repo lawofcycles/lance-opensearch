@@ -15,6 +15,7 @@ subpackage to open for any given change.
 - [Directory layout](#directory-layout)
 - [Request paths](#request-paths)
 - [Planner design](#planner-design)
+- [Memory](#memory)
 - [Storage and follow-forward](#storage-and-follow-forward)
 - [Reading a PR](#reading-a-pr)
 - [Reference links](#reference-links)
@@ -432,6 +433,50 @@ plan operator, then the cost model fitted to the measured aggregation shapes, th
 planning that ships the per node plan from the coordinator, and ahead: node local refinement of the
 plan on column store warmth, and accuracy and tie-stability as planner
 traits a request can demand. The CHANGELOG tracks what has landed.
+
+## Memory
+
+A data node holds the memory of a request in four pools, each with its own accounting, and the
+plugin's job is to make sure no request allocates in a pool that nothing bounds.
+
+1. **The JVM heap**, bounded by OpenSearch's `request` circuit breaker. Everything the plugin
+   materialises in Java is charged here before it is allocated: the sparse hit lists of a full text
+   or nearest scan (`LanceHitsAccounting`, label `lance_fts_hits`), the heap copy of a column the
+   off-heap store could not hold (`LanceShardColumnCache.chargeHeap`, label
+   `lance_heap_column:<column>`), the per fragment bit sets of a filter and the group state of a
+   pushed aggregate (reported by the admission gate and judged against the breaker's room). A
+   refusal is a 429; the node keeps running.
+2. **The Lance index cache**, the part of `lance.native_memory.limit` handed to the shared Lance
+   `Session` and accounted by the `lance_native` breaker through `Session.sizeBytes()`. BTree
+   pages, bitmaps, full text token dictionaries and posting lists, IVF centroids and partitions
+   live here once loaded, each as an entry that must fit one cache shard
+   (`NativeMemoryLimit.IndexCacheSizing.shardShareBytes`); an entry heavier than a shard is refused
+   by the cache without an error and rebuilt on every use, outside this pool.
+3. **The off-heap column store** (`ColumnStore`), the `lance.cache.column_share` fraction of the same
+   limit, accounted by the same breaker, holding the doc values columns of the fragment path
+   between requests; a load the budget cannot meet falls back to pool 1.
+4. **The native allocator's scan memory**, which nothing accounts: the document set Lance rebuilds
+   for a full text scan whose index does not fit a shard, the matching pages of a large BTree, the
+   row addresses `MaterializeIndexExec` collects for a filtered scan, the read queue
+   (`io_buffer_size`, 2 GiB per scan) and the decoded batches in flight (`batch_readahead` of
+   8192 rows each) of every scan, the partitions a nearest scan reads and concatenates. This is
+   the pool that ends a node with a kernel OOM kill, because the kernel sees the allocation before
+   any breaker does.
+
+The admission gate (`query/ScanAdmission`) exists for pool 4. Before each native scan or index
+load starts, the path that owns it (the fragment executor for a full text scan, the Weight of
+`LanceScanFilterQuery` and `LanceKnnQuery`, the sorted page of `FragmentHitsPages`, the
+`AggregateScanRunner`) estimates what the scan will make Lance allocate in pool 4, with one
+estimator per kind and the coefficients as named constants, and the gate refuses the request with
+429 (`lance_admission`) when the node's `MemAvailable` minus `lance.admission.headroom`, plus the
+memory earlier admitted scans retained, cannot hold the estimate. An estimate at or below the
+shard share is zero: what fits the cache is loaded once, and scan buffers smaller than one shard
+of the cache the node dedicates to Lance are within its sizing. The estimates read the planner's
+table statistics (`plan/metadata/TableStatistics`: index sizes from the manifest, a bitmap's
+distinct count, fragment row counts) through the node's `TableStatisticsCache`, so the executor
+and the coordinator share one collection per table version. The gate's coefficients are a model
+fitted to the measurements the project has; `docs/limitations.md` lists per kind what each
+estimate does and does not cover.
 
 ## Storage and follow-forward
 

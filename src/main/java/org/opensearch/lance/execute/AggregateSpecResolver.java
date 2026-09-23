@@ -1066,7 +1066,7 @@ final class AggregateSpecResolver {
                 return null;
             }
         }
-        return new ResolvedAggregate(shape, substrait, levels, null, List.of(), allMetrics, bins, topK);
+        return new ResolvedAggregate(shape, substrait, levels, null, List.of(), allMetrics, bins, topK, estimatedGroups);
     }
 
     /**
@@ -1342,6 +1342,6 @@ final class AggregateSpecResolver {
             return null;
         }
         Composite composite = new Composite(compositeBuilder, sources, metrics);
-        return new ResolvedAggregate(shape, substrait, List.of(), composite, List.of(), allMetrics, bins, null);
+        return new ResolvedAggregate(shape, substrait, List.of(), composite, List.of(), allMetrics, bins, null, compositeBuilder.size());
     }
 }

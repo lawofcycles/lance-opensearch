@@ -74,9 +74,10 @@ import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
 import org.opensearch.lance.plan.execute.MergeReducer;
 import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.lance.plan.execute.PlanExecutor.MatchedCount;
-import org.opensearch.lance.query.FtsAdmission;
+import org.opensearch.lance.query.ScanAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceHintingWeight;
+import org.opensearch.lance.query.LanceHitsAccounting;
 import org.opensearch.lance.query.LanceInvalidInput;
 import org.opensearch.lance.query.LanceKnnQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
@@ -777,16 +778,16 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // it is judged on the table's physical rows, not this
                 // executor's share: Lance rebuilds the whole document
                 // set whichever fragments the scan keeps.
-                FtsAdmission.Shape ftsShape = FtsAdmission.classify(
+                ScanAdmission.Shape ftsShape = ScanAdmission.classify(
                     query,
                     request.trackTotalHitsUpTo() == SearchContext.TRACK_TOTAL_HITS_ACCURATE
                 );
-                if (FtsAdmission.gates(ftsShape)) {
+                if (ScanAdmission.gates(ftsShape)) {
                     long tableRows = 0L;
                     for (LanceWarmCache.FragmentMeta fragment : snapshot.fragments()) {
                         tableRows += fragment.physicalRows();
                     }
-                    FtsAdmission.admit(request.indexName(), tableRows, ftsShape);
+                    ScanAdmission.admit(request.indexName(), tableRows, ftsShape, LanceHitsAccounting.of(searcher));
                 }
 
                 // A bare Lance clause at the top level (LanceFtsQuery,

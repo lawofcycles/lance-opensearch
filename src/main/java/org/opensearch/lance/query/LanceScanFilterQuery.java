@@ -135,7 +135,7 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
 
     @Override
     public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) {
-        return new LanceScanFilterWeight(this, LanceCancellation.of(searcher));
+        return new LanceScanFilterWeight(this, LanceHitsAccounting.of(searcher), LanceCancellation.of(searcher));
     }
 
     /**
@@ -161,11 +161,16 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
 
         private final java.util.concurrent.atomic.AtomicReference<Map<Integer, FixedBitSet>> shardMatches =
             new java.util.concurrent.atomic.AtomicReference<>();
+        // The request's accounting: the admission gate counts the
+        // request in flight on it and judges the bit sets' heap against
+        // its breaker's room.
+        private final LanceHitsAccounting accounting;
         // Checked at every batch boundary of the filter scan.
         private final LanceCancellation cancellation;
 
-        LanceScanFilterWeight(LanceScanFilterQuery query, LanceCancellation cancellation) {
+        LanceScanFilterWeight(LanceScanFilterQuery query, LanceHitsAccounting accounting, LanceCancellation cancellation) {
             super(query);
+            this.accounting = accounting;
             this.cancellation = cancellation;
         }
 
@@ -248,6 +253,27 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
                 return shardMatches.get();
             }
             int scanLimit = query().scanLimit();
+            // The scalar index Lance loads for the filter and the row
+            // addresses it materialises are native memory outside every
+            // breaker; the gate refuses the scan with 429 before it is
+            // created when the node cannot hold the estimate. The rows
+            // are the node's fragments (the scan is restricted to them),
+            // the row width the _rowaddr only projection.
+            long nodeRows = 0L;
+            for (LanceFragmentLeafReader sl : leavesByFragment.values()) {
+                nodeRows += sl.maxDoc();
+            }
+            ScanAdmission.admitFilterScan(
+                leaf.dataset().uri(),
+                leaf.dataset(),
+                query().filterSql(),
+                nodeRows,
+                fragmentIds.size(),
+                scanLimit == SCAN_LIMIT_UNBOUNDED ? 0L : scanLimit,
+                ScanAdmission.ROW_ADDRESS_BYTES,
+                accounting.breakerRoomBytes(),
+                accounting
+            );
             ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(fragmentIds)
                 .filter(query().filterSql())
                 .columns(Collections.emptyList())
@@ -255,6 +281,9 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
             if (scanLimit != SCAN_LIMIT_UNBOUNDED) {
                 builder = builder.limit(scanLimit);
             }
+            // The gate credits memory earlier scans left behind only
+            // while no gated scan runs.
+            ScanAdmission.scanStarted();
             try (LanceScanner scanner = leaf.dataset().newScan(builder.build()); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     cancellation.checkCancelled();
@@ -277,6 +306,8 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
                 throw e;
             } catch (Exception e) {
                 throw new IOException(e);
+            } finally {
+                ScanAdmission.scanFinished();
             }
             shardMatches.compareAndSet(null, matchesByFragment);
             return shardMatches.get();

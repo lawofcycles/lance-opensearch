@@ -30,7 +30,7 @@ import org.opensearch.lance.NativeMemoryLimit.IndexCacheSizing;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceWarmCache;
-import org.opensearch.lance.query.FtsAdmission;
+import org.opensearch.lance.query.ScanAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -66,8 +66,9 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             2,
             8_589_934_591L,
             1_000_000,
-            7L,
+            admissionRejections(7L, 1L),
             832L,
+            "fts",
             6_442_450_944L,
             268_435_456L,
             "metadata",
@@ -106,6 +107,18 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         );
     }
 
+    /** The admission rejections in the gate's key order, one per kind. */
+    private static Map<String, Long> admissionRejections(long fts, long filterScan) {
+        Map<String, Long> counts = new LinkedHashMap<>();
+        counts.put("fts", fts);
+        counts.put("scalar_index", 0L);
+        counts.put("vector_index", 0L);
+        counts.put("filter_scan", filterScan);
+        counts.put("aggregate_scan", 0L);
+        counts.put("column_load", 0L);
+        return counts;
+    }
+
     /** The executed counters in the collector's key order. */
     private static Map<String, Long> planExecuted(long pushedScan, long lucene) {
         Map<String, Long> counts = new LinkedHashMap<>();
@@ -137,8 +150,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
     }
 
     public void testNodeStatsXContentShape() throws Exception {
-        FtsAdmission.setEnabled(true);
-        FtsAdmission.setHeadroom(FtsAdmission.DEFAULT_HEADROOM);
+        ScanAdmission.setEnabled(true);
+        ScanAdmission.setHeadroom(ScanAdmission.DEFAULT_HEADROOM);
         try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
             builder.startObject();
             sample().toXContent(builder, ToXContent.EMPTY_PARAMS);
@@ -150,8 +163,11 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"budget_misses\":1,\"heap_fallback_bytes\":2048,\"heap_fallback_rejections\":3},"
                     + "\"native_memory\":{\"estimated_bytes\":5000,\"session_bytes\":900,\"column_store_bytes\":4096,"
                     + "\"index_cache_capacity\":17179869183,\"index_cache_shards\":2,\"index_cache_shard_share\":8589934591},"
-                    + "\"fts\":{\"subset_probe_limit\":1000000,\"admission\":{\"enabled\":true,\"headroom_bytes\":8589934592,"
-                    + "\"rejections\":7,\"last_estimate_bytes\":832,\"available_bytes\":6442450944,\"retained_bytes\":268435456}},"
+                    + "\"fts\":{\"subset_probe_limit\":1000000},"
+                    + "\"admission\":{\"enabled\":true,\"headroom_bytes\":8589934592,\"available_bytes\":6442450944,"
+                    + "\"retained_bytes\":268435456,\"last_estimate_bytes\":832,\"last_kind\":\"fts\","
+                    + "\"rejections\":{\"fts\":7,\"scalar_index\":0,\"vector_index\":0,\"filter_scan\":1,\"aggregate_scan\":0,"
+                    + "\"column_load\":0}},"
                     + "\"warm_up\":{\"mode\":\"metadata\",\"tables\":[{\"index\":\"perf\",\"table\":\"s3://bucket/perf.lance\","
                     + "\"version\":8,\"mode\":\"metadata\",\"state\":\"done\",\"started_at\":\"2023-11-14T22:13:20Z\",\"seconds\":3.46,"
                     + "\"indexes\":[{\"name\":\"rating_idx\",\"type\":\"BTree\",\"column\":\"rating\",\"state\":\"done\",\"seconds\":0.4},"
@@ -204,11 +220,12 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             builder.endObject();
             String json = builder.toString();
             assertTrue(json, json.startsWith("{\"nodes\":{\"node-1\":{\"name\":\"node-1\",\"snapshots\":{"));
-            assertTrue(json, json.contains("\"fts\":{\"subset_probe_limit\":1000000,\"admission\":{"));
+            assertTrue(json, json.contains("\"fts\":{\"subset_probe_limit\":1000000},\"admission\":{\"enabled\":"));
             assertTrue(
                 json,
                 json.contains(
-                    "\"rejections\":7,\"last_estimate_bytes\":832,\"available_bytes\":6442450944,\"retained_bytes\":268435456}},\"warm_up\":{\"mode\":\"metadata\""
+                    "\"rejections\":{\"fts\":7,\"scalar_index\":0,\"vector_index\":0,\"filter_scan\":1,\"aggregate_scan\":0,"
+                        + "\"column_load\":0}},\"warm_up\":{\"mode\":\"metadata\""
                 )
             );
             assertTrue(json, json.endsWith("\"local_clones\":{\"cloned\":{\"local_clone_bytes\":4321,\"source_version\":9}}}}}"));
@@ -239,8 +256,13 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         assertEquals(0, stats.indexCacheShards());
         assertEquals(0L, stats.indexCacheShardShareBytes());
         assertEquals(LanceFtsQuery.subsetProbeLimit(), stats.ftsSubsetProbeLimit());
-        assertTrue("a live host reports available memory: " + stats.ftsAdmissionAvailableBytes(), stats.ftsAdmissionAvailableBytes() > 0L);
-        assertEquals("nothing was admitted, so nothing is retained", 0L, stats.ftsAdmissionRetainedBytes());
+        assertTrue("a live host reports available memory: " + stats.admissionAvailableBytes(), stats.admissionAvailableBytes() > 0L);
+        assertEquals("nothing was admitted, so nothing is retained", 0L, stats.admissionRetainedBytes());
+        assertEquals(
+            "every kind is reported, zero when it never refused",
+            List.of("fts", "scalar_index", "vector_index", "filter_scan", "aggregate_scan", "column_load"),
+            List.copyOf(stats.admissionRejections().keySet())
+        );
         assertEquals("none", stats.warmUpMode());
         assertTrue(stats.warmUps().isEmpty());
         assertEquals(0, stats.planStatisticsTables());
