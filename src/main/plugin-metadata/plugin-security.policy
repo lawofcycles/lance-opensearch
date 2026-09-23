@@ -1,27 +1,59 @@
+// Permissions the plugin's jars need beyond what OpenSearch grants every
+// codebase. OpenSearch 3.x enforces java.io.FilePermission (on java.nio.file
+// operations) and java.net.SocketPermission (on socket connects) through its
+// Java agent, and the agent checks every protection domain on the stack up
+// to the nearest AccessController.doPrivileged frame. The core policy already
+// grants every codebase read, write and delete under path.data, path.logs,
+// path.repo and java.io.tmpdir, so the Lance JNI extraction, the node_local
+// clone directories and the text_analyzer backfill spool need no grant here.
+// The Lance native library reads and writes table files itself, outside the
+// JVM, so the agent never sees those operations; the lance.allowed_table_roots
+// setting is what limits which paths a table may be opened from.
+//
+// The RuntimePermission and ReflectPermission grants are not checked by the
+// 3.x agent. They stay because `opensearch-plugin install` shows them to the
+// operator and because they record what the bundled code does, the same way
+// the repository-s3, k-NN and neural-search plugins declare theirs.
 grant {
-  // lance-jni extracts and loads the native library from a temp dir
+  // io.questdb.jar.jni.JarJniLoader (lance-core's JniLoader) and
+  // org.apache.arrow.c.jni.JniLoader extract liblance_jni and
+  // libarrow_cdata_jni to a temporary file and call System.load on it, whose
+  // permission name is loadLibrary.<absolute path>; the path is random, so
+  // the wildcard is required.
   permission java.lang.RuntimePermission "loadLibrary.*";
-  // JNI extracts the native library under java.io.tmpdir and removes it on
-  // shutdown, so temp files need read / write / delete. Non-temp paths get
-  // read / write only; execute is not used anywhere in the plugin and is
-  // removed to shrink the audit surface.
-  permission java.io.FilePermission "${java.io.tmpdir}${/}-", "read,write,delete";
-  permission java.io.FilePermission "${java.io.tmpdir}", "read";
-  // Lance tables can live at any local or S3-backed path the operator points
-  // attach / namespace at. The REST handlers cross-check every path against
-  // the `lance.allowed_table_roots` node setting before opening it, so the
-  // JVM policy stays permissive on read / write but never grants execute or
-  // arbitrary delete.
-  permission java.io.FilePermission "<<ALL FILES>>", "read,write";
-  // Arrow memory / c-data internals
+
+  // org.opensearch.lance.query.FtsAdmission reads MemAvailable from
+  // /proc/meminfo to size full text scans; the core policy lists other /proc
+  // files but not this one. Read only, inside doPrivileged, so only the
+  // plugin's own domain is consulted.
+  permission java.io.FilePermission "/proc/meminfo", "read";
+
+  // Reflection. TransportLanceFragmentQueryAction and TransportLanceStatsAction
+  // call the package private IndexService.getReaderWrapper through
+  // getDeclaredMethod plus setAccessible; CoreAggregationResults opens a
+  // package private Lucene constructor the same way; Calcite's
+  // JaninoRelMetadataProvider instantiates the metadata handler classes it
+  // compiles through getDeclaredConstructors; Arrow's MemoryUtil and Guava's
+  // AbstractFuture reach
+  // sun.misc.Unsafe through reflection on their static initializers (the same
+  // classes thirdPartyAudit lists under ignoreViolations).
   permission java.lang.RuntimePermission "accessDeclaredMembers";
   permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
   permission java.lang.RuntimePermission "accessClassInPackage.sun.misc";
+
+  // Calcite compiles its metadata handlers with Janino at first use;
+  // Janino's compiler defines them in a class loader of its own.
+  // CompilerFactoryFactory (commons-compiler), Jackson's ClassUtil and the
+  // AWS SDK's ClassLoaderHelper read the context class loader when they
+  // resolve classes and services by name.
   permission java.lang.RuntimePermission "createClassLoader";
   permission java.lang.RuntimePermission "getClassLoader";
-  // tokio runtime threads inside lance core
-  permission java.lang.RuntimePermission "modifyThread";
-  permission java.lang.RuntimePermission "modifyThreadGroup";
-  // object storage access (S3 etc.) in later milestones
+
+  // Outbound connections from the Java clients the plugin bundles: the AWS
+  // SDK Glue client (url-connection-client) and the Iceberg REST, Polaris and
+  // Unity catalog clients (Apache HttpClient 5), plus the SDK's credential
+  // lookups (instance metadata, STS). The Lance native library opens its own
+  // object store connections outside the JVM. repository-s3 grants the same
+  // wildcard for the AWS SDK.
   permission java.net.SocketPermission "*", "connect,resolve";
 };
