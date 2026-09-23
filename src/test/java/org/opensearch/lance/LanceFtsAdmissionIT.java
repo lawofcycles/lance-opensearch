@@ -21,7 +21,8 @@ import org.opensearch.core.rest.RestStatus;
  * an unbounded shape must answer 429 with the {@code lance_fts_admission}
  * label before its scan starts, a bounded top-k page must keep
  * answering 200, and disabling the gate must let the unbounded shape
- * through again. The stats block must count the rejection.
+ * through again. The stats block must count the rejection and report
+ * the node's available memory.
  */
 public class LanceFtsAdmissionIT extends LanceRestTestCase {
 
@@ -34,9 +35,14 @@ public class LanceFtsAdmissionIT extends LanceRestTestCase {
             String indexName = fixture.indexName();
 
             // With the defaults the fixture's estimate fits the shard
-            // share, so estimate 0 admits both shapes.
+            // share, so estimate 0 admits both shapes, and the stats
+            // block reports the node's available memory (MemAvailable
+            // on Linux, which stays positive on a warm node whose page
+            // cache has consumed its free pages) next to the 200.
             String before = readAll(postJson("/" + indexName + "/_search", UNBOUNDED));
             assertEquals(8, extractIntPath(before, "hits", "total", "value"));
+            Map<String, Object> warm = admissionStats();
+            assertTrue(warm.toString(), ((Number) warm.get("available_bytes")).longValue() > 0L);
 
             updateClusterSetting("lance.test.index_cache_shard_share", "\"1b\"");
             updateClusterSetting("lance.fts.admission.headroom", "\"1pb\"");
