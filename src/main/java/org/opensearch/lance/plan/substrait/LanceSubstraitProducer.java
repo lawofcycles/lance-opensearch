@@ -15,6 +15,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 
+import com.google.protobuf.InvalidProtocolBufferException;
 import io.substrait.expression.AggregateFunctionInvocation;
 import io.substrait.expression.Expression;
 import io.substrait.expression.ExpressionCreator;
@@ -29,6 +30,7 @@ import io.substrait.isthmus.expression.ScalarFunctionConverter;
 import io.substrait.isthmus.expression.WindowFunctionConverter;
 import io.substrait.plan.Plan;
 import io.substrait.plan.PlanProtoConverter;
+import io.substrait.plan.ProtoPlanConverter;
 import io.substrait.relation.NamedScan;
 import io.substrait.type.Type;
 import io.substrait.type.TypeCreator;
@@ -155,24 +157,97 @@ public final class LanceSubstraitProducer {
      */
     public static Optional<ByteBuffer> toLancePercentilesBins(RelNode root, int callIndex, double min, double max, int bins) {
         Shape shape = resolve(root);
-        if (shape == null
-            || callIndex < 0
-            || callIndex >= shape.aggregate.getAggCallList().size()
-            || bins <= 0
-            || !Double.isFinite(min)
-            || !Double.isFinite(max)
-            || min > max) {
+        if (shape == null || callIndex < 0 || callIndex >= shape.aggregate.getAggCallList().size()) {
             return Optional.empty();
         }
         MetricSpec.Kind kind = shape.specs.metric(callIndex).kind();
         if (kind != MetricSpec.Kind.PERCENTILES && kind != MetricSpec.Kind.PERCENTILE_RANKS) {
             return Optional.empty();
         }
-        try {
-            return Optional.of(encodeBins(shape, callIndex, min, max, bins));
-        } catch (UnsupportedOperationException | IllegalArgumentException outsideTheConsumer) {
+        return toLanceAggregate(root).flatMap(main -> toLancePercentilesBins(main, callIndex, min, max, bins));
+    }
+
+    /**
+     * The bin-count scan of a {@code percentiles} / {@code percentile_ranks}
+     * call derived from the encoded main scan instead of the Calcite
+     * tree: the fragment executor holds the main scan's bytes the
+     * coordinator shipped and no planner, and the bounds are only known
+     * once that scan has run. The main plan is decoded, its group key
+     * expressions (the {@code k<i>} outputs) are kept, the argument of
+     * the call's {@code m<slot>_mn} measure supplies the value, and the
+     * plan is re-encoded with the bin ordinal as the last grouping and
+     * one {@code count(value)} measure. Empty when {@code callIndex} does
+     * not name a percentiles call of the main plan (its bounds measures
+     * are missing), when the bounds are not finite, or when the bytes
+     * are not a plan this producer wrote.
+     */
+    public static Optional<ByteBuffer> toLancePercentilesBins(ByteBuffer mainPlan, int callIndex, double min, double max, int bins) {
+        if (callIndex < 0 || bins <= 0 || !Double.isFinite(min) || !Double.isFinite(max) || min > max) {
             return Optional.empty();
         }
+        try {
+            ByteBuffer view = mainPlan.asReadOnlyBuffer();
+            byte[] bytes = new byte[view.remaining()];
+            view.get(bytes);
+            Plan plan = new ProtoPlanConverter(Extensions.COLLECTION).from(io.substrait.proto.Plan.parseFrom(bytes));
+            if (plan.getRoots().size() != 1) {
+                return Optional.empty();
+            }
+            Plan.Root root = plan.getRoots().get(0);
+            if (!(root.getInput() instanceof io.substrait.relation.Aggregate aggregate)
+                || !(aggregate.getInput() instanceof NamedScan namedScan)) {
+                return Optional.empty();
+            }
+            List<Expression> groupingExpressions = aggregate.getGroupings().isEmpty()
+                ? List.of()
+                : aggregate.getGroupings().get(0).getExpressions();
+            List<String> names = root.getNames();
+            int keyCount = 0;
+            while (keyCount < names.size() && isKeyName(names.get(keyCount))) {
+                keyCount++;
+            }
+            String prefix = prefix(callIndex);
+            int boundsAt = names.indexOf(prefix + "_mn");
+            boolean percentiles = boundsAt >= groupingExpressions.size()
+                && names.indexOf(prefix + "_mx") == boundsAt + 1
+                && !names.contains(prefix + "_c")
+                && !names.contains(prefix + "_s");
+            if (!percentiles) {
+                return Optional.empty();
+            }
+            io.substrait.relation.Aggregate.Measure bounds = aggregate.getMeasures().get(boundsAt - groupingExpressions.size());
+            List<FunctionArg> arguments = bounds.getFunction().arguments();
+            if (arguments.size() != 1 || !(arguments.get(0) instanceof Expression value)) {
+                return Optional.empty();
+            }
+            List<Expression> groupings = new ArrayList<>(groupingExpressions.subList(0, keyCount));
+            List<String> outNames = new ArrayList<>(names.subList(0, keyCount));
+            double width = max > min ? (max - min) / bins : 1d;
+            groupings.add(floorOrdinal(value, min, width));
+            outNames.add(prefix + "_b");
+            List<io.substrait.relation.Aggregate.Measure> measures = new ArrayList<>();
+            // count(value), not count(*): a row without a value has a null
+            // bin and must not weigh in. The value's null follows the
+            // argument's, so the count equals a count of the raw column.
+            measures.add(measure("count", TypeCreator.NULLABLE.I64, value));
+            outNames.add(prefix + "_bc");
+            return Optional.of(serialize(namedScan, groupings, measures, outNames));
+        } catch (InvalidProtocolBufferException | RuntimeException notAProducerPlan) {
+            return Optional.empty();
+        }
+    }
+
+    /** Whether a root output name is a group key output ({@code k0}, {@code k1}, ...). */
+    private static boolean isKeyName(String name) {
+        if (name.length() < 2 || name.charAt(0) != KEY_COLUMN_PREFIX.charAt(0)) {
+            return false;
+        }
+        for (int i = 1; i < name.length(); i++) {
+            if (!Character.isDigit(name.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** The accepted tree shape, with the project folded away by construction. */
@@ -278,37 +353,15 @@ public final class LanceSubstraitProducer {
             addMeasures(shape, converter, calls.get(slot), shape.specs.metric(slot).kind(), slot, measures, names);
         }
 
-        return serialize(shape, groupings, measures, names);
+        return serialize(namedScan(shape), groupings, measures, names);
     }
 
-    private static ByteBuffer encodeBins(Shape shape, int callIndex, double min, double max, int bins) {
-        RexExpressionConverter converter = converter(shape);
-        List<Expression> groupings = new ArrayList<>();
-        List<String> names = new ArrayList<>();
-
-        List<Integer> keys = shape.aggregate.getGroupSet().asList();
-        for (int key = 0; key < keys.size(); key++) {
-            RexNode rex = shape.inputExpression(keys.get(key));
-            groupings.add(numeric(rex, accepted(rex.accept(converter))));
-            names.add(KEY_COLUMN_PREFIX + key);
-        }
-
-        RexNode rex = argument(shape, shape.aggregate.getAggCallList().get(callIndex));
-        Expression reference = accepted(rex.accept(converter));
-        Expression value = numeric(rex, reference);
-        // Every value falls into bin 0 when they are all equal; any
-        // positive width does that, and keeps the centre at the value.
-        double width = max > min ? (max - min) / bins : 1d;
-        groupings.add(floorOrdinal(value, min, width));
-        names.add(prefix(callIndex) + "_b");
-
-        // count(field), not count(*): a row without a value has a null
-        // bin and must not weigh in.
-        List<io.substrait.relation.Aggregate.Measure> measures = new ArrayList<>();
-        measures.add(measure("count", TypeCreator.NULLABLE.I64, reference));
-        names.add(prefix(callIndex) + "_bc");
-
-        return serialize(shape, groupings, measures, names);
+    /** The {@code NamedScan} input of the emitted aggregate: the scan's row type and qualified name. */
+    private static NamedScan namedScan(Shape shape) {
+        return NamedScan.builder()
+            .initialSchema(TypeConverter.DEFAULT.toNamedStruct(shape.scan.getRowType()))
+            .addAllNames(shape.scan.getTable().getQualifiedName())
+            .build();
     }
 
     /**
@@ -408,15 +461,11 @@ public final class LanceSubstraitProducer {
      * buffer, so the bytes go into a direct buffer.
      */
     private static ByteBuffer serialize(
-        Shape shape,
+        NamedScan namedScan,
         List<Expression> groupings,
         List<io.substrait.relation.Aggregate.Measure> measures,
         List<String> names
     ) {
-        NamedScan namedScan = NamedScan.builder()
-            .initialSchema(TypeConverter.DEFAULT.toNamedStruct(shape.scan.getRowType()))
-            .addAllNames(shape.scan.getTable().getQualifiedName())
-            .build();
         var aggregate = io.substrait.relation.Aggregate.builder().input(namedScan);
         if (!groupings.isEmpty()) {
             aggregate.addGroupings(io.substrait.relation.Aggregate.Grouping.builder().addAllExpressions(groupings).build());

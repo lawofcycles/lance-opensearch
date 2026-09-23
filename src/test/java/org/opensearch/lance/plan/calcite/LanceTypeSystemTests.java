@@ -180,18 +180,27 @@ public class LanceTypeSystemTests extends OpenSearchTestCase {
         assertEquals(SqlTypeName.REAL, type.getComponentType().getSqlTypeName());
     }
 
-    public void testFixedSizeListOfNonFloat32Throws() {
-        Field vector = new Field(
+    public void testFixedSizeListOfOtherElementTypesMapsLikeAList() {
+        // A geo_point stored as two doubles, and any other fixed size
+        // list, keep their position in the row type as an array of the
+        // element type; the Substrait field references of a pushed
+        // aggregate index the dataset schema by position.
+        Field point = new Field(
+            "location",
+            new FieldType(true, new ArrowType.FixedSizeList(2), null),
+            List.of(field("item", new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE), false))
+        );
+        RelDataType pointType = LanceTypeSystem.toRelDataType(point, factory);
+        assertEquals(SqlTypeName.ARRAY, pointType.getSqlTypeName());
+        assertEquals(SqlTypeName.DOUBLE, pointType.getComponentType().getSqlTypeName());
+        Field codes = new Field(
             "codes",
             new FieldType(true, new ArrowType.FixedSizeList(8), null),
             List.of(field("item", new ArrowType.Int(32, true), false))
         );
-        UnsupportedOperationException e = expectThrows(
-            UnsupportedOperationException.class,
-            () -> LanceTypeSystem.toRelDataType(vector, factory)
-        );
-        assertTrue(e.getMessage(), e.getMessage().contains("FixedSizeList"));
-        assertTrue(e.getMessage(), e.getMessage().contains("codes"));
+        RelDataType codesType = LanceTypeSystem.toRelDataType(codes, factory);
+        assertEquals(SqlTypeName.ARRAY, codesType.getSqlTypeName());
+        assertEquals(SqlTypeName.INTEGER, codesType.getComponentType().getSqlTypeName());
     }
 
     public void testStruct() {

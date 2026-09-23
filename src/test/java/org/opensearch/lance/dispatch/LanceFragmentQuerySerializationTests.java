@@ -16,6 +16,7 @@ import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchModule;
 import org.opensearch.search.internal.SearchContext;
@@ -49,7 +50,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             "demo",
             storage,
             /* pinnedVersion */ 7L,
-            "id >= 2",
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_AGGREGATE, "id >= 2"),
             /* query */ null,
             /* postFilter */ null,
             /* sorts */ Collections.emptyList(),
@@ -74,7 +75,8 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
 
         assertEquals(original.tableUri(), restored.tableUri());
         assertEquals(original.indexName(), restored.indexName());
-        assertEquals(original.filterSql(), restored.filterSql());
+        assertEquals(original.plan(), restored.plan());
+        assertEquals("id >= 2", restored.plan().filterSql());
         assertEquals(original.size(), restored.size());
         assertNotNull(restored.aggregations());
         assertEquals(2, restored.aggregations().getAggregatorFactories().size());
@@ -96,7 +98,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
                 "demo",
                 StorageOptions.empty(),
                 /* pinnedVersion */ -1L,
-                /* filterSql */ null,
+                FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_COUNT, null),
                 /* query */ null,
                 /* postFilter */ null,
                 Collections.emptyList(),
@@ -124,7 +126,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             "/tmp/table.lance",
             "demo",
             storage,
-            /* filterSql */ null,
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, null),
             /* query */ null,
             /* sorts */ Collections.emptyList(),
             10,
@@ -142,7 +144,8 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         assertEquals(original.indexName(), restored.indexName());
         assertEquals("allFragments follows the latest manifest", -1L, restored.pinnedVersion());
         assertTrue("-1 must expose as an empty pin", restored.pinnedVersionOrEmpty().isEmpty());
-        assertNull(restored.filterSql());
+        assertNull(restored.plan().filterSql());
+        assertEquals(FragmentPlan.Kind.LUCENE_TOPK, restored.plan().kind());
         assertTrue("empty fragmentIds is the all-fragments sentinel", restored.fragmentIds().isEmpty());
         assertNull("empty list must expose as null through the SDK helper", restored.fragmentIdsOrNull());
         assertEquals(original.size(), restored.size());

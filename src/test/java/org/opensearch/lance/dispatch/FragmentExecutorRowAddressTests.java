@@ -4,6 +4,8 @@
  */
 package org.opensearch.lance.dispatch;
 
+import org.opensearch.lance.engine.LanceWarmCache;
+import org.opensearch.cluster.service.ClusterService;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.nio.file.Path;
@@ -25,7 +27,6 @@ import org.opensearch.lance.plan.execute.MergeReducer.RankedHit;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.search.SearchHit;
-import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.search.sort.ScoreSortBuilder;
 import org.opensearch.search.sort.SortBuilder;
@@ -63,32 +64,27 @@ public class FragmentExecutorRowAddressTests extends OpenSearchSingleNodeTestCas
         return tableUri;
     }
 
+    /** Plans the request the way the coordinator does and runs it on the node's executor. */
     private LanceFragmentQueryResponse run(
         String tableUri,
         String indexName,
         QueryBuilder query,
-        String filterSql,
         List<SortBuilder<?>> sorts,
         int size,
         List<Integer> fragmentIds
     ) throws Exception {
         TransportLanceFragmentQueryAction executor = getInstanceFromNode(TransportLanceFragmentQueryAction.class);
         return executor.execute(
-            new LanceFragmentQueryRequest(
+            FragmentRequests.planned(
+                getInstanceFromNode(ClusterService.class),
+                getInstanceFromNode(LanceWarmCache.class),
                 tableUri,
                 indexName,
-                StorageOptions.empty(),
-                /* pinnedVersion */ -1L,
-                filterSql,
                 query,
-                /* postFilter */ null,
                 sorts,
-                /* searchAfter */ null,
                 size,
                 /* aggregations */ null,
-                fragmentIds,
-                /* trackScores */ false,
-                SearchContext.TRACK_TOTAL_HITS_ACCURATE
+                fragmentIds
             )
         );
     }
@@ -103,15 +99,7 @@ public class FragmentExecutorRowAddressTests extends OpenSearchSingleNodeTestCas
         // Lucene's collector sees every match and orders the ties by
         // doc id.
         List<SortBuilder<?>> sorts = List.of(new ScoreSortBuilder().order(SortOrder.DESC));
-        LanceFragmentQueryResponse response = run(
-            tableUri,
-            indexName,
-            new LanceMatchQueryBuilder("body", "lance"),
-            null,
-            sorts,
-            30,
-            List.of()
-        );
+        LanceFragmentQueryResponse response = run(tableUri, indexName, new LanceMatchQueryBuilder("body", "lance"), sorts, 30, List.of());
         assertEquals(30, response.hits().size());
         assertRowAddressesMatchIds(response);
         float top = sortScore(response.hits().get(0));
@@ -138,7 +126,6 @@ public class FragmentExecutorRowAddressTests extends OpenSearchSingleNodeTestCas
             tableUri,
             indexName,
             new LanceMatchQueryBuilder("body", "lance"),
-            null,
             List.of(),
             30,
             List.of()
@@ -170,15 +157,7 @@ public class FragmentExecutorRowAddressTests extends OpenSearchSingleNodeTestCas
         // flag is true on even rows; a descending sort on it puts every
         // even row first, all tied, so the page is ordered by doc id.
         List<SortBuilder<?>> sorts = List.of(new FieldSortBuilder("flag").order(SortOrder.DESC));
-        LanceFragmentQueryResponse response = run(
-            tableUri,
-            indexName,
-            new LanceMatchQueryBuilder("body", "hello"),
-            null,
-            sorts,
-            40,
-            List.of()
-        );
+        LanceFragmentQueryResponse response = run(tableUri, indexName, new LanceMatchQueryBuilder("body", "hello"), sorts, 40, List.of());
         assertEquals(40, response.hits().size());
         assertRowAddressesMatchIds(response);
         for (int i = 1; i < response.hits().size(); i++) {
@@ -201,7 +180,7 @@ public class FragmentExecutorRowAddressTests extends OpenSearchSingleNodeTestCas
         // match_all with a plain field sort and no search_after takes
         // the Lance sort pushdown; rating is distinct per row.
         List<SortBuilder<?>> sorts = List.of(new FieldSortBuilder("rating").order(SortOrder.DESC));
-        LanceFragmentQueryResponse response = run(tableUri, indexName, new MatchAllQueryBuilder(), null, sorts, 10, List.of());
+        LanceFragmentQueryResponse response = run(tableUri, indexName, new MatchAllQueryBuilder(), sorts, 10, List.of());
         assertEquals(10, response.hits().size());
         assertRowAddressesMatchIds(response);
         // rating is (i * 37) % 1000 and null on i % 5 == 4; 999 is row
@@ -224,13 +203,13 @@ public class FragmentExecutorRowAddressTests extends OpenSearchSingleNodeTestCas
         }
         // The reference: one executor over every fragment, the page a
         // single node returns.
-        List<String> whole = ids(run(tableUri, indexName, query, null, sorts, size, List.of()).hits());
+        List<String> whole = ids(run(tableUri, indexName, query, sorts, size, List.of()).hits());
         assertEquals(expected, whole);
         // One executor per fragment, as on a three node cluster with
         // one fragment each, merged in every node order.
         List<List<RankedHit>> perFragment = new ArrayList<>();
         for (int fragment = 0; fragment < FRAGMENTS; fragment++) {
-            LanceFragmentQueryResponse response = run(tableUri, indexName, query, null, sorts, size, List.of(fragment));
+            LanceFragmentQueryResponse response = run(tableUri, indexName, query, sorts, size, List.of(fragment));
             assertEquals(size, response.hits().size());
             perFragment.add(ranked(response));
         }
@@ -241,8 +220,8 @@ public class FragmentExecutorRowAddressTests extends OpenSearchSingleNodeTestCas
             assertEquals(whole, ids(merged.subList(0, size)));
         }
         // Two nodes, fragments 0 and 2 on one and fragment 1 on the other.
-        LanceFragmentQueryResponse first = run(tableUri, indexName, query, null, sorts, size, List.of(0, 2));
-        LanceFragmentQueryResponse second = run(tableUri, indexName, query, null, sorts, size, List.of(1));
+        LanceFragmentQueryResponse first = run(tableUri, indexName, query, sorts, size, List.of(0, 2));
+        LanceFragmentQueryResponse second = run(tableUri, indexName, query, sorts, size, List.of(1));
         List<SearchHit> merged = MergeReducer.mergeHits(List.of(ranked(second), ranked(first)), sorts);
         assertEquals(whole, ids(merged.subList(0, size)));
     }

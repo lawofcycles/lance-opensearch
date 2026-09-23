@@ -4,6 +4,8 @@
  */
 package org.opensearch.lance.dispatch;
 
+import org.opensearch.lance.engine.LanceWarmCache;
+import org.opensearch.cluster.service.ClusterService;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.io.IOException;
@@ -115,12 +117,11 @@ public class ReaderWrapperMatchAllTotalTests extends OpenSearchSingleNodeTestCas
                     SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO,
                     SearchContext.TRACK_TOTAL_HITS_ACCURATE }) {
                     String label = spelling.getKey() + " size " + size + " track_total_hits " + trackTotalHitsUpTo;
-                    LanceFragmentQueryRequest request = new LanceFragmentQueryRequest(
+                    LanceFragmentQueryRequest request = FragmentRequests.planned(
+                        getInstanceFromNode(ClusterService.class),
+                        getInstanceFromNode(LanceWarmCache.class),
                         tableUri,
                         indexName,
-                        StorageOptions.empty(),
-                        /* pinnedVersion */ -1L,
-                        /* filterSql */ null,
                         spelling.getValue(),
                         /* postFilter */ null,
                         List.of(),

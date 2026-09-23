@@ -7,6 +7,8 @@ package org.opensearch.lance.stats;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -35,6 +37,10 @@ import org.opensearch.lance.query.FtsAdmission;
  * {@link LanceWarmUpStatus} per Lance-backed index the node has seen
  * since it started; {@code plan.statistics} the planner's table
  * statistics cache (entries held and milliseconds spent collecting);
+ * {@code plan.refinements} how often the fragment executor moved a
+ * pushed operation of a shipped plan to the Lucene side, per reason;
+ * {@code plan.executed} how many fragment requests the Lance scan and
+ * Lucene each answered;
  * {@code indices} the shard reader of every Lance-backed shard the node
  * hosts.
  */
@@ -72,6 +78,21 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     private final List<LanceWarmUpStatus> warmUps;
     private final List<IndexReaderStats> indices;
     private final List<LocalCloneStats> localClones;
+    /**
+     * How many times this node's fragment executor moved a pushed
+     * operation of a shipped plan to the Lucene side, per reason
+     * ({@code security_wrapper}, {@code sort_field_type},
+     * {@code aggregate_resolution}); every reason is present, zero when
+     * it never fired.
+     */
+    private final Map<String, Long> planRefinements;
+    /**
+     * How many fragment requests this node's executor answered through
+     * the Lance scan ({@code pushed_scan}: an ordered page or a Substrait
+     * aggregate) and through Lucene's collector and aggregators
+     * ({@code lucene}); both keys always present.
+     */
+    private final Map<String, Long> planExecuted;
 
     private final int planStatisticsTables;
     private final long planStatisticsCollectMillisTotal;
@@ -203,7 +224,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             List.of(),
             List.of(),
             0,
-            0L
+            0L,
+            Map.of(),
+            Map.of()
         );
     }
 
@@ -237,7 +260,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         List<IndexReaderStats> indices,
         List<LocalCloneStats> localClones,
         int planStatisticsTables,
-        long planStatisticsCollectMillisTotal
+        long planStatisticsCollectMillisTotal,
+        Map<String, Long> planRefinements,
+        Map<String, Long> planExecuted
     ) {
         this.cacheEnabled = cacheEnabled;
         this.snapshotCount = snapshotCount;
@@ -269,6 +294,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.localClones = List.copyOf(localClones);
         this.planStatisticsTables = planStatisticsTables;
         this.planStatisticsCollectMillisTotal = planStatisticsCollectMillisTotal;
+        this.planRefinements = Collections.unmodifiableMap(new LinkedHashMap<>(planRefinements));
+        this.planExecuted = Collections.unmodifiableMap(new LinkedHashMap<>(planExecuted));
     }
 
     public LanceNodeStats(StreamInput in) throws IOException {
@@ -307,6 +334,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.localClones = in.readList(LocalCloneStats::new);
         this.planStatisticsTables = in.readVInt();
         this.planStatisticsCollectMillisTotal = in.readVLong();
+        this.planRefinements = Collections.unmodifiableMap(in.readOrderedMap(StreamInput::readString, StreamInput::readVLong));
+        this.planExecuted = Collections.unmodifiableMap(in.readOrderedMap(StreamInput::readString, StreamInput::readVLong));
     }
 
     @Override
@@ -344,6 +373,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         out.writeList(localClones);
         out.writeVInt(planStatisticsTables);
         out.writeVLong(planStatisticsCollectMillisTotal);
+        out.writeMap(planRefinements, StreamOutput::writeString, StreamOutput::writeVLong);
+        out.writeMap(planExecuted, StreamOutput::writeString, StreamOutput::writeVLong);
     }
 
     @Override
@@ -403,6 +434,16 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.field("tables", planStatisticsTables);
         builder.field("collect_millis_total", planStatisticsCollectMillisTotal);
         builder.endObject();
+        builder.startObject("refinements");
+        for (Map.Entry<String, Long> refinement : planRefinements.entrySet()) {
+            builder.field(refinement.getKey(), refinement.getValue());
+        }
+        builder.endObject();
+        builder.startObject("executed");
+        for (Map.Entry<String, Long> executed : planExecuted.entrySet()) {
+            builder.field(executed.getKey(), executed.getValue());
+        }
+        builder.endObject();
         builder.endObject();
 
         builder.startObject("indices");
@@ -455,6 +496,16 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     /** Milliseconds this node has spent collecting planner table statistics, summed over every collection. */
     public long planStatisticsCollectMillisTotal() {
         return planStatisticsCollectMillisTotal;
+    }
+
+    /** Plan refinements this node's executor applied since it started, keyed by reason; every reason present. */
+    public Map<String, Long> planRefinements() {
+        return planRefinements;
+    }
+
+    /** Fragment requests this node's executor answered, keyed by {@code pushed_scan} and {@code lucene}. */
+    public Map<String, Long> planExecuted() {
+        return planExecuted;
     }
 
     public boolean cacheEnabled() {
@@ -614,7 +665,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && indices.equals(other.indices)
             && localClones.equals(other.localClones)
             && planStatisticsTables == other.planStatisticsTables
-            && planStatisticsCollectMillisTotal == other.planStatisticsCollectMillisTotal;
+            && planStatisticsCollectMillisTotal == other.planStatisticsCollectMillisTotal
+            && planRefinements.equals(other.planRefinements)
+            && planExecuted.equals(other.planExecuted);
     }
 
     @Override
@@ -649,7 +702,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             indices,
             localClones,
             planStatisticsTables,
-            planStatisticsCollectMillisTotal
+            planStatisticsCollectMillisTotal,
+            planRefinements,
+            planExecuted
         );
     }
 }

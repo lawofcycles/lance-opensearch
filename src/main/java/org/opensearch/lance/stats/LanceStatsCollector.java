@@ -19,6 +19,7 @@ import org.opensearch.lance.engine.HeapFallbackStats;
 import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.engine.LanceWarmCache;
+import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
 import org.opensearch.lance.query.FtsAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
 
@@ -39,7 +40,10 @@ import org.opensearch.lance.query.LanceFtsQuery;
  * reader opened without one loads every column into heap. {@code warm_up}
  * is the {@link LanceIndexWarmer}'s view of every Lance-backed index the
  * node has seen, empty with the mode {@code none} when the node has no
- * warmer.
+ * warmer. {@code plan.refinements} and {@code plan.executed} read
+ * {@link FragmentPlanRefiner}'s node wide counters: the pushed
+ * operations the fragment executor moved to the Lucene side, per
+ * reason, and the requests the Lance scan and Lucene each answered.
  */
 public final class LanceStatsCollector {
 
@@ -172,7 +176,9 @@ public final class LanceStatsCollector {
                 indices,
                 cloneStats,
                 0,
-                0L
+                0L,
+                FragmentPlanRefiner.refinementCounts(),
+                FragmentPlanRefiner.executedCounts()
             );
         }
         ColumnStore store = warmCache.columnStore();
@@ -206,7 +212,9 @@ public final class LanceStatsCollector {
             indices,
             cloneStats,
             warmCache.tableStatistics().size(),
-            warmCache.tableStatistics().collectMillisTotal()
+            warmCache.tableStatistics().collectMillisTotal(),
+            FragmentPlanRefiner.refinementCounts(),
+            FragmentPlanRefiner.executedCounts()
         );
     }
 }

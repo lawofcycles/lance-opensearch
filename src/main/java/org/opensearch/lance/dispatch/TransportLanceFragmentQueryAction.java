@@ -9,10 +9,8 @@ import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -21,31 +19,19 @@ import java.util.concurrent.Executor;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DirectoryReader;
-import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.index.ReaderUtil;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.Collector;
 import org.apache.lucene.search.CollectorManager;
-import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
-import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
-import org.apache.lucene.search.Scorer;
-import org.apache.lucene.search.ScorerSupplier;
-import org.apache.lucene.search.Sort;
-import org.apache.lucene.search.TopDocs;
-import org.apache.lucene.search.TopFieldCollector;
-import org.apache.lucene.search.TopFieldCollectorManager;
-import org.apache.lucene.search.TopFieldDocs;
-import org.apache.lucene.search.TopScoreDocCollectorManager;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.lance.Dataset;
 import org.lance.Fragment;
-import org.lance.ipc.ColumnOrdering;
 import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
@@ -65,7 +51,6 @@ import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.MapperService;
-import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.Rewriteable;
@@ -74,7 +59,6 @@ import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
-import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.execute.LanceAggregateResults;
 import org.opensearch.lance.engine.ColumnStore;
 import org.opensearch.core.tasks.TaskCancelledException;
@@ -82,14 +66,11 @@ import org.opensearch.lance.engine.FragmentGroupScan;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
-import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.lance.engine.LanceWarmCache;
-import org.opensearch.lance.plan.calcite.LancePlannerFactory;
+import org.opensearch.lance.plan.execute.FragmentPlan;
+import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
 import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.lance.plan.execute.PlanExecutor.MatchedCount;
-import org.opensearch.lance.plan.rel.LanceTableScan;
-import org.opensearch.lance.plan.rel.PushedOperation.PushedTopK;
-import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.query.FtsAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceHintingWeight;
@@ -97,7 +78,6 @@ import org.opensearch.lance.query.LanceInvalidInput;
 import org.opensearch.lance.query.LanceKnnQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.script.ScriptService;
-import org.opensearch.search.SearchHit;
 import org.opensearch.search.aggregations.Aggregation;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
@@ -277,14 +257,12 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      */
     private final LanceWarmCache warmCache;
     /**
-     * Runs the planner facing side of a request: an aggregation
-     * request is routed through the Volcano planner and, when the
-     * pushdown rule fires, executes as the scan carrying the Substrait
-     * bytes instead of the Lucene aggregators; a planned query or
-     * sorted page resolves to the pushed Lance scan the same way. The
-     * planner budgets mirror the explain action's.
+     * Applies the node local guards to the plan the coordinator
+     * shipped: a reader wrapper, the Lucene sort field types, and the
+     * resolution of a pushed aggregate against the mapping move a
+     * pushed operation to the Lucene side; nothing is planned here.
      */
-    private final PlanExecutor planExecutor;
+    private final FragmentPlanRefiner refiner = new FragmentPlanRefiner();
 
     @Inject
     public TransportLanceFragmentQueryAction(
@@ -307,11 +285,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         int permits = LancePlugin.FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING.get(clusterService.getSettings());
         this.concurrencyLimit = new java.util.concurrent.Semaphore(permits, /*fair*/ false);
         this.intraRequestExecutor = transportService.getThreadPool().executor(INTRA_REQUEST_POOL);
-        long nativeBudgetBytes = NativeMemoryLimit.parse(
-            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.get(clusterService.getSettings()),
-            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.getKey()
-        );
-        this.planExecutor = new PlanExecutor(new LancePlannerFactory(nativeBudgetBytes, Runtime.getRuntime().maxMemory()));
     }
 
     @Override
@@ -382,9 +355,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 );
             } else {
                 LOGGER.warn(
-                    "fragment query failed on this node for [{}] filter [{}] fragments [{}]",
+                    "fragment query failed on this node for [{}] plan [{}] fragments [{}]",
                     request.tableUri(),
-                    request.filterSql() == null ? "<match_all>" : request.filterSql(),
+                    request.plan(),
                     request.fragmentIds().isEmpty() ? "<all>" : request.fragmentIds(),
                     e
                 );
@@ -592,12 +565,21 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
-     * Run the scan against a resolved {@link IndexService}, either
+     * Run the plan against a resolved {@link IndexService}, either
      * the node's own registered instance or a request-scoped temporary
      * one. Nothing below depends on an {@link org.opensearch.index.shard.IndexShard}:
      * the shard id is fixed at 0 (Lance-backed indexes are
      * single-shard) and the {@link IndexSettings} come from the
      * IndexService.
+     *
+     * <p>The plan the coordinator shipped ({@link LanceFragmentQueryRequest#plan()})
+     * is refined once the mapping is at hand ({@link FragmentPlanRefiner}:
+     * the reader wrapper, the Lucene sort field types, the resolution of
+     * a pushed aggregate) and then executed: a pushed page runs as the
+     * ordered, limited Lance scan, a pushed aggregate as the Substrait
+     * scan, and everything else through Lucene's collector and
+     * aggregators over the fragment readers, driven by the Lucene query
+     * the plan's query part builds.
      */
     private LanceFragmentQueryResponse executeWithIndexService(
         IndexService indexService,
@@ -611,15 +593,17 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     ) throws Exception {
         ShardId shardId = new ShardId(indexMetadata.getIndex(), 0);
         Dataset dataset = snapshot.dataset();
+        FragmentPlan planned = request.plan();
 
         // Fetch the IndexService reader wrapper once so both
         // openWrappedReader and computeMatched see the same
         // wrapper reference. A non-null wrapper here is the
         // signal that DLS/FLS or a similar reader-level
-        // transform may filter documents; computeMatched uses
-        // that signal to route counts through the searcher
-        // instead of Lance-side metadata paths, which would
-        // bypass the wrapper and return the pre-DLS count.
+        // transform may filter documents; the refiner moves every
+        // wrapper sensitive pushed operation to the Lucene side and
+        // computeMatched routes counts through the searcher instead
+        // of Lance-side metadata paths, which would bypass the
+        // wrapper and return the pre-DLS count.
         CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper = resolveReaderWrapper(indexService);
         boolean hasSecurityWrapper = readerWrapper != null;
 
@@ -639,19 +623,21 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 snapshot,
                 snapshot.isCached() ? warmCache.columnStore() : null,
                 effectiveFragmentIds,
-                // Push the coordinator-translated Lance SQL down
-                // to the leaf reader. When the top-level query is
-                // a scalar filter the planner can print as Lance
-                // SQL (bool / term / terms / range / exists /
-                // match_all), request.filterSql() carries the SQL
-                // and every request scoped heap column scan the
-                // leaf reader issues inside ensureXxxLoaded is
-                // layered with that filter, so `filter + terms agg`
-                // and `filter + sum` materialise only the matching
-                // rows of the aggregated column when the column
-                // store cannot serve them. FTS and knn queries have
-                // no SQL representation so filterSql is null there.
-                request.filterSql(),
+                // Push the plan's scalar Lance SQL down to the leaf
+                // reader. When the top-level query is a scalar filter
+                // the planner spelled as Lance SQL (bool / term / terms
+                // / range / exists / match_all), every request scoped
+                // heap column scan the leaf reader issues inside
+                // ensureXxxLoaded is layered with that filter, so
+                // `filter + terms agg` and `filter + sum` materialise
+                // only the matching rows of the aggregated column when
+                // the column store cannot serve them. A full text or
+                // knn shape carries its SQL as the Lance query's
+                // prefilter instead, so the scalar filter is null there.
+                // No refinement changes this value: the guards drop
+                // pushed pages, aggregates and full text clauses, never
+                // the scalar filter.
+                planned.scalarFilterSql(),
                 readerWrapper,
                 cancellation
             )
@@ -705,8 +691,40 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 QueryShardContext qsc = indexService.newQueryShardContext(0, searcher, System::currentTimeMillis, null);
                 searchContext.withQueryShardContext(qsc);
 
+                SortAndFormats sortAndFormats = resolveSort(request, qsc);
+                int maxGroups = LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
+                FragmentPlanRefiner.Refined refined = refiner.refine(
+                    planned,
+                    new FragmentPlanRefiner.Inputs(
+                        hasSecurityWrapper,
+                        sortAndFormats,
+                        request,
+                        pushed -> LanceAggregateResults.resolve(
+                            pushed.toPushedShape(),
+                            pushed.substraitDirect(),
+                            request.aggregations(),
+                            dataset.getSchema(),
+                            multiFields,
+                            qsc,
+                            maxGroups
+                        )
+                    )
+                );
+                FragmentPlan effective = refined.plan();
+                if (refined.refined()) {
+                    LOGGER.debug(
+                        "lance.plan: index [{}] planned [{}] executed [{}] reason {}",
+                        request.indexName(),
+                        planned,
+                        effective,
+                        refined.reasons()
+                    );
+                } else {
+                    LOGGER.debug("lance.plan: index [{}] planned [{}] executed [{}]", request.indexName(), planned, effective);
+                }
+
                 Query query = applyNonNestedFilter(
-                    resolveLuceneQuery(request, qsc, hasSecurityWrapper, indexMetadata, dataset, multiFields, searcher.getIndexReader()),
+                    resolveLuceneQuery(effective, request, qsc, hasSecurityWrapper),
                     indexService.mapperService()
                 );
 
@@ -777,7 +795,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // from the query before handing it to
                 // computeMatched. Without this, an FTS Weight
                 // that was clipped to `size` rows during
-                // scanHitsViaIndexSearcher would also clip the
+                // the Lucene hits phase would also clip the
                 // count and hits.total.value would collapse to
                 // `size`.
                 Query countQuery = withoutScanLimit(hitsQuery);
@@ -790,7 +808,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     // from a count-only scan of the LanceFtsQuery.
                     countQuery = prebuilt;
                 }
-                SortAndFormats sortAndFormats = resolveSort(request, qsc);
 
                 // Aggregations run over the top-level query only —
                 // OpenSearch semantics for post_filter say the
@@ -798,37 +815,31 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // but not to aggregations. Hits and matched
                 // therefore use the AND-combined query.
                 //
-                // Sorted scalar-filter pages go through the planner:
-                // SearchRequestToRel.translateQuery builds the query
-                // root, the sort clauses become the LanceTopK's
-                // collations, and PushSortLimitIntoLanceScan folds
-                // both into the scan when every collation resolves to
-                // a Lance ColumnOrdering (and the search_after cursor,
-                // when present, to a strict SQL bound). Lance then
-                // returns the top `size` rows already ordered, so the
-                // hits phase never materialises the sort column for
-                // every matching row. Every shape the planner does not
-                // fold goes through the Lucene collector.
-                LanceTableScan plannedTopK = hasSecurityWrapper || sortAndFormats == null
-                    ? null
-                    : planExecutor.plannedTopK(
-                        request,
-                        qsc,
-                        indexMetadata,
-                        dataset,
-                        multiFields,
-                        searcher.getIndexReader(),
-                        sortAndFormats
-                    );
-                HitsPage hits;
-                if (plannedTopK != null) {
-                    PushedTopK pushedTopK = plannedTopK.pushedTopK().orElseThrow();
-                    hits = scanSortedHitsViaLance(
+                // A pushed page with Lance orderings runs as one
+                // ordered, limited Lance scan: Lance returns the top
+                // `fetch` rows already ordered, so the hits phase never
+                // materialises the sort column for every matching row.
+                // A pushed page without orderings (the scan's own order
+                // is the page order) and every Lucene plan go through
+                // the Lucene collector, with the scan limit the query
+                // carries.
+                FragmentPlan.TopK pushedTopK = effective.topK();
+                boolean pushedPage = pushedTopK != null && !pushedTopK.orderings().isEmpty();
+                boolean pushedAggregate = refined.aggregate() != null;
+                // Which branch runs the refined plan, for plan.executed
+                // in the stats: the Lance scan (an ordered page or a
+                // Substrait aggregate) or Lucene's collector and
+                // aggregators. Counted before the scans run so a failing
+                // scan still shows which path the node took.
+                FragmentPlanRefiner.recordExecuted(pushedPage || pushedAggregate);
+                FragmentHitsPages.HitsPage hits;
+                if (pushedPage) {
+                    hits = FragmentHitsPages.viaLanceSortedScan(
                         dataset,
                         request,
-                        pushedTopK.toScanOrderings(),
+                        pushedTopK.toColumnOrderings(),
                         pushedTopK.fetch(),
-                        PlanExecutor.plannedScanFilter(plannedTopK, pushedTopK),
+                        pushedTopK.scanFilterSql(effective.filterSql()),
                         sortAndFormats,
                         searcher.getIndexReader(),
                         effectiveFragmentIds,
@@ -839,7 +850,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     // hitsQuery is the very query it was created for;
                     // with a post_filter the hits query is a conjunction
                     // Lucene has to build its own Weight for.
-                    hits = scanHitsViaIndexSearcher(
+                    hits = FragmentHitsPages.viaIndexSearcher(
                         searcher,
                         hitsQuery,
                         hitsQuery == query ? lanceWeight : null,
@@ -851,15 +862,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 }
                 InternalAggregations aggregations;
                 MatchedCount matched;
-                PlanExecutor.PlannedAggregate pushdown = resolveAggregatePushdown(
-                    request,
-                    hasSecurityWrapper,
-                    dataset,
-                    multiFields,
-                    qsc,
-                    searcher.getIndexReader()
-                );
-                if (pushdown != null) {
+                if (pushedAggregate) {
                     // The scan groups and aggregates on the Lance side and
                     // also yields the row total, so neither the Lucene
                     // aggregators nor computeMatched run for this request.
@@ -867,11 +870,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     // pushdown_parallelism groups; the extra scans run on
                     // the index_searcher pool.
                     long pushdownStart = System.nanoTime();
-                    LanceAggregateResults.Result result = pushdown.results()
+                    LanceAggregateResults.Result result = refined.aggregate()
                         .execute(
                             dataset,
                             effectiveFragmentIds,
-                            pushdown.scanFilterSql(),
+                            effective.filterSql(),
                             clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING),
                             intraRequestExecutor,
                             cancellation,
@@ -893,6 +896,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     matched = PlanExecutor.computeMatched(
                         dataset,
                         request,
+                        effective.scalarFilterSql(),
                         searcher,
                         countQuery,
                         hasSecurityWrapper,
@@ -951,83 +955,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         return new BooleanQuery.Builder().add(query, BooleanClause.Occur.MUST)
             .add(Queries.newNonNestedFilter(), BooleanClause.Occur.FILTER)
             .build();
-    }
-
-    /**
-     * The hits of one page together with the Lance row address
-     * ({@code fragmentId << 32 | offset}) of each, parallel arrays. The
-     * addresses travel to the coordinator, which breaks ties between
-     * hits with equal sort values on them.
-     */
-    private record HitsPage(List<SearchHit> hits, long[] rowAddrs) {
-        static final HitsPage EMPTY = new HitsPage(Collections.emptyList(), new long[0]);
-    }
-
-    /**
-     * Row address of a doc of {@code reader}: the fragment id of the
-     * Lance leaf the doc belongs to in the high 32 bits, the offset of
-     * the doc inside that leaf in the low 32 bits. Every leaf of a
-     * fragment dispatch reader is Lance-backed; any other leaf is a
-     * bug in the reader construction, not something to paper over.
-     */
-    private static long rowAddressOf(IndexReader reader, int doc) {
-        List<LeafReaderContext> leaves = reader.leaves();
-        LeafReaderContext leaf = leaves.get(ReaderUtil.subIndex(doc, leaves));
-        LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(leaf.reader());
-        if (lance == null) {
-            throw new IllegalStateException("leaf " + leaf.ord + " of the fragment reader is not backed by a Lance fragment");
-        }
-        return ((long) lance.fragmentId() << 32) | (lance.rowOf(doc - leaf.docBase) & 0xFFFFFFFFL);
-    }
-
-    /**
-     * Decide whether this request's aggregations run as a Substrait
-     * group by inside the Lance scan and, when they do, prepare the
-     * executor. The request qualifies when
-     * {@code lance.aggregation.pushdown} is on, it asks for no hits
-     * ({@code size} 0) and has no {@code post_filter}, its query is
-     * {@code match_all} or a scalar filter the coordinator translated to
-     * Lance SQL ({@link LanceFragmentQueryRequest#filterSql()}; FTS and
-     * knn queries have no SQL form and stay on the aggregator path), no
-     * reader wrapper is installed (DLS / FLS filter documents in the
-     * Lucene reader, which the scan never sees), and the planner pushed
-     * the aggregation tree into the scan: the translator accepts the
-     * tree, the Volcano planner's pushdown rule obtains the Substrait
-     * bytes from the producer, and {@link LanceAggregateResults#resolve}
-     * pairs the request's builders with the pushed aggregate. Returns
-     * {@code null} otherwise, in which case the Lucene aggregators run.
-     */
-    private PlanExecutor.PlannedAggregate resolveAggregatePushdown(
-        LanceFragmentQueryRequest request,
-        boolean hasSecurityWrapper,
-        Dataset dataset,
-        Map<String, LinkedHashMap<String, String>> multiFields,
-        QueryShardContext qsc,
-        IndexReader reader
-    ) {
-        if (hasSecurityWrapper) {
-            // This gate must stay first and must not be folded into the
-            // combined condition below: the planner model built further
-            // down reads reader::numDocs from the raw reader, which a
-            // DLS / FLS wrapper has not filtered, and the pushed scan
-            // itself never sees the wrapper. Nothing wrapper sensitive
-            // may run past this point.
-            return null;
-        }
-        if (!clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_SETTING)) {
-            return null;
-        }
-        if (request.size() != 0 || request.postFilter() != null || request.aggregations() == null) {
-            return null;
-        }
-        boolean scalarQuery = request.query() == null || request.query() instanceof MatchAllQueryBuilder || request.filterSql() != null;
-        if (!scalarQuery) {
-            return null;
-        }
-        if (!LanceAggregationSupport.isPushdownCandidate(request.aggregations())) {
-            return null;
-        }
-        return planExecutor.plannedAggregate(request, dataset, multiFields, qsc, reader);
     }
 
     /**
@@ -1094,61 +1021,53 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
-     * Translate the request's OpenSearch-native query representation
-     * into a Lucene {@link Query} the shared {@link ContextIndexSearcher}
-     * can execute. Priority order:
+     * Build the Lucene {@link Query} the shared {@link ContextIndexSearcher}
+     * executes from the plan's query part. Priority order:
      * <ol>
-     *   <li>{@link LanceFragmentQueryRequest#filterSql()} — the
-     *       coordinator translated the whole top-level query tree to
-     *       Lance SQL (bool / term / terms / range / exists /
-     *       match_all over mapped columns). Wrapped in
-     *       {@link LanceScanFilterQuery} so one Lance native scan per
+     *   <li>{@link FragmentPlan#lanceClause()} — the planner pushed a
+     *       full text or knn clause into the scan (alone, or as the
+     *       single {@code must} of a {@code bool} whose scalar
+     *       {@code filter} / {@code must_not} companions, or the
+     *       {@code lance_knn}'s inner {@code filter}, print as Lance
+     *       SQL). The clause's own Lucene query is built through
+     *       {@code toQuery}, so the mapping validation (field types,
+     *       vector dimension) and the clause boost behave as on the
+     *       unplanned path, and the plan's filter SQL rides on the
+     *       {@link LanceFtsQuery} / {@link LanceKnnQuery} as the scan's
+     *       prefilter: Lance evaluates the scalar predicate before the
+     *       inverted-index or nearest lookup instead of Lucene
+     *       intersecting two full scans. A plain FTS clause takes the
+     *       scan limit {@link #resolveScanFilterTopK} allows; a boosted
+     *       one stays unbounded like the unplanned boosted path.</li>
+     *   <li>{@link FragmentPlan#filterSql()} — the planner spelled the
+     *       whole top-level query tree as Lance SQL (bool / term / terms
+     *       / range / exists / match_all over mapped columns). Wrapped
+     *       in {@link LanceScanFilterQuery} so one Lance native scan per
      *       shard evaluates the predicate and yields the matching row
-     *       addresses, optionally clipped to {@code size} when the
-     *       shape allows (see {@link #resolveScanFilterTopK}). This
-     *       takes precedence over the QueryBuilder because the Lucene
-     *       translation of the same tree (PointRange / term queries
-     *       that fall back to doc values on a reader without points)
-     *       has to load every referenced column through the doc value
-     *       path before it can match a single row, whereas the Lance
-     *       scan reads only {@code _rowaddr}. {@link PlanExecutor#computeMatched}
-     *       already trusts the same SQL for {@code hits.total}, so the
-     *       two stay consistent by construction.</li>
+     *       addresses, optionally clipped to {@code size} when the shape
+     *       allows. This beats the Lucene translation of the same tree
+     *       (PointRange / term queries that fall back to doc values on a
+     *       reader without points), which has to load every referenced
+     *       column through the doc value path before it can match a
+     *       single row, whereas the Lance scan reads only
+     *       {@code _rowaddr}. {@link PlanExecutor#computeMatched}
+     *       trusts the same SQL for {@code hits.total}, so the two stay
+     *       consistent by construction.</li>
      *   <li>{@link LanceFragmentQueryRequest#query()} — the top-level
      *       {@link org.opensearch.index.query.QueryBuilder} the
-     *       coordinator forwarded, for shapes the translator refused
-     *       (match / knn / anything scoring, or a tree touching an
-     *       unmapped field). Runs through the local
-     *       {@link QueryShardContext#toQuery} so per-node mapping
-     *       decisions (Lance FTS field types, knn field types, etc.)
-     *       apply. A {@code bool} whose only scoring clause is one
-     *       Lance FTS clause and whose {@code filter} / {@code
-     *       must_not} clauses all translate to Lance SQL, and a
-     *       {@code lance_knn} with an inner {@code filter}, are planned
-     *       through {@link SearchRequestToRel#translateQuery} and the
-     *       fuse rules first (see {@link PlanExecutor#plannedLanceQuery}):
-     *       the pushed operation's SQL rides on the
-     *       {@link LanceFtsQuery} / {@link LanceKnnQuery} as the scan's
-     *       prefilter, so Lance evaluates the scalar predicate before
-     *       the inverted-index or nearest lookup instead of Lucene
-     *       intersecting two full scans. The FTS collapse is skipped
-     *       when a reader wrapper is installed because DLS filters
-     *       would not be part of the Lance-side predicate.</li>
+     *       coordinator forwarded, for shapes the planner refused
+     *       (match / anything scoring, a tree touching an unmapped or
+     *       ip / geo field, a full text clause under a reader wrapper).
+     *       Runs through the local {@link QueryShardContext#toQuery} so
+     *       per-node mapping decisions apply.</li>
      *   <li>Otherwise: {@link MatchAllDocsQuery}.</li>
      * </ol>
-     * The coordinator ships the QueryBuilder on every request and
-     * adds filterSql whenever translation succeeds, so both are
-     * commonly set at once; filterSql wins because it is the
-     * cheaper, already-validated form of the same predicate.
      */
     private Query resolveLuceneQuery(
+        FragmentPlan plan,
         LanceFragmentQueryRequest request,
         QueryShardContext qsc,
-        boolean hasSecurityWrapper,
-        IndexMetadata indexMetadata,
-        Dataset dataset,
-        Map<String, LinkedHashMap<String, String>> multiFields,
-        IndexReader reader
+        boolean hasSecurityWrapper
     ) throws IOException {
         // Top-k pushdown clips the Lance scan to the first `size`
         // rows before the reader wrapper sees them. Under a wrapper
@@ -1157,8 +1076,31 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         // match, so the scan stays unbounded and the Lucene collector
         // does the clipping after the liveDocs are applied.
         int scanLimit = hasSecurityWrapper ? LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED : resolveScanFilterTopK(request);
-        if (request.filterSql() != null) {
-            return new LanceScanFilterQuery(request.filterSql(), scanLimit);
+        int ftsScanLimit = scanLimit == LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED ? LanceFtsQuery.SCAN_LIMIT_UNBOUNDED : scanLimit;
+        if (plan.lanceClause() != null) {
+            Query clause = plan.lanceClause().toQuery(qsc);
+            if (clause instanceof LanceFtsQuery fts) {
+                LanceFtsQuery pushed = fts.withScanFilterSql(plan.filterSql());
+                return ftsScanLimit == LanceFtsQuery.SCAN_LIMIT_UNBOUNDED ? pushed : pushed.withScanLimit(ftsScanLimit);
+            }
+            if (clause instanceof BoostQuery boosted && boosted.getQuery() instanceof LanceFtsQuery fts) {
+                // The boosted clause keeps its BoostQuery wrapper and
+                // the scan stays unbounded, like the top-level boosted
+                // FTS path.
+                return new BoostQuery(fts.withScanFilterSql(plan.filterSql()), boosted.getBoost());
+            }
+            if (clause instanceof LanceKnnQuery knn) {
+                return knn.withScanFilterSql(plan.filterSql());
+            }
+            if (clause instanceof BoostQuery boosted && boosted.getQuery() instanceof LanceKnnQuery knn) {
+                return new BoostQuery(knn.withScanFilterSql(plan.filterSql()), boosted.getBoost());
+            }
+            throw new IllegalStateException(
+                "the planned Lance clause [" + plan.lanceClause().getWriteableName() + "] built " + clause.getClass().getSimpleName()
+            );
+        }
+        if (plan.filterSql() != null) {
+            return new LanceScanFilterQuery(plan.filterSql(), scanLimit);
         }
         if (request.query() != null) {
             // Rewrite before toQuery so that shapes which rely on
@@ -1173,20 +1115,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // path does the same Rewriteable.rewrite call in
             // QueryShardContext.toQuery before invoking doToQuery.
             QueryBuilder rewritten = Rewriteable.rewrite(request.query(), qsc, true);
-            Query planned = planExecutor.plannedLanceQuery(
-                rewritten,
-                qsc,
-                hasSecurityWrapper,
-                scanLimit,
-                request,
-                indexMetadata,
-                dataset,
-                multiFields,
-                reader
-            );
-            if (planned != null) {
-                return planned;
-            }
             Query base = rewritten.toQuery(qsc);
             // If the request shape allows top-k pushdown and the
             // resulting Lucene tree is a bare LanceFtsQuery (single
@@ -1197,7 +1125,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // sentinel: mixing the top-k with other scorers would
             // clip the wrong side. LanceFtsQuery has its own
             // unbounded sentinel, so translate before comparing.
-            int ftsScanLimit = scanLimit == LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED ? LanceFtsQuery.SCAN_LIMIT_UNBOUNDED : scanLimit;
             if (ftsScanLimit != LanceFtsQuery.SCAN_LIMIT_UNBOUNDED && base instanceof LanceFtsQuery fts) {
                 return fts.withScanLimit(ftsScanLimit);
             }
@@ -1258,7 +1185,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         int size = request.size();
         if (size <= 0) {
             // size:0 count-only shape never enters
-            // scanHitsViaIndexSearcher, and computeMatched serves the
+            // the Lucene hits phase, and computeMatched serves the
             // total from Dataset.countRows without going through this
             // scorer, so we can leave the scan unbounded.
             return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
@@ -1355,450 +1282,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         return new org.apache.lucene.search.BooleanQuery.Builder().add(base, org.apache.lucene.search.BooleanClause.Occur.MUST)
             .add(pf, org.apache.lucene.search.BooleanClause.Occur.FILTER)
             .build();
-    }
-
-    /**
-     * Run the top-{@code size} query on the shared
-     * {@link ContextIndexSearcher} and materialise every hit through
-     * OpenSearch's stock stored-fields path
-     * ({@link org.opensearch.lance.engine.LanceFragmentLeafReader#materialiseStoredFields}).
-     * The reader is built by the caller so hits and aggregations
-     * share one Lucene scan of the fragment subset.
-     *
-     * <p>The score is the real Lucene score (BM25 for Lance FTS,
-     * cosine for Lance knn, 1.0 for {@link MatchAllDocsQuery}).
-     * Sort clauses go through the
-     * standard {@link org.apache.lucene.search.IndexSearcher#search(Query, int, org.apache.lucene.search.Sort)}
-     * call and per-hit sort values are captured for the coordinator's
-     * merge phase.
-     *
-     * <p>{@code trackScores} follows the OpenSearch
-     * {@code track_scores} request flag. Sort-based Lucene search
-     * defaults to computing sort values only, leaving
-     * {@link ScoreDoc#score} at {@link Float#NaN}. When the caller
-     * asks for {@code track_scores:true} the 4 / 5 argument
-     * {@link org.apache.lucene.search.IndexSearcher#search(Query, int, org.apache.lucene.search.Sort, boolean)}
-     * / {@code searchAfter} overloads compute scores alongside the
-     * sort, so hits come back with numeric {@code _score} values
-     * and the coordinator's {@code max_score} sees real numbers.
-     * The score-only path ({@code sortAndFormats == null}) already
-     * collects scores through
-     * {@link org.apache.lucene.search.IndexSearcher#search(Query, int)}
-     * and ignores this flag.
-     *
-     * <p>When {@code sharedWeight} is non-null the collectors run
-     * through {@link LanceFragmentIndexSearcher#search(Weight, org.apache.lucene.search.CollectorManager)}
-     * with that Weight instead of letting {@link org.apache.lucene.search.IndexSearcher}
-     * create one from {@code query}; the collector managers, the
-     * {@code numHits} cap and the total-hits threshold are the ones
-     * the stock {@code search} / {@code searchAfter} overloads build
-     * internally, so the returned page is the same either way. The
-     * caller passes a Weight only for a bare {@link LanceFtsQuery} or
-     * {@link LanceKnnQuery} so that its Lance scan is shared with the
-     * aggregators and, for FTS, the match count.
-     */
-    private HitsPage scanHitsViaIndexSearcher(
-        LanceFragmentIndexSearcher searcher,
-        Query query,
-        Weight sharedWeight,
-        SortAndFormats sortAndFormats,
-        Object[] searchAfter,
-        int size,
-        boolean trackScores
-    ) throws java.io.IOException {
-        if (size <= 0) {
-            return HitsPage.EMPTY;
-        }
-        TopDocs topDocs;
-        if (searchAfter != null && sortAndFormats != null) {
-            // FieldDoc.doc is Lucene's tie-breaker for docs sharing
-            // the sort value with the cursor. Setting it just past
-            // the reader's last doc means "exclude the tied doc",
-            // which matches OpenSearch's usual search_after
-            // semantics. Integer.MAX_VALUE is rejected by Lucene's
-            // pre-flight (`>= maxDoc`), so pin the value to
-            // `maxDoc - 1` (or 0 when the reader is empty).
-            int maxDoc = searcher.getIndexReader().maxDoc();
-            int afterDoc = maxDoc > 0 ? maxDoc - 1 : 0;
-            FieldDoc after = new FieldDoc(afterDoc, 0f, searchAfter);
-            topDocs = sharedWeight == null
-                ? searcher.searchAfter(after, query, size, sortAndFormats.sort, trackScores)
-                : searchSortedWithWeight(searcher, sharedWeight, after, size, sortAndFormats.sort, trackScores);
-        } else if (sortAndFormats == null) {
-            topDocs = sharedWeight == null
-                ? searcher.search(query, size)
-                : searcher.search(sharedWeight, new TopScoreDocCollectorManager(cappedNumHits(searcher, size), null, TOTAL_HITS_THRESHOLD));
-        } else {
-            topDocs = sharedWeight == null
-                ? searcher.search(query, size, sortAndFormats.sort, trackScores)
-                : searchSortedWithWeight(searcher, sharedWeight, null, size, sortAndFormats.sort, trackScores);
-        }
-        prefetchHitRows(searcher.getIndexReader(), topDocs.scoreDocs);
-        List<SearchHit> out = new ArrayList<>(topDocs.scoreDocs.length);
-        long[] rowAddrs = new long[topDocs.scoreDocs.length];
-        for (int i = 0; i < topDocs.scoreDocs.length; i++) {
-            ScoreDoc scoreDoc = topDocs.scoreDocs[i];
-            HitVisitor visitor = new HitVisitor();
-            searcher.storedFields().document(scoreDoc.doc, visitor);
-            SearchHit hit = new SearchHit(i, visitor.idString(), Collections.emptyMap(), Collections.emptyMap());
-            hit.score(scoreDoc.score);
-            if (visitor.source != null) {
-                hit.sourceRef(new org.opensearch.core.common.bytes.BytesArray(visitor.source));
-            }
-            if (sortAndFormats != null && scoreDoc instanceof FieldDoc fieldDoc) {
-                hit.sortValues(fieldDoc.fields, sortAndFormats.formats);
-            }
-            out.add(hit);
-            rowAddrs[i] = rowAddressOf(searcher.getIndexReader(), scoreDoc.doc);
-        }
-        return new HitsPage(out, rowAddrs);
-    }
-
-    /**
-     * Total-hits threshold {@link org.apache.lucene.search.IndexSearcher}
-     * hands its own top-docs collector managers ({@code
-     * IndexSearcher.TOTAL_HITS_THRESHOLD}, which is private there).
-     * Only the {@code TopDocs.totalHits} accounting depends on it;
-     * this class reads {@code hits.total} from {@link PlanExecutor#computeMatched}
-     * and never from the collector, so the value just keeps the
-     * Weight-driven page identical to the Query-driven one.
-     */
-    private static final int TOTAL_HITS_THRESHOLD = 1000;
-
-    /**
-     * {@code numHits} cap {@link org.apache.lucene.search.IndexSearcher#searchAfter}
-     * applies before building a collector: a top-docs collector
-     * rejects {@code numHits > maxDoc} and {@code numHits < 1}, so the
-     * result is clamped to {@code [1, max(1, maxDoc)]} whatever
-     * {@code size} is.
-     */
-    private static int cappedNumHits(LanceFragmentIndexSearcher searcher, int size) {
-        return Math.max(1, Math.min(size, Math.max(1, searcher.getIndexReader().maxDoc())));
-    }
-
-    /**
-     * Sorted top-{@code size} page driven by a caller-built
-     * {@link Weight}: the same steps as
-     * {@link org.apache.lucene.search.IndexSearcher#searchAfter(ScoreDoc, Query, int, org.apache.lucene.search.Sort, boolean)}
-     * ({@code Sort.rewrite}, {@link TopFieldCollectorManager} with the
-     * stock threshold, score population when {@code trackScores})
-     * with the Weight substituted for the Query.
-     */
-    private static TopFieldDocs searchSortedWithWeight(
-        LanceFragmentIndexSearcher searcher,
-        Weight weight,
-        FieldDoc after,
-        int size,
-        Sort sort,
-        boolean trackScores
-    ) throws IOException {
-        Sort rewrittenSort = sort.rewrite(searcher);
-        TopFieldCollectorManager manager = new TopFieldCollectorManager(
-            rewrittenSort,
-            cappedNumHits(searcher, size),
-            after,
-            TOTAL_HITS_THRESHOLD
-        );
-        TopFieldDocs topDocs = searcher.search(weight, manager);
-        if (trackScores) {
-            populateScores(topDocs.scoreDocs, searcher, weight);
-        }
-        return topDocs;
-    }
-
-    /**
-     * Fill {@link ScoreDoc#score} of a sorted page from {@code weight},
-     * the way {@link TopFieldCollector#populateScores(ScoreDoc[], org.apache.lucene.search.IndexSearcher, Query)}
-     * does, except that the caller's Weight is used instead of a new
-     * one created from the Query (which for a Lance-backed query
-     * would run the native scan again). Docs are visited in doc id
-     * order so each leaf's scorer is obtained once.
-     */
-    private static void populateScores(ScoreDoc[] scoreDocs, LanceFragmentIndexSearcher searcher, Weight weight) throws IOException {
-        ScoreDoc[] byDoc = scoreDocs.clone();
-        Arrays.sort(byDoc, Comparator.comparingInt(scoreDoc -> scoreDoc.doc));
-        List<LeafReaderContext> leaves = searcher.getIndexReader().leaves();
-        LeafReaderContext current = null;
-        Scorer scorer = null;
-        for (ScoreDoc scoreDoc : byDoc) {
-            if (current == null || scoreDoc.doc >= current.docBase + current.reader().maxDoc()) {
-                current = leaves.get(ReaderUtil.subIndex(scoreDoc.doc, leaves));
-                ScorerSupplier supplier = weight.scorerSupplier(current);
-                if (supplier == null) {
-                    throw new IllegalStateException("Doc id " + scoreDoc.doc + " does not match the query");
-                }
-                scorer = supplier.get(1L);
-            }
-            int leafDoc = scoreDoc.doc - current.docBase;
-            if (scorer.iterator().advance(leafDoc) != leafDoc) {
-                throw new IllegalStateException("Doc id " + scoreDoc.doc + " does not match the query");
-            }
-            scoreDoc.score = scorer.score();
-        }
-    }
-
-    /**
-     * Group the page's doc ids by leaf and hand each Lance-backed leaf
-     * its slice so the rows behind the hits are fetched in one Lance
-     * take per leaf before the per-doc {@code document(...)} loop
-     * runs. Without this, {@link LanceFragmentLeafReader#materialiseStoredFields}
-     * would fall back to a single-row take per hit ({@code size} JNI
-     * round trips instead of one per leaf touched).
-     *
-     * <p>Leaves that do not unwrap to a {@link LanceFragmentLeafReader}
-     * (which should not happen on this path; every leaf the fragment
-     * dispatch reader exposes is Lance-backed) are skipped and fall
-     * back to the per-doc path.
-     */
-    private static void prefetchHitRows(org.apache.lucene.index.IndexReader reader, ScoreDoc[] scoreDocs) throws IOException {
-        if (scoreDocs.length == 0) {
-            return;
-        }
-        List<org.apache.lucene.index.LeafReaderContext> leaves = reader.leaves();
-        java.util.Map<Integer, List<Integer>> docsByLeaf = new java.util.TreeMap<>();
-        for (ScoreDoc scoreDoc : scoreDocs) {
-            int leafIndex = org.apache.lucene.index.ReaderUtil.subIndex(scoreDoc.doc, leaves);
-            int localDoc = scoreDoc.doc - leaves.get(leafIndex).docBase;
-            docsByLeaf.computeIfAbsent(leafIndex, k -> new ArrayList<>()).add(localDoc);
-        }
-        for (java.util.Map.Entry<Integer, List<Integer>> entry : docsByLeaf.entrySet()) {
-            LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(leaves.get(entry.getKey()).reader());
-            if (lance == null) {
-                continue;
-            }
-            List<Integer> docs = entry.getValue();
-            int[] docIds = new int[docs.size()];
-            for (int i = 0; i < docIds.length; i++) {
-                docIds[i] = docs.get(i);
-            }
-            lance.prefetchRows(docIds);
-        }
-    }
-
-    /**
-     * Hits phase for sorted scalar-filter pages: one Lance scan with
-     * the pushed query's SQL (plus the {@code search_after} cursor
-     * bound, see {@link #plannedScanFilter}),
-     * {@code setColumnOrderings}, {@code limit(fetch)} and the sort
-     * columns projected. Lance evaluates the filter and the top-k in
-     * one pass (pylance measures {@code filter + order_by + limit 10}
-     * on a 10M-row table at tens of milliseconds where the Lucene
-     * collector path needed the whole sort column loaded), and the
-     * batches come back already in the requested order. Each row's
-     * {@code _rowaddr} is decoded to (fragment id, doc id) and routed
-     * to the matching leaf, which fetches {@code _id} / {@code _source}
-     * through the same {@link LanceFragmentLeafReader#prefetchRows} /
-     * {@link LanceFragmentLeafReader#materialiseStoredFields} path the
-     * Lucene hits phase uses, so the response shape is identical.
-     *
-     * <p>Sort values are read from the projected columns and typed the
-     * way the request's Lucene {@link org.apache.lucene.search.SortField}s
-     * would type them (see {@link #sortValueFrom}) so
-     * {@link SearchHit#sortValues} formats them identically and
-     * clients can feed them back as {@code search_after}. Arrow nulls
-     * become the missing-value object OpenSearch installed on the
-     * SortField for the request's {@code missing} / direction
-     * combination.
-     */
-    private HitsPage scanSortedHitsViaLance(
-        Dataset dataset,
-        LanceFragmentQueryRequest request,
-        List<ColumnOrdering> orderings,
-        int fetch,
-        String filterSql,
-        SortAndFormats sortAndFormats,
-        org.apache.lucene.index.IndexReader reader,
-        List<Integer> fragmentIds,
-        LanceCancellation cancellation
-    ) throws IOException {
-        org.apache.lucene.search.SortField[] sortFields = sortAndFormats.sort.getSort();
-        java.util.Map<Integer, LanceFragmentLeafReader> leafByFragment = new java.util.HashMap<>();
-        for (org.apache.lucene.index.LeafReaderContext ctx : reader.leaves()) {
-            LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(ctx.reader());
-            if (lance != null) {
-                leafByFragment.put(lance.fragmentId(), lance);
-            }
-        }
-        List<String> sortColumns = new ArrayList<>();
-        for (ColumnOrdering ordering : orderings) {
-            if (!sortColumns.contains(ordering.getColumnName())) {
-                sortColumns.add(ordering.getColumnName());
-            }
-        }
-        org.lance.ipc.ScanOptions.Builder builder = new org.lance.ipc.ScanOptions.Builder().fragmentIds(fragmentIds)
-            .columns(sortColumns)
-            .setColumnOrderings(orderings)
-            .limit(fetch)
-            .withRowAddress(true);
-        if (filterSql != null) {
-            builder = builder.filter(filterSql);
-        }
-        // Ordered (fragment id, doc id, raw sort values) triples in the
-        // order Lance returned them, which is the response order.
-        List<long[]> addresses = new ArrayList<>(fetch);
-        List<Object[]> sortValues = new ArrayList<>(fetch);
-        try (
-            org.lance.ipc.LanceScanner scanner = dataset.newScan(builder.build());
-            org.apache.arrow.vector.ipc.ArrowReader arrowReader = scanner.scanBatches()
-        ) {
-            while (arrowReader.loadNextBatch()) {
-                cancellation.checkCancelled();
-                org.apache.arrow.vector.VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
-                org.apache.arrow.vector.UInt8Vector rowAddr = (org.apache.arrow.vector.UInt8Vector) root.getVector("_rowaddr");
-                org.apache.arrow.vector.FieldVector[] vectors = new org.apache.arrow.vector.FieldVector[orderings.size()];
-                for (int o = 0; o < vectors.length; o++) {
-                    vectors[o] = root.getVector(orderings.get(o).getColumnName());
-                }
-                for (int i = 0; i < root.getRowCount(); i++) {
-                    long addr = rowAddr.get(i);
-                    addresses.add(new long[] { addr >>> 32, addr & 0xFFFFFFFFL });
-                    Object[] raw = new Object[orderings.size()];
-                    for (int o = 0; o < raw.length; o++) {
-                        raw[o] = sortValueFrom(vectors[o], i, sortFields[o]);
-                    }
-                    sortValues.add(raw);
-                }
-            }
-        } catch (IOException | TaskCancelledException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new IOException(e);
-        }
-        // One take per leaf for the rows behind the page, then render
-        // each hit in Lance's order. The decoded offsets are physical
-        // rows; the leaf's stored-fields and prefetch paths are keyed by
-        // doc id, so each offset maps through docOfRow (identity unless
-        // the table has nested columns).
-        java.util.Map<Integer, List<Integer>> docsByFragment = new java.util.HashMap<>();
-        for (long[] address : addresses) {
-            LanceFragmentLeafReader lance = leafByFragment.get((int) address[0]);
-            if (lance == null) {
-                continue;
-            }
-            docsByFragment.computeIfAbsent((int) address[0], k -> new ArrayList<>()).add(lance.docOfRow((int) address[1]));
-        }
-        for (java.util.Map.Entry<Integer, List<Integer>> entry : docsByFragment.entrySet()) {
-            LanceFragmentLeafReader lance = leafByFragment.get(entry.getKey());
-            if (lance == null) {
-                continue;
-            }
-            int[] docIds = new int[entry.getValue().size()];
-            for (int i = 0; i < docIds.length; i++) {
-                docIds[i] = entry.getValue().get(i);
-            }
-            lance.prefetchRows(docIds);
-        }
-        List<SearchHit> out = new ArrayList<>(addresses.size());
-        long[] rowAddrs = new long[addresses.size()];
-        float score = request.trackScores() ? 1.0f : Float.NaN;
-        for (int i = 0; i < addresses.size(); i++) {
-            long[] address = addresses.get(i);
-            LanceFragmentLeafReader lance = leafByFragment.get((int) address[0]);
-            if (lance == null) {
-                // The scan was pinned to fragmentIds, which is the same
-                // list the reader was opened with, so every address
-                // should map to a leaf. Skipping rather than failing
-                // keeps a fragment that vanished between the two opens
-                // from taking the whole page down.
-                continue;
-            }
-            HitVisitor visitor = new HitVisitor();
-            lance.materialiseStoredFields(lance.docOfRow((int) address[1]), visitor);
-            SearchHit hit = new SearchHit(out.size(), visitor.idString(), Collections.emptyMap(), Collections.emptyMap());
-            hit.score(score);
-            if (visitor.source != null) {
-                hit.sourceRef(new org.opensearch.core.common.bytes.BytesArray(visitor.source));
-            }
-            hit.sortValues(sortValues.get(i), sortAndFormats.formats);
-            rowAddrs[out.size()] = (address[0] << 32) | address[1];
-            out.add(hit);
-        }
-        return new HitsPage(out, out.size() == rowAddrs.length ? rowAddrs : Arrays.copyOf(rowAddrs, out.size()));
-    }
-
-    /**
-     * Read one sort value from a projected column the way Lucene's
-     * comparator for the matching {@link org.apache.lucene.search.SortField}
-     * would report it, so {@link SearchHit#sortValues} formats it
-     * identically to the Lucene hits path and clients can feed it
-     * back as {@code search_after}. {@link org.apache.lucene.search.SortedSetSortField}
-     * (keyword) yields a {@link org.apache.lucene.util.BytesRef};
-     * {@link org.apache.lucene.search.SortedNumericSortField} yields
-     * {@code Integer} / {@code Long} / {@code Float} / {@code Double}
-     * according to its numeric type (OpenSearch maps byte, short,
-     * integer and boolean to INT; long, date and unsigned_long to
-     * LONG). Integers, booleans, dates and timestamps go through
-     * {@link LanceFragmentLeafReader#readAsLong}, which already
-     * normalises date / timestamp units to epoch millis. A null cell
-     * yields {@code null} for keyword (what {@code TermOrdValComparator}
-     * reports for a missing term) and, for numerics, the exact
-     * missing-value object OpenSearch installed on the SortField for
-     * the request's {@code missing} / order combination.
-     */
-    private static Object sortValueFrom(org.apache.arrow.vector.FieldVector vector, int i, org.apache.lucene.search.SortField sortField) {
-        if (sortField instanceof org.apache.lucene.search.SortedSetSortField) {
-            if (vector.isNull(i)) {
-                return null;
-            }
-            return new org.apache.lucene.util.BytesRef(((org.apache.arrow.vector.VarCharVector) vector).get(i));
-        }
-        if (vector.isNull(i)) {
-            return sortField.getMissingValue();
-        }
-        org.apache.lucene.search.SortedNumericSortField numeric = (org.apache.lucene.search.SortedNumericSortField) sortField;
-        return switch (numeric.getNumericType()) {
-            case FLOAT -> ((org.apache.arrow.vector.Float4Vector) vector).get(i);
-            case DOUBLE -> ((org.apache.arrow.vector.Float8Vector) vector).get(i);
-            case INT -> (int) integralValue(vector, i);
-            case LONG -> integralValue(vector, i);
-            default -> throw new IllegalStateException("unsupported sort field type " + numeric.getNumericType());
-        };
-    }
-
-    private static long integralValue(org.apache.arrow.vector.FieldVector vector, int i) {
-        if (vector instanceof org.apache.arrow.vector.BitVector bits) {
-            return bits.get(i);
-        }
-        return LanceFragmentLeafReader.readAsLong(vector, i);
-    }
-
-    /**
-     * StoredFieldVisitor that captures the {@code _id} and
-     * {@code _source} bytes {@link LanceFragmentLeafReader#materialiseStoredFields}
-     * emits per hit. Reused for every doc in {@link
-     * #scanHitsViaIndexSearcher} to avoid allocating a new visitor
-     * per doc; the two capture fields are reset by the visitor
-     * itself on each {@code document} call.
-     */
-    private static final class HitVisitor extends org.apache.lucene.index.StoredFieldVisitor {
-
-        private byte[] source;
-        private byte[] idBytes;
-
-        @Override
-        public Status needsField(org.apache.lucene.index.FieldInfo fieldInfo) {
-            String name = fieldInfo.name;
-            if ("_id".equals(name) || "_source".equals(name)) {
-                return Status.YES;
-            }
-            return Status.NO;
-        }
-
-        @Override
-        public void binaryField(org.apache.lucene.index.FieldInfo fieldInfo, byte[] value) {
-            if ("_id".equals(fieldInfo.name)) {
-                idBytes = value;
-            } else if ("_source".equals(fieldInfo.name)) {
-                source = value;
-            }
-        }
-
-        String idString() {
-            if (idBytes == null) {
-                return "";
-            }
-            return org.opensearch.index.mapper.Uid.decodeId(idBytes);
-        }
     }
 
     /**

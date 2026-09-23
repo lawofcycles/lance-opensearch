@@ -14,6 +14,7 @@ import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgramBuilder;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
+import org.opensearch.index.query.TermQueryBuilder;
 import org.apache.calcite.rel.logical.LogicalFilter;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
@@ -305,5 +306,40 @@ public class PushSortLimitIntoLanceScanTests extends OpenSearchTestCase {
         assertEquals(hitShape.outputColumns(), pushed.outputColumns());
         assertTrue(pushed.includeSortValues());
         assertFalse(pushed.includeScore());
+    }
+
+    public void testHitShapeWithAPostFilterDoesNotFold() {
+        // The post filter narrows the page after the query matched; a
+        // scan that cut the page first would come back short, so the
+        // top-k stays for the Lucene collector.
+        LogicalFilter filter = filterOver(scan());
+        RelFieldCollation rating = new RelFieldCollation(
+            fieldIndex(filter, "rating"),
+            RelFieldCollation.Direction.ASCENDING,
+            RelFieldCollation.NullDirection.LAST
+        );
+        LanceTopK topK = topK(filter, List.of(rating), null);
+        LanceHitShape hitShape = new LanceHitShape(
+            filter.getCluster(),
+            filter.getCluster().traitSetOf(Convention.NONE),
+            topK,
+            List.of("id", "rating"),
+            true,
+            true,
+            false,
+            true,
+            new TermQueryBuilder("flag", true),
+            0
+        );
+        RelNode planned = hep(hitShape);
+        assertTrue("the hit shape stays at the root, saw " + planned.getClass().getSimpleName(), planned instanceof LanceHitShape);
+        RelNode below = ((LanceHitShape) planned).getInput();
+        if (below instanceof LanceTableScan scan) {
+            // The rule without the hit shape operand may still fold the
+            // top-k alone; the hit shape itself never folds.
+            assertNull("the post filtered hit shape did not fold", scan.pushedTopK().orElseThrow().hitShape());
+        } else {
+            assertTrue(below instanceof LanceTopK);
+        }
     }
 }

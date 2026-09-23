@@ -112,7 +112,7 @@ public class PlanExecutorTests extends OpenSearchTestCase {
                 "idx",
                 StorageOptions.empty(),
                 -1L,
-                null,
+                FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, null),
                 null,
                 null,
                 List.of(),

@@ -26,10 +26,14 @@ import org.apache.calcite.sql.type.SqlTypeName;
  *
  * <p>Unsigned integers map to the next wider signed type; unsigned 64-bit
  * needs {@code DECIMAL(20, 0)} because no wider signed integer exists.
- * A fixed size list of single precision floats is the Arrow shape of a
- * Lance vector column and maps to an array of {@code REAL}; the fixed
- * length is not represented in the Calcite type yet and is left to the
- * planner passes that cost vector scans. A nullable Arrow struct maps to a
+ * A fixed size list maps to an array of its element type, like a list: a
+ * Lance vector column (single precision floats) becomes an array of
+ * {@code REAL} and a geo point stored as two doubles an array of
+ * {@code DOUBLE}; the fixed length is not represented in the Calcite type
+ * yet and is left to the planner passes that cost vector scans. Every
+ * column keeps its position in the row type, because the Substrait field
+ * references of a pushed aggregate index the dataset schema by position.
+ * A nullable Arrow struct maps to a
  * nullable {@code ROW} whose fields all become nullable, because Calcite's
  * type factory propagates a record's nullability into its fields.
  */
@@ -111,13 +115,14 @@ public final class LanceTypeSystem extends RelDataTypeSystemImpl {
             return factory.createArrayType(toRelDataType(onlyChild(field), factory), -1);
         }
         if (arrowType instanceof ArrowType.FixedSizeList) {
-            Field child = onlyChild(field);
-            ArrowType childType = child.getType();
-            if (childType instanceof ArrowType.FloatingPoint
-                && ((ArrowType.FloatingPoint) childType).getPrecision() == FloatingPointPrecision.SINGLE) {
-                return factory.createArrayType(toRelDataType(child, factory), -1);
-            }
-            throw unsupported(field);
+            // A fixed size list maps like a list: the Lance vector column
+            // (single precision floats) and the geo_point override's
+            // (lon, lat) pair of doubles both keep their position in the
+            // row type, which the Substrait field references of a pushed
+            // aggregate index by. Neither is referenced by a plan: the
+            // query translator refuses geo columns and no aggregation
+            // reads a vector.
+            return factory.createArrayType(toRelDataType(onlyChild(field), factory), -1);
         }
         if (arrowType instanceof ArrowType.Struct) {
             RelDataTypeFactory.Builder builder = factory.builder();
