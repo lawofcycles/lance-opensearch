@@ -185,7 +185,7 @@ public final class RequestPlanner {
         }
         RelNode logical = translation.root();
         RelNode physical = factory.plan(logical, inputs);
-        FragmentPlan plan = FragmentPlan.of(physical, shape.hasAggregations(), shape.hits());
+        FragmentPlan plan = FragmentPlan.of(physical, shape.hasAggregations(), shape.hits(), inputs);
         if (filteredKnn != null && (plan.lanceClause() == null || plan.filterSql() == null)) {
             throw knnFilterRefusal(filteredKnn, "the filter has no Lance SQL form");
         }

@@ -8,7 +8,9 @@ package org.opensearch.lance.plan.execute;
 import org.apache.calcite.rel.RelNode;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
+import org.opensearch.lance.plan.cost.AggregateProfile;
 import org.opensearch.lance.plan.cost.CostInputs;
+import org.opensearch.lance.plan.cost.CostModel;
 import org.opensearch.lance.plan.cost.PerfTableFixture;
 import org.opensearch.lance.plan.cost.StorageKind;
 import org.opensearch.lance.plan.rel.LanceTableScan;
@@ -407,6 +409,61 @@ public class RequestPlannerTests extends OpenSearchTestCase {
             local.withMaxGroups(1L)
         );
         assertEquals(FragmentPlan.Kind.PUSHED_SCAN, oneGroup.plan().kind());
+    }
+
+    public void testPushedAggregateShipsTheCostOfTheWarmAggregatorsOverAnObjectStore() throws IOException {
+        // percentiles(price) with a filter stays on the pushed scan for
+        // four nodes over S3 (the aggregators' tdigest is dearer); the
+        // plan ships the pushed cost, the aggregators' cost over resident
+        // columns and the columns they would read, in the table's column
+        // order (the filter's rating before the metric's price).
+        String percentiles = "{\"size\":0,\"query\":{\"term\":{\"rating\":5}},\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"price\"}}}}";
+        CostInputs fourNodesOverS3 = CostInputs.forCluster(4, "s3://bench/perf1b.lance", 16, 8, 8, true, CostInputs.DEFAULT_MAX_GROUPS);
+        RequestPlanner.Planned planned = RequestPlanner.plan(
+            shape(percentiles),
+            PerfTableFixture.perf1b(),
+            NO_EXCLUDED,
+            PlanTestFixtures.factory(),
+            fourNodesOverS3
+        );
+        assertEquals(FragmentPlan.Kind.PUSHED_SCAN, planned.plan().kind());
+        FragmentPlan.Aggregate aggregate = planned.plan().aggregate();
+        assertTrue(aggregate.toString(), aggregate.pushedMillis() > 0.0);
+        assertTrue(aggregate.toString(), aggregate.luceneWarmMillis() > 0.0);
+        assertEquals(List.of("rating", "price"), aggregate.luceneColumns());
+
+        // The shipped numbers are the model's own: the pushed cost under
+        // the coordinator's inputs, the warm Lucene cost under the same
+        // inputs over local storage (no object store open).
+        LanceTableScan scan = (LanceTableScan) planned.perNode();
+        AggregateProfile profile = AggregateProfile.of(
+            scan.pushedAggregate().get().aggregate(),
+            scan,
+            scan.getCluster().getMetadataQuery()
+        );
+        assertEquals(CostModel.pushedAggregateMillis(fourNodesOverS3, profile), aggregate.pushedMillis(), 1e-9);
+        assertEquals(
+            CostModel.luceneAggregateMillis(fourNodesOverS3.withStorage(StorageKind.LOCAL), profile),
+            aggregate.luceneWarmMillis(),
+            1e-9
+        );
+        assertTrue(
+            "the warm cost drops the object store open the coordinator charged",
+            aggregate.luceneWarmMillis() < CostModel.luceneAggregateMillis(fourNodesOverS3, profile)
+        );
+    }
+
+    public void testPushedAggregateBelowTheFittedRangeShipsZeroCosts() throws IOException {
+        // The hint fixture is far below FITTED_MODEL_MIN_ROWS: the
+        // placeholder ordering chose the scan and no cost is shipped, so
+        // the data node's column store guard never fires; the columns
+        // still travel for the debug log.
+        FragmentPlan plan = plan("{\"size\":0,\"query\":{\"term\":{\"rating\":5}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}")
+            .plan();
+        assertEquals(FragmentPlan.Kind.PUSHED_SCAN, plan.kind());
+        assertEquals(0.0, plan.aggregate().pushedMillis(), 0.0);
+        assertEquals(0.0, plan.aggregate().luceneWarmMillis(), 0.0);
+        assertEquals(List.of("rating", "category"), plan.aggregate().luceneColumns());
     }
 
     public void testUnplannedNamesTheElementThatKeptTheEnvelopeOnLucene() throws IOException {

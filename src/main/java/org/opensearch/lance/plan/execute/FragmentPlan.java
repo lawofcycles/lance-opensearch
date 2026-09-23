@@ -16,6 +16,10 @@ import org.opensearch.core.xcontent.ToXContentObject;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.execute.LanceAggregateResults;
+import org.opensearch.lance.plan.cost.AggregateProfile;
+import org.opensearch.lance.plan.cost.CostInputs;
+import org.opensearch.lance.plan.cost.CostModel;
+import org.opensearch.lance.plan.cost.StorageKind;
 import org.opensearch.lance.plan.lancesql.RexToLanceSql;
 import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.LanceFtsMatch;
@@ -195,25 +199,62 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
     /**
      * A pushed aggregate: the Substrait bytes of the main scan, the
      * number of group keys and the metric slots, which is what the
-     * executor's resolution checks the request's builders against.
+     * executor's resolution checks the request's builders against, and
+     * the cost of the alternative the coordinator chose against, for
+     * the data node's column store guard: {@link #pushedMillis()} is
+     * what the cost model predicted for this scan, {@link #luceneWarmMillis()}
+     * what it predicts for the Lucene aggregators when every column
+     * they read is already resident in the node's column store (the
+     * run's inputs over local storage), and {@link #luceneColumns()}
+     * names those columns. Both numbers are zero for a table below the
+     * fitted model's range, where the model is a placeholder and the
+     * guard never fires.
      */
     public static final class Aggregate implements Writeable {
 
         private final byte[] substrait;
         private final int groupCount;
         private final List<MetricSlot> metrics;
+        private final double pushedMillis;
+        private final double luceneWarmMillis;
+        private final List<String> luceneColumns;
 
+        /** An aggregate without cost numbers: the placeholder regime, where the column store guard never fires. */
         public Aggregate(byte[] substrait, int groupCount, List<MetricSlot> metrics) {
+            this(substrait, groupCount, metrics, 0.0, 0.0, List.of());
+        }
+
+        public Aggregate(
+            byte[] substrait,
+            int groupCount,
+            List<MetricSlot> metrics,
+            double pushedMillis,
+            double luceneWarmMillis,
+            List<String> luceneColumns
+        ) {
             this.substrait = Objects.requireNonNull(substrait, "substrait").clone();
             if (groupCount < 0) {
                 throw new IllegalArgumentException("groupCount must not be negative, got " + groupCount);
             }
             this.groupCount = groupCount;
             this.metrics = List.copyOf(Objects.requireNonNull(metrics, "metrics"));
+            if (pushedMillis < 0.0 || luceneWarmMillis < 0.0) {
+                throw new IllegalArgumentException("costs must not be negative, got " + pushedMillis + " and " + luceneWarmMillis);
+            }
+            this.pushedMillis = pushedMillis;
+            this.luceneWarmMillis = luceneWarmMillis;
+            this.luceneColumns = List.copyOf(Objects.requireNonNull(luceneColumns, "luceneColumns"));
         }
 
-        /** From the pushed operation the planner produced. */
-        public static Aggregate of(PushedAggregate pushed) {
+        /**
+         * From the pushed operation the planner folded into {@code scan},
+         * costed under {@code inputs}, the same inputs the planner
+         * compared the two forms with. Over a table in the fitted
+         * model's range the profile is rebuilt from the aggregate the
+         * scan carries, exactly as the scan's own cost computed it;
+         * below the range the numbers are zero.
+         */
+        public static Aggregate of(PushedAggregate pushed, LanceTableScan scan, CostInputs inputs) {
             ByteBuffer bytes = pushed.substrait();
             byte[] copy = new byte[bytes.remaining()];
             bytes.get(copy);
@@ -221,11 +262,26 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
             for (MetricSpec spec : pushed.aggregate().metricSpecs()) {
                 slots.add(MetricSlot.of(spec));
             }
-            return new Aggregate(copy, pushed.aggregate().getGroupCount(), slots);
+            List<String> columns = AggregateProfile.columnNames(pushed.aggregate(), scan);
+            double pushedMillis = 0.0;
+            double luceneWarmMillis = 0.0;
+            if (CostModel.usesFittedModel(scan.getTable().getRowCount())) {
+                AggregateProfile profile = AggregateProfile.of(pushed.aggregate(), scan, scan.getCluster().getMetadataQuery());
+                pushedMillis = CostModel.pushedAggregateMillis(inputs, profile);
+                luceneWarmMillis = CostModel.luceneAggregateMillis(inputs.withStorage(StorageKind.LOCAL), profile);
+            }
+            return new Aggregate(copy, pushed.aggregate().getGroupCount(), slots, pushedMillis, luceneWarmMillis, columns);
         }
 
         public static Aggregate read(StreamInput in) throws IOException {
-            return new Aggregate(in.readByteArray(), in.readVInt(), in.readList(MetricSlot::read));
+            return new Aggregate(
+                in.readByteArray(),
+                in.readVInt(),
+                in.readList(MetricSlot::read),
+                in.readDouble(),
+                in.readDouble(),
+                in.readStringList()
+            );
         }
 
         @Override
@@ -233,6 +289,9 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
             out.writeByteArray(substrait);
             out.writeVInt(groupCount);
             out.writeList(metrics);
+            out.writeDouble(pushedMillis);
+            out.writeDouble(luceneWarmMillis);
+            out.writeStringCollection(luceneColumns);
         }
 
         /**
@@ -269,6 +328,25 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
             return metrics;
         }
 
+        /** Predicted milliseconds of this pushed scan under the coordinator's inputs; zero below the fitted model's range. */
+        public double pushedMillis() {
+            return pushedMillis;
+        }
+
+        /**
+         * Predicted milliseconds of the Lucene aggregators over resident
+         * columns under the coordinator's inputs; zero below the fitted
+         * model's range.
+         */
+        public double luceneWarmMillis() {
+            return luceneWarmMillis;
+        }
+
+        /** The table columns the Lucene aggregators would read, in the table's row type order. */
+        public List<String> luceneColumns() {
+            return luceneColumns;
+        }
+
         @Override
         public boolean equals(Object o) {
             if (this == o) {
@@ -277,17 +355,35 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
             if (!(o instanceof Aggregate other)) {
                 return false;
             }
-            return groupCount == other.groupCount && metrics.equals(other.metrics) && Arrays.equals(substrait, other.substrait);
+            return groupCount == other.groupCount
+                && metrics.equals(other.metrics)
+                && Arrays.equals(substrait, other.substrait)
+                && Double.compare(pushedMillis, other.pushedMillis) == 0
+                && Double.compare(luceneWarmMillis, other.luceneWarmMillis) == 0
+                && luceneColumns.equals(other.luceneColumns);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(groupCount, metrics, Arrays.hashCode(substrait));
+            return Objects.hash(groupCount, metrics, Arrays.hashCode(substrait), pushedMillis, luceneWarmMillis, luceneColumns);
         }
 
         @Override
         public String toString() {
-            return "aggregate{groups=" + groupCount + ", metrics=" + metrics + ", substraitBytes=" + substrait.length + "}";
+            StringBuilder sb = new StringBuilder("aggregate{groups=").append(groupCount)
+                .append(", metrics=")
+                .append(metrics)
+                .append(", substraitBytes=")
+                .append(substrait.length);
+            if (pushedMillis > 0.0 || luceneWarmMillis > 0.0) {
+                sb.append(", pushedMs=")
+                    .append(Math.round(pushedMillis))
+                    .append(", luceneWarmMs=")
+                    .append(Math.round(luceneWarmMillis))
+                    .append(", luceneColumns=")
+                    .append(luceneColumns);
+            }
+            return sb.append('}').toString();
         }
     }
 
@@ -372,8 +468,10 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
      * @param root the physical (or unlowered logical) per node plan
      * @param hasAggregations whether the request carries aggregations
      * @param hits whether the request asks for a page ({@code size} above 0)
+     * @param inputs the cost inputs the planner chose {@code root} under,
+     *     which a pushed aggregate's alternative cost is computed with
      */
-    public static FragmentPlan of(RelNode root, boolean hasAggregations, boolean hits) {
+    public static FragmentPlan of(RelNode root, boolean hasAggregations, boolean hits, CostInputs inputs) {
         Kind shapeKind = luceneKind(hasAggregations, hits);
         QueryPart query = queryPart(root);
         if (root instanceof LanceTableScan scan) {
@@ -384,7 +482,7 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
                     query.filterSql(),
                     query.lanceClause(),
                     null,
-                    Aggregate.of(pushedAggregate.get())
+                    Aggregate.of(pushedAggregate.get(), scan, inputs)
                 );
             }
             Optional<PushedTopK> pushedTopK = scan.pushedTopK();
