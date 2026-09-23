@@ -129,6 +129,7 @@ src/main/java/org/opensearch/lance/
 ├── namespace/       # catalog registration, poll loop, drift handling
 ├── plan/            # the Calcite planner
 │   ├── calcite/     #   conventions, schema, type system, cost, planner factory
+│   ├── cost/        #   the fitted latency model and its inputs
 │   ├── translate/   #   search body -> logical plan
 │   ├── rel/         #   logical nodes; rel/physical/ holds the Lucene-side operators
 │   ├── rules/       #   pushdown, fuse and converter rules
@@ -318,11 +319,37 @@ flowchart LR
 
 Translators turn the search body into a logical tree; pushdown rules fold what Lance can compute
 into the scan; converter rules produce the Lucene alternative for the same tree; and the Volcano
-planner picks by cost, with pushed scans deliberately priced to win whenever both forms exist. A
+planner picks by cost. A
 tree the planner cannot handle at all falls back to Lucene execution — a planner failure never
 surfaces as a request error. `GET /{index}/_lance/explain` runs exactly this pipeline without
 executing anything and prints both plans; it is the first tool to reach for when developing a
 rule.
+
+The cost the planner compares is predicted latency in milliseconds (the two other axes of
+`LanceCost`, native and heap bytes, are budgets checked as hard constraints and are not modelled
+yet). For an aggregation over a table of a million rows or more, the pushed scan and the Lucene
+aggregator operator are each priced by `plan/cost/CostModel` as a sum of coefficient times
+quantity terms: a fixed cost per request, an object store open latency when the table URI is
+`s3://`, `gs://`, `az://` or the like, the per row work of every thread (the table's rows divided
+by the fan-out node count and by the path's parallelism: `lance.aggregation.pushdown_parallelism`
+for the scan, `lance.fragment_path.slices` for the aggregators) with one coefficient per kind of
+group key and metric, the object store transfer of the columns the scan reads (per node, not per
+thread, because it is bandwidth bound), a hash table penalty above a million groups, and the
+executor's merge of its parallel scans' group rows. The quantities come from the tree and the
+table statistics (rows, the bitmap distinct count of a terms key, the Arrow type widths of the
+columns read); the run's inputs (nodes, storage kind, CPUs, the two settings) come from the caller
+as `plan/cost/CostInputs`, so the coordinator's plan sees the cluster and a data node's plan sees
+one local node. The coefficients in `CostCoefficients` were fitted by non negative least squares
+to the warm latencies measured on the 20M, 100M and 1B row benchmark tables across 1 to 6 node
+clusters with the pushdown on and off; `scripts/fit-cost-coefficients.py` reproduces the fit from
+`src/test/resources/cost/measurements.csv`, and `CostModelTests` holds the model to the measured
+choices. What the model does not see: whether the aggregator path's columns are warm in the
+node's column store (a cold node pays a storage read the model does not charge), the state of the
+Lance index cache, and concurrent requests (the coefficients are single request latencies). Below
+a million rows every path answers within the fixed cost and the measurements say nothing, so the
+placeholder ordering stands: the pushed form wins whenever a rule folds the tree. The hits shapes
+(sorted pages, full text, vector) have no measured comparison between their two forms and keep the
+same placeholder ordering at every size.
 
 The statistics the planner reads come from Lance table metadata, not from scanning rows. Once per
 manifest version a node collects, from the open dataset, the fragment list with each fragment's
@@ -346,8 +373,8 @@ The planner was delivered in phases, and the later ones are still in flight: fir
 foundations (dependencies, schema, conventions, cost, the explain endpoint), then the aggregation
 route through the planner, then hits, full text and vector translation, then the Lucene
 convention operators with fan-out and merge as plan operators, then the shard-path fallback as a
-plan operator, and ahead: a cost model fitted
-from Lance table statistics rather than constants, and accuracy and tie-stability as planner
+plan operator, then the cost model fitted to the measured aggregation shapes, and ahead: node
+local refinement of the plan on column store warmth, and accuracy and tie-stability as planner
 traits a request can demand. The CHANGELOG tracks what has landed.
 
 ## Storage and follow-forward

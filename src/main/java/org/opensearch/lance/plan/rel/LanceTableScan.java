@@ -19,6 +19,10 @@ import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.opensearch.lance.plan.calcite.LanceConvention;
 import org.opensearch.lance.plan.calcite.LanceRel;
+import org.opensearch.lance.plan.cost.AggregateProfile;
+import org.opensearch.lance.plan.cost.CostInputs;
+import org.opensearch.lance.plan.cost.CostInputsHolder;
+import org.opensearch.lance.plan.cost.CostModel;
 import org.apache.calcite.rex.RexNode;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedAggregate;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedFilter;
@@ -296,17 +300,38 @@ public class LanceTableScan extends TableScan implements LanceRel {
     }
 
     /**
-     * Rows read (a bare scan) or groups returned (a pushed aggregate)
-     * stand in for predicted milliseconds until the cost model gets
-     * real coefficients, with a constant per pushed operation in the
-     * second slot so two scans over the same table order by how much
-     * work was pushed. Native and heap bytes are not modelled yet, so
-     * the byte slots stay at the constant model and the budget check in
+     * Predicted milliseconds in the first slot, with a constant per
+     * pushed operation in the second slot so two scans over the same
+     * table order by how much work was pushed, and zero heap bytes.
+     * Native and heap bytes are not modelled, so the budget check in
      * the cost ordering cannot fire on a scan.
+     *
+     * <p>Over a table in the fitted model's range
+     * ({@link CostModel#usesFittedModel}), a scan carrying a pushed
+     * aggregate costs what {@link CostModel#pushedAggregateMillis}
+     * predicts for the shape under the run's {@link CostInputs}, and a
+     * bare scan costs nothing: a bare scan is only ever the input of a
+     * Lucene operator, whose own cost accounts for the rows it reads
+     * from the column store. Every other case, and every table below
+     * the range, keeps the placeholder: rows read (a bare scan) or
+     * groups returned (a pushed aggregate) stand in for milliseconds.
+     * The hits shapes (a pushed top-k, FTS or knn) have no measured
+     * alternative, so the placeholder is their model in both regimes.
      */
     @Override
     public RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
         double rows = estimateRowCount(mq);
+        if (CostModel.usesFittedModel(table.getRowCount())) {
+            Optional<PushedAggregate> pushed = pushedAggregate();
+            if (pushed.isPresent()) {
+                AggregateProfile shape = AggregateProfile.of(pushed.get().aggregate(), this, mq);
+                double millis = CostModel.pushedAggregateMillis(CostInputsHolder.inputsOf(planner), shape);
+                return planner.getCostFactory().makeCost(millis, pushedOperations.size(), 0);
+            }
+            if (pushedOperations.isEmpty()) {
+                return planner.getCostFactory().makeZeroCost();
+            }
+        }
         return planner.getCostFactory().makeCost(rows, pushedOperations.size(), 0);
     }
 

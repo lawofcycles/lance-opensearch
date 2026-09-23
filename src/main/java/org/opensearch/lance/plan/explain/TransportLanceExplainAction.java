@@ -23,6 +23,7 @@ import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
+import org.opensearch.lance.plan.cost.CostInputs;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
@@ -60,8 +61,12 @@ import java.io.IOException;
  * <p>The cost budgets handed to {@link LancePlannerFactory} (the node's
  * {@code lance.native_memory.limit} and the JVM's max heap) feed the
  * cost ordering the Volcano run compares candidates with; nothing
- * predicts real byte usage yet, so they act as placeholders until the
- * cost model gets real inputs.
+ * predicts real byte usage yet, so they act as placeholders. The
+ * latency side is costed under the {@link CostInputs} the coordinator
+ * would plan with: the cluster's data node count, the table URI's
+ * storage kind, this node's CPUs and the two parallelism settings, so
+ * the explain output shows the choice a search on this cluster makes
+ * rather than the single node default.
  */
 public final class TransportLanceExplainAction extends HandledTransportAction<LanceExplainRequest, LanceExplainResponse> {
 
@@ -122,7 +127,24 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
         // planner registers the tree and the physical string comes from
         // its own best expression.
         String logicalText = RelOptUtil.toString(planned);
-        RelNode physical = plannerFactory.plan(planned);
+        RelNode physical = plannerFactory.plan(planned, costInputs(metadata));
         return new LanceExplainResponse(metadata.getIndex().getName(), logicalText, RelOptUtil.toString(physical));
+    }
+
+    /**
+     * The inputs a search over {@code metadata}'s index would be
+     * planned with on this cluster: every data node is a fan out
+     * target, the storage kind follows the table URI, and the
+     * parallelism settings are read at their current values.
+     */
+    private CostInputs costInputs(IndexMetadata metadata) {
+        int dataNodes = Math.max(1, clusterService.state().nodes().getDataNodes().size());
+        return CostInputs.forCluster(
+            dataNodes,
+            metadata.getSettings().get(LanceEngineFactory.TABLE_SETTING),
+            NativeMemoryLimit.availableCpus(),
+            clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING),
+            clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_SLICES_SETTING)
+        );
     }
 }

@@ -19,6 +19,10 @@ import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.opensearch.lance.plan.calcite.LuceneConvention;
 import org.opensearch.lance.plan.calcite.LuceneRel;
+import org.opensearch.lance.plan.cost.AggregateProfile;
+import org.opensearch.lance.plan.cost.CostInputs;
+import org.opensearch.lance.plan.cost.CostInputsHolder;
+import org.opensearch.lance.plan.cost.CostModel;
 import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 
@@ -78,10 +82,19 @@ public final class LuceneAggregateExec extends SingleRel implements LuceneRel {
     }
 
     /**
-     * A constant until the cost model gets real coefficients: the tiny
-     * cost plus one unit in every slot. The offset keeps this
-     * alternative strictly above the zero cost of
-     * {@link LuceneHandoffExec}, so whenever a pushdown rule folds the
+     * Over a table in the fitted model's range
+     * ({@link CostModel#usesFittedModel}): what
+     * {@link CostModel#luceneAggregateMillis} predicts for the wrapped
+     * aggregate's shape under the run's {@link CostInputs}, with the
+     * placeholder byte slots. The bare scan below costs nothing there,
+     * so this is the whole cost of the Lucene form, compared against
+     * the pushed scan's whole cost through the zero cost
+     * {@link LuceneHandoffExec}; which of the two wins depends on the
+     * table size, the node count and the storage kind.
+     *
+     * <p>Below the range, a constant: the tiny cost plus one unit in
+     * every slot. The offset keeps this alternative strictly above the
+     * zero cost of the handoff, so whenever a pushdown rule folds the
      * same tree into the Lance scan, the Lance plan costs less and the
      * Volcano planner never has to break a tie between the two
      * conventions.
@@ -89,7 +102,22 @@ public final class LuceneAggregateExec extends SingleRel implements LuceneRel {
     @Override
     public RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
         RelOptCostFactory factory = planner.getCostFactory();
+        LanceTableScan scan = scanBelow(aggregate);
+        if (scan != null && CostModel.usesFittedModel(scan.getTable().getRowCount())) {
+            AggregateProfile shape = AggregateProfile.of(aggregate, scan, mq);
+            double millis = CostModel.luceneAggregateMillis(CostInputsHolder.inputsOf(planner), shape);
+            return factory.makeCost(millis, 2, 1);
+        }
         return factory.makeTinyCost().plus(factory.makeCost(1, 1, 1));
+    }
+
+    /** The concrete scan at the bottom of the wrapped aggregate's rebuilt input chain, null if the chain is not concrete. */
+    private static LanceTableScan scanBelow(LanceAggregate aggregate) {
+        RelNode node = aggregate.getInput();
+        while (node instanceof Project || node instanceof Filter) {
+            node = node.getInput(0);
+        }
+        return node instanceof LanceTableScan scan ? scan : null;
     }
 
     /**
