@@ -231,7 +231,7 @@ sequenceDiagram
     end
     Note over CO: plan executor drives the fan-out:<br/>fragments grouped across data nodes
     CO->>EX: one request per node (its fragment share + the per node plan)
-    EX->>EX: refine: reader wrapper, sort field types,<br/>aggregate resolution (downgrade only)
+    EX->>EX: refine: reader wrapper, sort field types,<br/>aggregate resolution, column store warmth (downgrade only)
     alt plan still carries the pushed aggregate
         EX->>L: native scan (Substrait aggregate + SQL filter)
         L-->>EX: one row per group
@@ -378,9 +378,13 @@ its own group bound as a guard on the estimate it builds from the request shape
 to the warm latencies measured on the 20M, 100M and 1B row benchmark tables across 1 to 6 node
 clusters with the pushdown on and off; `scripts/fit-cost-coefficients.py` reproduces the fit from
 `src/test/resources/cost/measurements.csv`, and `CostModelTests` holds the model to the measured
-choices. What the model does not see: whether the aggregator path's columns are warm in the
-node's column store (a cold node pays a storage read the model does not charge), the state of the
-Lance index cache, and concurrent requests (the coefficients are single request latencies). Below
+choices. What the model does not see: the state of the
+Lance index cache, and concurrent requests (the coefficients are single request latencies).
+Whether the aggregator path's columns are warm in a node's column store is not a coordinator
+quantity either (the coordinator does not know which node holds which column), so it is decided
+on the data node: the coordinator ships, next to a pushed aggregate, its own predicted cost and
+the aggregators' predicted cost over resident columns, and the data node's refinement compares
+them against its store (see the two stage planning below). Below
 a million rows every path answers within the fixed cost and the measurements say nothing, so the
 placeholder ordering stands: the pushed form wins whenever a rule folds the tree, except for a
 tree with a `cardinality` metric, whose pushed placeholder is penalised to match the fitted
@@ -413,9 +417,21 @@ physical form, and that form is written down as a `FragmentPlan` (the Lance SQL 
 predicate, the full text or knn clause the executor builds its Lance query from, and the pushed
 page or the pushed aggregate with its Substrait bytes) that every fragment request of the target
 carries. Stage two runs on each data node, without a planner: the executor checks the shipped plan
-against what only it knows (a reader wrapper on the index service, the Lucene sort field types the
-mapping built, the resolution of the pushed aggregate against the mapping and the group bound) and
-downgrades where a pushed operation cannot run there. Downgrades go one way, from the Lance scan to
+against what only it knows and downgrades where a pushed operation cannot or should not run there,
+for one of four reasons: a reader wrapper on the index service (`security_wrapper`), the Lucene
+sort field types the mapping built (`sort_field_type`), the resolution of the pushed aggregate
+against the mapping and the group bound (`aggregate_resolution`), and the node's column store
+(`column_store_warm`). The first three are correctness guards; the fourth is cost based: the
+coordinator ships with a pushed aggregate the cost it predicted for the scan and the cost it
+predicts for the Lucene aggregators when every column they read is already resident in the column
+store (the run's inputs over local storage, so no object store term), together with those column
+names, and the node runs the aggregators when its store holds every one of those columns for every
+fragment of the request and the resident Lucene cost is below the pushed cost. Over a local table
+the resident cost equals the cost the planner already compared, so the fourth reason cannot fire
+there; over an object store table it fires once a Lucene side request has loaded the columns.
+Nothing warms the store for it (`lance.attach.warm_indexes` warms the Lance index cache, not the
+column store), and below the fitted model's range the shipped costs are zero. Downgrades go one way,
+from the Lance scan to
 Lucene; nothing is pushed on the data node that the coordinator did not push, so the plan the
 explain endpoint prints is the plan the coordinator ships (the endpoint calls the same
 `RequestPlanner` entry with the same cost inputs and renders its result), and `GET /_lance/stats` counts every
@@ -430,8 +446,8 @@ foundations (dependencies, schema, conventions, cost, the explain endpoint), the
 route through the planner, then hits, full text and vector translation, then the Lucene
 convention operators with fan-out and merge as plan operators, then the shard-path fallback as a
 plan operator, then the cost model fitted to the measured aggregation shapes, then the two stage
-planning that ships the per node plan from the coordinator, and ahead: node local refinement of the
-plan on column store warmth, and accuracy and tie-stability as planner
+planning that ships the per node plan from the coordinator and the node local refinement of the
+plan on column store warmth, and ahead: accuracy and tie-stability as planner
 traits a request can demand. The CHANGELOG tracks what has landed.
 
 ## Memory
