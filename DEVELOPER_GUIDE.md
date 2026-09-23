@@ -14,6 +14,7 @@
     - [Integration tests](#integration-tests)
     - [Running one test class](#running-one-test-class)
     - [Precommit checks](#precommit-checks)
+    - [Dependencies, audit lists and the security policy](#dependencies-audit-lists-and-the-security-policy)
   - [Debugging](#debugging)
   - [Repository layout](#repository-layout)
   - [Submitting changes](#submitting-changes)
@@ -156,7 +157,7 @@ Test results are written as JUnit XML under `build/test-results/<task>/TEST-*.xm
 * `forbiddenApis` (`forbiddenApisMain`, `forbiddenApisTest`, `forbiddenApisTestFixtures`): rejects JDK and Lucene APIs OpenSearch forbids in plugins.
 * `licenseHeaders`: every Java source must start with the `Copyright OpenSearch Contributors` / `SPDX-License-Identifier: Apache-2.0` header.
 * `jarHell`: no class appears twice on the runtime classpath.
-* `thirdPartyAudit`: bundled third party jars reference no missing classes.
+* `thirdPartyAudit`: bundled third party jars reference no missing classes and no `sun.misc.Unsafe` user is unaccounted for. The ignore lists in `build.gradle` are grouped by the jar that holds the reference, one comment per group.
 * `dependencyLicenses`: every bundled jar has a matching `licenses/<jar>.sha1`, `LICENSE` and `NOTICE` file. After changing a dependency version run `./gradlew updateShas` and commit the new `.sha1` files.
 * `testingConventions`, `filepermissions`, `validateNebulaPom`.
 * `spotlessJavaCheck`: the formatting described above.
@@ -168,6 +169,10 @@ Run them without the tests:
 ```
 
 `loggerUsageCheck` is disabled in `build.gradle` because the module it needs is not published outside the opensearch-project organization.
+
+### Dependencies, audit lists and the security policy
+
+[docs/dependencies.md](docs/dependencies.md) lists every bundled jar with the code that needs it, the artifacts that were tried and left out, how the `thirdPartyAudit` ignore lists were verified and how to re-verify them after a version change (empty the lists, run `./gradlew thirdPartyAudit`, compare the report with `build.gradle`), the license file mappings, and the reason behind each grant in `src/main/plugin-metadata/plugin-security.policy`. Read it before adding or upgrading a dependency; the "Checking a dependency change" section at its end is the checklist.
 
 ## Debugging
 

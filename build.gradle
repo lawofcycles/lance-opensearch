@@ -3,6 +3,11 @@
  *  SPDX-License-Identifier: Apache-2.0
  */
 
+// Sections, in order: plugin metadata, dependencies (one comment per
+// group; docs/dependencies.md has the per jar reasons), tests, precommit
+// (third party audit, licenses, formatting), publishing. Versions live in
+// gradle.properties.
+
 buildscript {
     ext {
         opensearch_version = System.getProperty("opensearch.version", "3.8.0")
@@ -43,8 +48,8 @@ opensearchplugin {
 }
 
 java {
-    targetCompatibility = JavaVersion.VERSION_21
-    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.toVersion(java_release_version)
+    sourceCompatibility = JavaVersion.toVersion(java_release_version)
 }
 
 repositories {
@@ -52,91 +57,79 @@ repositories {
     maven { url "https://ci.opensearch.org/ci/dbc/snapshots/maven/" }
 }
 
+// The opensearchplugin build resolves no transitive dependencies for third
+// party groups, so every jar the plugin bundles is declared here and
+// "excluding" an artifact means not declaring it. jackson-core,
+// protobuf-java, jackson-dataformat-yaml, reactive-streams and slf4j's
+// binding come from the OpenSearch core classpath and must not be bundled
+// (jarHell). The reason each jar is on the closure, and the ones that
+// were tried and dropped, are listed in docs/dependencies.md.
 dependencies {
     api "org.opensearch:opensearch:${opensearch_version}"
 
-    // Apache Arrow — bundle the modules needed at runtime because the
-    // arrow-base plugin is not distributed with the OpenSearch release
-    // image. arrow-memory-unsafe stays as the allocator (arrow-memory-netty
-    // does not work under OpenSearch's -Dio.netty.noUnsafe=true).
-    // TODO(pre-transfer): switch to extendedPlugins = ['arrow-base'] once
-    // opensearch-project ships arrow-base in the plugin distribution.
-    implementation "org.apache.arrow:arrow-vector:${arrow_version}"
-    implementation "org.apache.arrow:arrow-memory-core:${arrow_version}"
-    implementation "org.apache.arrow:arrow-dataset:${arrow_version}"
-    implementation "org.apache.arrow:arrow-format:${arrow_version}"
-    implementation "org.apache.arrow:arrow-c-data:${arrow_version}"
-    implementation "com.google.flatbuffers:flatbuffers-java:${flatbuffers_version}"
-    implementation "org.slf4j:slf4j-api:${slf4j_version}"
-    implementation "commons-codec:commons-codec:${commons_codec_version}"
-
-    // lance-core's JNI native library loader delegates to questdb's JarJniLoader.
-    // The dependency is declared in lance-core's POM but its ${arrow.version} /
-    // ${opentelemetry.version} properties are unresolved there, so Gradle drops
-    // the entire dependency block. Redeclare explicitly so it lands on the
-    // runtime classpath.
-    implementation "org.questdb:jar-jni:${questdb_jar_jni_version}"
-
-    // Lance native (JNI). Exclusions:
-    //   jackson-core: provided by OpenSearch core, bundling causes jar hell
-    //   arrow-memory-netty: OpenSearch runs Netty with -Dio.netty.noUnsafe=true,
-    //     which breaks the Netty allocation manager. Use arrow-memory-unsafe instead
-    //     (requires -Darrow.allocation.manager.type=Unsafe at runtime).
+    // Lance and Apache Arrow. lance-core is the JNI binding (Dataset,
+    // LanceScanner, indexes, DirectoryNamespace and RestNamespace); its
+    // native library loader delegates to questdb's JarJniLoader, which
+    // lance-core's POM declares with unresolved properties, so it is
+    // declared here. Arrow ships in the plugin because the arrow-base
+    // plugin is not part of the OpenSearch distribution; arrow-dataset
+    // is on the closure only for the Scanner and ScanTask interfaces
+    // LanceScanner implements. arrow-memory-unsafe is the allocator
+    // (arrow-memory-netty cannot run under -Dio.netty.noUnsafe=true, the
+    // node needs -Darrow.allocation.manager.type=Unsafe). flatbuffers,
+    // commons-codec and slf4j-api are Arrow's own runtime dependencies.
     implementation("org.lance:lance-core:${lance_core_version}") {
         exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
         exclude group: 'org.apache.arrow', module: 'arrow-memory-netty'
     }
-    // Lance Namespace core library. The RFC's Attaching a table section
-    // describes registering a Lance Namespace catalog as the primary path
-    // for surfacing tables; DirectoryNamespace covers filesystem catalogs
-    // today and the same interface will accept REST catalogs (Glue, Unity,
-    // Iceberg REST) as the namespace ecosystem matures.
+    implementation "org.questdb:jar-jni:${questdb_jar_jni_version}"
+    implementation "org.apache.arrow:arrow-vector:${arrow_version}"
+    implementation "org.apache.arrow:arrow-memory-core:${arrow_version}"
+    implementation "org.apache.arrow:arrow-memory-unsafe:${arrow_version}"
+    implementation "org.apache.arrow:arrow-dataset:${arrow_version}"
+    implementation "org.apache.arrow:arrow-format:${arrow_version}"
+    implementation "org.apache.arrow:arrow-c-data:${arrow_version}"
+    implementation "com.google.flatbuffers:flatbuffers-java:${flatbuffers_version}"
+    implementation "commons-codec:commons-codec:${commons_codec_version}"
+    implementation "org.slf4j:slf4j-api:${slf4j_version}"
+
+    // Lance Namespace. lance-namespace-core is the LanceNamespace interface
+    // and lance-namespace-apache-client the request and response models
+    // (and the JavaTimeModule they need). The 0.4.1 lance-namespace-impls
+    // artifacts are the Glue, Iceberg REST, Polaris and Unity catalog
+    // clients; they build against lance-namespace 0.7.7 and the surface
+    // the plugin drives (initialize, listNamespaces, listTables,
+    // describeTable, the model and error classes) was verified binary
+    // compatible with the bundled 0.11.1 by javap descriptor comparison.
+    // impls-core carries their shared RestClient and LanceTableUtil.
     implementation("org.lance:lance-namespace-core:${lance_namespace_version}") {
         exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
     }
-    // Provides the request and response model classes that DirectoryNamespace
-    // (in lance-core) refers to across the module boundary.
     implementation("org.lance:lance-namespace-apache-client:${lance_namespace_version}") {
         exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
     }
-    // AWS Glue catalog implementation of the Lance Namespace interface.
-    // The newest released artifact (0.4.1) still targets lance-namespace
-    // 0.7.7 / lance-core 7.0.0; the surface this plugin drives —
-    // initialize, listTables, describeTable and the model classes they
-    // exchange — is binary-compatible with the bundled lance-namespace
-    // 0.11.1 / lance-core 12.0.0 (method descriptors verified against
-    // both jars). The build resolves no transitive dependencies, so the
-    // closure is declared explicitly: impls-core carries the shared
-    // LanceTableUtil, and the software.amazon.awssdk modules are the
-    // Glue client's full compile tree at 2.32.2 (the version the glue
-    // artifact was built against). The SDK's sync HTTP transport is
-    // url-connection-client, which needs nothing beyond the SPI —
-    // apache-client (httpcore, commons-logging) and netty-nio-client
-    // stay out. Guava comes from the Calcite block above; slf4j-api and
-    // reactive-streams come from the plugin's own declaration and the
-    // OpenSearch core classpath respectively.
-    implementation "org.lance:lance-namespace-glue:${lance_namespace_impls_version}"
     implementation "org.lance:lance-namespace-impls-core:${lance_namespace_impls_version}"
-    // Iceberg REST, Polaris, and Unity catalog implementations of the
-    // Lance Namespace interface, same 0.4.1 artifacts with the same
-    // lance-namespace 0.7.7 skew as glue above; the surface the plugin
-    // drives (initialize, listTables, listNamespaces, describeTable,
-    // their model classes and the errors package) is binary-compatible
-    // with the bundled 0.11.1 (method descriptors verified against both
-    // jars, plus offline initialisation tests through the factory).
-    // All three are thin REST clients over impls-core's RestClient,
-    // which runs on Apache HttpClient 5. Bundled below at 5.6.1 / core
-    // 5.4, the versions OpenSearch 3.7's own REST client pins, because
-    // the test framework brings those onto the test classpath and the
-    // build fails on version conflicts. impls-core compiles against
-    // 5.2.1; every HttpClient method it references resolves against
-    // 5.6.1 / 5.4 (javap descriptor comparison, four via inheritance).
+    implementation "org.lance:lance-namespace-glue:${lance_namespace_impls_version}"
     implementation "org.lance:lance-namespace-iceberg:${lance_namespace_impls_version}"
     implementation "org.lance:lance-namespace-polaris:${lance_namespace_impls_version}"
     implementation "org.lance:lance-namespace-unity:${lance_namespace_impls_version}"
+
+    // Apache HttpClient 5, the transport of impls-core's RestClient
+    // (Iceberg, Polaris, Unity). 5.6.1 / core 5.4 are the versions the
+    // OpenSearch test framework puts on the test classpath through
+    // opensearch-rest-client; the plugin has to match them or the strict
+    // version conflict check fails. impls-core compiles against 5.2.1 and
+    // every method it references resolves against these versions.
     implementation "org.apache.httpcomponents.client5:httpclient5:${httpclient5_version}"
     implementation "org.apache.httpcomponents.core5:httpcore5:${httpcore5_version}"
     implementation "org.apache.httpcomponents.core5:httpcore5-h2:${httpcore5_version}"
+
+    // AWS SDK for Java 2, the Glue client's compile tree at the version
+    // lance-namespace-glue was built against. The sync HTTP transport is
+    // url-connection-client (loaded through the SdkHttpService service
+    // file), so apache-client and netty-nio-client stay out. eventstream
+    // is referenced by aws-core, auth and http-auth-aws and stays for the
+    // audit; the Glue API has no event stream operation.
     implementation "software.amazon.awssdk:glue:${aws_sdk_version}"
     implementation "software.amazon.awssdk:aws-json-protocol:${aws_sdk_version}"
     implementation "software.amazon.awssdk:protocol-core:${aws_sdk_version}"
@@ -151,7 +144,6 @@ dependencies {
     implementation "software.amazon.awssdk:http-auth:${aws_sdk_version}"
     implementation "software.amazon.awssdk:http-auth-aws:${aws_sdk_version}"
     implementation "software.amazon.awssdk:http-auth-spi:${aws_sdk_version}"
-    implementation "software.amazon.awssdk:http-auth-aws-eventstream:${aws_sdk_version}"
     implementation "software.amazon.awssdk:checksums:${aws_sdk_version}"
     implementation "software.amazon.awssdk:checksums-spi:${aws_sdk_version}"
     implementation "software.amazon.awssdk:retries:${aws_sdk_version}"
@@ -163,33 +155,44 @@ dependencies {
     implementation "software.amazon.awssdk:annotations:${aws_sdk_version}"
     implementation "software.amazon.awssdk:url-connection-client:${aws_sdk_version}"
     implementation "software.amazon.eventstream:eventstream:${aws_eventstream_version}"
-    implementation "org.apache.arrow:arrow-memory-unsafe:${arrow_version}"
 
-    // Jackson databind + annotations are required at runtime by arrow-vector
-    // but are not shipped in the OpenSearch image (only jackson-core is).
-    // Bundle them here; jackson-core comes from OpenSearch core, so exclude it
-    // from the transitive graph to avoid jar hell.
+    // Jackson. OpenSearch core ships jackson-core only; databind and
+    // annotations are needed by arrow-vector's Schema JSON, the namespace
+    // models, Calcite and Substrait. jackson-datatype-jdk8 is registered
+    // by Substrait's SimpleExtension YAML loader, jackson-datatype-jsr310
+    // by the namespace client's ApiClient and by DirectoryNamespace and
+    // RestNamespace in lance-core. jackson-core is excluded everywhere it
+    // is transitive so it never lands next to the core copy.
     implementation("com.fasterxml.jackson.core:jackson-databind:${jackson_databind_version}") {
         exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
         exclude group: 'com.fasterxml.jackson.core', module: 'jackson-annotations'
     }
     implementation "com.fasterxml.jackson.core:jackson-annotations:${jackson_annotations_version}"
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jdk8:${jackson_databind_version}") {
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-annotations'
+    }
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:${jackson_databind_version}") {
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-annotations'
+    }
 
-    // Apache Calcite is the query planner foundation and Substrait Java's
-    // isthmus module supplies the Calcite RelNode to Substrait plan bridge
-    // (SubstraitRelVisitor). The build resolves no transitive dependencies
-    // for third-party groups, so the closure is declared explicitly and
-    // "excluding" an artifact means not declaring it. The plugin does not
-    // use Calcite's SQL parser, JDBC driver, or Enumerable runtime, so
-    // calcite-server and the Avatica remote metrics stay out; the
-    // geo (JTS / proj4j) and statistics (datasketches, uzaygezen,
-    // aggdesigner) paths are equally unused. calcite-linq4j must ship:
-    // creating any character type walks SqlCollation's static initializer
-    // into CalciteTrace, which loads linq4j's Functions class.
-    // protobuf-java and jackson-dataformat-yaml come from the OpenSearch
-    // core classpath.
-    // calcite-core 1.39.0 is the version isthmus 0.57.0 declares in its
-    // POM and was compiled against.
+    // Apache Calcite (the planner) and Substrait Java (isthmus bridges a
+    // Calcite RelNode to a Substrait plan). calcite-core 1.39.0 is the
+    // version isthmus 0.57.0 was compiled against; avatica-core, Guava
+    // and failureaccess are the versions calcite-core declares. The plugin
+    // never parses SQL, opens a JDBC connection or runs Enumerable code,
+    // so calcite-server, avatica-metrics, the geo (JTS, proj4j) and the
+    // statistics (datasketches, uzaygezen, aggdesigner) closures are not
+    // bundled (see thirdPartyAudit below). calcite-linq4j must ship:
+    // SqlCollation's static initializer reaches linq4j's Functions class.
+    // janino, commons-compiler and json-path are needed the moment a
+    // RelOptCluster exists: the cluster wraps its metadata provider in
+    // JaninoRelMetadataProvider and DefaultRelMetadataProvider's
+    // initializer reflects over JsonFunctions, whose signatures name
+    // json-path types. json-smart (json-path's own provider) is not
+    // bundled: only the JSON_* SQL function bodies build a json-path
+    // Configuration, and the plugin evaluates no SQL function.
     implementation "org.apache.calcite:calcite-core:${calcite_version}"
     implementation "org.apache.calcite:calcite-linq4j:${calcite_version}"
     implementation "org.apache.calcite.avatica:avatica-core:${avatica_version}"
@@ -197,47 +200,18 @@ dependencies {
     implementation "com.google.guava:failureaccess:${failureaccess_version}"
     implementation "io.substrait:core:${substrait_version}"
     implementation "io.substrait:isthmus:${substrait_version}"
-    // Janino, commons-compiler, and json-path are needed the moment any
-    // RelOptCluster exists: the cluster constructor wraps the metadata
-    // provider in JaninoRelMetadataProvider (commons-compiler at class
-    // load, janino when the first metadata call compiles its handlers),
-    // and initializing DefaultRelMetadataProvider walks BuiltInMethod's
-    // static initializer over JsonFunctions, whose signatures reference
-    // json-path types. Versions are what calcite-core 1.39.0 declares.
-    // json-smart (json-path's own runtime dependency) is not bundled: the
-    // metadata path never touches it, only the JSON_* SQL function bodies
-    // do, and the plugin does not evaluate SQL functions.
     implementation "org.codehaus.janino:janino:${janino_version}"
     implementation "org.codehaus.janino:commons-compiler:${janino_version}"
     implementation "com.jayway.jsonpath:json-path:${jsonpath_version}"
-    // Substrait's SimpleExtension loader deserialises extension YAML with
-    // the Jdk8Module (Optional fields on the model classes). Not shipped
-    // by OpenSearch core, so bundle it at the plugin's Jackson version.
-    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jdk8:${jackson_databind_version}") {
-        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
-        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-annotations'
-    }
-
-    // lance-namespace-apache-client 0.11.1+ uses JavaTimeModule for
-    // ISO-8601 handling on the request/response models (timestamp fields
-    // added in namespace 0.11's REST spec). Not bundled by OpenSearch
-    // core, so ship it here alongside jackson-databind. Exclude the
-    // annotations transitive because we already bring our own.
-    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:${jackson_databind_version}") {
-        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
-        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-annotations'
-    }
 
     testImplementation "org.opensearch.test:framework:${opensearch_version}"
 
-    // Test-fixtures source set carries reusable Lance-writing helpers
-    // (e.g. LanceTableFactory) that both `test` and `integTest` consume
-    // without publishing them as production code. Arrow and Lance are
-    // needed at compile time; OpenSearch's test framework is not (the
-    // fixtures do not extend OpenSearchTestCase). Jackson / SLF4J
-    // exclusions mirror the main dependencies block so the test-fixtures
-    // classpath does not fail the opensearchplugin's strict version
-    // conflict check with a duplicated Jackson.
+    // Test fixtures carry the Lance table writers (LanceTableFactory) that
+    // both `test` and `integTest` use without publishing them as
+    // production code. Arrow and Lance are needed at compile time; the
+    // OpenSearch test framework is not. The exclusions mirror the main
+    // block so the fixtures classpath does not fail the opensearchplugin
+    // version conflict check with a second Jackson or SLF4J.
     testFixturesImplementation("org.apache.arrow:arrow-vector:${arrow_version}") {
         exclude group: 'com.fasterxml.jackson.core'
         exclude group: 'com.fasterxml.jackson.datatype'
@@ -281,242 +255,9 @@ dependencies {
     }
 }
 
-// Collapse the Apache Arrow, Jackson, Calcite, Substrait, Guava, AWS SDK,
-// and Lance namespace implementation jars into single license/notice entries.
-tasks.named("dependencyLicenses").configure {
-    mapping from: /arrow-.*/, to: 'arrow'
-    mapping from: /jackson-.*/, to: 'jackson'
-    mapping from: /calcite-.*/, to: 'calcite'
-    mapping from: /avatica-.*/, to: 'avatica'
-    mapping from: /guava|failureaccess/, to: 'guava'
-    // janino and commons-compiler are both org.codehaus.janino artifacts.
-    mapping from: /janino|commons-compiler/, to: 'janino'
-    // io.substrait's core artifact is named core-<version>.jar. Non-capturing
-    // group: the task locates the matched mapping by capture-group index in
-    // one combined regex, so an inner capture group here would shift the
-    // indices of every mapping declared after it.
-    mapping from: /^(?:core|isthmus)$/, to: 'substrait'
-    // The AWS SDK v2 modules the Glue client pulls in. All ship from the
-    // same repository under the same Apache-2.0 license and notice.
-    mapping from: /^(?:glue|aws-core|sdk-core|auth|regions|profiles|utils|annotations|http-client-spi|metrics-spi|endpoints-spi|identity-spi|http-auth.*|checksums.*|retries.*|json-utils|third-party-jackson-core|protocol-core|aws-json-protocol|url-connection-client)$/, to: 'aws-sdk'
-    mapping from: /^lance-namespace-(?:glue|impls-core|iceberg|polaris|unity)$/, to: 'lance-namespace-impls'
-    // httpcore5 and httpcore5-h2 ship from the HttpComponents Core
-    // repository under one license and notice; httpclient5 has its own.
-    mapping from: /^httpcore5.*/, to: 'httpcore5'
-}
-
-// lance-core references API surface from libraries that are either provided
-// at runtime by other OpenSearch plugins (Apache Arrow through arrow-base)
-// or optional at compile time (metrics, alternate JNI loaders, the separately
-// distributed lance-namespace client). thirdPartyAudit is a static bytecode
-// scan and cannot see these facts on its own, so the references are enumerated
-// explicitly here.
-tasks.named('thirdPartyAudit').configure {
-    ignoreMissingClasses(
-
-        // Calcite SQL DDL parser from calcite-server, referenced by isthmus's SQL entry points. The plugin converts RelNode plans only and never parses SQL, so calcite-server is not bundled.
-        'org.apache.calcite.sql.parser.ddl.SqlDdlParserImpl',
-
-        // Avatica remote JDBC metrics. The plugin never opens an Avatica connection, so avatica-metrics is not bundled.
-        'org.apache.calcite.avatica.metrics.MetricsSystem',
-        'org.apache.calcite.avatica.metrics.Timer',
-        'org.apache.calcite.avatica.metrics.Timer$Context',
-        'org.apache.calcite.avatica.metrics.noop.NoopMetricsSystem',
-
-        // Calcite geospatial functions (JTS 1.19 additions and proj4j). The plugin maps no geo types through Calcite, so the geo path is unreachable.
-        'org.locationtech.jts.algorithm.InteriorPoint',
-        'org.locationtech.jts.geom.util.GeometryFixer',
-        'org.locationtech.jts.io.geojson.GeoJsonReader',
-        'org.locationtech.jts.io.geojson.GeoJsonWriter',
-        'org.locationtech.jts.operation.buffer.OffsetCurve',
-        'org.locationtech.jts.triangulate.polygon.ConstrainedDelaunayTriangulator',
-        'org.locationtech.jts.triangulate.tri.Tri',
-        'org.locationtech.proj4j.CRSFactory',
-        'org.locationtech.proj4j.CoordinateReferenceSystem',
-        'org.locationtech.proj4j.CoordinateTransform',
-        'org.locationtech.proj4j.CoordinateTransformFactory',
-        'org.locationtech.proj4j.ProjCoordinate',
-        'org.locationtech.proj4j.proj.Projection',
-
-        // Calcite statistics and lattice tooling (datasketches HLL, uzaygezen space filling curves, Pentaho aggregate designer). Unreachable without lattices or the profiler.
-        'com.google.uzaygezen.core.BacktrackingQueryBuilder',
-        'com.google.uzaygezen.core.BitVector',
-        'com.google.uzaygezen.core.BitVectorFactories',
-        'com.google.uzaygezen.core.CompactHilbertCurve',
-        'com.google.uzaygezen.core.FilteredIndexRange',
-        'com.google.uzaygezen.core.Query',
-        'com.google.uzaygezen.core.SimpleRegionInspector',
-        'com.google.uzaygezen.core.ranges.LongRange',
-        'com.google.uzaygezen.core.ranges.LongRangeHome',
-        'com.yahoo.sketches.hll.HllSketch',
-        'com.yahoo.sketches.hll.HllSketchBuilder',
-        'org.pentaho.aggdes.algorithm.Algorithm',
-        'org.pentaho.aggdes.algorithm.Algorithm$ParameterEnum',
-        'org.pentaho.aggdes.algorithm.Result',
-        'org.pentaho.aggdes.model.Aggregate',
-        'org.pentaho.aggdes.model.Attribute',
-        'org.pentaho.aggdes.model.Dialect',
-        'org.pentaho.aggdes.model.Schema',
-        'org.pentaho.aggdes.model.StatisticsProvider',
-        'org.pentaho.aggdes.model.Table',
-
-        // Apache Commons utilities used by Calcite's SQL function library, DDL executors, and the Hilbert curve indexer. Unreachable from planning APIs.
-        'org.apache.commons.dbcp2.BasicDataSource',
-        'org.apache.commons.io.IOUtils',
-        'org.apache.commons.lang.StringEscapeUtils',
-        'org.apache.commons.lang3.StringUtils',
-        'org.apache.commons.lang3.mutable.MutableBoolean',
-        'org.apache.commons.math3.fraction.BigFraction',
-        'org.apache.commons.math3.util.CombinatoricsUtils',
-        'org.apache.commons.text.similarity.LevenshteinDistance',
-
-        // json-path's pluggable JSON providers (json-smart is its default, gson / jakarta.json / jettison / tapestry / org.json are alternatives). A provider is only instantiated when a json-path Configuration is built, which happens inside Calcite's JSON_* SQL function bodies; the plugin does not evaluate SQL functions.
-        'com.google.gson.Gson',
-        'com.google.gson.JsonArray',
-        'com.google.gson.JsonElement',
-        'com.google.gson.JsonObject',
-        'com.google.gson.JsonParser',
-        'com.google.gson.JsonPrimitive',
-        'com.google.gson.TypeAdapter',
-        'com.google.gson.reflect.TypeToken',
-        'jakarta.json.JsonArray',
-        'jakarta.json.JsonArrayBuilder',
-        'jakarta.json.JsonBuilderFactory',
-        'jakarta.json.JsonNumber',
-        'jakarta.json.JsonObject',
-        'jakarta.json.JsonObjectBuilder',
-        'jakarta.json.JsonReader',
-        'jakarta.json.JsonString',
-        'jakarta.json.JsonStructure',
-        'jakarta.json.JsonValue',
-        'jakarta.json.JsonValue$ValueType',
-        'jakarta.json.bind.Jsonb',
-        'jakarta.json.bind.JsonbBuilder',
-        'jakarta.json.bind.JsonbConfig',
-        'jakarta.json.spi.JsonProvider',
-        'jakarta.json.stream.JsonLocation',
-        'jakarta.json.stream.JsonParser',
-        'jakarta.json.stream.JsonParser$Event',
-        'net.minidev.json.JSONArray',
-        'net.minidev.json.JSONObject',
-        'net.minidev.json.JSONStyle',
-        'net.minidev.json.JSONValue',
-        'net.minidev.json.parser.JSONParser',
-        'net.minidev.json.writer.JsonReader',
-        'net.minidev.json.writer.JsonReaderI',
-        'org.apache.tapestry5.json.JSONArray',
-        'org.apache.tapestry5.json.JSONCollection',
-        'org.apache.tapestry5.json.JSONObject',
-        'org.codehaus.jettison.json.JSONArray',
-        'org.codehaus.jettison.json.JSONException',
-        'org.codehaus.jettison.json.JSONObject',
-        'org.codehaus.jettison.json.JSONTokener',
-        'org.json.JSONArray',
-        'org.json.JSONObject',
-        'org.json.JSONTokener',
-
-        // Janino's Ant build integration (AntCompilerAdapter). Janino is only invoked through JaninoRelMetadataProvider's in-memory compiler, never through Ant.
-        'org.apache.tools.ant.taskdefs.Javac',
-        'org.apache.tools.ant.taskdefs.compilers.DefaultCompilerAdapter',
-        'org.apache.tools.ant.types.Path',
-
-        // Optional OpenTelemetry metrics instrumentation in lance-core.
-        'io.opentelemetry.api.GlobalOpenTelemetry',
-        'io.opentelemetry.api.OpenTelemetry',
-        'io.opentelemetry.api.common.Attributes',
-        'io.opentelemetry.api.common.AttributesBuilder',
-        'io.opentelemetry.api.metrics.DoubleCounterBuilder',
-        'io.opentelemetry.api.metrics.DoubleGaugeBuilder',
-        'io.opentelemetry.api.metrics.LongCounterBuilder',
-        'io.opentelemetry.api.metrics.Meter',
-        'io.opentelemetry.api.metrics.MeterBuilder',
-        'io.opentelemetry.api.metrics.MeterProvider',
-        'io.opentelemetry.api.metrics.ObservableDoubleMeasurement',
-        'io.opentelemetry.api.metrics.ObservableMeasurement',
-
-        // Lance Namespace API model classes referenced by lance-core through
-        // a factory pattern. The bundled lance-namespace-core artifact
-        // supplies the LanceNamespace interface, DirectoryNamespace
-        // implementation, and the request/response models the plugin
-        // actually uses; the rest live in adapter artifacts that we do not
-        // bundle today.
-
-        // OpenAPI nullable-wrapper referenced by lance-namespace-apache-client's
-        // generated model setters. The models the plugin drives never set a
-        // JsonNullable field, so the wrapper library is not bundled.
-        'org.openapitools.jackson.nullable.JsonNullable',
-
-        // Optional compression codecs and TLS providers referenced by the
-        // bundled httpclient5 5.6.1. Each loads only when a response
-        // arrives in that encoding or when Conscrypt is selected as the
-        // TLS provider; the classes below are the subset the audit
-        // classpath does not already carry.
-        'com.aayushatharva.brotli4j.decoder.DecoderJNI$Status',
-        'com.aayushatharva.brotli4j.decoder.DecoderJNI$Wrapper',
-        'com.aayushatharva.brotli4j.encoder.Encoder$Mode',
-        'com.aayushatharva.brotli4j.encoder.EncoderJNI$Operation',
-        'com.aayushatharva.brotli4j.encoder.EncoderJNI$Wrapper',
-        'org.apache.commons.compress.compressors.CompressorStreamFactory',
-        'org.conscrypt.Conscrypt',
-
-        // Internal helpers referenced by lance-core's shaded Guava on some JVMs.
-        'org.lance.shaded.guava.util.concurrent.internal.InternalFutureFailureAccess',
-        'org.lance.shaded.guava.util.concurrent.internal.InternalFutures',
-
-        // Optional CRT-backed SigV4 signer in the AWS SDK's http-auth-aws.
-        // The default signer is pure Java; aws-crt only loads when a
-        // caller selects the CRT signer explicitly, which the Glue
-        // client built here never does.
-        'software.amazon.awssdk.crt.auth.credentials.Credentials',
-        'software.amazon.awssdk.crt.auth.signing.AwsSigner',
-        'software.amazon.awssdk.crt.auth.signing.AwsSigningConfig',
-        'software.amazon.awssdk.crt.auth.signing.AwsSigningConfig$AwsSignatureType',
-        'software.amazon.awssdk.crt.auth.signing.AwsSigningConfig$AwsSignedBodyHeaderType',
-        'software.amazon.awssdk.crt.auth.signing.AwsSigningConfig$AwsSigningAlgorithm',
-        'software.amazon.awssdk.crt.auth.signing.AwsSigningResult',
-        'software.amazon.awssdk.crt.http.HttpHeader',
-        'software.amazon.awssdk.crt.http.HttpRequest',
-        'software.amazon.awssdk.crt.http.HttpRequestBodyStream'
-    )
-
-    ignoreViolations(
-        // Guava's Unsafe-based optimizations (bundled for Calcite). Same
-        // classes as the shaded copies below that lance-core already carries.
-        'com.google.common.cache.Striped64',
-        'com.google.common.cache.Striped64$1',
-        'com.google.common.cache.Striped64$Cell',
-        'com.google.common.hash.LittleEndianByteArray$UnsafeByteArray',
-        'com.google.common.hash.LittleEndianByteArray$UnsafeByteArray$1',
-        'com.google.common.hash.LittleEndianByteArray$UnsafeByteArray$2',
-        'com.google.common.hash.Striped64',
-        'com.google.common.hash.Striped64$1',
-        'com.google.common.hash.Striped64$Cell',
-        'com.google.common.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator',
-        'com.google.common.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator$1',
-        'com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper',
-        'com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper$1',
-        // arrow-memory-core's Unsafe-based MemoryUtil. Also enumerated as such
-        // by sandbox/plugins/parquet-data-format.
-        'org.apache.arrow.memory.util.MemoryUtil',
-        'org.apache.arrow.memory.util.MemoryUtil$1',
-        // Shaded Guava classes in lance-core that use sun.misc.Unsafe. These are
-        // standard Guava optimizations that the Guava project has shipped for
-        // years and are safe on the JVMs OpenSearch supports.
-        'org.lance.shaded.guava.cache.Striped64',
-        'org.lance.shaded.guava.cache.Striped64$1',
-        'org.lance.shaded.guava.cache.Striped64$Cell',
-        'org.lance.shaded.guava.hash.LittleEndianByteArray$UnsafeByteArray',
-        'org.lance.shaded.guava.hash.LittleEndianByteArray$UnsafeByteArray$1',
-        'org.lance.shaded.guava.hash.LittleEndianByteArray$UnsafeByteArray$2',
-        'org.lance.shaded.guava.hash.Striped64',
-        'org.lance.shaded.guava.hash.Striped64$1',
-        'org.lance.shaded.guava.hash.Striped64$Cell',
-        'org.lance.shaded.guava.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator',
-        'org.lance.shaded.guava.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator$1',
-        'org.lance.shaded.guava.util.concurrent.AbstractFuture$UnsafeAtomicHelper',
-        'org.lance.shaded.guava.util.concurrent.AbstractFuture$UnsafeAtomicHelper$1'
-    )
-}
+// ---------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------
 
 test {
     // OpenSearch's BootstrapForTesting requires the javaagent-based
@@ -533,60 +274,6 @@ test {
     systemProperty 'arrow.allocation.manager.type', 'Unsafe'
     jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
 }
-
-publishing {
-    repositories {
-        maven {
-            name = "localRepo"
-            url = "${rootProject.buildDir}/repository"
-        }
-    }
-    publications {
-        pluginZip(MavenPublication) { publication ->
-            pom {
-                name = "opensearch-lance"
-                description = "Distributed search layer over Lance tables for OpenSearch (RFC #22643)"
-                groupId = "org.opensearch.plugin"
-            }
-        }
-        all {
-            pom {
-                name = "opensearch-lance"
-                description = "Distributed search layer over Lance tables for OpenSearch (RFC #22643)"
-            }
-            pom.withXml { XmlProvider xml ->
-                Node node = xml.asNode()
-                node.appendNode('inceptionYear', '2026')
-                if (!node.'description') {
-                    node.appendNode('description', description)
-                }
-
-                Node license = node.appendNode('licenses').appendNode('license')
-                license.appendNode('name',  "The Apache License, Version 2.0")
-                license.appendNode('url', "http://www.apache.org/licenses/LICENSE-2.0.txt")
-
-                Node developer = node.appendNode('developers').appendNode('developer')
-                developer.appendNode('name', 'OpenSearch')
-                developer.appendNode('url', 'https://github.com/lawofcycles/lance-opensearch')
-            }
-        }
-    }
-}
-
-// The loggerUsage precommit check requires org.opensearch.test:logger-usage,
-// which is an internal opensearch-project module that is not published to
-// Maven Central or the opensearch snapshot repository. External plugins
-// (opensearch-jvector, this repository) cannot resolve it. Once this project
-// is transferred into the opensearch-project organization and can reference
-// the module directly, this override should be removed.
-tasks.named('loggerUsageCheck').configure { enabled = false }
-
-// Wire spotless into the standard `check` chain so the formatting is enforced
-// alongside the rest of the precommit tasks. Use `./gradlew spotlessApply` to
-// apply the formatting locally.
-check.dependsOn spotlessCheck
-
-
 
 // Integration tests spin up an OpenSearch test cluster with the plugin
 // installed and drive it through REST. Standard opensearch-project pattern
@@ -714,3 +401,333 @@ testClusters.multiNodeIntegTest {
 }
 
 check.dependsOn multiNodeIntegTest
+
+// ---------------------------------------------------------------------
+// Precommit: third party audit, licenses, formatting
+// ---------------------------------------------------------------------
+
+// thirdPartyAudit is a static bytecode scan of the bundled jars against
+// the OpenSearch core classpath. Every class it cannot resolve is listed
+// below, grouped by the jar whose bytecode references it, with the
+// classes that hold the reference and why that code path is not reached.
+// The lists are verified by emptying them and reading the task's report:
+// each entry below is still reported with the current versions.
+tasks.named('thirdPartyAudit').configure {
+    ignoreMissingClasses(
+        // lance-core: optional OpenTelemetry metrics (org.lance.otel.LanceMetrics).
+        // The plugin never registers a meter provider, so the class is not loaded.
+        'io.opentelemetry.api.GlobalOpenTelemetry',
+        'io.opentelemetry.api.OpenTelemetry',
+        'io.opentelemetry.api.common.Attributes',
+        'io.opentelemetry.api.common.AttributesBuilder',
+        'io.opentelemetry.api.metrics.DoubleCounterBuilder',
+        'io.opentelemetry.api.metrics.DoubleGaugeBuilder',
+        'io.opentelemetry.api.metrics.LongCounterBuilder',
+        'io.opentelemetry.api.metrics.Meter',
+        'io.opentelemetry.api.metrics.MeterBuilder',
+        'io.opentelemetry.api.metrics.MeterProvider',
+        'io.opentelemetry.api.metrics.ObservableDoubleMeasurement',
+        'io.opentelemetry.api.metrics.ObservableMeasurement',
+
+        // lance-core: its shaded Guava (AbstractFuture, AbstractCatchingFuture,
+        // Futures$CallbackListener) references the shaded copy of Guava's
+        // failureaccess artifact, which Lance's shading did not include.
+        // Lance's own classes use only the shaded MoreObjects, Preconditions
+        // and immutable collections, so no shaded future is ever created.
+        'org.lance.shaded.guava.util.concurrent.internal.InternalFutureFailureAccess',
+        'org.lance.shaded.guava.util.concurrent.internal.InternalFutures',
+
+        // lance-namespace-apache-client: the OpenAPI JsonNullable wrapper on
+        // eleven generated model setters. The models the plugin drives never
+        // set a JsonNullable field, so the wrapper library is not bundled.
+        'org.openapitools.jackson.nullable.JsonNullable',
+
+        // calcite-core: geospatial functions (SpatialTypeFunctions,
+        // SpatialTypeUtils, ProjectionTransformer) reference JTS 1.19 additions
+        // and proj4j. OpenSearch core ships JTS 1.15 (bundling 1.19 would be
+        // jarHell) and the plugin maps no geo type through Calcite, so the
+        // geo function library is never loaded.
+        'org.locationtech.jts.algorithm.InteriorPoint',
+        'org.locationtech.jts.geom.util.GeometryFixer',
+        'org.locationtech.jts.io.geojson.GeoJsonReader',
+        'org.locationtech.jts.io.geojson.GeoJsonWriter',
+        'org.locationtech.jts.operation.buffer.OffsetCurve',
+        'org.locationtech.jts.triangulate.polygon.ConstrainedDelaunayTriangulator',
+        'org.locationtech.jts.triangulate.tri.Tri',
+        'org.locationtech.proj4j.CRSFactory',
+        'org.locationtech.proj4j.CoordinateReferenceSystem',
+        'org.locationtech.proj4j.CoordinateTransform',
+        'org.locationtech.proj4j.CoordinateTransformFactory',
+        'org.locationtech.proj4j.ProjCoordinate',
+        'org.locationtech.proj4j.proj.Projection',
+
+        // calcite-core: statistics and lattice tooling. HilbertCurve2D
+        // (uzaygezen), ProfilerImpl's HLL collectors (datasketches) and
+        // TileSuggester (Pentaho aggregate designer) are reached only through
+        // lattices and the profiler, which the planner does not use.
+        'com.google.uzaygezen.core.BacktrackingQueryBuilder',
+        'com.google.uzaygezen.core.BitVector',
+        'com.google.uzaygezen.core.BitVectorFactories',
+        'com.google.uzaygezen.core.CompactHilbertCurve',
+        'com.google.uzaygezen.core.FilteredIndexRange',
+        'com.google.uzaygezen.core.Query',
+        'com.google.uzaygezen.core.SimpleRegionInspector',
+        'com.google.uzaygezen.core.ranges.LongRange',
+        'com.google.uzaygezen.core.ranges.LongRangeHome',
+        'com.yahoo.sketches.hll.HllSketch',
+        'com.yahoo.sketches.hll.HllSketchBuilder',
+        'org.pentaho.aggdes.algorithm.Algorithm',
+        'org.pentaho.aggdes.algorithm.Algorithm$ParameterEnum',
+        'org.pentaho.aggdes.algorithm.Result',
+        'org.pentaho.aggdes.model.Aggregate',
+        'org.pentaho.aggdes.model.Attribute',
+        'org.pentaho.aggdes.model.Dialect',
+        'org.pentaho.aggdes.model.Schema',
+        'org.pentaho.aggdes.model.StatisticsProvider',
+        'org.pentaho.aggdes.model.Table',
+
+        // calcite-core: Apache Commons utilities on paths the planner never
+        // takes. dbcp2 in the JDBC adapter's connection pool, commons-io in the
+        // rule match visualizer, commons-lang and commons-text in the SQL
+        // function bodies (SqlFunctions), commons-lang3 in SqlFunctions,
+        // XmlFunctions, CompressionFunctions, FormatElementEnum and the
+        // correlated scalar subquery branch of RelMdColumnUniqueness (the
+        // planner builds no join and no subquery), commons-math3 in
+        // TimeFrames, which only the SQL validator instantiates.
+        'org.apache.commons.dbcp2.BasicDataSource',
+        'org.apache.commons.io.IOUtils',
+        'org.apache.commons.lang.StringEscapeUtils',
+        'org.apache.commons.lang3.StringUtils',
+        'org.apache.commons.lang3.mutable.MutableBoolean',
+        'org.apache.commons.math3.fraction.BigFraction',
+        'org.apache.commons.math3.util.CombinatoricsUtils',
+        'org.apache.commons.text.similarity.LevenshteinDistance',
+
+        // avatica-core: the remote JDBC server side (JsonHandler,
+        // ProtobufHandler, LocalService) times its calls with avatica-metrics.
+        // The plugin never opens an Avatica connection.
+        'org.apache.calcite.avatica.metrics.MetricsSystem',
+        'org.apache.calcite.avatica.metrics.Timer',
+        'org.apache.calcite.avatica.metrics.Timer$Context',
+        'org.apache.calcite.avatica.metrics.noop.NoopMetricsSystem',
+
+        // isthmus: SqlConverterBase parses SQL DDL with calcite-server's
+        // parser. The plugin hands isthmus RelNode plans and never a SQL string.
+        'org.apache.calcite.sql.parser.ddl.SqlDdlParserImpl',
+
+        // janino: AntCompilerAdapter integrates with Ant's javac task. Calcite
+        // drives Janino through JaninoRelMetadataProvider's in-memory compiler.
+        'org.apache.tools.ant.taskdefs.Javac',
+        'org.apache.tools.ant.taskdefs.compilers.DefaultCompilerAdapter',
+        'org.apache.tools.ant.types.Path',
+
+        // json-path: its pluggable JSON providers (json-smart is the default;
+        // gson, jakarta.json, jettison, tapestry and org.json are the
+        // alternatives). A provider is instantiated only when a json-path
+        // Configuration is built, which happens inside Calcite's JSON_* SQL
+        // function bodies; the plugin evaluates no SQL function.
+        'com.google.gson.Gson',
+        'com.google.gson.JsonArray',
+        'com.google.gson.JsonElement',
+        'com.google.gson.JsonObject',
+        'com.google.gson.JsonParser',
+        'com.google.gson.JsonPrimitive',
+        'com.google.gson.TypeAdapter',
+        'com.google.gson.reflect.TypeToken',
+        'jakarta.json.JsonArray',
+        'jakarta.json.JsonArrayBuilder',
+        'jakarta.json.JsonBuilderFactory',
+        'jakarta.json.JsonNumber',
+        'jakarta.json.JsonObject',
+        'jakarta.json.JsonObjectBuilder',
+        'jakarta.json.JsonReader',
+        'jakarta.json.JsonString',
+        'jakarta.json.JsonStructure',
+        'jakarta.json.JsonValue',
+        'jakarta.json.JsonValue$ValueType',
+        'jakarta.json.bind.Jsonb',
+        'jakarta.json.bind.JsonbBuilder',
+        'jakarta.json.bind.JsonbConfig',
+        'jakarta.json.spi.JsonProvider',
+        'jakarta.json.stream.JsonLocation',
+        'jakarta.json.stream.JsonParser',
+        'jakarta.json.stream.JsonParser$Event',
+        'net.minidev.json.JSONArray',
+        'net.minidev.json.JSONObject',
+        'net.minidev.json.JSONStyle',
+        'net.minidev.json.JSONValue',
+        'net.minidev.json.parser.JSONParser',
+        'net.minidev.json.writer.JsonReader',
+        'net.minidev.json.writer.JsonReaderI',
+        'org.apache.tapestry5.json.JSONArray',
+        'org.apache.tapestry5.json.JSONCollection',
+        'org.apache.tapestry5.json.JSONObject',
+        'org.codehaus.jettison.json.JSONArray',
+        'org.codehaus.jettison.json.JSONException',
+        'org.codehaus.jettison.json.JSONObject',
+        'org.codehaus.jettison.json.JSONTokener',
+        'org.json.JSONArray',
+        'org.json.JSONObject',
+        'org.json.JSONTokener',
+
+        // httpclient5 and httpcore5-h2: optional Brotli (brotli4j) and Commons
+        // Compress content codecs, and the Conscrypt TLS strategy. A codec
+        // loads only when a response arrives in that encoding, Conscrypt only
+        // when selected as the TLS provider; the catalog clients do neither.
+        'com.aayushatharva.brotli4j.decoder.DecoderJNI$Status',
+        'com.aayushatharva.brotli4j.decoder.DecoderJNI$Wrapper',
+        'com.aayushatharva.brotli4j.encoder.Encoder$Mode',
+        'com.aayushatharva.brotli4j.encoder.EncoderJNI$Operation',
+        'com.aayushatharva.brotli4j.encoder.EncoderJNI$Wrapper',
+        'org.apache.commons.compress.compressors.CompressorStreamFactory',
+        'org.conscrypt.Conscrypt',
+
+        // http-auth-aws: the CRT backed SigV4a signer (DefaultAwsCrtV4aHttpSigner
+        // and its helpers) links aws-crt. The default signer is pure Java and
+        // the Glue client never selects the CRT signer.
+        'software.amazon.awssdk.crt.auth.credentials.Credentials',
+        'software.amazon.awssdk.crt.auth.signing.AwsSigner',
+        'software.amazon.awssdk.crt.auth.signing.AwsSigningConfig',
+        'software.amazon.awssdk.crt.auth.signing.AwsSigningConfig$AwsSignatureType',
+        'software.amazon.awssdk.crt.auth.signing.AwsSigningConfig$AwsSignedBodyHeaderType',
+        'software.amazon.awssdk.crt.auth.signing.AwsSigningConfig$AwsSigningAlgorithm',
+        'software.amazon.awssdk.crt.auth.signing.AwsSigningResult',
+        'software.amazon.awssdk.crt.http.HttpHeader',
+        'software.amazon.awssdk.crt.http.HttpRequest',
+        'software.amazon.awssdk.crt.http.HttpRequestBodyStream'
+    )
+
+    // Users of sun.misc.Unsafe in the bundled jars. The audit flags the
+    // bytecode whether or not the class is loaded; each entry says which
+    // code reaches it.
+    ignoreViolations(
+        // guava (bundled for Calcite). Striped64 backs the LongAdder counters
+        // of Guava's LocalCache and AbstractFuture$UnsafeAtomicHelper is the
+        // atomic helper AbstractFuture picks at class initialization; both
+        // are reached because RelDataTypeFactoryImpl and
+        // JaninoRelMetadataProvider each hold a LoadingCache, whose loading
+        // value reference is a SettableFuture. The hash package
+        // (LittleEndianByteArray, the hash Striped64) and
+        // UnsignedBytes.lexicographicalComparator() are referenced by no
+        // bundled class outside Guava, so they are never loaded.
+        'com.google.common.cache.Striped64',
+        'com.google.common.cache.Striped64$1',
+        'com.google.common.cache.Striped64$Cell',
+        'com.google.common.hash.LittleEndianByteArray$UnsafeByteArray',
+        'com.google.common.hash.LittleEndianByteArray$UnsafeByteArray$1',
+        'com.google.common.hash.LittleEndianByteArray$UnsafeByteArray$2',
+        'com.google.common.hash.Striped64',
+        'com.google.common.hash.Striped64$1',
+        'com.google.common.hash.Striped64$Cell',
+        'com.google.common.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator',
+        'com.google.common.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator$1',
+        'com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper',
+        'com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper$1',
+
+        // arrow-memory-core: MemoryUtil is the Unsafe accessor behind every
+        // ArrowBuf read and write, so it is reached by every Arrow buffer the
+        // plugin touches. OpenSearch's own parquet-data-format sandbox plugin
+        // lists the same two classes.
+        'org.apache.arrow.memory.util.MemoryUtil',
+        'org.apache.arrow.memory.util.MemoryUtil$1',
+
+        // lance-core: the shaded copy of the Guava classes above. Lance's own
+        // classes use only the shaded MoreObjects, Preconditions and immutable
+        // collections, so none of these is reached from the Java side; they
+        // are in the jar because Lance shades all of Guava.
+        'org.lance.shaded.guava.cache.Striped64',
+        'org.lance.shaded.guava.cache.Striped64$1',
+        'org.lance.shaded.guava.cache.Striped64$Cell',
+        'org.lance.shaded.guava.hash.LittleEndianByteArray$UnsafeByteArray',
+        'org.lance.shaded.guava.hash.LittleEndianByteArray$UnsafeByteArray$1',
+        'org.lance.shaded.guava.hash.LittleEndianByteArray$UnsafeByteArray$2',
+        'org.lance.shaded.guava.hash.Striped64',
+        'org.lance.shaded.guava.hash.Striped64$1',
+        'org.lance.shaded.guava.hash.Striped64$Cell',
+        'org.lance.shaded.guava.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator',
+        'org.lance.shaded.guava.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator$1',
+        'org.lance.shaded.guava.util.concurrent.AbstractFuture$UnsafeAtomicHelper',
+        'org.lance.shaded.guava.util.concurrent.AbstractFuture$UnsafeAtomicHelper$1'
+    )
+}
+
+// dependencyLicenses wants one LICENSE and NOTICE pair per jar; the
+// mappings collapse the jars that ship from one project under one pair.
+// The task builds a single combined regex from every mapping and finds
+// the matched mapping by capture group index, so mappings use
+// non-capturing groups only.
+tasks.named("dependencyLicenses").configure {
+    // Lance and Arrow
+    mapping from: /arrow-.*/, to: 'arrow'
+    mapping from: /^lance-namespace-(?:glue|impls-core|iceberg|polaris|unity)$/, to: 'lance-namespace-impls'
+    // Apache HttpComponents: httpcore5 and httpcore5-h2 ship from the core
+    // repository under one notice; httpclient5 has its own.
+    mapping from: /^httpcore5.*/, to: 'httpcore5'
+    // AWS SDK for Java 2 modules
+    mapping from: /^(?:glue|aws-core|sdk-core|auth|regions|profiles|utils|annotations|http-client-spi|metrics-spi|endpoints-spi|identity-spi|http-auth.*|checksums.*|retries.*|json-utils|third-party-jackson-core|protocol-core|aws-json-protocol|url-connection-client)$/, to: 'aws-sdk'
+    // Jackson
+    mapping from: /jackson-.*/, to: 'jackson'
+    // Calcite, Avatica, Guava, Substrait (whose core artifact is named
+    // core-<version>.jar) and Janino (janino and commons-compiler)
+    mapping from: /calcite-.*/, to: 'calcite'
+    mapping from: /avatica-.*/, to: 'avatica'
+    mapping from: /guava|failureaccess/, to: 'guava'
+    mapping from: /^(?:core|isthmus)$/, to: 'substrait'
+    mapping from: /janino|commons-compiler/, to: 'janino'
+}
+
+// The loggerUsage precommit check requires org.opensearch.test:logger-usage,
+// which is an internal opensearch-project module that is not published to
+// Maven Central or the opensearch snapshot repository. External plugins
+// (opensearch-jvector, this repository) cannot resolve it. Once this project
+// is transferred into the opensearch-project organization and can reference
+// the module directly, this override should be removed.
+tasks.named('loggerUsageCheck').configure { enabled = false }
+
+// Wire spotless into the standard `check` chain so the formatting is enforced
+// alongside the rest of the precommit tasks. Use `./gradlew spotlessApply` to
+// apply the formatting locally.
+check.dependsOn spotlessCheck
+
+// ---------------------------------------------------------------------
+// Publishing
+// ---------------------------------------------------------------------
+
+publishing {
+    repositories {
+        maven {
+            name = "localRepo"
+            url = "${rootProject.buildDir}/repository"
+        }
+    }
+    publications {
+        pluginZip(MavenPublication) { publication ->
+            pom {
+                name = "opensearch-lance"
+                description = "Distributed search layer over Lance tables for OpenSearch (RFC #22643)"
+                groupId = "org.opensearch.plugin"
+            }
+        }
+        all {
+            pom {
+                name = "opensearch-lance"
+                description = "Distributed search layer over Lance tables for OpenSearch (RFC #22643)"
+            }
+            pom.withXml { XmlProvider xml ->
+                Node node = xml.asNode()
+                node.appendNode('inceptionYear', '2026')
+                if (!node.'description') {
+                    node.appendNode('description', description)
+                }
+
+                Node license = node.appendNode('licenses').appendNode('license')
+                license.appendNode('name',  "The Apache License, Version 2.0")
+                license.appendNode('url', "http://www.apache.org/licenses/LICENSE-2.0.txt")
+
+                Node developer = node.appendNode('developers').appendNode('developer')
+                developer.appendNode('name', 'OpenSearch')
+                developer.appendNode('url', 'https://github.com/lawofcycles/lance-opensearch')
+            }
+        }
+    }
+}
