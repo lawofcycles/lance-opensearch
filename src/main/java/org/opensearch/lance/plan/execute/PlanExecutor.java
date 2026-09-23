@@ -33,6 +33,7 @@ import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.rel.physical.FanOutExec;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
 import org.opensearch.lance.plan.rel.physical.ShardPathFallbackExec;
+import org.opensearch.lance.query.FtsAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.search.approximate.ApproximateScoreQuery;
 import org.opensearch.search.internal.ContextIndexSearcher;
@@ -722,6 +723,24 @@ public final class PlanExecutor {
 
     /** {@link #countFtsHitsDirectly(Dataset, LanceFtsQuery, List, long)} whose scans stop once {@code cancellation} reports a cancelled task. */
     public static FtsHitCount countFtsHitsDirectly(
+        Dataset dataset,
+        LanceFtsQuery fts,
+        List<Integer> fragmentIds,
+        long limit,
+        LanceCancellation cancellation
+    ) throws Exception {
+        // The admission gate credits memory earlier scans left behind
+        // only while no full text scan runs; a count-only scan reloads
+        // the inverted index the same way the hits scan does.
+        FtsAdmission.scanStarted();
+        try {
+            return countFtsHitsDirectlyUnguarded(dataset, fts, fragmentIds, limit, cancellation);
+        } finally {
+            FtsAdmission.scanFinished();
+        }
+    }
+
+    private static FtsHitCount countFtsHitsDirectlyUnguarded(
         Dataset dataset,
         LanceFtsQuery fts,
         List<Integer> fragmentIds,

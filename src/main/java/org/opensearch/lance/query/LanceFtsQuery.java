@@ -644,45 +644,55 @@ public final class LanceFtsQuery extends Query {
             List<ScanOptions> issued = new ArrayList<>(2);
             Map<Integer, LanceFragmentHits> hits = new HashMap<>();
             boolean complete;
-            if (scanLimit != SCAN_LIMIT_UNBOUNDED) {
-                // Top k over the whole table; each executor keeps its
-                // share of the same k rows. Lance rejects limit == 0;
-                // if a caller passed scanLimit == 0 through some other
-                // route the clip is 1.
-                long limit = Math.max(1L, (long) scanLimit);
-                ScanOptions options = newScanOptions().limit(limit).build();
-                issued.add(options);
-                long returned = collectHits(dataset, options, keep, hits);
-                // Lance returns exactly min(limit, matches) rows, so a
-                // short result means every match of the table, and
-                // with it every match of the reader's fragments, has
-                // been seen.
-                complete = returned < limit;
-            } else if (keep == null) {
-                ScanOptions options = newScanOptions().build();
-                issued.add(options);
-                collectHits(dataset, options, null, hits);
-                complete = true;
-            } else {
-                // Probe limit proportional to the rows the reader
-                // covers, see effectiveSubsetProbeLimit.
-                long probeLimit = effectiveSubsetProbeLimit(subsetRows);
-                ScanOptions probe = newScanOptions().limit(probeLimit).build();
-                issued.add(probe);
-                long returned = collectHits(dataset, probe, keep, hits);
-                if (returned >= probeLimit) {
-                    // Too many matches to filter here: discard the
-                    // probe and let Lance restrict the scan to the
-                    // reader's fragments. The probe rows leave the
-                    // heap, so their bytes go back to the breaker
-                    // before the restricted scan reserves its own.
-                    accounting.release(heapBytesOf(hits));
-                    hits = new HashMap<>();
-                    ScanOptions restricted = restrictToFragmentsUnlessAll(newScanOptions(), new ArrayList<>(fragmentIds), dataset).build();
-                    issued.add(restricted);
-                    collectHits(dataset, restricted, null, hits);
+            // The admission gate credits memory earlier scans left
+            // behind only while no scan runs, and samples what this
+            // scan leaves behind when it is the admitted one; both
+            // hang off these two calls.
+            FtsAdmission.scanStarted();
+            try {
+                if (scanLimit != SCAN_LIMIT_UNBOUNDED) {
+                    // Top k over the whole table; each executor keeps its
+                    // share of the same k rows. Lance rejects limit == 0;
+                    // if a caller passed scanLimit == 0 through some other
+                    // route the clip is 1.
+                    long limit = Math.max(1L, (long) scanLimit);
+                    ScanOptions options = newScanOptions().limit(limit).build();
+                    issued.add(options);
+                    long returned = collectHits(dataset, options, keep, hits);
+                    // Lance returns exactly min(limit, matches) rows, so a
+                    // short result means every match of the table, and
+                    // with it every match of the reader's fragments, has
+                    // been seen.
+                    complete = returned < limit;
+                } else if (keep == null) {
+                    ScanOptions options = newScanOptions().build();
+                    issued.add(options);
+                    collectHits(dataset, options, null, hits);
+                    complete = true;
+                } else {
+                    // Probe limit proportional to the rows the reader
+                    // covers, see effectiveSubsetProbeLimit.
+                    long probeLimit = effectiveSubsetProbeLimit(subsetRows);
+                    ScanOptions probe = newScanOptions().limit(probeLimit).build();
+                    issued.add(probe);
+                    long returned = collectHits(dataset, probe, keep, hits);
+                    if (returned >= probeLimit) {
+                        // Too many matches to filter here: discard the
+                        // probe and let Lance restrict the scan to the
+                        // reader's fragments. The probe rows leave the
+                        // heap, so their bytes go back to the breaker
+                        // before the restricted scan reserves its own.
+                        accounting.release(heapBytesOf(hits));
+                        hits = new HashMap<>();
+                        ScanOptions restricted = restrictToFragmentsUnlessAll(newScanOptions(), new ArrayList<>(fragmentIds), dataset)
+                            .build();
+                        issued.add(restricted);
+                        collectHits(dataset, restricted, null, hits);
+                    }
+                    complete = true;
                 }
-                complete = true;
+            } finally {
+                FtsAdmission.scanFinished();
             }
             ShardScan fresh = new ShardScan(hits, complete, List.copyOf(issued));
             // Whichever thread wins the CAS installs the result; losers
