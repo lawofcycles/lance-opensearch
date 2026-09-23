@@ -13,9 +13,11 @@ import io.substrait.proto.Rel;
 import org.apache.calcite.plan.volcano.VolcanoPlanner;
 import org.apache.calcite.rel.RelNode;
 import org.opensearch.lance.plan.calcite.LanceConvention;
+import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.rel.MetricSpec;
 import org.opensearch.lance.plan.rel.PushedOperation;
+import org.opensearch.lance.plan.rel.physical.LuceneAggregateExec;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -28,11 +30,13 @@ import java.util.List;
 /**
  * Runs the Volcano planner with the pushdown rules over every
  * translation fixture and asserts it terminates with the expected
- * physical root: the scan carrying the pushed aggregate, for every
- * shape, because the producer covers everything the translator
- * accepts. The pushed bytes must deserialize to a Substrait plan whose
- * aggregate carries the measures and groupings the shape's specs
- * expand to.
+ * physical root: the scan carrying the pushed aggregate for every
+ * shape without a {@code cardinality} metric, because the producer
+ * covers everything the translator accepts, and the Lucene aggregate
+ * operator for the shapes with one, because the pushdown rule's
+ * operand rejects them. The pushed bytes must deserialize to a
+ * Substrait plan whose aggregate carries the measures and groupings
+ * the shape's specs expand to.
  */
 public class PlannerFixturePhysicalTests extends OpenSearchTestCase {
 
@@ -53,6 +57,17 @@ public class PlannerFixturePhysicalTests extends OpenSearchTestCase {
 
     public void testVolcanoTerminatesWithThePushedScan() throws IOException {
         RelNode logical = PlanTestFixtures.translate(PlanTestFixtures.parse(body()));
+        boolean cardinality = ((LanceAggregate) logical).metricSpecs()
+            .stream()
+            .anyMatch(spec -> spec.kind() == MetricSpec.Kind.CARDINALITY);
+        if (cardinality) {
+            RelNode physical = PlanTestFixtures.factory().plan(logical);
+            assertTrue(
+                "physical root of [" + fixture + "] is the Lucene aggregate operator: " + physical,
+                physical instanceof LuceneAggregateExec
+            );
+            return;
+        }
         VolcanoPlanner planner = (VolcanoPlanner) logical.getCluster().getPlanner();
         RelNode root = planner.changeTraits(logical, logical.getTraitSet().replace(LanceConvention.INSTANCE));
         planner.setRoot(root);

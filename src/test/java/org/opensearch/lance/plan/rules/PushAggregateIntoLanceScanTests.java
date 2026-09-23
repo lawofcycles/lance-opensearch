@@ -32,8 +32,9 @@ import java.util.List;
 /**
  * The pushdown rule: it replaces the aggregate with the scan carrying
  * the producer's bytes for the three operand shapes, it leaves the
- * plan alone when the producer refuses an expression, and the Volcano
- * planner terminates either way.
+ * plan alone when the producer refuses an expression or when a metric
+ * of the tree is a {@code cardinality}, and the Volcano planner
+ * terminates either way.
  */
 public class PushAggregateIntoLanceScanTests extends OpenSearchTestCase {
 
@@ -138,6 +139,48 @@ public class PushAggregateIntoLanceScanTests extends OpenSearchTestCase {
             List.of(BucketSpec.of(BucketSpec.Kind.TERMS, "k")),
             List.of(),
             List.of(List.of())
+        );
+        expectThrows(RelOptPlanner.CannotPlanException.class, () -> volcanoPlan(aggregate));
+    }
+
+    public void testDoesNotFireOnACardinalityMetric() throws Exception {
+        // The direct operand shape: the aggregate sits on the bare scan.
+        // No Lance convention plan exists because the operand predicate
+        // rejects the cardinality; the Lucene aggregator operator is the
+        // only alternative and it lives in the other convention.
+        RelNode logical = PlanTestFixtures.translate(
+            PlanTestFixtures.parse("{\"size\":0,\"aggs\":{\"c\":{\"cardinality\":{\"field\":\"category\"}}}}")
+        );
+        expectThrows(RelOptPlanner.CannotPlanException.class, () -> volcanoPlan(logical));
+    }
+
+    public void testDoesNotFireOnABucketTreeWithACardinalityChild() throws Exception {
+        // The project operand shape: the group key projection sits
+        // between the aggregate and the scan.
+        RelNode logical = PlanTestFixtures.translate(
+            PlanTestFixtures.parse(
+                "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"rating\"}}}}}}"
+            )
+        );
+        expectThrows(RelOptPlanner.CannotPlanException.class, () -> volcanoPlan(logical));
+    }
+
+    public void testDoesNotFireOnAFilteredCardinality() {
+        // The filter operand shape, spelled the way the translator
+        // spells a cardinality: COUNT(DISTINCT col) with the CARDINALITY
+        // metric spec.
+        RelBuilder builder = PlanTestFixtures.factory().relBuilder(PlanTestFixtures.model().schema());
+        builder.scan(LancePlannerFactory.SCHEMA_NAME, "idx");
+        builder.filter(builder.call(SqlStdOperatorTable.GREATER_THAN, builder.field("rating"), builder.literal(5)));
+        RelNode filtered = builder.build();
+        AggregateCall distinctCount = AggregateCall.create(SqlStdOperatorTable.COUNT, true, false, List.of(1), -1, 0, filtered, null, "c");
+        LanceAggregate aggregate = LanceAggregate.create(
+            filtered,
+            ImmutableBitSet.of(),
+            List.of(distinctCount),
+            List.of(),
+            List.of(MetricSpec.of(MetricSpec.Kind.CARDINALITY, "c")),
+            List.of()
         );
         expectThrows(RelOptPlanner.CannotPlanException.class, () -> volcanoPlan(aggregate));
     }

@@ -431,14 +431,15 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
             Map<String, LinkedHashMap<String, String>> noMultiFields = Map.of();
             assertNotNull("stats on integer", planned(dataset, noMultiFields, qsc, AggregationBuilders.stats("s").field("rating")));
             assertNull("stats on keyword", planned(dataset, noMultiFields, qsc, AggregationBuilders.stats("s").field("category")));
-            assertNotNull(
+            // Cardinality passes the structural gate but the planner's
+            // pushdown rule rejects any tree carrying it (the pushed
+            // form is slower than the aggregator), so the routing
+            // answers null and the aggregators run.
+            assertNull(
                 "cardinality on keyword",
                 planned(dataset, noMultiFields, qsc, AggregationBuilders.cardinality("c").field("category"))
             );
-            assertNotNull(
-                "cardinality on boolean",
-                planned(dataset, noMultiFields, qsc, AggregationBuilders.cardinality("c").field("flag"))
-            );
+            assertNull("cardinality on boolean", planned(dataset, noMultiFields, qsc, AggregationBuilders.cardinality("c").field("flag")));
             assertNull(
                 "cardinality on a keyword list",
                 planned(dataset, noMultiFields, qsc, AggregationBuilders.cardinality("c").field("tags"))
@@ -767,7 +768,10 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
         // parallelism 1 and 4, on every fragment and on the contiguous
         // fragments 2 and 3 (a gap between the fragments' id ranges would
         // leave the median undefined and the two digests free to differ),
-        // alone and under buckets.
+        // alone and under buckets. A tree carrying a cardinality runs
+        // through the aggregators on both runs (the planner refuses to
+        // push it), so those comparisons pin that the answer does not
+        // depend on the pushdown setting.
         String indexName = "pushdown-sketches";
         String tableUri = attach(indexName, 8, 100);
         List<AggregatorFactories.Builder> trees = List.of(
