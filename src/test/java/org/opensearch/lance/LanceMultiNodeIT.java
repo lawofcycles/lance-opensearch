@@ -1896,7 +1896,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             }
             assertEquals(
                 "one executor per node per index per request",
-                executedBefore + 2 * shapes.length * dataNodes,
+                executedBefore + shapes.length * dataNodes + 2 * shapes.length * dataNodes,
                 LanceRestTestCase.fragmentRequestsExecuted()
             );
         } finally {
