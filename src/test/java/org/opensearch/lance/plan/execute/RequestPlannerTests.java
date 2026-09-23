@@ -6,7 +6,11 @@
 package org.opensearch.lance.plan.execute;
 
 import org.apache.calcite.rel.RelNode;
+import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
+import org.opensearch.lance.plan.cost.CostInputs;
+import org.opensearch.lance.plan.cost.PerfTableFixture;
+import org.opensearch.lance.plan.cost.StorageKind;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.rel.physical.FanOutExec;
 import org.opensearch.lance.plan.rel.physical.HeapTopKExec;
@@ -318,5 +322,67 @@ public class RequestPlannerTests extends OpenSearchTestCase {
         // it; both read the same query part.
         assertTrue(planned.perNode() instanceof LuceneAggregateExec || planned.perNode() instanceof LanceTableScan);
         assertEquals("rating = 5", planned.plan().filterSql());
+    }
+
+    public void testClusterInputsFlipAKeywordTermsOverABillionRowsToTheLuceneOperator() throws IOException {
+        // The same tree, planned under the inputs a four node coordinator
+        // over an object store builds and under one local node collecting
+        // on a single thread: the fitted cost model sends the first to
+        // the aggregators and keeps the second on the pushed scan.
+        String terms = "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}";
+        ExecutionShape shape = shape(terms, true);
+        LancePlannerFactory factory = PlanTestFixtures.factory();
+        CostInputs fourNodesOverS3 = CostInputs.forCluster(4, "s3://bench/perf1b.lance", 16, 8, 8);
+        RequestPlanner.Planned overS3 = RequestPlanner.plan(shape, PerfTableFixture.perf1b(), NO_EXCLUDED, factory, fourNodesOverS3);
+        assertEquals(FragmentPlan.Kind.LUCENE_AGGREGATE, overS3.plan().kind());
+        assertNull(overS3.plan().aggregate());
+        assertTrue("the aggregators win over S3: " + overS3.perNode(), overS3.perNode() instanceof LuceneAggregateExec);
+        assertNull("nothing was refused, the cost chose", overS3.unplanned());
+
+        RequestPlanner.Planned local = RequestPlanner.plan(
+            shape,
+            PerfTableFixture.perf1b(),
+            NO_EXCLUDED,
+            factory,
+            new CostInputs(1, StorageKind.LOCAL, 64, 32, 1)
+        );
+        assertEquals(FragmentPlan.Kind.PUSHED_SCAN, local.plan().kind());
+        assertNotNull(local.plan().aggregate());
+        assertTrue("the pushed scan wins locally: " + local.perNode(), local.perNode() instanceof LanceTableScan);
+
+        // The four argument overload plans under the local default.
+        assertEquals(
+            RequestPlanner.plan(shape, PerfTableFixture.perf1b(), NO_EXCLUDED, factory, CostInputs.local()).plan(),
+            RequestPlanner.plan(shape, PerfTableFixture.perf1b(), NO_EXCLUDED, factory).plan()
+        );
+    }
+
+    public void testUnplannedNamesTheElementThatKeptTheEnvelopeOnLucene() throws IOException {
+        // The translator refuses the aggregation; the plan runs it on the
+        // aggregators and the refusal message is kept for explain.
+        RequestPlanner.Planned refusedAggregation = plan(
+            "{\"size\":0,\"query\":{\"term\":{\"rating\":5}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"category\"}}}}"
+        );
+        assertEquals(FragmentPlan.Kind.LUCENE_AGGREGATE, refusedAggregation.plan().kind());
+        assertNotNull(refusedAggregation.unplanned());
+        assertThat(refusedAggregation.unplanned(), containsString("category"));
+
+        // A sort without a collation spelling keeps the page on the
+        // collector and names the sort.
+        RequestPlanner.Planned geoSort = plan(
+            "{\"size\":4,\"sort\":[{\"_geo_distance\":{\"location\":{\"lat\":35.6,\"lon\":139.7},\"order\":\"asc\"}}]}"
+        );
+        assertEquals(FragmentPlan.Kind.LUCENE_TOPK, geoSort.plan().kind());
+        assertEquals("sort type [_geo_distance]", geoSort.unplanned());
+
+        // A query outside the vocabulary names the query type.
+        RequestPlanner.Planned match = plan("{\"size\":5,\"query\":{\"match\":{\"body\":\"hello\"}}}");
+        assertEquals(FragmentPlan.Kind.LUCENE_TOPK, match.plan().kind());
+        assertEquals("query type [match]", match.unplanned());
+        assertSame("the fallback's logical tree is the bare scan it wraps", match.logical(), match.perNode());
+
+        // A fully planned request has nothing unplanned.
+        assertNull(plan("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}").unplanned());
+        assertNull(plan("{\"size\":5,\"sort\":[{\"rating\":\"desc\"}]}").unplanned());
     }
 }

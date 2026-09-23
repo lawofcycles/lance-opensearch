@@ -541,7 +541,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 target.dateOverrideColumns(),
                 () -> totalRows
             );
-        RequestPlanner.Planned planned = RequestPlanner.plan(baseSpec.executionShape(), model, target.sqlExcludedColumns(), plannerFactory);
+        RequestPlanner.Planned planned = RequestPlanner.plan(
+            baseSpec.executionShape(),
+            model,
+            target.sqlExcludedColumns(),
+            plannerFactory,
+            RequestPlanner.clusterInputs(nodeList.size(), target.tableUri(), clusterService.getClusterSettings())
+        );
         FragmentQuerySpec spec = baseSpec.withPlan(planned.plan());
         if (allFragmentIds.isEmpty()) {
             if (spec.aggregations() == null) {
