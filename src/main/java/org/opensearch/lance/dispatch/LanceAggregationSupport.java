@@ -77,9 +77,13 @@ import org.opensearch.search.builder.SearchSourceBuilder;
  * fragment request), {@code top_hits} / {@code sampler} /
  * {@code significant_terms} (a fetch phase or a background frequency
  * set), {@code nested} / {@code reverse_nested} / {@code geo*} (field
- * types the Lance mapping does not derive), {@code scripted_metric},
- * and every pipeline aggregation: the coordinator reduces with
- * {@code PipelineTree.EMPTY}, so a pipeline would never run.
+ * types the Lance mapping does not derive), and {@code scripted_metric}.
+ * Pipeline aggregations ({@code avg_bucket}, {@code cumulative_sum},
+ * {@code bucket_sort}, {@code bucket_script}, ...) are not gated: they
+ * run on the coordinator's final reduce ({@code MergeReducer}) over the
+ * reduced tree, the way {@code SearchPhaseController} runs them over the
+ * shards' trees, so only the bucket and metric aggregations they read
+ * from have to be on the list.
  *
  * <p>Approximate aggregations ({@code percentiles} with the default
  * tdigest, {@code cardinality}) merge one sketch per executor on the
@@ -115,9 +119,6 @@ public final class LanceAggregationSupport {
         if (source == null || source.aggregations() == null) {
             return true;
         }
-        if (!source.aggregations().getPipelineAggregatorFactories().isEmpty()) {
-            return false;
-        }
         for (AggregationBuilder top : source.aggregations().getAggregatorFactories()) {
             if (!isBuilderSupported(top)) {
                 return false;
@@ -126,22 +127,15 @@ public final class LanceAggregationSupport {
         return true;
     }
 
-    /** True when the source carries at least one aggregation. */
-    static boolean hasAggregations(SearchSourceBuilder source) {
-        return source != null && source.aggregations() != null && !source.aggregations().getAggregatorFactories().isEmpty();
-    }
-
     /**
      * Whether {@code builder} and every aggregation below it are on the
-     * allow list. A pipeline aggregation anywhere in the subtree rejects
-     * the whole tree (see the class comment); so does a sub aggregation
-     * off the list, so a {@code date_histogram} containing a scripted
-     * metric is rejected as a whole.
+     * allow list. A sub aggregation off the list rejects the whole tree,
+     * so a {@code date_histogram} containing a scripted metric is
+     * rejected as a whole. The pipeline aggregations under a builder
+     * play no part: they run on the coordinator's final reduce over the
+     * reduced tree, whatever the executors ran to build it.
      */
     static boolean isBuilderSupported(AggregationBuilder builder) {
-        if (!builder.getPipelineAggregations().isEmpty()) {
-            return false;
-        }
         if (!isRecognisedAggType(builder)) {
             return false;
         }

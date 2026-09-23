@@ -26,15 +26,5 @@ public enum ShardPathReason {
      * {@code highlight} needs FTS positional APIs Lance does not
      * surface yet.
      */
-    HIGHLIGHT,
-
-    /**
-     * A pipeline aggregation (sibling like {@code avg_bucket} or parent
-     * like {@code cumulative_sum}) hits an "Already been replayed"
-     * IllegalStateException in the coordinator merge, because the
-     * fragment path replays the InternalAggregations tree in a way the
-     * pipeline aggregators don't expect. The shard path's standard
-     * reduce loop handles them.
-     */
-    PIPELINE_AGG
+    HIGHLIGHT
 }

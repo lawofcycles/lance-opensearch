@@ -35,7 +35,6 @@ import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.lance.query.LanceMatchPhraseQueryBuilder;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.lance.query.LanceMultiMatchQueryBuilder;
-import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.sort.SortBuilder;
@@ -501,47 +500,7 @@ public final class SearchRequestToRel {
         if (source.highlighter() != null) {
             reasons.add(ShardPathReason.HIGHLIGHT);
         }
-        if (source.aggregations() != null && hasPipelineAggregation(source.aggregations())) {
-            reasons.add(ShardPathReason.PIPELINE_AGG);
-        }
         return reasons;
-    }
-
-    /**
-     * Returns {@code true} if the aggregation tree contains any
-     * pipeline aggregator, either at the top level (sibling pipelines
-     * such as {@code avg_bucket}) or nested inside a bucket
-     * aggregation (parent pipelines such as {@code cumulative_sum}
-     * or {@code bucket_sort}).
-     */
-    private static boolean hasPipelineAggregation(AggregatorFactories.Builder aggs) {
-        if (aggs == null) {
-            return false;
-        }
-        if (!aggs.getPipelineAggregatorFactories().isEmpty()) {
-            return true;
-        }
-        for (AggregationBuilder child : aggs.getAggregatorFactories()) {
-            if (containsPipeline(child)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean containsPipeline(AggregationBuilder agg) {
-        if (agg == null) {
-            return false;
-        }
-        if (!agg.getPipelineAggregations().isEmpty()) {
-            return true;
-        }
-        for (AggregationBuilder child : agg.getSubAggregations()) {
-            if (containsPipeline(child)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /**

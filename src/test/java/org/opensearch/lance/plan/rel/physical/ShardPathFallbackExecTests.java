@@ -88,7 +88,7 @@ public class ShardPathFallbackExecTests extends OpenSearchTestCase {
         // pushed Lance scan must always cost less than the shard path,
         // so whenever another form of the same tree exists the planner
         // keeps the fragment path.
-        ShardPathFallbackExec exec = exec(ShardPathReason.PIPELINE_AGG);
+        ShardPathFallbackExec exec = exec(ShardPathReason.HIGHLIGHT);
         RelOptPlanner planner = exec.getCluster().getPlanner();
         RelMetadataQuery mq = exec.getCluster().getMetadataQuery();
         RelOptCost luceneOperatorCost = planner.getCostFactory().makeTinyCost().plus(planner.getCostFactory().makeCost(1, 1, 1));
@@ -109,10 +109,10 @@ public class ShardPathFallbackExecTests extends OpenSearchTestCase {
     }
 
     public void testExplainCarriesTheReasons() {
-        ShardPathFallbackExec exec = exec(ShardPathReason.HIGHLIGHT, ShardPathReason.PIPELINE_AGG);
+        ShardPathFallbackExec exec = exec(ShardPathReason.SUGGEST, ShardPathReason.HIGHLIGHT);
         String plan = RelOptUtil.toString(exec);
         assertTrue("names the operator: " + plan, plan.contains("ShardPathFallbackExec"));
-        assertTrue("carries the reasons: " + plan, plan.contains("HIGHLIGHT") && plan.contains("PIPELINE_AGG"));
+        assertTrue("carries the reasons: " + plan, plan.contains("SUGGEST") && plan.contains("HIGHLIGHT"));
         assertTrue("the scan is the input: " + plan, plan.contains("LanceTableScan"));
     }
 
@@ -132,7 +132,7 @@ public class ShardPathFallbackExecTests extends OpenSearchTestCase {
     public void testReasonKinds() {
         // The kinds the translator can attach; the executor and the
         // explain output spell them by name, so renames are breaking.
-        assertEquals(List.of("SUGGEST", "HIGHLIGHT", "PIPELINE_AGG"), Arrays.stream(ShardPathReason.values()).map(Enum::name).toList());
+        assertEquals(List.of("SUGGEST", "HIGHLIGHT"), Arrays.stream(ShardPathReason.values()).map(Enum::name).toList());
     }
 
     public void testRowEstimatePassesTheInputThrough() {

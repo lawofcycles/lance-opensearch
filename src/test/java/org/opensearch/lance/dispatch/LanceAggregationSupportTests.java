@@ -60,8 +60,6 @@ public class LanceAggregationSupportTests extends OpenSearchTestCase {
     public void testNoAggregationsIsSupported() {
         assertTrue(LanceAggregationSupport.isSupported(null));
         assertTrue(LanceAggregationSupport.isSupported(new SearchSourceBuilder()));
-        assertFalse(LanceAggregationSupport.hasAggregations(new SearchSourceBuilder()));
-        assertTrue(LanceAggregationSupport.hasAggregations(sourceWith(AggregationBuilders.sum("s").field("price"))));
     }
 
     public void testMetricAggregationsOverAField() {
@@ -210,13 +208,17 @@ public class LanceAggregationSupportTests extends OpenSearchTestCase {
         );
     }
 
-    public void testPipelineAggregationsStayOnTheShardPath() {
+    public void testPipelineAggregationsStayOnTheFragmentPath() {
+        // Pipelines run on the coordinator's final reduce, so a parent
+        // pipeline under a bucket and a sibling pipeline at the top
+        // level both leave the request on the fragment path; only the
+        // bucket and metric aggregations they read are gated.
         AggregationBuilder withParentPipeline = AggregationBuilders.dateHistogram("d")
             .field("ts")
             .calendarInterval(DateHistogramInterval.DAY)
             .subAggregation(AggregationBuilders.sum("s").field("price"))
             .subAggregation(new CumulativeSumPipelineAggregationBuilder("cs", "s"));
-        assertRejected(withParentPipeline);
+        assertAccepted(withParentPipeline);
 
         SearchSourceBuilder withSiblingPipeline = sourceWith(
             AggregationBuilders.dateHistogram("d")
@@ -224,7 +226,15 @@ public class LanceAggregationSupportTests extends OpenSearchTestCase {
                 .calendarInterval(DateHistogramInterval.DAY)
                 .subAggregation(AggregationBuilders.sum("s").field("price"))
         ).aggregation(new AvgBucketPipelineAggregationBuilder("ab", "d>s"));
-        assertFalse(LanceAggregationSupport.isSupported(withSiblingPipeline));
+        assertTrue(LanceAggregationSupport.isSupported(withSiblingPipeline));
+
+        // A pipeline over a bucket the list rejects follows the bucket.
+        AggregationBuilder overScriptedMetric = AggregationBuilders.dateHistogram("d")
+            .field("ts")
+            .calendarInterval(DateHistogramInterval.DAY)
+            .subAggregation(AggregationBuilders.sum("s").script(new Script("doc['price'].value")))
+            .subAggregation(new CumulativeSumPipelineAggregationBuilder("cs", "s"));
+        assertRejected(overScriptedMetric);
     }
 
     public void testOneRejectedTopLevelAggregationRejectsTheRequest() {
