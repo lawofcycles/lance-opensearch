@@ -23,8 +23,9 @@ import org.opensearch.core.rest.RestStatus;
  * 429 (it rebuilds the same document set) until
  * {@code lance.fts.admission.bounded_shapes_gated} opts it out, and
  * disabling the gate must let the unbounded shape through again. The
- * stats block must count the rejections and report the node's
- * available memory.
+ * stats block must count the rejections, report the node's
+ * available memory and the memory earlier admitted scans left behind,
+ * and a repeat of an admitted unbounded shape must be admitted.
  */
 public class LanceFtsAdmissionIT extends LanceRestTestCase {
 
@@ -56,6 +57,7 @@ public class LanceFtsAdmissionIT extends LanceRestTestCase {
                 assertTrue("expected circuit_breaking_exception: " + body, body.contains("circuit_breaking_exception"));
                 assertTrue("expected the admission label: " + body, body.contains("lance_fts_admission"));
                 assertTrue("expected the index name in the message: " + body, body.contains(indexName));
+                assertTrue("expected the retained figure in the message: " + body, body.contains("retained by earlier full text scans"));
 
                 // The rejection is counted and the estimate recorded:
                 // 16 rows at 52 bytes per row for the document set,
@@ -136,6 +138,40 @@ public class LanceFtsAdmissionIT extends LanceRestTestCase {
             // Back at the defaults the bounded page answers as before.
             String restored = readAll(postJson("/" + indexName + "/_search", BOUNDED));
             assertEquals(8, extractIntPath(restored, "hits", "total", "value"));
+        }
+    }
+
+    public void testRepeatOfAnAdmittedUnboundedShapeIsAdmittedAndTheRetainedFigureStaysWithinTheEstimate() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "ftsadmissionr")) {
+            String indexName = fixture.indexName();
+
+            // The fixture's index is declared as not fitting, so every
+            // decision carries the full estimate (16 rows at 52 bytes
+            // plus the 24 byte scan buffer), and a one byte headroom
+            // lets any host's available memory admit it.
+            updateClusterSetting("lance.test.index_cache_shard_share", "\"1b\"");
+            updateClusterSetting("lance.fts.admission.headroom", "\"1b\"");
+            try {
+                long rejectedBefore = ((Number) admissionStats().get("rejections")).longValue();
+                for (int repeat = 1; repeat <= 3; repeat++) {
+                    String response = readAll(postJson("/" + indexName + "/_search", UNBOUNDED));
+                    assertEquals("repeat " + repeat, 8, extractIntPath(response, "hits", "total", "value"));
+                    Map<String, Object> admission = admissionStats();
+                    assertEquals(admission.toString(), rejectedBefore, ((Number) admission.get("rejections")).longValue());
+                    assertEquals(admission.toString(), 16L * 52L + 24L, ((Number) admission.get("last_estimate_bytes")).longValue());
+                    // What the completed scans left behind is measured on
+                    // the live host, so only its bounds are pinned: never
+                    // negative, never above the largest admitted estimate,
+                    // and computed (which needs every admitted request to
+                    // have reported its end) rather than absent.
+                    long retained = ((Number) admission.get("retained_bytes")).longValue();
+                    assertTrue(admission.toString(), retained >= 0L);
+                    assertTrue(admission.toString(), retained <= 16L * 52L + 24L);
+                }
+            } finally {
+                updateClusterSetting("lance.fts.admission.headroom", null);
+                updateClusterSetting("lance.test.index_cache_shard_share", null);
+            }
         }
     }
 
