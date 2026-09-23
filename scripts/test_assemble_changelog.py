@@ -199,6 +199,22 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(":2: every line must start a list item", err)
 
+    def test_whitespace_only_line_after_the_first_item_fails(self):
+        code, _, err = self.check({"fixed/a.md": "- Fixed a thing.\n   \n- Fixed another.\n"})
+        self.assertEqual(code, 1)
+        self.assertIn(":2: blank or whitespace only line", err)
+
+    def test_empty_line_between_items_fails(self):
+        code, _, err = self.check({"fixed/a.md": "- Fixed a thing.\n\n- Fixed another.\n"})
+        self.assertEqual(code, 1)
+        self.assertIn(":2: blank or whitespace only line", err)
+
+    def test_leading_blank_line_fails(self):
+        code, _, err = self.check({"fixed/a.md": "\n- Fixed a thing.\n"})
+        self.assertEqual(code, 1)
+        self.assertIn(":1: blank or whitespace only line", err)
+        self.assertNotIn("must start with a markdown list item", err)
+
     def test_missing_trailing_newline_fails(self):
         code, _, err = self.check({"fixed/a.md": "- Fixed a thing."})
         self.assertEqual(code, 1)

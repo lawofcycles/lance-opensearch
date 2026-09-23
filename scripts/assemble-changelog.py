@@ -81,18 +81,18 @@ def check_fragment(fragment: Path) -> list:
     problems = []
     if not text.endswith("\n"):
         problems.append(f"{fragment}: missing trailing newline")
-    first = True
     for number, line in enumerate(text.splitlines(), start=1):
         if line.strip() == "":
-            continue
-        if first and not line.startswith("- "):
+            problems.append(
+                f"{fragment}:{number}: blank or whitespace only line, a fragment holds list items only"
+            )
+        elif number == 1 and not line.startswith("- "):
             problems.append(f"{fragment}:{number}: must start with a markdown list item ('- ')")
         elif not (line.startswith("- ") or line.startswith("  ")):
             problems.append(
                 f"{fragment}:{number}: every line must start a list item ('- ') "
                 "or continue one (two leading spaces)"
             )
-        first = False
     return problems
 
 
