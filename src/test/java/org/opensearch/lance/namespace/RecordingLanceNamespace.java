@@ -9,6 +9,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.lance.namespace.LanceNamespace;
@@ -35,8 +38,14 @@ import org.lance.namespace.model.ListTablesResponse;
  * {@code listTables} answers only ids present in the table tree and
  * rejects every other id the way Iceberg and Unity reject listings at
  * the wrong level.
+ *
+ * <p>{@link #listTablesGate}, when set, holds every {@code listTables}
+ * call open until the test counts it down, and {@link #listTablesEntered}
+ * reports that a call has reached that point. Together with
+ * {@link #closeCalls} and {@link #closedWhileListing} they let a test pin
+ * the order of an in-flight listing and the handle's release.
  */
-class RecordingLanceNamespace implements LanceNamespace {
+class RecordingLanceNamespace implements LanceNamespace, AutoCloseable {
 
     final List<Map<String, String>> initializeCalls = new ArrayList<>();
     RuntimeException initializeFailure;
@@ -44,13 +53,21 @@ class RecordingLanceNamespace implements LanceNamespace {
     Set<String> childNamespaces;
     Map<String, String> tableLocations = Map.of();
     int describeTableCalls;
+    final AtomicInteger closeCalls = new AtomicInteger();
+    /** Set to true if {@link #close} ran while a {@code listTables} call was still in progress. */
+    volatile boolean closedWhileListing;
+    /** Every {@code listTables} call waits on this latch when it is non-null. */
+    volatile CountDownLatch listTablesGate;
+    /** Counted down once a {@code listTables} call has started waiting on {@link #listTablesGate}. */
+    final CountDownLatch listTablesEntered = new CountDownLatch(1);
+    private final AtomicInteger listingsInFlight = new AtomicInteger();
 
     /** Tree mode: children per exact parent id (dot-joined; the root is the empty string). */
     Map<String, Set<String>> namespaceTree;
     /** Tree mode: tables per exact namespace id (dot-joined); other ids reject the listing. */
     Map<String, Set<String>> tableTree;
-    final List<List<String>> listTablesIds = new ArrayList<>();
-    final List<List<String>> listNamespacesIds = new ArrayList<>();
+    final List<List<String>> listTablesIds = new CopyOnWriteArrayList<>();
+    final List<List<String>> listNamespacesIds = new CopyOnWriteArrayList<>();
 
     @Override
     public void initialize(Map<String, String> properties, BufferAllocator allocator) {
@@ -72,6 +89,25 @@ class RecordingLanceNamespace implements LanceNamespace {
     @Override
     public ListTablesResponse listTables(ListTablesRequest request) {
         listTablesIds.add(request.getId() == null ? List.of() : List.copyOf(request.getId()));
+        listingsInFlight.incrementAndGet();
+        try {
+            CountDownLatch gate = listTablesGate;
+            if (gate != null) {
+                listTablesEntered.countDown();
+                try {
+                    gate.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("interrupted while holding listTables open", e);
+                }
+            }
+            return answerListTables(request);
+        } finally {
+            listingsInFlight.decrementAndGet();
+        }
+    }
+
+    private ListTablesResponse answerListTables(ListTablesRequest request) {
         if (tableTree != null) {
             Set<String> found = tableTree.get(joined(request.getId()));
             if (found == null) {
@@ -107,5 +143,13 @@ class RecordingLanceNamespace implements LanceNamespace {
         DescribeTableResponse response = new DescribeTableResponse();
         response.setLocation(tableLocations.get(tableName));
         return response;
+    }
+
+    @Override
+    public void close() {
+        if (listingsInFlight.get() > 0) {
+            closedWhileListing = true;
+        }
+        closeCalls.incrementAndGet();
     }
 }

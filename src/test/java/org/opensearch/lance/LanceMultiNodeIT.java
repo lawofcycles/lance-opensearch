@@ -19,7 +19,11 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import org.apache.hc.core5.http.HttpHost;
@@ -1943,6 +1947,98 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 deleteJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
             } catch (Exception ignored) {}
         }
+    }
+
+    /**
+     * Unregistering a namespace while requests are still inside its
+     * catalog handle must not take a node down. The tables preview runs
+     * {@code listTables} on the node that receives it, and the cluster
+     * state applier hands the removed registration's handle to the same
+     * generic pool for closing, so a steady stream of previews across
+     * every node (the client round-robins the requests) racing a series
+     * of register / unregister rounds exercises the release ordering on
+     * each of them; the elected cluster manager's poll adds its own
+     * {@code listTables} to the mix. Without the release waiting for the
+     * calls in flight, {@code DirectoryNamespace} frees its native
+     * object under a running call and the node dies with a SIGSEGV,
+     * which shows up here as a transport failure on a preview or on the
+     * health check.
+     */
+    public void testUnregisterDuringTablePreviewsKeepsEveryNodeAlive() throws Exception {
+        int rounds = 10;
+        int streams = 12;
+        AtomicReference<String> currentBody = new AtomicReference<>();
+        AtomicBoolean stop = new AtomicBoolean();
+        List<String> failures = new CopyOnWriteArrayList<>();
+        AtomicInteger listed = new AtomicInteger();
+        AtomicInteger unregistered = new AtomicInteger();
+        List<Thread> previewers = new ArrayList<>();
+        for (int i = 0; i < streams; i++) {
+            Thread previewer = new Thread(() -> {
+                while (stop.get() == false) {
+                    String body = currentBody.get();
+                    if (body == null) {
+                        Thread.onSpinWait();
+                        continue;
+                    }
+                    try {
+                        postJson("/_lance/namespace/tables", body);
+                        listed.incrementAndGet();
+                    } catch (ResponseException e) {
+                        // A preview that came after the unregister answers
+                        // 404; anything else is recorded for the assertion.
+                        int status = e.getResponse().getStatusLine().getStatusCode();
+                        if (status == RestStatus.NOT_FOUND.getStatus()) {
+                            unregistered.incrementAndGet();
+                        } else {
+                            failures.add(status + ": " + e.getMessage());
+                        }
+                    } catch (IOException e) {
+                        // A connection reset or refused connection: a node went away.
+                        failures.add(e.toString());
+                    }
+                }
+            });
+            previewer.setDaemon(true);
+            previewers.add(previewer);
+            previewer.start();
+        }
+        String lastBody = null;
+        try {
+            for (int round = 0; round < rounds; round++) {
+                Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-mn-churn-" + randomAlphaOfLength(8)));
+                String body = "{\"path\":\"" + scratchDir + "\"}";
+                lastBody = body;
+                Response register = postJson("/_lance/namespace", body);
+                assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
+                currentBody.set(body);
+                // Let the previews reach the handle on every node, then
+                // pull the registration out from under them.
+                Thread.sleep(150);
+                Response unregister = deleteJson("/_lance/namespace", body);
+                assertEquals(RestStatus.OK.getStatus(), unregister.getStatusLine().getStatusCode());
+                Thread.sleep(50);
+                assertTrue("round " + round + ": previews failed: " + failures, failures.isEmpty());
+            }
+        } finally {
+            stop.set(true);
+            for (Thread previewer : previewers) {
+                previewer.join(30_000);
+            }
+            if (lastBody != null) {
+                try {
+                    deleteJson("/_lance/namespace", lastBody);
+                } catch (Exception ignored) {}
+            }
+        }
+        assertTrue("previews failed: " + failures, failures.isEmpty());
+        logger.info("preview churn: {} listed, {} answered unregistered", listed.get(), unregistered.get());
+        assertTrue(
+            "expected previews to reach the handle, saw " + listed.get() + " listed and " + unregistered.get() + " unregistered",
+            listed.get() > 0
+        );
+        Response health = client().performRequest(new Request("GET", "/_cluster/health?wait_for_nodes=3&timeout=30s"));
+        assertEquals(3, extractIntPath(readAll(health), "number_of_nodes"));
     }
 
     /**
