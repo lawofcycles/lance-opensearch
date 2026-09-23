@@ -106,6 +106,25 @@ public class LanceExplainIT extends LanceRestTestCase {
             assertTrue("the operator runs over the scan: " + filteredBucketPhysical, filteredBucketPhysical.contains("LanceTableScan"));
             assertFalse("nothing is pushed into the scan: " + filteredBucketPhysical, filteredBucketPhysical.contains("pushed=[["));
 
+            // A cardinality metric never folds into the scan (the
+            // pushed form is slower than the aggregator), so the
+            // physical plan shows the Lucene aggregate operator over
+            // the bare scan.
+            Response cardinality = explain(indexName, "{\"size\":0,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"id\"}}}}");
+            assertEquals(RestStatus.OK.getStatus(), cardinality.getStatusLine().getStatusCode());
+            String cardinalityBody = readAll(cardinality);
+            String cardinalityLogical = stringPath(cardinalityBody, "logical");
+            assertTrue(
+                "logical plan carries the cardinality spec: " + cardinalityLogical,
+                cardinalityLogical.contains("CARDINALITY{name=u}")
+            );
+            String cardinalityPhysical = stringPath(cardinalityBody, "physical");
+            assertTrue(
+                "the Lucene aggregate operator appears in the physical plan: " + cardinalityPhysical,
+                cardinalityPhysical.contains("LuceneAggregateExec(")
+            );
+            assertFalse("nothing is pushed into the scan: " + cardinalityPhysical, cardinalityPhysical.contains("pushed=[["));
+
             // A page mixing the score order with a column collation
             // stays on Lucene's collector, so the physical plan shows
             // the heap top-k operator.

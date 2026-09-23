@@ -53,6 +53,33 @@ public class PlannerConventionChoiceTests extends OpenSearchTestCase {
         assertTrue(((LanceTableScan) exec.getInput()).pushedOperations().isEmpty());
     }
 
+    public void testMetricOnlySumAnswersWithThePushedScan() throws IOException {
+        RelNode physical = plan("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}");
+        assertTrue("the pushed scan wins the cost comparison: " + physical, physical instanceof LanceTableScan);
+        assertTrue(((LanceTableScan) physical).pushedAggregate().isPresent());
+    }
+
+    public void testCardinalityAnswersWithTheLuceneOperator() throws IOException {
+        // The pushdown rule's operand rejects a tree with a cardinality
+        // metric (the pushed form is slower than the aggregator), so the
+        // Lucene operator is the only physical form.
+        RelNode physical = plan("{\"size\":0,\"aggs\":{\"c\":{\"cardinality\":{\"field\":\"category\"}}}}");
+        assertTrue("the Lucene operator answers the shape: " + physical, physical instanceof LuceneAggregateExec);
+        LuceneAggregateExec exec = (LuceneAggregateExec) physical;
+        assertTrue("the operator runs over the bare scan", exec.getInput() instanceof LanceTableScan);
+        assertTrue(((LanceTableScan) exec.getInput()).pushedOperations().isEmpty());
+    }
+
+    public void testBucketTreeWithACardinalityChildAnswersWithTheLuceneOperator() throws IOException {
+        // One cardinality anywhere in the tree keeps the whole tree on
+        // the aggregators: the executor has no way to split one request
+        // between the pushed scan and the aggregator machinery.
+        RelNode physical = plan(
+            "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"rating\"}}}}}}"
+        );
+        assertTrue("the Lucene operator answers the shape: " + physical, physical instanceof LuceneAggregateExec);
+    }
+
     public void testFoldableHitsPageAnswersWithTheLanceScan() throws IOException {
         RelNode physical = plan("{\"size\":3,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"sort\":[\"_score\"]}");
         assertTrue("the pushed scan wins the cost comparison: " + physical, physical instanceof LanceTableScan);

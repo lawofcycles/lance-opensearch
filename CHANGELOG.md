@@ -62,6 +62,7 @@ Inspired by [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `cardinality` aggregations run through the aggregator path by default: the planner's pushdown rule no longer folds a tree carrying one into the Lance scan, because the pushed implementation (feeding the field's distinct values into the HyperLogLog++ sketch one by one) is 3.6x to 46x slower than the aggregators on large tables. The cardinality result is identical. (#208)
 - `storage_options` values of registered namespaces follow the same redaction rule as `config`: in the cluster state API (`GET _cluster/state/metadata`, custom `lance.namespaces`) and in log lines, values whose key contains `secret`, `password`, `token`, `key`, `authorization` or `credential` render as `***`. Only the gateway-persisted state keeps the raw values so a full cluster restart reopens the tables with working credentials. Previously the raw object store credentials passed at registration were readable by any caller with `cluster:monitor/state`.
 - A plain sorted page (`sort` without aggregations) on a dotted field name no longer answers 400. The sort pushdown's column resolution used Arrow's `Schema.findField`, which throws for any non-top-level name instead of returning null, so a sort on a multi-field sub-field (`body.raw`) never reached its base-column fallback and a sort on a struct child (`meta.score`) could not fall back to the Lucene collector.
 

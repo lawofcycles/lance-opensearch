@@ -823,16 +823,20 @@ public class LanceAggregationIT extends LanceRestTestCase {
     }
 
     /**
-     * The sketch metrics through the pushdown against the aggregators:
-     * {@code cardinality} built from the distinct values Lance returns,
-     * {@code percentiles} / {@code percentile_ranks} from a bin
-     * histogram. The values are compared with the setting off within the
-     * tolerance the two constructions allow (a relative 1 % for the
-     * count; 3 % of the value range for a percentile, 3 points for a
-     * rank, the tolerance two tdigests of the same data get elsewhere in
-     * this class), and with {@code pushdown_parallelism} 1 the
-     * percentiles requests have to take two scans per executor (the
-     * bounds, then the bins) while cardinality takes one.
+     * The sketch metrics against the aggregators: {@code percentiles} /
+     * {@code percentile_ranks} take the pushdown and build their
+     * tdigest from a bin histogram, while any tree carrying a
+     * {@code cardinality} runs through the aggregators (the planner
+     * refuses to push it because the pushed form is slower), with the
+     * pushdown setting on and off alike. The values are compared with
+     * the setting off within the tolerance the two constructions allow
+     * (a relative 1 % for the count; 3 % of the value range for a
+     * percentile, 3 points for a rank, the tolerance two tdigests of
+     * the same data get elsewhere in this class). With
+     * {@code pushdown_parallelism} 1 the percentiles request takes
+     * three scans per executor (the bounds, then one bin scan per
+     * sketch metric), and the cardinality requests leave no pushdown
+     * line at all.
      */
     @SuppressWarnings("unchecked")
     public void testSubstraitPushdownSketchesAgreeWithTheAggregators() throws Exception {
@@ -857,22 +861,26 @@ public class LanceAggregationIT extends LanceRestTestCase {
             );
             client().performRequest(debug);
             try {
-                long oneScanBefore = pushdownLogLines(index, "in 1 scans");
-                long twoScansBefore = pushdownLogLines(index, "in 2 scans");
+                long allScansBefore = pushdownLogLines(index);
                 long threeScansBefore = pushdownLogLines(index, "in 3 scans");
                 Map<String, Object> counted = parse(readAll(postJson("/" + index + "/_search", cardinality)));
                 Map<String, Object> flagsCounted = parse(readAll(postJson("/" + index + "/_search", perCategoryFlags)));
                 Map<String, Object> sketched = parse(readAll(postJson("/" + index + "/_search", percentiles)));
                 Map<String, Object> perCategory = parse(readAll(postJson("/" + index + "/_search", nested)));
-                assertBusy(() -> {
-                    assertEquals(
-                        "the two cardinality requests are one scan each",
-                        oneScanBefore + 2,
-                        pushdownLogLines(index, "in 1 scans")
-                    );
-                    assertEquals("one percentiles metric adds one bin scan", twoScansBefore + 1, pushdownLogLines(index, "in 2 scans"));
-                    assertEquals("two percentiles metrics add two bin scans", threeScansBefore + 1, pushdownLogLines(index, "in 3 scans"));
-                });
+                assertBusy(
+                    () -> {
+                        assertEquals(
+                            "two percentiles metrics add two bin scans",
+                            threeScansBefore + 1,
+                            pushdownLogLines(index, "in 3 scans")
+                        );
+                    }
+                );
+                assertEquals(
+                    "the three requests carrying a cardinality leave no pushdown line",
+                    allScansBefore + 1,
+                    pushdownLogLines(index)
+                );
 
                 Request disable = new Request("PUT", "/_cluster/settings");
                 disable.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":false}}");
