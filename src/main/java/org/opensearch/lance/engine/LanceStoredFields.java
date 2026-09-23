@@ -78,7 +78,9 @@ final class LanceStoredFields extends StoredFields {
     private final LanceFragmentLeafReader leaf;
     private final Dataset dataset;
     private final int fragmentId;
-    /** Column kind in schema order, shared with the leaf; see {@link LanceFragmentSchema#columnKind}. */
+    // Column kind in schema order, from the shared schema. Preserves schema
+    // order so materialiseStoredFields emits _source keys in schema order
+    // regardless of which columns have been loaded so far.
     private final Map<String, ColumnKind> columnKind;
     /**
      * Top-level {@code List<Struct>} column names with at least one

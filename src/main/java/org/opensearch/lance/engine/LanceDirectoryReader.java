@@ -354,7 +354,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
      * {@link #openForFragments(Directory, IndexCommit, Dataset, String,
      * LancePrimaryKeyType, LanceOverrides, List)}, plus a Lance SQL predicate the caller
      * wants attached to every per-column Lance scan the resulting
-     * leaves issue. See {@link LanceFragmentLeafReader#filterSql} for
+     * leaves issue. See {@link LanceColumnLoader#filterSql} for
      * the rationale and semantics; {@code filterSql} is nullable and
      * absent by default so existing callers (whole-table {@code open}
      * used by the shard engine, tests that build a reader without

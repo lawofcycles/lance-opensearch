@@ -66,6 +66,18 @@ import org.opensearch.lance.engine.LanceFragmentSchema.ColumnKind;
  * {@link ColumnStore} through entries another request may have loaded
  * ({@link CachedColumn}, {@link CachedKeywordColumn},
  * {@link CachedKeywordArrayColumn}).
+ *
+ * <p>The class itself owns the {@link LeafReader} contract, the fragment
+ * identity and the doc id to row mapping over the {@link NestedDocLayout},
+ * the hint entry point {@link #hintMatchedOffsets}, and the wiring of
+ * the per leaf collaborators it delegates to: {@link LanceColumnLoader}
+ * (column loads, hint and sparse state, shard cache sinks),
+ * {@link LanceDocValues} (hinted numeric, keyword and geo_point doc
+ * values), {@link NestedDocValues} ({@code _primary_term},
+ * {@code _nested_path} and nested child fields),
+ * {@link GeoPointPointValues} (the points side of geo_point),
+ * {@link LanceStoredFields} ({@code _id} / {@code _source}) and
+ * {@link LeafCacheBridge} (the {@code CacheHelper} lifetime).
  */
 public final class LanceFragmentLeafReader extends LeafReader {
 
@@ -131,9 +143,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
     private final LanceDocValues docValues;
     /** Hinted hit set ratio above which the doc values load the whole column; see {@link LanceColumnLoader#SPARSE_RATIO}. */
     static final double SPARSE_RATIO = LanceColumnLoader.SPARSE_RATIO;
-    // Column kind in schema order, from the shared schema. Preserves schema
-    // order so materialiseStoredFields emits _source keys in schema order
-    // regardless of which columns have been loaded so far.
+    /** Column kind by name, from the shared schema; the doc values and points overrides dispatch on it. */
     private final Map<String, ColumnKind> columnKind;
     /**
      * Bridge to Lucene's cache lifecycle: the lazily built one-doc
