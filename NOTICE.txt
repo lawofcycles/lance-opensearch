@@ -1,2 +1,40 @@
 OpenSearch Lance Plugin
 Copyright OpenSearch Contributors
+
+This product includes software developed by
+The Lance Authors (https://github.com/lancedb/lance):
+Lance, Lance Namespace and Lance Namespace Implementations.
+
+This product includes software developed by
+The Apache Software Foundation (http://www.apache.org/):
+Apache Arrow, Apache Calcite, Apache Calcite Avatica, Apache Commons Codec,
+Apache HttpClient and Apache HttpComponents Core.
+
+This product includes software developed by
+Amazon.com, Inc. or its affiliates (https://aws.amazon.com/):
+AWS SDK for Java 2.0 and AWS Event Stream.
+
+This product includes software developed by
+Google Inc. (https://github.com/google): Guava and FlatBuffers.
+
+This product includes software developed by
+FasterXML, LLC (https://github.com/FasterXML): Jackson.
+
+This product includes software developed at
+the Substrait project (https://substrait.io/): Substrait Java.
+
+This product includes software developed by
+Arno Unkrig and TIBCO Software Inc. (https://janino-compiler.github.io/janino/):
+Janino, under the BSD 3-Clause License.
+
+This product includes software developed by
+Jayway (https://github.com/json-path/JsonPath): Jayway JsonPath.
+
+This product includes software developed by
+QuestDB Ltd (https://github.com/questdb/jar-jni): QuestDB Jar-Jni.
+
+This product includes software developed by
+QOS.ch Sarl (https://www.slf4j.org/): SLF4J API, under the MIT license.
+
+The license and notice files of each bundled dependency are under licenses/
+and are appended to this file in the distribution.
