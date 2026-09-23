@@ -30,6 +30,7 @@ import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
 import org.opensearch.lance.plan.explain.LanceExplainAction;
 import org.opensearch.lance.plan.explain.LanceExplainRequest;
+import org.opensearch.lance.plan.explain.LanceExplainResponse;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
 import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.plugins.Plugin;
@@ -39,6 +40,7 @@ import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.search.sort.SortOrder;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
+import org.opensearch.test.junit.annotations.TestLogging;
 
 /**
  * The coordinator's side of planning against a live node: the
@@ -113,12 +115,16 @@ public class CoordinatorPlanningTests extends OpenSearchSingleNodeTestCase {
     }
 
     /**
-     * The physical plan the explain endpoint prints and the plan the
-     * coordinator ships agree, shape by shape: a pushed aggregate, a
-     * pushed sorted page and a fused filtered knn print on the explain
-     * scan and arrive at the executor as the same pushed operation, and
-     * executing the shipped plan on this node applies no downgrade.
+     * The plan the explain endpoint prints and the plan the coordinator
+     * ships agree, shape by shape: a pushed aggregate, a pushed sorted
+     * page and a fused filtered knn print on the explain scan under the
+     * coordinator's merge and fan out, the {@code fragment_plan} of the
+     * answer equals the plan the executor receives, and executing the
+     * shipped plan on this node applies no downgrade. The executor's
+     * {@code lance.plan} debug line is raised for the run so the log
+     * shows the data node's plan next to the explain answer.
      */
+    @TestLogging(value = "org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction:DEBUG", reason = "pair the explain answer with the executor's lance.plan line")
     public void testExplainPlanAndShippedPlanAgree() throws Exception {
         String indexName = "coordinator-explain-agree";
         String tableUri = attach(indexName, 3, 100);
@@ -131,7 +137,8 @@ public class CoordinatorPlanningTests extends OpenSearchSingleNodeTestCase {
         // with the filter's SQL, the shipped plan the same aggregate.
         SearchSourceBuilder aggregation = new SearchSourceBuilder().size(0).query(new RangeQueryBuilder("rating").gte(500));
         aggregation.aggregation(AggregationBuilders.terms("c").field("category"));
-        String aggregationPhysical = explain(indexName, aggregation);
+        LanceExplainResponse aggregationExplain = explain(indexName, aggregation);
+        String aggregationPhysical = aggregationExplain.physical();
         LanceFragmentQueryRequest aggregationRequest = FragmentRequests.planned(
             clusterService,
             warmCache,
@@ -143,8 +150,19 @@ public class CoordinatorPlanningTests extends OpenSearchSingleNodeTestCase {
             aggregation.aggregations(),
             List.of()
         );
-        logger.info("filter + terms explain physical:\n{}\nshipped plan: {}", aggregationPhysical, aggregationRequest.plan());
-        assertTrue(aggregationPhysical, aggregationPhysical.startsWith("LanceTableScan("));
+        logger.info(
+            "filter + terms explain physical:\n{}explain fragment_plan: {}\nshipped plan: {}",
+            aggregationPhysical,
+            aggregationExplain.fragmentPlan(),
+            aggregationRequest.plan()
+        );
+        assertTrue(aggregationPhysical, aggregationPhysical.startsWith("MergeExec(reduce=[AGGREGATE_INTERNAL])"));
+        assertTrue(aggregationPhysical, aggregationPhysical.contains("FanOutExec(fanOut=[1]"));
+        assertTrue(aggregationPhysical, aggregationPhysical.contains("LanceTableScan("));
+        assertEquals(LanceExplainResponse.Route.FRAGMENT, aggregationExplain.route());
+        assertEquals(aggregationRequest.plan(), aggregationExplain.fragmentPlan());
+        assertNull(aggregationExplain.unplanned());
+        assertEquals(List.of(), aggregationExplain.refinementsPossible());
         assertTrue(aggregationPhysical, aggregationPhysical.contains("aggregate{groups=1"));
         assertTrue(aggregationPhysical, aggregationPhysical.contains("filter=rating >= 500"));
         assertEquals(FragmentPlan.Kind.PUSHED_SCAN, aggregationRequest.plan().kind());
@@ -158,7 +176,8 @@ public class CoordinatorPlanningTests extends OpenSearchSingleNodeTestCase {
         SearchSourceBuilder page = new SearchSourceBuilder().size(5)
             .query(new RangeQueryBuilder("rating").gte(500))
             .sort(new FieldSortBuilder("rating").order(SortOrder.DESC));
-        String pagePhysical = explain(indexName, page);
+        LanceExplainResponse pageExplain = explain(indexName, page);
+        String pagePhysical = pageExplain.physical();
         LanceFragmentQueryRequest pageRequest = FragmentRequests.planned(
             clusterService,
             warmCache,
@@ -170,8 +189,16 @@ public class CoordinatorPlanningTests extends OpenSearchSingleNodeTestCase {
             null,
             List.of()
         );
-        logger.info("sorted page explain physical:\n{}\nshipped plan: {}", pagePhysical, pageRequest.plan());
-        assertTrue(pagePhysical, pagePhysical.startsWith("LanceTableScan("));
+        logger.info(
+            "sorted page explain physical:\n{}explain fragment_plan: {}\nshipped plan: {}",
+            pagePhysical,
+            pageExplain.fragmentPlan(),
+            pageRequest.plan()
+        );
+        assertTrue(pagePhysical, pagePhysical.startsWith("MergeExec(reduce=[HITS_TOP_K])"));
+        assertTrue(pagePhysical, pagePhysical.contains("LanceTableScan("));
+        assertEquals(pageRequest.plan(), pageExplain.fragmentPlan());
+        assertEquals(List.of(), pageExplain.refinementsPossible());
         assertTrue(pagePhysical, pagePhysical.contains("topk{collations=["));
         assertTrue(pagePhysical, pagePhysical.contains("fetch=5"));
         assertEquals(FragmentPlan.Kind.PUSHED_SCAN, pageRequest.plan().kind());
@@ -186,7 +213,8 @@ public class CoordinatorPlanningTests extends OpenSearchSingleNodeTestCase {
         vector[0] = 1f;
         SearchSourceBuilder knn = new SearchSourceBuilder().size(3)
             .query(new LanceKnnQueryBuilder("embedding", vector, 3).filter(new RangeQueryBuilder("rating").gte(500)));
-        String knnPhysical = explain(indexName, knn);
+        LanceExplainResponse knnExplain = explain(indexName, knn);
+        String knnPhysical = knnExplain.physical();
         LanceFragmentQueryRequest knnRequest = FragmentRequests.planned(
             clusterService,
             warmCache,
@@ -198,8 +226,15 @@ public class CoordinatorPlanningTests extends OpenSearchSingleNodeTestCase {
             null,
             List.of()
         );
-        logger.info("knn + filter explain physical:\n{}\nshipped plan: {}", knnPhysical, knnRequest.plan());
-        assertTrue(knnPhysical, knnPhysical.startsWith("LanceTableScan("));
+        logger.info(
+            "knn + filter explain physical:\n{}explain fragment_plan: {}\nshipped plan: {}",
+            knnPhysical,
+            knnExplain.fragmentPlan(),
+            knnRequest.plan()
+        );
+        assertTrue(knnPhysical, knnPhysical.startsWith("MergeExec(reduce=[HITS_TOP_K])"));
+        assertTrue(knnPhysical, knnPhysical.contains("LanceTableScan("));
+        assertEquals(knnRequest.plan(), knnExplain.fragmentPlan());
         assertTrue(knnPhysical, knnPhysical.contains("knn{"));
         assertTrue(knnPhysical, knnPhysical.contains("filter=rating >= 500"));
         assertEquals(FragmentPlan.Kind.PUSHED_SCAN, knnRequest.plan().kind());
@@ -211,8 +246,8 @@ public class CoordinatorPlanningTests extends OpenSearchSingleNodeTestCase {
         assertEquals("no downgrade on a node without a reader wrapper", before, FragmentPlanRefiner.refinementCounts());
     }
 
-    private String explain(String indexName, SearchSourceBuilder source) {
-        return client().execute(LanceExplainAction.INSTANCE, new LanceExplainRequest(indexName, source)).actionGet().physical();
+    private LanceExplainResponse explain(String indexName, SearchSourceBuilder source) {
+        return client().execute(LanceExplainAction.INSTANCE, new LanceExplainRequest(indexName, source)).actionGet();
     }
 
     public void testEmptyTableWithAggregationsAnswersTheAggregationsBlock() throws Exception {

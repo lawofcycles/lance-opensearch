@@ -12,6 +12,8 @@ import org.lance.ipc.ColumnOrdering;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
+import org.opensearch.core.xcontent.ToXContentObject;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.execute.LanceAggregateResults;
 import org.opensearch.lance.plan.lancesql.RexToLanceSql;
@@ -63,7 +65,7 @@ import java.util.Optional;
  * <p>The wire format is internal to the plugin and assumes every node
  * runs the same plugin version; there is no version negotiation.
  */
-public final class FragmentPlan implements Writeable {
+public final class FragmentPlan implements Writeable, ToXContentObject {
 
     /** Which physical root the plan came from, and so how the envelope executes. */
     public enum Kind {
@@ -577,5 +579,59 @@ public final class FragmentPlan implements Writeable {
             sb.append(' ').append(aggregate);
         }
         return sb.toString();
+    }
+
+    /**
+     * The same parts {@link #toString} names, as JSON for the explain
+     * endpoint: {@code kind}, then {@code filter_sql}, {@code lance_clause}
+     * (the clause's query name), {@code top_k} ({@code orderings} with
+     * {@code column} / {@code ascending} / {@code nulls_first},
+     * {@code fetch}, {@code cursor_sql}) and {@code aggregate}
+     * ({@code group_count}, {@code metrics} with {@code name} /
+     * {@code kind}, {@code substrait_bytes}), each present only when set.
+     * The Substrait bytes themselves are not rendered, only their length.
+     */
+    @Override
+    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+        builder.startObject();
+        builder.field("kind", kind.name());
+        if (filterSql != null) {
+            builder.field("filter_sql", filterSql);
+        }
+        if (lanceClause != null) {
+            builder.field("lance_clause", lanceClause.getWriteableName());
+        }
+        if (topK != null) {
+            builder.startObject("top_k");
+            builder.startArray("orderings");
+            for (ScanOrdering ordering : topK.orderings()) {
+                builder.startObject();
+                builder.field("column", ordering.column());
+                builder.field("ascending", ordering.ascending());
+                builder.field("nulls_first", ordering.nullsFirst());
+                builder.endObject();
+            }
+            builder.endArray();
+            builder.field("fetch", topK.fetch());
+            if (topK.cursorSql() != null) {
+                builder.field("cursor_sql", topK.cursorSql());
+            }
+            builder.endObject();
+        }
+        if (aggregate != null) {
+            builder.startObject("aggregate");
+            builder.field("group_count", aggregate.groupCount());
+            builder.startArray("metrics");
+            for (MetricSlot slot : aggregate.metrics()) {
+                builder.startObject();
+                builder.field("name", slot.name());
+                builder.field("kind", slot.kind().name());
+                builder.endObject();
+            }
+            builder.endArray();
+            builder.field("substrait_bytes", aggregate.substrait.length);
+            builder.endObject();
+        }
+        return builder.endObject();
     }
 }
