@@ -1527,12 +1527,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             );
             String danglingPath =
                 "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"}},\"ab\":{\"avg_bucket\":{\"buckets_path\":\"nosuch>s\"}}}}";
-            assertSameRefusalAsShardPath(
-                index,
-                danglingPath,
-                400,
-                "buckets_path aggregation does not exist for aggregation [ab]: nosuch>s"
-            );
+            assertSameRefusalAsShardPath(index, danglingPath, 400, "No aggregation found for path [nosuch>s]");
             assertEquals("the validation refusals left no fan-out line", fanOutBefore + requests, fanOutLogLines(index));
             // A script that does not compile fails the reduce on the
             // coordinator on both paths: the status is the script
