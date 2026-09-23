@@ -78,6 +78,7 @@ Inspired by [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Documentation
 
+- `docs/architecture.md` gives developers a map of the codebase: the directory layout, the request flows from REST to the Lance native scan (aggregation, hits, attach, namespace poll), the Calcite planner's conventions, rel types and rule pattern, extension points, the testing structure, and how to place a PR on the map.
 - The getting-started walkthrough's "Prepare a Lance table" step gains Option C: a Python script that writes the sample table straight to an S3 bucket with explicit `storage_options` credentials, wired to the existing `storage_options` attach path in step 4. Both the new S3 flow and the existing local flow are verified end to end against the walkthrough text.
 - Clarify in docs that the reader route already uses Lance's DataFusion-backed SIMD aggregation and Zone Map / BTree / Bitmap pruning; the analytics route adds a cross-plugin shared runtime, PPL / SQL entry points and richer aggregation trees, not those two capabilities.
 - README trimmed to overview, status, build, and pointers into `docs/`. Feature reference lives in `docs/features.md`, known limitations in `docs/limitations.md`, and the walkthrough in `docs/getting-started.md`.
