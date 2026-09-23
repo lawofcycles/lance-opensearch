@@ -524,6 +524,20 @@ final class AggregateSpecResolver {
      * terms order the top-k selection cannot honour), in which case the
      * request stays on the Lucene aggregators.
      *
+     * <p>The group bound here is a node local guard, not a routing
+     * decision. The coordinator's planner already compared its own
+     * estimate, built from the table statistics (the distinct counts of
+     * the bitmap indexes, the date intervals, the range and filter
+     * counts) when every key has one, with the same
+     * {@code lance.aggregation.pushdown_max_groups} and priced the
+     * pushed form as infinite when it exceeded the bound; this estimate
+     * is built from the request shape instead ({@code shard_size} of
+     * every terms level, the range and filter counts) and protects the
+     * executor's group state when the two disagree or the statistics
+     * had nothing to say. A refusal here is
+     * counted as {@code plan.refinements.aggregate_resolution} and the
+     * request runs on the Lucene aggregators.
+     *
      * @param shape the pushed aggregate's group key count and metric
      *     slots, as the plan the coordinator shipped carries them
      * @param substrait the encoded main scan, a direct buffer
@@ -531,7 +545,9 @@ final class AggregateSpecResolver {
      * @param schema the dataset's Arrow schema
      * @param multiFields the index's keyword sub-field spec
      * @param qsc the mapping of the index the request targets
-     * @param maxGroups the bound on the estimated number of groups
+     * @param maxGroups the bound on the estimated number of groups,
+     *     {@code lance.aggregation.pushdown_max_groups} read from the
+     *     node settings
      */
     static ResolvedAggregate resolve(
         PushedShape shape,
