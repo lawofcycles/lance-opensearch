@@ -250,7 +250,7 @@ public class LanceTextAnalyzerBackfillTests extends OpenSearchTestCase {
             assertEquals("one AddColumns commit", versionBefore + 1, dataset.version());
             Set<Path> after = listTmpdir(tmpdir);
             after.removeAll(before);
-            assertTrue("the backfill must not write under java.io.tmpdir, found " + after, after.isEmpty());
+            assertTrue("the backfill must not write a file under java.io.tmpdir, found " + after, after.isEmpty());
             assertEquals(rows, dataset.countRows());
 
             // Every row's tokens are those of its own sentence.
@@ -423,13 +423,20 @@ public class LanceTextAnalyzerBackfillTests extends OpenSearchTestCase {
         return byId;
     }
 
+    /**
+     * The regular files directly under {@code tmpdir}, which is where a
+     * spool would appear. Other test JVMs of the same Gradle run share
+     * the directory: they create per suite directories and Lance
+     * extracts its native library there as {@code jnilib-*.tmp}, so
+     * directories and those files are left out.
+     */
     private static Set<Path> listTmpdir(Path tmpdir) throws IOException {
         if (!Files.isDirectory(tmpdir)) {
             return new HashSet<>();
         }
         try (Stream<Path> entries = Files.list(tmpdir)) {
             Set<Path> files = new HashSet<>();
-            entries.forEach(files::add);
+            entries.filter(Files::isRegularFile).filter(p -> !p.getFileName().toString().startsWith("jnilib-")).forEach(files::add);
             return files;
         }
     }

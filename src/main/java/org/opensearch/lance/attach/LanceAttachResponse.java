@@ -43,12 +43,13 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
     private final Backfill backfill;
 
     /**
-     * The {@code backfill} object of a {@code derive: async} attach:
-     * about how many bytes the derived tokens columns add to the table
-     * ({@code estimated_bytes}), where the backfill spools ({@code
-     * spool_path}, {@code "none"} because it streams into the table
-     * without a local spool), and how many threads tokenize
-     * ({@code threads}).
+     * The {@code backfill} object of a {@code derive: async} attach.
+     *
+     * @param estimatedBytes about how many bytes the derived tokens
+     *     columns add to the table
+     * @param spoolPath where the backfill spools; {@code "none"}
+     *     because it streams into the table without a local spool
+     * @param threads how many threads tokenize at once
      */
     public record Backfill(long estimatedBytes, String spoolPath, int threads) implements Writeable, ToXContentObject {
 
