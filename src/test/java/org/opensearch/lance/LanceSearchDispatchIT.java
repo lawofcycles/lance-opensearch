@@ -482,50 +482,15 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         }
     }
 
-    public void testStoredFieldsDocValueFieldsExplainFallThroughToShardPath() throws Exception {
-        // stored_fields, docvalue_fields and explain are not implemented
-        // by the fragment dispatch path; the dispatch filter sends those
-        // requests to the shard path, whose fetch phase handles them.
-        String suffix = "s3-storedfields-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
-        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
-        String tableName = "demo-" + suffix;
-        LanceTableFactory.writeTable(scratchDir, tableName, 4);
-        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
-        String indexName = tableName;
-        try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
-            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
-
-            String noneBody = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"stored_fields\":\"_none_\"}")
-            );
-            assertFalse("stored_fields:_none_ should suppress _source: " + noneBody, noneBody.contains("\"_source\""));
-
-            String docvalueBody = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"docvalue_fields\":[\"id\"]}")
-            );
-            assertTrue(
-                "docvalue_fields should populate hits.fields on the shard path: " + docvalueBody,
-                docvalueBody.contains("\"fields\":{\"id\"")
-            );
-
-            String explainBody = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"explain\":true}")
-            );
-            assertTrue("explain:true should add _explanation on the shard path: " + explainBody, explainBody.contains("\"_explanation\""));
-        } finally {
-            try {
-                client().performRequest(new Request("DELETE", "/" + indexName));
-            } catch (Exception ignored) {}
-        }
-    }
-
-    public void testMinScoreTerminateAfterFallThroughToShardPath() throws Exception {
-        // min_score and terminate_after are not implemented by the
-        // fragment dispatch path (it counts matches from Lance without
-        // those knobs); the dispatch filter sends those requests to
-        // the shard path.
-        String suffix = "s3-reject-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+    public void testMinScoreRunsOnTheFragmentPath() throws Exception {
+        // min_score is applied by the stock MinimumScoreCollector around
+        // the executor's hits, count and aggregation collectors, so the
+        // documents below the threshold are neither returned, counted
+        // nor aggregated. Every shape is compared with the shard path's
+        // answer (the same body with a global aggregation, which routes
+        // there) and the executed counter proves the fragment path
+        // served the plain body.
+        String suffix = "min-score-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -535,28 +500,173 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // Every match_all hit scores 1.0, so min_score above that
-            // excludes everything.
-            String minScoreBody = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"min_score\":2.0}")
-            );
-            assertEquals(0, extractIntPath(minScoreBody, "hits", "total", "value"));
+            // Every match_all hit scores 1.0: a threshold above it
+            // empties the page and the count, one below keeps both.
+            String above = "{\"size\":10,\"query\":{\"match_all\":{}},\"min_score\":2.0}";
+            long executedBefore = fragmentRequestsExecuted();
+            String aboveBody = readAll(postJson("/" + indexName + "/_search", above));
+            assertEquals("the fragment path served the request", executedBefore + 1, fragmentRequestsExecuted());
+            assertEquals(0, extractIntPath(aboveBody, "hits", "total", "value"));
+            assertEquals("eq", stringPath(aboveBody, "hits", "total", "relation"));
+            assertTrue("no hit reaches min_score 2.0: " + aboveBody, fullHitsOf(aboveBody).isEmpty());
+            assertSameHitsAsShardPath(indexName, above);
 
-            // The shard path signals terminate_after through
-            // terminated_early; hits.total keeps the pre-terminate count,
-            // so only the flag is asserted.
-            String terminateBody = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"terminate_after\":2}")
-            );
-            assertTrue(
-                "terminate_after should set terminated_early=true on the shard path: " + terminateBody,
-                terminateBody.contains("\"terminated_early\":true")
-            );
+            String below = "{\"size\":10,\"query\":{\"match_all\":{}},\"min_score\":0.5}";
+            String belowBody = readAll(postJson("/" + indexName + "/_search", below));
+            assertEquals(6, extractIntPath(belowBody, "hits", "total", "value"));
+            assertEquals(6, fullHitsOf(belowBody).size());
+            assertSameHitsAsShardPath(indexName, below);
+
+            // size 0 counts through the same collector.
+            String countOnly = "{\"size\":0,\"query\":{\"match_all\":{}},\"min_score\":2.0}";
+            assertEquals(0, extractIntPath(readAll(postJson("/" + indexName + "/_search", countOnly)), "hits", "total", "value"));
+            assertSameHitsAsShardPath(indexName, countOnly);
+
+            // A scalar filter planned as a Lance scan scores 1.0 too.
+            String term = "{\"size\":10,\"query\":{\"term\":{\"id\":2}},\"min_score\":0.5}";
+            String termBody = readAll(postJson("/" + indexName + "/_search", term));
+            assertEquals(1, extractIntPath(termBody, "hits", "total", "value"));
+            assertEquals(List.of("0-2"), idsOf(hitsOf(termBody)));
+            assertSameHitsAsShardPath(indexName, term);
+
+            // A pushed FTS query: the BM25 scores of the three "hello
+            // lance" rows are 0.7361701, so a low threshold keeps all
+            // three (counted through the collector, not the Lance scan)
+            // and a high one drops them.
+            String ftsLow = "{\"size\":10,\"query\":{\"match\":{\"body\":\"lance\"}},\"min_score\":0.01}";
+            String ftsLowBody = readAll(postJson("/" + indexName + "/_search", ftsLow));
+            assertEquals(3, extractIntPath(ftsLowBody, "hits", "total", "value"));
+            assertEquals(List.of("0-0", "0-2", "0-4"), idsOf(hitsOf(ftsLowBody)));
+            assertEquals(0.7361701d, extractDoublePath(ftsLowBody, "hits", "max_score"), 1e-6d);
+            assertSameHitsAsShardPath(indexName, ftsLow);
+
+            String ftsHigh = "{\"size\":10,\"query\":{\"match\":{\"body\":\"lance\"}},\"min_score\":100}";
+            String ftsHighBody = readAll(postJson("/" + indexName + "/_search", ftsHigh));
+            assertEquals(0, extractIntPath(ftsHighBody, "hits", "total", "value"));
+            assertTrue(fullHitsOf(ftsHighBody).isEmpty());
+            assertSameHitsAsShardPath(indexName, ftsHigh);
+
+            String ftsCount = "{\"size\":0,\"query\":{\"match\":{\"body\":\"lance\"}},\"min_score\":0.01}";
+            assertEquals(3, extractIntPath(readAll(postJson("/" + indexName + "/_search", ftsCount)), "hits", "total", "value"));
+            assertSameHitsAsShardPath(indexName, ftsCount);
+
+            // Aggregations see only the documents above the threshold.
+            String agg = "{\"size\":0,\"query\":{\"match_all\":{}},\"min_score\":2.0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+            String aggBody = readAll(postJson("/" + indexName + "/_search", agg));
+            assertEquals(0, extractIntPath(aggBody, "hits", "total", "value"));
+            assertEquals(0.0d, extractDoublePath(aggBody, "aggregations", "s", "value"), 0.0d);
+            assertSameHitsAsShardPath(indexName, agg);
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
         }
+    }
+
+    public void testTerminateAfterRunsOnTheFragmentPath() throws Exception {
+        // terminate_after stops the executor's collection after that
+        // many documents and the response says terminated_early, as the
+        // shard path does; without the knob the response carries no
+        // terminated_early at all. hits.total is what the collection
+        // counted: the documents collected for a page, and for size 0
+        // the count Lucene's TotalHitCountCollector answers, which for
+        // match_all is the leaf's document count before termination,
+        // exactly as on the shard path.
+        String suffix = "terminate-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            String plain = readAll(postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}}}"));
+            assertFalse("no terminate_after, no terminated_early: " + plain, plain.contains("terminated_early"));
+
+            String countOnly = "{\"size\":0,\"query\":{\"match_all\":{}},\"terminate_after\":2}";
+            long executedBefore = fragmentRequestsExecuted();
+            String countOnlyBody = readAll(postJson("/" + indexName + "/_search", countOnly));
+            assertEquals("the fragment path served the request", executedBefore + 1, fragmentRequestsExecuted());
+            assertTrue("terminated_early: " + countOnlyBody, countOnlyBody.contains("\"terminated_early\":true"));
+            assertEquals(6, extractIntPath(countOnlyBody, "hits", "total", "value"));
+            assertSameHitsAsShardPath(indexName, countOnly);
+
+            String page = "{\"size\":10,\"query\":{\"match_all\":{}},\"terminate_after\":2}";
+            String pageBody = readAll(postJson("/" + indexName + "/_search", page));
+            assertTrue("terminated_early: " + pageBody, pageBody.contains("\"terminated_early\":true"));
+            assertEquals(2, extractIntPath(pageBody, "hits", "total", "value"));
+            assertEquals("eq", stringPath(pageBody, "hits", "total", "relation"));
+            assertEquals(List.of("0-0", "0-1"), idsOf(hitsOf(pageBody)));
+            assertSameHitsAsShardPath(indexName, page);
+
+            String smallPage = "{\"size\":1,\"query\":{\"match_all\":{}},\"terminate_after\":2}";
+            String smallPageBody = readAll(postJson("/" + indexName + "/_search", smallPage));
+            assertEquals(2, extractIntPath(smallPageBody, "hits", "total", "value"));
+            assertEquals(List.of("0-0"), idsOf(hitsOf(smallPageBody)));
+            assertSameHitsAsShardPath(indexName, smallPage);
+
+            String accurate = "{\"size\":0,\"query\":{\"match_all\":{}},\"terminate_after\":2,\"track_total_hits\":true}";
+            String accurateBody = readAll(postJson("/" + indexName + "/_search", accurate));
+            assertTrue(accurateBody.contains("\"terminated_early\":true"));
+            assertEquals(6, extractIntPath(accurateBody, "hits", "total", "value"));
+            assertSameHitsAsShardPath(indexName, accurate);
+
+            String notReached = "{\"size\":0,\"query\":{\"match_all\":{}},\"terminate_after\":20}";
+            String notReachedBody = readAll(postJson("/" + indexName + "/_search", notReached));
+            assertTrue("bound above the row count: " + notReachedBody, notReachedBody.contains("\"terminated_early\":false"));
+            assertEquals(6, extractIntPath(notReachedBody, "hits", "total", "value"));
+            assertSameHitsAsShardPath(indexName, notReached);
+
+            // A pushed FTS query stops after two of its three hits.
+            String fts = "{\"size\":10,\"query\":{\"match\":{\"body\":\"lance\"}},\"terminate_after\":2}";
+            String ftsBody = readAll(postJson("/" + indexName + "/_search", fts));
+            assertTrue(ftsBody.contains("\"terminated_early\":true"));
+            assertEquals(2, extractIntPath(ftsBody, "hits", "total", "value"));
+            assertEquals(List.of("0-0", "0-2"), idsOf(hitsOf(ftsBody)));
+            assertSameHitsAsShardPath(indexName, fts);
+
+            // The aggregators see the two documents collected before the
+            // bound: ids 0 and 1 sum to 1.
+            String agg = "{\"size\":0,\"query\":{\"match_all\":{}},\"terminate_after\":2,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+            String aggBody = readAll(postJson("/" + indexName + "/_search", agg));
+            assertTrue(aggBody.contains("\"terminated_early\":true"));
+            assertEquals(6, extractIntPath(aggBody, "hits", "total", "value"));
+            assertEquals(1.0d, extractDoublePath(aggBody, "aggregations", "s", "value"), 0.0d);
+            assertSameHitsAsShardPath(indexName, agg);
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Assert that {@code body} answers the same {@code hits} (total,
+     * max_score and every rendered hit key), the same
+     * {@code terminated_early} and the same {@code aggregations} (the
+     * oracle's own key aside) on the fragment path as on the shard
+     * path, which the same body with the global aggregation of
+     * {@link #onShardPath} routes to.
+     */
+    private static void assertSameHitsAsShardPath(String indexName, String body) throws IOException {
+        String fragmentBody = readAll(postJson("/" + indexName + "/_search", body));
+        String shardBody = readAll(postJson("/" + indexName + "/_search", onShardPath(body)));
+        Map<String, Object> fragmentPath = parseJson(fragmentBody);
+        Map<String, Object> shardPath = parseJson(shardBody);
+        Map<String, Object> fragmentHits = new java.util.LinkedHashMap<>(hitsBlock(fragmentPath));
+        Map<String, Object> shardHits = new java.util.LinkedHashMap<>(hitsBlock(shardPath));
+        fragmentHits.put("hits", fullHitsOf(fragmentBody));
+        shardHits.put("hits", fullHitsOf(shardBody));
+        assertEquals(body, shardHits, fragmentHits);
+        assertEquals(body, shardPath.get("terminated_early"), fragmentPath.get("terminated_early"));
+        assertEquals(body, withoutShardPathOracle(shardPath.get("aggregations")), fragmentPath.get("aggregations"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> hitsBlock(Map<String, Object> response) {
+        return (Map<String, Object>) response.get("hits");
     }
 
     public void testTrackTotalHitsAndCountRunOnFragmentPath() throws Exception {
@@ -1161,11 +1271,12 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             String pkCount = readAll(client().performRequest(new Request("GET", "/" + pkTable + "/_count")));
             assertEquals(12, extractIntPath(pkCount, "count"));
 
-            // A shape only the shard path serves would see the shard
-            // reader's rows; it is refused with 400 naming both counts.
+            // A shape only the shard path serves (a global aggregation)
+            // would see the shard reader's rows; it is refused with 400
+            // naming both counts.
             ResponseException refused = expectThrows(
                 ResponseException.class,
-                () -> postJson("/" + pkTable + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"explain\":true}")
+                () -> postJson("/" + pkTable + "/_search", onShardPath("{\"size\":1,\"query\":{\"match_all\":{}}}"))
             );
             assertEquals(400, refused.getResponse().getStatusLine().getStatusCode());
             String refusedBody = readAll(refused.getResponse());
@@ -1191,8 +1302,8 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals(List.of("119=1", "118=1", "117=1"), bucketsOf(readAll(postJson("/" + tableName + "/_search", terms)), "t"));
             assertEquals(List.of("2-17", "2-18", "2-16"), idsOf(hitsOf(readAll(postJson("/" + tableName + "/_search", knn)))));
             // The shard path is open again for a table under the default bound.
-            String explained = readAll(postJson("/" + pkTable + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"explain\":true}"));
-            assertTrue(explained, explained.contains("\"_explanation\""));
+            String viaShard = readAll(postJson("/" + pkTable + "/_search", onShardPath("{\"size\":1,\"query\":{\"match_all\":{}}}")));
+            assertTrue(viaShard, viaShard.contains("\"" + SHARD_PATH_ORACLE + "\""));
         } finally {
             updateClusterSetting("lance.test.max_docs_per_reader", null);
             for (String index : List.of(tableName, pkTable)) {

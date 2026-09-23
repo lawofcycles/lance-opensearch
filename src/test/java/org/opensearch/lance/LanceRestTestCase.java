@@ -267,6 +267,113 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
         }
     }
 
+    /**
+     * Name of the aggregation {@link #onShardPath} adds to a search
+     * body. Tests comparing an {@code aggregations} block between the two
+     * paths drop this key from the shard path's block first.
+     */
+    static final String SHARD_PATH_ORACLE = "shard_path_oracle";
+
+    /**
+     * {@code body} (a complete {@code _search} JSON body) with a
+     * {@code global} aggregation added under {@link #SHARD_PATH_ORACLE}.
+     * {@code global} is off the fragment path's aggregation allow list,
+     * so the dispatch filter hands the request to the shard path: the
+     * oracle the fragment path tests compare against. The added
+     * aggregation changes nothing about the hits, the count or the
+     * other aggregations; its own result is the extra key.
+     */
+    @SuppressWarnings("unchecked")
+    static String onShardPath(String body) {
+        Map<String, Object> map = new java.util.LinkedHashMap<>(parseJson(body));
+        String aggsKey = map.containsKey("aggregations") ? "aggregations" : "aggs";
+        Map<String, Object> aggs = new java.util.LinkedHashMap<>();
+        if (map.get(aggsKey) instanceof Map<?, ?> existing) {
+            aggs.putAll((Map<String, Object>) existing);
+        }
+        aggs.put(SHARD_PATH_ORACLE, Map.of("global", Map.of()));
+        map.put(aggsKey, aggs);
+        try (org.opensearch.core.xcontent.XContentBuilder builder = MediaTypeRegistry.JSON.contentBuilder()) {
+            builder.map(map);
+            return builder.toString();
+        } catch (IOException e) {
+            throw new AssertionError("could not rebuild JSON: " + body, e);
+        }
+    }
+
+    /**
+     * {@code aggregations} without the {@link #SHARD_PATH_ORACLE} key, for
+     * comparing the two paths' blocks; {@code null} when nothing else is
+     * left, as a response without aggregations has no block at all.
+     */
+    @SuppressWarnings("unchecked")
+    static Map<String, Object> withoutShardPathOracle(Object aggregations) {
+        if (!(aggregations instanceof Map<?, ?> map)) {
+            return null;
+        }
+        Map<String, Object> copy = new java.util.LinkedHashMap<>((Map<String, Object>) map);
+        copy.remove(SHARD_PATH_ORACLE);
+        return copy.isEmpty() ? null : copy;
+    }
+
+    /**
+     * How many fragment requests the data nodes have executed so far:
+     * the sum over the nodes of {@code plan.executed} (both the Lance
+     * scan and the Lucene counters) in {@code GET /_lance/stats}. A
+     * request served by the fragment path advances it by one per
+     * executor; a request the shard path served leaves it unchanged.
+     */
+    @SuppressWarnings("unchecked")
+    static long fragmentRequestsExecuted() throws IOException {
+        Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
+        long total = 0L;
+        for (Object node : nodes.values()) {
+            Map<String, Object> plan = (Map<String, Object>) ((Map<String, Object>) node).get("plan");
+            Map<String, Object> executed = (Map<String, Object>) plan.get("executed");
+            for (Object count : executed.values()) {
+                total += ((Number) count).longValue();
+            }
+        }
+        return total;
+    }
+
+    /**
+     * The hits of {@code searchBody} with every rendered key ({@code _score}
+     * included) except {@code _shard} and {@code _node}, which
+     * {@code explain: true} adds and which name the node that rendered
+     * the hit (the coordinating node on the fragment path, the data
+     * node on the shard path).
+     */
+    @SuppressWarnings("unchecked")
+    static List<Map<String, Object>> fullHitsOf(String searchBody) {
+        Map<String, Object> map = parseJson(searchBody);
+        List<Object> hits = (List<Object>) ((Map<String, Object>) map.get("hits")).get("hits");
+        List<Map<String, Object>> out = new ArrayList<>(hits.size());
+        for (Object hit : hits) {
+            Map<String, Object> copy = new java.util.LinkedHashMap<>((Map<String, Object>) hit);
+            copy.remove("_shard");
+            copy.remove("_node");
+            out.add(copy);
+        }
+        return out;
+    }
+
+    /** The {@code hits.total} object of {@code searchBody}, or null when the response has none. */
+    @SuppressWarnings("unchecked")
+    static Map<String, Object> totalOf(String searchBody) {
+        return (Map<String, Object>) ((Map<String, Object>) parseJson(searchBody).get("hits")).get("total");
+    }
+
+    /** Status code and body of a {@code POST} whose status may be an error. */
+    static ConcurrentResult postForStatus(String path, String body) throws IOException {
+        try {
+            return toResult(postJson(path, body));
+        } catch (ResponseException e) {
+            return toResult(e.getResponse());
+        }
+    }
+
     static double extractDoublePath(String json, String... path) {
         try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
             Object value = parser.map();

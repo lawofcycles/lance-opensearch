@@ -850,8 +850,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     /**
      * Every FTS shape answered by executors that hold a proper subset
      * of the fragments must equal the answer over the whole table. The
-     * oracle is the shard path: {@code "explain": true} routes the same
-     * request to the one shard, whose reader holds every fragment, so
+     * oracle is the shard path: a {@code global} aggregation routes the
+     * same request to the one shard, whose reader holds every fragment, so
      * its Lance scan runs unrestricted on one node. Compared per shape:
      * hit ids and order, scores, sort values, {@code hits.total},
      * and terms buckets. The interleaved fixture gives every row a
@@ -966,8 +966,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     /**
      * Hits with equal scores or equal sort values come back in the same
      * order from three executors as from one reader over the whole
-     * table. The oracle is again the shard path ({@code "explain":
-     * true}), whose Lucene collectors break ties by doc id, which on the
+     * table. The oracle is again the shard path (a {@code global}
+     * aggregation), whose Lucene collectors break ties by doc id, which on the
      * whole-table reader is fragment order then offset. The doc value
      * fixture has ties everywhere: {@code lance} is repeated
      * {@code (i % 5) + 1} times so sixty rows over the six fragments
@@ -1009,9 +1009,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"flag\":\"desc\"}]",
             "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"rating\":\"desc\"}]"
         );
-        // A _score clause next to a field clause: the shard path copies
-        // the score sort value into _score, the fragment path does not,
-        // so these compare everything but the per-hit _score.
+        // A _score clause next to a field clause: both paths copy the
+        // score sort value into _score.
         List<String> mixedShapes = List.of(
             "\"size\":10,\"query\":" + tied + byCategoryThenScore,
             "\"from\":7,\"size\":10,\"query\":" + tied + byCategoryThenScore
@@ -1026,7 +1025,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 assertFragmentPathMatchesShardPath(indexName, shape);
             }
             for (String shape : mixedShapes) {
-                assertFragmentPathMatchesShardPath(indexName, shape, false);
+                assertFragmentPathMatchesShardPath(indexName, shape);
             }
             // The top ten of the score sort are the first ten rows with
             // i % 5 == 4, all in fragment 0, and the page starting at
@@ -1044,16 +1043,16 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             for (String order : List.of("asc", "desc")) {
                 String shape = "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"_score\":\"desc\"},{\"_doc\":\"" + order + "\"}]";
                 Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
-                Map<String, Object> shardPath = parse(readAll(postJson("/" + indexName + "/_search", "{\"explain\":true," + shape + "}")));
+                Map<String, Object> shardPath = parse(
+                    readAll(postJson("/" + indexName + "/_search", LanceRestTestCase.onShardPath("{" + shape + "}")))
+                );
                 assertEquals(shape, hitIdsOf(shardPath), hitIdsOf(fragmentPath));
             }
 
             // search_after with a cursor on a tied value skips the whole
             // tie group on both paths, and the next group starts with the
             // lowest row addresses again: after flag 1 (even rows) come
-            // the odd rows, fragment by fragment. The cursor is written
-            // as the integer the INT sort compares, because the fragment
-            // executor hands search_after values to Lucene untyped.
+            // the odd rows, fragment by fragment.
             String withCursor = "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"flag\":\"desc\"}],\"search_after\":[1]";
             assertFragmentPathMatchesShardPath(indexName, withCursor);
             Map<String, Object> secondPage = parse(readAll(postJson("/" + indexName + "/_search", "{" + withCursor + "}")));
@@ -1252,9 +1251,13 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 // groups the single shard keeps.
                 if (!partialsLoseGroups.contains(i)) {
                     Map<String, Object> shardPath = parse(
-                        readAll(postJson("/" + indexName + "/_search", "{\"explain\":true," + shape + "}"))
+                        readAll(postJson("/" + indexName + "/_search", LanceRestTestCase.onShardPath("{" + shape + "}")))
                     );
-                    assertEquals(shape, shardPath.get("aggregations"), response.get("aggregations"));
+                    assertEquals(
+                        shape,
+                        LanceRestTestCase.withoutShardPathOracle(shardPath.get("aggregations")),
+                        response.get("aggregations")
+                    );
                 }
             }
             // Analytic check of the size 2 terms, independent of the
@@ -1347,9 +1350,16 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 for (String shape : sketches) {
                     Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
                     Map<String, Object> shardPath = parse(
-                        readAll(postJson("/" + indexName + "/_search?request_cache=false", "{\"explain\":true," + shape + "}"))
+                        readAll(
+                            postJson("/" + indexName + "/_search?request_cache=false", LanceRestTestCase.onShardPath("{" + shape + "}"))
+                        )
                     );
-                    assertSketchesClose(shape, shardPath.get("aggregations"), fragmentPath.get("aggregations"), 300d);
+                    assertSketchesClose(
+                        shape,
+                        LanceRestTestCase.withoutShardPathOracle(shardPath.get("aggregations")),
+                        fragmentPath.get("aggregations"),
+                        300d
+                    );
                     pushedSketches.add(fragmentPath);
                 }
                 // Exactly 300 distinct ids and 3 categories, both in the
@@ -1504,9 +1514,13 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 // that a single shard keeps; every other block is equal.
                 if (i != 1) {
                     Map<String, Object> shardPath = parse(
-                        readAll(postJson("/" + indexName + "/_search", "{\"explain\":true," + shape + "}"))
+                        readAll(postJson("/" + indexName + "/_search", LanceRestTestCase.onShardPath("{" + shape + "}")))
                     );
-                    assertEquals(shape, shardPath.get("aggregations"), response.get("aggregations"));
+                    assertEquals(
+                        shape,
+                        LanceRestTestCase.withoutShardPathOracle(shardPath.get("aggregations")),
+                        response.get("aggregations")
+                    );
                 }
             }
             // 300 one row groups: each node keeps shard_size 13 of its
@@ -1605,7 +1619,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
 
             // Fragment path requests issued below; the shard path
-            // requests (explain) leave no executor line.
+            // requests (the global aggregation oracle) leave no executor
+            // line.
             int fragmentPathRequests = 0;
             for (String shape : exact) {
                 assertAggregationsMatchShardPath(indexName, shape);
@@ -1650,7 +1665,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             Map<String, Object> viaFragments = parse(readAll(postJson("/" + indexName + "/_search", tdigest)));
             fragmentPathRequests++;
             Map<String, Object> viaShard = parse(
-                readAll(postJson("/" + indexName + "/_search?request_cache=false", "{\"explain\":true," + tdigest.substring(1)))
+                readAll(postJson("/" + indexName + "/_search?request_cache=false", LanceRestTestCase.onShardPath(tdigest)))
             );
             Map<String, Object> fragmentValues = (Map<String, Object>) aggregationOf(viaFragments, "p").get("values");
             Map<String, Object> shardValues = (Map<String, Object>) aggregationOf(viaShard, "p").get("values");
@@ -1759,7 +1774,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             Map<String, Object> viaFragments = parse(readAll(postJson("/" + indexName + "/_search", tdigest)));
             fragmentPathRequests++;
             Map<String, Object> viaShard = parse(
-                readAll(postJson("/" + indexName + "/_search?request_cache=false", "{\"explain\":true," + tdigest.substring(1)))
+                readAll(postJson("/" + indexName + "/_search?request_cache=false", LanceRestTestCase.onShardPath(tdigest)))
             );
             Map<String, Object> fragmentValues = (Map<String, Object>) aggregationOf(viaFragments, "p").get("values");
             Map<String, Object> shardValues = (Map<String, Object>) aggregationOf(viaShard, "p").get("values");
@@ -1812,23 +1827,24 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
-     * Run {@code shape} through the fragment path and, with
-     * {@code "explain": true}, through the shard path, and assert the two
-     * responses carry the same {@code hits.total} and the same
-     * {@code aggregations} block. Returns the fragment path response.
+     * Run {@code shape} through the fragment path and, with the
+     * {@code global} aggregation of {@code LanceRestTestCase.onShardPath},
+     * through the shard path, and assert the two responses carry the same
+     * {@code hits.total} and the same {@code aggregations} block (the
+     * oracle's own key aside). Returns the fragment path response.
      */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> assertAggregationsMatchShardPath(String indexName, String shape) throws IOException {
         Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
         Map<String, Object> shardPath = parse(
-            readAll(postJson("/" + indexName + "/_search?request_cache=false", "{\"explain\":true," + shape + "}"))
+            readAll(postJson("/" + indexName + "/_search?request_cache=false", LanceRestTestCase.onShardPath("{" + shape + "}")))
         );
         assertEquals(
             shape,
             ((Map<String, Object>) shardPath.get("hits")).get("total"),
             ((Map<String, Object>) fragmentPath.get("hits")).get("total")
         );
-        assertEquals(shape, shardPath.get("aggregations"), fragmentPath.get("aggregations"));
+        assertEquals(shape, LanceRestTestCase.withoutShardPathOracle(shardPath.get("aggregations")), fragmentPath.get("aggregations"));
         return fragmentPath;
     }
 
@@ -1956,9 +1972,10 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
     /**
      * Run {@code shape} (the body of a {@code _search} request without
-     * its outer braces) through the fragment path and, with
-     * {@code "explain": true} added, through the shard path, and
-     * compare the parts of the two responses that describe the result.
+     * its outer braces) through the fragment path and, with the
+     * {@code global} aggregation of {@code LanceRestTestCase.onShardPath}
+     * added, through the shard path, and compare the parts of the two
+     * responses that describe the result.
      */
     private static void assertFragmentPathMatchesShardPath(String indexName, String shape) throws IOException {
         assertFragmentPathMatchesShardPath(indexName, shape, true);
@@ -1967,14 +1984,13 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     /**
      * As {@link #assertFragmentPathMatchesShardPath(String, String)};
      * {@code compareScores} false skips the per-hit {@code _score}
-     * comparison, for a sort that has a {@code _score} clause next to a
-     * field clause: the shard path copies that clause's sort value into
-     * {@code _score}, the fragment path leaves {@code _score} null
-     * unless {@code track_scores} is set.
+     * comparison.
      */
     private static void assertFragmentPathMatchesShardPath(String indexName, String shape, boolean compareScores) throws IOException {
         Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
-        Map<String, Object> shardPath = parse(readAll(postJson("/" + indexName + "/_search", "{\"explain\":true," + shape + "}")));
+        Map<String, Object> shardPath = parse(
+            readAll(postJson("/" + indexName + "/_search", LanceRestTestCase.onShardPath("{" + shape + "}")))
+        );
         assertEquals(shape, hitIdsOf(shardPath), hitIdsOf(fragmentPath));
         assertEquals(shape, sortValues(shardPath), sortValues(fragmentPath));
         if (compareScores) {
@@ -2471,7 +2487,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             }
             ResponseException refused = expectThrows(
                 ResponseException.class,
-                () -> postJson("/" + pkTable + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}},\"explain\":true}")
+                () -> postJson("/" + pkTable + "/_search", LanceRestTestCase.onShardPath("{\"size\":1,\"query\":{\"match_all\":{}}}"))
             );
             assertEquals(400, refused.getResponse().getStatusLine().getStatusCode());
             assertTrue(readAll(refused.getResponse()).contains("above the Lucene bound"));

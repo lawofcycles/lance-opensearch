@@ -1710,15 +1710,15 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             );
             assertEquals(400, extractIntPath(body, "status"));
 
-            // The same query with `explain` runs on the shard path
-            // (see docs/limitations.md). Lucene's query phase wraps
+            // The same query with a global aggregation runs on the shard
+            // path (see docs/limitations.md). Lucene's query phase wraps
             // the failure in QueryPhaseExecutionException, which
             // OpenSearch answers as 500; Lance's message still reaches
             // the client. The 500 below is the documented limitation,
             // not the wanted behaviour: when the shard path learns to
             // answer 400 this assertion is expected to flip to 400 and
             // the limitations entry goes away with it.
-            String explained = "{\"explain\":true,\"query\":{\"lance_match_phrase\":{\"field\":\"label\",\"query\":\"row 3\"}}}";
+            String explained = onShardPath("{\"query\":{\"lance_match_phrase\":{\"field\":\"label\",\"query\":\"row 3\"}}}");
             ResponseException shardPath = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", explained));
             String shardBody = readAll(shardPath.getResponse());
             assertEquals(
