@@ -19,9 +19,9 @@ import java.util.List;
 /**
  * Lowers the logical {@link LanceShardPathShape} to the
  * {@link ShardPathConvention} physical operator, so the shard path
- * fallback (a request carrying {@code suggest}, {@code collapse},
- * {@code rescore}, a pipeline aggregation, {@code min_score}, or
- * another element only the standard shard search path serves) is a
+ * fallback (a request carrying {@code suggest}, {@code highlight},
+ * {@code collapse}, {@code rescore} or a pipeline aggregation, the
+ * elements only the standard shard search path serves) is a
  * plan the Volcano planner produces instead of a hand written allow
  * list inside the dispatch filter.
  *

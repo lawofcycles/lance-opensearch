@@ -76,7 +76,7 @@ public class ShardPathFallbackExecTests extends OpenSearchTestCase {
     }
 
     public void testCostIsTheConstant() {
-        ShardPathFallbackExec exec = exec(ShardPathReason.MIN_SCORE);
+        ShardPathFallbackExec exec = exec(ShardPathReason.RESCORE);
         RelOptPlanner planner = exec.getCluster().getPlanner();
         RelOptCost cost = exec.computeSelfCost(planner, exec.getCluster().getMetadataQuery());
         assertTrue(cost.equals(planner.getCostFactory().makeTinyCost().plus(planner.getCostFactory().makeCost(100, 100, 100))));
@@ -109,10 +109,10 @@ public class ShardPathFallbackExecTests extends OpenSearchTestCase {
     }
 
     public void testExplainCarriesTheReasons() {
-        ShardPathFallbackExec exec = exec(ShardPathReason.COLLAPSE, ShardPathReason.MIN_SCORE);
+        ShardPathFallbackExec exec = exec(ShardPathReason.COLLAPSE, ShardPathReason.RESCORE);
         String plan = RelOptUtil.toString(exec);
         assertTrue("names the operator: " + plan, plan.contains("ShardPathFallbackExec"));
-        assertTrue("carries the reasons: " + plan, plan.contains("COLLAPSE") && plan.contains("MIN_SCORE"));
+        assertTrue("carries the reasons: " + plan, plan.contains("COLLAPSE") && plan.contains("RESCORE"));
         assertTrue("the scan is the input: " + plan, plan.contains("LanceTableScan"));
     }
 
@@ -133,19 +133,7 @@ public class ShardPathFallbackExecTests extends OpenSearchTestCase {
         // The kinds the translator can attach; the executor and the
         // explain output spell them by name, so renames are breaking.
         assertEquals(
-            List.of(
-                "SUGGEST",
-                "HIGHLIGHT",
-                "SEARCH_AFTER_SCORE",
-                "COLLAPSE",
-                "RESCORE",
-                "PIPELINE_AGG",
-                "MIN_SCORE",
-                "TERMINATE_AFTER",
-                "STORED_FIELDS",
-                "DOCVALUE_FIELDS",
-                "EXPLAIN_PER_HIT"
-            ),
+            List.of("SUGGEST", "HIGHLIGHT", "COLLAPSE", "RESCORE", "PIPELINE_AGG"),
             Arrays.stream(ShardPathReason.values()).map(Enum::name).toList()
         );
     }

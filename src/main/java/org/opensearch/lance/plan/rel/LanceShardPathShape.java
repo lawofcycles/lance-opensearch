@@ -20,8 +20,8 @@ import java.util.Objects;
 /**
  * Logical marker for a search request whose shape only OpenSearch's
  * regular shard search path serves: the request carries at least one
- * element ({@code suggest}, {@code collapse}, {@code rescore}, a
- * pipeline aggregation, {@code min_score}, ...) the fragment fan-out
+ * element ({@code suggest}, {@code highlight}, {@code collapse},
+ * {@code rescore}, or a pipeline aggregation) the fragment fan-out
  * does not answer, each named by a {@link ShardPathReason}. The
  * translator's dispatch entry point wraps the index's scan with this
  * node when it detects such an element; the planner's

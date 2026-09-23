@@ -478,12 +478,6 @@ public final class SearchRequestToRel {
         if (source.highlighter() != null) {
             reasons.add(ShardPathReason.HIGHLIGHT);
         }
-        // search_after depends on sort — Lucene's searchAfter takes a
-        // FieldDoc whose fields correspond to the Sort clauses. A
-        // score-order search_after is a shard-path shape.
-        if (source.searchAfter() != null && (source.sorts() == null || source.sorts().isEmpty())) {
-            reasons.add(ShardPathReason.SEARCH_AFTER_SCORE);
-        }
         if (source.collapse() != null) {
             reasons.add(ShardPathReason.COLLAPSE);
         }
@@ -492,21 +486,6 @@ public final class SearchRequestToRel {
         }
         if (source.aggregations() != null && hasPipelineAggregation(source.aggregations())) {
             reasons.add(ShardPathReason.PIPELINE_AGG);
-        }
-        if (source.minScore() != null) {
-            reasons.add(ShardPathReason.MIN_SCORE);
-        }
-        if (source.terminateAfter() > 0) {
-            reasons.add(ShardPathReason.TERMINATE_AFTER);
-        }
-        if (source.storedFields() != null) {
-            reasons.add(ShardPathReason.STORED_FIELDS);
-        }
-        if (source.docValueFields() != null && !source.docValueFields().isEmpty()) {
-            reasons.add(ShardPathReason.DOCVALUE_FIELDS);
-        }
-        if (Boolean.TRUE.equals(source.explain())) {
-            reasons.add(ShardPathReason.EXPLAIN_PER_HIT);
         }
         return reasons;
     }
