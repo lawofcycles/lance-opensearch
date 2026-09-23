@@ -46,7 +46,6 @@ import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.lucene.document.Document;
 import org.apache.lucene.geo.GeoEncodingUtils;
 import org.apache.lucene.index.BaseTermsEnum;
 import org.apache.lucene.index.BinaryDocValues;
@@ -75,11 +74,6 @@ import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.index.TermVectors;
 import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.index.DirectoryReader;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.IndexWriterConfig;
-import org.apache.lucene.store.AlreadyClosedException;
-import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.AcceptDocs;
@@ -455,31 +449,13 @@ public final class LanceFragmentLeafReader extends LeafReader {
      */
     private volatile LanceShardColumnCache shardColumnCache;
 
-    // Bridge to Lucene's cache lifecycle. IndicesQueryCache, IndicesFieldDataCache
-    // and IndicesRequestCache all key entries by IndexReader.CacheKey and rely on
-    // IndexReader.ClosedListener to invalidate them. IndexReader.CacheKey has a
-    // package-private constructor, so a plugin sitting outside the
-    // org.apache.lucene.index package cannot mint its own key. We instead hold a
-    // tiny one-doc Lucene reader whose lifetime is bound to this fragment reader:
-    // its CacheHelper is exposed as ours, and closing this reader closes the
-    // bridge, which fires the listeners registered by the OpenSearch caches.
-    //
-    // Built on the first getCoreCacheHelper / getReaderCacheHelper call rather
-    // than in the constructor: the bridge costs an IndexWriter, a commit and a
-    // DirectoryReader.open, and the fragment path opens one leaf per fragment
-    // per request, so an aggregation over hundreds of fragments would pay that
-    // per leaf although nothing on its path asks for a leaf-level cache key
-    // (the query cache is disabled, the request cache keys off the composite
-    // reader, and numeric doc values fielddata is built without the cache).
-    // Consumers that do ask (the bitset filter cache for nested docs, global
-    // ordinals fielddata, a DLS/FLS reader wrapper) get the same bridge for
-    // the life of the leaf. Guarded by `this` and published through the
-    // volatile field; helpers may be requested from any slice thread.
-    // `closed` (also guarded by `this`) keeps a helper request that races
-    // with close from building a bridge doClose has already read as
-    // absent, which nothing would ever close.
-    private volatile DirectoryReader cacheLifetimeBridge;
-    private boolean closed;
+    /**
+     * Bridge to Lucene's cache lifecycle: the lazily built one-doc
+     * reader whose {@code CacheHelper} this leaf exposes as its own, and
+     * whose close fires the listeners the OpenSearch caches registered.
+     * See {@link LeafCacheBridge} for why it exists and why it is lazy.
+     */
+    private final LeafCacheBridge cacheBridge = new LeafCacheBridge();
 
     /**
      * Resolve which Utf8 columns of {@code dataset} carry an FTS
@@ -691,52 +667,9 @@ public final class LanceFragmentLeafReader extends LeafReader {
         return nestedLayout.isParent(doc) ? nestedLayout.rowOfDoc(doc) : -1;
     }
 
-    /**
-     * The one-doc Lucene reader backing {@link #getCoreCacheHelper()}
-     * and {@link #getReaderCacheHelper()}, built on first use (see the
-     * field comment for why it is not built in the constructor). The
-     * instance is stable for the life of this leaf, as the cache
-     * helper contract requires.
-     *
-     * @throws AlreadyClosedException when the
-     *         leaf was closed before any helper was requested; building
-     *         a bridge then would leak it, because {@link #doClose()}
-     *         has already read the field as absent
-     */
-    private DirectoryReader cacheLifetimeBridge() {
-        DirectoryReader bridge = cacheLifetimeBridge;
-        if (bridge != null) {
-            return bridge;
-        }
-        synchronized (this) {
-            bridge = cacheLifetimeBridge;
-            if (bridge != null) {
-                return bridge;
-            }
-            if (closed) {
-                throw new AlreadyClosedException("this LanceFragmentLeafReader was closed before a cache helper was requested");
-            }
-            try {
-                ByteBuffersDirectory bridgeDir = new ByteBuffersDirectory();
-                try (IndexWriter writer = new IndexWriter(bridgeDir, new IndexWriterConfig())) {
-                    writer.addDocument(new Document());
-                    writer.commit();
-                }
-                bridge = DirectoryReader.open(bridgeDir);
-            } catch (IOException e) {
-                // getCoreCacheHelper / getReaderCacheHelper cannot
-                // throw a checked exception; an in-heap one-doc index
-                // only fails when the JVM is already in trouble.
-                throw new UncheckedIOException("could not build the cache lifetime bridge", e);
-            }
-            cacheLifetimeBridge = bridge;
-            return bridge;
-        }
-    }
-
     /** Whether the cache lifetime bridge has been built. Test observability only. */
     boolean cacheLifetimeBridgeExists() {
-        return cacheLifetimeBridge != null;
+        return cacheBridge.exists();
     }
 
     private Object columnLock(String name) {
@@ -4035,25 +3968,16 @@ public final class LanceFragmentLeafReader extends LeafReader {
 
     @Override
     protected void doClose() throws IOException {
-        DirectoryReader bridge;
-        synchronized (this) {
-            closed = true;
-            bridge = cacheLifetimeBridge;
-        }
-        // Close outside the monitor so the bridge's closed listeners
-        // (cache invalidation callbacks) do not run while holding it.
-        if (bridge != null) {
-            bridge.close();
-        }
+        cacheBridge.close();
     }
 
     @Override
     public CacheHelper getCoreCacheHelper() {
-        return cacheLifetimeBridge().leaves().get(0).reader().getCoreCacheHelper();
+        return cacheBridge.coreCacheHelper();
     }
 
     @Override
     public CacheHelper getReaderCacheHelper() {
-        return cacheLifetimeBridge().getReaderCacheHelper();
+        return cacheBridge.readerCacheHelper();
     }
 }
