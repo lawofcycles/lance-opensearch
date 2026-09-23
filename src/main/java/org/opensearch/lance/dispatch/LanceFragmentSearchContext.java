@@ -92,10 +92,18 @@ import org.opensearch.common.unit.TimeValue;
  * and {@link #partialOnShard()} carry the executor's slice count into the
  * searcher and the aggregators so a request collects its fragments on
  * several threads and merges the slice results the way concurrent
- * segment search does on the shard path.
+ * segment search does on the shard path. The fetch side
+ * ({@link #fetchSourceContext()}, {@link #storedFieldsContext()},
+ * {@link #docValuesContext()}, {@link #fetchFieldsContext()},
+ * {@link #explain()}, {@link #rescore()} empty, {@link #highlight()} null)
+ * answers as {@code DefaultSearchContext} does for the same body, so the
+ * stock fetch sub phases {@link FragmentFetchPhase} drives render the
+ * hits the shard path would.
  * Every other {@link SearchContext} method throws
- * {@link UnsupportedOperationException} on purpose: if a code path the
- * fragment handler drives ever needs one, its failure surfaces immediately
+ * {@link UnsupportedOperationException} naming the method on purpose: if
+ * a code path the fragment handler drives ever needs one (the highlight
+ * or suggest sub phases, {@code docIdsToLoad} and {@code fetchResult} of
+ * the stock {@code FetchPhase.execute}), its failure surfaces immediately
  * with a clear stack trace instead of silently returning a null or default.
  *
  * <p>Non-abstract {@link SearchContext} defaults (for example
@@ -119,13 +127,22 @@ public final class LanceFragmentSearchContext extends SearchContext {
     private final BigArrays bigArrays;
     private final SearchShardTarget shardTarget;
     private final BitsetFilterCache bitsetFilterCache;
-    private final Query query;
+    private Query query;
     private final SearchContextAggregations aggregations;
     private BucketCollectorProcessor bucketCollectorProcessor = new BucketCollectorProcessor();
     private final List<Releasable> releasables = new ArrayList<>();
     private LanceCancellation cancellation = LanceCancellation.NONE;
     private int targetMaxSliceCount = 1;
     private ScriptService scriptService;
+    // The fetch phase's view of the request: what the stock fetch sub
+    // phases (source, doc values, fields, explain) read through
+    // FetchContext. Absent elements stay null / false, which is what
+    // DefaultSearchContext reports for a body without them.
+    private FetchSourceContext fetchSourceContext;
+    private StoredFieldsContext storedFieldsContext;
+    private FetchDocValuesContext docValuesContext;
+    private FetchFieldsContext fetchFieldsContext;
+    private boolean explain;
 
     /**
      * Two-phase construction: {@link ContextIndexSearcher} keeps a
@@ -230,6 +247,44 @@ public final class LanceFragmentSearchContext extends SearchContext {
      */
     public LanceFragmentSearchContext withScriptService(ScriptService scriptService) {
         this.scriptService = scriptService;
+        return this;
+    }
+
+    /**
+     * The query the fetch phase explains hits against
+     * ({@code ExplainPhase} reads it through {@link #query()}). The
+     * executor sets it once the request's Lucene query is built: the
+     * request's query itself, or the {@link PrebuiltWeightQuery} over the
+     * Weight the executor already ran, so an explanation of a Lance
+     * scored hit reuses that Weight's scan instead of running a new one.
+     * Until then {@link #query()} is the placeholder the constructor
+     * received.
+     */
+    public LanceFragmentSearchContext withQuery(Query query) {
+        this.query = query;
+        return this;
+    }
+
+    /**
+     * The per hit projections the fetch phase renders: the
+     * {@code _source} filter, the {@code stored_fields} list, the
+     * {@code docvalue_fields} resolved against the mapping (patterns
+     * expanded, bound by {@code index.max_docvalue_fields_search}, null
+     * when the request has none), the {@code fields} list (null when
+     * absent) and {@code explain}.
+     */
+    public LanceFragmentSearchContext withProjection(
+        FetchSourceContext fetchSourceContext,
+        StoredFieldsContext storedFieldsContext,
+        FetchDocValuesContext docValuesContext,
+        FetchFieldsContext fetchFieldsContext,
+        boolean explain
+    ) {
+        this.fetchSourceContext = fetchSourceContext;
+        this.storedFieldsContext = storedFieldsContext;
+        this.docValuesContext = docValuesContext;
+        this.fetchFieldsContext = fetchFieldsContext;
+        this.explain = explain;
         return this;
     }
 
@@ -472,7 +527,10 @@ public final class LanceFragmentSearchContext extends SearchContext {
 
     @Override
     public SearchHighlightContext highlight() {
-        throw uoe("highlight");
+        // Read by the fetch phase's nested hit preparation and by the
+        // highlight sub phase, which the executor does not run; null is
+        // what DefaultSearchContext reports for a body without one.
+        return null;
     }
 
     @Override
@@ -492,7 +550,9 @@ public final class LanceFragmentSearchContext extends SearchContext {
 
     @Override
     public List<RescoreContext> rescore() {
-        throw uoe("rescore");
+        // ExplainPhase folds the rescorers' explanations over the
+        // query's; the fragment path runs none.
+        return List.of();
     }
 
     @Override
@@ -510,44 +570,52 @@ public final class LanceFragmentSearchContext extends SearchContext {
         throw uoe("scriptFields");
     }
 
+    // The _source / stored_fields / docvalue_fields / fields / explain
+    // accessors answer as DefaultSearchContext does for the same
+    // request elements, so FetchPhase.createStoredFieldsVisitor and the
+    // stock fetch sub phases see the request the client sent.
+
     @Override
     public boolean sourceRequested() {
-        return false;
+        return fetchSourceContext != null && fetchSourceContext.fetchSource();
     }
 
     @Override
     public boolean hasFetchSourceContext() {
-        return false;
+        return fetchSourceContext != null;
     }
 
     @Override
     public FetchSourceContext fetchSourceContext() {
-        throw uoe("fetchSourceContext");
+        return fetchSourceContext;
     }
 
     @Override
     public SearchContext fetchSourceContext(FetchSourceContext fetchSourceContext) {
-        throw uoe("fetchSourceContext(FetchSourceContext)");
+        this.fetchSourceContext = fetchSourceContext;
+        return this;
     }
 
     @Override
     public FetchDocValuesContext docValuesContext() {
-        throw uoe("docValuesContext");
+        return docValuesContext;
     }
 
     @Override
     public SearchContext docValuesContext(FetchDocValuesContext docValuesContext) {
-        throw uoe("docValuesContext(FetchDocValuesContext)");
+        this.docValuesContext = docValuesContext;
+        return this;
     }
 
     @Override
     public FetchFieldsContext fetchFieldsContext() {
-        throw uoe("fetchFieldsContext");
+        return fetchFieldsContext;
     }
 
     @Override
     public SearchContext fetchFieldsContext(FetchFieldsContext fetchFieldsContext) {
-        throw uoe("fetchFieldsContext(FetchFieldsContext)");
+        this.fetchFieldsContext = fetchFieldsContext;
+        return this;
     }
 
     @Override
@@ -672,37 +740,38 @@ public final class LanceFragmentSearchContext extends SearchContext {
 
     @Override
     public boolean hasStoredFields() {
-        return false;
+        return storedFieldsContext != null && storedFieldsContext.fieldNames() != null;
     }
 
     @Override
     public boolean hasStoredFieldsContext() {
-        return false;
+        return storedFieldsContext != null;
     }
 
     @Override
     public boolean storedFieldsRequested() {
-        return false;
+        return storedFieldsContext == null || storedFieldsContext.fetchFields();
     }
 
     @Override
     public StoredFieldsContext storedFieldsContext() {
-        return null;
+        return storedFieldsContext;
     }
 
     @Override
     public SearchContext storedFieldsContext(StoredFieldsContext storedFieldsContext) {
-        throw uoe("storedFieldsContext(StoredFieldsContext)");
+        this.storedFieldsContext = storedFieldsContext;
+        return this;
     }
 
     @Override
     public boolean explain() {
-        return false;
+        return explain;
     }
 
     @Override
     public void explain(boolean explain) {
-        throw uoe("explain(boolean)");
+        this.explain = explain;
     }
 
     @Override
@@ -828,7 +897,9 @@ public final class LanceFragmentSearchContext extends SearchContext {
 
     private static UnsupportedOperationException uoe(String methodSignature) {
         return new UnsupportedOperationException(
-            "LanceFragmentSearchContext does not support " + methodSignature + "; fragment path aggregator use has no need for it"
+            "LanceFragmentSearchContext does not support "
+                + methodSignature
+                + "; the fragment executor's hits, aggregation and fetch phases have no need for it"
         );
     }
 }

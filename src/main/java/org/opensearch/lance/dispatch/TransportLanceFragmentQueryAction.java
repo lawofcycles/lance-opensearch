@@ -25,9 +25,11 @@ import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.Collector;
 import org.apache.lucene.search.CollectorManager;
+import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.lance.Dataset;
@@ -69,6 +71,7 @@ import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
+import org.opensearch.lance.plan.execute.MergeReducer;
 import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.lance.plan.execute.PlanExecutor.MatchedCount;
 import org.opensearch.lance.query.FtsAdmission;
@@ -87,8 +90,11 @@ import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.MultiBucketCollector;
 import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer;
 import org.opensearch.search.aggregations.SearchContextAggregations;
+import org.opensearch.search.fetch.subphase.FetchDocValuesContext;
+import org.opensearch.search.fetch.subphase.FetchFieldsContext;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
+import org.opensearch.search.searchafter.SearchAfterBuilder;
 import org.opensearch.search.sort.SortAndFormats;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.Task;
@@ -111,11 +117,16 @@ import org.opensearch.transport.TransportService;
  * bundle:
  * <ul>
  *   <li>{@link org.apache.lucene.search.IndexSearcher#search(Query, int)}
- *       returns the top-{@code size} docs with real scores (BM25 for
- *       Lance FTS, cosine for Lance knn) and the standard stored-fields
- *       path materialises {@code _source} and {@code _id} via
- *       {@link org.opensearch.lance.engine.LanceFragmentLeafReader#materialiseStoredFields}.
- *       The Lance-native scan + hand-rolled Arrow JSON path is retired.</li>
+ *       style top docs collectors return the top-{@code size} docs with
+ *       real scores (BM25 for Lance FTS, cosine for Lance knn), with the
+ *       request's {@code min_score} and {@code terminate_after} composed
+ *       around them ({@link CollectorKnobs}), and {@link FragmentFetchPhase}
+ *       renders every hit through the stock fetch sub phases over the
+ *       stored fields
+ *       {@link org.opensearch.lance.engine.LanceFragmentLeafReader#materialiseStoredFields}
+ *       synthesises ({@code _id}, {@code _source} under the request's
+ *       source filter, {@code stored_fields}, {@code docvalue_fields},
+ *       {@code fields}, {@code _explanation}).</li>
  *   <li>The aggregator branch drives OpenSearch's stock
  *       {@link org.opensearch.search.aggregations.metrics.SumAggregator}
  *       / {@code Avg} / {@code Min} / {@code Max} / {@code ValueCount}
@@ -130,7 +141,10 @@ import org.opensearch.transport.TransportService;
  * path ({@link Fragment#countRows()} sums when no filter is set;
  * {@link Dataset#countRows(String)} otherwise). This keeps
  * hits.total.value cheap; the aggregator does not need to be
- * consulted for it.
+ * consulted for it. Under {@code min_score} or {@code terminate_after}
+ * the count is what the hits collection saw through those collectors
+ * instead, since neither Lance nor the Weight's hit count knows the
+ * score threshold or the bound.
  */
 public final class TransportLanceFragmentQueryAction extends HandledTransportAction<LanceFragmentQueryRequest, LanceFragmentQueryResponse> {
 
@@ -263,6 +277,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * pushed operation to the Lucene side; nothing is planned here.
      */
     private final FragmentPlanRefiner refiner = new FragmentPlanRefiner();
+    /**
+     * Renders the hits of a page through the stock fetch sub phases;
+     * stateless, shared by every request.
+     */
+    private final FragmentFetchPhase fetchPhase = new FragmentFetchPhase();
 
     @Inject
     public TransportLanceFragmentQueryAction(
@@ -668,7 +687,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // them side by side on the index_searcher pool; the
                 // aggregators read the same count through the context
                 // to decide how they apply their shard thresholds.
-                int slices = clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_SLICES_SETTING);
+                // Under terminate_after the request collects on one
+                // slice: the bound is a count of documents collected in
+                // order, which slices collected side by side would each
+                // apply to their own share, and the abort that stops the
+                // collection at the bound has one collector to reduce.
+                int slices = request.terminateAfter() > 0
+                    ? 1
+                    : clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_SLICES_SETTING);
                 searchContext.withTargetMaxSliceCount(slices).withScriptService(scriptService);
                 LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(
                     dr,
@@ -692,6 +718,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 searchContext.withQueryShardContext(qsc);
 
                 SortAndFormats sortAndFormats = resolveSort(request, qsc);
+                FieldDoc searchAfter = resolveSearchAfter(request, sortAndFormats);
+                searchContext.withProjection(
+                    request.projection().fetchSource(),
+                    request.projection().storedFields(),
+                    resolveDocValuesContext(request.projection(), indexService),
+                    request.projection().fetchFields().isEmpty() ? null : new FetchFieldsContext(request.projection().fetchFields()),
+                    request.projection().explain()
+                );
+                CollectorKnobs knobs = FragmentHitsPages.knobsOf(request);
                 int maxGroups = LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
                 FragmentPlanRefiner.Refined refined = refiner.refine(
                     planned,
@@ -789,6 +824,17 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 if (request.postFilter() != null) {
                     hitsQuery = applyPostFilter(prebuilt == null ? query : prebuilt, request, qsc);
                 }
+                // "explain": true explains every hit against the request's
+                // query (not the post_filter conjunction, as on the shard
+                // path); through the prebuilt Weight when there is one,
+                // so a Lance scored hit is explained from the scan that
+                // already ran rather than from a new one per hit. Set for
+                // an explaining request only: the aggregators built over
+                // this context keep seeing the constructor's placeholder,
+                // as they did before the fetch phase existed.
+                if (request.projection().explain()) {
+                    searchContext.withQuery(prebuilt == null ? query : prebuilt);
+                }
                 // Match count runs through the same Weight as the
                 // hits phase when the query is a scoring Lucene
                 // query (FTS, knn), so strip any scan-limit hint
@@ -832,9 +878,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // aggregators. Counted before the scans run so a failing
                 // scan still shows which path the node took.
                 FragmentPlanRefiner.recordExecuted(pushedPage || pushedAggregate);
-                FragmentHitsPages.HitsPage hits;
+                FragmentHitsPages.CollectedPage page;
                 if (pushedPage) {
-                    hits = FragmentHitsPages.viaLanceSortedScan(
+                    page = FragmentHitsPages.viaLanceSortedScan(
                         dataset,
                         request,
                         pushedTopK.toColumnOrderings(),
@@ -850,16 +896,19 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     // hitsQuery is the very query it was created for;
                     // with a post_filter the hits query is a conjunction
                     // Lucene has to build its own Weight for.
-                    hits = FragmentHitsPages.viaIndexSearcher(
+                    page = FragmentHitsPages.viaIndexSearcher(
                         searcher,
                         hitsQuery,
                         hitsQuery == query ? lanceWeight : null,
                         sortAndFormats,
-                        request.searchAfter(),
+                        searchAfter,
                         request.size(),
-                        request.trackScores()
+                        request.trackScores(),
+                        knobs,
+                        request.trackTotalHitsUpTo()
                     );
                 }
+                Boolean terminatedEarly = page.terminatedEarly();
                 InternalAggregations aggregations;
                 MatchedCount matched;
                 if (pushedAggregate) {
@@ -892,18 +941,48 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         ? MatchedCount.NOT_TRACKED
                         : MatchedCount.exact(result.totalRows());
                 } else {
-                    aggregations = aggregateViaIndexSearcher(request, searchContext, searcher, qsc, query, lanceWeight);
-                    matched = PlanExecutor.computeMatched(
-                        dataset,
+                    AggregationsResult aggregated = aggregateViaIndexSearcher(
                         request,
-                        effective.scalarFilterSql(),
+                        searchContext,
                         searcher,
-                        countQuery,
-                        hasSecurityWrapper,
-                        ftsWeight,
-                        cancellation
+                        qsc,
+                        query,
+                        lanceWeight,
+                        knobs
                     );
+                    aggregations = aggregated.aggregations();
+                    terminatedEarly = MergeReducer.mergeTerminatedEarly(terminatedEarly, aggregated.terminatedEarly());
+                    if (page.collected() != null) {
+                        // min_score or terminate_after: the count is what
+                        // the hits collection saw through the knobs; the
+                        // Lance side counts and the Weight's hit count do
+                        // not know the score threshold or the bound.
+                        matched = request.trackTotalHitsUpTo() == SearchContext.TRACK_TOTAL_HITS_DISABLED
+                            ? MatchedCount.NOT_TRACKED
+                            : new MatchedCount(
+                                page.collected().value(),
+                                page.collected().relation() == TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO
+                            );
+                    } else {
+                        matched = PlanExecutor.computeMatched(
+                            dataset,
+                            request,
+                            effective.scalarFilterSql(),
+                            searcher,
+                            countQuery,
+                            hasSecurityWrapper,
+                            ftsWeight,
+                            cancellation
+                        );
+                    }
                 }
+                FragmentHitsPages.HitsPage hits = FragmentHitsPages.materialise(
+                    searchContext,
+                    fetchPhase,
+                    searcher.getIndexReader(),
+                    page.scoreDocs(),
+                    sortAndFormats
+                );
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debug(
                         "lance.dispatch: fragment path slices for [{}]: {} leaves in {} slices (lance.fragment_path.slices {})",
@@ -923,7 +1002,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     fragmentCount,
                     hits.hits(),
                     hits.rowAddrs(),
-                    aggregations
+                    aggregations,
+                    terminatedEarly
                 );
             }
         }
@@ -1155,7 +1235,10 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * </ul>
      * The caller additionally keeps the scan unbounded when a reader
      * wrapper is installed: the wrapper's liveDocs narrow the result
-     * after the scan the same way a post_filter would.
+     * after the scan the same way a post_filter would. {@code min_score}
+     * and {@code terminate_after} keep it unbounded too: the collectors
+     * that apply them also count the matches, and a scan clipped to
+     * {@code size} rows would clip that count.
      *
      * <p>The coordinator already folds the top-level {@code from} into
      * {@code size} before shipping the request (see
@@ -1174,6 +1257,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      */
     private int resolveScanFilterTopK(LanceFragmentQueryRequest request) {
         if (!request.sorts().isEmpty()) {
+            return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
+        }
+        if (request.hasCollectorKnobs()) {
             return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
         }
         if (request.aggregations() != null && !request.aggregations().getAggregatorFactories().isEmpty()) {
@@ -1263,6 +1349,45 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
+     * The request's {@code search_after} cursor typed against the Lucene
+     * sort the mapping built, through the same
+     * {@link SearchAfterBuilder#buildFieldDoc} the shard path uses: each
+     * JSON value is converted to its {@link org.apache.lucene.search.SortField}
+     * type (a {@code Double} to the {@code Float} of a {@code _score}
+     * clause, an {@code Integer} to the {@code Long} of a numeric
+     * field), and a cursor whose length differs from the sort's is
+     * refused with the shard path's message. A cursor without a sort
+     * ({@code sort} absent, which the coordinator already refuses, or a
+     * lone descending {@code _score}, which
+     * {@code SortBuilder.buildSort} folds into no sort) is refused with
+     * the shard path's message as well. {@code null} without a cursor.
+     */
+    private static FieldDoc resolveSearchAfter(LanceFragmentQueryRequest request, SortAndFormats sortAndFormats) {
+        if (request.searchAfter() == null) {
+            return null;
+        }
+        return SearchAfterBuilder.buildFieldDoc(sortAndFormats, request.searchAfter());
+    }
+
+    /**
+     * The request's {@code docvalue_fields} resolved against the mapping
+     * the way {@code SearchService.parseSource} resolves them: patterns
+     * expanded to field names and the total bounded by
+     * {@code index.max_docvalue_fields_search}. {@code null} when the
+     * request has none.
+     */
+    private static FetchDocValuesContext resolveDocValuesContext(HitProjection projection, IndexService indexService) {
+        if (projection.docValueFields().isEmpty()) {
+            return null;
+        }
+        return FetchDocValuesContext.create(
+            indexService.mapperService()::simpleMatchToFullName,
+            indexService.getIndexSettings().getMaxDocvalueFields(),
+            projection.docValueFields()
+        );
+    }
+
+    /**
      * Combine the top-level query with {@code post_filter} into the
      * Lucene query used for hits and matched counting. Returns the
      * unmodified {@code base} when no post_filter is set.
@@ -1284,6 +1409,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             .build();
     }
 
+    /** The aggregations of a request and whether {@code terminate_after} stopped their collection ({@code null} without the knob). */
+    private record AggregationsResult(InternalAggregations aggregations, Boolean terminatedEarly) {
+        static final AggregationsResult NONE = new AggregationsResult(null, null);
+    }
+
     /**
      * Aggregator path. Runs the request's
      * {@link org.opensearch.search.aggregations.AggregatorFactories.Builder}
@@ -1291,9 +1421,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * per-node {@link InternalAggregations} for the coordinator to
      * reduce.
      *
-     * <p>Returns {@code null} when the request carries no
-     * aggregations; the response ships {@code aggregations == null}
-     * in that case.
+     * <p>Returns no aggregations when the request carries none; the
+     * response ships {@code aggregations == null} in that case.
      *
      * <p>{@code sharedWeight}, when non-null, is the Weight the caller
      * already built for {@code query}; the collector tree is then
@@ -1313,26 +1442,44 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * slice the single tree's result is returned as it is, which is
      * what the shard path does without concurrent segment search and
      * what this method returned before slicing.
+     *
+     * <p>{@code knobs} composes {@code min_score} and
+     * {@code terminate_after} around every tree, as {@code QueryPhase}
+     * composes them around the aggregation collectors: a document below
+     * the score threshold is not aggregated, and the aggregators see
+     * the documents collected before the bound stopped the collection.
+     * The bound aborts the search before the searcher post collects the
+     * tree, so that step runs here on the abort path.
      */
-    private InternalAggregations aggregateViaIndexSearcher(
+    private AggregationsResult aggregateViaIndexSearcher(
         LanceFragmentQueryRequest request,
         LanceFragmentSearchContext searchContext,
         LanceFragmentIndexSearcher searcher,
         QueryShardContext qsc,
         Query query,
-        Weight sharedWeight
+        Weight sharedWeight,
+        CollectorKnobs knobs
     ) throws Exception {
         AggregatorFactories.Builder factoriesBuilder = request.aggregations();
         if (factoriesBuilder == null || factoriesBuilder.getAggregatorFactories().isEmpty()) {
-            return null;
+            return AggregationsResult.NONE;
         }
 
         AggregatorFactories factories = factoriesBuilder.build(qsc, null);
-        CollectorManager<Collector, InternalAggregations> manager = new SliceAggregationCollectorManager(searchContext, factories);
-        if (sharedWeight != null) {
-            return searcher.search(sharedWeight, manager);
+        SliceAggregationCollectorManager trees = new SliceAggregationCollectorManager(searchContext, factories);
+        CollectorKnobs.Wrapped<Collector, InternalAggregations> manager = knobs.wrap(trees);
+        Boolean terminatedEarly = knobs.terminatesEarly() ? Boolean.FALSE : null;
+        try {
+            InternalAggregations aggregations = sharedWeight != null
+                ? searcher.search(sharedWeight, manager)
+                : searcher.search(query, manager);
+            return new AggregationsResult(aggregations, terminatedEarly);
+        } catch (CollectorKnobs.Terminated terminated) {
+            for (Collector tree : manager.innersCreated()) {
+                searchContext.bucketCollectorProcessor().processPostCollection(tree);
+            }
+            return new AggregationsResult(manager.reduceCreated(), Boolean.TRUE);
         }
-        return searcher.search(query, manager);
     }
 
     /**

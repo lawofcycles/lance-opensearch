@@ -159,9 +159,27 @@ public final class LanceKnnQuery extends Query {
             this.cancellation = Objects.requireNonNull(cancellation, "cancellation must not be null");
         }
 
+        /**
+         * The hit's score as the scorer of its leaf reports it
+         * ({@code boost / (1 + distance)} from Lance's nearest scan), or
+         * no match. Reads the Weight's shard scan, so an explanation
+         * through the Weight the executor already ran costs no second
+         * scan.
+         */
         @Override
-        public Explanation explain(LeafReaderContext context, int doc) {
-            return Explanation.match(0f, "lance knn");
+        public Explanation explain(LeafReaderContext context, int doc) throws IOException {
+            ScorerSupplier supplier = scorerSupplier(context);
+            if (supplier == null) {
+                return Explanation.noMatch("no Lance knn hit on this leaf");
+            }
+            Scorer scorer = supplier.get(1L);
+            if (scorer.iterator().advance(doc) != doc) {
+                return Explanation.noMatch("not among the k nearest rows of the Lance knn query");
+            }
+            return Explanation.match(
+                scorer.score(),
+                "lance knn: boost / (1 + distance) from the Lance nearest scan" + (boost == 1f ? "" : ", boost " + boost)
+            );
         }
 
         /**

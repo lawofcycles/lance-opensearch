@@ -8,6 +8,7 @@ package org.opensearch.lance.dispatch;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -23,11 +24,9 @@ import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
-import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.ReaderUtil;
-import org.apache.lucene.index.StoredFieldVisitor;
 import org.apache.lucene.search.CollectorManager;
 import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.IndexSearcher;
@@ -43,17 +42,16 @@ import org.apache.lucene.search.SortedSetSortField;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopFieldCollector;
 import org.apache.lucene.search.TopFieldCollectorManager;
-import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.search.TopScoreDocCollectorManager;
+import org.apache.lucene.search.TotalHitCountCollector;
+import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.util.BytesRef;
 import org.lance.Dataset;
 import org.lance.ipc.ColumnOrdering;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
-import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.tasks.TaskCancelledException;
-import org.opensearch.index.mapper.Uid;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.lance.plan.execute.FragmentPlan;
@@ -61,22 +59,43 @@ import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceKnnQuery;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.internal.ContextIndexSearcher;
+import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.SortAndFormats;
 
 /**
- * The two hits phases of the fragment executor and the page they
- * produce: {@link #viaIndexSearcher} collects the page through Lucene's
- * top docs collectors over the fragment leaf readers, and
- * {@link #viaLanceSortedScan} reads it from one ordered, limited Lance
- * scan when the coordinator's plan pushed the page into the scan. Both
- * materialise the hit envelope ({@code _id}, {@code _source}, sort
- * values) through the fragment readers' stored fields path and report
- * every hit's Lance row address for the coordinator's tie break, so the
- * response shape does not depend on which phase answered.
+ * The hits phase of the fragment executor in two steps. The page is
+ * collected first, as Lucene {@link ScoreDoc}s over the fragment leaf
+ * readers: {@link #viaIndexSearcher} through Lucene's top docs
+ * collectors (with the request's {@code min_score} and
+ * {@code terminate_after} composed around them, see
+ * {@link CollectorKnobs}), or {@link #viaLanceSortedScan} from one
+ * ordered, limited Lance scan when the coordinator's plan pushed the
+ * page into the scan. {@link #materialise} then renders the hits of
+ * either page through {@link FragmentFetchPhase}, so the hit envelope
+ * ({@code _id}, {@code _source} under the request's source filter,
+ * {@code stored_fields}, {@code docvalue_fields}, {@code fields},
+ * {@code _explanation}, score and sort values) does not depend on which
+ * step collected the page, and reports every hit's Lance row address for
+ * the coordinator's tie break.
  */
 final class FragmentHitsPages {
 
     private FragmentHitsPages() {}
+
+    /**
+     * A collected page before the fetch phase: the top level doc ids
+     * with their scores and, for a sorted page, their sort values as
+     * {@link FieldDoc}s, in response order. {@code collected} is the
+     * match count the collection itself established, or {@code null}
+     * when the caller counts through {@code PlanExecutor.computeMatched}
+     * (no {@code min_score} or {@code terminate_after} on the request).
+     * {@code terminatedEarly} is {@code null} without
+     * {@code terminate_after}, else whether the bound stopped the
+     * collection.
+     */
+    record CollectedPage(ScoreDoc[] scoreDocs, TotalHits collected, Boolean terminatedEarly) {
+        static final CollectedPage EMPTY = new CollectedPage(new ScoreDoc[0], null, null);
+    }
 
     /**
      * The hits of one page together with the Lance row address
@@ -106,112 +125,149 @@ final class FragmentHitsPages {
     }
 
     /**
-     * Run the top-{@code size} query on the shared
-     * {@link ContextIndexSearcher} and materialise every hit through
-     * OpenSearch's stock stored-fields path
-     * ({@link LanceFragmentLeafReader#materialiseStoredFields}).
-     * The reader is built by the caller so hits and aggregations
-     * share one Lucene scan of the fragment subset.
+     * Total-hits threshold {@link IndexSearcher} hands its own top-docs
+     * collector managers ({@code IndexSearcher.TOTAL_HITS_THRESHOLD},
+     * which is private there). Without collector knobs only the
+     * {@code TopDocs.totalHits} accounting depends on it and the
+     * executor reads {@code hits.total} from
+     * {@code PlanExecutor.computeMatched}, so the value keeps the page
+     * identical to the one {@code IndexSearcher.search} would return.
+     */
+    private static final int TOTAL_HITS_THRESHOLD = 1000;
+
+    /**
+     * Collect the top-{@code size} page of {@code query} on the shared
+     * {@link ContextIndexSearcher} through the collector managers
+     * {@link IndexSearcher#search(Query, int)},
+     * {@link IndexSearcher#search(Query, int, Sort, boolean)} and their
+     * {@code searchAfter} overloads build internally: a
+     * {@link TopScoreDocCollectorManager} for score order, a
+     * {@link TopFieldCollectorManager} for a sort, each with
+     * {@code numHits} capped and the stock total hits threshold. The
+     * reader is built by the caller so hits and aggregations share one
+     * Lucene scan of the fragment subset.
      *
-     * <p>The score is the real Lucene score (BM25 for Lance FTS,
-     * cosine for Lance knn, 1.0 for {@link MatchAllDocsQuery}).
-     * Sort clauses go through the
-     * standard {@link IndexSearcher#search(Query, int, Sort)}
-     * call and per-hit sort values are captured for the coordinator's
-     * merge phase.
+     * <p>The score is the real Lucene score (BM25 for Lance FTS, cosine
+     * for Lance knn, 1.0 for {@link MatchAllDocsQuery}). A sorted page
+     * captures per-hit sort values for the coordinator's merge and,
+     * when {@code trackScores} ({@code track_scores}) is set, scores
+     * populated after the collection the way the 4 argument
+     * {@code search} overload does; without it a sorted page carries
+     * {@link Float#NaN} scores.
      *
-     * <p>{@code trackScores} follows the OpenSearch
-     * {@code track_scores} request flag. Sort-based Lucene search
-     * defaults to computing sort values only, leaving
-     * {@link ScoreDoc#score} at {@link Float#NaN}. When the caller
-     * asks for {@code track_scores:true} the 4 / 5 argument
-     * {@link IndexSearcher#search(Query, int, Sort, boolean)}
-     * / {@code searchAfter} overloads compute scores alongside the
-     * sort, so hits come back with numeric {@code _score} values
-     * and the coordinator's {@code max_score} sees real numbers.
-     * The score-only path ({@code sortAndFormats == null}) already
-     * collects scores through
-     * {@link IndexSearcher#search(Query, int)}
-     * and ignores this flag.
+     * <p>{@code after} is the {@code search_after} cursor as
+     * {@code SearchAfterBuilder.buildFieldDoc} typed it against the
+     * request's sort, or null. Its {@code doc} is pinned to the reader's
+     * last doc: Lucene reads the field as the tie break for docs sharing
+     * the cursor's sort values, and any value at or past the end of the
+     * reader excludes the tied docs, which is the shard path's
+     * {@code Integer.MAX_VALUE} semantics without tripping the
+     * {@code doc >= maxDoc} pre-flight of {@code IndexSearcher.searchAfter}.
      *
      * <p>When {@code sharedWeight} is non-null the collectors run
      * through {@link LanceFragmentIndexSearcher#search(Weight, CollectorManager)}
-     * with that Weight instead of letting {@link IndexSearcher}
-     * create one from {@code query}; the collector managers, the
-     * {@code numHits} cap and the total-hits threshold are the ones
-     * the stock {@code search} / {@code searchAfter} overloads build
-     * internally, so the returned page is the same either way. The
-     * caller passes a Weight only for a bare {@link LanceFtsQuery} or
-     * {@link LanceKnnQuery} so that its Lance scan is shared with the
-     * aggregators and, for FTS, the match count.
+     * with that Weight instead of letting {@link IndexSearcher} create
+     * one from {@code query}, so a bare {@link LanceFtsQuery} or
+     * {@link LanceKnnQuery}'s Lance scan is shared with the aggregators
+     * and, for FTS, the match count.
+     *
+     * <p>{@code knobs} composes {@code min_score} and
+     * {@code terminate_after} around the top docs collector; with either
+     * present the collection also establishes the match count
+     * ({@link CollectedPage#collected}): the top docs collector's total
+     * under the request's {@code track_total_hits} threshold for a page,
+     * a {@link TotalHitCountCollector} for {@code size: 0}, both of which
+     * see only the documents the knobs let through. Without knobs a
+     * {@code size: 0} request collects nothing here.
      */
-    static HitsPage viaIndexSearcher(
+    static CollectedPage viaIndexSearcher(
         LanceFragmentIndexSearcher searcher,
         Query query,
         Weight sharedWeight,
         SortAndFormats sortAndFormats,
-        Object[] searchAfter,
+        FieldDoc after,
         int size,
-        boolean trackScores
-    ) throws java.io.IOException {
+        boolean trackScores,
+        CollectorKnobs knobs,
+        int trackTotalHitsUpTo
+    ) throws IOException {
+        if (size <= 0 && !knobs.any()) {
+            return CollectedPage.EMPTY;
+        }
         if (size <= 0) {
-            return HitsPage.EMPTY;
+            CollectorKnobs.Wrapped<TotalHitCountCollector, Long> manager = knobs.wrap(new HitCountCollectorManager());
+            Boolean terminatedEarly = knobs.terminatesEarly() ? Boolean.FALSE : null;
+            long count;
+            try {
+                count = sharedWeight == null ? searcher.search(query, manager) : searcher.search(sharedWeight, manager);
+            } catch (CollectorKnobs.Terminated terminated) {
+                terminatedEarly = Boolean.TRUE;
+                count = manager.reduceCreated();
+            }
+            return new CollectedPage(new ScoreDoc[0], new TotalHits(count, TotalHits.Relation.EQUAL_TO), terminatedEarly);
         }
-        TopDocs topDocs;
-        if (searchAfter != null && sortAndFormats != null) {
-            // FieldDoc.doc is Lucene's tie-breaker for docs sharing
-            // the sort value with the cursor. Setting it just past
-            // the reader's last doc means "exclude the tied doc",
-            // which matches OpenSearch's usual search_after
-            // semantics. Integer.MAX_VALUE is rejected by Lucene's
-            // pre-flight (`>= maxDoc`), so pin the value to
-            // `maxDoc - 1` (or 0 when the reader is empty).
-            int maxDoc = searcher.getIndexReader().maxDoc();
-            int afterDoc = maxDoc > 0 ? maxDoc - 1 : 0;
-            FieldDoc after = new FieldDoc(afterDoc, 0f, searchAfter);
-            topDocs = sharedWeight == null
-                ? searcher.searchAfter(after, query, size, sortAndFormats.sort, trackScores)
-                : searchSortedWithWeight(searcher, sharedWeight, after, size, sortAndFormats.sort, trackScores);
-        } else if (sortAndFormats == null) {
-            topDocs = sharedWeight == null
-                ? searcher.search(query, size)
-                : searcher.search(sharedWeight, new TopScoreDocCollectorManager(cappedNumHits(searcher, size), null, TOTAL_HITS_THRESHOLD));
+        int threshold = knobs.any() ? totalHitsThreshold(trackTotalHitsUpTo) : TOTAL_HITS_THRESHOLD;
+        int numHits = cappedNumHits(searcher, size);
+        FieldDoc cursor = after == null ? null : pinnedCursor(searcher, after);
+        Sort sort = sortAndFormats == null ? null : sortAndFormats.sort.rewrite(searcher);
+        CollectorManager<?, ? extends TopDocs> topDocsManager;
+        if (sort == null) {
+            topDocsManager = new TopScoreDocCollectorManager(numHits, cursor, threshold);
         } else {
-            topDocs = sharedWeight == null
-                ? searcher.search(query, size, sortAndFormats.sort, trackScores)
-                : searchSortedWithWeight(searcher, sharedWeight, null, size, sortAndFormats.sort, trackScores);
+            topDocsManager = new TopFieldCollectorManager(sort, numHits, cursor, threshold);
         }
-        prefetchHitRows(searcher.getIndexReader(), topDocs.scoreDocs);
-        List<SearchHit> out = new ArrayList<>(topDocs.scoreDocs.length);
-        long[] rowAddrs = new long[topDocs.scoreDocs.length];
-        for (int i = 0; i < topDocs.scoreDocs.length; i++) {
-            ScoreDoc scoreDoc = topDocs.scoreDocs[i];
-            HitVisitor visitor = new HitVisitor();
-            searcher.storedFields().document(scoreDoc.doc, visitor);
-            SearchHit hit = new SearchHit(i, visitor.idString(), Collections.emptyMap(), Collections.emptyMap());
-            hit.score(scoreDoc.score);
-            if (visitor.source != null) {
-                hit.sourceRef(new BytesArray(visitor.source));
-            }
-            if (sortAndFormats != null && scoreDoc instanceof FieldDoc fieldDoc) {
-                hit.sortValues(fieldDoc.fields, sortAndFormats.formats);
-            }
-            out.add(hit);
-            rowAddrs[i] = rowAddressOf(searcher.getIndexReader(), scoreDoc.doc);
+        CollectorKnobs.Wrapped<?, ? extends TopDocs> manager = knobs.wrap(topDocsManager);
+        Boolean terminatedEarly = knobs.terminatesEarly() ? Boolean.FALSE : null;
+        TopDocs topDocs;
+        try {
+            topDocs = sharedWeight == null ? searcher.search(query, manager) : searcher.search(sharedWeight, manager);
+        } catch (CollectorKnobs.Terminated terminated) {
+            terminatedEarly = Boolean.TRUE;
+            topDocs = manager.reduceCreated();
         }
-        return new HitsPage(out, rowAddrs);
+        if (sort != null && trackScores) {
+            if (sharedWeight == null) {
+                TopFieldCollector.populateScores(topDocs.scoreDocs, searcher, query);
+            } else {
+                populateScores(topDocs.scoreDocs, searcher, sharedWeight);
+            }
+        }
+        return new CollectedPage(topDocs.scoreDocs, knobs.any() ? topDocs.totalHits : null, terminatedEarly);
     }
 
     /**
-     * Total-hits threshold {@link IndexSearcher}
-     * hands its own top-docs collector managers ({@code
-     * IndexSearcher.TOTAL_HITS_THRESHOLD}, which is private there).
-     * Only the {@code TopDocs.totalHits} accounting depends on it;
-     * this class reads {@code hits.total} from {@link PlanExecutor#computeMatched}
-     * and never from the collector, so the value just keeps the
-     * Weight-driven page identical to the Query-driven one.
+     * The total hits threshold of a page whose collection also counts
+     * the matches: the request's {@code track_total_hits} bound, every
+     * match for {@code track_total_hits: true}, and a single hit when
+     * tracking is off (the coordinator leaves {@code hits.total} out
+     * then).
      */
-    private static final int TOTAL_HITS_THRESHOLD = 1000;
+    private static int totalHitsThreshold(int trackTotalHitsUpTo) {
+        if (trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
+            return Integer.MAX_VALUE;
+        }
+        if (trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_DISABLED) {
+            return 1;
+        }
+        return trackTotalHitsUpTo;
+    }
+
+    /** One {@link TotalHitCountCollector} per slice, the counts summed. */
+    private static final class HitCountCollectorManager implements CollectorManager<TotalHitCountCollector, Long> {
+        @Override
+        public TotalHitCountCollector newCollector() {
+            return new TotalHitCountCollector();
+        }
+
+        @Override
+        public Long reduce(Collection<TotalHitCountCollector> collectors) {
+            long total = 0L;
+            for (TotalHitCountCollector collector : collectors) {
+                total += collector.getTotalHits();
+            }
+            return total;
+        }
+    }
 
     /**
      * {@code numHits} cap {@link IndexSearcher#searchAfter}
@@ -225,33 +281,13 @@ final class FragmentHitsPages {
     }
 
     /**
-     * Sorted top-{@code size} page driven by a caller-built
-     * {@link Weight}: the same steps as
-     * {@link IndexSearcher#searchAfter(ScoreDoc, Query, int, Sort, boolean)}
-     * ({@code Sort.rewrite}, {@link TopFieldCollectorManager} with the
-     * stock threshold, score population when {@code trackScores})
-     * with the Weight substituted for the Query.
+     * The cursor with its tie break doc pinned to the reader's last doc
+     * (or 0 on an empty reader); see {@link #viaIndexSearcher}.
      */
-    private static TopFieldDocs searchSortedWithWeight(
-        LanceFragmentIndexSearcher searcher,
-        Weight weight,
-        FieldDoc after,
-        int size,
-        Sort sort,
-        boolean trackScores
-    ) throws IOException {
-        Sort rewrittenSort = sort.rewrite(searcher);
-        TopFieldCollectorManager manager = new TopFieldCollectorManager(
-            rewrittenSort,
-            cappedNumHits(searcher, size),
-            after,
-            TOTAL_HITS_THRESHOLD
-        );
-        TopFieldDocs topDocs = searcher.search(weight, manager);
-        if (trackScores) {
-            populateScores(topDocs.scoreDocs, searcher, weight);
-        }
-        return topDocs;
+    private static FieldDoc pinnedCursor(LanceFragmentIndexSearcher searcher, FieldDoc after) {
+        int maxDoc = searcher.getIndexReader().maxDoc();
+        int afterDoc = maxDoc > 0 ? maxDoc - 1 : 0;
+        return new FieldDoc(afterDoc, after.score, after.fields);
     }
 
     /**
@@ -283,6 +319,61 @@ final class FragmentHitsPages {
             }
             scoreDoc.score = scorer.score();
         }
+    }
+
+    /**
+     * Render the hits of a collected page: one Lance take per leaf for
+     * the rows behind the page ({@link #prefetchHitRows}), the fetch
+     * phase over the page's doc ids, then the score and, for a sorted
+     * page, the sort values of every hit from its {@link ScoreDoc} (a
+     * {@code _score} clause's value becoming the hit's score), as
+     * {@code SearchPhaseController} stamps them on the shard path. The
+     * row address of every hit rides along for the coordinator.
+     */
+    static HitsPage materialise(
+        LanceFragmentSearchContext searchContext,
+        FragmentFetchPhase fetchPhase,
+        IndexReader reader,
+        ScoreDoc[] scoreDocs,
+        SortAndFormats sortAndFormats
+    ) throws IOException {
+        if (scoreDocs.length == 0) {
+            return HitsPage.EMPTY;
+        }
+        prefetchHitRows(reader, scoreDocs);
+        int[] docIds = new int[scoreDocs.length];
+        for (int i = 0; i < scoreDocs.length; i++) {
+            docIds[i] = scoreDocs[i].doc;
+        }
+        SearchHit[] hits = fetchPhase.fetch(searchContext, docIds);
+        // A sort with a _score clause carries the score as that clause's
+        // sort value; SearchPhaseController copies it into _score on the
+        // shard path, whether or not track_scores is set.
+        int sortScoreIndex = -1;
+        if (sortAndFormats != null) {
+            SortField[] sortFields = sortAndFormats.sort.getSort();
+            for (int i = 0; i < sortFields.length; i++) {
+                if (sortFields[i].getType() == SortField.Type.SCORE) {
+                    sortScoreIndex = i;
+                }
+            }
+        }
+        List<SearchHit> out = new ArrayList<>(hits.length);
+        long[] rowAddrs = new long[hits.length];
+        for (int i = 0; i < hits.length; i++) {
+            ScoreDoc scoreDoc = scoreDocs[i];
+            SearchHit hit = hits[i];
+            hit.score(scoreDoc.score);
+            if (sortAndFormats != null && scoreDoc instanceof FieldDoc fieldDoc) {
+                hit.sortValues(fieldDoc.fields, sortAndFormats.formats);
+                if (sortScoreIndex != -1 && fieldDoc.fields[sortScoreIndex] instanceof Number score) {
+                    hit.score(score.floatValue());
+                }
+            }
+            out.add(hit);
+            rowAddrs[i] = rowAddressOf(reader, scoreDoc.doc);
+        }
+        return new HitsPage(out, rowAddrs);
     }
 
     /**
@@ -333,11 +424,10 @@ final class FragmentHitsPages {
      * on a 10M-row table at tens of milliseconds where the Lucene
      * collector path needed the whole sort column loaded), and the
      * batches come back already in the requested order. Each row's
-     * {@code _rowaddr} is decoded to (fragment id, doc id) and routed
-     * to the matching leaf, which fetches {@code _id} / {@code _source}
-     * through the same {@link LanceFragmentLeafReader#prefetchRows} /
-     * {@link LanceFragmentLeafReader#materialiseStoredFields} path the
-     * Lucene hits phase uses, so the response shape is identical.
+     * {@code _rowaddr} is decoded to (fragment id, doc id), routed to
+     * the matching leaf and reported as a top level {@link FieldDoc}
+     * so {@link #materialise} renders it through the same fetch phase
+     * as a collector page.
      *
      * <p>Sort values are read from the projected columns and typed the
      * way the request's Lucene {@link SortField}s
@@ -346,9 +436,11 @@ final class FragmentHitsPages {
      * clients can feed them back as {@code search_after}. Arrow nulls
      * become the missing-value object OpenSearch installed on the
      * SortField for the request's {@code missing} / direction
-     * combination.
+     * combination. The score is 1.0 under {@code track_scores} and
+     * {@link Float#NaN} otherwise, as for a sorted collector page over
+     * a scalar filter.
      */
-    static HitsPage viaLanceSortedScan(
+    static CollectedPage viaLanceSortedScan(
         Dataset dataset,
         LanceFragmentQueryRequest request,
         List<ColumnOrdering> orderings,
@@ -360,11 +452,11 @@ final class FragmentHitsPages {
         LanceCancellation cancellation
     ) throws IOException {
         SortField[] sortFields = sortAndFormats.sort.getSort();
-        Map<Integer, LanceFragmentLeafReader> leafByFragment = new HashMap<>();
+        Map<Integer, LeafReaderContext> leafByFragment = new HashMap<>();
         for (LeafReaderContext ctx : reader.leaves()) {
             LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(ctx.reader());
             if (lance != null) {
-                leafByFragment.put(lance.fragmentId(), lance);
+                leafByFragment.put(lance.fragmentId(), ctx);
             }
         }
         List<String> sortColumns = new ArrayList<>();
@@ -381,8 +473,8 @@ final class FragmentHitsPages {
         if (filterSql != null) {
             builder = builder.filter(filterSql);
         }
-        // Ordered (fragment id, doc id, raw sort values) triples in the
-        // order Lance returned them, which is the response order.
+        // Ordered (fragment id, row offset, raw sort values) triples in
+        // the order Lance returned them, which is the response order.
         List<long[]> addresses = new ArrayList<>(fetch);
         List<Object[]> sortValues = new ArrayList<>(fetch);
         try (LanceScanner scanner = dataset.newScan(builder.build()); ArrowReader arrowReader = scanner.scanBatches()) {
@@ -409,37 +501,15 @@ final class FragmentHitsPages {
         } catch (Exception e) {
             throw new IOException(e);
         }
-        // One take per leaf for the rows behind the page, then render
-        // each hit in Lance's order. The decoded offsets are physical
-        // rows; the leaf's stored-fields and prefetch paths are keyed by
-        // doc id, so each offset maps through docOfRow (identity unless
-        // the table has nested columns).
-        Map<Integer, List<Integer>> docsByFragment = new HashMap<>();
-        for (long[] address : addresses) {
-            LanceFragmentLeafReader lance = leafByFragment.get((int) address[0]);
-            if (lance == null) {
-                continue;
-            }
-            docsByFragment.computeIfAbsent((int) address[0], k -> new ArrayList<>()).add(lance.docOfRow((int) address[1]));
-        }
-        for (Map.Entry<Integer, List<Integer>> entry : docsByFragment.entrySet()) {
-            LanceFragmentLeafReader lance = leafByFragment.get(entry.getKey());
-            if (lance == null) {
-                continue;
-            }
-            int[] docIds = new int[entry.getValue().size()];
-            for (int i = 0; i < docIds.length; i++) {
-                docIds[i] = entry.getValue().get(i);
-            }
-            lance.prefetchRows(docIds);
-        }
-        List<SearchHit> out = new ArrayList<>(addresses.size());
-        long[] rowAddrs = new long[addresses.size()];
+        // The decoded offsets are physical rows; the leaf's doc ids map
+        // through docOfRow (identity unless the table has nested
+        // columns), and the top level doc id adds the leaf's docBase.
         float score = request.trackScores() ? 1.0f : Float.NaN;
+        List<ScoreDoc> page = new ArrayList<>(addresses.size());
         for (int i = 0; i < addresses.size(); i++) {
             long[] address = addresses.get(i);
-            LanceFragmentLeafReader lance = leafByFragment.get((int) address[0]);
-            if (lance == null) {
+            LeafReaderContext ctx = leafByFragment.get((int) address[0]);
+            if (ctx == null) {
                 // The scan was pinned to fragmentIds, which is the same
                 // list the reader was opened with, so every address
                 // should map to a leaf. Skipping rather than failing
@@ -447,18 +517,10 @@ final class FragmentHitsPages {
                 // from taking the whole page down.
                 continue;
             }
-            HitVisitor visitor = new HitVisitor();
-            lance.materialiseStoredFields(lance.docOfRow((int) address[1]), visitor);
-            SearchHit hit = new SearchHit(out.size(), visitor.idString(), Collections.emptyMap(), Collections.emptyMap());
-            hit.score(score);
-            if (visitor.source != null) {
-                hit.sourceRef(new BytesArray(visitor.source));
-            }
-            hit.sortValues(sortValues.get(i), sortAndFormats.formats);
-            rowAddrs[out.size()] = (address[0] << 32) | address[1];
-            out.add(hit);
+            LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(ctx.reader());
+            page.add(new FieldDoc(ctx.docBase + lance.docOfRow((int) address[1]), score, sortValues.get(i)));
         }
-        return new HitsPage(out, out.size() == rowAddrs.length ? rowAddrs : Arrays.copyOf(rowAddrs, out.size()));
+        return new CollectedPage(page.toArray(new ScoreDoc[0]), null, null);
     }
 
     /**
@@ -508,41 +570,10 @@ final class FragmentHitsPages {
     }
 
     /**
-     * StoredFieldVisitor that captures the {@code _id} and
-     * {@code _source} bytes {@link LanceFragmentLeafReader#materialiseStoredFields}
-     * emits per hit. Reused for every doc in {@link
-     * #viaIndexSearcher} to avoid allocating a new visitor
-     * per doc; the two capture fields are reset by the visitor
-     * itself on each {@code document} call.
+     * The knobs of {@code request} as a {@link CollectorKnobs}, for the
+     * hits and the aggregation collections alike.
      */
-    private static final class HitVisitor extends StoredFieldVisitor {
-
-        private byte[] source;
-        private byte[] idBytes;
-
-        @Override
-        public Status needsField(FieldInfo fieldInfo) {
-            String name = fieldInfo.name;
-            if ("_id".equals(name) || "_source".equals(name)) {
-                return Status.YES;
-            }
-            return Status.NO;
-        }
-
-        @Override
-        public void binaryField(FieldInfo fieldInfo, byte[] value) {
-            if ("_id".equals(fieldInfo.name)) {
-                idBytes = value;
-            } else if ("_source".equals(fieldInfo.name)) {
-                source = value;
-            }
-        }
-
-        String idString() {
-            if (idBytes == null) {
-                return "";
-            }
-            return Uid.decodeId(idBytes);
-        }
+    static CollectorKnobs knobsOf(LanceFragmentQueryRequest request) {
+        return new CollectorKnobs(request.minScore(), request.terminateAfter());
     }
 }

@@ -433,9 +433,27 @@ public final class LanceFtsQuery extends Query {
             this.cancellation = Objects.requireNonNull(cancellation, "cancellation must not be null");
         }
 
+        /**
+         * The hit's score as the scorer of its leaf reports it (the
+         * BM25 score Lance's inverted index computed, times the boost),
+         * or no match. Reads the Weight's shard scan, so an explanation
+         * through the Weight the executor already ran costs no second
+         * scan; a fresh Weight runs the scan once for all its hits.
+         */
         @Override
-        public Explanation explain(LeafReaderContext context, int doc) {
-            return Explanation.match(0f, "lance fts");
+        public Explanation explain(LeafReaderContext context, int doc) throws IOException {
+            ScorerSupplier supplier = scorerSupplier(context);
+            if (supplier == null) {
+                return Explanation.noMatch("no Lance full text hit on this leaf");
+            }
+            Scorer scorer = supplier.get(1L);
+            if (scorer.iterator().advance(doc) != doc) {
+                return Explanation.noMatch("not a hit of the Lance full text query");
+            }
+            return Explanation.match(
+                scorer.score(),
+                "lance fts: BM25 score from the Lance inverted index of " + query().columns() + (boost == 1f ? "" : ", boost " + boost)
+            );
         }
 
         /**
