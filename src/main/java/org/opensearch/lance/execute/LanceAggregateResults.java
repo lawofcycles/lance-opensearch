@@ -46,6 +46,20 @@ import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram
  * scans and assembles the buckets. A null from {@link #resolve} sends
  * the request to the Lucene aggregators.
  *
+ * <p>This class is the public surface and the wiring; the work is
+ * split by responsibility over four package private collaborators.
+ * {@link AggregateSpecResolver} walks the request tree against the
+ * mapping and the pushed aggregate and produces a
+ * {@link ResolvedAggregate} (the spec records: levels, composite
+ * sources, metrics by slot, the top-k selection).
+ * {@link AggregateScanRunner} owns the Lance scans: the fragment group
+ * fan out, the percentiles bin rounds and the row loops that fill the
+ * {@link GroupAggregationState} (the columnar group table, the metric
+ * columns, the bounded top-k selection and their merge).
+ * {@link AggregationResultAssembler} turns the merged state into the
+ * {@link InternalAggregation} objects per kind. The Arrow scalar
+ * readers the three share are in {@link ArrowRowValues}.
+ *
  * <p>Semantics reproduced from the shard aggregators:
  * <ul>
  *   <li>Rows whose bucket key is null form no bucket at that level
