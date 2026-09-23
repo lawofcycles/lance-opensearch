@@ -48,6 +48,7 @@ The end-to-end walkthrough (install into OpenSearch, prepare a Lance table, regi
 - [docs/getting-started.md](docs/getting-started.md) — Build, install, prepare a table, run the query shapes.
 - [docs/features.md](docs/features.md) — Feature reference by concern.
 - [docs/limitations.md](docs/limitations.md) — Known limitations and shard-path fall-throughs.
+- [docs/architecture.md](docs/architecture.md) — Developer guide to the codebase: directory layout, request flows, planner internals, extension points.
 - [CHANGELOG.md](CHANGELOG.md) — Release notes.
 
 ## Feedback
