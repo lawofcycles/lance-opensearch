@@ -126,6 +126,7 @@ public final class LanceStatsCollector {
         long admissionRejections = FtsAdmission.rejections();
         long admissionLastEstimate = FtsAdmission.lastEstimateBytes();
         long admissionAvailable = Math.max(0L, FtsAdmission.availablePhysicalMemoryBytes());
+        long admissionRetained = FtsAdmission.retainedCreditBytes();
         long heapFallbackBytes = HeapFallbackStats.bytes();
         long heapFallbackRejections = HeapFallbackStats.rejections();
         String warmUpMode = indexWarmer == null ? "none" : indexWarmer.mode().settingValue();
@@ -171,6 +172,7 @@ public final class LanceStatsCollector {
                 admissionRejections,
                 admissionLastEstimate,
                 admissionAvailable,
+                admissionRetained,
                 warmUpMode,
                 warmUps,
                 indices,
@@ -207,6 +209,7 @@ public final class LanceStatsCollector {
             admissionRejections,
             admissionLastEstimate,
             admissionAvailable,
+            admissionRetained,
             warmUpMode,
             warmUps,
             indices,
