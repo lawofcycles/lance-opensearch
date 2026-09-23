@@ -13,6 +13,7 @@ import org.apache.calcite.plan.ConventionTraitDef;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelOptRule;
+import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgramBuilder;
 import org.apache.calcite.plan.volcano.VolcanoPlanner;
@@ -37,6 +38,10 @@ import org.opensearch.lance.plan.rules.PlanToShardPathRule;
 import org.opensearch.lance.plan.rules.PushAggregateIntoLanceScan;
 import org.opensearch.lance.plan.rules.PushFilterIntoLanceScan;
 import org.opensearch.lance.plan.rules.PushSortLimitIntoLanceScan;
+import org.opensearch.lance.plan.traits.Accuracy;
+import org.opensearch.lance.plan.traits.PlanRequirement;
+import org.opensearch.lance.plan.traits.TieStability;
+import org.opensearch.lance.plan.traits.UnmetPlanRequirementException;
 
 /**
  * Assembles the Calcite planner objects for Lance backed indexes: a Volcano
@@ -73,7 +78,11 @@ public final class LancePlannerFactory {
      * precision above 3 and {@code DECIMAL(20, 0)} survive. Registering
      * the convention trait def is what makes conventions available to
      * the planner; the individual conventions need no explicit
-     * registration. The metadata provider is
+     * registration. The {@link Accuracy} and {@link TieStability} defs
+     * are registered next to it, so every trait set the cluster hands
+     * out carries a value for each and a request can demand one at the
+     * root ({@link #plan(RelNode, CostInputs, PlanRequirement)}). The
+     * metadata provider is
      * {@link LanceRelMetadataProvider#INSTANCE}: Lance's row count and
      * distinct row count handlers for the scan, Calcite's defaults for
      * everything else.
@@ -84,6 +93,13 @@ public final class LancePlannerFactory {
         // fills it before the first cost is computed.
         VolcanoPlanner planner = new VolcanoPlanner(costFactory, Contexts.of(new CostInputsHolder()));
         planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+        // The two request demandable traits. Registering the defs puts
+        // their defaults (the weakest declaration) into every trait set
+        // the cluster hands out; the physical operators replace them
+        // with what they guarantee, and plan(...) places what a request
+        // demands on the root.
+        planner.addRelTraitDef(Accuracy.Def.INSTANCE);
+        planner.addRelTraitDef(TieStability.Def.INSTANCE);
         for (PushAggregateIntoLanceScan rule : PushAggregateIntoLanceScan.rules()) {
             planner.addRule(rule);
         }
@@ -158,16 +174,43 @@ public final class LancePlannerFactory {
      * surface as a request error.
      */
     public RelNode plan(RelNode logical, CostInputs inputs) {
+        return plan(logical, inputs, PlanRequirement.NONE);
+    }
+
+    /**
+     * {@link #plan(RelNode, CostInputs)} under a request's
+     * {@link PlanRequirement}. The first Volcano pass is the one above,
+     * demanding the convention alone; when its cheapest plan already
+     * declares the demanded {@link Accuracy} and {@link TieStability}
+     * (the common case: every hits page and every exact aggregate is
+     * {@code EXACT}, a column ordered page is {@code STABLE_KEY}) it is
+     * returned as is. Otherwise the same cluster is asked again with the
+     * two demanded values on the root trait set, so a costlier plan
+     * that meets the demand wins over the cheaper one that does not;
+     * when no plan declares them the Volcano planner raises
+     * {@code CannotPlanException} and this method raises
+     * {@link UnmetPlanRequirementException} naming the demand and what
+     * the cheapest plan offers, which the caller answers as the
+     * request's error. The convention fallbacks of the first pass (the
+     * shard path root, the logical plan) are untouched: they are only
+     * reached when nothing plans at all, and a demand never turns them
+     * into an error.
+     *
+     * @throws UnmetPlanRequirementException when a plan exists but none
+     *     declares the demanded traits
+     */
+    public RelNode plan(RelNode logical, CostInputs inputs, PlanRequirement requirement) {
         VolcanoPlanner planner = (VolcanoPlanner) logical.getCluster().getPlanner();
         CostInputsHolder holder = planner.getContext().unwrap(CostInputsHolder.class);
         if (holder != null) {
             holder.set(inputs);
         }
-        RelNode root = planner.changeTraits(logical, logical.getTraitSet().replace(LuceneConvention.INSTANCE));
+        RelTraitSet luceneRoot = logical.getTraitSet().replace(LuceneConvention.INSTANCE);
+        RelNode root = planner.changeTraits(logical, luceneRoot);
         planner.setRoot(root);
+        RelNode best;
         try {
-            RelNode best = planner.findBestExp();
-            return best instanceof LuceneHandoffExec handoff ? handoff.getInput() : best;
+            best = planner.findBestExp();
         } catch (RelOptPlanner.CannotPlanException noLucenePlan) {
             return shardPathPlan(planner, logical);
         } catch (RuntimeException plannerFailure) {
@@ -178,6 +221,20 @@ public final class LancePlannerFactory {
             );
             return logical;
         }
+        if (requirement.isNone() || requirement.satisfiedBy(best.getTraitSet())) {
+            return unwrapHandoff(best);
+        }
+        try {
+            planner.setRoot(planner.changeTraits(logical, requirement.applyTo(luceneRoot)));
+            return unwrapHandoff(planner.findBestExp());
+        } catch (RelOptPlanner.CannotPlanException nothingMeetsTheDemand) {
+            throw new UnmetPlanRequirementException(requirement, best.getTraitSet());
+        }
+    }
+
+    /** The scan itself for a plan that arrived as the zero cost handoff over it, {@code best} otherwise. */
+    private static RelNode unwrapHandoff(RelNode best) {
+        return best instanceof LuceneHandoffExec handoff ? handoff.getInput() : best;
     }
 
     /**
