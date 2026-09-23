@@ -21,10 +21,10 @@ import org.opensearch.common.hash.MurmurHash3;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.util.BitMixer;
 import org.opensearch.common.util.Comparators;
-import org.opensearch.lance.execute.LanceAggregateResults.KeyKind;
-import org.opensearch.lance.execute.LanceAggregateResults.Metric;
-import org.opensearch.lance.execute.LanceAggregateResults.MetricKind;
-import org.opensearch.lance.execute.LanceAggregateResults.TopKSpec;
+import org.opensearch.lance.execute.AggregateSpecResolver.KeyKind;
+import org.opensearch.lance.execute.AggregateSpecResolver.Metric;
+import org.opensearch.lance.execute.AggregateSpecResolver.MetricKind;
+import org.opensearch.lance.execute.AggregateSpecResolver.TopKSpec;
 import org.opensearch.search.aggregations.metrics.HyperLogLogPlusPlus;
 import org.opensearch.search.aggregations.metrics.TDigestState;
 
