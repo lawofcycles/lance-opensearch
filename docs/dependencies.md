@@ -240,7 +240,8 @@ shape it.
   narrows what a table URI may point at; `lance.allowed_table_roots` is
   the control. The plugin's own Java file access outside the core grants
   is the read of `/proc/meminfo` by `FtsAdmission`, which has an explicit
-  grant.
+  grant (as does its read of `/proc/self/status`, which the core policy
+  also grants).
 
 The policy language expands system properties (`${java.io.tmpdir}`,
 `${/}`) and the `${codebase.<jar>}` names of the plugin's own jars; it has
