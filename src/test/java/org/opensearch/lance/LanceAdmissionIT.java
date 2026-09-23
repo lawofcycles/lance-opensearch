@@ -163,6 +163,16 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             // the kernel's kibibyte granularity could show.
             updateClusterSetting("lance.test.index_cache_shard_share", "\"1b\"");
             try {
+                // The pool of memory earlier admitted scans left behind
+                // outlives the other tests of this cluster, and a pool
+                // above 356 bytes would admit the refusal below on its
+                // own. An admission at a reading above every earlier one
+                // starts the pool over with nothing retained.
+                updateClusterSetting("lance.test.admission_available_memory", "[\"1pb\"]");
+                String fresh = readAll(postJson("/" + indexName + "/_search", UNBOUNDED));
+                assertEquals(8, extractIntPath(fresh, "hits", "total", "value"));
+                assertEquals(admissionStats().toString(), 0L, ((Number) admissionStats().get("retained_bytes")).longValue());
+
                 // A reading of 1000 bytes and a headroom of 500 leave 500
                 // for an 856 byte estimate. Nothing has been retained
                 // yet, so the shape is refused and the message says so.

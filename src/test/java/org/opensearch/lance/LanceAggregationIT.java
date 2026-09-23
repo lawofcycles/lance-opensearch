@@ -1344,8 +1344,12 @@ public class LanceAggregationIT extends LanceRestTestCase {
      * through the fragment path and, with the {@link #onShardPath}
      * highlighter added, through the shard path, and assert the two
      * responses carry the same {@code hits.total} and the same
-     * {@code aggregations} block (the oracle's own key aside). Returns
-     * the fragment path response.
+     * {@code aggregations} block (the oracle's own key aside). Numbers
+     * are compared with a relative tolerance of 1e-9: the two paths add
+     * the same values in a different order (one collector per fragment
+     * leaf against one over the whole reader), so the last bits of a
+     * floating point moment ({@code matrix_stats} variance, skewness)
+     * can differ. Returns the fragment path response.
      */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> assertShardPathAgrees(String index, String shape) throws IOException {
@@ -1368,7 +1372,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             ((Map<String, Object>) shardPath.get("hits")).get("total"),
             ((Map<String, Object>) fragmentPath.get("hits")).get("total")
         );
-        assertEquals(shape, withoutShardPathOracle(shardPath.get("aggregations")), fragmentPath.get("aggregations"));
+        assertJsonClose(shape, withoutShardPathOracle(shardPath.get("aggregations")), fragmentPath.get("aggregations"));
         return fragmentPath;
     }
 
@@ -1382,6 +1386,41 @@ public class LanceAggregationIT extends LanceRestTestCase {
         options.setWarningsHandler(WarningsHandler.PERMISSIVE);
         request.setOptions(options);
         return client().performRequest(request);
+    }
+
+    /**
+     * {@code assertEquals} over parsed JSON, except that two numbers are
+     * equal when they are within a relative 1e-9 of each other (or both
+     * are NaN); maps and lists recurse, everything else compares with
+     * {@code equals}. {@code path} names the element in the failure.
+     */
+    @SuppressWarnings("unchecked")
+    private static void assertJsonClose(String path, Object expected, Object actual) {
+        if (expected instanceof Map<?, ?> expectedMap && actual instanceof Map<?, ?> actualMap) {
+            assertEquals(path + ": keys", expectedMap.keySet(), actualMap.keySet());
+            for (Map.Entry<?, ?> entry : expectedMap.entrySet()) {
+                assertJsonClose(path + "." + entry.getKey(), entry.getValue(), actualMap.get(entry.getKey()));
+            }
+            return;
+        }
+        if (expected instanceof List<?> expectedList && actual instanceof List<?> actualList) {
+            assertEquals(path + ": size", expectedList.size(), actualList.size());
+            for (int i = 0; i < expectedList.size(); i++) {
+                assertJsonClose(path + "[" + i + "]", expectedList.get(i), actualList.get(i));
+            }
+            return;
+        }
+        if (expected instanceof Number expectedNumber && actual instanceof Number actualNumber) {
+            double e = expectedNumber.doubleValue();
+            double a = actualNumber.doubleValue();
+            if (Double.isNaN(e) && Double.isNaN(a)) {
+                return;
+            }
+            double scale = Math.max(Math.abs(e), Math.abs(a));
+            assertTrue(path + ": expected " + e + " got " + a, Math.abs(e - a) <= 1e-9 * Math.max(scale, 1e-300) || e == a);
+            return;
+        }
+        assertEquals(path, expected, actual);
     }
 
     @SuppressWarnings("unchecked")
@@ -1506,12 +1545,12 @@ public class LanceAggregationIT extends LanceRestTestCase {
             long fanOut = fanOutLogLines(index);
             assertEquals("every request above took the fragment path", fanOutBefore + requests, fanOut);
 
-            // A filter bucket over a Lance query and a scripted metric stay
-            // on the shard path: they answer, and leave no fan-out line.
-            String ftsFilter = "{\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}}}}}";
-            Map<String, Object> viaShardOnly = parse(readAll(postJson("/" + index + "/_search", ftsFilter)));
-            assertEquals(48, ((Number) aggregation(viaShardOnly, "f").get("doc_count")).intValue());
-            assertEquals(fanOut, fanOutLogLines(index));
+            // A filter bucket over a Lance query runs on the fragment path
+            // too and answers what the shard path answers.
+            String ftsFilter = "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}}}}";
+            Map<String, Object> ftsBucket = assertShardPathAgrees(index, ftsFilter);
+            assertEquals(48, ((Number) aggregation(ftsBucket, "f").get("doc_count")).intValue());
+            assertEquals(fanOut + 1, fanOutLogLines(index));
         }
     }
 
