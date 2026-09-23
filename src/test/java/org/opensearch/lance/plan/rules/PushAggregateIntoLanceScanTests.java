@@ -31,10 +31,11 @@ import java.util.List;
 
 /**
  * The pushdown rule: it replaces the aggregate with the scan carrying
- * the producer's bytes for the three operand shapes, it leaves the
- * plan alone when the producer refuses an expression or when a metric
- * of the tree is a {@code cardinality}, and the Volcano planner
- * terminates either way.
+ * the producer's bytes for the four operand shapes, the filtered shapes
+ * carry the filter's Lance SQL on the pushed aggregate, it leaves the
+ * plan alone when the producer refuses an expression, when the filter
+ * has no SQL spelling or when a metric of the tree is a
+ * {@code cardinality}, and the Volcano planner terminates either way.
  */
 public class PushAggregateIntoLanceScanTests extends OpenSearchTestCase {
 
@@ -117,6 +118,94 @@ public class PushAggregateIntoLanceScanTests extends OpenSearchTestCase {
         PushedOperation.PushedAggregate pushed = pushedRoot(physical);
         AggregateRel rel = decode(pushed.substrait());
         assertEquals(2, rel.getMeasuresCount());
+        // The filter is not in the bytes; it rides next to them as the
+        // SQL the executor hands to the scan.
+        assertEquals("rating > 5", pushed.filterSql());
+        assertTrue("the digest names the filter: " + physical, physical.getDigest().contains("filter=rating > 5"));
+    }
+
+    public void testFiresOnAggregateOverProjectOverFilterOverScan() throws Exception {
+        // The chain the request translator builds for a bucket tree
+        // under a query: the group key projection over the query filter.
+        RelNode logical = PlanTestFixtures.translate(
+            PlanTestFixtures.parse(
+                "{\"size\":0,\"query\":{\"term\":{\"category\":\"c0\"}},\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}"
+            )
+        );
+        RelNode physical = volcanoPlan(logical);
+        PushedOperation.PushedAggregate pushed = pushedRoot(physical);
+        AggregateRel rel = decode(pushed.substrait());
+        assertEquals(1, rel.getGroupingsCount());
+        assertEquals(1, rel.getGroupings(0).getGroupingExpressionsCount());
+        assertEquals("category = 'c0'", pushed.filterSql());
+        assertEquals(logical.getRowType(), physical.getRowType());
+    }
+
+    public void testFilterlessTreeCarriesNoFilterSql() throws Exception {
+        RelNode logical = PlanTestFixtures.translate(
+            PlanTestFixtures.parse("{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}")
+        );
+        PushedOperation.PushedAggregate pushed = pushedRoot(volcanoPlan(logical));
+        assertNull(pushed.filterSql());
+        assertFalse(pushed.toString().contains("filter="));
+    }
+
+    public void testTheSameAggregateOverDifferentFiltersHasDifferentDigests() throws Exception {
+        RelNode first = volcanoPlan(
+            PlanTestFixtures.translate(
+                PlanTestFixtures.parse(
+                    "{\"size\":0,\"query\":{\"term\":{\"category\":\"c0\"}},\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}"
+                )
+            )
+        );
+        RelNode second = volcanoPlan(
+            PlanTestFixtures.translate(
+                PlanTestFixtures.parse(
+                    "{\"size\":0,\"query\":{\"term\":{\"category\":\"c1\"}},\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}"
+                )
+            )
+        );
+        assertNotEquals(first.getDigest(), second.getDigest());
+    }
+
+    public void testDoesNotFireOnAFilterWithoutASqlSpelling() {
+        // rating + 1 = 2 has no Lance SQL form, so neither filtered
+        // shape pushes: the filter cannot travel in the bytes and must
+        // not be dropped, and no Lance convention plan exists.
+        RelBuilder builder = PlanTestFixtures.factory()
+            .relBuilder(PlanTestFixtures.model().schema())
+            .transform(config -> config.withSimplify(false));
+        builder.scan(LancePlannerFactory.SCHEMA_NAME, "idx");
+        builder.filter(
+            builder.call(
+                SqlStdOperatorTable.EQUALS,
+                builder.call(SqlStdOperatorTable.PLUS, builder.field("rating"), builder.literal(1)),
+                builder.literal(2)
+            )
+        );
+        RelNode filtered = builder.build();
+        LanceAggregate metricOnly = LanceAggregate.create(
+            filtered,
+            ImmutableBitSet.of(),
+            List.of(sumCall(filtered, "s", 1)),
+            List.of(),
+            List.of(MetricSpec.of(MetricSpec.Kind.SUM, "s")),
+            List.of()
+        );
+        expectThrows(RelOptPlanner.CannotPlanException.class, () -> volcanoPlan(metricOnly));
+
+        builder.push(filtered);
+        builder.project(List.of(builder.field("category")), List.of("k"), true);
+        RelNode projected = builder.build();
+        LanceAggregate bucket = LanceAggregate.create(
+            projected,
+            ImmutableBitSet.of(0),
+            List.of(),
+            List.of(BucketSpec.of(BucketSpec.Kind.TERMS, "k")),
+            List.of(),
+            List.of(List.of())
+        );
+        expectThrows(RelOptPlanner.CannotPlanException.class, () -> volcanoPlan(bucket));
     }
 
     public void testDoesNotFireWhenTheProducerRefuses() {

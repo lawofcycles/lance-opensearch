@@ -194,18 +194,23 @@ public class LanceToLuceneConverterRuleTests extends OpenSearchTestCase {
     }
 
     /**
-     * A {@link LanceAggregate} chain the aggregate pushdown rule has no
-     * operand for (the projection over the query filter) still gets a
-     * physical form: with every rule registered, the full planner
-     * answers the shape with the Lucene operator instead of a
-     * {@code CannotPlanException}.
+     * A {@link LanceAggregate} chain the aggregate pushdown rule refuses
+     * (the projection over the query filter, with a cardinality metric
+     * the rule's operand rejects) still gets a physical form: with every
+     * rule registered, the full planner answers the shape with the
+     * Lucene operator instead of a {@code CannotPlanException}, and the
+     * filter stays inside the wrapped tree for the Lucene side.
      */
     public void testProjectionOverFilterChainConvertsUnderTheFullRuleSet() throws IOException {
         RelNode logical = translate(
-            "{\"size\":0,\"query\":{\"term\":{\"category\":\"c0\"}},\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}"
+            "{\"size\":0,\"query\":{\"term\":{\"category\":\"c0\"}},"
+                + "\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"rating\"}}}}}}"
         );
         assertTrue(logical instanceof LanceAggregate);
         RelNode physical = PlanTestFixtures.factory().plan(logical);
         assertTrue("the full rule set answers with the Lucene operator: " + physical, physical instanceof LuceneAggregateExec);
+        RelNode input = ((LuceneAggregateExec) physical).aggregate().getInput();
+        assertTrue(input instanceof org.apache.calcite.rel.core.Project);
+        assertTrue(input.getInput(0) instanceof Filter);
     }
 }

@@ -6,9 +6,11 @@
 package org.opensearch.lance.plan.translate;
 
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.tools.RelBuilder;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.rel.LanceTableScan;
+import org.opensearch.lance.plan.rel.PushedOperation.PushedAggregate;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedTopK;
 import org.opensearch.lance.plan.rel.physical.HeapTopKExec;
 import org.opensearch.lance.plan.rel.physical.LuceneAggregateExec;
@@ -40,17 +42,32 @@ public class PlannerConventionChoiceTests extends OpenSearchTestCase {
         assertTrue(((LanceTableScan) physical).pushedAggregate().isPresent());
     }
 
-    public void testUnfoldableAggregateAnswersWithTheLuceneOperator() throws IOException {
-        // The aggregate pushdown rule has no operand for the key
-        // projection over the query filter, so the converter rule's
-        // alternative is the only physical form of this tree.
+    public void testFilteredBucketTreeAnswersWithThePushedScan() throws IOException {
+        // The key projection over the query filter is an operand of the
+        // aggregate pushdown rule, so the whole tree folds into one
+        // scan whose pushed aggregate carries the filter's SQL; this is
+        // the plan the fragment executor runs for the same request.
         RelNode physical = plan(
             "{\"size\":0,\"query\":{\"term\":{\"category\":\"c0\"}},\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}"
+        );
+        assertTrue("the pushed scan wins the cost comparison: " + physical, physical instanceof LanceTableScan);
+        PushedAggregate pushed = ((LanceTableScan) physical).pushedAggregate().orElseThrow();
+        assertEquals("category = 'c0'", pushed.filterSql());
+    }
+
+    public void testFilteredCardinalityAnswersWithTheLuceneOperator() throws IOException {
+        // The pushdown rule's operand rejects the cardinality whatever
+        // the chain below it, so the converter rule's alternative is
+        // the only physical form of this tree; the filter stays inside
+        // the wrapped logical tree for the Lucene side.
+        RelNode physical = plan(
+            "{\"size\":0,\"query\":{\"term\":{\"category\":\"c0\"}},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"rating\"}}}}"
         );
         assertTrue("the Lucene operator answers the shape: " + physical, physical instanceof LuceneAggregateExec);
         LuceneAggregateExec exec = (LuceneAggregateExec) physical;
         assertTrue("the operator runs over the bare scan", exec.getInput() instanceof LanceTableScan);
         assertTrue(((LanceTableScan) exec.getInput()).pushedOperations().isEmpty());
+        assertTrue("the filter stays in the wrapped tree: " + exec.aggregate(), exec.aggregate().getInput() instanceof Filter);
     }
 
     public void testMetricOnlySumAnswersWithThePushedScan() throws IOException {

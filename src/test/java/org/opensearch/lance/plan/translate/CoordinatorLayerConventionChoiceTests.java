@@ -75,7 +75,7 @@ public class CoordinatorLayerConventionChoiceTests extends OpenSearchTestCase {
 
     public void testLuceneFallbackStaysTheSameUnderTheCoordinatorLayer() throws IOException {
         String aggregateBody =
-            "{\"size\":0,\"query\":{\"term\":{\"category\":\"c0\"}},\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}";
+            "{\"size\":0,\"query\":{\"term\":{\"category\":\"c0\"}},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"rating\"}}}}";
         assertTrue(planBare(aggregateBody) instanceof LuceneAggregateExec);
         assertTrue(planWrapped(aggregateBody) instanceof LuceneAggregateExec);
         String pageBody = "{\"size\":3,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},"
