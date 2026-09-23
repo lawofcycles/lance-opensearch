@@ -22,7 +22,6 @@ import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.NativeMemoryLimit;
-import org.opensearch.lance.dispatch.LanceAggregationSupport;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
@@ -59,20 +58,21 @@ import java.util.List;
  * query is rewritten with the shard free {@link QueryRewriteContext}
  * the coordinator applies ({@link RequestPlanner#rewriteAtCoordinator}),
  * the {@link ExecutionShape} is built the way
- * the coordinator builds it (the pushdown setting and the structural
- * allow list decide whether the aggregation tree may plan into the
- * scan), and {@link RequestPlanner#plan} runs with the same
- * {@link CostInputs} the coordinator would plan with (the cluster's
- * data node count, the table URI's storage kind, this node's CPUs and
- * the two parallelism settings). The physical text is the coordinator
+ * the coordinator builds it, and {@link RequestPlanner#plan} runs with
+ * the same {@link CostInputs} the coordinator would plan with (the
+ * cluster's data node count, the table URI's storage kind, this node's
+ * CPUs, the two parallelism settings, and the aggregation routing
+ * settings {@code lance.aggregation.pushdown} and
+ * {@code lance.aggregation.pushdown_max_groups}, which the cost model
+ * turns into an infinite pushed cost). The physical text is the coordinator
  * tree over a fan out of one request per data node; at execution the
  * width can differ when the table has fewer fragments than nodes or a
  * node's share exceeds the Lucene reader bound. The request accepts
  * every envelope the runtime accepts; the only refusal left is the one
  * the runtime answers with the same 400, a filtered {@code lance_knn}
- * whose filter has no Lance SQL form. The aggregation allow list and
- * the multi index checks the dispatch filter applies outside the plan
- * are not reflected here.
+ * whose filter has no Lance SQL form. The aggregation allow list of
+ * the fragment path and the multi index checks the dispatch filter
+ * applies outside the plan are not reflected here.
  *
  * <p>Threading: the cluster state lookup runs wherever the request
  * arrives; the model build and the planning are handed to the plugin's
@@ -156,11 +156,7 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
             source == null ? null : source.query(),
             System.currentTimeMillis()
         );
-        boolean planAggregations = source != null
-            && source.aggregations() != null
-            && clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_SETTING)
-            && LanceAggregationSupport.isPushdownCandidate(source.aggregations());
-        ExecutionShape shape = ExecutionShape.of(source, query, planAggregations);
+        ExecutionShape shape = ExecutionShape.of(source, query);
         RequestPlanner.Planned planned = RequestPlanner.plan(
             shape,
             model,

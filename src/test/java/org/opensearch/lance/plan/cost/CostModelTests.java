@@ -155,7 +155,28 @@ public class CostModelTests extends OpenSearchTestCase {
         // aggregators (measured 848 ms pushed vs 346 ms), one 16xlarge
         // node reading NVMe with the slicing switched off prefers the
         // pushed scan (measured 716 ms vs 8.86 s).
-        AggregateProfile terms = new AggregateProfile(1e9, 200, 100, 1, 2, 1, 1, 0, 0, 0, 0, 0, false, 0, false, false, false, 0, 1.0);
+        AggregateProfile terms = new AggregateProfile(
+            1e9,
+            200,
+            100,
+            true,
+            1,
+            2,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+            0,
+            false,
+            false,
+            false,
+            0,
+            1.0
+        );
         CostInputs s3 = new CostInputs(4, StorageKind.OBJECT_STORE, 16, 8, 8);
         assertTrue(CostModel.luceneAggregateMillis(s3, terms) < CostModel.pushedAggregateMillis(s3, terms));
         CostInputs nvmeUnsliced = new CostInputs(1, StorageKind.LOCAL, 64, 32, 1);
@@ -165,10 +186,10 @@ public class CostModelTests extends OpenSearchTestCase {
     public void testObjectStoreInvertsTheMetricOnlyChoiceAtOneBillionRows() {
         // sum(price): 4 nodes on S3 measured 784 ms pushed vs 442 ms;
         // 20M rows on one local node measured 30 ms vs 255 ms.
-        AggregateProfile sum = new AggregateProfile(1e9, 1, 1, 1, 8, 1, 0, 0, 0, 0, 0, 0, false, 1, false, false, false, 0, 1.0);
+        AggregateProfile sum = new AggregateProfile(1e9, 1, 1, true, 1, 8, 1, 0, 0, 0, 0, 0, 0, false, 1, false, false, false, 0, 1.0);
         CostInputs s3 = new CostInputs(4, StorageKind.OBJECT_STORE, 16, 8, 8);
         assertTrue(CostModel.luceneAggregateMillis(s3, sum) < CostModel.pushedAggregateMillis(s3, sum));
-        AggregateProfile small = new AggregateProfile(2e7, 1, 1, 1, 8, 1, 0, 0, 0, 0, 0, 0, false, 1, false, false, false, 0, 1.0);
+        AggregateProfile small = new AggregateProfile(2e7, 1, 1, true, 1, 8, 1, 0, 0, 0, 0, 0, 0, false, 1, false, false, false, 0, 1.0);
         CostInputs local = CostInputs.local(16);
         assertTrue(CostModel.pushedAggregateMillis(local, small) < CostModel.luceneAggregateMillis(local, small));
     }
@@ -176,18 +197,67 @@ public class CostModelTests extends OpenSearchTestCase {
     public void testCardinalityStaysOnTheAggregators() {
         // cardinality(user_id) measured 22.6 s pushed vs 4.03 s on 4
         // nodes at 1B, and 14.1 s vs 446 ms on one node at 20M.
-        AggregateProfile card = new AggregateProfile(1e9, 1, 1, 1, 8, 1, 0, 0, 0, 0, 0, 0, false, 0, false, false, true, 1e7, 1.0);
+        AggregateProfile card = new AggregateProfile(1e9, 1, 1, true, 1, 8, 1, 0, 0, 0, 0, 0, 0, false, 0, false, false, true, 1e7, 1.0);
         CostInputs s3 = new CostInputs(4, StorageKind.OBJECT_STORE, 16, 8, 8);
         assertTrue(CostModel.luceneAggregateMillis(s3, card) < CostModel.pushedAggregateMillis(s3, card));
-        AggregateProfile small = new AggregateProfile(2e7, 1, 1, 1, 8, 1, 0, 0, 0, 0, 0, 0, false, 0, false, false, true, 1e7, 1.0);
+        AggregateProfile small = new AggregateProfile(2e7, 1, 1, true, 1, 8, 1, 0, 0, 0, 0, 0, 0, false, 0, false, false, true, 1e7, 1.0);
         CostInputs local = CostInputs.local(16);
         assertTrue(CostModel.luceneAggregateMillis(local, small) < CostModel.pushedAggregateMillis(local, small));
+    }
+
+    public void testEveryMeasuredCardinalityShapePrefersTheAggregators() throws IOException {
+        // The pushdown rule no longer refuses a cardinality metric; the
+        // fitted model is what keeps such trees on the aggregators, so
+        // every (table, cluster) the CSV measured a cardinality shape on
+        // must price the Lucene form below the pushed form.
+        int checked = 0;
+        for (CostMeasurements.Row row : CostMeasurements.load()) {
+            if (!row.shape().cardinality()) {
+                continue;
+            }
+            double pushed = CostModel.pushedAggregateMillis(row.inputs(), row.shape());
+            double lucene = CostModel.luceneAggregateMillis(row.inputs(), row.shape());
+            assertTrue(
+                String.format(
+                    Locale.ROOT,
+                    "%s (slices %d): model pushed %.0f ms vs lucene %.0f ms",
+                    row.pairKey(),
+                    row.slices(),
+                    pushed,
+                    lucene
+                ),
+                lucene < pushed
+            );
+            checked++;
+        }
+        assertTrue("the CSV carries cardinality rows", checked > 0);
     }
 
     public void testPercentilesStayPushed() {
         // percentiles(price) measured 2.04 s pushed vs 3.35 s on 4 nodes
         // at 1B, and 1.02 s vs 3.60 s on the 16xlarge with 32 slices.
-        AggregateProfile percentiles = new AggregateProfile(1e9, 1, 1, 1, 8, 2, 0, 0, 0, 0, 0, 0, false, 0, false, true, false, 0, 1.0);
+        AggregateProfile percentiles = new AggregateProfile(
+            1e9,
+            1,
+            1,
+            true,
+            1,
+            8,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+            0,
+            false,
+            true,
+            false,
+            0,
+            1.0
+        );
         CostInputs s3 = new CostInputs(4, StorageKind.OBJECT_STORE, 16, 8, 8);
         assertTrue(CostModel.pushedAggregateMillis(s3, percentiles) < CostModel.luceneAggregateMillis(s3, percentiles));
         CostInputs xl = CostInputs.local(64);

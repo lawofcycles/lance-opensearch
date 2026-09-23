@@ -12,8 +12,8 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.LanceOverrides;
-import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
@@ -88,11 +88,8 @@ public final class FragmentRequests {
         int trackTotalHitsUpTo
     ) {
         IndexMetadata metadata = clusterService.state().metadata().index(indexName);
-        boolean planAggregations = aggregations != null
-            && clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_SETTING)
-            && LanceAggregationSupport.isPushdownCandidate(aggregations);
-        ExecutionShape shape = new ExecutionShape(query, postFilter, sorts, searchAfter, 0, size, aggregations, planAggregations, false);
-        FragmentPlan plan = plan(metadata, warmCache, shape);
+        ExecutionShape shape = new ExecutionShape(query, postFilter, sorts, searchAfter, 0, size, aggregations, false);
+        FragmentPlan plan = plan(metadata, warmCache, shape, clusterService);
         return new LanceFragmentQueryRequest(
             tableUri,
             indexName,
@@ -111,15 +108,23 @@ public final class FragmentRequests {
         );
     }
 
-    /** The plan the coordinator would ship for {@code shape} against the index behind {@code metadata}. */
-    public static FragmentPlan plan(IndexMetadata metadata, LanceWarmCache warmCache, ExecutionShape shape) {
+    /**
+     * The plan the coordinator would ship for {@code shape} against the
+     * index behind {@code metadata}, costed with the cluster's current
+     * settings the way the coordinator costs it (one data node, the
+     * table URI's storage kind, the parallelism and the aggregation
+     * routing settings).
+     */
+    public static FragmentPlan plan(IndexMetadata metadata, LanceWarmCache warmCache, ExecutionShape shape, ClusterService clusterService) {
         try {
             LanceSchemas.IndexModel model = LanceSchemas.build(metadata, warmCache);
+            String tableUri = metadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
             return RequestPlanner.plan(
                 shape,
                 model,
                 PlanExecutor.sqlExcludedColumns(LanceOverrides.of(metadata.getSettings())),
-                new LancePlannerFactory(1L << 30, 1L << 30)
+                new LancePlannerFactory(1L << 30, 1L << 30),
+                RequestPlanner.clusterInputs(1, tableUri, clusterService.getClusterSettings())
             ).plan();
         } catch (IOException e) {
             throw new AssertionError(e);

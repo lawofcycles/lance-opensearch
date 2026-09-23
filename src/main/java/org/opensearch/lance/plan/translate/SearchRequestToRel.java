@@ -130,18 +130,20 @@ public final class SearchRequestToRel {
      * {@code post_filter}, the sort clauses and cursor, the leading hits
      * skipped ({@code from}), the rows every executor returns
      * ({@code fetch}, the request's {@code from + size}; 0 for a count
-     * or aggregation request), the aggregations, whether the
-     * aggregation tree may plan into the scan at all (the pushdown
-     * setting and the structural allow list, both read by the caller),
-     * and whether the request carries a collector knob
-     * ({@code min_score} or {@code terminate_after}). The knobs apply
-     * inside Lucene's collectors on the executor, so neither the page
-     * nor the aggregate is pushed into the Lance scan for such a
-     * request: the query root alone is planned and the collector and
-     * the aggregators run over it.
+     * or aggregation request), the aggregations, and whether the
+     * request carries a collector knob ({@code min_score} or
+     * {@code terminate_after}). The knobs apply inside Lucene's
+     * collectors on the executor, so neither the page nor the aggregate
+     * is pushed into the Lance scan for such a request: the query root
+     * alone is planned and the collector and the aggregators run over
+     * it. Whether an aggregation tree plans into the scan is otherwise
+     * not a request element: the translator accepts or refuses the
+     * tree's shape and the cost model, fed the routing settings through
+     * {@code CostInputs}, chooses between the pushed scan and the Lucene
+     * operator.
      */
     public record ExecutionShape(QueryBuilder query, QueryBuilder postFilter, List<SortBuilder<?>> sorts, Object[] searchAfter, int from,
-        int fetch, AggregatorFactories.Builder aggregations, boolean planAggregations, boolean collectorKnobs) {
+        int fetch, AggregatorFactories.Builder aggregations, boolean collectorKnobs) {
 
         /**
          * The shape the coordinator plans a search body under:
@@ -152,13 +154,8 @@ public final class SearchRequestToRel {
          * @param source the parsed body; null stands for an empty body
          *     (a {@code match_all} page of 10)
          * @param query the top level query after the coordinator rewrite
-         * @param planAggregations whether the aggregation tree may plan
-         *     into the scan (the pushdown setting and the structural
-         *     allow list, both read by the caller); a body carrying
-         *     {@code min_score} or {@code terminate_after} plans no
-         *     aggregate whatever the caller read
          */
-        public static ExecutionShape of(SearchSourceBuilder source, QueryBuilder query, boolean planAggregations) {
+        public static ExecutionShape of(SearchSourceBuilder source, QueryBuilder query) {
             int size = source == null || source.size() < 0 ? 10 : source.size();
             int from = source == null || source.from() < 0 ? 0 : source.from();
             List<SortBuilder<?>> sorts = source == null || source.sorts() == null ? List.of() : source.sorts();
@@ -171,7 +168,6 @@ public final class SearchRequestToRel {
                 from,
                 from + size,
                 source == null ? null : source.aggregations(),
-                planAggregations && !collectorKnobs,
                 collectorKnobs
             );
         }
@@ -260,12 +256,6 @@ public final class SearchRequestToRel {
                 // count, which a post filter would have to narrow; the
                 // aggregators and the Lucene count serve that shape.
                 return new ExecutionTranslation(root, "aggregations with a post_filter");
-            }
-            if (!shape.planAggregations()) {
-                return new ExecutionTranslation(
-                    root,
-                    "aggregation tree outside the pushdown shapes, or lance.aggregation.pushdown is false"
-                );
             }
             if (!shape.aggregations().getPipelineAggregatorFactories().isEmpty()) {
                 return new ExecutionTranslation(root, "pipeline aggregation");

@@ -359,9 +359,21 @@ group key and metric, the object store transfer of the columns the scan reads (p
 thread, because it is bandwidth bound), a hash table penalty above a million groups, and the
 executor's merge of its parallel scans' group rows. The quantities come from the tree and the
 table statistics (rows, the bitmap distinct count of a terms key, the Arrow type widths of the
-columns read); the run's inputs (nodes, storage kind, CPUs, the two settings) come from the caller
+columns read); the run's inputs (nodes, storage kind, CPUs, the four settings) come from the caller
 as `plan/cost/CostInputs`, so the coordinator's plan sees the cluster and a data node's plan sees
-one local node. The coefficients in `CostCoefficients` were fitted by non negative least squares
+one local node. The aggregation routing settings are cost inputs, not gates in front of the
+planner: `lance.aggregation.pushdown: false`, and a statistics based estimate of the group rows
+the executor would hold above `lance.aggregation.pushdown_max_groups`, make the pushed scan's cost
+infinite, so the Volcano planner implements the aggregate through the Lucene operator and explain
+shows that as a cost decision with nothing `unplanned`. The estimate is judged only when every key
+domain is known (a bitmap distinct count, a date interval, a range or filter count); a key without
+statistics is guessed as a share of the rows, which would put any large table over the bound, so
+such a tree is left to the executor's own bound. The pushdown rule carries no shape predicate of its own: every
+aggregate the translator accepts is offered to the Substrait producer, and a tree with a
+`cardinality` metric loses the comparison on cost (the fitted coefficients above a million rows, a
+documented placeholder penalty below) rather than being refused by the rule. The data node keeps
+its own group bound as a guard on the estimate it builds from the request shape
+(`shard_size`, range and filter counts), counted as `aggregate_resolution` when it fires. The coefficients in `CostCoefficients` were fitted by non negative least squares
 to the warm latencies measured on the 20M, 100M and 1B row benchmark tables across 1 to 6 node
 clusters with the pushdown on and off; `scripts/fit-cost-coefficients.py` reproduces the fit from
 `src/test/resources/cost/measurements.csv`, and `CostModelTests` holds the model to the measured
@@ -369,7 +381,9 @@ choices. What the model does not see: whether the aggregator path's columns are 
 node's column store (a cold node pays a storage read the model does not charge), the state of the
 Lance index cache, and concurrent requests (the coefficients are single request latencies). Below
 a million rows every path answers within the fixed cost and the measurements say nothing, so the
-placeholder ordering stands: the pushed form wins whenever a rule folds the tree. The hits shapes
+placeholder ordering stands: the pushed form wins whenever a rule folds the tree, except for a
+tree with a `cardinality` metric, whose pushed placeholder is penalised to match the fitted
+model's choice. The hits shapes
 (sorted pages, full text, vector) have no measured comparison between their two forms and keep the
 same placeholder ordering at every size.
 

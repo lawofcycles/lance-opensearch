@@ -44,6 +44,7 @@ public class AggregateProfileTests extends OpenSearchTestCase {
         AggregateProfile p = profile("{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}");
         assertEquals(1e9, p.tableRows(), 0.0);
         assertEquals(200.0, p.groups(), 0.0);
+        assertTrue("the bitmap distinct count grounds the estimate", p.groupsKnown());
         assertEquals("terms size 10 gives shard_size 25, four times that per scan", 100.0, p.mergedGroups(), 0.0);
         assertEquals(1, p.columnsRead());
         assertEquals(
@@ -64,6 +65,7 @@ public class AggregateProfileTests extends OpenSearchTestCase {
     public void testNumericTermsWithoutADistinctCountTakesCalcitesShare() throws IOException {
         AggregateProfile p = profile("{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"rating\"}}}}");
         assertEquals(1e9 * CostCoefficients.UNKNOWN_KEY_DISTINCT_SHARE, p.groups(), 0.0);
+        assertFalse("a guessed domain is not a known group count", p.groupsKnown());
         assertTrue(p.largeGroups());
         assertEquals(100.0, p.mergedGroups(), 0.0);
         assertEquals(1, p.numericKeys());
@@ -75,6 +77,7 @@ public class AggregateProfileTests extends OpenSearchTestCase {
         AggregateProfile p = profile("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}");
         assertEquals(1.0, p.groups(), 0.0);
         assertEquals(1.0, p.mergedGroups(), 0.0);
+        assertTrue("no key, one group", p.groupsKnown());
         assertEquals(1, p.columnsRead());
         assertEquals(8.0, p.bytesPerRow(), 0.0);
         assertEquals(1, p.simpleMetrics());
@@ -89,6 +92,7 @@ public class AggregateProfileTests extends OpenSearchTestCase {
         assertEquals(16.0, p.bytesPerRow(), 0.0);
         assertEquals(1, p.dateKeys());
         assertEquals("ten assumed years of months", 120.0, p.groups(), 0.0);
+        assertTrue("an interval bounds the buckets whatever the row count", p.groupsKnown());
         assertEquals(1, p.simpleMetrics());
     }
 
@@ -108,6 +112,7 @@ public class AggregateProfileTests extends OpenSearchTestCase {
         assertEquals(1, p.numericKeys());
         assertEquals(1, p.nestedLevels());
         assertEquals("a nested tree is not cut per scan", p.groups(), p.mergedGroups(), 0.0);
+        assertFalse("the rating level has no distinct count", p.groupsKnown());
         assertEquals(1, p.simpleMetrics());
     }
 
@@ -122,6 +127,8 @@ public class AggregateProfileTests extends OpenSearchTestCase {
         );
         assertEquals(1, filters.filterKeys());
         assertEquals(3.0, filters.groups(), 0.0);
+        assertTrue(range.groupsKnown());
+        assertTrue(filters.groupsKnown());
         assertEquals("the three predicates read three columns", 3, filters.columnsRead());
         assertEquals(4 + 2 + 8, filters.bytesPerRow(), 0.0);
     }

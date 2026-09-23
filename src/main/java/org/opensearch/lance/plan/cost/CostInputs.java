@@ -11,13 +11,20 @@ import java.util.Objects;
 
 /**
  * What the cost model needs beyond the plan tree: the cluster the request
- * fans out over and the two parallelism settings the executors run with.
- * The table's row count and column statistics are already on the tree
- * through the scan's table, so they are not repeated here. Built once
- * per planning run by the caller and handed to
+ * fans out over and the aggregation routing settings the executors run
+ * with. The table's row count and column statistics are already on the
+ * tree through the scan's table, so they are not repeated here. Built
+ * once per planning run by the caller and handed to
  * {@code LancePlannerFactory.plan(RelNode, CostInputs)}; a caller without
  * cluster knowledge (a data node planning its own request, a unit test)
  * uses {@link #local()}.
+ *
+ * <p>The two settings that used to gate the aggregation pushdown outside
+ * the planner are cost inputs: {@code lance.aggregation.pushdown} off and
+ * a group estimate above {@code lance.aggregation.pushdown_max_groups}
+ * both make the pushed scan's cost infinite, so the planner implements
+ * the aggregate through the Lucene operator and explain shows that
+ * choice as a cost decision.
  *
  * @param nodes data nodes the coordinator fans the request out to; 1
  *     when planning on a data node or for a single node cluster
@@ -30,11 +37,20 @@ import java.util.Objects;
  *     node
  * @param slices effective {@code lance.fragment_path.slices}: how many
  *     collector threads the Lucene aggregator path runs on one node
+ * @param pushdownEnabled effective {@code lance.aggregation.pushdown}:
+ *     false prices every pushed aggregate as infinite
+ * @param maxGroups effective {@code lance.aggregation.pushdown_max_groups}:
+ *     a pushed aggregate whose statistics based estimate of the group
+ *     rows the executor holds exceeds it is priced as infinite
  */
-public record CostInputs(int nodes, StorageKind storage, int cpusPerNode, int pushdownParallelism, int slices) {
+public record CostInputs(int nodes, StorageKind storage, int cpusPerNode, int pushdownParallelism, int slices, boolean pushdownEnabled,
+    long maxGroups) {
 
     /** Upper bound of both parallelism settings, as {@code LancePlugin} registers them. */
     public static final int MAX_PARALLELISM = 32;
+
+    /** Default of {@code lance.aggregation.pushdown_max_groups}, as {@code LancePlugin} registers it. */
+    public static final long DEFAULT_MAX_GROUPS = 1_000_000L;
 
     public CostInputs {
         Objects.requireNonNull(storage, "storage");
@@ -50,6 +66,14 @@ public record CostInputs(int nodes, StorageKind storage, int cpusPerNode, int pu
         if (slices < 1) {
             throw new IllegalArgumentException("slices must be at least 1, got " + slices);
         }
+        if (maxGroups < 1) {
+            throw new IllegalArgumentException("maxGroups must be at least 1, got " + maxGroups);
+        }
+    }
+
+    /** The cluster and parallelism inputs with the pushdown on and the group bound at its default. */
+    public CostInputs(int nodes, StorageKind storage, int cpusPerNode, int pushdownParallelism, int slices) {
+        this(nodes, storage, cpusPerNode, pushdownParallelism, slices, true, DEFAULT_MAX_GROUPS);
     }
 
     /**
@@ -64,8 +88,9 @@ public record CostInputs(int nodes, StorageKind storage, int cpusPerNode, int pu
 
     /**
      * Inputs for a plan built without cluster knowledge: one node, local
-     * storage, this JVM's CPU count and the two settings at their
-     * defaults for that count. What a data node uses when it plans the
+     * storage, this JVM's CPU count, the two parallelism settings at
+     * their defaults for that count, the pushdown on and the group
+     * bound at its default. What a data node uses when it plans the
      * request it received, and what {@code plan(RelNode)} without inputs
      * assumes.
      */
@@ -81,10 +106,28 @@ public record CostInputs(int nodes, StorageKind storage, int cpusPerNode, int pu
 
     /**
      * Inputs for a coordinator fanning out to {@code nodes} data nodes
-     * over a table at {@code tableUri}, with the two settings' effective
-     * values.
+     * over a table at {@code tableUri}, with the four settings'
+     * effective values.
      */
-    public static CostInputs forCluster(int nodes, String tableUri, int cpusPerNode, int pushdownParallelism, int slices) {
-        return new CostInputs(nodes, StorageKind.fromUri(tableUri), cpusPerNode, pushdownParallelism, slices);
+    public static CostInputs forCluster(
+        int nodes,
+        String tableUri,
+        int cpusPerNode,
+        int pushdownParallelism,
+        int slices,
+        boolean pushdownEnabled,
+        long maxGroups
+    ) {
+        return new CostInputs(nodes, StorageKind.fromUri(tableUri), cpusPerNode, pushdownParallelism, slices, pushdownEnabled, maxGroups);
+    }
+
+    /** The same inputs with {@code pushdownEnabled} replaced. */
+    public CostInputs withPushdownEnabled(boolean enabled) {
+        return new CostInputs(nodes, storage, cpusPerNode, pushdownParallelism, slices, enabled, maxGroups);
+    }
+
+    /** The same inputs with {@code maxGroups} replaced. */
+    public CostInputs withMaxGroups(long bound) {
+        return new CostInputs(nodes, storage, cpusPerNode, pushdownParallelism, slices, pushdownEnabled, bound);
     }
 }

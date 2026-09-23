@@ -9,6 +9,7 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.tools.RelBuilder;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
+import org.opensearch.lance.plan.cost.CostInputs;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedAggregate;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedTopK;
@@ -56,9 +57,10 @@ public class PlannerConventionChoiceTests extends OpenSearchTestCase {
     }
 
     public void testFilteredCardinalityAnswersWithTheLuceneOperator() throws IOException {
-        // The pushdown rule's operand rejects the cardinality whatever
-        // the chain below it, so the converter rule's alternative is
-        // the only physical form of this tree; the filter stays inside
+        // The pushdown rule folds the cardinality like any other tree,
+        // but the pushed scan's placeholder carries the cardinality
+        // penalty on this small table, so the converter rule's
+        // alternative wins the cost comparison; the filter stays inside
         // the wrapped logical tree for the Lucene side.
         RelNode physical = plan(
             "{\"size\":0,\"query\":{\"term\":{\"category\":\"c0\"}},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"rating\"}}}}"
@@ -77,9 +79,10 @@ public class PlannerConventionChoiceTests extends OpenSearchTestCase {
     }
 
     public void testCardinalityAnswersWithTheLuceneOperator() throws IOException {
-        // The pushdown rule's operand rejects a tree with a cardinality
-        // metric (the pushed form is slower than the aggregator), so the
-        // Lucene operator is the only physical form.
+        // Both physical forms exist; the pushed scan of a tree with a
+        // cardinality metric is priced above the Lucene operator (the
+        // pushed form is slower than the aggregator), so the operator
+        // wins.
         RelNode physical = plan("{\"size\":0,\"aggs\":{\"c\":{\"cardinality\":{\"field\":\"category\"}}}}");
         assertTrue("the Lucene operator answers the shape: " + physical, physical instanceof LuceneAggregateExec);
         LuceneAggregateExec exec = (LuceneAggregateExec) physical;
@@ -95,6 +98,48 @@ public class PlannerConventionChoiceTests extends OpenSearchTestCase {
             "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"rating\"}}}}}}"
         );
         assertTrue("the Lucene operator answers the shape: " + physical, physical instanceof LuceneAggregateExec);
+    }
+
+    public void testEveryTranslatedShapeHasALuceneFormWhenThePushdownIsOff() throws IOException {
+        // With lance.aggregation.pushdown off the pushed scan costs
+        // infinity for every aggregate, so the planner must find the
+        // Lucene operator for every tree the translator accepts; a shape
+        // without one would come back as the logical plan, which the
+        // executor could not run.
+        CostInputs off = CostInputs.local().withPushdownEnabled(false);
+        for (String fixture : AggregationToRelFixtureTests.FIXTURES) {
+            RelNode logical = PlanTestFixtures.translate(PlanTestFixtures.parse(AggregationToRelFixtureTests.resource(fixture + ".json")));
+            RelNode physical = PlanTestFixtures.factory().plan(logical, off);
+            assertTrue(
+                "[" + fixture + "] with the pushdown off answers with the Lucene operator: " + physical,
+                physical instanceof LuceneAggregateExec
+            );
+            LuceneAggregateExec exec = (LuceneAggregateExec) physical;
+            assertTrue("[" + fixture + "] runs over the bare scan", exec.getInput() instanceof LanceTableScan);
+            assertTrue(((LanceTableScan) exec.getInput()).pushedOperations().isEmpty());
+        }
+    }
+
+    public void testAGroupBoundBelowTheEstimateAnswersWithTheLuceneOperator() throws IOException {
+        // A range with two ranges is two groups whatever the table, so a
+        // bound of 1 sends it to the aggregators; a metric only tree
+        // (one group) stays pushed. The fixture model has no statistics,
+        // so a terms key's domain is a guess (Calcite's share of the
+        // rows) and is not judged against the bound: terms stays pushed.
+        CostInputs oneGroup = CostInputs.local().withMaxGroups(1L);
+        RelNode range = planUnder(
+            "{\"size\":0,\"aggs\":{\"r\":{\"range\":{\"field\":\"rating\",\"ranges\":[{\"to\":5},{\"from\":5}]}}}}",
+            oneGroup
+        );
+        assertTrue("two ranges over a bound of one go to the aggregators: " + range, range instanceof LuceneAggregateExec);
+        RelNode sum = planUnder("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}", oneGroup);
+        assertTrue("one group fits a bound of one: " + sum, sum instanceof LanceTableScan);
+        RelNode terms = planUnder("{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}", oneGroup);
+        assertTrue("a guessed terms domain is not judged against the bound: " + terms, terms instanceof LanceTableScan);
+    }
+
+    private static RelNode planUnder(String body, CostInputs inputs) throws IOException {
+        return PlanTestFixtures.factory().plan(PlanTestFixtures.translate(PlanTestFixtures.parse(body)), inputs);
     }
 
     public void testFoldableHitsPageAnswersWithTheLanceScan() throws IOException {

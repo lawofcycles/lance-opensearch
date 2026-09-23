@@ -31,11 +31,12 @@ import java.util.List;
 
 /**
  * The pushdown rule: it replaces the aggregate with the scan carrying
- * the producer's bytes for the four operand shapes, the filtered shapes
- * carry the filter's Lance SQL on the pushed aggregate, it leaves the
- * plan alone when the producer refuses an expression, when the filter
- * has no SQL spelling or when a metric of the tree is a
- * {@code cardinality}, and the Volcano planner terminates either way.
+ * the producer's bytes for the four operand shapes (a {@code cardinality}
+ * metric included, since the rule carries no shape predicate and the
+ * cost model decides such trees), the filtered shapes carry the
+ * filter's Lance SQL on the pushed aggregate, it leaves the plan alone
+ * when the producer refuses an expression or when the filter has no
+ * SQL spelling, and the Volcano planner terminates either way.
  */
 public class PushAggregateIntoLanceScanTests extends OpenSearchTestCase {
 
@@ -232,32 +233,42 @@ public class PushAggregateIntoLanceScanTests extends OpenSearchTestCase {
         expectThrows(RelOptPlanner.CannotPlanException.class, () -> volcanoPlan(aggregate));
     }
 
-    public void testDoesNotFireOnACardinalityMetric() throws Exception {
+    public void testFiresOnACardinalityMetric() throws Exception {
         // The direct operand shape: the aggregate sits on the bare scan.
-        // No Lance convention plan exists because the operand predicate
-        // rejects the cardinality; the Lucene aggregator operator is the
-        // only alternative and it lives in the other convention.
+        // Under a Lance convention root the pushed scan is the only
+        // physical form, and the producer spells the cardinality as one
+        // grouping over the field next to the count(*) measure; which
+        // form runs is the cost model's call, not the rule's.
         RelNode logical = PlanTestFixtures.translate(
             PlanTestFixtures.parse("{\"size\":0,\"aggs\":{\"c\":{\"cardinality\":{\"field\":\"category\"}}}}")
         );
-        expectThrows(RelOptPlanner.CannotPlanException.class, () -> volcanoPlan(logical));
+        PushedOperation.PushedAggregate pushed = pushedRoot(volcanoPlan(logical));
+        assertEquals(MetricSpec.Kind.CARDINALITY, pushed.aggregate().metricSpecs().get(0).kind());
+        AggregateRel rel = decode(pushed.substrait());
+        assertEquals(1, rel.getMeasuresCount());
+        assertEquals(1, rel.getGroupingsCount());
+        assertEquals(1, rel.getGroupings(0).getGroupingExpressionsCount());
     }
 
-    public void testDoesNotFireOnABucketTreeWithACardinalityChild() throws Exception {
+    public void testFiresOnABucketTreeWithACardinalityChild() throws Exception {
         // The project operand shape: the group key projection sits
-        // between the aggregate and the scan.
+        // between the aggregate and the scan; the terms key and the
+        // cardinality field are the two groupings.
         RelNode logical = PlanTestFixtures.translate(
             PlanTestFixtures.parse(
                 "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"rating\"}}}}}}"
             )
         );
-        expectThrows(RelOptPlanner.CannotPlanException.class, () -> volcanoPlan(logical));
+        PushedOperation.PushedAggregate pushed = pushedRoot(volcanoPlan(logical));
+        AggregateRel rel = decode(pushed.substrait());
+        assertEquals(1, rel.getGroupingsCount());
+        assertEquals(2, rel.getGroupings(0).getGroupingExpressionsCount());
     }
 
-    public void testDoesNotFireOnAFilteredCardinality() {
+    public void testFiresOnAFilteredCardinality() throws Exception {
         // The filter operand shape, spelled the way the translator
         // spells a cardinality: COUNT(DISTINCT col) with the CARDINALITY
-        // metric spec.
+        // metric spec; the filter's SQL rides on the pushed aggregate.
         RelBuilder builder = PlanTestFixtures.factory().relBuilder(PlanTestFixtures.model().schema());
         builder.scan(LancePlannerFactory.SCHEMA_NAME, "idx");
         builder.filter(builder.call(SqlStdOperatorTable.GREATER_THAN, builder.field("rating"), builder.literal(5)));
@@ -271,6 +282,7 @@ public class PushAggregateIntoLanceScanTests extends OpenSearchTestCase {
             List.of(MetricSpec.of(MetricSpec.Kind.CARDINALITY, "c")),
             List.of()
         );
-        expectThrows(RelOptPlanner.CannotPlanException.class, () -> volcanoPlan(aggregate));
+        PushedOperation.PushedAggregate pushed = pushedRoot(volcanoPlan(aggregate));
+        assertEquals("rating > 5", pushed.filterSql());
     }
 }
