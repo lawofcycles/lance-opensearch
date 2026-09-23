@@ -33,6 +33,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
     private final StorageOptions storageOptions;
     private final LanceOverrides overrides;
     private final String indexPlacement;
+    private final boolean asyncDerive;
 
     public LanceAttachRequest(
         String table,
@@ -42,7 +43,19 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         StorageOptions storageOptions,
         LanceOverrides overrides
     ) {
-        this(table, indexName, pinnedVersion, tag, storageOptions, overrides, null);
+        this(table, indexName, pinnedVersion, tag, storageOptions, overrides, null, false);
+    }
+
+    public LanceAttachRequest(
+        String table,
+        String indexName,
+        Long pinnedVersion,
+        String tag,
+        StorageOptions storageOptions,
+        LanceOverrides overrides,
+        String indexPlacement
+    ) {
+        this(table, indexName, pinnedVersion, tag, storageOptions, overrides, indexPlacement, false);
     }
 
     /**
@@ -61,6 +74,11 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
      *                       structures from per-node shallow clones,
      *                       {@code "in_table"} or {@code null} for the
      *                       default in-table commits.
+     * @param asyncDerive    {@code true} to run the text_analyzer backfill
+     *                       in the background after the attach answers;
+     *                       {@code false} (the default) blocks the attach
+     *                       until the derived tokens columns are written
+     *                       and indexed.
      */
     public LanceAttachRequest(
         String table,
@@ -69,7 +87,8 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         String tag,
         StorageOptions storageOptions,
         LanceOverrides overrides,
-        String indexPlacement
+        String indexPlacement,
+        boolean asyncDerive
     ) {
         this.table = table;
         this.indexName = indexName;
@@ -78,6 +97,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         this.storageOptions = storageOptions == null ? StorageOptions.empty() : storageOptions;
         this.overrides = overrides == null ? LanceOverrides.EMPTY : overrides;
         this.indexPlacement = indexPlacement;
+        this.asyncDerive = asyncDerive;
     }
 
     public LanceAttachRequest(StreamInput in) throws IOException {
@@ -93,6 +113,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         // survives because the JSON object preserves it.
         this.overrides = LanceOverrides.parse(in.readString());
         this.indexPlacement = in.readOptionalString();
+        this.asyncDerive = in.readBoolean();
     }
 
     @Override
@@ -105,6 +126,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         storageOptions.writeTo(out);
         out.writeString(overrides.toJson());
         out.writeOptionalString(indexPlacement);
+        out.writeBoolean(asyncDerive);
     }
 
     @Override
@@ -175,5 +197,10 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
      */
     public Optional<String> indexPlacement() {
         return Optional.ofNullable(indexPlacement);
+    }
+
+    /** Whether the text_analyzer backfill runs in the background after the attach answers. */
+    public boolean asyncDerive() {
+        return asyncDerive;
     }
 }

@@ -13,11 +13,14 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.en.EnglishAnalyzer;
 import org.lance.Dataset;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.attach.LanceTextAnalyzerBackfill;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -465,6 +468,111 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
             );
             assertTrue(e.getMessage(), e.getMessage().contains("order=xy"));
             assertTrue(e.getMessage(), e.getMessage().contains("lat_lon"));
+        }
+    }
+
+    private String englishTextTable() throws Exception {
+        Path scratchDir = createTempDir();
+        return LanceTableFactory.writeEnglishTextTable(scratchDir, "derive-" + getTestName().toLowerCase(Locale.ROOT));
+    }
+
+    public void testTextAnalyzerPendingDerivesDefaultWithNote() throws Exception {
+        // Before the backfill lands, the override derives the column by
+        // the default rules (keyword: no FTS index on the raw column)
+        // and records a pending note instead of failing, so the
+        // derive: async attach and the namespace poll can both derive
+        // while the backfill is in flight.
+        try (Dataset dataset = LanceRegistry.openDataset(englishTextTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("body", Map.of("type", "text_analyzer", "analyzer", "english")))
+            );
+            String mapping = derivation.mappingJson();
+            assertTrue("body must fall back to keyword: " + mapping, mapping.contains("\"body\":{\"type\":\"keyword\""));
+            assertFalse("no tokens_column before the backfill: " + mapping, mapping.contains("tokens_column"));
+            assertTrue(
+                "expected a pending note, saw: " + derivation.notes(),
+                derivation.notes().stream().anyMatch(note -> note.contains("text_analyzer override pending"))
+            );
+            assertTrue("overrides JSON must persist: " + derivation.overridesJson(), derivation.overridesJson().contains("text_analyzer"));
+        }
+    }
+
+    public void testTextAnalyzerDerivesLanceTextWithTokensColumn() throws Exception {
+        String uri = englishTextTable();
+        LanceOverrides overrides = overrides(Map.of("body", Map.of("type", "text_analyzer", "analyzer", "english")));
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty()); Analyzer english = new EnglishAnalyzer()) {
+            LanceTextAnalyzerBackfill.ensureDerivedColumns(
+                dataset,
+                overrides.textAnalyzerColumns(),
+                name -> english,
+                LanceRegistry.allocator()
+            );
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides);
+            String mapping = derivation.mappingJson();
+            assertTrue(
+                "body must map as lance_text with tokens_column: " + mapping,
+                mapping.contains("\"body\":{\"type\":\"lance_text\",\"tokens_column\":\"body__lance_tokens\"")
+            );
+            assertTrue("meta must record the analyzer: " + mapping, mapping.contains("\"lance_analyzer\":\"english\""));
+            assertTrue("meta must keep the Arrow type: " + mapping, mapping.contains("\"lance_arrow_type\":\"Utf8\""));
+            // The derived column is plugin-managed: hidden from the
+            // mapping, targeted by the FTS build and optimise paths.
+            assertFalse("derived column must not surface: " + mapping, mapping.contains("\"body__lance_tokens\":{"));
+            assertTrue(
+                "derived column must be an FTS target: " + derivation.ftsColumns(),
+                derivation.ftsColumns().contains("body__lance_tokens")
+            );
+            assertFalse("base column must not be an FTS target: " + derivation.ftsColumns(), derivation.ftsColumns().contains("body"));
+            assertFalse(
+                "base column must not be a scalar target: " + derivation.scalarColumns(),
+                derivation.scalarColumns().contains("body")
+            );
+            assertTrue(
+                "expected a not-surfaced note, saw: " + derivation.notes(),
+                derivation.notes().stream().anyMatch(note -> note.startsWith("body__lance_tokens: derived tokens column"))
+            );
+        }
+    }
+
+    public void testTextAnalyzerOnNonUtf8Refused() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(englishTextTable(), StorageOptions.empty())) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("id", Map.of("type", "text_analyzer", "analyzer", "english"))))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("type=text_analyzer] needs a Utf8 column"));
+        }
+    }
+
+    public void testTextAnalyzerLenientSkipsNonUtf8WithNote() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(englishTextTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("id", Map.of("type", "text_analyzer", "analyzer", "english"))),
+                true
+            );
+            assertTrue(
+                "expected a skip note, saw: " + derivation.notes(),
+                derivation.notes().stream().anyMatch(note -> note.contains("override skipped"))
+            );
+            String mapping = derivation.mappingJson();
+            assertTrue("id keeps its integer mapping: " + mapping, mapping.contains("\"id\":{\"type\":\"integer\""));
+        }
+    }
+
+    public void testTextAnalyzerDerivedNameCollisionWithNonUtf8Refused() throws Exception {
+        // derived_column_name names the Int32 id column: strict derive
+        // refuses, naming the column and its type.
+        try (Dataset dataset = LanceRegistry.openDataset(englishTextTable(), StorageOptions.empty())) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(
+                    dataset,
+                    overrides(Map.of("body", Map.of("type", "text_analyzer", "analyzer", "english", "derived_column_name", "id")))
+                )
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("exists with Arrow type"));
         }
     }
 }
