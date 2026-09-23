@@ -103,7 +103,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             5,
             123L,
             planRefinements(2L, 0L, 1L),
-            planExecuted(7L, 4L)
+            planExecuted(7L, 4L),
+            new LanceNodeStats.FreshnessStats(2, 40L, 3L, 1L, 2L, 1L, 0L, 1_700_000_000_000L)
         );
     }
 
@@ -176,6 +177,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"plan\":{\"statistics\":{\"tables\":5,\"collect_millis_total\":123},"
                     + "\"refinements\":{\"security_wrapper\":2,\"sort_field_type\":0,\"aggregate_resolution\":1},"
                     + "\"executed\":{\"pushed_scan\":7,\"lucene\":4}},"
+                    + "\"freshness\":{\"tracked\":2,\"checks\":40,\"moves\":3,\"mapping_updates\":1,\"mapping_unchanged\":2,"
+                    + "\"rebuilds\":1,\"failures\":0,\"last_check_millis\":1700000000000},"
                     + "\"indices\":{\"big\":{\"rows\":3000000000,\"shard_reader_rows\":2000000000,\"nested_docs\":0,"
                     + "\"lucene_bound_exceeded\":true,\"index_types\":{},"
                     + "\"renamed_fields\":[{\"from\":\"ts\",\"to\":\"event_ts\",\"lance_field_id\":1}]},"
