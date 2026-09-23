@@ -95,6 +95,23 @@ public class HeapTopKExecTests extends OpenSearchTestCase {
         assertTrue(cost.equals(planner.getCostFactory().makeTinyCost().plus(planner.getCostFactory().makeCost(1, 1, 1))));
     }
 
+    public void testCostStaysAboveTheHandoff() throws IOException {
+        // The deterministic preference for the Lance form rests on this
+        // inequality: the handoff over a pushed scan must always cost
+        // less than the exec's constant when the trees below are equal.
+        HeapTopKExec exec = exec(hitsPlan("{\"size\":5,\"sort\":[{\"rating\":\"asc\"}]}"));
+        RelOptPlanner planner = exec.getCluster().getPlanner();
+        RelMetadataQuery mq = exec.getCluster().getMetadataQuery();
+        LuceneHandoffExec handoff = new LuceneHandoffExec(
+            exec.getCluster(),
+            exec.getInput().getTraitSet().replace(LuceneConvention.INSTANCE),
+            exec.getInput()
+        );
+        RelOptCost handoffCost = handoff.computeSelfCost(planner, mq);
+        RelOptCost execCost = exec.computeSelfCost(planner, mq);
+        assertTrue(handoffCost.isLt(execCost));
+    }
+
     public void testCopyBindsANewInputAndKeepsThePage() throws IOException {
         LanceHitShape hitShape = hitsPlan("{\"size\":5,\"sort\":[{\"rating\":\"asc\"}]}");
         HeapTopKExec exec = exec(hitShape);
