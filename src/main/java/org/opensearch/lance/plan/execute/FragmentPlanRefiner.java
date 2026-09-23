@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * The fragment executor's side of planning: the shipped
@@ -29,7 +30,7 @@ import java.util.function.Function;
  * Downgrades go one way, from the Lance scan to Lucene; nothing is
  * pushed on the data node that the coordinator did not push.
  *
- * <p>Three guards exist. {@link Reason#SECURITY_WRAPPER}: a reader
+ * <p>Four guards exist. {@link Reason#SECURITY_WRAPPER}: a reader
  * wrapper on the index service (the security plugin's DLS / FLS)
  * filters documents on the Lucene side, which a Lance scan never sees,
  * so a pushed aggregate, a pushed page and a pushed full text clause
@@ -50,7 +51,19 @@ import java.util.function.Function;
  * executor's resolution of the pushed aggregate against the mapping
  * ({@link LanceAggregateResults#resolve}: field types, the group
  * estimate bound, the terms top-k selection) refused, and the
- * aggregators run.
+ * aggregators run. {@link Reason#COLUMN_STORE_WARM}: the coordinator
+ * chose the pushed aggregate without knowing whether this node's
+ * column store holds the columns the Lucene aggregators would read;
+ * when the store holds every one of them for every fragment this
+ * request serves and the shipped {@link FragmentPlan.Aggregate#luceneWarmMillis()}
+ * (the aggregators' predicted cost over resident columns) is below
+ * {@link FragmentPlan.Aggregate#pushedMillis()}, the aggregators run
+ * instead of scanning the table again. The decision is cost only: over
+ * a local table the Lucene cost has no object store term, so the warm
+ * cost equals the cost the planner already compared and lost against
+ * and the guard cannot fire; over an object store table it fires only
+ * for the columns a Lucene side request already loaded, because
+ * nothing here warms the store.
  *
  * <p>Every downgrade is counted per reason in {@link #refinementCounts}
  * for {@code GET /_lance/stats}, and the caller logs the planned and
@@ -67,7 +80,8 @@ public final class FragmentPlanRefiner {
     public enum Reason {
         SECURITY_WRAPPER,
         SORT_FIELD_TYPE,
-        AGGREGATE_RESOLUTION;
+        AGGREGATE_RESOLUTION,
+        COLUMN_STORE_WARM;
 
         /** The key under {@code plan.refinements} in the stats. */
         public String statsKey() {
@@ -81,11 +95,13 @@ public final class FragmentPlanRefiner {
      * the request's sort clauses (null when the request has none), the
      * request itself, and the resolution of a pushed aggregate against
      * the mapping (null when the request carries none; returns null when
-     * the resolution refuses).
+     * the resolution refuses), and whether the node's column store holds
+     * a list of table columns for every fragment this request serves
+     * (null when the snapshot is not cached, so no store serves it).
      */
     public record Inputs(boolean hasSecurityWrapper, SortAndFormats sortAndFormats, LanceFragmentQueryRequest request, Function<
         FragmentPlan.Aggregate,
-        LanceAggregateResults> aggregateResolver) {
+        LanceAggregateResults> aggregateResolver, Predicate<List<String>> columnsResident) {
     }
 
     /**
@@ -140,10 +156,32 @@ public final class FragmentPlanRefiner {
                 reasons.add(Reason.AGGREGATE_RESOLUTION);
             }
         }
+        if (plan.aggregate() != null && luceneOverResidentColumnsIsCheaper(plan.aggregate(), in)) {
+            // The resolved executor holds no scan or native state, so it
+            // is dropped without a close.
+            aggregate = null;
+            plan = plan.withoutAggregate();
+            reasons.add(Reason.COLUMN_STORE_WARM);
+        }
         for (Reason reason : reasons) {
             COUNTS.computeIfAbsent(reason, r -> new LongAdder()).increment();
         }
         return new Refined(plan, reasons, aggregate);
+    }
+
+    /**
+     * Whether the Lucene aggregators over this node's column store are
+     * predicted cheaper than the shipped scan: the store serves the
+     * snapshot, the coordinator shipped fitted costs (both above zero;
+     * zeros mean the placeholder regime), the warm Lucene cost is
+     * strictly below the pushed cost, and every column the aggregators
+     * read is resident for every fragment of the request.
+     */
+    private static boolean luceneOverResidentColumnsIsCheaper(FragmentPlan.Aggregate aggregate, Inputs in) {
+        return in.columnsResident() != null
+            && aggregate.luceneWarmMillis() > 0.0
+            && aggregate.luceneWarmMillis() < aggregate.pushedMillis()
+            && in.columnsResident().test(aggregate.luceneColumns());
     }
 
     /**

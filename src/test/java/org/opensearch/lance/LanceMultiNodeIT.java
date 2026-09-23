@@ -317,7 +317,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 Map<String, Object> refinements = (Map<String, Object>) plan.get("refinements");
                 assertEquals(
                     "every reason is reported on " + node.getKey() + ": " + stats,
-                    Set.of("security_wrapper", "sort_field_type", "aggregate_resolution"),
+                    Set.of("security_wrapper", "sort_field_type", "aggregate_resolution", "column_store_warm"),
                     refinements.keySet()
                 );
                 for (Map.Entry<String, Object> reason : refinements.entrySet()) {

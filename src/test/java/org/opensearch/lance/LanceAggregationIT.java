@@ -471,12 +471,65 @@ public class LanceAggregationIT extends LanceRestTestCase {
     /** The {@code column_store} object of the single test node from {@code GET /_lance/stats}. */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> columnStoreStats() throws IOException {
+        return (Map<String, Object>) singleNodeStats().get("column_store");
+    }
+
+    /** The {@code plan.refinements} counters of the single test node from {@code GET /_lance/stats}, keyed by reason. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> planRefinements() throws IOException {
+        Map<String, Object> plan = (Map<String, Object>) singleNodeStats().get("plan");
+        return (Map<String, Object>) plan.get("refinements");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> singleNodeStats() throws IOException {
         String json = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
         try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
             Map<String, Object> nodes = (Map<String, Object>) parser.map().get("nodes");
             assertEquals("single node cluster", 1, nodes.size());
-            Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();
-            return (Map<String, Object>) node.get("column_store");
+            return (Map<String, Object>) nodes.values().iterator().next();
+        }
+    }
+
+    public void testWarmColumnStoreLeavesASmallTablePushedAggregationAlone() throws Exception {
+        // terms(category) once with the pushdown off, so the Lucene
+        // aggregators load the keyword column into the store, then with
+        // the pushdown back on. The coordinator ships the pushed
+        // aggregate with the cost of the warm aggregators next to it and
+        // the columns they would read; the fixture is far below the
+        // fitted model's range, so the shipped costs are zero and the
+        // data node keeps the pushed scan (no column_store_warm
+        // downgrade) while both runs answer the same buckets. The real
+        // effect over an object store is a benchmark question, not one
+        // this fixture can ask.
+        putTransientSetting("lance.aggregation.pushdown", "false");
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "warm-store")) {
+            String index = fixture.indexName();
+            String terms = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"size\":10}}}}";
+            Map<String, Object> before = columnStoreStats();
+            Map<String, Object> refinementsBefore = planRefinements();
+            assertTrue("the reason is reported: " + refinementsBefore, refinementsBefore.containsKey("column_store_warm"));
+
+            String onAggregators = withoutTook(readAll(postJson("/" + index + "/_search", terms)));
+            assertEquals(List.of("c0=150", "c1=150", "c2=150"), bucketsOf(onAggregators, "c"));
+            Map<String, Object> afterLucene = columnStoreStats();
+            assertEquals(
+                "the aggregators loaded the column into the store",
+                number(before.get("loads")) + 1,
+                number(afterLucene.get("loads"))
+            );
+
+            putTransientSetting("lance.aggregation.pushdown", null);
+            String onScan = withoutTook(readAll(postJson("/" + index + "/_search", terms)));
+            assertEquals("the pushed scan answers the same buckets", onAggregators, onScan);
+            Map<String, Object> refinementsAfter = planRefinements();
+            assertEquals(
+                "below the fitted range the shipped costs are zero and the guard does not fire",
+                refinementsBefore.get("column_store_warm"),
+                refinementsAfter.get("column_store_warm")
+            );
+        } finally {
+            putTransientSetting("lance.aggregation.pushdown", null);
         }
     }
 

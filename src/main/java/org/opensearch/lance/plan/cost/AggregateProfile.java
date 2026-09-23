@@ -30,6 +30,7 @@ import org.opensearch.lance.plan.rel.BucketSpec;
 import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
@@ -128,25 +129,11 @@ public record AggregateProfile(double tableRows, double groups, double mergedGro
         // aggregate reports the aggregate's row type.
         RelDataType scanRowType = scan.getTable().getRowType();
 
-        // The chain under the aggregate: an optional key projection over
-        // an optional query filter over the scan.
-        Project project = null;
-        Filter filter = null;
-        RelNode node = aggregate.getInput();
-        while (true) {
-            if (node instanceof Project p && project == null) {
-                project = p;
-            } else if (node instanceof Filter f && filter == null) {
-                filter = f;
-            } else {
-                break;
-            }
-            node = node.getInput(0);
-        }
+        Chain chain = Chain.under(aggregate);
+        Filter filter = chain.filter();
         int keyCount = aggregate.getGroupSet().cardinality();
         RelDataType inputRowType = aggregate.getInput().getRowType();
 
-        ImmutableBitSet.Builder columns = ImmutableBitSet.builder();
         int stringKeys = 0;
         int numericKeys = 0;
         int dateKeys = 0;
@@ -158,11 +145,7 @@ public record AggregateProfile(double tableRows, double groups, double mergedGro
         boolean groupsKnown = true;
         for (int key = 0; key < keyCount; key++) {
             BucketSpec spec = aggregate.bucket(key);
-            RexNode keyExpression = project != null
-                ? project.getProjects().get(key)
-                : new RexInputRef(key, inputRowType.getFieldList().get(key).getType());
-            ImmutableBitSet keyColumns = scanColumns(keyExpression);
-            columns.addAll(keyColumns);
+            ImmutableBitSet keyColumns = scanColumns(chain.inputExpression(inputRowType, key));
             boolean string = inputRowType.getFieldList().get(key).getType().getFamily() == SqlTypeFamily.CHARACTER;
             switch (spec.kind()) {
                 case TERMS, COMPOSITE_TERMS -> {
@@ -217,12 +200,8 @@ public record AggregateProfile(double tableRows, double groups, double mergedGro
         for (int i = 0; i < calls.size(); i++) {
             ImmutableBitSet callColumns = ImmutableBitSet.of();
             for (int argument : calls.get(i).getArgList()) {
-                RexNode expression = project != null
-                    ? project.getProjects().get(argument)
-                    : new RexInputRef(argument, inputRowType.getFieldList().get(argument).getType());
-                callColumns = callColumns.union(scanColumns(expression));
+                callColumns = callColumns.union(scanColumns(chain.inputExpression(inputRowType, argument)));
             }
-            columns.addAll(callColumns);
             switch (aggregate.metric(i).kind()) {
                 case SUM, AVG, MIN, MAX, VALUE_COUNT, STATS -> simpleMetrics++;
                 case EXTENDED_STATS -> extendedStats = true;
@@ -237,13 +216,12 @@ public record AggregateProfile(double tableRows, double groups, double mergedGro
 
         double selectivity = 1.0;
         if (filter != null) {
-            columns.addAll(scanColumns(filter.getCondition()));
             Double estimated = mq.getSelectivity(filter.getInput(), filter.getCondition());
             selectivity = estimated != null ? estimated : RelMdUtil.guessSelectivity(filter.getCondition());
             selectivity = Math.max(0.0, Math.min(1.0, selectivity));
         }
 
-        ImmutableBitSet read = columns.build();
+        ImmutableBitSet read = columnsRead(aggregate, chain);
         double bytes = 0.0;
         for (int column : read) {
             if (column < scanRowType.getFieldCount()) {
@@ -284,6 +262,81 @@ public record AggregateProfile(double tableRows, double groups, double mergedGro
             cardinalityDistinct,
             selectivity
         );
+    }
+
+    /**
+     * The distinct table columns the Lucene aggregators read for
+     * {@code aggregate} over {@code scan}'s table, by name in the
+     * table's row type order: the columns behind the keys, the metric
+     * arguments and the query filter, the same set {@link #of} counts as
+     * {@link #columnsRead}. Column positions past the table's row type
+     * (none today; a projection over a computed expression) are skipped.
+     */
+    public static List<String> columnNames(LanceAggregate aggregate, LanceTableScan scan) {
+        RelDataType scanRowType = scan.getTable().getRowType();
+        List<String> names = new ArrayList<>();
+        for (int column : columnsRead(aggregate, Chain.under(aggregate))) {
+            if (column < scanRowType.getFieldCount()) {
+                names.add(scanRowType.getFieldList().get(column).getName());
+            }
+        }
+        return names;
+    }
+
+    /**
+     * The chain under an aggregate: an optional key projection over an
+     * optional query filter over the scan. The projection sits directly
+     * over the scan or over a filter over the scan, and a filter keeps
+     * the scan's row type, so the projection's input positions are scan
+     * positions.
+     */
+    private record Chain(Project project, Filter filter) {
+
+        static Chain under(LanceAggregate aggregate) {
+            Project project = null;
+            Filter filter = null;
+            RelNode node = aggregate.getInput();
+            while (true) {
+                if (node instanceof Project p && project == null) {
+                    project = p;
+                } else if (node instanceof Filter f && filter == null) {
+                    filter = f;
+                } else {
+                    break;
+                }
+                node = node.getInput(0);
+            }
+            return new Chain(project, filter);
+        }
+
+        /**
+         * The expression the aggregate's input field {@code index} stands
+         * for: the projection's expression when there is one, else a
+         * reference to the scan column at the same position.
+         */
+        RexNode inputExpression(RelDataType inputRowType, int index) {
+            return project != null
+                ? project.getProjects().get(index)
+                : new RexInputRef(index, inputRowType.getFieldList().get(index).getType());
+        }
+    }
+
+    /** The scan columns the keys, the metric arguments and the filter of {@code aggregate} reference. */
+    private static ImmutableBitSet columnsRead(LanceAggregate aggregate, Chain chain) {
+        RelDataType inputRowType = aggregate.getInput().getRowType();
+        ImmutableBitSet.Builder columns = ImmutableBitSet.builder();
+        for (int key = 0; key < aggregate.getGroupSet().cardinality(); key++) {
+            columns.addAll(scanColumns(chain.inputExpression(inputRowType, key)));
+        }
+        for (AggregateCall call : aggregate.getAggCallList()) {
+            for (int argument : call.getArgList()) {
+                columns.addAll(scanColumns(chain.inputExpression(inputRowType, argument)));
+            }
+        }
+        if (chain.filter() != null) {
+            columns.addAll(scanColumns(chain.filter().getCondition()));
+        }
+        return columns.build();
     }
 
     /**

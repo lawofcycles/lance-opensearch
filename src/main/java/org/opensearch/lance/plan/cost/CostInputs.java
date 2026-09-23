@@ -130,4 +130,15 @@ public record CostInputs(int nodes, StorageKind storage, int cpusPerNode, int pu
     public CostInputs withMaxGroups(long bound) {
         return new CostInputs(nodes, storage, cpusPerNode, pushdownParallelism, slices, pushdownEnabled, bound);
     }
+
+    /**
+     * The same inputs over {@code newStorage}: what the Lucene aggregator
+     * path costs once the columns it reads are resident in the node's
+     * column store is this run's inputs with {@link StorageKind#LOCAL},
+     * because a resident column is read without an object store round
+     * trip whatever the table's URI says.
+     */
+    public CostInputs withStorage(StorageKind newStorage) {
+        return new CostInputs(nodes, newStorage, cpusPerNode, pushdownParallelism, slices, pushdownEnabled, maxGroups);
+    }
 }

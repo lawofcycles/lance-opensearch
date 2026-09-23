@@ -269,7 +269,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         assertEquals(0L, stats.planStatisticsCollectMillisTotal());
         assertEquals(
             "every refinement reason is reported, zero when it never fired",
-            List.of("security_wrapper", "sort_field_type", "aggregate_resolution"),
+            List.of("security_wrapper", "sort_field_type", "aggregate_resolution", "column_store_warm"),
             List.copyOf(stats.planRefinements().keySet())
         );
         assertEquals(List.of("pushed_scan", "lucene"), List.copyOf(stats.planExecuted().keySet()));

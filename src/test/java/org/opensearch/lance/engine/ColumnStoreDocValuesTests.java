@@ -39,6 +39,7 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceWarmCache.Lease;
 import org.opensearch.lance.engine.LanceWarmCache.Snapshot;
+import org.opensearch.lance.engine.LanceWarmCache.SnapshotKey;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -308,6 +309,64 @@ public class ColumnStoreDocValuesTests extends OpenSearchTestCase {
                 assertTrue(store.contains(snapshot.key(), "id", 0));
                 assertEquals(3, store.entryCount());
                 assertEquals(oneColumn, store.allocatedBytes());
+            }
+        }
+    }
+
+    public void testHoldsAnswersResidencyForEveryEntryKindWithoutCounting() throws Exception {
+        ColumnStore store = cache.columnStore();
+        try (Lease lease = acquire()) {
+            Snapshot snapshot = lease.snapshot();
+            assertFalse("nothing is loaded yet", store.holds(snapshot.key(), "rating", allFragments));
+            assertTrue("no fragment asked for is trivially held", store.holds(snapshot.key(), "rating", List.of()));
+            try (LanceDirectoryReader partial = openCached(snapshot, List.of(0, 1))) {
+                LanceFragmentLeafReader leaf = leavesOf(partial).get(0);
+                readByAdvanceExact(leaf, "rating");
+                ordsByDoc(leaf.getSortedDocValues("category"), leaf.maxDoc());
+                rowsByDoc(leaf.getSortedSetDocValues("tags"), leaf.maxDoc());
+            }
+            long hits = store.hitCount();
+            long loads = store.loadCount();
+            assertTrue("a numeric entry counts", store.holds(snapshot.key(), "rating", List.of(0, 1)));
+            assertTrue("a keyword entry counts", store.holds(snapshot.key(), "category", List.of(0, 1)));
+            assertTrue("a keyword array entry counts", store.holds(snapshot.key(), "tags", List.of(1, 0)));
+            assertFalse("one fragment is missing", store.holds(snapshot.key(), "rating", allFragments));
+            assertFalse("the column was never loaded", store.holds(snapshot.key(), "id", List.of(0, 1)));
+            assertFalse("another snapshot", store.holds(new SnapshotKey("other-uuid", snapshot.key().version()), "rating", List.of(0)));
+            assertEquals("a residency question is not a hit", hits, store.hitCount());
+            assertEquals("and loads nothing", loads, store.loadCount());
+            assertEquals(6, store.entryCount());
+        }
+    }
+
+    public void testHoldsLeavesTheEvictionOrderAlone() throws Exception {
+        cache.close();
+        // Exactly two numeric columns of three fragments fit.
+        long oneColumn = FRAGMENTS * ColumnStore.estimateBytes(ROWS, false);
+        cache = new LanceWarmCache(allocator, 2 * oneColumn, 64, true);
+        ColumnStore store = cache.columnStore();
+        try (Lease lease = acquire()) {
+            Snapshot snapshot = lease.snapshot();
+            try (LanceDirectoryReader loading = openCached(snapshot, allFragments)) {
+                LanceFragmentLeafReader leaf = leavesOf(loading).get(0);
+                readByAdvanceExact(leaf, "rating");
+                readByAdvanceExact(leaf, "id");
+                assertEquals(6, store.entryCount());
+                assertEquals(2 * oneColumn, store.allocatedBytes());
+                assertEquals(0L, store.evictionCount());
+            }
+            // rating is the least recently used column. Asking whether it
+            // is held must not make it the most recently used one: the
+            // next load, which needs one entry's worth of room, evicts a
+            // rating fragment, not an id fragment.
+            assertTrue(store.holds(snapshot.key(), "rating", allFragments));
+            assertTrue(store.holds(snapshot.key(), "id", allFragments));
+            try (LanceDirectoryReader third = openCached(snapshot, allFragments)) {
+                readByAdvanceExact(leavesOf(third).get(0), "flag");
+                assertEquals(1L, store.evictionCount());
+                assertFalse("a rating fragment was evicted", store.holds(snapshot.key(), "rating", allFragments));
+                assertTrue("id stayed whole", store.holds(snapshot.key(), "id", allFragments));
+                assertTrue(store.holds(snapshot.key(), "flag", allFragments));
             }
         }
     }

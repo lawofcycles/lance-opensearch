@@ -78,6 +78,8 @@ public class CostInputsTests extends OpenSearchTestCase {
         assertEquals(1L, inputs.withPushdownEnabled(true).maxGroups());
         assertEquals(50L, inputs.withMaxGroups(50L).maxGroups());
         assertFalse(inputs.withMaxGroups(50L).pushdownEnabled());
+        assertEquals("the storage swap keeps the routing settings", 1L, inputs.withStorage(StorageKind.LOCAL).maxGroups());
+        assertFalse(inputs.withStorage(StorageKind.LOCAL).pushdownEnabled());
         assertEquals(
             new CostInputs(2, StorageKind.OBJECT_STORE, 16, 8, 8, true, CostInputs.DEFAULT_MAX_GROUPS),
             new CostInputs(2, StorageKind.OBJECT_STORE, 16, 8, 8)
