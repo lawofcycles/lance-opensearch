@@ -17,14 +17,9 @@ import java.util.concurrent.Executor;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 
-import org.apache.arrow.vector.BigIntVector;
-import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
-import org.apache.arrow.vector.IntVector;
-import org.apache.arrow.vector.SmallIntVector;
-import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
@@ -124,6 +119,13 @@ import org.opensearch.search.aggregations.metrics.TDigestState;
 import org.opensearch.search.aggregations.metrics.ValueCountAggregationBuilder;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
 import org.opensearch.search.sort.SortOrder;
+
+import static org.opensearch.lance.execute.ArrowRowValues.asLong;
+import static org.opensearch.lance.execute.ArrowRowValues.doubleKeyOf;
+import static org.opensearch.lance.execute.ArrowRowValues.doubleOr;
+import static org.opensearch.lance.execute.ArrowRowValues.doubleOrZero;
+import static org.opensearch.lance.execute.ArrowRowValues.longOrZero;
+import static org.opensearch.lance.execute.ArrowRowValues.readUtf8;
 
 /**
  * Runs a {@code size: 0} aggregation request as a group by inside the
@@ -3207,75 +3209,6 @@ public final class LanceAggregateResults {
                 yield dateInterval > 0L ? value * dateInterval : value;
             }
         };
-    }
-
-    private static double doubleKeyOf(FieldVector vector, int row) {
-        if (vector instanceof Float4Vector v) {
-            return v.get(row);
-        }
-        if (vector instanceof Float8Vector v) {
-            return v.get(row);
-        }
-        throw new IllegalStateException(
-            "unexpected Arrow vector " + vector.getClass().getSimpleName() + " for a floating point key " + vector.getName()
-        );
-    }
-
-    /**
-     * The row's UTF-8 bytes read into {@code scratch} through the
-     * vector's offset and data buffers, so the row loop copies bytes
-     * instead of allocating an array per row as {@code VarCharVector#get}
-     * does.
-     */
-    private static BytesRef readUtf8(VarCharVector vector, int row, BytesRefBuilder scratch) {
-        long start = vector.getOffsetBuffer().getInt(row * 4L);
-        int length = vector.getOffsetBuffer().getInt((row + 1) * 4L) - (int) start;
-        scratch.grow(length);
-        vector.getDataBuffer().getBytes(start, scratch.bytes(), 0, length);
-        scratch.setLength(length);
-        return scratch.get();
-    }
-
-    private static long longOrZero(FieldVector vector, int row) {
-        return vector.isNull(row) ? 0L : asLong(vector, row);
-    }
-
-    private static double doubleOrZero(FieldVector vector, int row) {
-        return doubleOr(vector, row, 0d);
-    }
-
-    private static double doubleOr(FieldVector vector, int row, double whenNull) {
-        if (vector.isNull(row)) {
-            return whenNull;
-        }
-        if (vector instanceof Float4Vector v) {
-            return v.get(row);
-        }
-        if (vector instanceof Float8Vector v) {
-            return v.get(row);
-        }
-        return (double) asLong(vector, row);
-    }
-
-    private static long asLong(FieldVector vector, int row) {
-        if (vector instanceof BigIntVector v) {
-            return v.get(row);
-        }
-        if (vector instanceof IntVector v) {
-            return v.get(row);
-        }
-        if (vector instanceof SmallIntVector v) {
-            return v.get(row);
-        }
-        if (vector instanceof TinyIntVector v) {
-            return v.get(row);
-        }
-        if (vector instanceof BitVector v) {
-            return v.get(row);
-        }
-        throw new IllegalStateException(
-            "unexpected Arrow vector " + vector.getClass().getSimpleName() + " for aggregate column " + vector.getName()
-        );
     }
 
     // ---------------------------------------------------------------
