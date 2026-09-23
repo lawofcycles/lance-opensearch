@@ -374,14 +374,11 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
                 .append(", metrics=")
                 .append(metrics)
                 .append(", substraitBytes=")
-                .append(substrait.length);
+                .append(substrait.length)
+                .append(", luceneColumns=")
+                .append(luceneColumns);
             if (pushedMillis > 0.0 || luceneWarmMillis > 0.0) {
-                sb.append(", pushedMs=")
-                    .append(Math.round(pushedMillis))
-                    .append(", luceneWarmMs=")
-                    .append(Math.round(luceneWarmMillis))
-                    .append(", luceneColumns=")
-                    .append(luceneColumns);
+                sb.append(", pushedMs=").append(Math.round(pushedMillis)).append(", luceneWarmMs=").append(Math.round(luceneWarmMillis));
             }
             return sb.append('}').toString();
         }

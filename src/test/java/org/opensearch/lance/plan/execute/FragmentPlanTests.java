@@ -261,6 +261,17 @@ public class FragmentPlanTests extends OpenSearchTestCase {
         assertEquals(0.0, placeholder.luceneWarmMillis(), 0.0);
         assertEquals(List.of(), placeholder.luceneColumns());
         assertNotEquals("the cost fields take part in equality", aggregate, placeholder);
+        FragmentPlan.Aggregate placeholderWithColumns = new FragmentPlan.Aggregate(
+            new byte[] { 1 },
+            1,
+            aggregate.metrics(),
+            0.0,
+            0.0,
+            List.of("category")
+        );
+        String rendered = placeholderWithColumns.toString();
+        assertTrue("the columns print below the fitted range too: " + rendered, rendered.contains("luceneColumns=[category]"));
+        assertFalse("the zero costs do not print: " + rendered, rendered.contains("pushedMs"));
         expectThrows(
             IllegalArgumentException.class,
             () -> new FragmentPlan.Aggregate(new byte[] { 1 }, 0, List.of(), -1.0, 0.0, List.of())
