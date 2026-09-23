@@ -123,12 +123,9 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
 
     public void testClassifyForAdoptionSkipsIndexWithoutLanceTable() {
         Settings plain = Settings.builder().put("index.number_of_shards", 1).build();
-        assertEquals(LanceNamespaceService.Adoption.NOT_LANCE, LanceNamespaceService.classifyForAdoption("plain", plain, Set.of("/ns")));
+        assertEquals(LanceIndexAdopter.Adoption.NOT_LANCE, LanceIndexAdopter.classifyForAdoption("plain", plain, Set.of("/ns")));
         Settings emptyTable = Settings.builder().put(LanceEngineFactory.TABLE_SETTING, "").build();
-        assertEquals(
-            LanceNamespaceService.Adoption.NOT_LANCE,
-            LanceNamespaceService.classifyForAdoption("plain", emptyTable, Set.of("/ns"))
-        );
+        assertEquals(LanceIndexAdopter.Adoption.NOT_LANCE, LanceIndexAdopter.classifyForAdoption("plain", emptyTable, Set.of("/ns")));
     }
 
     public void testClassifyForAdoptionSkipsPinnedIndex() {
@@ -138,7 +135,7 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
             .put(LanceEngineFactory.TABLE_SETTING, "/ns/demo.lance")
             .put(LanceEngineFactory.VERSION_SETTING, randomIntBetween(0, 100))
             .build();
-        assertEquals(LanceNamespaceService.Adoption.PINNED, LanceNamespaceService.classifyForAdoption("demo", pinned, Set.of("/ns")));
+        assertEquals(LanceIndexAdopter.Adoption.PINNED, LanceIndexAdopter.classifyForAdoption("demo", pinned, Set.of("/ns")));
     }
 
     public void testClassifyForAdoptionRecognisesNamespaceSurfacedIndex() {
@@ -151,28 +148,28 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
             .put(LanceEngineFactory.VERSION_SETTING, -1L)
             .build();
         assertEquals(
-            LanceNamespaceService.Adoption.NAMESPACE,
-            LanceNamespaceService.classifyForAdoption("demo", surfaced, Set.of("/other", "/ns"))
+            LanceIndexAdopter.Adoption.NAMESPACE,
+            LanceIndexAdopter.classifyForAdoption("demo", surfaced, Set.of("/other", "/ns"))
         );
     }
 
     public void testClassifyForAdoptionTreatsOtherLanceIndexesAsAttached() {
         Settings attached = Settings.builder().put(LanceEngineFactory.TABLE_SETTING, "/elsewhere/demo.lance").build();
         // Not under any registered root.
-        assertEquals(LanceNamespaceService.Adoption.ATTACH, LanceNamespaceService.classifyForAdoption("demo", attached, Set.of("/ns")));
+        assertEquals(LanceIndexAdopter.Adoption.ATTACH, LanceIndexAdopter.classifyForAdoption("demo", attached, Set.of("/ns")));
         // No namespace registered at all.
-        assertEquals(LanceNamespaceService.Adoption.ATTACH, LanceNamespaceService.classifyForAdoption("demo", attached, Set.of()));
+        assertEquals(LanceIndexAdopter.Adoption.ATTACH, LanceIndexAdopter.classifyForAdoption("demo", attached, Set.of()));
         // Under a registered root but attached under a different index
         // name, so the namespace loop would never sync it by that name.
         Settings renamed = Settings.builder().put(LanceEngineFactory.TABLE_SETTING, "/ns/demo.lance").build();
-        assertEquals(LanceNamespaceService.Adoption.ATTACH, LanceNamespaceService.classifyForAdoption("alias", renamed, Set.of("/ns")));
+        assertEquals(LanceIndexAdopter.Adoption.ATTACH, LanceIndexAdopter.classifyForAdoption("alias", renamed, Set.of("/ns")));
         // A tag does not change the classification; it is carried into
         // the attach bookkeeping by the caller.
         Settings tagged = Settings.builder()
             .put(LanceEngineFactory.TABLE_SETTING, "/elsewhere/demo.lance")
             .put(LanceEngineFactory.TAG_SETTING, "release")
             .build();
-        assertEquals(LanceNamespaceService.Adoption.ATTACH, LanceNamespaceService.classifyForAdoption("demo", tagged, Set.of("/ns")));
+        assertEquals(LanceIndexAdopter.Adoption.ATTACH, LanceIndexAdopter.classifyForAdoption("demo", tagged, Set.of("/ns")));
     }
 
     public void testInitializeFailureSurfacesAsUnavailableAndRetries() throws Exception {
@@ -556,19 +553,19 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
 
     public void testTableLocationStripsTrailingSlashAndHandlesMissingLocation() {
         DescribeTableResponse response = new DescribeTableResponse();
-        assertNull(LanceNamespaceService.tableLocation(response));
+        assertNull(LanceCatalogEnumerator.tableLocation(response));
         response.setLocation("s3://bucket/prefix/orders.lance/");
-        assertEquals("s3://bucket/prefix/orders.lance", LanceNamespaceService.tableLocation(response));
+        assertEquals("s3://bucket/prefix/orders.lance", LanceCatalogEnumerator.tableLocation(response));
         response.setLocation("/data/orders.lance");
-        assertEquals("/data/orders.lance", LanceNamespaceService.tableLocation(response));
-        assertNull(LanceNamespaceService.tableLocation(null));
+        assertEquals("/data/orders.lance", LanceCatalogEnumerator.tableLocation(response));
+        assertNull(LanceCatalogEnumerator.tableLocation(null));
     }
 
     public void testMergeStorageOptionsOverlaysEntryValuesOnCatalogValues() {
         StorageOptions entryOptions = StorageOptions.of(Map.of("aws_region", "ap-northeast-1"));
-        assertEquals(entryOptions, LanceNamespaceService.mergeStorageOptions(null, entryOptions));
-        assertEquals(entryOptions, LanceNamespaceService.mergeStorageOptions(Map.of(), entryOptions));
-        StorageOptions merged = LanceNamespaceService.mergeStorageOptions(
+        assertEquals(entryOptions, LanceCatalogEnumerator.mergeStorageOptions(null, entryOptions));
+        assertEquals(entryOptions, LanceCatalogEnumerator.mergeStorageOptions(Map.of(), entryOptions));
+        StorageOptions merged = LanceCatalogEnumerator.mergeStorageOptions(
             Map.of("aws_region", "us-east-1", "allow_http", "true"),
             entryOptions
         );
