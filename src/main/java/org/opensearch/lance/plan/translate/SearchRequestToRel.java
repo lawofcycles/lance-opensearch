@@ -22,7 +22,9 @@ import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.LanceFtsMatch;
 import org.opensearch.lance.plan.rel.LanceHitShape;
 import org.opensearch.lance.plan.rel.LanceKnnSearch;
+import org.opensearch.lance.plan.rel.LanceShardPathShape;
 import org.opensearch.lance.plan.rel.LanceTopK;
+import org.opensearch.lance.plan.rel.ShardPathReason;
 import org.opensearch.lance.plan.rel.physical.FanOutExec;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
 import org.opensearch.lance.plan.rules.SortResolution;
@@ -33,6 +35,7 @@ import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.lance.query.LanceMatchPhraseQueryBuilder;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.lance.query.LanceMultiMatchQueryBuilder;
+import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
@@ -221,6 +224,125 @@ public final class SearchRequestToRel {
             relBuilder.push(LogicalFilter.create(relBuilder.build(), predicate));
         }
         return relBuilder.build();
+    }
+
+    /**
+     * Translates one search body for the dispatch decision: whether the
+     * fragment fan-out or the standard shard search path serves it. The
+     * result is the index's bare scan when the fragment path can answer
+     * the request's envelope, or the scan wrapped in a
+     * {@link LanceShardPathShape} carrying the {@link ShardPathReason}s
+     * when the body holds an element only the shard path serves.
+     * {@code LancePlannerFactory.plan} then answers the shard path tree
+     * with a {@code ShardPathFallbackExec} root, which is the routing
+     * decision the dispatch filter reads.
+     *
+     * <p>Unlike {@link #translate}, nothing here throws for an
+     * unsupported element: the fragment path accepts every query type
+     * and most envelope elements by shipping the request to the
+     * per-node executors as OpenSearch builders, so a shape this
+     * translator cannot spell in relational form is still
+     * dispatchable. Only the elements {@link #shardPathReasons} names
+     * route away. The query tree itself plays no part in the decision,
+     * so the scan stays bare instead of carrying it.
+     *
+     * @param source the parsed search body; null stands for an empty
+     *     body and is dispatchable
+     */
+    public static RelNode translateDispatch(SearchSourceBuilder source, LanceSchemas.IndexModel model, LancePlannerFactory factory) {
+        List<ShardPathReason> reasons = shardPathReasons(source);
+        RelNode scan = scanBuilder(model, factory).build();
+        if (reasons.isEmpty()) {
+            return scan;
+        }
+        return new LanceShardPathShape(scan.getCluster(), scan.getCluster().traitSetOf(Convention.NONE), scan, reasons);
+    }
+
+    /**
+     * The request elements of {@code source} only the shard path
+     * serves, in the fixed order the checks run; empty when the
+     * fragment fan-out can answer the envelope. Each check's rationale
+     * is on its {@link ShardPathReason} constant.
+     */
+    public static List<ShardPathReason> shardPathReasons(SearchSourceBuilder source) {
+        if (source == null) {
+            return List.of();
+        }
+        List<ShardPathReason> reasons = new ArrayList<>();
+        if (source.suggest() != null) {
+            reasons.add(ShardPathReason.SUGGEST);
+        }
+        if (source.highlighter() != null) {
+            reasons.add(ShardPathReason.HIGHLIGHT);
+        }
+        // search_after depends on sort — Lucene's searchAfter takes a
+        // FieldDoc whose fields correspond to the Sort clauses. A
+        // score-order search_after is a shard-path shape.
+        if (source.searchAfter() != null && (source.sorts() == null || source.sorts().isEmpty())) {
+            reasons.add(ShardPathReason.SEARCH_AFTER_SCORE);
+        }
+        if (source.collapse() != null) {
+            reasons.add(ShardPathReason.COLLAPSE);
+        }
+        if (source.rescores() != null && !source.rescores().isEmpty()) {
+            reasons.add(ShardPathReason.RESCORE);
+        }
+        if (source.aggregations() != null && hasPipelineAggregation(source.aggregations())) {
+            reasons.add(ShardPathReason.PIPELINE_AGG);
+        }
+        if (source.minScore() != null) {
+            reasons.add(ShardPathReason.MIN_SCORE);
+        }
+        if (source.terminateAfter() > 0) {
+            reasons.add(ShardPathReason.TERMINATE_AFTER);
+        }
+        if (source.storedFields() != null) {
+            reasons.add(ShardPathReason.STORED_FIELDS);
+        }
+        if (source.docValueFields() != null && !source.docValueFields().isEmpty()) {
+            reasons.add(ShardPathReason.DOCVALUE_FIELDS);
+        }
+        if (Boolean.TRUE.equals(source.explain())) {
+            reasons.add(ShardPathReason.EXPLAIN_PER_HIT);
+        }
+        return reasons;
+    }
+
+    /**
+     * Returns {@code true} if the aggregation tree contains any
+     * pipeline aggregator, either at the top level (sibling pipelines
+     * such as {@code avg_bucket}) or nested inside a bucket
+     * aggregation (parent pipelines such as {@code cumulative_sum}
+     * or {@code bucket_sort}).
+     */
+    private static boolean hasPipelineAggregation(AggregatorFactories.Builder aggs) {
+        if (aggs == null) {
+            return false;
+        }
+        if (!aggs.getPipelineAggregatorFactories().isEmpty()) {
+            return true;
+        }
+        for (AggregationBuilder child : aggs.getAggregatorFactories()) {
+            if (containsPipeline(child)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsPipeline(AggregationBuilder agg) {
+        if (agg == null) {
+            return false;
+        }
+        if (!agg.getPipelineAggregations().isEmpty()) {
+            return true;
+        }
+        for (AggregationBuilder child : agg.getSubAggregations()) {
+            if (containsPipeline(child)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

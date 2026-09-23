@@ -59,6 +59,7 @@ import org.opensearch.lance.plan.rel.PushedOperation.PushedKnn;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedTopK;
 import org.opensearch.lance.plan.rel.physical.FanOutExec;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
+import org.opensearch.lance.plan.rel.physical.ShardPathFallbackExec;
 import org.opensearch.lance.plan.rules.SortResolution;
 import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
@@ -184,6 +185,24 @@ public final class PlanExecutor {
     /** The reduce of one target's gathered responses into the accumulated state. */
     private static void executeMerge(MergeExec merge, MergeReducer reducer, String indexName, FragmentFanOut.Outcome outcome) {
         reducer.absorbTarget(indexName, outcome.responses(), outcome.incompleteNodes() > 0);
+    }
+
+    /**
+     * Run one shard path fallback plan: the root must be the
+     * {@link ShardPathFallbackExec} the shard path rule produced. The
+     * operator's execution is the forward itself — the whole
+     * {@code SearchRequest} leaves the planner's tree and continues on
+     * OpenSearch's standard shard search path, per request, exactly as
+     * if the dispatch filter had dropped it back onto the filter chain
+     * — so {@code forward} carries the caller's chain continuation
+     * (including its reader-bound guard and its thread pool hop) and
+     * nothing below the root is traversed.
+     */
+    public void executeShardPath(RelNode shardPathPlan, Runnable forward) {
+        if (!(shardPathPlan instanceof ShardPathFallbackExec)) {
+            throw new IllegalArgumentException("the shard path plan root must be a ShardPathFallbackExec, got " + shardPathPlan);
+        }
+        forward.run();
     }
 
     /**

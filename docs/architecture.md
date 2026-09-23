@@ -233,9 +233,12 @@ sequenceDiagram
 ```
 
 The dispatch filter checks that every target index is Lance-backed and the request shape is one
-the fragment executor answers correctly; anything else (suggesters, highlighters, collapse,
+the fragment executor answers correctly. That shape decision is itself a plan: the translator
+marks a body holding an element only the shard path serves (suggesters, highlighters, collapse,
 rescore, pipeline aggregations and the rest of the list in
-[limitations.md](limitations.md)) proceeds unchanged onto the shard path. The coordinator never
+[limitations.md](limitations.md)) with a shard-path shape node naming each element as a reason,
+the planner lowers it to the shard-path convention's fallback operator, and a plan with that
+operator at its root proceeds unchanged onto the shard path. The coordinator never
 touches shards: fan-out and merge are plan operators, and a plan executor walks that plan to send
 one request per data node and reduce the answers with OpenSearch's stock reduction. A node needs
 no shard copy to take a share of the work — it builds its context from cluster state — which is
@@ -287,14 +290,17 @@ operator runs, and converting between them is an explicit, costed step:
   vector search, ordered limited pages).
 - The Lucene convention: work executed by Lucene's aggregator and collector machinery over the
   fragment leaf readers, plus the coordinator's fan-out and merge operators.
-- The shard-path convention: work answered by OpenSearch's regular shard search. Reserved today;
-  the intent is to make the shard fallback a plan alternative the planner costs, retiring the
-  dispatch filter's shape checks.
+- The shard-path convention: work answered by OpenSearch's regular shard search. Its single
+  operator, `ShardPathFallbackExec`, is produced by `PlanToShardPathRule` for a request whose body
+  holds an element only the shard path serves; the operator carries the reasons and its presence
+  at the plan root is what routes the request there, so the shard fallback is a plan the planner
+  produces rather than a shape checklist in the dispatch filter.
 
 ```mermaid
 flowchart LR
     subgraph logical ["Logical plan (from the request body)"]
         LT["query / aggregate / top-k /<br/>FTS / knn nodes over a table scan"]
+        SS["shard-path shape<br/>(reasons) over a table scan"]
     end
     subgraph lance ["Lance convention"]
         PS["scan carrying pushed operations"]
@@ -302,10 +308,11 @@ flowchart LR
     subgraph lucene ["Lucene convention"]
         LE["aggregate / top-k executed by<br/>Lucene machinery; fan-out and merge"]
     end
-    SP["shard-path convention (reserved)"]
+    SP["shard-path convention:<br/>fallback operator"]
     LT -- "pushdown and fuse rules" --> PS
     LT -- "converter rules" --> LE
     PS -- "zero-cost handoff" --> LE
+    SS -- "shard-path rule" --> SP
 ```
 
 Translators turn the search body into a logical tree; pushdown rules fold what Lance can compute
@@ -319,7 +326,8 @@ rule.
 The planner was delivered in phases, and the later ones are still in flight: first the
 foundations (dependencies, schema, conventions, cost, the explain endpoint), then the aggregation
 route through the planner, then hits, full text and vector translation, then the Lucene
-convention operators with fan-out and merge as plan operators, and ahead: a cost model fitted
+convention operators with fan-out and merge as plan operators, then the shard-path fallback as a
+plan operator, and ahead: a cost model fitted
 from Lance table statistics rather than constants, and accuracy and tie-stability as planner
 traits a request can demand. The CHANGELOG tracks what has landed.
 
