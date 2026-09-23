@@ -890,8 +890,10 @@ public final class LanceFragmentSearchContext extends SearchContext {
      * so a {@code terms} reduce applies {@code shard_size} and
      * {@code shard_min_doc_count} rather than the request level
      * {@code size} and {@code min_doc_count} the coordinator applies
-     * later. The fragment path routes every request with a pipeline
-     * aggregation to the shard path, so the pipeline tree is empty.
+     * later. The pipeline tree the partial context carries is only read
+     * for wire compatibility with nodes before pipelines moved to the
+     * coordinator, so it stays empty; the request's pipelines run on
+     * the coordinator's final reduce.
      *
      * @throws IllegalStateException when several slices are configured
      *         and no {@link ScriptService} was attached through
