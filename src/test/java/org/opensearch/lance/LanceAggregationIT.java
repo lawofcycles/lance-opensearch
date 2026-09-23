@@ -19,8 +19,10 @@ import java.util.Set;
 import java.util.stream.Stream;
 
 import org.opensearch.client.Request;
+import org.opensearch.client.RequestOptions;
 import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
+import org.opensearch.client.WarningsHandler;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
@@ -1231,9 +1233,19 @@ public class LanceAggregationIT extends LanceRestTestCase {
      */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> assertShardPathAgrees(String index, String shape) throws IOException {
-        Map<String, Object> fragmentPath = parse(readAll(postJson("/" + index + "/_search", "{" + shape + "}")));
+        return assertShardPathAgrees(index, shape, false);
+    }
+
+    /**
+     * As {@link #assertShardPathAgrees(String, String)}; {@code
+     * allowWarnings} accepts a {@code Warning} header on both answers
+     * (a deprecated aggregation such as {@code moving_avg}).
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> assertShardPathAgrees(String index, String shape, boolean allowWarnings) throws IOException {
+        Map<String, Object> fragmentPath = parse(readAll(post("/" + index + "/_search", "{" + shape + "}", allowWarnings)));
         Map<String, Object> shardPath = parse(
-            readAll(postJson("/" + index + "/_search?request_cache=false", onShardPath("{" + shape + "}")))
+            readAll(post("/" + index + "/_search?request_cache=false", onShardPath("{" + shape + "}"), allowWarnings))
         );
         assertEquals(
             shape,
@@ -1242,6 +1254,16 @@ public class LanceAggregationIT extends LanceRestTestCase {
         );
         assertEquals(shape, withoutShardPathOracle(shardPath.get("aggregations")), fragmentPath.get("aggregations"));
         return fragmentPath;
+    }
+
+    private static Response post(String path, String body, boolean allowWarnings) throws IOException {
+        if (!allowWarnings) {
+            return postJson(path, body);
+        }
+        Request request = new Request("POST", path);
+        request.setJsonEntity(body);
+        request.setOptions(RequestOptions.DEFAULT.toBuilder().setWarningsHandler(WarningsHandler.PERMISSIVE));
+        return client().performRequest(request);
     }
 
     @SuppressWarnings("unchecked")
@@ -1373,6 +1395,173 @@ public class LanceAggregationIT extends LanceRestTestCase {
             assertEquals(48, ((Number) aggregation(viaShardOnly, "f").get("doc_count")).intValue());
             assertEquals(fanOut, fanOutLogLines(index));
         }
+    }
+
+    /**
+     * Pipeline aggregations run on the coordinator's final reduce, so a
+     * request carrying one stays on the fragment path and answers what
+     * the shard path answers. The interleaved fixture has three fragments
+     * of eight rows: id 0..23, category {@code c(id % 3)}, ts one day per
+     * id from 2024-01-01. Every sibling pipeline ({@code avg_bucket},
+     * {@code sum_bucket}, {@code min_bucket}, {@code max_bucket},
+     * {@code stats_bucket}, {@code extended_stats_bucket},
+     * {@code percentiles_bucket}) over a {@code terms}, every parent
+     * pipeline ({@code cumulative_sum}, {@code derivative},
+     * {@code moving_fn}, {@code moving_avg}, {@code serial_diff},
+     * {@code bucket_sort}, {@code bucket_script}, {@code bucket_selector})
+     * under a {@code date_histogram} or a {@code terms}, and the two
+     * nested placements (a parent pipeline two levels down, a sibling
+     * pipeline under a bucket) have to match the shard path's block byte
+     * for byte. The refusals are core's, raised before the routing
+     * decision, so both paths answer the same 400.
+     */
+    @SuppressWarnings("unchecked")
+    public void testPipelineAggregationsAnswerLikeTheShardPath() throws Exception {
+        String suffix = "pipeline-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        String tableUri = LanceTableFactory.writeInterleavedTable(scratchDir, tableName, 3, 8);
+        String index = tableName;
+        String byCategory =
+            "\"t\":{\"terms\":{\"field\":\"category\",\"order\":{\"_key\":\"asc\"}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+        String byWeek =
+            "\"m\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"week\"},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}";
+        String[] shapes = {
+            // Sibling pipelines over the merged terms buckets.
+            "\"size\":0,\"aggs\":{"
+                + byCategory
+                + ",\"ab\":{\"avg_bucket\":{\"buckets_path\":\"t>s\"}},"
+                + "\"sb\":{\"sum_bucket\":{\"buckets_path\":\"t>s\"}},\"nb\":{\"min_bucket\":{\"buckets_path\":\"t>s\"}},"
+                + "\"xb\":{\"max_bucket\":{\"buckets_path\":\"t>s\"}},\"cb\":{\"sum_bucket\":{\"buckets_path\":\"t>_count\"}}}",
+            "\"size\":0,\"aggs\":{"
+                + byCategory
+                + ",\"st\":{\"stats_bucket\":{\"buckets_path\":\"t>s\"}},"
+                + "\"es\":{\"extended_stats_bucket\":{\"buckets_path\":\"t>s\",\"sigma\":1.5}},"
+                + "\"pb\":{\"percentiles_bucket\":{\"buckets_path\":\"t>s\",\"percents\":[0,50,100]}}}",
+            // Parent pipelines inside the date histogram.
+            "\"size\":0,\"aggs\":{"
+                + byWeek
+                + ",\"cs\":{\"cumulative_sum\":{\"buckets_path\":\"s\"}},"
+                + "\"d\":{\"derivative\":{\"buckets_path\":\"s\"}},\"sd\":{\"serial_diff\":{\"buckets_path\":\"s\",\"lag\":1}},"
+                + "\"cc\":{\"cumulative_sum\":{\"buckets_path\":\"_count\"}}}}}",
+            "\"size\":0,\"aggs\":{"
+                + byWeek
+                + ",\"mf\":{\"moving_fn\":{\"buckets_path\":\"s\",\"window\":2,"
+                + "\"script\":\"MovingFunctions.unweightedAvg(values)\"}}}}}",
+            // Parent pipelines that reorder, compute over or drop the
+            // terms buckets.
+            "\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}},"
+                + "\"bs\":{\"bucket_sort\":{\"sort\":[{\"s\":{\"order\":\"asc\"}}],\"size\":2}}}}}",
+            "\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}},"
+                + "\"bs\":{\"bucket_sort\":{\"from\":1,\"size\":1}}}}}",
+            "\"size\":0,\"aggs\":{"
+                + byCategory.replace(
+                    "\"s\":{\"sum\":{\"field\":\"id\"}}",
+                    "\"s\":{\"sum\":{\"field\":\"id\"}},"
+                        + "\"ratio\":{\"bucket_script\":{\"buckets_path\":{\"s\":\"s\",\"c\":\"_count\"},\"script\":\"params.s / params.c\"}}"
+                )
+                + "}",
+            "\"size\":0,\"aggs\":{"
+                + byCategory.replace(
+                    "\"s\":{\"sum\":{\"field\":\"id\"}}",
+                    "\"s\":{\"sum\":{\"field\":\"id\"}},"
+                        + "\"keep\":{\"bucket_selector\":{\"buckets_path\":{\"s\":\"s\"},\"script\":\"params.s > 90\"}}"
+                )
+                + "}",
+            // With a query, and the two nested placements.
+            "\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":6}}},\"aggs\":{"
+                + byCategory
+                + ",\"ab\":{\"avg_bucket\":{\"buckets_path\":\"t>s\"}}}",
+            "\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},\"aggs\":{"
+                + byWeek
+                + ",\"cs\":{\"cumulative_sum\":{\"buckets_path\":\"s\"}}}}}}}",
+            "\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"h\":{\"histogram\":{\"field\":\"id\",\"interval\":8},"
+                + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}},\"ab\":{\"avg_bucket\":{\"buckets_path\":\"h>s\"}}}}}" };
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            long fanOutBefore = fanOutLogLines(index);
+            int requests = 0;
+            for (String shape : shapes) {
+                Map<String, Object> answer = assertShardPathAgrees(index, shape);
+                assertNotNull(shape, answer.get("aggregations"));
+                requests++;
+            }
+            // moving_avg is deprecated in favour of moving_fn and answers
+            // with a Warning header on both paths.
+            String movingAvg = "\"size\":0,\"aggs\":{" + byWeek + ",\"ma\":{\"moving_avg\":{\"buckets_path\":\"s\",\"window\":2}}}}}";
+            assertShardPathAgrees(index, movingAvg, true);
+            requests++;
+
+            // Spot check of the reduce: the sums per category are 84, 92
+            // and 100 (c0 holds 0, 3, ..., 21), so avg_bucket is 92 and
+            // the selector keeps c1 and c2.
+            Map<String, Object> sibling = parse(
+                readAll(
+                    postJson(
+                        "/" + index + "/_search",
+                        "{\"size\":0,\"aggs\":{" + byCategory + ",\"ab\":{\"avg_bucket\":{\"buckets_path\":\"t>s\"}}}}"
+                    )
+                )
+            );
+            requests++;
+            assertEquals(92d, ((Number) aggregation(sibling, "ab").get("value")).doubleValue(), 0d);
+            Map<String, Object> selected = parse(readAll(postJson("/" + index + "/_search", "{" + shapes[7] + "}")));
+            requests++;
+            List<Map<String, Object>> kept = (List<Map<String, Object>>) aggregation(selected, "t").get("buckets");
+            assertEquals(2, kept.size());
+            assertEquals("c1", kept.get(0).get("key"));
+            assertEquals("c2", kept.get(1).get("key"));
+            assertEquals("every request above took the fragment path", fanOutBefore + requests, fanOutLogLines(index));
+
+            // The refusals are core's request validation, answered before
+            // the routing decision: the same 400 and message on both paths.
+            String noop = "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"bs\":{\"bucket_sort\":{}}}}}}";
+            assertSameRefusalAsShardPath(
+                index,
+                noop,
+                400,
+                "[bs] is configured to perform nothing. Please set either of [sort, size, from] to use bucket_sort"
+            );
+            String danglingPath =
+                "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"}},\"ab\":{\"avg_bucket\":{\"buckets_path\":\"nosuch>s\"}}}}";
+            assertSameRefusalAsShardPath(
+                index,
+                danglingPath,
+                400,
+                "buckets_path aggregation does not exist for aggregation [ab]: nosuch>s"
+            );
+            // A script that does not compile fails the reduce on the
+            // coordinator on both paths: the status is the script
+            // exception's and the body carries the compiler's message.
+            String brokenScript = "{\"size\":0,\"aggs\":{"
+                + byCategory.replace(
+                    "\"s\":{\"sum\":{\"field\":\"id\"}}",
+                    "\"s\":{\"sum\":{\"field\":\"id\"}},"
+                        + "\"bad\":{\"bucket_script\":{\"buckets_path\":{\"s\":\"s\"},\"script\":\"params.s +\"}}"
+                )
+                + "}}";
+            assertSameRefusalAsShardPath(index, brokenScript, 400, "compile error");
+            assertEquals("the refusals left no fan-out line", fanOutBefore + requests, fanOutLogLines(index));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + index));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * {@code body} answers the same status and a body carrying
+     * {@code reason} on the fragment path and on the shard path (the
+     * body with the {@link #onShardPath} oracle added).
+     */
+    private static void assertSameRefusalAsShardPath(String index, String body, int status, String reason) throws IOException {
+        ConcurrentResult fragmentPath = postForStatus("/" + index + "/_search", body);
+        ConcurrentResult shardPath = postForStatus("/" + index + "/_search", onShardPath(body));
+        assertEquals(fragmentPath.body(), status, fragmentPath.status());
+        assertEquals(shardPath.body(), status, shardPath.status());
+        assertTrue(fragmentPath.body(), fragmentPath.body().contains(reason));
+        assertTrue(shardPath.body(), shardPath.body().contains(reason));
     }
 
     /**

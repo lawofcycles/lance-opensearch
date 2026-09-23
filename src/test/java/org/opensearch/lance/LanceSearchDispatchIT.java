@@ -1098,6 +1098,127 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         }
     }
 
+    /**
+     * A search whose target expands to several indexes routes by the
+     * backing of every target. Two Lance backed indexes (one table of six
+     * rows, one of twelve rows in three fragments) fan out once per index
+     * and the coordinator merges the pages, sums the totals and reduces
+     * the two indexes' aggregation trees together; the answer is the
+     * shard path's for hits, totals, metrics, buckets and a pipeline over
+     * the buckets. A Lance backed index next to an ordinary Lucene index,
+     * named directly or through an alias, keeps the shard path (no
+     * fragment request runs) and the shard path answers hits and metrics
+     * over both.
+     */
+    @SuppressWarnings("unchecked")
+    public void testCrossIndexSearchRoutesByTheTargetsBacking() throws Exception {
+        String suffix = "cross-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String small = "small-" + suffix;
+        String large = "large-" + suffix;
+        String lucene = "lucene-" + suffix;
+        String alias = "alias-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, small, 6);
+        LanceTableFactory.writeMultiFragmentTable(scratchDir, large, 12, 4);
+        try {
+            for (String table : List.of(small, large)) {
+                Response attach = postJson("/_lance/attach", "{\"table\":\"" + scratchDir.resolve(table + ".lance") + "\"}");
+                assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            }
+            Request create = new Request("PUT", "/" + lucene);
+            create.setJsonEntity(
+                "{\"settings\":{\"number_of_shards\":1,\"number_of_replicas\":0},"
+                    + "\"mappings\":{\"properties\":{\"id\":{\"type\":\"long\"},\"body\":{\"type\":\"text\"}}},"
+                    + "\"aliases\":{\""
+                    + alias
+                    + "\":{}}}"
+            );
+            client().performRequest(create);
+            for (int id = 100; id < 102; id++) {
+                Request doc = new Request("PUT", "/" + lucene + "/_doc/" + id + "?refresh=true");
+                doc.setJsonEntity("{\"id\":" + id + ",\"body\":\"lucene row " + id + "\"}");
+                client().performRequest(doc);
+            }
+
+            // Two Lance backed indexes: one fragment request per index
+            // (one data node), the merged page, the summed total, and
+            // the aggregations reduced across the two tables' trees.
+            String hitsAndMetrics = "{\"size\":30,\"sort\":[{\"id\":\"asc\"}],\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}},"
+                + "\"st\":{\"stats\":{\"field\":\"id\"}},\"t\":{\"terms\":{\"field\":\"id\",\"size\":20,\"order\":{\"_key\":\"asc\"}}}}}";
+            long executedBefore = fragmentRequestsExecuted();
+            String twoLance = readAll(postJson("/" + small + "," + large + "/_search", hitsAndMetrics));
+            assertEquals("one fragment request per Lance backed index", executedBefore + 2, fragmentRequestsExecuted());
+            assertEquals(18, extractIntPath(twoLance, "hits", "total", "value"));
+            assertEquals(18, fullHitsOf(twoLance).size());
+            // ids 0..5 twice and 6..11 once: 15 + 66.
+            assertEquals(81.0d, extractDoublePath(twoLance, "aggregations", "s", "value"), 0d);
+            assertEquals(18, extractIntPath(twoLance, "aggregations", "st", "count"));
+            List<Map<String, Object>> buckets = (List<Map<String, Object>>) castMap(
+                castMap(parseJson(twoLance).get("aggregations")).get("t")
+            ).get("buckets");
+            assertEquals(12, buckets.size());
+            assertEquals(2, ((Number) buckets.get(0).get("doc_count")).intValue());
+            assertEquals(1, ((Number) buckets.get(11).get("doc_count")).intValue());
+            assertSameHitsAsShardPathInAnyOrder(small + "," + large, hitsAndMetrics);
+
+            String pipeline = "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"id\",\"interval\":4},"
+                + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}},\"cs\":{\"cumulative_sum\":{\"buckets_path\":\"s\"}}}},"
+                + "\"ab\":{\"avg_bucket\":{\"buckets_path\":\"h>s\"}}}}";
+            assertSameHitsAsShardPathInAnyOrder(small + "," + large, pipeline);
+            String filtered = "{\"size\":5,\"query\":{\"range\":{\"id\":{\"gte\":3}}},\"sort\":[{\"id\":\"desc\"}],"
+                + "\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}";
+            assertSameHitsAsShardPathInAnyOrder(small + "," + large, filtered);
+            assertEquals("every request above fanned out once per index", executedBefore + 2 + 3 * 2, fragmentRequestsExecuted());
+
+            // A Lance backed index next to a Lucene index, directly and
+            // through the alias: the shard path answers over both and no
+            // fragment request runs.
+            for (String target : List.of(small + "," + lucene, small + "," + alias)) {
+                String mixed = readAll(postJson("/" + target + "/_search", hitsAndMetrics));
+                assertEquals("the shard path served " + target, executedBefore + 8, fragmentRequestsExecuted());
+                assertEquals(target, 8, extractIntPath(mixed, "hits", "total", "value"));
+                assertEquals(target, 2, extractIntPath(mixed, "_shards", "total"));
+                List<Map<String, Object>> hits = fullHitsOf(mixed);
+                assertEquals(target, 8, hits.size());
+                assertEquals(target, small, hits.get(0).get("_index"));
+                assertEquals(target, lucene, hits.get(7).get("_index"));
+                // 15 from the table, 201 from the two Lucene documents.
+                assertEquals(target, 216.0d, extractDoublePath(mixed, "aggregations", "s", "value"), 0d);
+                assertEquals(target, 8, extractIntPath(mixed, "aggregations", "st", "count"));
+            }
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + small + "," + large + "," + lucene));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * As {@link #assertSameHitsAsShardPath}, for a target of several
+     * indexes: the hits are compared as a set keyed on {@code _index} and
+     * {@code _id}, since the two paths order equal sort values of
+     * different indexes differently (the shard path by shard iteration
+     * order, the fragment path by the request's target order).
+     */
+    private static void assertSameHitsAsShardPathInAnyOrder(String target, String body) throws IOException {
+        String fragmentBody = readAll(postJson("/" + target + "/_search", body));
+        String shardBody = readAll(postJson("/" + target + "/_search", onShardPath(body)));
+        Map<String, Object> fragmentPath = parseJson(fragmentBody);
+        Map<String, Object> shardPath = parseJson(shardBody);
+        assertEquals(body, hitsBlock(shardPath).get("total"), hitsBlock(fragmentPath).get("total"));
+        assertEquals(body, hitsBlock(shardPath).get("max_score"), hitsBlock(fragmentPath).get("max_score"));
+        assertEquals(body, keyedHits(shardBody), keyedHits(fragmentBody));
+        assertEquals(body, withoutShardPathOracle(shardPath.get("aggregations")), fragmentPath.get("aggregations"));
+    }
+
+    private static Map<String, Map<String, Object>> keyedHits(String searchBody) {
+        Map<String, Map<String, Object>> keyed = new java.util.TreeMap<>();
+        for (Map<String, Object> hit : fullHitsOf(searchBody)) {
+            keyed.put(hit.get("_index") + "/" + hit.get("_id"), hit);
+        }
+        return keyed;
+    }
+
     public void testFragmentDispatchModeAnswersFromPagination() throws Exception {
         // The coordinator asks each node for from + size hits and drops
         // the leading from after the merge.

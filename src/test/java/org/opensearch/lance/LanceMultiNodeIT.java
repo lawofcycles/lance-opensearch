@@ -1835,6 +1835,78 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
+     * Pipeline aggregations reduce once on the coordinator over the three
+     * executors' trees. Twelve fragments of 25 rows, four per node: a
+     * category's rows and a week's rows sit on every node, so a parent
+     * pipeline computed on any executor would read partial sums; the
+     * coordinator computes it after the cross node reduce and the answer
+     * equals the shard path's single shard for every sibling and parent
+     * pipeline. A second table of the same shape pins the cross index
+     * merge: two Lance backed indexes fan out once each per node and the
+     * aggregations, pipelines included, reduce across the six answers.
+     */
+    public void testPipelineAggregationsAcrossThreeNodes() throws Exception {
+        String suffix = "mn-pipeline-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String indexName = "demo-" + suffix;
+        String otherIndex = "other-" + suffix;
+        String tableUri = LanceTableFactory.writeInterleavedTable(scratchDir, indexName, 12, 25);
+        String otherUri = LanceTableFactory.writeInterleavedTable(scratchDir, otherIndex, 6, 10);
+        String byCategory =
+            "\"t\":{\"terms\":{\"field\":\"category\",\"order\":{\"_key\":\"asc\"}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+        String byWeek =
+            "\"w\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"week\"},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}";
+        String[] shapes = {
+            "\"size\":0,\"aggs\":{"
+                + byCategory
+                + ",\"ab\":{\"avg_bucket\":{\"buckets_path\":\"t>s\"}},"
+                + "\"st\":{\"stats_bucket\":{\"buckets_path\":\"t>s\"}},\"es\":{\"extended_stats_bucket\":{\"buckets_path\":\"t>s\"}},"
+                + "\"pb\":{\"percentiles_bucket\":{\"buckets_path\":\"t>_count\",\"percents\":[50]}}}",
+            "\"size\":0,\"aggs\":{"
+                + byWeek
+                + ",\"cs\":{\"cumulative_sum\":{\"buckets_path\":\"s\"}},"
+                + "\"d\":{\"derivative\":{\"buckets_path\":\"s\"}},\"sd\":{\"serial_diff\":{\"buckets_path\":\"s\"}},"
+                + "\"mf\":{\"moving_fn\":{\"buckets_path\":\"s\",\"window\":3,\"script\":\"MovingFunctions.max(values)\"}}}}}",
+            "\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}},"
+                + "\"ratio\":{\"bucket_script\":{\"buckets_path\":{\"s\":\"s\",\"c\":\"_count\"},\"script\":\"params.s / params.c\"}},"
+                + "\"bs\":{\"bucket_sort\":{\"sort\":[{\"ratio\":{\"order\":\"desc\"}}],\"size\":2}}}}}",
+            "\"size\":0,\"query\":{\"range\":{\"id\":{\"lt\":200}}},\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},"
+                + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}},\"keep\":{\"bucket_selector\":{\"buckets_path\":{\"s\":\"s\"},"
+                + "\"script\":\"params.s >= 6600\"}}}}}" };
+        try {
+            for (String uri : List.of(tableUri, otherUri)) {
+                Response attach = postJson("/_lance/attach", "{\"table\":\"" + uri + "\"}");
+                assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            }
+            client().performRequest(
+                new Request("GET", "/_cluster/health/" + indexName + "," + otherIndex + "?wait_for_status=green&timeout=60s")
+            );
+            int dataNodes = dataNodeCount();
+            long executedBefore = LanceRestTestCase.fragmentRequestsExecuted();
+            for (String shape : shapes) {
+                assertAggregationsMatchShardPath(indexName, shape);
+            }
+            assertEquals(
+                "one executor per node per request",
+                executedBefore + shapes.length * dataNodes,
+                LanceRestTestCase.fragmentRequestsExecuted()
+            );
+            for (String shape : shapes) {
+                assertAggregationsMatchShardPath(indexName + "," + otherIndex, shape);
+            }
+            assertEquals(
+                "one executor per node per index per request",
+                executedBefore + 2 * shapes.length * dataNodes,
+                LanceRestTestCase.fragmentRequestsExecuted()
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName + "," + otherIndex));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
      * Sliced collection on three executors answers like the shard path.
      * Twelve fragments of 25 rows, four per node, collected in two slices
      * per executor with the pushdown off so every shape runs through the
