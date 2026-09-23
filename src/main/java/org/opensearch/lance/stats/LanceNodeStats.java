@@ -29,11 +29,14 @@ import org.opensearch.lance.query.FtsAdmission;
  * counter or gauge read from the owning component.
  *
  * <p>Rendered as the {@code snapshots}, {@code column_store},
- * {@code native_memory}, {@code fts}, {@code warm_up} and {@code indices}
- * objects of one node in {@code GET /_lance/stats}. {@code warm_up} carries
- * the mode in force and one {@link LanceWarmUpStatus} per Lance-backed
- * index the node has seen since it started; {@code indices} the shard
- * reader of every Lance-backed shard the node hosts.
+ * {@code native_memory}, {@code fts}, {@code warm_up}, {@code plan} and
+ * {@code indices} objects of one node in {@code GET /_lance/stats}.
+ * {@code warm_up} carries the mode in force and one
+ * {@link LanceWarmUpStatus} per Lance-backed index the node has seen
+ * since it started; {@code plan.statistics} the planner's table
+ * statistics cache (entries held and milliseconds spent collecting);
+ * {@code indices} the shard reader of every Lance-backed shard the node
+ * hosts.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
@@ -69,6 +72,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     private final List<LanceWarmUpStatus> warmUps;
     private final List<IndexReaderStats> indices;
     private final List<LocalCloneStats> localClones;
+
+    private final int planStatisticsTables;
+    private final long planStatisticsCollectMillisTotal;
 
     /**
      * One node-local shallow clone directory on this node (an index
@@ -195,7 +201,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             "none",
             List.of(),
             List.of(),
-            List.of()
+            List.of(),
+            0,
+            0L
         );
     }
 
@@ -227,7 +235,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         String warmUpMode,
         List<LanceWarmUpStatus> warmUps,
         List<IndexReaderStats> indices,
-        List<LocalCloneStats> localClones
+        List<LocalCloneStats> localClones,
+        int planStatisticsTables,
+        long planStatisticsCollectMillisTotal
     ) {
         this.cacheEnabled = cacheEnabled;
         this.snapshotCount = snapshotCount;
@@ -257,6 +267,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.warmUps = List.copyOf(warmUps);
         this.indices = List.copyOf(indices);
         this.localClones = List.copyOf(localClones);
+        this.planStatisticsTables = planStatisticsTables;
+        this.planStatisticsCollectMillisTotal = planStatisticsCollectMillisTotal;
     }
 
     public LanceNodeStats(StreamInput in) throws IOException {
@@ -293,6 +305,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.warmUps = List.copyOf(read);
         this.indices = in.readList(IndexReaderStats::new);
         this.localClones = in.readList(LocalCloneStats::new);
+        this.planStatisticsTables = in.readVInt();
+        this.planStatisticsCollectMillisTotal = in.readVLong();
     }
 
     @Override
@@ -328,6 +342,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         }
         out.writeList(indices);
         out.writeList(localClones);
+        out.writeVInt(planStatisticsTables);
+        out.writeVLong(planStatisticsCollectMillisTotal);
     }
 
     @Override
@@ -382,6 +398,13 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.endArray();
         builder.endObject();
 
+        builder.startObject("plan");
+        builder.startObject("statistics");
+        builder.field("tables", planStatisticsTables);
+        builder.field("collect_millis_total", planStatisticsCollectMillisTotal);
+        builder.endObject();
+        builder.endObject();
+
         builder.startObject("indices");
         for (IndexReaderStats index : indices) {
             builder.startObject(index.index());
@@ -422,6 +445,16 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
     public List<LocalCloneStats> localClones() {
         return localClones;
+    }
+
+    /** Planner table statistics entries this node holds, one per (table URI, manifest version). */
+    public int planStatisticsTables() {
+        return planStatisticsTables;
+    }
+
+    /** Milliseconds this node has spent collecting planner table statistics, summed over every collection. */
+    public long planStatisticsCollectMillisTotal() {
+        return planStatisticsCollectMillisTotal;
     }
 
     public boolean cacheEnabled() {
@@ -579,7 +612,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && warmUpMode.equals(other.warmUpMode)
             && warmUps.equals(other.warmUps)
             && indices.equals(other.indices)
-            && localClones.equals(other.localClones);
+            && localClones.equals(other.localClones)
+            && planStatisticsTables == other.planStatisticsTables
+            && planStatisticsCollectMillisTotal == other.planStatisticsCollectMillisTotal;
     }
 
     @Override
@@ -612,7 +647,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             warmUpMode,
             warmUps,
             indices,
-            localClones
+            localClones,
+            planStatisticsTables,
+            planStatisticsCollectMillisTotal
         );
     }
 }

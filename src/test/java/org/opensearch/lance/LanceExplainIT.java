@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
+import java.util.Map;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -155,6 +156,46 @@ public class LanceExplainIT extends LanceRestTestCase {
             );
             assertEquals(RestStatus.BAD_REQUEST.getStatus(), hits.getResponse().getStatusLine().getStatusCode());
             assertTrue(readAll(hits.getResponse()).contains("size [5] (only 0 with aggregations)"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testExplainFillsThePlannerStatisticsCache() throws Exception {
+        String suffix = "explain-stats-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            Response ok = explain(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
+            assertEquals(RestStatus.OK.getStatus(), ok.getStatusLine().getStatusCode());
+
+            // The plan construction collected the table's statistics
+            // under the snapshot's version and the node's stats report
+            // the cache entry and the time spent collecting.
+            String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+            @SuppressWarnings("unchecked")
+            Map<String, Object> nodes = (Map<String, Object>) parseJson(stats).get("nodes");
+            String nodeId = nodes.keySet().iterator().next();
+            int tables = extractIntPath(stats, "nodes", nodeId, "plan", "statistics", "tables");
+            assertTrue("at least the explained table is cached: " + stats, tables >= 1);
+            assertTrue(
+                "collect time is reported: " + stats,
+                extractIntPath(stats, "nodes", nodeId, "plan", "statistics", "collect_millis_total") >= 0
+            );
+
+            // A second explain of the same version reads the cached
+            // entry: the entry count does not grow.
+            explain(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
+            String again = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+            assertEquals(tables, extractIntPath(again, "nodes", nodeId, "plan", "statistics", "tables"));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
