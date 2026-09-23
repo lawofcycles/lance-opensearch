@@ -159,7 +159,20 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
                     + tableUri
                     + "\",\"derive\":\"async\",\"overrides\":{\"body\":{\"type\":\"text_analyzer\",\"analyzer\":\"english\"}}}"
             );
-            assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            String attachBody = readAll(attach);
+            assertEquals("attach failed: " + attachBody, RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // The async response describes the backfill it started: the
+            // derived column is streamed into the table (no spool), on
+            // the node's configured thread count, and the estimate is
+            // the sampled value length over the table's rows.
+            Map<String, Object> body = parseJson(attachBody);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> backfill = (Map<String, Object>) body.get("backfill");
+            assertNotNull("async attach must report its backfill: " + attachBody, backfill);
+            assertEquals("none", backfill.get("spool_path"));
+            assertTrue("threads must be at least 1: " + backfill, ((Number) backfill.get("threads")).intValue() >= 1);
+            assertTrue("estimated_bytes must be positive: " + backfill, ((Number) backfill.get("estimated_bytes")).longValue() > 0L);
 
             // The backfill runs in the background; the namespace poll
             // re-derives the mapping when its commit advances the
