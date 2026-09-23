@@ -109,16 +109,29 @@ public class LanceTableScan extends TableScan implements LanceRel {
     }
 
     /**
+     * The same scan with {@code aggregate} pushed into it and no query
+     * filter: {@link #withPushedAggregate(LanceAggregate, ByteBuffer, String)}
+     * with a null {@code filterSql}.
+     */
+    public LanceTableScan withPushedAggregate(LanceAggregate aggregate, ByteBuffer bytes) {
+        return withPushedAggregate(aggregate, bytes, null);
+    }
+
+    /**
      * The same scan with {@code aggregate} pushed into it: the scan's
      * row type becomes the aggregate's and the plan above no longer
      * contains the aggregate. {@code aggregate} is the node the rule
      * matched with its input rebuilt to the concrete tree; {@code bytes}
-     * is what the Substrait producer encoded for it. Refuses when the
-     * scan already carries any pushed operation: the push rule matches
-     * bare scans, and an aggregate consumes every matching row, so it
-     * combines with nothing.
+     * is what the Substrait producer encoded for it; {@code filterSql}
+     * is the Lance SQL of the query filter the tree carried under the
+     * aggregate (null when it carried none), which the executor hands
+     * to the scan's {@code filter(sql)} next to the bytes. Refuses when
+     * the scan already carries any pushed operation: the push rule
+     * matches bare scans, the filter travels inside the aggregate
+     * rather than as a pushed filter of its own, and an aggregate
+     * consumes every matching row, so it combines with nothing.
      */
-    public LanceTableScan withPushedAggregate(LanceAggregate aggregate, ByteBuffer bytes) {
+    public LanceTableScan withPushedAggregate(LanceAggregate aggregate, ByteBuffer bytes, String filterSql) {
         if (pushedAggregate().isPresent()) {
             throw new IllegalStateException("the scan already carries a pushed aggregate");
         }
@@ -128,7 +141,7 @@ public class LanceTableScan extends TableScan implements LanceRel {
         if (!pushedOperations.isEmpty()) {
             throw new IllegalStateException("the scan already carries a pushed operation: " + pushedOperations);
         }
-        return new LanceTableScan(getCluster(), getTraitSet(), table, ImmutableList.of(new PushedAggregate(aggregate, bytes)));
+        return new LanceTableScan(getCluster(), getTraitSet(), table, ImmutableList.of(new PushedAggregate(aggregate, bytes, filterSql)));
     }
 
     /**
