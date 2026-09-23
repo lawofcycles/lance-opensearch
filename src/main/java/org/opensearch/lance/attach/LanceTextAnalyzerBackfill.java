@@ -437,12 +437,27 @@ public final class LanceTextAnalyzerBackfill {
         /**
          * Read source batches and submit their tokenisation until the
          * window is full, the scan is exhausted, or every permit is
-         * taken (a permit is held while a task runs and released when
-         * it completes, so no more than {@code threads} tokenise at
-         * once).
+         * taken. A permit is held from submit until the task completes
+         * (released in the task itself, after the future is completed),
+         * so no more than {@code threads} tokenise at once. When the
+         * window is empty the producer must have at least one batch to
+         * hand out, so it waits for a permit rather than trying: the
+         * permit of the batch just emitted is released moments after
+         * its future completed, and a {@code tryAcquire} in that gap
+         * would look like the end of the stream.
          */
         private void topUp() throws IOException {
-            while (!sourceExhausted && inFlight.size() < maxInFlight && permits.tryAcquire()) {
+            while (!sourceExhausted && inFlight.size() < maxInFlight) {
+                if (inFlight.isEmpty()) {
+                    try {
+                        permits.acquire();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("text_analyzer backfill interrupted", e);
+                    }
+                } else if (!permits.tryAcquire()) {
+                    return;
+                }
                 boolean submitted = false;
                 try {
                     if (!source.loadNextBatch()) {

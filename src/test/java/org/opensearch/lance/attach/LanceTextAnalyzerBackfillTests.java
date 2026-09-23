@@ -305,17 +305,34 @@ public class LanceTextAnalyzerBackfillTests extends OpenSearchTestCase {
                 LanceRegistry.allocator(),
                 new LanceTextAnalyzerBackfill.Options(threadPool.generic(), 7, () -> false)
             );
+            // One permit on a real pool: the producer has to wait for the
+            // permit of the batch it just emitted, which the task releases
+            // right after completing its future. AddColumns refuses a
+            // stream that ends before every row has a value, so the
+            // commit succeeding is the assertion.
+            LanceTextAnalyzerBackfill.backfill(
+                dataset,
+                "body",
+                "one_thread",
+                english,
+                LanceRegistry.allocator(),
+                new LanceTextAnalyzerBackfill.Options(threadPool.generic(), 1, () -> false)
+            );
             int compared = 0;
-            ScanOptions options = new ScanOptions.Builder().columns(new ArrayList<>(Arrays.asList("single", "parallel"))).build();
+            ScanOptions options = new ScanOptions.Builder().columns(new ArrayList<>(Arrays.asList("single", "parallel", "one_thread")))
+                .build();
             try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
                     VarCharVector single = (VarCharVector) root.getVector("single");
                     VarCharVector parallel = (VarCharVector) root.getVector("parallel");
+                    VarCharVector oneThread = (VarCharVector) root.getVector("one_thread");
                     for (int i = 0; i < root.getRowCount(); i++) {
                         assertEquals(single.isNull(i), parallel.isNull(i));
+                        assertEquals(single.isNull(i), oneThread.isNull(i));
                         if (!single.isNull(i)) {
                             assertArrayEquals(single.get(i), parallel.get(i));
+                            assertArrayEquals(single.get(i), oneThread.get(i));
                         }
                         compared++;
                     }
