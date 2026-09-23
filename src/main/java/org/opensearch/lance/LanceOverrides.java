@@ -59,6 +59,16 @@ public final class LanceOverrides {
     public static final String TYPE_IP = "ip";
     public static final String TYPE_WILDCARD = "wildcard";
     public static final String TYPE_GEO_POINT = "geo_point";
+    public static final String TYPE_TEXT_ANALYZER = "text_analyzer";
+
+    /**
+     * Suffix of the default derived column name of a
+     * {@code type: text_analyzer} override: the plugin writes the
+     * OpenSearch-analyzed tokens of column {@code body} into
+     * {@code body__lance_tokens} unless the override declares a
+     * {@code derived_column_name}.
+     */
+    public static final String DERIVED_COLUMN_SUFFIX = "__lance_tokens";
 
     /** Default mapping format of a {@code type: date} override on an integer column. */
     public static final String DEFAULT_DATE_FORMAT = "epoch_millis";
@@ -134,17 +144,28 @@ public final class LanceOverrides {
      * {@code null} when not declared; {@code order} is {@code null}
      * unless the column declares a {@code type: geo_point} override on
      * a FixedSizeList&lt;Float64&gt;[2] column (where the operator picks
-     * the storage order); {@code subFields} is empty when the column
-     * declares no sub-fields.
+     * the storage order); {@code analyzer} and {@code derivedColumn}
+     * are {@code null} unless the column declares a
+     * {@code type: text_analyzer} override ({@code analyzer} is
+     * required there, {@code derivedColumn} optional);
+     * {@code subFields} is empty when the column declares no
+     * sub-fields.
      */
-    public record Column(String type, String format, String order, LinkedHashMap<String, String> subFields) {
+    public record Column(String type, String format, String order, String analyzer, String derivedColumn, LinkedHashMap<
+        String,
+        String> subFields) {
         public Column {
             subFields = subFields == null ? new LinkedHashMap<>() : subFields;
         }
 
+        /** Back-compat constructor: no {@code analyzer} / {@code derivedColumn}. */
+        public Column(String type, String format, String order, LinkedHashMap<String, String> subFields) {
+            this(type, format, order, null, null, subFields);
+        }
+
         /** Back-compat constructor: no {@code order}. */
         public Column(String type, String format, LinkedHashMap<String, String> subFields) {
-            this(type, format, null, subFields);
+            this(type, format, null, null, null, subFields);
         }
     }
 
@@ -278,6 +299,33 @@ public final class LanceOverrides {
     }
 
     /**
+     * Columns overridden to {@code text_analyzer}, mapped to their full
+     * override entry (the {@code analyzer} name and the optional
+     * {@code derived_column_name}), in declaration order. Resolve the
+     * derived column's Lance name through
+     * {@link #derivedColumnName(String, Column)}.
+     */
+    public Map<String, Column> textAnalyzerColumns() {
+        LinkedHashMap<String, Column> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Column> entry : columns.entrySet()) {
+            if (TYPE_TEXT_ANALYZER.equals(entry.getValue().type())) {
+                out.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return out;
+    }
+
+    /**
+     * The Lance column name a {@code type: text_analyzer} override on
+     * {@code baseName} writes the analyzed tokens into: the declared
+     * {@code derived_column_name} when present, else
+     * {@code baseName + }{@link #DERIVED_COLUMN_SUFFIX}.
+     */
+    public static String derivedColumnName(String baseName, Column column) {
+        return column.derivedColumn() != null ? column.derivedColumn() : baseName + DERIVED_COLUMN_SUFFIX;
+    }
+
+    /**
      * Resolve the overrides of an index from its settings:
      * {@code index.lance.overrides} when present, else the legacy
      * {@code index.lance.multi_fields} setting folded into sub-field
@@ -405,6 +453,12 @@ public final class LanceOverrides {
                 if (column.order() != null) {
                     builder.field("order", column.order());
                 }
+                if (column.analyzer() != null) {
+                    builder.field("analyzer", column.analyzer());
+                }
+                if (column.derivedColumn() != null) {
+                    builder.field("derived_column_name", column.derivedColumn());
+                }
                 if (!column.subFields().isEmpty()) {
                     builder.startObject("fields");
                     for (Map.Entry<String, String> sub : column.subFields().entrySet()) {
@@ -514,10 +568,14 @@ public final class LanceOverrides {
      *
      * <p>Structural validation only, everything a 400 without opening
      * the table: per-column values must be objects whose keys come from
-     * {@code type} / {@code format} / {@code fields}, {@code type} must
-     * be {@code date}, {@code keyword}, {@code ip} or {@code wildcard},
-     * {@code format} needs {@code type: date} and must parse through
-     * {@link DateFormatter#forPattern}, and sub-field entries must be
+     * {@code type} / {@code format} / {@code order} / {@code analyzer} /
+     * {@code derived_column_name} / {@code fields}, {@code type} must
+     * be {@code date}, {@code keyword}, {@code ip}, {@code wildcard},
+     * {@code geo_point} or {@code text_analyzer}, {@code format} needs
+     * {@code type: date} and must parse through
+     * {@link DateFormatter#forPattern}, {@code analyzer} (required) and
+     * {@code derived_column_name} (optional) need
+     * {@code type: text_analyzer}, and sub-field entries must be
      * objects with a string {@code type}.
      *
      * @throws IllegalArgumentException on any structural violation; the
@@ -573,7 +631,14 @@ public final class LanceOverrides {
                 if (existing != null) {
                     columns.put(
                         baseName,
-                        new Column(existing.type(), existing.format(), existing.order(), new LinkedHashMap<>(entry.getValue()))
+                        new Column(
+                            existing.type(),
+                            existing.format(),
+                            existing.order(),
+                            existing.analyzer(),
+                            existing.derivedColumn(),
+                            new LinkedHashMap<>(entry.getValue())
+                        )
                     );
                 } else {
                     columns.put(baseName, new Column(null, null, null, new LinkedHashMap<>(entry.getValue())));
@@ -700,9 +765,18 @@ public final class LanceOverrides {
             throw new IllegalArgumentException("[overrides." + baseName + "] must be an object");
         }
         for (Object key : spec.keySet()) {
-            if (!"type".equals(key) && !"format".equals(key) && !"order".equals(key) && !"fields".equals(key)) {
+            if (!"type".equals(key)
+                && !"format".equals(key)
+                && !"order".equals(key)
+                && !"analyzer".equals(key)
+                && !"derived_column_name".equals(key)
+                && !"fields".equals(key)) {
                 throw new IllegalArgumentException(
-                    "[overrides." + baseName + "] has unknown key [" + key + "]; accepted keys are [type], [format], [order], [fields]"
+                    "[overrides."
+                        + baseName
+                        + "] has unknown key ["
+                        + key
+                        + "]; accepted keys are [type], [format], [order], [analyzer], [derived_column_name], [fields]"
                 );
             }
         }
@@ -716,13 +790,14 @@ public final class LanceOverrides {
                 && !TYPE_KEYWORD.equals(typeStr)
                 && !TYPE_IP.equals(typeStr)
                 && !TYPE_WILDCARD.equals(typeStr)
-                && !TYPE_GEO_POINT.equals(typeStr)) {
+                && !TYPE_GEO_POINT.equals(typeStr)
+                && !TYPE_TEXT_ANALYZER.equals(typeStr)) {
                 throw new IllegalArgumentException(
                     "[overrides."
                         + baseName
                         + ".type="
                         + typeStr
-                        + "] is not supported; accepted types are [date], [keyword], [ip], [wildcard], [geo_point]"
+                        + "] is not supported; accepted types are [date], [keyword], [ip], [wildcard], [geo_point], [text_analyzer]"
                 );
             }
             type = typeStr;
@@ -770,6 +845,42 @@ public final class LanceOverrides {
             }
             order = orderStr;
         }
+        String analyzer = null;
+        Object rawAnalyzer = spec.get("analyzer");
+        if (rawAnalyzer != null) {
+            if (!(rawAnalyzer instanceof String analyzerStr) || analyzerStr.isEmpty()) {
+                throw new IllegalArgumentException("[overrides." + baseName + ".analyzer] must be a non-empty string");
+            }
+            if (!TYPE_TEXT_ANALYZER.equals(type)) {
+                throw new IllegalArgumentException(
+                    "[overrides." + baseName + ".analyzer] is only accepted together with [type: text_analyzer]"
+                );
+            }
+            analyzer = analyzerStr;
+        }
+        if (TYPE_TEXT_ANALYZER.equals(type) && analyzer == null) {
+            throw new IllegalArgumentException(
+                "[overrides." + baseName + ".type=text_analyzer] requires an [analyzer] naming an OpenSearch analyzer"
+            );
+        }
+        String derivedColumn = null;
+        Object rawDerived = spec.get("derived_column_name");
+        if (rawDerived != null) {
+            if (!(rawDerived instanceof String derivedStr) || derivedStr.isEmpty()) {
+                throw new IllegalArgumentException("[overrides." + baseName + ".derived_column_name] must be a non-empty string");
+            }
+            if (!TYPE_TEXT_ANALYZER.equals(type)) {
+                throw new IllegalArgumentException(
+                    "[overrides." + baseName + ".derived_column_name] is only accepted together with [type: text_analyzer]"
+                );
+            }
+            if (derivedStr.equals(baseName)) {
+                throw new IllegalArgumentException(
+                    "[overrides." + baseName + ".derived_column_name] must differ from the column it derives from"
+                );
+            }
+            derivedColumn = derivedStr;
+        }
         LinkedHashMap<String, String> subFields = new LinkedHashMap<>();
         Object rawFields = spec.get("fields");
         if (rawFields != null) {
@@ -795,7 +906,7 @@ public final class LanceOverrides {
         if (type == null && subFields.isEmpty()) {
             throw new IllegalArgumentException("[overrides." + baseName + "] must declare at least one of [type], [fields]");
         }
-        return new Column(type, format, order, subFields);
+        return new Column(type, format, order, analyzer, derivedColumn, subFields);
     }
 
     @Override

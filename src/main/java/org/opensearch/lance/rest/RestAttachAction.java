@@ -86,6 +86,7 @@ public class RestAttachAction extends BaseRestHandler {
         StorageOptions storageOptions;
         LanceOverrides overrides;
         String placement;
+        boolean asyncDerive;
         try {
             table = readOptionalString(body, "table");
             if (table == null || table.isEmpty()) {
@@ -140,12 +141,38 @@ public class RestAttachAction extends BaseRestHandler {
                 );
             }
             placement = indexPlacement;
+            // `derive` steers the text_analyzer backfill: `sync` (default)
+            // blocks the attach until the derived tokens columns are
+            // written and indexed, `async` answers at once and lets the
+            // namespace poll flip the mapping when the backfill commits.
+            String derive = readOptionalString(body, "derive");
+            if (derive != null && !"sync".equals(derive) && !"async".equals(derive)) {
+                return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, "[derive] must be 'sync' or 'async'"));
+            }
+            if (derive != null && overrides.textAnalyzerColumns().isEmpty()) {
+                return channel -> channel.sendResponse(
+                    new BytesRestResponse(
+                        RestStatus.BAD_REQUEST,
+                        "[derive] is only accepted together with a [type: text_analyzer] override; nothing else derives a column"
+                    )
+                );
+            }
+            asyncDerive = "async".equals(derive);
         } catch (IllegalArgumentException e) {
             String message = e.getMessage();
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
         }
 
-        LanceAttachRequest attach = new LanceAttachRequest(table, explicitName, pinnedVersion, tag, storageOptions, overrides, placement);
+        LanceAttachRequest attach = new LanceAttachRequest(
+            table,
+            explicitName,
+            pinnedVersion,
+            tag,
+            storageOptions,
+            overrides,
+            placement,
+            asyncDerive
+        );
         return channel -> client.execute(LanceAttachAction.INSTANCE, attach, new RestToXContentListener<>(channel));
     }
 
@@ -241,10 +268,34 @@ public class RestAttachAction extends BaseRestHandler {
         java.util.Set<String> ipOverrides = effective.ipColumns();
         java.util.Set<String> wildcardOverrides = effective.wildcardColumns();
         Map<String, String> geoPointOverrides = effective.geoPointColumns();
+        Map<String, LanceOverrides.Column> textAnalyzerOverrides = effective.textAnalyzerColumns();
+        // Derived tokens column name -> the base column its text_analyzer
+        // override derives it from. Such a column is plugin-managed: it is
+        // hidden from the mapping (queries reach it through the base
+        // field's tokens_column) and carries the whitespace FTS index the
+        // base field's queries run against.
+        Map<String, String> derivedToBase = new LinkedHashMap<>();
+        for (Map.Entry<String, LanceOverrides.Column> entry : textAnalyzerOverrides.entrySet()) {
+            derivedToBase.put(LanceOverrides.derivedColumnName(entry.getKey(), entry.getValue()), entry.getKey());
+        }
+        Map<String, LanceField> fieldsByName = new LinkedHashMap<>();
+        for (LanceField field : lanceSchema.fields()) {
+            fieldsByName.put(field.getName(), field);
+        }
         for (LanceField field : lanceSchema.fields()) {
             ArrowType type = field.getType();
             String name = field.getName();
             int fieldId = field.getId();
+            if (derivedToBase.containsKey(name) && type instanceof ArrowType.Utf8) {
+                // The plugin-managed tokens column of a text_analyzer
+                // override: queries reach it through the base field's
+                // tokens_column, so it does not surface as a field of its
+                // own, but it is the FTS build and optimise target of the
+                // analyzer mode.
+                notes.add(name + ": derived tokens column of [" + derivedToBase.get(name) + "], not surfaced");
+                ftsColumns.add(name);
+                continue;
+            }
             boolean declaredPk = field.getMetadata() != null && field.getMetadata().containsKey(PK_METADATA_KEY);
             if (declaredPk) {
                 // Lance's Rust schema validator refuses a table whose
@@ -428,6 +479,52 @@ public class RestAttachAction extends BaseRestHandler {
                 mapping.field("index", false).field("doc_values", true).endObject();
                 scalarColumns.add(name);
             } else if (type instanceof ArrowType.Utf8) {
+                if (textAnalyzerOverrides.containsKey(name)) {
+                    LanceOverrides.Column override = textAnalyzerOverrides.get(name);
+                    String derived = LanceOverrides.derivedColumnName(name, override);
+                    LanceField derivedField = fieldsByName.get(derived);
+                    if (derivedField != null && derivedField.getType() instanceof ArrowType.Utf8) {
+                        // The analyzer mode: the field surfaces under its own
+                        // name as lance_text, term and FTS queries run against
+                        // the derived tokens column (tokens_column), and the
+                        // query text goes through the same OpenSearch analyzer
+                        // (meta.lance_analyzer) before it reaches Lance, so
+                        // the index-time and query-time tokenisation agree.
+                        mapping.startObject(name).field("type", "lance_text");
+                        mapping.field("tokens_column", derived);
+                        mapping.startObject("meta");
+                        mapping.field("lance_field_id", Integer.toString(fieldId));
+                        mapping.field("lance_arrow_type", arrowTypeIdentity(type));
+                        mapping.field("lance_analyzer", override.analyzer());
+                        mapping.endObject();
+                        writeMultiFieldsBlock(mapping, name, multiFields);
+                        mapping.endObject();
+                        continue;
+                    }
+                    if (derivedField != null) {
+                        String message = "[overrides."
+                            + name
+                            + "] derived column ["
+                            + derived
+                            + "] exists with Arrow type "
+                            + derivedField.getType()
+                            + "; the analyzer mode needs a Utf8 tokens column. Declare a different [derived_column_name]";
+                        if (!lenient) {
+                            throw new IllegalArgumentException(message);
+                        }
+                        notes.add(name + ": text_analyzer override skipped (" + message + ")");
+                    } else {
+                        // The backfill has not created the tokens column yet
+                        // (attach with derive: async, or a namespace poll
+                        // before the attach-side backfill lands). The column
+                        // derives by the default rules this cycle; the next
+                        // re-derivation after the backfill commit flips it to
+                        // the analyzer mode.
+                        notes.add(
+                            name + ": text_analyzer override pending; derived column [" + derived + "] does not exist in this version"
+                        );
+                    }
+                }
                 boolean hasFts = !dataset.describeIndices(new IndexCriteria.Builder().forColumn(name).mustSupportFts(true).build())
                     .isEmpty();
                 if (ipOverrides.contains(name)) {
@@ -756,6 +853,13 @@ public class RestAttachAction extends BaseRestHandler {
             throw new IllegalArgumentException(
                 "[overrides." + baseName + ".type=wildcard] needs a Utf8 column; [" + baseName + "] is " + type
             );
+        }
+        if (LanceOverrides.TYPE_TEXT_ANALYZER.equals(column.type())) {
+            if (!(type instanceof ArrowType.Utf8)) {
+                throw new IllegalArgumentException(
+                    "[overrides." + baseName + ".type=text_analyzer] needs a Utf8 column; [" + baseName + "] is " + type
+                );
+            }
         }
         if (LanceOverrides.TYPE_GEO_POINT.equals(column.type())) {
             boolean structShape = false;

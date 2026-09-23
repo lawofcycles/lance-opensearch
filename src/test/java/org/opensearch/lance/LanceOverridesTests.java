@@ -92,10 +92,90 @@ public class LanceOverridesTests extends OpenSearchTestCase {
     public void testUnknownKeyRejected() {
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> LanceOverrides.parseAttachClauses(Map.of("ts", Map.of("analyzer", "kuromoji")), null)
+            () -> LanceOverrides.parseAttachClauses(Map.of("ts", Map.of("tokenizer", "kuromoji")), null)
         );
-        assertTrue(e.getMessage(), e.getMessage().contains("unknown key [analyzer]"));
-        assertTrue(e.getMessage(), e.getMessage().contains("[type], [format], [order], [fields]"));
+        assertTrue(e.getMessage(), e.getMessage().contains("unknown key [tokenizer]"));
+        assertTrue(e.getMessage(), e.getMessage().contains("[type], [format], [order], [analyzer], [derived_column_name], [fields]"));
+    }
+
+    public void testTextAnalyzerParsesAndRoundTrips() {
+        LanceOverrides overrides = LanceOverrides.parseAttachClauses(
+            Map.of("body", Map.of("type", "text_analyzer", "analyzer", "english")),
+            null
+        );
+        LanceOverrides.Column column = overrides.textAnalyzerColumns().get("body");
+        assertNotNull(column);
+        assertEquals("english", column.analyzer());
+        assertNull(column.derivedColumn());
+        assertEquals("body__lance_tokens", LanceOverrides.derivedColumnName("body", column));
+        assertTrue(overrides.keywordColumns().isEmpty());
+        // Persist and re-read; the analyzer must survive the round trip.
+        LanceOverrides restored = LanceOverrides.parse(overrides.toJson());
+        assertEquals(overrides, restored);
+        assertEquals("english", restored.textAnalyzerColumns().get("body").analyzer());
+    }
+
+    public void testTextAnalyzerDerivedColumnNameRoundTrips() {
+        LanceOverrides overrides = LanceOverrides.parseAttachClauses(
+            Map.of("body", Map.of("type", "text_analyzer", "analyzer", "standard", "derived_column_name", "body_tokens")),
+            null
+        );
+        LanceOverrides.Column column = overrides.textAnalyzerColumns().get("body");
+        assertEquals("body_tokens", column.derivedColumn());
+        assertEquals("body_tokens", LanceOverrides.derivedColumnName("body", column));
+        LanceOverrides restored = LanceOverrides.parse(overrides.toJson());
+        assertEquals(overrides, restored);
+        assertEquals("body_tokens", restored.textAnalyzerColumns().get("body").derivedColumn());
+    }
+
+    public void testTextAnalyzerRequiresAnalyzer() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(Map.of("body", Map.of("type", "text_analyzer")), null)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("requires an [analyzer]"));
+    }
+
+    public void testAnalyzerWithoutTextAnalyzerTypeRejected() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(Map.of("body", Map.of("type", "keyword", "analyzer", "english")), null)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("only accepted together with [type: text_analyzer]"));
+        IllegalArgumentException noType = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(Map.of("body", Map.of("analyzer", "english")), null)
+        );
+        assertTrue(noType.getMessage(), noType.getMessage().contains("only accepted together with [type: text_analyzer]"));
+    }
+
+    public void testDerivedColumnNameWithoutTextAnalyzerTypeRejected() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(Map.of("body", Map.of("type", "keyword", "derived_column_name", "tokens")), null)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("only accepted together with [type: text_analyzer]"));
+    }
+
+    public void testDerivedColumnNameMustDifferFromBase() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(
+                Map.of("body", Map.of("type", "text_analyzer", "analyzer", "english", "derived_column_name", "body")),
+                null
+            )
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("must differ from the column"));
+    }
+
+    public void testTextAnalyzerKeepsSubFields() {
+        LanceOverrides overrides = LanceOverrides.parseAttachClauses(
+            Map.of("body", Map.of("type", "text_analyzer", "analyzer", "english", "fields", Map.of("raw", Map.of("type", "keyword")))),
+            null
+        );
+        assertEquals("keyword", overrides.subFields().get("body").get("raw"));
+        assertEquals("english", overrides.textAnalyzerColumns().get("body").analyzer());
+        assertEquals(overrides, LanceOverrides.parse(overrides.toJson()));
     }
 
     public void testUnknownTypeRejected() {
