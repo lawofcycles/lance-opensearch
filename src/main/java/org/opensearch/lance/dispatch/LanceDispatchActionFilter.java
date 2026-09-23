@@ -63,8 +63,7 @@ import org.opensearch.transport.client.Client;
  *       {@link LanceAggregationSupport#isSupported}). The shape
  *       decision is planned: {@link SearchRequestToRel#translateDispatch}
  *       marks a body holding an element the fragment executor cannot
- *       answer correctly — suggester, highlighter, pipeline
- *       aggregations — and the planner
+ *       answer correctly — suggester, highlighter — and the planner
  *       answers such a body with a {@link ShardPathFallbackExec}
  *       root, which routes the request to the shard path.</li>
  *   <li>Delegate the request to {@link LanceCoordinatorAction} via
@@ -77,9 +76,10 @@ import org.opensearch.transport.client.Client;
  *       one local hop. When the pool refuses the request, the
  *       request fails with the pool's rejection (HTTP 429).</li>
  *   <li>Fall through to the standard shard fan-out via
- *       {@code chain.proceed} for anything else (non-Lance targets,
- *       unsupported query or aggregation shapes, cross-index
- *       requests with metrics). The shard path still exists as a
+ *       {@code chain.proceed} for anything else (a target that is not
+ *       Lance backed, alone or next to Lance backed ones, and
+ *       unsupported query or aggregation shapes). The shard path still
+ *       exists as a
  *       safety net for shapes the fragment executor has not yet
  *       taken over; it is never used because of load. A Lance-backed
  *       target whose table has more rows than one Lucene reader may
@@ -187,9 +187,9 @@ public class LanceDispatchActionFilter implements ActionFilter {
         RelNode dispatchPlan = planDispatch(searchRequest);
         if (!isDispatchable(dispatchPlan)) {
             // The planner answered the body with a shard path fallback:
-            // it carries an element (suggest, highlighter, a pipeline
-            // aggregation) the fragment executor does not serve. Fall
-            // through so the standard path can still answer.
+            // it carries an element (suggest, highlighter) the fragment
+            // executor does not serve. Fall through so the standard
+            // path can still answer.
             planExecutor.executeShardPath(dispatchPlan, () -> proceedOnShardPath(task, action, request, listener, chain, concrete));
             return;
         }
@@ -197,16 +197,7 @@ public class LanceDispatchActionFilter implements ActionFilter {
         if (!LanceAggregationSupport.isSupported(searchRequest.source())) {
             // Aggregation shape the fragment executor has not taken
             // over yet (a script, a type off the allow list, a filter
-            // bucket over a Lance query, a pipeline).
-            proceedOnShardPath(task, action, request, listener, chain, concrete);
-            return;
-        }
-
-        if (LanceAggregationSupport.hasAggregations(searchRequest.source()) && concrete.length > 1) {
-            // Cross-index aggregation needs a partial-reduce path that
-            // merges partials across independent Lance datasets. Until
-            // then multi-index aggregation requests route through the
-            // shard path.
+            // bucket over a Lance query).
             proceedOnShardPath(task, action, request, listener, chain, concrete);
             return;
         }
