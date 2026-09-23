@@ -154,12 +154,15 @@ public final class SearchRequestToRel {
          * @param query the top level query after the coordinator rewrite
          * @param planAggregations whether the aggregation tree may plan
          *     into the scan (the pushdown setting and the structural
-         *     allow list, both read by the caller)
+         *     allow list, both read by the caller); a body carrying
+         *     {@code min_score} or {@code terminate_after} plans no
+         *     aggregate whatever the caller read
          */
         public static ExecutionShape of(SearchSourceBuilder source, QueryBuilder query, boolean planAggregations) {
             int size = source == null || source.size() < 0 ? 10 : source.size();
             int from = source == null || source.from() < 0 ? 0 : source.from();
             List<SortBuilder<?>> sorts = source == null || source.sorts() == null ? List.of() : source.sorts();
+            boolean collectorKnobs = source != null && (source.minScore() != null || source.terminateAfter() > 0);
             return new ExecutionShape(
                 query,
                 source == null ? null : source.postFilter(),
@@ -168,7 +171,8 @@ public final class SearchRequestToRel {
                 from,
                 from + size,
                 source == null ? null : source.aggregations(),
-                planAggregations
+                planAggregations && !collectorKnobs,
+                collectorKnobs
             );
         }
 
@@ -241,7 +245,7 @@ public final class SearchRequestToRel {
             // collectors: the count, the page and the aggregations are
             // whatever those collectors saw, which no Lance side page or
             // aggregate scan can reproduce.
-            return root;
+            return new ExecutionTranslation(root, "min_score or terminate_after (applied by the Lucene collectors)");
         }
         boolean hasAggregations = shape.hasAggregations();
         if (!shape.hits()) {
