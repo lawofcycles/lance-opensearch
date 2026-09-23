@@ -70,6 +70,10 @@ public final class MergeReducer {
     // behaviour where these fields default off.
     private final boolean versionRequested;
     private final boolean seqNoAndPrimaryTermRequested;
+    // Whether the request asked for track_scores; with a sort that is
+    // not score ordered it decides whether max_score is reported, as
+    // the shard path's TopDocsCollectorContext decides it.
+    private final boolean trackScores;
     // track_total_hits bound the executors counted up to; decides
     // the hits.total relation in buildResponse.
     private final int trackTotalHitsUpTo;
@@ -82,6 +86,12 @@ public final class MergeReducer {
     // response is built from the nodes that did, says timed_out,
     // and reports hits.total as a lower bound.
     private boolean timedOut = false;
+    // terminated_early of the response: null (left out of the
+    // response) unless an executor reported the flag, which only
+    // happens when the request carried terminate_after; then true
+    // when any executor stopped early, as the shard path reports the
+    // flag when any shard did.
+    private Boolean terminatedEarly = null;
     // One entry per per-node response, in fan-out order (target
     // order, then node id order within a target). Each inner list
     // is already sorted by the executor and cut to from + size,
@@ -105,6 +115,7 @@ public final class MergeReducer {
         int size,
         boolean versionRequested,
         boolean seqNoAndPrimaryTermRequested,
+        boolean trackScores,
         int trackTotalHitsUpTo
     ) {
         this.clusterService = clusterService;
@@ -116,6 +127,7 @@ public final class MergeReducer {
         this.size = size;
         this.versionRequested = versionRequested;
         this.seqNoAndPrimaryTermRequested = seqNoAndPrimaryTermRequested;
+        this.trackScores = trackScores;
         this.trackTotalHitsUpTo = trackTotalHitsUpTo;
     }
 
@@ -140,6 +152,7 @@ public final class MergeReducer {
         for (LanceFragmentQueryResponse response : responses) {
             totalMatched += response.matched();
             matchedIsLowerBound |= response.matchedIsLowerBound();
+            terminatedEarly = mergeTerminatedEarly(terminatedEarly, response.terminatedEarly());
             // Keep each node's list intact; the sort merge and
             // the from/size cut run in buildResponse once every
             // node of every target has answered.
@@ -156,6 +169,23 @@ public final class MergeReducer {
                 perNodeAggregations.add(response.aggregations());
             }
         }
+    }
+
+    /**
+     * {@code terminated_early} after one more executor answered: the
+     * flag stays absent ({@code null}) while no executor reported one,
+     * and is {@code true} once any executor stopped early, the way
+     * {@code SearchPhaseController.TopDocsStats} folds the per shard
+     * flags.
+     */
+    public static Boolean mergeTerminatedEarly(Boolean merged, Boolean fromExecutor) {
+        if (fromExecutor == null) {
+            return merged;
+        }
+        if (merged == null) {
+            return fromExecutor;
+        }
+        return merged || fromExecutor;
     }
 
     /**
@@ -211,21 +241,22 @@ public final class MergeReducer {
             int end = Math.min(hits.size(), from + size);
             paged = hits.subList(from, end).toArray(new SearchHit[0]);
         }
-        // max_score is the largest per-hit score in the paged
-        // window, matching shard path behaviour. The old
-        // hard-coded 1.0f flattened the response for
-        // function_score / script_score / FTS queries where
-        // real scores can range far above 1.0. NaN when no
-        // hits survive paging, or when every hit carries NaN
-        // (e.g. sort without track_scores).
+        // max_score follows the shard path's TopDocsCollectorContext: a
+        // score ordered page (no sort, or a leading descending _score
+        // clause) reports its top score, a sort with track_scores the
+        // largest score of the paged window, and any other sort NaN,
+        // although its hits carry a score when a _score clause sits
+        // among the sort clauses. NaN also when no hit survives paging.
         float maxScore = Float.NaN;
-        for (SearchHit hit : paged) {
-            float score = hit.getScore();
-            if (Float.isNaN(score)) {
-                continue;
-            }
-            if (Float.isNaN(maxScore) || score > maxScore) {
-                maxScore = score;
+        if (scoreOrdered(sorts) || trackScores) {
+            for (SearchHit hit : paged) {
+                float score = hit.getScore();
+                if (Float.isNaN(score)) {
+                    continue;
+                }
+                if (Float.isNaN(maxScore) || score > maxScore) {
+                    maxScore = score;
+                }
             }
         }
         SearchHits searchHits = new SearchHits(paged, mergedTotalHits(), maxScore);
@@ -249,8 +280,9 @@ public final class MergeReducer {
         // so there is no failed shard to count; the coordinator's
         // WARN log names the node, the fragment count and the
         // timeout. Aggregations are the reduce of the nodes that
-        // answered, as on the shard path.
-        SearchResponseSections sections = new SearchResponseSections(searchHits, aggregations, null, timedOut, false, null, 1);
+        // answered, as on the shard path. terminated_early is left
+        // out unless the request carried terminate_after.
+        SearchResponseSections sections = new SearchResponseSections(searchHits, aggregations, null, timedOut, terminatedEarly, null, 1);
         // Hide the Lance fragment fan-out from the response
         // shape. The user's mental model is one logical dataset,
         // not N shards; reporting fragmentCount here would leak
@@ -271,6 +303,19 @@ public final class MergeReducer {
             ShardSearchFailure.EMPTY_ARRAY,
             SearchResponse.Clusters.EMPTY
         );
+    }
+
+    /**
+     * Whether the page is in score order: no sort clause, or a leading
+     * {@code _score} clause in its default descending direction (the
+     * {@code SortField.FIELD_SCORE} the shard path reads the top score
+     * from).
+     */
+    private static boolean scoreOrdered(List<SortBuilder<?>> sorts) {
+        if (sorts == null || sorts.isEmpty()) {
+            return true;
+        }
+        return sorts.get(0) instanceof ScoreSortBuilder && sorts.get(0).order() != SortOrder.ASC;
     }
 
     /**

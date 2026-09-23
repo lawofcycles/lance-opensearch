@@ -69,6 +69,9 @@ import org.opensearch.search.SearchService;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.fetch.StoredFieldsContext;
+import org.opensearch.search.fetch.subphase.FetchSourceContext;
+import org.opensearch.search.fetch.subphase.FieldAndFormat;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.SortBuilder;
 import org.opensearch.tasks.CancellableTask;
@@ -286,7 +289,17 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         QueryBuilder query = rewriteAtCoordinator(source == null ? null : source.query(), start);
         QueryBuilder postFilter = source == null ? null : source.postFilter();
         List<SortBuilder<?>> sorts = source == null || source.sorts() == null ? Collections.emptyList() : source.sorts();
-        Object[] searchAfter = source == null ? null : source.searchAfter();
+        Object[] searchAfter = source == null || source.searchAfter() == null || source.searchAfter().length == 0
+            ? null
+            : source.searchAfter();
+        if (searchAfter != null && sorts.isEmpty()) {
+            // The shard path's SearchAfterBuilder.buildFieldDoc refuses
+            // a cursor without a sort with this message; a request whose
+            // sort builds no Lucene sort (a lone descending _score) is
+            // refused with the same message on the executor, where the
+            // sort is built.
+            throw new IllegalArgumentException("Sort must contain at least one field.");
+        }
         AggregatorFactories.Builder aggregations = source == null ? null : source.aggregations();
         int size = resolveSize(source);
         int from = resolveFrom(source);
@@ -296,6 +309,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // fragment-level penalty.
         int perNodeSize = from + size;
         int trackTotalHitsUpTo = resolveTrackTotalHitsUpTo(source);
+        Float minScore = source == null ? null : source.minScore();
+        int terminateAfter = source == null ? 0 : source.terminateAfter();
+        HitProjection projection = resolveProjection(source);
 
         Index[] concrete = indexNameExpressionResolver.concreteIndices(clusterService.state(), searchRequest);
         List<IndexTarget> targets = resolveTargets(concrete);
@@ -319,7 +335,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // Per-index fan-out results, collected sequentially. The plan
         // is derived per target inside runIndexLoop, against the
         // target's own schema; the spec built here carries no plan yet.
+        // min_score and terminate_after apply inside Lucene's collectors
+        // on the executor, so a request carrying either is not planned
+        // as a pushed aggregate or a pushed page (see
+        // ExecutionShape.collectorKnobs).
+        boolean collectorKnobs = minScore != null || terminateAfter > 0;
         boolean planAggregations = aggregations != null
+            && !collectorKnobs
             && clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_SETTING)
             && LanceAggregationSupport.isPushdownCandidate(aggregations);
         FragmentQuerySpec spec = new FragmentQuerySpec(
@@ -333,7 +355,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             aggregations,
             planAggregations,
             source != null && source.trackScores(),
-            trackTotalHitsUpTo
+            trackTotalHitsUpTo,
+            minScore,
+            terminateAfter,
+            projection
         );
         boolean versionRequested = source != null && Boolean.TRUE.equals(source.version());
         boolean seqNoAndPrimaryTermRequested = source != null && Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
@@ -347,6 +372,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             size,
             versionRequested,
             seqNoAndPrimaryTermRequested,
+            source != null && source.trackScores(),
             trackTotalHitsUpTo
         );
         runIndexLoop(targets, 0, nodeList, spec, policy, merged, start, listener);
@@ -411,6 +437,39 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             return SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO;
         }
         return source.trackTotalHitsUpTo();
+    }
+
+    /**
+     * The per hit projections of the body, checked the way
+     * {@code SearchService.parseSource} checks them: {@code stored_fields:
+     * _none_} cannot be combined with a requested {@code _source} or with
+     * {@code fields}, because both read the source the request just
+     * switched off. The shard path reports these two as a 500
+     * {@code search_exception}; here they are the client's error and
+     * answer 400.
+     */
+    static HitProjection resolveProjection(SearchSourceBuilder source) {
+        if (source == null) {
+            return HitProjection.NONE;
+        }
+        FetchSourceContext fetchSource = source.fetchSource();
+        StoredFieldsContext storedFields = source.storedFields();
+        List<FieldAndFormat> fetchFields = source.fetchFields() == null ? List.of() : source.fetchFields();
+        if (storedFields != null && !storedFields.fetchFields()) {
+            if (fetchSource != null && fetchSource.fetchSource()) {
+                throw new IllegalArgumentException("[stored_fields] cannot be disabled if [_source] is requested");
+            }
+            if (!fetchFields.isEmpty()) {
+                throw new IllegalArgumentException("[stored_fields] cannot be disabled when using the [fields] option");
+            }
+        }
+        return new HitProjection(
+            fetchSource,
+            storedFields,
+            source.docValueFields() == null ? List.of() : source.docValueFields(),
+            fetchFields,
+            Boolean.TRUE.equals(source.explain())
+        );
     }
 
     /**
@@ -675,7 +734,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             spec.aggregations(),
             fragmentsForNode,
             spec.trackScores(),
-            spec.trackTotalHitsUpTo()
+            spec.trackTotalHitsUpTo(),
+            spec.minScore(),
+            spec.terminateAfter(),
+            spec.projection()
         );
     }
 
@@ -922,7 +984,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      */
     private record FragmentQuerySpec(FragmentPlan plan, QueryBuilder query, QueryBuilder postFilter, List<SortBuilder<?>> sorts,
         Object[] searchAfter, int from, int effectiveSize, AggregatorFactories.Builder aggregations, boolean planAggregations,
-        boolean trackScores, int trackTotalHitsUpTo) {
+        boolean trackScores, int trackTotalHitsUpTo, Float minScore, int terminateAfter, HitProjection projection) {
 
         /** The same spec carrying the plan derived for one target. */
         FragmentQuerySpec withPlan(FragmentPlan targetPlan) {
@@ -937,13 +999,26 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 aggregations,
                 planAggregations,
                 trackScores,
-                trackTotalHitsUpTo
+                trackTotalHitsUpTo,
+                minScore,
+                terminateAfter,
+                projection
             );
         }
 
         /** What the planner reads of the request. */
         ExecutionShape executionShape() {
-            return new ExecutionShape(query, postFilter, sorts, searchAfter, from, effectiveSize, aggregations, planAggregations);
+            return new ExecutionShape(
+                query,
+                postFilter,
+                sorts,
+                searchAfter,
+                from,
+                effectiveSize,
+                aggregations,
+                planAggregations,
+                minScore != null || terminateAfter > 0
+            );
         }
     }
 }

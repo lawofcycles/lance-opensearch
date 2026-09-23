@@ -2239,7 +2239,7 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
         LancePlannerFactory factory = new LancePlannerFactory(1L << 30, 1L << 30);
         LanceSchemas.IndexModel model = LanceSchemas.model("idx", dataset.getSchema(), multiFields, () -> 600L);
         RelNode logical = SearchRequestToRel.translateForExecution(
-            new ExecutionShape(new MatchAllQueryBuilder(), null, List.of(), null, 0, 0, tree, true),
+            new ExecutionShape(new MatchAllQueryBuilder(), null, List.of(), null, 0, 0, tree, true, false),
             model,
             factory
         );

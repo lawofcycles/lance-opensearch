@@ -59,10 +59,6 @@ public class PlanToShardPathRuleTests extends OpenSearchTestCase {
         assertFallsBack("{\"query\":{\"match_all\":{}},\"highlight\":{\"fields\":{\"body\":{}}}}", ShardPathReason.HIGHLIGHT);
     }
 
-    public void testScoreOrderSearchAfterFallsBack() throws IOException {
-        assertFallsBack("{\"size\":5,\"search_after\":[100]}", ShardPathReason.SEARCH_AFTER_SCORE);
-    }
-
     public void testCollapseFallsBack() throws IOException {
         assertFallsBack("{\"collapse\":{\"field\":\"category\"}}", ShardPathReason.COLLAPSE);
     }
@@ -89,30 +85,27 @@ public class PlanToShardPathRuleTests extends OpenSearchTestCase {
         );
     }
 
-    public void testMinScoreFallsBack() throws IOException {
-        assertFallsBack("{\"size\":0,\"query\":{\"match_all\":{}},\"min_score\":2.0}", ShardPathReason.MIN_SCORE);
-    }
-
-    public void testTerminateAfterFallsBack() throws IOException {
-        assertFallsBack("{\"size\":0,\"query\":{\"match_all\":{}},\"terminate_after\":2}", ShardPathReason.TERMINATE_AFTER);
-    }
-
-    public void testStoredFieldsFallsBack() throws IOException {
-        assertFallsBack("{\"size\":1,\"stored_fields\":\"_none_\"}", ShardPathReason.STORED_FIELDS);
-    }
-
-    public void testDocValueFieldsFallsBack() throws IOException {
-        assertFallsBack("{\"size\":1,\"docvalue_fields\":[\"id\"]}", ShardPathReason.DOCVALUE_FIELDS);
-    }
-
-    public void testExplainFallsBack() throws IOException {
-        assertFallsBack("{\"size\":1,\"query\":{\"match_all\":{}},\"explain\":true}", ShardPathReason.EXPLAIN_PER_HIT);
-    }
-
     public void testCombinedReasonsRideOneFallback() throws IOException {
-        RelNode physical = plan("{\"size\":0,\"query\":{\"match_all\":{}},\"min_score\":2.0,\"terminate_after\":2}");
+        RelNode physical = plan(
+            "{\"size\":5,\"query\":{\"match_all\":{}},\"collapse\":{\"field\":\"category\"},"
+                + "\"rescore\":{\"window_size\":10,\"query\":{\"rescore_query\":{\"match_all\":{}}}}}"
+        );
         assertTrue("the shard path operator answers the shape: " + physical, physical instanceof ShardPathFallbackExec);
-        assertEquals(List.of(ShardPathReason.MIN_SCORE, ShardPathReason.TERMINATE_AFTER), ((ShardPathFallbackExec) physical).reasons());
+        assertEquals(List.of(ShardPathReason.COLLAPSE, ShardPathReason.RESCORE), ((ShardPathFallbackExec) physical).reasons());
+    }
+
+    public void testCollectorKnobsAndProjectionsAreDispatchable() throws IOException {
+        // min_score, terminate_after, the per hit projections and a
+        // score order search_after are served by the fragment executors
+        // (the collectors and the fetch sub phases), so none of them
+        // routes to the shard path.
+        assertDispatchable("{\"size\":0,\"query\":{\"match_all\":{}},\"min_score\":2.0}");
+        assertDispatchable("{\"size\":0,\"query\":{\"match_all\":{}},\"terminate_after\":2}");
+        assertDispatchable("{\"size\":1,\"stored_fields\":\"_none_\"}");
+        assertDispatchable("{\"size\":1,\"docvalue_fields\":[\"id\"]}");
+        assertDispatchable("{\"size\":1,\"fields\":[\"id\"],\"_source\":false}");
+        assertDispatchable("{\"size\":1,\"query\":{\"match_all\":{}},\"explain\":true}");
+        assertDispatchable("{\"size\":5,\"search_after\":[100]}");
     }
 
     public void testEmptyBodyIsDispatchable() {
@@ -146,9 +139,12 @@ public class PlanToShardPathRuleTests extends OpenSearchTestCase {
     }
 
     public void testShardPathReasonsCollectEveryElement() throws IOException {
-        SearchSourceBuilder source = PlanTestFixtures.parse("{\"size\":1,\"stored_fields\":\"_none_\",\"explain\":true,\"min_score\":1.5}");
+        SearchSourceBuilder source = PlanTestFixtures.parse(
+            "{\"size\":1,\"highlight\":{\"fields\":{\"body\":{}}},\"collapse\":{\"field\":\"category\"},"
+                + "\"rescore\":{\"window_size\":10,\"query\":{\"rescore_query\":{\"match_all\":{}}}}}"
+        );
         assertEquals(
-            List.of(ShardPathReason.MIN_SCORE, ShardPathReason.STORED_FIELDS, ShardPathReason.EXPLAIN_PER_HIT),
+            List.of(ShardPathReason.HIGHLIGHT, ShardPathReason.COLLAPSE, ShardPathReason.RESCORE),
             SearchRequestToRel.shardPathReasons(source)
         );
     }

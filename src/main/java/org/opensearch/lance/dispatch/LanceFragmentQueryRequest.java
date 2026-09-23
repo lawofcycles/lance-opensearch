@@ -51,6 +51,12 @@ import org.opensearch.tasks.Task;
  *       through {@link org.opensearch.search.sort.SortBuilder#buildSort}.</li>
  *   <li>{@link #aggregations()} — top-level aggregator specs
  *       ({@link AggregatorFactories.Builder}), NamedWriteable-compatible.</li>
+ *   <li>{@link #minScore()}, {@link #terminateAfter()} — the collector
+ *       knobs Lucene's {@code MinimumScoreCollector} and an early
+ *       terminating collector apply on the executor.</li>
+ *   <li>{@link #projection()} — the per hit projections ({@code _source},
+ *       {@code stored_fields}, {@code docvalue_fields}, {@code fields},
+ *       {@code explain}) the executor's fetch phase renders.</li>
  * </ul>
  *
  * <p>{@link #plan()} is the per node plan the coordinator's planner
@@ -116,7 +122,27 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
      * {@link LanceFragmentQueryResponse#matchedIsLowerBound()}.
      */
     private final int trackTotalHitsUpTo;
+    /**
+     * The request's {@code min_score}, or {@code null} when it has none.
+     * The executor wraps its hits and aggregation collectors in the
+     * stock {@code MinimumScoreCollector}, so a document below the
+     * threshold is neither returned, aggregated nor counted.
+     */
+    private final Float minScore;
+    /**
+     * The request's {@code terminate_after}, or 0 when it has none. The
+     * executor stops collecting after that many documents and reports
+     * {@link LanceFragmentQueryResponse#terminatedEarly()}.
+     */
+    private final int terminateAfter;
+    /** The per hit projections of the body; {@link HitProjection#NONE} when it has none. */
+    private final HitProjection projection;
 
+    /**
+     * A request without collector knobs and without per hit projections:
+     * the full constructor with {@code minScore} null,
+     * {@code terminateAfter} 0 and {@link HitProjection#NONE}.
+     */
     public LanceFragmentQueryRequest(
         String tableUri,
         String indexName,
@@ -133,6 +159,46 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         boolean trackScores,
         int trackTotalHitsUpTo
     ) {
+        this(
+            tableUri,
+            indexName,
+            storageOptions,
+            pinnedVersion,
+            plan,
+            query,
+            postFilter,
+            sorts,
+            searchAfter,
+            size,
+            aggregations,
+            fragmentIds,
+            trackScores,
+            trackTotalHitsUpTo,
+            null,
+            0,
+            HitProjection.NONE
+        );
+    }
+
+    public LanceFragmentQueryRequest(
+        String tableUri,
+        String indexName,
+        StorageOptions storageOptions,
+        long pinnedVersion,
+        FragmentPlan plan,
+        QueryBuilder query,
+        QueryBuilder postFilter,
+        List<SortBuilder<?>> sorts,
+        Object[] searchAfter,
+        int size,
+        AggregatorFactories.Builder aggregations,
+        List<Integer> fragmentIds,
+        boolean trackScores,
+        int trackTotalHitsUpTo,
+        Float minScore,
+        int terminateAfter,
+        HitProjection projection
+    ) {
         this.tableUri = tableUri;
         this.indexName = indexName;
         this.storageOptions = storageOptions;
@@ -147,6 +213,9 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.fragmentIds = List.copyOf(fragmentIds);
         this.trackScores = trackScores;
         this.trackTotalHitsUpTo = trackTotalHitsUpTo;
+        this.minScore = minScore;
+        this.terminateAfter = Math.max(0, terminateAfter);
+        this.projection = projection == null ? HitProjection.NONE : projection;
     }
 
     public LanceFragmentQueryRequest(StreamInput in) throws IOException {
@@ -183,6 +252,9 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.fragmentIds = List.copyOf(readFragments);
         this.trackScores = in.readBoolean();
         this.trackTotalHitsUpTo = in.readInt();
+        this.minScore = in.readOptionalFloat();
+        this.terminateAfter = in.readVInt();
+        this.projection = HitProjection.read(in);
     }
 
     @Override
@@ -221,6 +293,9 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         // and TRACK_TOTAL_HITS_ACCURATE is Integer.MAX_VALUE, neither
         // of which VInt encodes compactly or (for -1) safely.
         out.writeInt(trackTotalHitsUpTo);
+        out.writeOptionalFloat(minScore);
+        out.writeVInt(terminateAfter);
+        projection.writeTo(out);
     }
 
     @Override
@@ -318,10 +393,14 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
 
     /**
      * Cursor for {@code search_after} pagination — the sort-field
-     * values of the last hit from the previous page. {@code null}
-     * when the request is not paginated with {@code search_after}.
-     * When non-null, sorts is guaranteed non-empty (the dispatch
-     * filter rejects search_after without a matching sort).
+     * values of the last hit from the previous page, as the client sent
+     * them (JSON numbers arrive as Integer / Long / Double). {@code null}
+     * when the request is not paginated with {@code search_after}. The
+     * executor types them against its Lucene sort through
+     * {@code SearchAfterBuilder.buildFieldDoc}, the way the shard path
+     * does, and refuses a cursor whose request builds no sort
+     * ({@code sort} absent, or a lone descending {@code _score}) with
+     * the shard path's message.
      */
     public Object[] searchAfter() {
         return searchAfter;
@@ -382,6 +461,32 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
      */
     public int trackTotalHitsUpTo() {
         return trackTotalHitsUpTo;
+    }
+
+    /** The request's {@code min_score}, or {@code null} when it has none. */
+    public Float minScore() {
+        return minScore;
+    }
+
+    /** The request's {@code terminate_after}, or 0 when it has none. */
+    public int terminateAfter() {
+        return terminateAfter;
+    }
+
+    /**
+     * Whether the request carries {@code min_score} or
+     * {@code terminate_after}. Both apply inside Lucene's collectors, so
+     * the executor then collects the hits, the aggregations and the
+     * match count through those collectors and runs no Lance side count
+     * or bounded scan for the request.
+     */
+    public boolean hasCollectorKnobs() {
+        return minScore != null || terminateAfter > 0;
+    }
+
+    /** The per hit projections of the body, never {@code null}. */
+    public HitProjection projection() {
+        return projection;
     }
 
     /**

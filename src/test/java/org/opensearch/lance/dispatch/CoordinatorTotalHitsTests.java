@@ -77,4 +77,17 @@ public class CoordinatorTotalHitsTests extends OpenSearchTestCase {
         assertNull(MergeReducer.totalHits(9_991L, true, SearchContext.TRACK_TOTAL_HITS_DISABLED));
         assertNull(MergeReducer.totalHits(0L, false, SearchContext.TRACK_TOTAL_HITS_DISABLED));
     }
+
+    public void testTerminatedEarlyIsAbsentUntilAnExecutorReportsItAndOrsTheFlags() {
+        // Without terminate_after no executor reports the flag and the
+        // response leaves terminated_early out; with it the flag is the
+        // OR over the executors, as SearchPhaseController folds shards.
+        assertNull(MergeReducer.mergeTerminatedEarly(null, null));
+        assertEquals(Boolean.FALSE, MergeReducer.mergeTerminatedEarly(null, false));
+        assertEquals(Boolean.TRUE, MergeReducer.mergeTerminatedEarly(null, true));
+        assertEquals(Boolean.FALSE, MergeReducer.mergeTerminatedEarly(false, false));
+        assertEquals(Boolean.TRUE, MergeReducer.mergeTerminatedEarly(false, true));
+        assertEquals(Boolean.TRUE, MergeReducer.mergeTerminatedEarly(true, false));
+        assertEquals(Boolean.TRUE, MergeReducer.mergeTerminatedEarly(true, null));
+    }
 }

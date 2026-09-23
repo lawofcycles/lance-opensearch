@@ -305,10 +305,19 @@ public class LanceExplainIT extends LanceRestTestCase {
             // Two elements, both named, in the order the checks run.
             String twoReasons = explainOk(
                 indexName,
-                "{\"size\":3,\"query\":{\"term\":{\"id\":1}},\"rescore\":{\"query\":{\"rescore_query\":{\"term\":{\"id\":2}}}},\"min_score\":0.5}"
+                "{\"size\":3,\"query\":{\"term\":{\"id\":1}},\"highlight\":{\"fields\":{\"body\":{}}},"
+                    + "\"rescore\":{\"query\":{\"rescore_query\":{\"term\":{\"id\":2}}}}}"
             );
             assertEquals("shard_path", stringPath(twoReasons, "route"));
-            assertEquals(List.of("RESCORE", "MIN_SCORE"), listOf(twoReasons, "reasons"));
+            assertEquals(List.of("HIGHLIGHT", "RESCORE"), listOf(twoReasons, "reasons"));
+
+            // min_score is served by the executors' collectors: the
+            // route stays on the fragment path and the plan is the query
+            // root alone, with the knob named as the unplanned element.
+            String minScoreBody = explainOk(indexName, "{\"size\":3,\"query\":{\"term\":{\"id\":1}},\"min_score\":0.5}");
+            assertEquals("fragment", stringPath(minScoreBody, "route"));
+            assertEquals("LUCENE_TOPK", fragmentPlanOf(minScoreBody).get("kind"));
+            assertEquals("min_score or terminate_after (applied by the Lucene collectors)", stringPath(minScoreBody, "unplanned"));
 
             // The refusal the runtime shares: a filtered lance_knn whose
             // filter has no Lance SQL form answers 400 with the same

@@ -556,10 +556,11 @@ public class LanceAggregationIT extends LanceRestTestCase {
             assertEquals(first, again);
             assertEquals(rejectionsBefore + 1, longNumber(columnStoreStats().get("heap_fallback_rejections")));
 
-            // The shard path reader (explain routes there) stays open for
-            // the life of the shard, so its heap column stays charged and
-            // the gauge shows it until the index goes away.
-            String viaShard = readAll(postJson("/" + index + "/_search", "{\"explain\":true," + sum.substring(1)));
+            // The shard path reader (a global aggregation routes there)
+            // stays open for the life of the shard, so its heap column
+            // stays charged and the gauge shows it until the index goes
+            // away.
+            String viaShard = readAll(postJson("/" + index + "/_search", onShardPath(sum)));
             assertEquals(expectedSum, extractDoublePath(viaShard, "aggregations", "s", "value"), 0d);
             long held = longNumber(columnStoreStats().get("heap_fallback_bytes"));
             assertTrue(
@@ -1169,23 +1170,24 @@ public class LanceAggregationIT extends LanceRestTestCase {
 
     /**
      * Run {@code shape} (a {@code _search} body without its outer braces)
-     * through the fragment path and, with {@code "explain": true} added,
-     * through the shard path, and assert the two responses carry the same
-     * {@code hits.total} and the same {@code aggregations} block. Returns
+     * through the fragment path and, with the {@link #onShardPath} global
+     * aggregation added, through the shard path, and assert the two
+     * responses carry the same {@code hits.total} and the same
+     * {@code aggregations} block (the oracle's own key aside). Returns
      * the fragment path response.
      */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> assertShardPathAgrees(String index, String shape) throws IOException {
         Map<String, Object> fragmentPath = parse(readAll(postJson("/" + index + "/_search", "{" + shape + "}")));
         Map<String, Object> shardPath = parse(
-            readAll(postJson("/" + index + "/_search?request_cache=false", "{\"explain\":true," + shape + "}"))
+            readAll(postJson("/" + index + "/_search?request_cache=false", onShardPath("{" + shape + "}")))
         );
         assertEquals(
             shape,
             ((Map<String, Object>) shardPath.get("hits")).get("total"),
             ((Map<String, Object>) fragmentPath.get("hits")).get("total")
         );
-        assertEquals(shape, shardPath.get("aggregations"), fragmentPath.get("aggregations"));
+        assertEquals(shape, withoutShardPathOracle(shardPath.get("aggregations")), fragmentPath.get("aggregations"));
         return fragmentPath;
     }
 
@@ -1273,9 +1275,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             String tdigest = "{\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"rating\"}}}}";
             Map<String, Object> viaFragments = parse(readAll(postJson("/" + index + "/_search", tdigest)));
             requests++;
-            Map<String, Object> viaShard = parse(
-                readAll(postJson("/" + index + "/_search?request_cache=false", "{\"explain\":true," + tdigest.substring(1)))
-            );
+            Map<String, Object> viaShard = parse(readAll(postJson("/" + index + "/_search?request_cache=false", onShardPath(tdigest))));
             Map<String, Object> fragmentValues = (Map<String, Object>) aggregation(viaFragments, "p").get("values");
             Map<String, Object> shardValues = (Map<String, Object>) aggregation(viaShard, "p").get("values");
             assertEquals(shardValues.keySet(), fragmentValues.keySet());

@@ -73,7 +73,16 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
     private final List<SearchHit> hits;
     private final long[] rowAddrs;
     private final InternalAggregations aggregations;
+    /**
+     * Whether the executor stopped collecting at the request's
+     * {@code terminate_after}: {@code null} when the request carried
+     * none, otherwise the flag the shard path reports per shard as
+     * {@code terminated_early}. The coordinator ORs the flags of every
+     * executor into the response.
+     */
+    private final Boolean terminatedEarly;
 
+    /** A response of a request without {@code terminate_after}: {@link #terminatedEarly()} is {@code null}. */
     public LanceFragmentQueryResponse(
         long matched,
         boolean matchedIsLowerBound,
@@ -81,6 +90,18 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         List<SearchHit> hits,
         long[] rowAddrs,
         InternalAggregations aggregations
+    ) {
+        this(matched, matchedIsLowerBound, fragmentCount, hits, rowAddrs, aggregations, null);
+    }
+
+    public LanceFragmentQueryResponse(
+        long matched,
+        boolean matchedIsLowerBound,
+        int fragmentCount,
+        List<SearchHit> hits,
+        long[] rowAddrs,
+        InternalAggregations aggregations,
+        Boolean terminatedEarly
     ) {
         if (rowAddrs.length != hits.size()) {
             throw new IllegalArgumentException("rowAddrs has " + rowAddrs.length + " entries for " + hits.size() + " hits");
@@ -91,6 +112,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         this.hits = List.copyOf(hits);
         this.rowAddrs = rowAddrs.clone();
         this.aggregations = aggregations;
+        this.terminatedEarly = terminatedEarly;
     }
 
     public LanceFragmentQueryResponse(StreamInput in) throws IOException {
@@ -109,6 +131,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
             throw new IOException("rowAddrs has " + rowAddrs.length + " entries for " + hitCount + " hits");
         }
         this.aggregations = in.readBoolean() ? InternalAggregations.readFrom(in) : null;
+        this.terminatedEarly = in.readOptionalBoolean();
     }
 
     @Override
@@ -127,6 +150,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
             out.writeBoolean(true);
             aggregations.writeTo(out);
         }
+        out.writeOptionalBoolean(terminatedEarly);
     }
 
     public long matched() {
@@ -169,5 +193,13 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
      */
     public InternalAggregations aggregations() {
         return aggregations;
+    }
+
+    /**
+     * Whether collection stopped at the request's {@code terminate_after}
+     * on this executor; {@code null} when the request carried none.
+     */
+    public Boolean terminatedEarly() {
+        return terminatedEarly;
     }
 }
