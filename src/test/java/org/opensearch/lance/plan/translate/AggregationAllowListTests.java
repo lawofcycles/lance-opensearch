@@ -13,6 +13,7 @@ import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionTranslation;
+import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.script.Script;
 import org.opensearch.search.aggregations.AggregationBuilder;
@@ -28,7 +29,10 @@ import org.opensearch.search.aggregations.bucket.composite.TermsValuesSourceBuil
 import org.opensearch.search.aggregations.bucket.filter.FiltersAggregator;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.terms.IncludeExclude;
+import org.opensearch.search.aggregations.bucket.terms.MultiTermsAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.terms.RareTermsAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.PercentilesMethod;
+import org.opensearch.search.aggregations.support.MultiTermsValuesSourceConfig;
 import org.opensearch.search.sort.SortOrder;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -38,13 +42,15 @@ import java.util.Map;
 
 /**
  * The translator alone decides which aggregation trees reach the
- * planner: every shape the coordinator's former structural allow list
- * ({@code LanceAggregationSupport.isPushdownCandidate}) accepted
- * translates to a {@link LanceAggregate}, and every shape it rejected
- * is refused by {@link SearchRequestToRel#translateExecution} with the
- * translator's own message, so removing the allow list changed no
- * routing decision. The shapes are the ones that test enumerated,
- * spelled over the shared fixture schema.
+ * planner: every shape the coordinator's former structural allow lists
+ * ({@code LanceAggregationSupport.isPushdownCandidate} and
+ * {@code LanceAggregationSupport.isSupported}) accepted translates to
+ * a {@link LanceAggregate}, every shape the pushdown does not spell is
+ * refused by {@link SearchRequestToRel#translateExecution} with the
+ * translator's own message and runs on the aggregators, and the few
+ * shapes the fragment executors cannot run at all are refused outright
+ * with an {@link IllegalArgumentException}. The shapes are the ones
+ * those tests enumerated, spelled over the shared fixture schema.
  */
 public class AggregationAllowListTests extends OpenSearchTestCase {
 
@@ -431,6 +437,69 @@ public class AggregationAllowListTests extends OpenSearchTestCase {
             "query type [lance_match] in filter of aggregation [f]",
             tree(AggregationBuilders.filter("f", new LanceMatchQueryBuilder("body", "hello")))
         );
-        assertRefuses("top_hits", "aggregation type [top_hits]", tree(AggregationBuilders.topHits("t").size(1)));
+        assertRefuses("sampler", "aggregation type [sampler]", tree(AggregationBuilders.sampler("sm").shardSize(10)));
+        assertRefuses("nested", "aggregation type [nested]", tree(AggregationBuilders.nested("n", "body")));
+        assertRefuses(
+            "multi_terms",
+            "aggregation type [multi_terms]",
+            tree(
+                new MultiTermsAggregationBuilder("mt").terms(
+                    List.of(
+                        new MultiTermsValuesSourceConfig.Builder().setFieldName("category").build(),
+                        new MultiTermsValuesSourceConfig.Builder().setFieldName("flag").build()
+                    )
+                )
+            )
+        );
+        assertRefuses(
+            "scripted metric",
+            "aggregation type [scripted_metric]",
+            tree(AggregationBuilders.scriptedMetric("sm").mapScript(new Script("state.n = 1")))
+        );
+        assertRefuses(
+            "filter over a lance_knn",
+            "query type [lance_knn] in filter of aggregation [f]",
+            tree(AggregationBuilders.filter("f", new LanceKnnQueryBuilder("embedding", new float[] { 1f, 0f }, 3)))
+        );
+    }
+
+    /**
+     * The builders the fragment executors cannot run: the translator
+     * refuses the whole request with the 400 exception before any
+     * translation, wherever the builder sits in the tree.
+     */
+    public void testTheUnservableShapesAreRefusedOutright() {
+        assertRefusedOutright("top_hits", "aggregation type [top_hits] on [t]", tree(AggregationBuilders.topHits("t").size(1)));
+        assertRefusedOutright("global", "aggregation type [global] on [g]", tree(AggregationBuilders.global("g")));
+        assertRefusedOutright(
+            "rare_terms",
+            "aggregation type [rare_terms] on [r]",
+            tree(new RareTermsAggregationBuilder("r").field("category"))
+        );
+        assertRefusedOutright(
+            "significant_terms",
+            "aggregation type [significant_terms] on [st]",
+            tree(AggregationBuilders.significantTerms("st").field("category"))
+        );
+        assertRefusedOutright(
+            "significant_text",
+            "aggregation type [significant_text] on [sx]",
+            tree(AggregationBuilders.significantText("sx", "body"))
+        );
+        assertRefusedOutright(
+            "top_hits under terms",
+            "aggregation type [top_hits] on [t]",
+            tree(AggregationBuilders.terms("c").field("category").subAggregation(AggregationBuilders.topHits("t").size(1)))
+        );
+        assertRefusedOutright(
+            "global next to a served metric",
+            "aggregation type [global] on [g]",
+            tree(AggregationBuilders.sum("s").field("rating"), AggregationBuilders.global("g"))
+        );
+    }
+
+    private static void assertRefusedOutright(String label, String message, AggregatorFactories.Builder tree) {
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> translate(tree));
+        assertTrue(label + ": the refusal names the builder, got [" + e.getMessage() + "]", e.getMessage().startsWith(message));
     }
 }

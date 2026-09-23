@@ -297,8 +297,8 @@ public class SearchRequestToRelTests extends OpenSearchTestCase {
     }
 
     public void testUnsupportedAggregationTypeThrows() {
-        SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.topHits("t"));
-        assertEquals("aggregation type [top_hits]", messageOf(source));
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.sampler("t"));
+        assertEquals("aggregation type [sampler]", messageOf(source));
     }
 
     public void testMetricOnKeywordColumnNamesTheColumn() {

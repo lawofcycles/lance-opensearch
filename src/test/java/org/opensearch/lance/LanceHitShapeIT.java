@@ -26,7 +26,7 @@ import org.opensearch.client.Response;
  * ({@code _source}, {@code stored_fields}, {@code docvalue_fields},
  * {@code fields}, {@code explain}) and the score order cursor are
  * compared with the shard path's answers, which the same body with a
- * {@code global} aggregation routes to.
+ * highlighter routes to.
  */
 public class LanceHitShapeIT extends LanceRestTestCase {
 
@@ -124,7 +124,7 @@ public class LanceHitShapeIT extends LanceRestTestCase {
     /**
      * Assert that {@code body} answers the same {@code hits} block (total,
      * max_score and every rendered hit key) on the fragment path as on
-     * the shard path, which the same body with the global aggregation of
+     * the shard path, which the same body with the highlighter of
      * {@link #onShardPath} routes to. Returns the fragment path body.
      */
     private static String assertSameHitsAsShardPath(String indexName, String body) throws IOException {

@@ -230,16 +230,29 @@ public class LanceExplainIT extends LanceRestTestCase {
             assertEquals("LUCENE_AGGREGATE", fragmentPlanOf(pageWithAggregations).get("kind"));
             assertEquals("size [5] (only 0 with aggregations)", stringPath(pageWithAggregations, "unplanned"));
 
-            // An aggregation off the pushdown shapes (top_hits) reaches
+            // An aggregation off the pushdown shapes (multi_terms) reaches
             // the translator, which refuses it by name: the aggregators
-            // run over the bare scan. The dispatch filter's allow list,
-            // which sends this body to the shard path, is not part of
-            // the plan and not of the route.
-            String topHits = explainOk(indexName, "{\"size\":0,\"aggs\":{\"t\":{\"top_hits\":{\"size\":1}}}}");
-            assertEquals("fragment", stringPath(topHits, "route"));
-            assertEquals("LUCENE_AGGREGATE", fragmentPlanOf(topHits).get("kind"));
-            assertEquals("aggregation type [top_hits]", stringPath(topHits, "unplanned"));
-            assertFalse("nothing is pushed into the scan: " + topHits, stringPath(topHits, "physical").contains("pushed=[["));
+            // run over the bare scan. Nothing about the aggregation tree
+            // sends a body to the shard path.
+            String multiTerms = explainOk(
+                indexName,
+                "{\"size\":0,\"aggs\":{\"t\":{\"multi_terms\":{\"terms\":[{\"field\":\"id\"},{\"field\":\"title\"}]}}}}"
+            );
+            assertEquals("fragment", stringPath(multiTerms, "route"));
+            assertEquals("LUCENE_AGGREGATE", fragmentPlanOf(multiTerms).get("kind"));
+            assertEquals("aggregation type [multi_terms]", stringPath(multiTerms, "unplanned"));
+            assertFalse("nothing is pushed into the scan: " + multiTerms, stringPath(multiTerms, "physical").contains("pushed=[["));
+
+            // An aggregation the fragment executors cannot run (top_hits)
+            // answers 400 with the message the coordinator gives a search.
+            ResponseException topHits = expectThrows(
+                ResponseException.class,
+                () -> explain(indexName, "{\"size\":0,\"aggs\":{\"t\":{\"top_hits\":{\"size\":1}}}}")
+            );
+            assertEquals(RestStatus.BAD_REQUEST.getStatus(), topHits.getResponse().getStatusLine().getStatusCode());
+            String topHitsBody = readAll(topHits.getResponse());
+            assertTrue("400 body names the builder: " + topHitsBody, topHitsBody.contains("aggregation type [top_hits] on [t]"));
+            assertTrue("400 body is an illegal_argument_exception: " + topHitsBody, topHitsBody.contains("illegal_argument_exception"));
         } finally {
             deleteQuietly(indexName);
         }

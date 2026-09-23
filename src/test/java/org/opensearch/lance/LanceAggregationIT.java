@@ -611,7 +611,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             assertEquals(first, again);
             assertEquals(rejectionsBefore + 1, longNumber(columnStoreStats().get("heap_fallback_rejections")));
 
-            // The shard path reader (a global aggregation routes there)
+            // The shard path reader (a highlighter routes there)
             // stays open for the life of the shard, so its heap column
             // stays charged and the gauge shows it until the index goes
             // away.
@@ -836,6 +836,9 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "{\"size\":0,\"aggs\":{\"d\":{\"composite\":{\"sources\":[{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}}]}}}}",
                 "{\"size\":0,\"aggs\":{\"d\":{\"composite\":{\"sources\":[{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"time_zone\":\"+09:00\"}}}]}}}}" };
             assertPushdownAgreesWithAggregators(indexName, shapes, aggregatorShapes);
+            // auto_date_histogram is served by the aggregators and equals
+            // the shard path.
+            assertShardPathAgrees(indexName, "\"size\":0,\"aggs\":{\"d\":{\"auto_date_histogram\":{\"field\":\"ts\",\"buckets\":3}}}");
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
@@ -1224,9 +1227,122 @@ public class LanceAggregationIT extends LanceRestTestCase {
     }
 
     /**
+     * Every aggregation type the coordinator's former allow list sent to
+     * the shard path now runs on the fragment path, through the stock
+     * aggregators over the fragment leaves, and answers what the shard
+     * path answers: {@code multi_terms}, {@code matrix_stats},
+     * {@code sampler} / {@code diversified_sampler}, scripted builders,
+     * {@code filter} / {@code filters} over a Lance full text or knn
+     * clause or over a query outside the pushdown's vocabulary, and the
+     * multi value and clustering metrics. The samplers keep
+     * {@code shard_size} documents per collection slice, as they do per
+     * slice under concurrent segment search, so the collection runs in
+     * one slice to equal the single slice shard path. The executed
+     * counter proves the fragment path served every shape.
+     */
+    public void testAggregationsOffTheFormerAllowListRunOnTheFragmentPath() throws Exception {
+        putTransientSetting("lance.fragment_path.slices", "1");
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "former-allow-list")) {
+            String index = fixture.indexName();
+            String[] shapes = new String[] {
+                "\"size\":0,\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"category\"},{\"field\":\"flag\"}]}}}",
+                "\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":100}}},\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"category\"},{\"field\":\"flag\"}],\"size\":3},"
+                    + "\"aggs\":{\"a\":{\"avg\":{\"field\":\"rating\"}}}}}",
+                "\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"flag\"},{\"field\":\"tags\"}],\"size\":2}}}}}",
+                "\"size\":0,\"aggs\":{\"ms\":{\"matrix_stats\":{\"fields\":[\"rating\",\"id\"]}}}",
+                "\"size\":0,\"query\":{\"term\":{\"flag\":true}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"ms\":{\"matrix_stats\":{\"fields\":[\"rating\",\"id\"]}}}}}",
+                "\"size\":0,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"aggs\":{\"sm\":{\"sampler\":{\"shard_size\":50},"
+                    + "\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}",
+                "\"size\":0,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"aggs\":{\"ds\":{\"diversified_sampler\":{\"shard_size\":50,\"field\":\"category\"},"
+                    + "\"aggs\":{\"f\":{\"terms\":{\"field\":\"flag\"}}}}}",
+                "\"size\":0,\"aggs\":{\"sm\":{\"scripted_metric\":{\"init_script\":\"state.n = 0\",\"map_script\":\"state.n += 1\","
+                    + "\"combine_script\":\"return state.n\",\"reduce_script\":\"long t = 0; for (s in states) { t += s } return t\"}}}",
+                "\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"rating\",\"script\":{\"source\":\"_value * 2\"},\"size\":3,\"order\":{\"_key\":\"asc\"}}}}",
+                "\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"script\":{\"source\":\"doc['rating'].size() == 0 ? 0 : doc['rating'].value\"}}}}",
+                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}",
+                "\"size\":0,\"aggs\":{\"fs\":{\"filters\":{\"filters\":{\"a\":{\"term\":{\"category\":\"c0\"}},\"b\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}}}}}}",
+                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":[250.4,0,0,0,0,0,0,0],\"k\":5}},"
+                    + "\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}}",
+                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"match\":{\"body\":\"grp7\"}}}}",
+                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"prefix\":{\"category\":\"c\"}}}}",
+                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"script\":{\"script\":{\"source\":\"doc['id'].value % 2 == 0\"}}}}}",
+                "\"size\":0,\"aggs\":{\"w\":{\"weighted_avg\":{\"value\":{\"field\":\"rating\"},\"weight\":{\"field\":\"id\"}}}}",
+                "\"size\":0,\"aggs\":{\"m\":{\"median_absolute_deviation\":{\"field\":\"rating\"}}}",
+                "\"size\":0,\"aggs\":{\"v\":{\"variable_width_histogram\":{\"field\":\"rating\",\"buckets\":3}}}",
+                "\"size\":0,\"aggs\":{\"a\":{\"adjacency_matrix\":{\"filters\":{\"x\":{\"term\":{\"flag\":true}},\"y\":{\"term\":{\"category\":\"c0\"}}}}}}",
+                "\"size\":2,\"query\":{\"term\":{\"category\":\"c1\"}},\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"category\"},{\"field\":\"flag\"}]}}}" };
+            long before = fragmentRequestsExecuted();
+            for (String shape : shapes) {
+                assertShardPathAgrees(index, shape);
+            }
+            assertEquals("every shape ran on the fragment path", before + shapes.length, fragmentRequestsExecuted());
+
+            // Analytic checks independent of the oracle: 450 rows carry a
+            // category and a flag, two thirds of them true.
+            Map<String, Object> multiTerms = parse(readAll(postJson("/" + index + "/_search", "{" + shapes[0] + "}")));
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> buckets = (List<Map<String, Object>>) aggregation(multiTerms, "mt").get("buckets");
+            assertEquals(6, buckets.size());
+            int total = 0;
+            for (Map<String, Object> bucket : buckets) {
+                total += ((Number) bucket.get("doc_count")).intValue();
+            }
+            assertEquals(450, total);
+            Map<String, Object> matrix = parse(readAll(postJson("/" + index + "/_search", "{" + shapes[3] + "}")));
+            assertEquals(480, ((Number) aggregation(matrix, "ms").get("doc_count")).intValue());
+            Map<String, Object> scripted = parse(readAll(postJson("/" + index + "/_search", "{" + shapes[7] + "}")));
+            assertEquals(600, ((Number) aggregation(scripted, "sm").get("value")).intValue());
+        } finally {
+            putTransientSetting("lance.fragment_path.slices", null);
+        }
+    }
+
+    /**
+     * The aggregation types the fragment executors cannot run answer 400
+     * at the coordinator, naming the builder and the reason, wherever
+     * the builder sits and whatever the query or the page: the same
+     * refusal the explain endpoint gives. Nothing reaches an executor.
+     */
+    public void testUnservableAggregationsAnswer400() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "unservable")) {
+            String index = fixture.indexName();
+            String[][] refused = new String[][] {
+                {
+                    "{\"size\":0,\"aggs\":{\"g\":{\"global\":{},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}}}",
+                    "aggregation type [global] on [g]" },
+                {
+                    "{\"size\":5,\"query\":{\"term\":{\"category\":\"c1\"}},\"aggs\":{\"g\":{\"global\":{}}}}",
+                    "aggregation type [global] on [g]" },
+                {
+                    "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"t\":{\"top_hits\":{\"size\":1}}}}}}",
+                    "aggregation type [top_hits] on [t]" },
+                {
+                    "{\"size\":0,\"query\":{\"match\":{\"body\":\"hello\"}},\"aggs\":{\"t\":{\"top_hits\":{\"size\":1}}}}",
+                    "aggregation type [top_hits] on [t]" },
+                {
+                    "{\"size\":0,\"aggs\":{\"r\":{\"rare_terms\":{\"field\":\"rating\",\"max_doc_count\":1}}}}",
+                    "aggregation type [rare_terms] on [r]" },
+                {
+                    "{\"size\":0,\"aggs\":{\"st\":{\"significant_terms\":{\"field\":\"category\"}}}}",
+                    "aggregation type [significant_terms] on [st]" },
+                {
+                    "{\"size\":0,\"aggs\":{\"sx\":{\"significant_text\":{\"field\":\"body\"}}}}",
+                    "aggregation type [significant_text] on [sx]" } };
+            long before = fragmentRequestsExecuted();
+            for (String[] shape : refused) {
+                ConcurrentResult result = postForStatus("/" + index + "/_search", shape[0]);
+                assertEquals(shape[0] + " -> " + result.body(), RestStatus.BAD_REQUEST.getStatus(), result.status());
+                assertTrue(result.body(), result.body().contains("illegal_argument_exception"));
+                assertTrue(result.body(), result.body().contains(shape[1] + " is not supported for Lance-backed indices: "));
+            }
+            assertEquals("no executor saw a refused request", before, fragmentRequestsExecuted());
+        }
+    }
+
+    /**
      * Run {@code shape} (a {@code _search} body without its outer braces)
-     * through the fragment path and, with the {@link #onShardPath} global
-     * aggregation added, through the shard path, and assert the two
+     * through the fragment path and, with the {@link #onShardPath}
+     * highlighter added, through the shard path, and assert the two
      * responses carry the same {@code hits.total} and the same
      * {@code aggregations} block (the oracle's own key aside). Returns
      * the fragment path response.

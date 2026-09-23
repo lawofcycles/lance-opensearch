@@ -268,31 +268,25 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
     }
 
     /**
-     * Name of the aggregation {@link #onShardPath} adds to a search
-     * body. Tests comparing an {@code aggregations} block between the two
-     * paths drop this key from the shard path's block first.
+     * Name of the unmapped field {@link #onShardPath} highlights. The
+     * name is kept as a key the tests strip from the shard path's
+     * aggregations block ({@link #withoutShardPathOracle}) from the days
+     * the oracle was an aggregation of that name.
      */
     static final String SHARD_PATH_ORACLE = "shard_path_oracle";
 
     /**
      * {@code body} (a complete {@code _search} JSON body) with a
-     * {@code global} aggregation added under {@link #SHARD_PATH_ORACLE}.
-     * {@code global} is off the fragment path's aggregation allow list,
-     * so the dispatch filter hands the request to the shard path: the
-     * oracle the fragment path tests compare against. The added
-     * aggregation changes nothing about the hits, the count or the
-     * other aggregations; its own result is the extra key.
+     * {@code highlight} of the unmapped field {@link #SHARD_PATH_ORACLE}
+     * added. A highlighter is a {@code ShardPathReason}, so the dispatch
+     * filter hands the request to the shard path: the oracle the fragment
+     * path tests compare against. The highlight phase skips a field the
+     * mapping does not know, so the added element changes nothing about
+     * the hits, the count or the aggregations.
      */
-    @SuppressWarnings("unchecked")
     static String onShardPath(String body) {
         Map<String, Object> map = new java.util.LinkedHashMap<>(parseJson(body));
-        String aggsKey = map.containsKey("aggregations") ? "aggregations" : "aggs";
-        Map<String, Object> aggs = new java.util.LinkedHashMap<>();
-        if (map.get(aggsKey) instanceof Map<?, ?> existing) {
-            aggs.putAll((Map<String, Object>) existing);
-        }
-        aggs.put(SHARD_PATH_ORACLE, Map.of("global", Map.of()));
-        map.put(aggsKey, aggs);
+        map.put("highlight", Map.of("fields", Map.of(SHARD_PATH_ORACLE, Map.of())));
         try (org.opensearch.core.xcontent.XContentBuilder builder = MediaTypeRegistry.JSON.contentBuilder()) {
             builder.map(map);
             return builder.toString();

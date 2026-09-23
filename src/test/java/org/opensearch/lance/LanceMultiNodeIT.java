@@ -955,7 +955,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     /**
      * Every FTS shape answered by executors that hold a proper subset
      * of the fragments must equal the answer over the whole table. The
-     * oracle is the shard path: a {@code global} aggregation routes the
+     * oracle is the shard path: a highlighter routes the
      * same request to the one shard, whose reader holds every fragment, so
      * its Lance scan runs unrestricted on one node. Compared per shape:
      * hit ids and order, scores, sort values, {@code hits.total},
@@ -1071,8 +1071,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     /**
      * Hits with equal scores or equal sort values come back in the same
      * order from three executors as from one reader over the whole
-     * table. The oracle is again the shard path (a {@code global}
-     * aggregation), whose Lucene collectors break ties by doc id, which on the
+     * table. The oracle is again the shard path (a highlighter),
+     * whose Lucene collectors break ties by doc id, which on the
      * whole-table reader is fragment order then offset. The doc value
      * fixture has ties everywhere: {@code lance} is repeated
      * {@code (i % 5) + 1} times so sixty rows over the six fragments
@@ -1724,7 +1724,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
 
             // Fragment path requests issued below; the shard path
-            // requests (the global aggregation oracle) leave no executor
+            // requests (the highlighter oracle) leave no executor
             // line.
             int fragmentPathRequests = 0;
             for (String shape : exact) {
@@ -1907,6 +1907,72 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
+     * The aggregation types the coordinator's former allow list sent to
+     * the shard path, on three executors: {@code multi_terms}, a
+     * scripted metric, a {@code filter} over a Lance full text clause
+     * and {@code weighted_avg} run through the aggregators on every node
+     * and their merged answer equals the shard path's; a {@code global}
+     * answers 400 at the coordinator and reaches no executor. Twelve
+     * fragments of 25 rows, four per node, with a {@code bucket} column
+     * ({@code id % 4}) so every multi terms key spans the nodes.
+     * {@code matrix_stats} is compared on one node only
+     * ({@code LanceAggregationIT}): its moments merge across partials
+     * with a floating point path of their own.
+     */
+    public void testFormerAllowListShapesAcrossThreeNodes() throws Exception {
+        String suffix = "mn-former-allow-list-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 12;
+        LanceTableFactory.writeBucketedInterleavedTable(scratchDir, tableName, fragments, 25);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String[] shapes = {
+            "\"size\":0,\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"category\"},{\"field\":\"bucket\"}]},\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}}",
+            "\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":100}}},\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"bucket\"},{\"field\":\"category\"}],\"size\":5,\"shard_size\":20}}}",
+            "\"size\":0,\"aggs\":{\"sm\":{\"scripted_metric\":{\"init_script\":\"state.n = 0\",\"map_script\":\"state.n += doc['bucket'].value\","
+                + "\"combine_script\":\"return state.n\",\"reduce_script\":\"long t = 0; for (s in states) { t += s } return t\"}}}",
+            "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}",
+            "\"size\":0,\"aggs\":{\"w\":{\"weighted_avg\":{\"value\":{\"field\":\"id\"},\"weight\":{\"field\":\"bucket\"}}}}" };
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+            assertEquals("fixture assumes four fragments per data node", 3, dataNodeCount());
+
+            long before = LanceRestTestCase.fragmentRequestsExecuted();
+            for (String shape : shapes) {
+                assertAggregationsMatchShardPath(indexName, shape);
+            }
+            assertEquals(
+                "every shape ran on all three executors",
+                before + (long) shapes.length * dataNodeCount(),
+                LanceRestTestCase.fragmentRequestsExecuted()
+            );
+
+            LanceRestTestCase.ConcurrentResult refused = LanceRestTestCase.postForStatus(
+                "/" + indexName + "/_search",
+                "{\"size\":0,\"aggs\":{\"g\":{\"global\":{},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}}"
+            );
+            assertEquals(refused.body(), RestStatus.BAD_REQUEST.getStatus(), refused.status());
+            assertTrue(
+                refused.body(),
+                refused.body().contains("aggregation type [global] on [g] is not supported for Lance-backed indices")
+            );
+            assertEquals(
+                "the refusal reached no executor",
+                before + (long) shapes.length * dataNodeCount(),
+                LanceRestTestCase.fragmentRequestsExecuted()
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
      * Sliced collection on three executors answers like the shard path.
      * Twelve fragments of 25 rows, four per node, collected in two slices
      * per executor with the pushdown off so every shape runs through the
@@ -2005,7 +2071,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
     /**
      * Run {@code shape} through the fragment path and, with the
-     * {@code global} aggregation of {@code LanceRestTestCase.onShardPath},
+     * highlighter of {@code LanceRestTestCase.onShardPath},
      * through the shard path, and assert the two responses carry the same
      * {@code hits.total} and the same {@code aggregations} block (the
      * oracle's own key aside). Returns the fragment path response.
@@ -2150,7 +2216,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     /**
      * Run {@code shape} (the body of a {@code _search} request without
      * its outer braces) through the fragment path and, with the
-     * {@code global} aggregation of {@code LanceRestTestCase.onShardPath}
+     * highlighter of {@code LanceRestTestCase.onShardPath}
      * added, through the shard path, and compare the parts of the two
      * responses that describe the result.
      */

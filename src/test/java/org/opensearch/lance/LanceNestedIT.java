@@ -22,8 +22,9 @@ import org.opensearch.core.rest.RestStatus;
  * every list element becomes a hidden child doc before its row's
  * parent doc, a {@code nested} query matches several attributes of the
  * same element (and not the same attributes spread across elements),
- * {@code _source} and GET render the array, and counts stay on the
- * parents.
+ * {@code _source} and GET render the array, the {@code nested} and
+ * {@code reverse_nested} aggregations answer the shard path's buckets
+ * from the fragment executors, and counts stay on the parents.
  *
  * <p>Fixture ({@link LanceTableFactory#writeNestedTable}): six rows,
  * {@code id} int32 PK, {@code title} Utf8 keyword, {@code items}
@@ -146,6 +147,35 @@ public class LanceNestedIT extends LanceRestTestCase {
                 "beta bucket under nested filter: " + aggBody,
                 2,
                 extractIntPath(aggBody, "aggregations", "titles", "buckets", "1", "doc_count")
+            );
+
+            // nested and reverse_nested aggregations run on the fragment
+            // path (the leaf reader carries the parent join the stock
+            // aggregators read) and answer what the shard path answers:
+            // seven elements over the five surviving rows, red on rows 0,
+            // 1 and 3 (titles alpha, beta), qty summing to 28.
+            String nestedAggs = "{\"size\":0,\"aggs\":{\"n\":{\"nested\":{\"path\":\"items\"},\"aggs\":{"
+                + "\"colors\":{\"terms\":{\"field\":\"items.color\",\"order\":{\"_key\":\"asc\"}},"
+                + "\"aggs\":{\"back\":{\"reverse_nested\":{},\"aggs\":{\"titles\":{\"terms\":{\"field\":\"title\",\"order\":{\"_key\":\"asc\"}}}}}}},"
+                + "\"qty\":{\"sum\":{\"field\":\"items.qty\"}}}}}}";
+            long before = fragmentRequestsExecuted();
+            String nestedAggBody = readAll(postJson("/" + indexName + "/_search", nestedAggs));
+            assertEquals("the fragment path served the nested aggregation", before + 1, fragmentRequestsExecuted());
+            assertEquals(7, extractIntPath(nestedAggBody, "aggregations", "n", "doc_count"));
+            assertEquals(28.0d, extractDoublePath(nestedAggBody, "aggregations", "n", "qty", "value"), 0d);
+            Map<String, Object> shardPath = parseJson(
+                readAll(postJson("/" + indexName + "/_search?request_cache=false", onShardPath(nestedAggs)))
+            );
+            assertEquals(withoutShardPathOracle(shardPath.get("aggregations")), parseJson(nestedAggBody).get("aggregations"));
+            String filteredNested =
+                "{\"size\":0,\"query\":{\"term\":{\"title\":\"alpha\"}},\"aggs\":{\"n\":{\"nested\":{\"path\":\"items\"},"
+                    + "\"aggs\":{\"colors\":{\"terms\":{\"field\":\"items.color\",\"order\":{\"_key\":\"asc\"}}}}}}}";
+            Map<String, Object> filteredShardPath = parseJson(
+                readAll(postJson("/" + indexName + "/_search?request_cache=false", onShardPath(filteredNested)))
+            );
+            assertEquals(
+                withoutShardPathOracle(filteredShardPath.get("aggregations")),
+                parseJson(readAll(postJson("/" + indexName + "/_search", filteredNested))).get("aggregations")
             );
 
             // sort + nested query: the sort stays on the Lucene comparator

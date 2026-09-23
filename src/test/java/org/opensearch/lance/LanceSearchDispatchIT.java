@@ -487,7 +487,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // the executor's hits, count and aggregation collectors, so the
         // documents below the threshold are neither returned, counted
         // nor aggregated. Every shape is compared with the shard path's
-        // answer (the same body with a global aggregation, which routes
+        // answer (the same body with a highlighter, which routes
         // there) and the executed counter proves the fragment path
         // served the plain body.
         String suffix = "min-score-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
@@ -879,7 +879,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
      * max_score and every rendered hit key), the same
      * {@code terminated_early} and the same {@code aggregations} (the
      * oracle's own key aside) on the fragment path as on the shard
-     * path, which the same body with the global aggregation of
+     * path, which the same body with the highlighter of
      * {@link #onShardPath} routes to.
      */
     private static void assertSameHitsAsShardPath(String indexName, String body) throws IOException {
@@ -1624,7 +1624,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             String pkCount = readAll(client().performRequest(new Request("GET", "/" + pkTable + "/_count")));
             assertEquals(12, extractIntPath(pkCount, "count"));
 
-            // A shape only the shard path serves (a global aggregation)
+            // A shape only the shard path serves (a highlighter)
             // would see the shard reader's rows; it is refused with 400
             // naming both counts.
             ResponseException refused = expectThrows(
@@ -1655,8 +1655,10 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals(List.of("119=1", "118=1", "117=1"), bucketsOf(readAll(postJson("/" + tableName + "/_search", terms)), "t"));
             assertEquals(List.of("2-17", "2-18", "2-16"), idsOf(hitsOf(readAll(postJson("/" + tableName + "/_search", knn)))));
             // The shard path is open again for a table under the default bound.
+            long executed = fragmentRequestsExecuted();
             String viaShard = readAll(postJson("/" + pkTable + "/_search", onShardPath("{\"size\":1,\"query\":{\"match_all\":{}}}")));
-            assertTrue(viaShard, viaShard.contains("\"" + SHARD_PATH_ORACLE + "\""));
+            assertEquals(viaShard, 12, extractIntPath(viaShard, "hits", "total", "value"));
+            assertEquals("the shard path served it", executed, fragmentRequestsExecuted());
         } finally {
             updateClusterSetting("lance.test.max_docs_per_reader", null);
             for (String index : List.of(tableName, pkTable)) {

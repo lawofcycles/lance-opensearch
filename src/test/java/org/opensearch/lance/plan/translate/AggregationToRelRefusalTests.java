@@ -55,8 +55,91 @@ public class AggregationToRelRefusalTests extends OpenSearchTestCase {
         );
     }
 
-    public void testTopHitsThrows() throws IOException {
-        assertEquals("aggregation type [top_hits]", messageOf("{\"size\":0,\"aggs\":{\"h\":{\"top_hits\":{\"size\":1}}}}"));
+    public void testTopHitsIsRefusedForTheFragmentPath() throws IOException {
+        assertRefusedOutright(
+            "aggregation type [top_hits] on [h] is not supported for Lance-backed indices: "
+                + "it builds its hits through the search context's fetch phase, which the fragment executor's context does not carry",
+            "{\"size\":0,\"aggs\":{\"h\":{\"top_hits\":{\"size\":1}}}}"
+        );
+    }
+
+    public void testGlobalIsRefusedForTheFragmentPath() throws IOException {
+        String message = refusalOf("{\"size\":0,\"aggs\":{\"g\":{\"global\":{},\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}}}");
+        assertTrue(message, message.startsWith("aggregation type [global] on [g] is not supported for Lance-backed indices: "));
+        assertTrue(message, message.contains("every document of the index"));
+    }
+
+    public void testRareTermsIsRefusedForTheFragmentPath() throws IOException {
+        String message = refusalOf("{\"size\":0,\"aggs\":{\"r\":{\"rare_terms\":{\"field\":\"category\"}}}}");
+        assertTrue(message, message.startsWith("aggregation type [rare_terms] on [r] is not supported for Lance-backed indices: "));
+        assertTrue(message, message.contains("shard id"));
+    }
+
+    public void testSignificantTermsAndTextAreRefusedForTheFragmentPath() throws IOException {
+        String terms = refusalOf("{\"size\":0,\"aggs\":{\"st\":{\"significant_terms\":{\"field\":\"category\"}}}}");
+        assertTrue(terms, terms.startsWith("aggregation type [significant_terms] on [st] is not supported for Lance-backed indices: "));
+        assertTrue(terms, terms.contains("background frequencies"));
+        String text = refusalOf("{\"size\":0,\"aggs\":{\"sx\":{\"significant_text\":{\"field\":\"body\"}}}}");
+        assertTrue(text, text.startsWith("aggregation type [significant_text] on [sx] is not supported for Lance-backed indices: "));
+    }
+
+    public void testRefusedBuilderBelowABucketRefusesTheTree() throws IOException {
+        String message = refusalOf(
+            "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"h\":{\"top_hits\":{\"size\":1}}}}}}"
+        );
+        assertTrue(message, message.startsWith("aggregation type [top_hits] on [h]"));
+    }
+
+    public void testRefusedBuilderNextToHitsRefusesTheRequest() throws IOException {
+        String message = refusalOf("{\"size\":5,\"aggs\":{\"g\":{\"global\":{}}}}");
+        assertTrue(message, message.startsWith("aggregation type [global] on [g]"));
+    }
+
+    /**
+     * The shapes the pushdown does not spell but the fragment executors
+     * serve through the aggregators: the translator throws
+     * {@link UnsupportedOperationException} (not the 400), naming the
+     * type, so the request runs the aggregators over the bare query.
+     */
+    public void testServedShapesOutsideThePushdownNameTheType() throws IOException {
+        assertEquals("aggregation type [sampler]", messageOf("{\"size\":0,\"aggs\":{\"sm\":{\"sampler\":{\"shard_size\":10}}}}"));
+        assertEquals(
+            "aggregation type [diversified_sampler]",
+            messageOf("{\"size\":0,\"aggs\":{\"ds\":{\"diversified_sampler\":{\"shard_size\":10,\"field\":\"category\"}}}}")
+        );
+        assertEquals("aggregation type [nested]", messageOf("{\"size\":0,\"aggs\":{\"n\":{\"nested\":{\"path\":\"body\"}}}}"));
+        assertEquals("aggregation type [reverse_nested]", messageOf("{\"size\":0,\"aggs\":{\"b\":{\"reverse_nested\":{}}}}"));
+        assertEquals(
+            "aggregation type [multi_terms]",
+            messageOf("{\"size\":0,\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"category\"},{\"field\":\"flag\"}]}}}}")
+        );
+        assertEquals(
+            "aggregation type [scripted_metric]",
+            messageOf(
+                "{\"size\":0,\"aggs\":{\"sm\":{\"scripted_metric\":{\"map_script\":\"state.n = 1\",\"combine_script\":\"return state.n\","
+                    + "\"reduce_script\":\"return 1\"}}}}"
+            )
+        );
+        assertEquals(
+            "aggregation type [geo_centroid]",
+            messageOf("{\"size\":0,\"aggs\":{\"gc\":{\"geo_centroid\":{\"field\":\"category\"}}}}")
+        );
+        assertEquals(
+            "aggregation type [geo_distance]",
+            messageOf(
+                "{\"size\":0,\"aggs\":{\"gd\":{\"geo_distance\":{\"field\":\"category\",\"origin\":\"35,139\",\"ranges\":[{\"to\":10}]}}}}"
+            )
+        );
+        assertEquals(
+            "aggregation type [weighted_avg]",
+            messageOf(
+                "{\"size\":0,\"aggs\":{\"w\":{\"weighted_avg\":{\"value\":{\"field\":\"price\"},\"weight\":{\"field\":\"rating\"}}}}}"
+            )
+        );
+        assertEquals(
+            "query type [lance_match] in filter of aggregation [f]",
+            messageOf("{\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}}}}")
+        );
     }
 
     public void testSamplerThrows() throws IOException {
@@ -65,6 +148,16 @@ public class AggregationToRelRefusalTests extends OpenSearchTestCase {
 
     public void testNestedThrows() throws IOException {
         assertEquals("aggregation type [nested]", messageOf("{\"size\":0,\"aggs\":{\"n\":{\"nested\":{\"path\":\"body\"}}}}"));
+    }
+
+    private static String refusalOf(String json) throws IOException {
+        SearchSourceBuilder source = PlanTestFixtures.parse(json);
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> PlanTestFixtures.translate(source));
+        return e.getMessage();
+    }
+
+    private static void assertRefusedOutright(String message, String json) throws IOException {
+        assertEquals(message, refusalOf(json));
     }
 
     public void testPipelineThrows() throws IOException {
