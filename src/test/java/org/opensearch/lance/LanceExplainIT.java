@@ -61,15 +61,16 @@ public class LanceExplainIT extends LanceRestTestCase {
             String filteredLogical = stringPath(filteredBody, "logical");
             assertTrue("logical plan carries the filter: " + filteredLogical, filteredLogical.contains("LogicalFilter"));
             // The aggregate rule fires on Aggregate(Filter(scan)) and
-            // rebuilds the filter inside the pushed aggregate's input,
-            // so the physical plan carries the scan with only the
-            // aggregate visible as a pushed operation; the filter is
-            // absorbed.
+            // rebuilds the filter inside the pushed aggregate's input;
+            // the filter's Lance SQL rides on the pushed aggregate, so
+            // the physical plan carries the scan with the aggregate and
+            // its filter visible as one pushed operation.
             String filteredPhysical = stringPath(filteredBody, "physical");
             assertTrue(
                 "the aggregate is pushed onto the filtered scan: " + filteredPhysical,
                 filteredPhysical.contains("pushed=[[aggregate{")
             );
+            assertTrue("the pushed aggregate carries the filter SQL: " + filteredPhysical, filteredPhysical.contains("filter=id = 3"));
             assertFalse("the filter left the physical plan: " + filteredPhysical, filteredPhysical.contains("LogicalFilter"));
 
             Response bucket = explain(
@@ -89,10 +90,10 @@ public class LanceExplainIT extends LanceRestTestCase {
             );
             assertTrue("the pushed shape names the bucket: " + bucketPhysical, bucketPhysical.contains("TERMS{name=by_id"));
 
-            // A bucket tree over a query filter has no aggregate
-            // pushdown operand, so the planner answers with the Lucene
-            // convention operator over the bare scan instead of the
-            // pushed scan or the logical fallback.
+            // A bucket tree over a query filter folds into one scan as
+            // well: the pushed aggregate carries the bucket and the
+            // filter's SQL, the plan the fragment executor runs for the
+            // same request, instead of the Lucene operator.
             Response filteredBucket = explain(
                 indexName,
                 "{\"size\":0,\"query\":{\"term\":{\"id\":3}},\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\"}}}}"
@@ -100,11 +101,18 @@ public class LanceExplainIT extends LanceRestTestCase {
             assertEquals(RestStatus.OK.getStatus(), filteredBucket.getStatusLine().getStatusCode());
             String filteredBucketPhysical = stringPath(readAll(filteredBucket), "physical");
             assertTrue(
-                "the Lucene aggregate operator appears in the physical plan: " + filteredBucketPhysical,
+                "the pushed aggregate appears in the physical plan: " + filteredBucketPhysical,
+                filteredBucketPhysical.contains("pushed=[[aggregate{")
+            );
+            assertTrue("the pushed shape names the bucket: " + filteredBucketPhysical, filteredBucketPhysical.contains("TERMS{name=by_id"));
+            assertTrue(
+                "the pushed aggregate carries the filter SQL: " + filteredBucketPhysical,
+                filteredBucketPhysical.contains("filter=id = 3")
+            );
+            assertFalse(
+                "the Lucene operator does not answer the shape: " + filteredBucketPhysical,
                 filteredBucketPhysical.contains("LuceneAggregateExec(")
             );
-            assertTrue("the operator runs over the scan: " + filteredBucketPhysical, filteredBucketPhysical.contains("LanceTableScan"));
-            assertFalse("nothing is pushed into the scan: " + filteredBucketPhysical, filteredBucketPhysical.contains("pushed=[["));
 
             // A cardinality metric never folds into the scan (the
             // pushed form is slower than the aggregator), so the
