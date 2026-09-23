@@ -10,6 +10,7 @@ import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Filter;
+import org.apache.calcite.rel.core.Project;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LuceneConvention;
 import org.opensearch.lance.plan.rel.LanceAggregate;
@@ -90,7 +91,7 @@ public class LanceToLuceneConverterRuleTests extends OpenSearchTestCase {
         LuceneAggregateExec exec = aggregateExec("{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}");
         assertTrue(
             "the group key projection is kept inside the wrapped aggregate: " + exec.aggregate().getInput(),
-            exec.aggregate().getInput() instanceof org.apache.calcite.rel.core.Project
+            exec.aggregate().getInput() instanceof Project
         );
     }
 
@@ -106,7 +107,7 @@ public class LanceToLuceneConverterRuleTests extends OpenSearchTestCase {
             "{\"size\":0,\"query\":{\"term\":{\"category\":\"c0\"}},\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}"
         );
         RelNode input = exec.aggregate().getInput();
-        assertTrue(input instanceof org.apache.calcite.rel.core.Project);
+        assertTrue(input instanceof Project);
         assertTrue(input.getInput(0) instanceof Filter);
     }
 
@@ -210,7 +211,7 @@ public class LanceToLuceneConverterRuleTests extends OpenSearchTestCase {
         RelNode physical = PlanTestFixtures.factory().plan(logical);
         assertTrue("the full rule set answers with the Lucene operator: " + physical, physical instanceof LuceneAggregateExec);
         RelNode input = ((LuceneAggregateExec) physical).aggregate().getInput();
-        assertTrue(input instanceof org.apache.calcite.rel.core.Project);
+        assertTrue(input instanceof Project);
         assertTrue(input.getInput(0) instanceof Filter);
     }
 }
