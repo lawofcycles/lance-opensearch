@@ -201,7 +201,7 @@ final class GroupAggregationState {
      * ordered by {@code _count} or by one metric keeps the bounded per
      * scan selection in {@code topK} instead, with the row count over
      * every keyed group in {@code keyedCount}
-     * ({@link LanceAggregateResults#mergePartials} folds the top-k partials into a
+     * ({@link AggregateScanRunner#mergePartials} folds the top-k partials into a
      * {@code groups} table before the buckets are built).
      */
     static final class Partial {
@@ -962,7 +962,7 @@ final class GroupAggregationState {
      * <p>Entries are not coalesced here: Lance runs the aggregate to
      * completion before emitting rows, so one scan returns each group
      * at most once. The same key retained by several fragment group
-     * scans is summed when {@link LanceAggregateResults#mergePartials} folds the
+     * scans is summed when {@link AggregateScanRunner#mergePartials} folds the
      * per scan selections into one {@link GroupTable} and the final
      * {@code shard_size} cut re-evaluates the summed counts. A key a
      * scan dropped loses that scan's rows the way a term a shard did
