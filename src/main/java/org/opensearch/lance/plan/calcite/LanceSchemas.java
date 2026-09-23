@@ -6,6 +6,8 @@
 package org.opensearch.lance.plan.calcite;
 
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.lance.Dataset;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
@@ -16,6 +18,7 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceWarmCache;
+import org.opensearch.lance.plan.metadata.TableStatistics;
 
 import java.io.IOException;
 import java.util.LinkedHashMap;
@@ -23,6 +26,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 /**
  * Builds the planner's view of one Lance backed index: the
@@ -37,12 +41,15 @@ import java.util.function.LongSupplier;
  * node's {@link LanceWarmCache}, the same snapshot cache the fragment
  * executors acquire from, so a plan construction reuses an open
  * {@code Dataset} when the node has one and shares the node's Lance
- * {@code Session} when it does not. The Arrow schema and the row count
- * (sum of {@code Dataset.getFragmentStatistics()} row counts) are read
- * once while the lease is held; the model keeps no reference to the
- * dataset.
+ * {@code Session} when it does not. The Arrow schema is read while the
+ * lease is held and the {@link TableStatistics} come from the node's
+ * statistics cache under the snapshot's version (collected from the open
+ * dataset on the first request of that version); the model keeps no
+ * reference to the dataset.
  */
 public final class LanceSchemas {
+
+    private static final Logger LOGGER = LogManager.getLogger(LanceSchemas.class);
 
     private LanceSchemas() {}
 
@@ -114,7 +121,46 @@ public final class LanceSchemas {
         Set<String> dateOverrideColumns,
         LongSupplier rowCount
     ) {
-        LanceTable table = new LanceTable(indexName, arrowSchema, rowCount);
+        return model(indexName, arrowSchema, multiFields, renamedFields, primaryKeyField, dateOverrideColumns, rowCount, null);
+    }
+
+    /**
+     * The model over the table's collected {@link TableStatistics}: the
+     * table's row count is the statistics' live row count and the
+     * planner's metadata handlers read the column statistics from them.
+     */
+    public static IndexModel model(
+        String indexName,
+        Schema arrowSchema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        Map<String, String> renamedFields,
+        String primaryKeyField,
+        Set<String> dateOverrideColumns,
+        TableStatistics statistics
+    ) {
+        return model(
+            indexName,
+            arrowSchema,
+            multiFields,
+            renamedFields,
+            primaryKeyField,
+            dateOverrideColumns,
+            statistics::rowCount,
+            () -> statistics
+        );
+    }
+
+    private static IndexModel model(
+        String indexName,
+        Schema arrowSchema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        Map<String, String> renamedFields,
+        String primaryKeyField,
+        Set<String> dateOverrideColumns,
+        LongSupplier rowCount,
+        Supplier<TableStatistics> statistics
+    ) {
+        LanceTable table = new LanceTable(indexName, arrowSchema, rowCount, statistics);
         return new IndexModel(
             indexName,
             arrowSchema,
@@ -130,8 +176,9 @@ public final class LanceSchemas {
     /**
      * The model for a Lance backed index, read through the node's warm
      * cache. The lease is released before returning: the Arrow schema
-     * is a plain Java object once read and the row count is captured as
-     * a constant, so nothing of the model outlives the snapshot.
+     * is a plain Java object once read and the statistics are an
+     * immutable object owned by the statistics cache, so nothing of
+     * the model outlives the snapshot.
      *
      * <p>The primary key and multi-fields arguments of the acquire
      * mirror what the fragment executor passes, because a snapshot this
@@ -177,6 +224,14 @@ public final class LanceSchemas {
         ) {
             Dataset dataset = lease.snapshot().dataset();
             Schema arrowSchema = dataset.getSchema();
+            try {
+                TableStatistics statistics = warmCache.tableStatistics().forVersion(dataset.uri(), lease.snapshot().version(), dataset);
+                return model(indexName, arrowSchema, multiFields, renamedFields, pkField, overrides.dateColumns().keySet(), statistics);
+            } catch (RuntimeException e) {
+                // Statistics inform plan quality, not correctness: fall
+                // back to the fragment row counts rather than failing.
+                LOGGER.warn("table statistics of [{}] unavailable, planning without them", indexName, e);
+            }
             long rows = 0L;
             for (long fragmentRows : dataset.getFragmentStatistics().getRowCounts()) {
                 rows += fragmentRows;

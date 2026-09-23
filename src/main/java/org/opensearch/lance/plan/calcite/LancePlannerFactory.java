@@ -19,12 +19,12 @@ import org.apache.calcite.plan.volcano.VolcanoPlanner;
 import org.apache.calcite.prepare.CalciteCatalogReader;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.RelFactories;
-import org.apache.calcite.rel.metadata.DefaultRelMetadataProvider;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.apache.calcite.tools.RelBuilder;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.lance.plan.metadata.LanceRelMetadataProvider;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.rel.physical.LuceneHandoffExec;
 import org.opensearch.lance.plan.rules.CoordinatorLayerRules;
@@ -71,8 +71,10 @@ public final class LancePlannerFactory {
      * precision above 3 and {@code DECIMAL(20, 0)} survive. Registering
      * the convention trait def is what makes conventions available to
      * the planner; the individual conventions need no explicit
-     * registration. The metadata provider is Calcite's default for now;
-     * wiring Lance statistics into it is later work.
+     * registration. The metadata provider is
+     * {@link LanceRelMetadataProvider#INSTANCE}: Lance's row count and
+     * distinct row count handlers for the scan, Calcite's defaults for
+     * everything else.
      */
     public RelOptCluster newCluster() {
         VolcanoPlanner planner = new VolcanoPlanner(costFactory, Contexts.empty());
@@ -102,7 +104,7 @@ public final class LancePlannerFactory {
             planner.addRule(rule);
         }
         RelOptCluster cluster = RelOptCluster.create(planner, new RexBuilder(new SqlTypeFactoryImpl(LanceTypeSystem.INSTANCE)));
-        cluster.setMetadataProvider(DefaultRelMetadataProvider.INSTANCE);
+        cluster.setMetadataProvider(LanceRelMetadataProvider.INSTANCE);
         return cluster;
     }
 
