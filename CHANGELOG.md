@@ -94,3 +94,7 @@ Inspired by [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - The per-fragment leaf reader builds its cache lifetime bridge (a one-doc in-heap Lucene index that supplies `IndexReader.CacheKey`) on the first cache helper request instead of in the constructor, so a fragment path request over many fragments no longer pays one `IndexWriter` commit per leaf when nothing on its path asks for a leaf-level cache key.
 - Upgrade `org.lance:lance-core` to `12.0.0` (from `11.0.0`), `org.lance:lance-namespace-core` and `org.lance:lance-namespace-apache-client` to `0.11.1` (from `0.7.7`), and Arrow to `18.3.0` (from `18.1.0`).
+
+### Testing
+
+- Make the async derive IT tolerate the index rebuild window. `LanceTextAnalyzerIT.testAsyncDeriveFlipsMappingAfterBackfill` retries when the mapping or search call inside its `assertBusy` is refused (404 while the keyword to lance_text flip deletes and recreates the index) instead of failing on the first such response.
