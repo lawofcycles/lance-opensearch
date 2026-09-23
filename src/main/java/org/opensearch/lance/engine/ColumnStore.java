@@ -9,6 +9,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -865,6 +866,26 @@ public final class ColumnStore implements Closeable {
     /** Number of (snapshot, column, fragment) entries held. */
     public synchronized int entryCount() {
         return columns.size();
+    }
+
+    /**
+     * Whether the store holds {@code column} of {@code snapshot} for
+     * every fragment in {@code fragmentIds}, whatever the entry kind.
+     * A residency question only: the lookup does not refresh the
+     * access order, pins nothing, loads nothing and does not count as a
+     * hit. The answer is a snapshot under the store's lock; an eviction
+     * that follows makes it stale, which the caller treats as a miss
+     * (its request then reads the table instead of the store). Heap
+     * fallbacks a request holds are not entries and never count.
+     */
+    public synchronized boolean holds(SnapshotKey snapshot, String column, Collection<Integer> fragmentIds) {
+        for (int fragmentId : fragmentIds) {
+            // get() would refresh the access order; use containsKey.
+            if (!columns.containsKey(new ColumnKey(snapshot, column, fragmentId))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Whether {@code (snapshot, column, fragmentId)} is held, for tests. */
