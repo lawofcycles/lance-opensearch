@@ -25,6 +25,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.unit.ByteSizeValue;
+import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.mapper.Mapper;
@@ -37,6 +38,7 @@ import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.engine.LanceLocalClones;
+import org.opensearch.lance.engine.LanceServedVersions;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.index.LanceBuildIndexesAction;
 import org.opensearch.lance.index.LanceBuildIndexesNodesAction;
@@ -45,9 +47,14 @@ import org.opensearch.lance.index.TransportLanceBuildIndexesNodesAction;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
 import org.opensearch.lance.mapper.LanceVectorFieldMapper;
 import org.opensearch.lance.namespace.AllowedTableRoots;
+import org.opensearch.lance.namespace.LanceIndexFreshnessService;
+import org.opensearch.lance.namespace.LanceIndexSyncAction;
 import org.opensearch.lance.namespace.LanceNamespaceListAction;
+import org.opensearch.lance.namespace.LanceNamespacePollAction;
 import org.opensearch.lance.namespace.LanceNamespaceService;
+import org.opensearch.lance.namespace.TransportLanceIndexSyncAction;
 import org.opensearch.lance.namespace.TransportLanceNamespaceListAction;
+import org.opensearch.lance.namespace.TransportLanceNamespacePollAction;
 import org.opensearch.lance.plan.explain.LanceExplainAction;
 import org.opensearch.lance.plan.explain.TransportLanceExplainAction;
 import org.opensearch.lance.query.ScanAdmission;
@@ -65,6 +72,7 @@ import org.opensearch.lance.rest.RestBuildIndexesAction;
 import org.opensearch.lance.rest.RestLanceExplainAction;
 import org.opensearch.lance.rest.RestNamespaceAction;
 import org.opensearch.lance.rest.RestLanceStatsAction;
+import org.opensearch.lance.rest.RestLanceSyncAction;
 import org.opensearch.lance.rest.RestRefsAction;
 import org.opensearch.lance.stats.LanceStatsAction;
 import org.opensearch.lance.stats.LanceStatsCollector;
@@ -905,25 +913,35 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     @Override
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
         if (indexSettings.getSettings().get(LanceEngineFactory.TABLE_SETTING) != null) {
-            return Optional.of(new LanceEngineFactory(warmCache, () -> maxDocsPerReader));
+            return Optional.of(new LanceEngineFactory(warmCache, () -> maxDocsPerReader, servedVersions));
         }
         return Optional.empty();
     }
 
     /**
-     * No plugin-level index events are wired. Lance 12 keys its
-     * index-metadata cache on the manifest ETag
+     * Every Lance-backed index gets the node's
+     * {@link LanceIndexFreshnessService} as a shard lifecycle listener:
+     * a started shard registers for freshness checks on this node and a
+     * closing shard unregisters. No DELETE-time cache invalidation is
+     * wired: Lance 12 keys its index-metadata cache on the manifest ETag
      * (<a href="https://github.com/lancedb/lance/pull/8904">lance#8904</a>),
      * so a table recreated at the same path gets a fresh cache slot on
-     * first access without a DELETE-time invalidation from the plugin;
-     * {@code LanceAttachIT#testAttachRecreateAtSamePathServesNewContent}
-     * covers that. The override is kept as the wiring point for any
-     * future per-index hook (warm cache, per-index breaker).
+     * first access; {@code LanceAttachIT#testAttachRecreateAtSamePathServesNewContent}
+     * covers that. The service is {@code null} only for an index module
+     * built before the components exist (a test harness).
      */
     @Override
-    public void onIndexModule(org.opensearch.index.IndexModule indexModule) {}
+    public void onIndexModule(IndexModule indexModule) {
+        LanceIndexFreshnessService freshness = freshnessService;
+        if (freshness != null && indexModule.getSettings().get(LanceEngineFactory.TABLE_SETTING) != null) {
+            indexModule.addIndexEventListener(freshness);
+        }
+    }
 
     private LanceNamespaceService namespaceService;
+    private volatile LanceIndexFreshnessService freshnessService;
+    /** Served manifest version of every open Lance engine on this node, published by the engines. */
+    private final LanceServedVersions servedVersions = new LanceServedVersions();
     private org.opensearch.threadpool.ThreadPool threadPool;
     private AllowedTableRoots allowedTableRoots;
     private LanceDispatchActionFilter dispatchActionFilter;
@@ -1082,10 +1100,14 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // Read side of GET /_lance/stats. The session size is read through
         // the registry here because the stats package cannot see the
         // registry's package-private session accessor.
+        // Freshness of the Lance-backed shards this node holds: one
+        // scheduled check per started shard at the namespace poll
+        // cadence, registered through onIndexModule.
+        this.freshnessService = new LanceIndexFreshnessService(client, threadPool, cadence, warmCache, servedVersions);
         LanceStatsCollector statsCollector = new LanceStatsCollector(warmCache, () -> {
             Session session = LanceRegistry.currentSession();
             return session == null || session.isClosed() ? 0L : session.sizeBytes();
-        }, LanceRegistry::indexCacheSizing, indexWarmer, localClones::cloneStats);
+        }, LanceRegistry::indexCacheSizing, indexWarmer, localClones::cloneStats, freshnessService::stats);
 
         // Prime the circuit-breaker helper with the current cluster
         // settings and start the polling loop that keeps its accounting
@@ -1162,9 +1184,9 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(NAMESPACE_RESURFACE_GRACE_SETTING, namespaceService::setResurfaceGrace);
         // The components are injected into the plugin's transport
-        // actions (attach, build_indexes, namespace list / update,
-        // fragment query).
-        return List.of(namespaceService, allowedTableRoots, warmCache, statsCollector, localClones);
+        // actions (attach, build_indexes, namespace list / update / poll,
+        // index sync, fragment query).
+        return List.of(namespaceService, freshnessService, allowedTableRoots, warmCache, statsCollector, localClones);
     }
 
     /**
@@ -1217,6 +1239,13 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         if (task != null) {
             task.cancel();
             circuitBreakerPollTask = null;
+        }
+        // Stop the freshness checks before the caches they retire from
+        // and the session they open tables through go away.
+        LanceIndexFreshnessService freshness = freshnessService;
+        if (freshness != null) {
+            freshness.close();
+            freshnessService = null;
         }
         // Stop the warm-ups before their snapshots close under them.
         LanceIndexWarmer warmer = indexWarmer;
@@ -1291,6 +1320,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
                 org.opensearch.lance.namespace.TransportLanceNamespaceUpdateAction.class
             ),
             new ActionHandler<>(LanceNamespaceListAction.INSTANCE, TransportLanceNamespaceListAction.class),
+            new ActionHandler<>(LanceNamespacePollAction.INSTANCE, TransportLanceNamespacePollAction.class),
+            new ActionHandler<>(LanceIndexSyncAction.INSTANCE, TransportLanceIndexSyncAction.class),
             new ActionHandler<>(LanceAttachAction.INSTANCE, TransportLanceAttachAction.class),
             new ActionHandler<>(LanceBuildIndexesAction.INSTANCE, TransportLanceBuildIndexesAction.class),
             new ActionHandler<>(LanceBuildIndexesNodesAction.INSTANCE, TransportLanceBuildIndexesNodesAction.class),
@@ -1343,7 +1374,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             new RestBuildIndexesAction(),
             new RestRefsAction(),
             new RestLanceStatsAction(),
-            new RestLanceExplainAction()
+            new RestLanceExplainAction(),
+            new RestLanceSyncAction()
         );
     }
 }

@@ -156,10 +156,10 @@ public final class LanceRegistry {
      * Open a Lance dataset at a specific manifest version. When
      * {@code pinnedVersion} is non-empty, the returned dataset is
      * pinned to that Lance version and will not follow subsequent
-     * appends. Callers that pin should also opt the resulting index
-     * out of the namespace poll cycle (see {@code
-     * LanceNamespaceService.registerAttachedIndex}) so refresh does
-     * not race with a manifest advance.
+     * appends. An index pinned this way carries {@code index.lance.version},
+     * which keeps it out of the freshness checks (see
+     * {@code LanceIndexFreshnessService}) so refresh does not race with a
+     * manifest advance.
      *
      * <p>Storage options and version pinning both go through
      * {@link ReadOptions}, so this method combines them into a single

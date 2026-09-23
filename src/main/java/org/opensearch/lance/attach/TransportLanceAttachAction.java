@@ -57,7 +57,6 @@ import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.namespace.AllowedTableRoots;
-import org.opensearch.lance.namespace.LanceNamespaceService;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.Task;
@@ -67,8 +66,9 @@ import org.opensearch.transport.client.Client;
 
 /**
  * Serves {@link LanceAttachAction}: opens the table, derives the
- * mapping, creates the index, and registers it with the namespace
- * poller. Running this behind a transport action places it after the
+ * mapping and creates the index. The node that starts the new index's
+ * shard keeps it in step with the table from then on. Running this
+ * behind a transport action places it after the
  * {@link ActionFilters} chain, so a security plugin rejects a caller
  * without {@code cluster:admin/lance/attach} before the plugin touches
  * the table.
@@ -77,8 +77,7 @@ import org.opensearch.transport.client.Client;
  * receives {@code POST /_lance/attach} forwards the request to the
  * elected cluster manager, and {@link #clusterManagerOperation} runs
  * there. Attach reads and writes cluster state (index existence check,
- * create index, poll tracking), so the manager is where that work
- * belongs. It is also what keeps the internal create-index header
+ * create index), so the manager is where that work belongs. It is also what keeps the internal create-index header
  * intact: the create call below runs through the node client on the
  * manager itself, so {@code indices:admin/create} executes locally and
  * is never forwarded over transport. A security plugin stashes the
@@ -111,7 +110,6 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
     private static final Logger LOG = LogManager.getLogger(TransportLanceAttachAction.class);
 
     private final Client client;
-    private final LanceNamespaceService namespaceService;
     private final AllowedTableRoots allowedRoots;
     private final AnalysisRegistry analysisRegistry;
 
@@ -123,7 +121,6 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         ActionFilters actionFilters,
         IndexNameExpressionResolver indexNameExpressionResolver,
         Client client,
-        LanceNamespaceService namespaceService,
         AllowedTableRoots allowedRoots,
         AnalysisRegistry analysisRegistry
     ) {
@@ -137,7 +134,6 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             indexNameExpressionResolver
         );
         this.client = client;
-        this.namespaceService = namespaceService;
         this.allowedRoots = allowedRoots;
         this.analysisRegistry = analysisRegistry;
     }
@@ -200,8 +196,9 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         LOG.debug("lance.attach: attaching table [{}] as index [{}] on this node", table, indexName);
         // A tag is resolved to the version it points at right now so the
         // derivation below reads the tagged snapshot. The engine and the
-        // namespace poll resolve it again on every open and poll, which is
-        // what makes the index follow the tag when Lance moves it.
+        // freshness check on the shard's node resolve it again on every
+        // open and check, which is what makes the index follow the tag
+        // when Lance moves it.
         Optional<Long> openVersion = request.pinnedVersion();
         if (request.tag().isPresent()) {
             String tag = request.tag().get();
@@ -270,9 +267,9 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
      * columns through {@link LanceTextAnalyzerBackfill}. With
      * {@code derive: async} the backfill runs on the generic pool after
      * this method returns and the derivation maps the base column by
-     * the default rules for now; the namespace poll re-derives the
-     * mapping when the backfill commit advances the manifest, which is
-     * when the column flips to the analyzer mode. A snapshot pinned by
+     * the default rules for now; the freshness check on the shard's node
+     * re-derives the mapping when the backfill commit advances the
+     * manifest, which is when the column flips to the analyzer mode. A snapshot pinned by
      * {@code version} or {@code tag} cannot be written, so every
      * derived column must already exist there.
      *
@@ -573,21 +570,10 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             client.admin().indices().create(create, new ActionListener<CreateIndexResponse>() {
                 @Override
                 public void onResponse(CreateIndexResponse response) {
-                    // Register the attach-created index with the namespace
-                    // poller unless the operator pinned a version. The
-                    // poll runs on the elected cluster manager, which is
-                    // the node this code runs on, so the registration
-                    // lands in the memory the poll reads. Pinned
-                    // indices stay on their manifest version by design
-                    // (readonly snapshot for reproducibility), so the poll
-                    // cycle does not need to touch them and would otherwise
-                    // burn cycles probing for a manifest advance that must
-                    // not change the reader. Tag-following indices are
-                    // registered with their tag so the poll re-resolves it
-                    // and refreshes when Lance moves the tag.
-                    if (pinnedVersion.isEmpty()) {
-                        namespaceService.registerAttachedIndex(indexName, table, derivation.version(), storageOptions, tag.orElse(null));
-                    }
+                    // Nothing to register: the node that starts the new
+                    // index's shard picks it up for freshness checks from
+                    // its settings (table, tag, storage options), and a
+                    // pinned index is left alone there by design.
                     listener.onResponse(response(indexName, table, derivation, false, luceneBoundExceeded, backfill));
                 }
 
@@ -653,25 +639,8 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             );
             return;
         }
-        // Same table, so record the (index, table) pair with the
-        // namespace poller in case this node has forgotten it
-        // (cluster restart after attach, for example). The existing
-        // index's own settings decide how it is registered, because
-        // that is what its engine reads: a version pin keeps it out
-        // of the poll cycle (readonly snapshot), and a stored tag is
-        // what the poll has to re-resolve, even if this request named
-        // a different tag or none.
-        long existingVersion = md.getSettings().getAsLong(LanceEngineFactory.VERSION_SETTING, -1L);
-        String existingTag = md.getSettings().get(LanceEngineFactory.TAG_SETTING, "");
-        if (existingVersion < 0) {
-            namespaceService.registerAttachedIndex(
-                indexName,
-                table,
-                derivation.version(),
-                storageOptions,
-                existingTag.isEmpty() ? null : existingTag
-            );
-        }
+        // Same table: the existing index keeps following its own
+        // settings (its version pin or tag), whatever this request named.
         listener.onResponse(response(indexName, table, derivation, true, luceneBoundExceeded, backfill));
     }
 

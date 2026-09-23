@@ -32,7 +32,7 @@ import org.opensearch.transport.client.Client;
 
 /**
  * Detection of drift between a Lance table's current schema and the
- * OpenSearch mapping the poll derived earlier: column renames, schema
+ * OpenSearch mapping derived earlier: column renames, schema
  * resets (a field id reused with a different Arrow type) and drops.
  * Warns once per observation, marks stale names as
  * {@code lance_dropped} in the mapping's field meta, and follows the
@@ -45,7 +45,7 @@ final class LanceSchemaDriftDetector {
 
     private final Client client;
     // Track rename warnings so a table that renamed the same field is not
-    // logged on every poll. Keyed by "indexName:fieldId:oldName->newName" so
+    // logged on every check. Keyed by "indexName:fieldId:oldName->newName" so
     // the same rename fires once, but a later re-rename still warns.
     private final Set<String> warnedRenamed = ConcurrentHashMap.newKeySet();
 
@@ -86,7 +86,7 @@ final class LanceSchemaDriftDetector {
      * <p>The rewritten JSON is persisted with an update-settings call on
      * {@code index.lance.overrides} (Dynamic for exactly this purpose).
      * When persisting fails the stored overrides are returned unchanged
-     * and the rewrite retries on the next poll cycle.
+     * and the rewrite retries on the next check.
      */
     LanceOverrides rewriteOverridesForSchemaDrift(String indexName, LanceOverrides stored, LanceSchema lanceSchema) {
         if (stored.isEmpty()) {
@@ -373,7 +373,7 @@ final class LanceSchemaDriftDetector {
      * non-Lance mappings) are skipped, and so are fields already marked
      * {@code lance_dropped}: after a rename both the stale and the live
      * name carry the same field id, and drift detection must see the
-     * live one only, or every later poll would re-detect the rename the
+     * live one only, or every later check would re-detect the rename the
      * mapping already recorded. Returns a map from Lance field id
      * to the field's OpenSearch name, type, Arrow type identifier, and
      * remaining top-level options (so a subsequent update can round-trip

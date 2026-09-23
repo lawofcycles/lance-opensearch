@@ -18,9 +18,11 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.lance.namespace.model.DescribeTableResponse;
 
+import org.opensearch.Version;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionType;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.cluster.metadata.Metadata;
@@ -43,9 +45,8 @@ import org.opensearch.threadpool.ThreadPoolStats;
  * {@link LanceNamespaceService#register} cannot be exercised without a
  * live transport stack; the tests here cover the surface that stands
  * on its own: cadence exposure, the metadata-backed
- * {@link LanceNamespaceService#namespaces} reader, and the
- * settings-only classification the poll uses to adopt indexes it does
- * not track yet.
+ * {@link LanceNamespaceService#namespaces} reader, and the listing
+ * cycle's handling of tables whose index already exists.
  *
  * <p>End-to-end register / unregister behaviour is exercised in
  * {@code LanceNamespaceIT}.
@@ -124,55 +125,104 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
         assertEquals(1, service.namespaces().size());
     }
 
-    public void testClassifyForAdoptionSkipsIndexWithoutLanceTable() {
-        Settings plain = Settings.builder().put("index.number_of_shards", 1).build();
-        assertEquals(LanceIndexAdopter.Adoption.NOT_LANCE, LanceIndexAdopter.classifyForAdoption("plain", plain, Set.of("/ns")));
-        Settings emptyTable = Settings.builder().put(LanceEngineFactory.TABLE_SETTING, "").build();
-        assertEquals(LanceIndexAdopter.Adoption.NOT_LANCE, LanceIndexAdopter.classifyForAdoption("plain", emptyTable, Set.of("/ns")));
-    }
-
-    public void testClassifyForAdoptionSkipsPinnedIndex() {
-        // A pinned index is a readonly snapshot and stays outside the
-        // poll even when its table sits under a registered namespace.
-        Settings pinned = Settings.builder()
-            .put(LanceEngineFactory.TABLE_SETTING, "/ns/demo.lance")
-            .put(LanceEngineFactory.VERSION_SETTING, randomIntBetween(0, 100))
-            .build();
-        assertEquals(LanceIndexAdopter.Adoption.PINNED, LanceIndexAdopter.classifyForAdoption("demo", pinned, Set.of("/ns")));
-    }
-
-    public void testClassifyForAdoptionRecognisesNamespaceSurfacedIndex() {
-        // The surface step builds the table path as root + "/" + name +
-        // ".lance", so that exact shape under a registered root is a
-        // namespace index. An explicit -1 version (the follow-latest
-        // default) does not count as a pin.
-        Settings surfaced = Settings.builder()
-            .put(LanceEngineFactory.TABLE_SETTING, "/ns/demo.lance")
-            .put(LanceEngineFactory.VERSION_SETTING, -1L)
-            .build();
-        assertEquals(
-            LanceIndexAdopter.Adoption.NAMESPACE,
-            LanceIndexAdopter.classifyForAdoption("demo", surfaced, Set.of("/other", "/ns"))
+    public void testPollLeavesAnExistingIndexOfTheTableAloneWithoutOpeningIt() throws Exception {
+        // The manager's cycle only lists catalogs and creates indexes.
+        // A table whose index exists (index.lance.table equals the table
+        // path) is left to the node holding its shard: no dataset open,
+        // no refresh, no mapping update, nothing through the client. The
+        // table path here does not exist on disk, so an open would have
+        // failed and shown up as a skipped table.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.tables = Set.of("orders");
+        LanceNamespaceFactory.setInstantiatorForTests(type -> recording);
+        RecordingNoOpClient recordingClient = new RecordingNoOpClient(threadPool);
+        LanceNamespaceService listing = new LanceNamespaceService(
+            recordingClient,
+            clusterService,
+            threadPool,
+            TimeValue.timeValueHours(1),
+            1_000_000L
         );
+        try {
+            String root = "/no-such-root-" + randomAlphaOfLength(6);
+            LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
+                new LanceNamespaceMetadata.Entry(root, StorageOptions.empty())
+            );
+            IndexMetadata existing = IndexMetadata.builder("orders")
+                .settings(
+                    Settings.builder()
+                        .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                        .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                        .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                        .put(IndexMetadata.SETTING_INDEX_UUID, "orders-uuid")
+                        .put(LanceEngineFactory.TABLE_SETTING, root + "/orders.lance")
+                )
+                .build();
+            ClusterState state = ClusterState.builder(clusterService.state())
+                .metadata(
+                    Metadata.builder(clusterService.state().metadata())
+                        .putCustom(LanceNamespaceMetadata.TYPE, metadata)
+                        .put(existing, false)
+                )
+                .build();
+            ClusterServiceUtils.setState(clusterService, state);
+
+            LanceNamespaceService.PollReport report = listing.pollNow(null);
+            assertTrue("nothing to surface: " + report, report.surfaced().isEmpty());
+            assertTrue("an existing index of the table is not a skip: " + report, report.skipped().isEmpty());
+            assertTrue("no client action for an existing index: " + recordingClient.actionNames, recordingClient.actionNames.isEmpty());
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
     }
 
-    public void testClassifyForAdoptionTreatsOtherLanceIndexesAsAttached() {
-        Settings attached = Settings.builder().put(LanceEngineFactory.TABLE_SETTING, "/elsewhere/demo.lance").build();
-        // Not under any registered root.
-        assertEquals(LanceIndexAdopter.Adoption.ATTACH, LanceIndexAdopter.classifyForAdoption("demo", attached, Set.of("/ns")));
-        // No namespace registered at all.
-        assertEquals(LanceIndexAdopter.Adoption.ATTACH, LanceIndexAdopter.classifyForAdoption("demo", attached, Set.of()));
-        // Under a registered root but attached under a different index
-        // name, so the namespace loop would never sync it by that name.
-        Settings renamed = Settings.builder().put(LanceEngineFactory.TABLE_SETTING, "/ns/demo.lance").build();
-        assertEquals(LanceIndexAdopter.Adoption.ATTACH, LanceIndexAdopter.classifyForAdoption("alias", renamed, Set.of("/ns")));
-        // A tag does not change the classification; it is carried into
-        // the attach bookkeeping by the caller.
-        Settings tagged = Settings.builder()
-            .put(LanceEngineFactory.TABLE_SETTING, "/elsewhere/demo.lance")
-            .put(LanceEngineFactory.TAG_SETTING, "release")
-            .build();
-        assertEquals(LanceIndexAdopter.Adoption.ATTACH, LanceIndexAdopter.classifyForAdoption("demo", tagged, Set.of("/ns")));
+    public void testPollReportsANameCollisionAndWarnsOnce() throws Exception {
+        // An index under the table's name that is not backed by the table
+        // (a plain index here) is a name collision: the cycle skips the
+        // table with the reason and warns once, not on every cycle.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.tables = Set.of("orders");
+        LanceNamespaceFactory.setInstantiatorForTests(type -> recording);
+        RecordingNoOpClient recordingClient = new RecordingNoOpClient(threadPool);
+        LanceNamespaceService listing = new LanceNamespaceService(
+            recordingClient,
+            clusterService,
+            threadPool,
+            TimeValue.timeValueHours(1),
+            1_000_000L
+        );
+        try {
+            String root = "/no-such-root-" + randomAlphaOfLength(6);
+            LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
+                new LanceNamespaceMetadata.Entry(root, StorageOptions.empty())
+            );
+            IndexMetadata plain = IndexMetadata.builder("orders")
+                .settings(
+                    Settings.builder()
+                        .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                        .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                        .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                        .put(IndexMetadata.SETTING_INDEX_UUID, "orders-uuid")
+                )
+                .build();
+            ClusterState state = ClusterState.builder(clusterService.state())
+                .metadata(
+                    Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata).put(plain, false)
+                )
+                .build();
+            ClusterServiceUtils.setState(clusterService, state);
+
+            LanceNamespaceService.PollReport first = listing.pollNow(null);
+            assertTrue(first.surfaced().isEmpty());
+            assertEquals(1, first.skipped().size());
+            assertEquals("orders", first.skipped().get(0).index());
+            assertTrue(first.skipped().get(0).reason(), first.skipped().get(0).reason().startsWith("name collision"));
+            LanceNamespaceService.PollReport second = listing.pollNow(null);
+            assertEquals("the collision is reported on every cycle", 1, second.skipped().size());
+            assertTrue("no client action for a collision: " + recordingClient.actionNames, recordingClient.actionNames.isEmpty());
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
     }
 
     public void testInitializeFailureSurfacesAsUnavailableAndRetries() throws Exception {

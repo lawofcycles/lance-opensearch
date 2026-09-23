@@ -6,12 +6,15 @@
 package org.opensearch.lance.namespace;
 
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -19,24 +22,22 @@ import org.lance.Dataset;
 import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.model.DescribeTableRequest;
 import org.lance.namespace.model.DescribeTableResponse;
-import org.opensearch.action.admin.indices.create.CreateIndexRequest;
-import org.opensearch.action.admin.indices.exists.indices.IndicesExistsRequest;
-import org.opensearch.action.admin.indices.refresh.RefreshRequest;
+import org.opensearch.ResourceAlreadyExistsException;
+import org.opensearch.action.admin.indices.create.CreateIndexResponse;
+import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
-import org.opensearch.core.action.ActionListener;
+import org.opensearch.common.lifecycle.Lifecycle;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.core.xcontent.MediaTypeRegistry;
-import org.opensearch.lance.LanceInternalHeaders;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
-import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.threadpool.ThreadPool;
@@ -46,18 +47,25 @@ import org.opensearch.transport.client.Client;
  * The RFC's namespace registration.
  *
  * <p>A registered catalog is polled at a configurable cadence via the Lance
- * Namespace API. Tables in the catalog surface as OpenSearch indexes
- * automatically, with mappings and shard counts derived from the Lance
- * schema. Version changes propagate through a shard-level refresh that
- * swaps the reader without closing the index. The runtime handle behind
- * each registration is a {@link LanceNamespace}: {@code DirectoryNamespace}
- * for filesystem catalogs, {@code RestNamespace} for REST catalogs, and
- * the Glue, Iceberg REST, Polaris and Unity implementations for those
- * catalog servers, all built by {@link LanceNamespaceFactory}.
+ * Namespace API, on the elected cluster manager only. Tables in the
+ * catalog surface as OpenSearch indexes automatically, with mappings and
+ * shard counts derived from the Lance schema. Keeping a surfaced or
+ * attached index in step with its table afterwards (a new manifest
+ * version, a moved tag, a schema change) is the job of
+ * {@link LanceIndexFreshnessService} on the node that holds the index's
+ * shard; the manager opens no table except the one it is about to
+ * surface. The runtime handle behind each registration is a
+ * {@link LanceNamespace}: {@code DirectoryNamespace} for filesystem
+ * catalogs, {@code RestNamespace} for REST catalogs, and the Glue,
+ * Iceberg REST, Polaris and Unity implementations for those catalog
+ * servers, all built by {@link LanceNamespaceFactory}.
  */
 public final class LanceNamespaceService {
 
     private static final Logger LOG = LogManager.getLogger(LanceNamespaceService.class);
+
+    /** How long a manual poll waits for the CreateIndex calls it issued before answering. */
+    private static final TimeValue MANUAL_POLL_CREATE_TIMEOUT = TimeValue.timeValueSeconds(60);
 
     private final Client client;
     private final ClusterService clusterService;
@@ -88,35 +96,15 @@ public final class LanceNamespaceService {
     private final Set<String> warnedDisallowedLocation = ConcurrentHashMap.newKeySet();
     /** Serialises handle construction so a poll and an applier tick do not double-initialise. */
     private final Object initLock = new Object();
-    private final Map<String, Long> servedVersions = new ConcurrentHashMap<>();
-    // Index names created via /_lance/attach along with the absolute Lance
-    // table path and storage_options they point at. Tracked here so poll()
-    // can extend append coverage to attach-only indexes and not just
-    // namespace-registered tables; otherwise an append to a table whose
-    // index came from attach would not surface through _search until
-    // the operator refreshed manually.
-    private final Map<String, AttachedIndex> attachedIndexes = new ConcurrentHashMap<>();
+    /** Serialises poll cycles so a manual poll and the scheduled one do not race to create the same index. */
+    private final Object pollLock = new Object();
     // Index names we've already flagged as unowned, so the poll doesn't shout
     // the same warning every ten seconds. Cleared if the collision resolves.
     private final Set<String> warnedUnowned = ConcurrentHashMap.newKeySet();
-    // Lance-backed indexes found in cluster state whose table could not be
-    // opened when the poll tried to adopt them. Warned once per index; the
-    // entry is dropped as soon as a later poll adopts the index or the
-    // index leaves cluster state.
-    private final Set<String> warnedUnreachableAdopt = ConcurrentHashMap.newKeySet();
-    // Track which indexes we've already told the operator that the
-    // `wait` uncovered-fragment policy is a no-op today. Set once per
-    // index for the lifetime of the plugin instance; a poll every few
-    // seconds would otherwise flood the log.
-    private final Set<String> warnedWaitPolicy = ConcurrentHashMap.newKeySet();
     /** Tombstone bookkeeping and grace check for the re-surface guard. */
     private final LanceResurfaceGuard resurfaceGuard;
-    /** Schema drift detection and mapping override rewriting. */
-    private final LanceSchemaDriftDetector driftDetector;
-    /** Adoption of Lance-backed indexes the tracking maps do not know yet. */
-    private final LanceIndexAdopter indexAdopter;
     private final ThreadPool threadPool;
-    /** Fragment path snapshot cache to retire from, or {@code null}. */
+    /** Fragment path snapshot cache to retire from on index deletion, or {@code null}. */
     private final LanceWarmCache warmCache;
 
     public LanceNamespaceService(
@@ -154,9 +142,8 @@ public final class LanceNamespaceService {
 
     /**
      * @param warmCache    fragment path snapshot cache to retire entries
-     *                     from when a table moves to a new version or an
-     *                     index is deleted; {@code null} when there is none
-     *                     (tests)
+     *                     from when an index is deleted; {@code null}
+     *                     when there is none (tests)
      * @param allowedRoots the {@code lance.allowed_table_roots} allowlist,
      *                     applied to the table locations rest / glue
      *                     catalogs return before their tables surface
@@ -179,14 +166,6 @@ public final class LanceNamespaceService {
         this.warmCache = warmCache;
         this.allowedRoots = allowedRoots;
         this.resurfaceGuard = new LanceResurfaceGuard(resurfaceGrace);
-        this.driftDetector = new LanceSchemaDriftDetector(client);
-        this.indexAdopter = new LanceIndexAdopter(
-            servedVersions,
-            attachedIndexes,
-            warnedUnreachableAdopt,
-            warnedUnowned,
-            this.resurfaceGuard
-        );
         // The applier listener keeps the tombstone bookkeeping current
         // and releases handles of removed registrations; the poll
         // builds handles itself on the generic pool. addListener
@@ -227,14 +206,14 @@ public final class LanceNamespaceService {
         // touch the map here; the poll cycle removes an entry once the
         // grace period elapses or the operator sets the grace to zero.
         if (event.previousState() != null && event.previousState().metadata() != null) {
-            org.opensearch.cluster.metadata.Metadata previous = event.previousState().metadata();
-            org.opensearch.cluster.metadata.Metadata current = event.state().metadata();
+            Metadata previous = event.previousState().metadata();
+            Metadata current = event.state().metadata();
             long now = System.currentTimeMillis();
             for (String prevIndex : previous.indices().keySet()) {
                 if (current.hasIndex(prevIndex)) {
                     continue;
                 }
-                org.opensearch.cluster.metadata.IndexMetadata prevMeta = previous.index(prevIndex);
+                IndexMetadata prevMeta = previous.index(prevIndex);
                 if (prevMeta == null) {
                     continue;
                 }
@@ -243,15 +222,7 @@ public final class LanceNamespaceService {
                     continue;
                 }
                 resurfaceGuard.recordTombstone(prevIndex, table, now);
-                // Also stop tracking the served version and the
-                // attached-index bookkeeping so the delete really looks
-                // "gone" to the poll cycle and to attach retries.
-                servedVersions.remove(prevIndex);
-                attachedIndexes.remove(prevIndex);
                 warnedUnowned.remove(prevIndex);
-                warnedUnreachableAdopt.remove(prevIndex);
-                driftDetector.forgetIndex(prevIndex);
-                warnedWaitPolicy.remove(prevIndex);
                 // The fragment path keys its snapshots on the index uuid,
                 // so nothing will ask for them again; close them as soon
                 // as the requests that hold them finish. Closing a
@@ -265,7 +236,7 @@ public final class LanceNamespaceService {
             }
         }
         LanceNamespaceMetadata metadata = currentMetadata(event.state());
-        Set<String> desired = new java.util.HashSet<>(metadata.entries().size());
+        Set<String> desired = new HashSet<>(metadata.entries().size());
         for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
             desired.add(entry.name());
         }
@@ -431,6 +402,30 @@ public final class LanceNamespaceService {
         return List.copyOf(infos);
     }
 
+    /**
+     * What one catalog listing cycle did: the indexes whose CreateIndex
+     * was issued (and, for a manual poll, acknowledged), the tables that
+     * were left alone with the reason, and the registrations whose
+     * listing failed with the error.
+     */
+    public record PollReport(List<String> surfaced, List<SkippedTable> skipped, Map<String, String> unavailable) {
+
+        /** A catalog table the cycle did not surface: the index name it would have taken and why. */
+        public record SkippedTable(String namespace, String table, String index, String reason) {
+        }
+    }
+
+    /** One cycle's bookkeeping; the scheduled poll drops it, the manual poll answers with it. */
+    private static final class CycleReport {
+        final List<String> surfaced = new ArrayList<>();
+        final List<PollReport.SkippedTable> skipped = new ArrayList<>();
+        final Map<String, String> unavailable = new LinkedHashMap<>();
+        final List<PendingCreate> creates = new ArrayList<>();
+
+        record PendingCreate(String namespace, String table, String index, PlainActionFuture<CreateIndexResponse> future) {
+        }
+    }
+
     // Package-private so tests can drive a poll cycle synchronously
     // instead of waiting for the scheduled cadence.
     void poll() {
@@ -438,7 +433,7 @@ public final class LanceNamespaceService {
         // cluster state, which happens once at startup. Reading state()
         // then would trip the AssertionError inside
         // ClusterApplierService instead of returning gracefully.
-        if (clusterService.lifecycleState() != org.opensearch.common.lifecycle.Lifecycle.State.STARTED) {
+        if (clusterService.lifecycleState() != Lifecycle.State.STARTED) {
             return;
         }
         // Poll only on the cluster manager. In a multi-node cluster
@@ -451,66 +446,96 @@ public final class LanceNamespaceService {
         if (!clusterService.state().nodes().isLocalNodeElectedClusterManager()) {
             return;
         }
-        ClusterState state = clusterService.state();
-        // The tracking maps live only in this node's memory, so any index
-        // that carries index.lance.table in cluster state but is missing
-        // from servedVersions has to be picked up again before the two
-        // sync loops below run; otherwise those loops would treat it as a
-        // name collision and skip it for good.
-        indexAdopter.adoptUntrackedIndexes(state);
-        LanceNamespaceMetadata metadata = currentMetadata(state);
-        for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
-            LanceNamespaceHandle handle = ensureHandle(entry);
-            if (handle == null) {
-                // initialise failed; ensureHandle recorded the error and
-                // will retry on the next poll.
-                continue;
-            }
-            try {
-                for (LanceCatalogEnumerator.CatalogTable table : handle.call(
-                    namespace -> LanceCatalogEnumerator.enumerateTables(namespace, entry)
-                )) {
-                    syncCatalogTable(entry, handle, table);
+        pollCycle(null, false);
+    }
+
+    /**
+     * Run one catalog listing cycle now, on the calling thread (the
+     * generic pool: listing and the derivation open storage), and
+     * answer what it did. {@code name} limits the cycle to one
+     * registration; {@code null} lists every registration. The
+     * CreateIndex calls the cycle issues are awaited so the answer
+     * names the indexes that exist when it returns. Callers route this
+     * to the elected cluster manager, where the scheduled poll runs.
+     */
+    public PollReport pollNow(String name) {
+        return pollCycle(name, true);
+    }
+
+    private PollReport pollCycle(String onlyName, boolean awaitCreates) {
+        synchronized (pollLock) {
+            ClusterState state = clusterService.state();
+            CycleReport report = new CycleReport();
+            LanceNamespaceMetadata metadata = currentMetadata(state);
+            for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
+                if (onlyName != null && !onlyName.equals(entry.name()) && !onlyName.equals(entry.rootUri())) {
+                    continue;
                 }
-                unavailable.remove(entry.name());
-            } catch (LanceNamespaceHandle.ReleasedException e) {
-                // The registration was removed after this cycle read the
-                // metadata; there is nothing to report against it.
-                LOG.debug("namespace {} was unregistered during the poll cycle", entry.name());
-            } catch (Exception e) {
-                // A listing failure (unreachable endpoint, revoked
-                // credentials after a successful initialise) marks the
-                // registration unavailable until a poll succeeds again.
-                String message = e.getMessage() == null ? e.toString() : e.getMessage();
-                unavailable.put(entry.name(), message);
-                LOG.warn("namespace poll failed for {}", entry.name(), e);
+                LanceNamespaceHandle handle = ensureHandle(entry);
+                if (handle == null) {
+                    // initialise failed; ensureHandle recorded the error and
+                    // will retry on the next poll.
+                    report.unavailable.put(entry.name(), unavailable.getOrDefault(entry.name(), "initialise failed"));
+                    continue;
+                }
+                try {
+                    for (LanceCatalogEnumerator.CatalogTable table : handle.call(
+                        namespace -> LanceCatalogEnumerator.enumerateTables(namespace, entry)
+                    )) {
+                        syncCatalogTable(state, entry, handle, table, report);
+                    }
+                    unavailable.remove(entry.name());
+                } catch (LanceNamespaceHandle.ReleasedException e) {
+                    // The registration was removed after this cycle read the
+                    // metadata; there is nothing to report against it.
+                    LOG.debug("namespace {} was unregistered during the poll cycle", entry.name());
+                } catch (Exception e) {
+                    // A listing failure (unreachable endpoint, revoked
+                    // credentials after a successful initialise) marks the
+                    // registration unavailable until a poll succeeds again.
+                    String message = e.getMessage() == null ? e.toString() : e.getMessage();
+                    unavailable.put(entry.name(), message);
+                    report.unavailable.put(entry.name(), message);
+                    LOG.warn("namespace poll failed for {}", entry.name(), e);
+                }
             }
+            if (awaitCreates) {
+                awaitCreates(report);
+            } else {
+                for (CycleReport.PendingCreate pending : report.creates) {
+                    report.surfaced.add(pending.index());
+                }
+            }
+            return new PollReport(List.copyOf(report.surfaced), List.copyOf(report.skipped), Map.copyOf(report.unavailable));
         }
-        // Sync attach-created indexes so append fragments surface on the
-        // same schedule as namespace-registered tables. attach records the
-        // (indexName -> tablePath) pair; the sync path is the same, just
-        // without the rootUri / tableName join namespace tables use. The
-        // tag is a Dynamic setting the operator can rewrite on a running
-        // index, so it is re-read from cluster state each cycle rather
-        // than taken from the value captured at attach time; the cached
-        // entry is refreshed too so a later restart replays the current
-        // tag through adoption.
-        for (Map.Entry<String, AttachedIndex> entry : attachedIndexes.entrySet()) {
-            AttachedIndex attached = entry.getValue();
-            String indexName = entry.getKey();
-            String currentTag = attached.tag;
-            IndexMetadata attachedMetadata = state.metadata().index(indexName);
-            if (attachedMetadata != null) {
-                String tagSetting = attachedMetadata.getSettings().get(LanceEngineFactory.TAG_SETTING, "");
-                currentTag = tagSetting.isEmpty() ? null : tagSetting;
-                if (!java.util.Objects.equals(currentTag, attached.tag)) {
-                    attachedIndexes.put(indexName, new AttachedIndex(attached.tablePath, attached.storageOptions, currentTag));
-                }
-            }
+    }
+
+    /**
+     * Wait for the creates a manual cycle issued. A create that failed
+     * (other than because the index already exists) moves its table to
+     * the skipped list with the failure; one that does not answer in
+     * time is reported as issued but not acknowledged.
+     */
+    private void awaitCreates(CycleReport report) {
+        long deadline = System.nanoTime() + MANUAL_POLL_CREATE_TIMEOUT.nanos();
+        for (CycleReport.PendingCreate pending : report.creates) {
+            long remaining = Math.max(1L, deadline - System.nanoTime());
             try {
-                syncAttachedTable(indexName, attached.tablePath, attached.storageOptions, currentTag);
+                pending.future().actionGet(remaining, TimeUnit.NANOSECONDS);
+                report.surfaced.add(pending.index());
             } catch (Exception e) {
-                LOG.warn("attach poll failed for index {} at {}", indexName, attached.tablePath, e);
+                if (isAlreadyExists(e)) {
+                    report.surfaced.add(pending.index());
+                } else {
+                    report.skipped.add(
+                        new PollReport.SkippedTable(
+                            pending.namespace(),
+                            pending.table(),
+                            pending.index(),
+                            "create index failed: " + e.getMessage()
+                        )
+                    );
+                }
             }
         }
     }
@@ -519,22 +544,32 @@ public final class LanceNamespaceService {
      * Sync one catalog table into the poll's index bookkeeping.
      *
      * <p>A directory registration builds the table path from its root
-     * and the table name, exactly the shape adoption classification
-     * and the persisted {@code index.lance.table} setting rely on. A
-     * rest or glue registration asks the catalog itself through
+     * and the table name, exactly the shape the persisted
+     * {@code index.lance.table} setting relies on. A rest or glue
+     * registration asks the catalog itself through
      * {@code describeTable}; the returned location is validated
      * against {@code lance.allowed_table_roots} before anything
      * surfaces, because for these types the register call had no root
      * the allowlist could gate.
      */
     private void syncCatalogTable(
+        ClusterState state,
         LanceNamespaceMetadata.Entry entry,
         LanceNamespaceHandle handle,
-        LanceCatalogEnumerator.CatalogTable table
+        LanceCatalogEnumerator.CatalogTable table,
+        CycleReport report
     ) {
         String indexName = table.name();
         if (LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(entry.type())) {
-            runSyncCycle(entry.rootUri() + "/" + indexName + ".lance", indexName, entry.storageOptions(), null, entry.overridesJson());
+            surfaceIfMissing(
+                state,
+                entry.name(),
+                entry.rootUri() + "/" + indexName + ".lance",
+                indexName,
+                entry.storageOptions(),
+                entry.overridesJson(),
+                report
+            );
             return;
         }
         DescribeTableResponse described;
@@ -545,11 +580,13 @@ public final class LanceNamespaceService {
             return;
         } catch (Exception e) {
             LOG.warn("describe_table failed for {} in namespace {}: {}", indexName, entry.name(), e.getMessage());
+            report.skipped.add(new PollReport.SkippedTable(entry.name(), indexName, indexName, "describe_table failed: " + e.getMessage()));
             return;
         }
         String location = LanceCatalogEnumerator.tableLocation(described);
         if (location == null) {
             LOG.warn("catalog {} returned no location for table {}; skipping", entry.name(), indexName);
+            report.skipped.add(new PollReport.SkippedTable(entry.name(), indexName, indexName, "the catalog returned no location"));
             return;
         }
         if (!allowedRoots.allows(location)) {
@@ -561,15 +598,25 @@ public final class LanceNamespaceService {
                     location
                 );
             }
+            report.skipped.add(
+                new PollReport.SkippedTable(
+                    entry.name(),
+                    indexName,
+                    indexName,
+                    "location " + location + " is outside lance.allowed_table_roots"
+                )
+            );
             return;
         }
         warnedDisallowedLocation.remove(entry.name() + ":" + indexName);
-        runSyncCycle(
+        surfaceIfMissing(
+            state,
+            entry.name(),
             location,
             indexName,
             LanceCatalogEnumerator.mergeStorageOptions(described.getStorageOptions(), entry.storageOptions()),
-            null,
-            entry.overridesJson()
+            entry.overridesJson(),
+            report
         );
     }
 
@@ -583,222 +630,91 @@ public final class LanceNamespaceService {
         return warnedDisallowedLocation.size();
     }
 
-    // Attach-created indexes carry the fully-qualified table path already,
-    // so the rootUri / tableName join namespace tables use doesn't apply.
-    // Everything downstream of the path resolution is identical, except
-    // that a tag-following index compares against the version its tag
-    // resolves to instead of the latest manifest.
-    private void syncAttachedTable(String indexName, String tablePath, StorageOptions storageOptions, String tag) {
-        // An attach-created index that got deleted and resurfaces after
-        // the grace period carries no overrides: they lived in the
-        // deleted index's settings, and attach is where the operator
-        // declares them again.
-        runSyncCycle(tablePath, indexName, storageOptions, tag, "");
-    }
-
-    private void runSyncCycle(String table, String indexName, StorageOptions storageOptions, String tag, String surfaceOverridesJson) {
+    /**
+     * Create the index for {@code table} unless one exists. An existing
+     * index that carries {@code index.lance.table} equal to the table is
+     * the one an earlier cycle (or attach) created for it, and the node
+     * holding its shard keeps it fresh; any other index under the name
+     * is a name collision, warned once and left alone. A name deleted
+     * within the resurface grace is left alone too.
+     */
+    private void surfaceIfMissing(
+        ClusterState state,
+        String namespaceName,
+        String table,
+        String indexName,
+        StorageOptions storageOptions,
+        String surfaceOverridesJson,
+        CycleReport report
+    ) {
+        IndexMetadata existing = state.metadata().index(indexName);
+        if (existing != null) {
+            String existingTable = existing.getSettings().get(LanceEngineFactory.TABLE_SETTING, "");
+            if (existingTable.equals(table)) {
+                // Present again after a restore or a rebuild: a tombstone
+                // recorded for the name no longer describes anything.
+                resurfaceGuard.clearTombstone(indexName);
+                warnedUnowned.remove(indexName);
+                return;
+            }
+            // The index name already existed before we saw the table: a
+            // classic OpenSearch index, or another namespace beat us to
+            // the name. Recoverable with operator action, so log once
+            // per index instead of silently skipping every poll.
+            if (warnedUnowned.add(indexName)) {
+                LOG.warn("skipping table {}: index {} exists but is not backed by it (name collision)", table, indexName);
+            }
+            report.skipped.add(
+                new PollReport.SkippedTable(
+                    namespaceName,
+                    indexName,
+                    indexName,
+                    existingTable.isEmpty()
+                        ? "name collision: an index of that name exists and is not Lance backed"
+                        : "name collision: index is backed by another table " + existingTable
+                )
+            );
+            return;
+        }
+        // Re-surface guard: if this index was recently deleted through
+        // OpenSearch, honour the operator's intent and skip the surface
+        // until the grace period expires. Grace <= 0 disables the guard
+        // and every poll recreates the index unconditionally.
+        if (resurfaceGuard.shouldSkipSurface(indexName, table)) {
+            report.skipped.add(
+                new PollReport.SkippedTable(namespaceName, indexName, indexName, "deleted within lance.namespace.resurface_guard_grace")
+            );
+            return;
+        }
         try {
-            boolean exists = client.admin().indices().exists(new IndicesExistsRequest(indexName)).actionGet().isExists();
-            if (!exists) {
-                // Re-surface guard: if this index was recently deleted
-                // through OpenSearch, honour the operator's intent and
-                // skip the surface until the grace period expires.
-                // Grace <= 0 disables the guard and every poll recreates
-                // the index unconditionally.
-                if (resurfaceGuard.shouldSkipSurface(indexName, table)) {
-                    return;
-                }
-                surface(indexName, table, storageOptions, surfaceOverridesJson);
-                return;
-            }
-            Long served = servedVersions.get(indexName);
-            if (served == null) {
-                // The index name already existed before we saw the table: a
-                // classic OpenSearch index, or another namespace beat us to
-                // the name. Recoverable with operator action, so log once
-                // per index instead of silently skipping every poll.
-                if (warnedUnowned.add(indexName)) {
-                    LOG.warn("skipping table {}: index {} exists but is not tracked by this namespace (name collision)", table, indexName);
-                }
-                return;
-            }
-            // In case the collision has resolved (index deleted and re-created by
-            // us), allow future warnings again.
-            warnedUnowned.remove(indexName);
-            String policy = readUncoveredFragmentPolicy(indexName);
-            // `target` is the version the index should serve after this
-            // cycle: the latest manifest for a latest-following index, or
-            // the version the tag points at for a tag-following one. The
-            // latest dataset is opened in both cases because tags are read
-            // from the table's refs, not from a particular manifest.
-            long target;
-            boolean moved;
-            String rederivedMappingJson = null;
-            LanceOverrides storedOverrides = LanceOverrides.EMPTY;
-            try (Dataset latestDataset = LanceRegistry.openDataset(table, storageOptions)) {
-                long latest = latestDataset.version();
-                // An index adopted from cluster state serves -1 until this
-                // point, so its first cycle always counts as a move and
-                // refreshes the reader once.
-                if (tag == null) {
-                    target = latest;
-                    moved = target > served;
-                } else {
-                    target = latestDataset.tags().getVersion(tag);
-                    // A tag can move backwards as well as forwards, so any
-                    // difference from the served version is a move.
-                    moved = target != served;
-                }
-                if (moved) {
-                    // The RFC's Mapping interface states the mapping is re-derived at
-                    // every checkout. We derive first so the builder only touches
-                    // columns that derived to lance_text; keyword columns stay untouched.
-                    // Re-apply any attach-body overrides captured on shard creation
-                    // so the re-derived mapping preserves type overrides and
-                    // multi-field declarations across manifest version advance;
-                    // without this the mapping would drop back to the default
-                    // derivation and a caller querying body.raw would suddenly
-                    // see 400 no-such-field errors. Lenient: a column an
-                    // override names may have been dropped or retyped by the
-                    // writer; its override is skipped this cycle but stays in
-                    // the setting, so it applies again if a later manifest
-                    // restores the column.
-                    IndexMetadata rederivationMetadata = clusterService.state().metadata().index(indexName);
-                    storedOverrides = rederivationMetadata == null
-                        ? LanceOverrides.EMPTY
-                        : LanceOverrides.of(rederivationMetadata.getSettings());
-                    boolean nodeLocal = rederivationMetadata != null && LanceLocalClones.isNodeLocal(rederivationMetadata.getSettings());
-                    if (nodeLocal) {
-                        // node_local: the search structures live in per-node
-                        // clones the source never carries, so a derivation
-                        // from the source would flip every clone-built
-                        // lance_text column back to keyword (and trigger the
-                        // rebuild loop below on every cycle). The build
-                        // action maintains the mapping from the clones; the
-                        // poll only advances the reader.
-                        rederivedMappingJson = null;
-                    } else if (target == latest) {
-                        storedOverrides = driftDetector.rewriteOverridesForSchemaDrift(
-                            indexName,
-                            storedOverrides,
-                            latestDataset.getLanceSchema()
-                        );
-                        RestAttachAction.Derivation derivation = RestAttachAction.derive(latestDataset, storedOverrides, true);
-                        rederivedMappingJson = derivation.mappingJson();
-                        driftDetector.warnOnLanceFieldRename(indexName, latestDataset.getLanceSchema());
-                    } else {
-                        // The tag points at an older manifest: derive from
-                        // that snapshot so the mapping matches the schema
-                        // the shard is about to read.
-                        try (Dataset tagged = LanceRegistry.openDataset(table, storageOptions, Optional.of(target))) {
-                            storedOverrides = driftDetector.rewriteOverridesForSchemaDrift(
-                                indexName,
-                                storedOverrides,
-                                tagged.getLanceSchema()
-                            );
-                            RestAttachAction.Derivation derivation = RestAttachAction.derive(tagged, storedOverrides, true);
-                            rederivedMappingJson = derivation.mappingJson();
-                            driftDetector.warnOnLanceFieldRename(indexName, tagged.getLanceSchema());
-                        }
-                    }
-                    if ("wait".equals(policy)) {
-                        // `wait` is accepted but converges with the
-                        // immediate branch: the plugin never writes to a
-                        // user table, so folding appended fragments into
-                        // the existing indexes is left to the table's
-                        // writer or to POST /_lance/build_indexes/{index}.
-                        // Log once per index so an operator who set `wait`
-                        // on purpose sees why nothing is happening.
-                        warnDeprecatedWaitPolicyOnce(indexName);
-                    }
-                    // Either branch exposes the new version at once and
-                    // lets Lance fall back to scan evaluation on any
-                    // fragment the existing indexes have not caught up
-                    // to. Lance's scanner produces a mixed plan for FTS
-                    // and knn (index for covered fragments, flat scan for
-                    // uncovered, unioned) so an incremental append does
-                    // not slow down queries on covered fragments.
-                }
-            }
-            if (moved) {
-                if (tag == null) {
-                    LOG.info("table {} moved to version {} (serving {}), refreshing {}", table, target, served, indexName);
-                } else {
-                    LOG.info(
-                        "tag {} on table {} now points at version {} (serving {}), refreshing {}",
-                        tag,
-                        table,
-                        target,
-                        served,
-                        indexName
-                    );
-                }
-                if (rederivedMappingJson != null) {
-                    try {
-                        client.admin()
-                            .indices()
-                            .preparePutMapping(indexName)
-                            .setSource(rederivedMappingJson, MediaTypeRegistry.JSON)
-                            .execute()
-                            .actionGet();
-                    } catch (Exception e) {
-                        String message = e.getMessage() == null ? "" : e.getMessage();
-                        if (message.contains("cannot be changed from type")) {
-                            // A Utf8 column has flipped between keyword and
-                            // lance_text after the user created / dropped an
-                            // FTS index on the Lance side. PutMapping refuses
-                            // the type change, but leaving the stale mapping
-                            // in place makes the column silently unsearchable.
-                            // Rebuild the index (delete + recreate with the
-                            // new mapping) so the reader sees the correct
-                            // field type. The underlying Lance table keeps
-                            // its data intact, so nothing is lost.
-                            LOG.warn(
-                                "mapping re-derivation for {} at version {} hit a keyword <-> lance_text type change ({}); "
-                                    + "rebuilding the OpenSearch index (Lance data is untouched)",
-                                indexName,
-                                target,
-                                message
-                            );
-                            try {
-                                client.admin()
-                                    .indices()
-                                    .delete(new org.opensearch.action.admin.indices.delete.DeleteIndexRequest(indexName))
-                                    .actionGet();
-                                servedVersions.remove(indexName);
-                                // The recreate must keep the index's own
-                                // overrides; without them the rebuilt
-                                // mapping would drop the operator's type
-                                // and sub-field declarations.
-                                surface(indexName, table, storageOptions, storedOverrides.toJson());
-                                return;
-                            } catch (Exception rebuild) {
-                                LOG.warn("rebuild after type change failed for {}: {}", indexName, rebuild.getMessage());
-                            }
-                        } else {
-                            LOG.warn("mapping re-derivation failed for {} at version {}: {}", indexName, target, message);
-                        }
-                    }
-                }
-                client.admin().indices().refresh(new RefreshRequest(indexName)).actionGet();
-                servedVersions.put(indexName, target);
-                // Fragment path requests key on the new version from now
-                // on; let the snapshots of the version left behind close
-                // as soon as no request holds them instead of waiting for
-                // the cache's size bound.
-                if (warmCache != null) {
-                    IndexMetadata movedMetadata = clusterService.state().metadata().index(indexName);
-                    if (movedMetadata != null) {
-                        warmCache.retire(movedMetadata.getIndexUUID(), target);
-                    }
-                }
-            }
+            report.creates.add(
+                new CycleReport.PendingCreate(
+                    namespaceName,
+                    table,
+                    indexName,
+                    surface(indexName, table, storageOptions, surfaceOverridesJson)
+                )
+            );
         } catch (Exception e) {
-            LOG.warn("sync failed for table {}", table, e);
+            LOG.warn("surface failed for table {} as index {}", table, indexName, e);
+            report.skipped.add(new PollReport.SkippedTable(namespaceName, indexName, indexName, "surface failed: " + e.getMessage()));
         }
     }
 
-    private void surface(String indexName, String table, StorageOptions storageOptions, String overridesJson) throws Exception {
+    /**
+     * Derive the mapping from the table's current schema and issue the
+     * CreateIndex. The create is asynchronous so a red shard on this
+     * table does not block the poll thread for 30 seconds waiting for
+     * the ack while every other table in the namespace waits behind it;
+     * the returned future completes with the ack (a manual poll waits
+     * on it, the scheduled one does not).
+     */
+    private PlainActionFuture<CreateIndexResponse> surface(
+        String indexName,
+        String table,
+        StorageOptions storageOptions,
+        String overridesJson
+    ) throws Exception {
         // Overrides apply leniently: the register call's override list
         // covers every table under the root, so a column this table
         // lacks is skipped (visible once at debug) while the full list
@@ -818,119 +734,44 @@ public final class LanceNamespaceService {
                 LOG.debug("surface of {} at {}: {}", indexName, table, note);
             }
         }
-        // Fire the CreateIndex asynchronously so a red shard on this table
-        // does not block the poll thread for 30 seconds waiting for ack.
-        // Every other table in the same namespace would otherwise wait
-        // behind that block.
         final long version = derivation.version();
-        Settings.Builder settings = Settings.builder()
-            .put("index.number_of_shards", 1)
-            .put("index.number_of_replicas", 0)
-            .put(LanceEngineFactory.TABLE_SETTING, table)
-            .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, derivation.keyField())
-            .put(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, derivation.keyFieldType());
-        if (!derivation.overridesJson().isEmpty()) {
-            settings.put(LanceEngineFactory.OVERRIDES_SETTING, derivation.overridesJson());
-        }
-        storageOptions.writeToSettings(settings);
-        // LanceCreateIndexActionFilter blocks user PUT /{index} with
-        // index.lance.table in settings. This surface call is
-        // plugin-internal so stamp the marker header before dispatch;
-        // stashContext preserves the caller's headers for whatever
-        // scheduled the poll.
-        ThreadContext threadContext = threadPool.getThreadContext();
-        try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
-            threadContext.putHeader(LanceInternalHeaders.LANCE_INTERNAL_CREATE_INDEX, "true");
-            client.admin()
-                .indices()
-                .create(
-                    new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson()),
-                    new ActionListener<org.opensearch.action.admin.indices.create.CreateIndexResponse>() {
-                        @Override
-                        public void onResponse(org.opensearch.action.admin.indices.create.CreateIndexResponse response) {
-                            servedVersions.put(indexName, version);
-                            LOG.info("surfaced table {} as index {} (version {})", table, indexName, version);
-                        }
+        PlainActionFuture<CreateIndexResponse> future = PlainActionFuture.newFuture();
+        LanceIndexCreation.create(
+            client,
+            threadPool,
+            LanceIndexCreation.request(indexName, table, storageOptions, derivation, Settings.EMPTY),
+            new ActionListener<CreateIndexResponse>() {
+                @Override
+                public void onResponse(CreateIndexResponse response) {
+                    LOG.info("surfaced table {} as index {} (version {})", table, indexName, version);
+                    future.onResponse(response);
+                }
 
-                        @Override
-                        public void onFailure(Exception e) {
-                            // ResourceAlreadyExistsException means another node
-                            // (or an earlier poll) already surfaced the table;
-                            // the syncTable path will pick it up next cycle.
-                            Throwable cursor = e;
-                            while (cursor != null) {
-                                if (cursor instanceof org.opensearch.ResourceAlreadyExistsException) {
-                                    LOG.debug("surface for {} raced with an existing index", indexName);
-                                    return;
-                                }
-                                cursor = cursor.getCause();
-                            }
-                            LOG.warn("surface failed for {} at version {}: {}", indexName, version, e.getMessage());
-                        }
+                @Override
+                public void onFailure(Exception e) {
+                    // ResourceAlreadyExistsException means another node
+                    // (or an earlier poll) already surfaced the table;
+                    // the next cycle finds the index in cluster state.
+                    if (isAlreadyExists(e)) {
+                        LOG.debug("surface for {} raced with an existing index", indexName);
+                    } else {
+                        LOG.warn("surface failed for {} at version {}: {}", indexName, version, e.getMessage());
                     }
-                );
-        }
-    }
-
-    void recordServedVersion(String indexName, long version) {
-        servedVersions.put(indexName, version);
-    }
-
-    /**
-     * Records an attach-created index and its Lance table path so poll()
-     * can pick up appends for it, just as it would for a namespace-registered
-     * table. Idempotent: repeated calls with the same (indexName, tablePath)
-     * are a no-op beyond overwriting the served version.
-     */
-    public void registerAttachedIndex(String indexName, String tablePath, long version) {
-        registerAttachedIndex(indexName, tablePath, version, StorageOptions.empty());
-    }
-
-    public void registerAttachedIndex(String indexName, String tablePath, long version, StorageOptions storageOptions) {
-        registerAttachedIndex(indexName, tablePath, version, storageOptions, null);
-    }
-
-    /**
-     * Variant for indexes that follow a Lance tag. {@code tag} is the tag
-     * name the poll re-resolves on every cycle, or {@code null} for an
-     * index that follows the latest manifest. {@code version} is the
-     * version currently served (the tag's version at attach time).
-     */
-    public void registerAttachedIndex(String indexName, String tablePath, long version, StorageOptions storageOptions, String tag) {
-        attachedIndexes.put(indexName, new AttachedIndex(tablePath, storageOptions, tag));
-        servedVersions.put(indexName, version);
-    }
-
-    private String readUncoveredFragmentPolicy(String indexName) {
-        try {
-            var state = client.admin().cluster().prepareState().execute().actionGet().getState();
-            var metadata = state.metadata().index(indexName);
-            if (metadata == null) {
-                return "immediate";
+                    future.onFailure(e);
+                }
             }
-            return metadata.getSettings().get("index.lance.uncovered_fragment_policy", "immediate");
-        } catch (Exception e) {
-            LOG.warn("failed to read uncovered_fragment_policy for {}: {}", indexName, e.getMessage());
-            return "immediate";
-        }
+        );
+        return future;
     }
 
-    private void warnDeprecatedWaitPolicyOnce(String indexName) {
-        if (warnedWaitPolicy.add(indexName)) {
-            LOG.info(
-                "index [{}] has index.lance.uncovered_fragment_policy=wait, but the plugin no longer runs auto-optimize on the user's Lance table. "
-                    + "Index maintenance is expected to happen outside OpenSearch (Python, Ray, Spark, or the Lance Java SDK) or via "
-                    + "an explicit POST /_lance/build_indexes/{{index}} call. The wait value is accepted for a future async-optimize implementation.",
-                indexName
-            );
+    private static boolean isAlreadyExists(Exception e) {
+        Throwable cursor = e;
+        while (cursor != null) {
+            if (cursor instanceof ResourceAlreadyExistsException) {
+                return true;
+            }
+            cursor = cursor.getCause();
         }
-    }
-
-    /**
-     * Poll bookkeeping for an attach-created index. {@code tag} is the
-     * Lance tag the index follows, or {@code null} when it follows the
-     * latest manifest.
-     */
-    record AttachedIndex(String tablePath, StorageOptions storageOptions, String tag) {
+        return false;
     }
 }

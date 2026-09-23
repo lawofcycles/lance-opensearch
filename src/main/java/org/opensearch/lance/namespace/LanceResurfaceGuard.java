@@ -66,7 +66,7 @@ final class LanceResurfaceGuard {
 
     /**
      * Drop the tombstone for {@code indexName}. Called when the index
-     * is present again (a snapshot restore, or the poll adopted it),
+     * is present again (a snapshot restore, a rebuild, or the poll found it),
      * so the tombstone no longer describes anything.
      */
     void clearTombstone(String indexName) {

@@ -21,7 +21,7 @@ import org.opensearch.core.common.io.stream.Writeable;
  * every field: {@code meta.lance_field_id} (the Lance immutable field
  * id), {@code meta.lance_arrow_type} (the Arrow type fingerprint), and
  * {@code meta.lance_dropped} (the field's column no longer exists in
- * the Lance table under this name). The namespace poll writes the
+ * the Lance table under this name). The freshness check writes the
  * dropped marker when a rename, reset or drop leaves a stale name in
  * the mapping, because PutMapping cannot remove properties.
  */

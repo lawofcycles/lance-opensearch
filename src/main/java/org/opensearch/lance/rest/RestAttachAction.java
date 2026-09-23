@@ -144,7 +144,7 @@ public class RestAttachAction extends BaseRestHandler {
             // `derive` steers the text_analyzer backfill: `sync` (default)
             // blocks the attach until the derived tokens columns are
             // written and indexed, `async` answers at once and lets the
-            // namespace poll flip the mapping when the backfill commits.
+            // freshness check flip the mapping when the backfill commits.
             String derive = readOptionalString(body, "derive");
             if (derive != null && !"sync".equals(derive) && !"async".equals(derive)) {
                 return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, "[derive] must be 'sync' or 'async'"));

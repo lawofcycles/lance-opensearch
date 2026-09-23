@@ -717,6 +717,22 @@ public final class LanceTableFactory {
     }
 
     /**
+     * Add an all-null column of {@code type} to an existing Lance table
+     * through {@code Dataset.addColumns(List<Field>)}. Simulates
+     * {@code dataset.add_columns(schema)} from Python / Rust: the schema
+     * gains a field under a new manifest version without touching the
+     * data files. Used by tests that need the mapping to gain a field.
+     */
+    public static void addColumn(String tableUri, String column, ArrowType type) throws Exception {
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
+        ) {
+            dataset.addColumns(List.of(new Field(column, FieldType.nullable(type), null)));
+        }
+    }
+
+    /**
      * Drop columns from an existing Lance table. Simulates
      * {@code dataset.drop_columns([...])} from Python / Rust; used by
      * integration tests that exercise mapping-drift detection when the

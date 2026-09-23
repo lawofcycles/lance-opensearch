@@ -50,7 +50,7 @@ future work tracked in the RFC; it builds on the same foundations rather than re
 flowchart TD
     CL[Client]
     subgraph cm ["Elected cluster manager"]
-        NS["Namespace / catalog service<br/>(poll loop, drift handling)"]
+        NS["Namespace / catalog service<br/>(catalog listing, index creation)"]
         AT["Attach action<br/>(derive mapping, create index)"]
     end
     subgraph coord ["Coordinating node"]
@@ -63,6 +63,7 @@ flowchart TD
         EX["Fragment executor<br/>(refines the shipped plan: downgrade only)"]
         LU["Lucene aggregators / collectors<br/>over fragment leaf readers"]
         LN["Lance native scan<br/>(DataFusion, FTS / vector indexes)"]
+        FR["Freshness service<br/>(per held shard: version, mapping, drift)"]
     end
     ST[("Lance table<br/>object store or filesystem")]
     CAT[("External catalog<br/>directory / Glue / Iceberg REST / ...")]
@@ -79,6 +80,7 @@ flowchart TD
     AT --> ST
     NS --> CAT
     NS --> ST
+    FR --> ST
 ```
 
 Six concerns make up the plugin.
@@ -91,8 +93,13 @@ REST or transport thread.
 The namespace and catalog layer owns registration and freshness. Attach registers one table;
 namespace registration points at a catalog (a filesystem directory, a Lance Namespace REST
 catalog, AWS Glue, Iceberg REST, Polaris or Unity) and a poll loop on the elected cluster manager
-surfaces new tables as indexes, advances indexes whose manifest moved, and classifies schema
-drift (rename, reset, drop) between polls.
+lists the catalog and surfaces new tables as indexes. Keeping an index fresh is the job of the
+node that holds its shard: a freshness service there checks each held index at the same cadence,
+advances the reader when the manifest (or the followed tag) moved, re-derives the mapping and
+sends a mapping update only when it changed, and classifies schema drift (rename, reset, drop)
+between checks. `POST /_lance/namespace/_poll` and `POST /{index}/_lance/sync` run the two
+jobs on demand. [docs/design/namespace-freshness.md](design/namespace-freshness.md) records why
+the split is drawn there.
 
 The dispatch layer decides, per request, which of two routes answers a `_search`. The fragment
 path intercepts the request before OpenSearch's shard fan-out, distributes the table's fragments
@@ -130,7 +137,7 @@ src/main/java/org/opensearch/lance/
 ├── execute/         # pushed-aggregate result decoding
 ├── index/           # the build_indexes transport actions
 ├── mapper/          # the lance_text and lance_vector field types
-├── namespace/       # catalog registration, poll loop, drift handling
+├── namespace/       # catalog registration, poll loop, per shard freshness, drift handling
 ├── plan/            # the Calcite planner
 │   ├── calcite/     #   conventions, schema, type system, cost, planner factory
 │   ├── cost/        #   the fitted latency model and its inputs
@@ -200,12 +207,43 @@ state.
 
 Namespace registration generalises attach to a catalog: the registration is stored in cluster
 state, and the poll loop (elected cluster manager only, so a large cluster does not stampede the
-catalog) enumerates the catalog's tables each cycle, surfaces new ones through the same
-derive-and-create path, and advances existing indexes whose manifest version moved — swapping the
-reader without closing the index. Deletion tombstones stop a deleted index from resurfacing on
-the next cycle, and schema drift detection uses Lance's immutable field ids to tell a renamed
-column from a replaced one. [Storage and follow-forward](#storage-and-follow-forward) covers the
-freshness semantics.
+catalog) enumerates the catalog's tables each cycle and surfaces new ones through the same
+derive-and-create path. Deletion tombstones stop a deleted index from resurfacing on the next
+cycle. The manager opens no table it is not about to surface.
+
+Freshness runs where the shard is. Every started Lance-backed shard registers with the node's
+freshness service through the shard lifecycle hooks, and the service checks it at the poll
+cadence: open the latest manifest, resolve the followed tag if any, compare with the version the
+shard's reader serves, and when they differ re-derive the mapping from the version about to be
+served, apply it only when it differs from the current one (a preflight merge into the shard's
+own mapper service decides), then refresh the shard — which is where the engine swaps the reader
+without closing the index — and retire the previous snapshot. Schema drift detection uses Lance's
+immutable field ids to tell a renamed column from a replaced one.
+
+```mermaid
+sequenceDiagram
+    participant S as Freshness service (node holding the shard)
+    participant L as Lance table
+    participant M as Shard mapper service
+    participant CM as Cluster manager
+    participant E as Shard engine
+    S->>L: open latest manifest (resolve tag)
+    S->>S: compare with the version the reader serves
+    alt version moved (or first check after the shard started)
+        S->>L: derive mapping from the target version
+        S->>M: preflight merge of the derived mapping
+        alt merged mapping differs
+            S->>CM: PutMapping (one cluster state task)
+        else keyword to lance_text flip refused
+            S->>CM: DeleteIndex, then CreateIndex with the new mapping
+        end
+        S->>E: refresh (reader swaps to the new version)
+    end
+```
+
+[Storage and follow-forward](#storage-and-follow-forward) covers the freshness semantics, and
+[docs/design/namespace-freshness.md](design/namespace-freshness.md) the reasons the check lives
+on the shard's node.
 
 ### Search: an aggregation
 
@@ -500,11 +538,11 @@ A Lance table is immutable per manifest version, and every write produces a new 
 plugin turns that into snapshot semantics: the per-node cache keys its open datasets and fragment
 lists by manifest version, so an in-flight request keeps reading the version it started on while
 the next request sees the new one. Follow-forward is what keeps an index useful under active
-writers — without it, an attached index would silently freeze at attach time. By default the poll
-loop notices a version advance and swaps the reader in place, with no shard close or
-reallocation. `"version": N` on attach pins a readonly snapshot that never advances; `"tag"`
-follows a Lance tag re-resolved every cycle, giving operators a moving pointer they control from
-the Lance side.
+writers — without it, an attached index would silently freeze at attach time. By default the
+freshness check on the node holding the shard notices a version advance and swaps the reader in
+place, with no shard close or reallocation. `"version": N` on attach pins a readonly snapshot
+that never advances; `"tag"` follows a Lance tag re-resolved every check, giving operators a
+moving pointer they control from the Lance side.
 
 Per-table credentials flow through the `storage_options` clause: parsed at attach, persisted in
 index settings, and handed to Lance's object store on every open, with credential-like values
@@ -550,6 +588,8 @@ In this repository:
 - [limitations.md](limitations.md) — known gaps and shard-path fall-throughs.
 - [getting-started.md](getting-started.md) — end-to-end walkthrough.
 - [CHANGELOG.md](../CHANGELOG.md) — what has landed, release by release.
+- [design/namespace-freshness.md](design/namespace-freshness.md) — why freshness runs on the
+  node holding the shard, and where the mapping goes from here.
 - Class Javadoc — the per-file reference this document deliberately stops short of.
 
 Outside:

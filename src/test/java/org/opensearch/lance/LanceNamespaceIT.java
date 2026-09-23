@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Locale;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -80,7 +81,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     public void testRegisterNamespaceRejectsFilePath() throws IOException {
         java.nio.file.Path base = sharedRoot();
         java.nio.file.Path file = java.nio.file.Files.createFile(
-            base.resolve("not-a-dir-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT) + ".lance")
+            base.resolve("not-a-dir-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT) + ".lance")
         );
         try {
             ResponseException failure = expectThrows(
@@ -125,7 +126,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     public void testListTablesReturnsSurfacedNames() throws Exception {
         // POST /_lance/namespace/tables previews what the poll would
         // surface without waiting for a poll cycle.
-        String suffix = "listtables-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "listtables-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         LanceTableFactory.writeTable(scratchDir, "alpha", 4);
         LanceTableFactory.writeTable(scratchDir, "bravo", 4);
@@ -140,6 +141,81 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             assertTrue("expected table alpha in list: " + body, body.contains("\"alpha\""));
             assertTrue("expected table bravo in list: " + body, body.contains("\"bravo\""));
         } finally {
+            try {
+                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testPollTriggerSurfacesATableDroppedIntoTheDirectory() throws Exception {
+        // POST /_lance/namespace/_poll runs the listing cycle now: a table
+        // written into a registered directory gets its index without
+        // waiting for the cadence, and the answer names it. The scheduled
+        // cycle (1s here) may surface it first; the trigger then finds the
+        // index and reports nothing, and the index exists either way.
+        String suffix = "polltrigger-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String first = "first-" + suffix;
+        String second = "second-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, first, 4);
+        try {
+            Response register = postJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
+            client().performRequest(new Request("GET", "/_cluster/health/" + first + "?wait_for_status=yellow&timeout=30s"));
+
+            LanceTableFactory.writeTable(scratchDir, second, 4);
+            Response poll = postJson("/_lance/namespace/_poll?name=" + scratchDir.toString(), "");
+            assertEquals(RestStatus.OK.getStatus(), poll.getStatusLine().getStatusCode());
+            String body = readAll(poll);
+            java.util.Map<String, Object> parsed = parseJson(body);
+            assertTrue("surfaced is a list: " + body, parsed.get("surfaced") instanceof List<?>);
+            assertTrue("skipped is a list: " + body, parsed.get("skipped") instanceof List<?>);
+            assertTrue("unavailable is an object: " + body, parsed.get("unavailable") instanceof java.util.Map<?, ?>);
+            assertFalse("an existing index of the table is not a skip: " + body, body.contains("\"index\":\"" + first + "\""));
+            Response health = client().performRequest(
+                new Request("GET", "/_cluster/health/" + second + "?wait_for_status=yellow&timeout=30s")
+            );
+            assertEquals("the new table has its index after the trigger: " + readAll(health), 200, health.getStatusLine().getStatusCode());
+
+            // A registration nobody knows: nothing to list, nothing done.
+            String unknown = readAll(postJson("/_lance/namespace/_poll?name=/no-such-registration-" + suffix, ""));
+            assertEquals("{\"surfaced\":[],\"skipped\":[],\"unavailable\":{}}", unknown);
+        } finally {
+            for (String index : List.of(first, second)) {
+                try {
+                    client().performRequest(new Request("DELETE", "/" + index));
+                } catch (Exception ignored) {}
+            }
+            try {
+                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testPollTriggerReportsANameCollision() throws Exception {
+        // An index that exists under the table's name and is not backed by
+        // the table is left alone, and the trigger says why.
+        String suffix = "pollclash-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String clashing = "clash-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, clashing, 4);
+        try {
+            Request plain = new Request("PUT", "/" + clashing);
+            plain.setJsonEntity("{\"settings\":{\"index.number_of_shards\":1,\"index.number_of_replicas\":0}}");
+            client().performRequest(plain);
+            Response register = postJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
+
+            String body = readAll(postJson("/_lance/namespace/_poll", ""));
+            assertTrue("the clashing table is skipped: " + body, body.contains("\"index\":\"" + clashing + "\""));
+            assertTrue("with the collision as the reason: " + body, body.contains("name collision"));
+            assertTrue("the plain index is untouched: " + body, body.contains("\"surfaced\":[]"));
+            String settings = readAll(client().performRequest(new Request("GET", "/" + clashing + "/_settings")));
+            assertFalse("the plain index stays plain: " + settings, settings.contains("index.lance.table"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + clashing));
+            } catch (Exception ignored) {}
             try {
                 deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             } catch (Exception ignored) {}
@@ -171,7 +247,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         // An index deleted through DELETE /{index} must stay deleted for
         // the resurface grace period. A short grace keeps the post-grace
         // assertion inside the test's wall-clock budget.
-        String suffix = "resurface-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "resurface-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 4);
@@ -220,7 +296,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     public void testResurfaceGuardDisabledByZeroGrace() throws Exception {
         // Grace 0 disables the tombstone check: the next poll recreates
         // the index immediately.
-        String suffix = "resurface0-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "resurface0-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 4);
@@ -254,7 +330,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         // Namespace-level storage_options apply to every auto-surfaced
         // index under it, so a namespace pointing at an S3 root carries
         // the credentials once for all of its tables.
-        String suffix = "nsso-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "nsso-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 2);

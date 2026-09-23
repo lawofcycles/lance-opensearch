@@ -44,6 +44,8 @@ import org.opensearch.lance.query.LanceFtsQuery;
  * {@link FragmentPlanRefiner}'s node wide counters: the pushed
  * operations the fragment executor moved to the Lucene side, per
  * reason, and the requests the Lance scan and Lucene each answered.
+ * {@code freshness} reads the node's {@code LanceIndexFreshnessService}
+ * counters: the checks of the Lance backed shards this node holds.
  */
 public final class LanceStatsCollector {
 
@@ -52,6 +54,7 @@ public final class LanceStatsCollector {
     private final Supplier<IndexCacheSizing> indexCacheSizing;
     private final LanceIndexWarmer indexWarmer;
     private final Supplier<Map<String, LanceLocalClones.CloneStat>> localClones;
+    private final Supplier<LanceNodeStats.FreshnessStats> freshness;
 
     /**
      * @param warmCache        the node's snapshot cache, or {@code null}
@@ -97,11 +100,29 @@ public final class LanceStatsCollector {
         LanceIndexWarmer indexWarmer,
         Supplier<Map<String, LanceLocalClones.CloneStat>> localClones
     ) {
+        this(warmCache, sessionBytes, indexCacheSizing, indexWarmer, localClones, null);
+    }
+
+    /**
+     * @param freshness reads this node's freshness counters (the checks of
+     *                  the Lance backed shards it holds), or {@code null}
+     *                  when the plugin created no freshness service (the
+     *                  {@code freshness} block is then all zeros)
+     */
+    public LanceStatsCollector(
+        LanceWarmCache warmCache,
+        LongSupplier sessionBytes,
+        Supplier<IndexCacheSizing> indexCacheSizing,
+        LanceIndexWarmer indexWarmer,
+        Supplier<Map<String, LanceLocalClones.CloneStat>> localClones,
+        Supplier<LanceNodeStats.FreshnessStats> freshness
+    ) {
         this.warmCache = warmCache;
         this.sessionBytes = sessionBytes;
         this.indexCacheSizing = indexCacheSizing;
         this.indexWarmer = indexWarmer;
         this.localClones = localClones;
+        this.freshness = freshness;
     }
 
     /** The node's cache figures with no index block; {@link #collect(List)} adds the shard readers. */
@@ -150,6 +171,7 @@ public final class LanceStatsCollector {
             }
             cloneStats.sort((a, b) -> a.index().compareTo(b.index()));
         }
+        LanceNodeStats.FreshnessStats freshnessStats = freshness == null ? LanceNodeStats.FreshnessStats.NONE : freshness.get();
         if (warmCache == null) {
             return new LanceNodeStats(
                 false,
@@ -185,7 +207,8 @@ public final class LanceStatsCollector {
                 0,
                 0L,
                 FragmentPlanRefiner.refinementCounts(),
-                FragmentPlanRefiner.executedCounts()
+                FragmentPlanRefiner.executedCounts(),
+                freshnessStats
             );
         }
         ColumnStore store = warmCache.columnStore();
@@ -223,7 +246,8 @@ public final class LanceStatsCollector {
             warmCache.tableStatistics().size(),
             warmCache.tableStatistics().collectMillisTotal(),
             FragmentPlanRefiner.refinementCounts(),
-            FragmentPlanRefiner.executedCounts()
+            FragmentPlanRefiner.executedCounts(),
+            freshnessStats
         );
     }
 }
