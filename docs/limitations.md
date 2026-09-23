@@ -156,7 +156,7 @@ The coordinator orders hits with equal scores or equal sort values by their Lanc
 
 Items on the roadmap that no version of the plugin ships today.
 
-- Analytics route via `sandbox/plugins/analytics-backend-datafusion`. Every query currently takes the reader route.
+- Analytics route via `sandbox/plugins/analytics-backend-datafusion`. Every query currently takes the reader route. The reader route already reaches Lance's DataFusion-backed columnar aggregation for the shapes the [Aggregation pushdown](features.md#aggregation-pushdown) covers, and Lance's scalar index resolver consults the Zone Map, BTree and Bitmap indexes whenever the scan carries a filter. What the analytics route adds is a DataFusion runtime shared across plugins, the PPL and SQL entry points, and aggregation trees richer than the single `AggregateRel` root Lance accepts inside a scan; it is not the only path to SIMD aggregation or Zone Map pruning.
 - PPL / SQL integration (lives in `opensearch-project/sql`).
 - Text analysis beyond Lance's native tokenizer. The RFC's second text mode (OpenSearch analyzer plus a derived column backfilled by the plugin) is only proven for English today.
 - Native ingestion via `_bulk` / `_doc` (RFC future work item 1).
