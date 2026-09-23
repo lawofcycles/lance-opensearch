@@ -13,6 +13,7 @@ import org.opensearch.action.search.SearchResponseSections;
 import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.document.DocumentField;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.lance.dispatch.LanceFragmentQueryResponse;
@@ -31,7 +32,9 @@ import org.opensearch.search.sort.SortOrder;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Mutable accumulator that folds every fan-out result into the final
@@ -77,6 +80,10 @@ public final class MergeReducer {
     // track_total_hits bound the executors counted up to; decides
     // the hits.total relation in buildResponse.
     private final int trackTotalHitsUpTo;
+    // The request's collapse field, or null without collapse. The
+    // executors already return one hit per distinct value of their
+    // fragments; the merge keeps one per value across them.
+    private final String collapseField;
     private long totalMatched = 0L;
     // Set when any executor stopped counting at the bound, so the
     // summed total is a lower bound even if it did not exceed
@@ -105,6 +112,7 @@ public final class MergeReducer {
     private int targetOrdinal = -1;
     private final List<InternalAggregations> perNodeAggregations = new ArrayList<>();
 
+    /** A reducer of a request without {@code collapse}. */
     public MergeReducer(
         ClusterService clusterService,
         BigArrays bigArrays,
@@ -118,6 +126,36 @@ public final class MergeReducer {
         boolean trackScores,
         int trackTotalHitsUpTo
     ) {
+        this(
+            clusterService,
+            bigArrays,
+            scriptService,
+            aggregationsRequested,
+            sorts,
+            from,
+            size,
+            versionRequested,
+            seqNoAndPrimaryTermRequested,
+            trackScores,
+            trackTotalHitsUpTo,
+            null
+        );
+    }
+
+    public MergeReducer(
+        ClusterService clusterService,
+        BigArrays bigArrays,
+        ScriptService scriptService,
+        AggregatorFactories.Builder aggregationsRequested,
+        List<SortBuilder<?>> sorts,
+        int from,
+        int size,
+        boolean versionRequested,
+        boolean seqNoAndPrimaryTermRequested,
+        boolean trackScores,
+        int trackTotalHitsUpTo,
+        String collapseField
+    ) {
         this.clusterService = clusterService;
         this.bigArrays = bigArrays;
         this.scriptService = scriptService;
@@ -129,6 +167,7 @@ public final class MergeReducer {
         this.seqNoAndPrimaryTermRequested = seqNoAndPrimaryTermRequested;
         this.trackScores = trackScores;
         this.trackTotalHitsUpTo = trackTotalHitsUpTo;
+        this.collapseField = collapseField;
     }
 
     /** Fold one target's per-node responses (in fan-out order) into the accumulated state. */
@@ -232,8 +271,13 @@ public final class MergeReducer {
         // then apply from/size so the response reflects the
         // requested pagination window. Every node returned up to
         // from + size hits, so the merged list always holds the
-        // global top from + size.
+        // global top from + size. Under collapse every node returned
+        // its top from + size groups, one hit each, and the merged
+        // list is cut to one hit per value before the window applies.
         List<SearchHit> hits = mergeHits(perNodeHits, sorts);
+        if (collapseField != null) {
+            hits = collapseHits(hits, collapseField);
+        }
         SearchHit[] paged;
         if (hits.size() <= from) {
             paged = new SearchHit[0];
@@ -244,12 +288,16 @@ public final class MergeReducer {
         // max_score follows the shard path's TopDocsCollectorContext: a
         // score ordered page (no sort, or a leading descending _score
         // clause) reports its top score, a sort with track_scores the
-        // largest score of the paged window, and any other sort NaN,
+        // largest score of the merged window, and any other sort NaN,
         // although its hits carry a score when a _score clause sits
-        // among the sort clauses. NaN also when no hit survives paging.
+        // among the sort clauses. The window is read before the from
+        // cut, as the shard path reads each shard's top docs before the
+        // coordinator skips from (a rescored page reports the best
+        // rescored score whatever from is). NaN also when no hit
+        // survives the merge.
         float maxScore = Float.NaN;
         if (scoreOrdered(sorts) || trackScores) {
-            for (SearchHit hit : paged) {
+            for (SearchHit hit : hits) {
                 float score = hit.getScore();
                 if (Float.isNaN(score)) {
                     continue;
@@ -384,6 +432,36 @@ public final class MergeReducer {
      * total order over every hit of the request.
      */
     public record RankedHit(SearchHit hit, int target, long rowAddr) {
+    }
+
+    /**
+     * One hit per distinct value of {@code collapseField} out of the
+     * merged, ordered union: the first hit of each value in merged order
+     * survives, which is the group's best hit under the request's sort
+     * across every executor, and the rest of the group is dropped. This
+     * is the walk {@code CollapseTopFieldDocs.merge} does over the
+     * shards' collapsed pages on the shard path, with the merged order
+     * standing in for its priority queue. The value is read from the
+     * doc value field the executor's fetch phase added for the collapse
+     * field (the same field the shard path's response carries); a hit
+     * without a value belongs to the group of the missing value, as it
+     * does in the collapsing collector.
+     */
+    public static List<SearchHit> collapseHits(List<SearchHit> merged, String collapseField) {
+        Set<Object> seen = new HashSet<>();
+        List<SearchHit> out = new ArrayList<>(merged.size());
+        for (SearchHit hit : merged) {
+            if (seen.add(collapseValueOf(hit, collapseField))) {
+                out.add(hit);
+            }
+        }
+        return out;
+    }
+
+    /** The collapse value of {@code hit}: its doc value field {@code field}'s first value, or null without one. */
+    public static Object collapseValueOf(SearchHit hit, String field) {
+        DocumentField documentField = hit.field(field);
+        return documentField == null ? null : documentField.getValue();
     }
 
     private static Comparator<RankedHit> hitComparator(List<SortBuilder<?>> sorts) {

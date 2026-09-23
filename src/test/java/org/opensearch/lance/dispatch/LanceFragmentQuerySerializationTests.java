@@ -15,14 +15,22 @@ import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.index.query.InnerHitBuilder;
+import org.opensearch.index.query.MatchAllQueryBuilder;
+import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchModule;
+import org.opensearch.search.collapse.CollapseBuilder;
 import org.opensearch.search.fetch.StoredFieldsContext;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.search.fetch.subphase.FieldAndFormat;
 import org.opensearch.search.internal.SearchContext;
+import org.opensearch.search.rescore.QueryRescoreMode;
+import org.opensearch.search.rescore.QueryRescorerBuilder;
+import org.opensearch.search.sort.FieldSortBuilder;
+import org.opensearch.search.sort.SortOrder;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -237,6 +245,90 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         assertFalse(restored.hasCollectorKnobs());
         assertEquals(HitProjection.NONE, restored.projection());
         assertTrue(restored.projection().isEmpty());
+    }
+
+    public void testRequestRescoreAndCollapseRoundTrip() throws Exception {
+        // The rescorers travel as named writeables (the search module
+        // registers the query rescorer) and the collapse as the stock
+        // Writeable, inner hits and the concurrency bound included.
+        QueryRescorerBuilder first = new QueryRescorerBuilder(new TermQueryBuilder("category", "c1")).windowSize(25)
+            .setQueryWeight(0.7f)
+            .setRescoreQueryWeight(1.2f)
+            .setScoreMode(QueryRescoreMode.Max);
+        QueryRescorerBuilder second = new QueryRescorerBuilder(new MatchAllQueryBuilder());
+        CollapseBuilder collapse = new CollapseBuilder("category").setInnerHits(
+            new InnerHitBuilder("top").setSize(2).addSort(new FieldSortBuilder("id").order(SortOrder.DESC))
+        ).setMaxConcurrentGroupRequests(3);
+        LanceFragmentQueryRequest original = new LanceFragmentQueryRequest(
+            "/tmp/table.lance",
+            "demo",
+            StorageOptions.empty(),
+            /* pinnedVersion */ -1L,
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, null),
+            /* query */ null,
+            /* postFilter */ null,
+            Collections.emptyList(),
+            /* searchAfter */ null,
+            5,
+            /* aggregations */ null,
+            Collections.emptyList(),
+            /* trackScores */ false,
+            SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO,
+            /* minScore */ null,
+            /* terminateAfter */ 0,
+            HitProjection.NONE,
+            List.of(first, second),
+            collapse
+        );
+        assertEquals("the first pass collects the largest window", 25, original.firstPassSize());
+        LanceFragmentQueryRequest restored;
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (
+                StreamInput raw = out.bytes().streamInput();
+                NamedWriteableAwareStreamInput in = new NamedWriteableAwareStreamInput(raw, AGG_REGISTRY)
+            ) {
+                restored = new LanceFragmentQueryRequest(in);
+            }
+        }
+        assertEquals(List.of(first, second), restored.rescores());
+        assertEquals(Integer.valueOf(25), restored.rescores().get(0).windowSize());
+        assertNull("a rescorer without a window keeps none on the wire", restored.rescores().get(1).windowSize());
+        assertEquals(collapse, restored.collapse());
+        assertEquals("category", restored.collapse().getField());
+        assertEquals(1, restored.collapse().getInnerHits().size());
+        assertEquals("top", restored.collapse().getInnerHits().get(0).getName());
+        assertEquals(3, restored.collapse().getMaxConcurrentGroupRequests());
+        assertEquals(25, restored.firstPassSize());
+    }
+
+    public void testRequestWithoutRescoreOrCollapseRoundTrip() throws Exception {
+        LanceFragmentQueryRequest original = new LanceFragmentQueryRequest(
+            "/tmp/table.lance",
+            "demo",
+            StorageOptions.empty(),
+            -1L,
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, null),
+            null,
+            null,
+            Collections.emptyList(),
+            null,
+            5,
+            null,
+            Collections.emptyList(),
+            false,
+            SearchContext.TRACK_TOTAL_HITS_ACCURATE
+        );
+        LanceFragmentQueryRequest restored;
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                restored = new LanceFragmentQueryRequest(in);
+            }
+        }
+        assertTrue(restored.rescores().isEmpty());
+        assertNull(restored.collapse());
+        assertEquals("without rescorers the first pass is the page", 5, restored.firstPassSize());
     }
 
     public void testResponseTerminatedEarlyRoundTrip() throws Exception {

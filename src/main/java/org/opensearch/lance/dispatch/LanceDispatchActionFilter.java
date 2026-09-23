@@ -63,8 +63,8 @@ import org.opensearch.transport.client.Client;
  *       {@link LanceAggregationSupport#isSupported}). The shape
  *       decision is planned: {@link SearchRequestToRel#translateDispatch}
  *       marks a body holding an element the fragment executor cannot
- *       answer correctly — suggester, highlighter, {@code collapse},
- *       {@code rescore}, pipeline aggregations — and the planner
+ *       answer correctly — suggester, highlighter, pipeline
+ *       aggregations — and the planner
  *       answers such a body with a {@link ShardPathFallbackExec}
  *       root, which routes the request to the shard path.</li>
  *   <li>Delegate the request to {@link LanceCoordinatorAction} via
@@ -187,10 +187,9 @@ public class LanceDispatchActionFilter implements ActionFilter {
         RelNode dispatchPlan = planDispatch(searchRequest);
         if (!isDispatchable(dispatchPlan)) {
             // The planner answered the body with a shard path fallback:
-            // it carries an element (suggest, highlighter, collapse,
-            // rescore, a pipeline aggregation) the fragment executor
-            // does not serve. Fall through so the
-            // standard path can still answer.
+            // it carries an element (suggest, highlighter, a pipeline
+            // aggregation) the fragment executor does not serve. Fall
+            // through so the standard path can still answer.
             planExecutor.executeShardPath(dispatchPlan, () -> proceedOnShardPath(task, action, request, listener, chain, concrete));
             return;
         }

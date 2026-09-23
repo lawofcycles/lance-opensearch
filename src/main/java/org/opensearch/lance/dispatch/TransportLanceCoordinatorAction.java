@@ -69,10 +69,12 @@ import org.opensearch.search.SearchService;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.collapse.CollapseBuilder;
 import org.opensearch.search.fetch.StoredFieldsContext;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.search.fetch.subphase.FieldAndFormat;
 import org.opensearch.search.internal.SearchContext;
+import org.opensearch.search.rescore.RescorerBuilder;
 import org.opensearch.search.sort.SortBuilder;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.Task;
@@ -312,6 +314,22 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         Float minScore = source == null ? null : source.minScore();
         int terminateAfter = source == null ? 0 : source.terminateAfter();
         HitProjection projection = resolveProjection(source);
+        List<RescorerBuilder<?>> rescores = resolveRescores(source);
+        CollapseBuilder collapse = source == null ? null : source.collapse();
+        if (collapse != null) {
+            // The two combinations SearchService.parseSource refuses
+            // before any mapping is consulted, with its messages; the
+            // shard path reports them as a search exception (500), here
+            // they are the client's error and answer 400. The rest of
+            // the collapse checks need the mapping and run on the
+            // executors.
+            if (searchRequest.scroll() != null) {
+                throw new IllegalArgumentException("cannot use `collapse` in a scroll context");
+            }
+            if (!rescores.isEmpty()) {
+                throw new IllegalArgumentException("cannot use `collapse` in conjunction with `rescore`");
+            }
+        }
 
         Index[] concrete = indexNameExpressionResolver.concreteIndices(clusterService.state(), searchRequest);
         List<IndexTarget> targets = resolveTargets(concrete);
@@ -348,7 +366,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             trackTotalHitsUpTo,
             minScore,
             terminateAfter,
-            projection
+            projection,
+            rescores,
+            collapse
         );
         boolean versionRequested = source != null && Boolean.TRUE.equals(source.version());
         boolean seqNoAndPrimaryTermRequested = source != null && Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
@@ -363,9 +383,54 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             versionRequested,
             seqNoAndPrimaryTermRequested,
             source != null && source.trackScores(),
-            trackTotalHitsUpTo
+            trackTotalHitsUpTo,
+            collapse == null ? null : collapse.getField()
         );
-        runIndexLoop(targets, 0, nodeList, spec, policy, merged, start, listener);
+        runIndexLoop(targets, 0, nodeList, spec, policy, merged, start, expandingListener(searchRequest, collapse, policy, listener));
+    }
+
+    /**
+     * The request's {@code rescore} list, empty when it has none. The
+     * builders travel to the executors as they are; the executors build
+     * the rescore contexts against their mapping.
+     */
+    private static List<RescorerBuilder<?>> resolveRescores(SearchSourceBuilder source) {
+        if (source == null || source.rescores() == null || source.rescores().isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<RescorerBuilder<?>> rescores = new ArrayList<>(source.rescores().size());
+        for (RescorerBuilder<?> rescore : source.rescores()) {
+            rescores.add(rescore);
+        }
+        return rescores;
+    }
+
+    /**
+     * The listener that completes the request: the merged response as
+     * it is, or, when the body's {@code collapse} carries
+     * {@code inner_hits}, the response after {@link CollapseExpansion}
+     * attached the inner hits of every collapsed group.
+     */
+    private ActionListener<SearchResponse> expandingListener(
+        SearchRequest searchRequest,
+        CollapseBuilder collapse,
+        FanOutPolicy policy,
+        ActionListener<SearchResponse> listener
+    ) {
+        if (collapse == null || collapse.getInnerHits() == null || collapse.getInnerHits().isEmpty()) {
+            return listener;
+        }
+        return ActionListener.wrap(
+            response -> new CollapseExpansion(
+                client,
+                clusterService.localNode().getId(),
+                searchRequest,
+                collapse,
+                policy.task(),
+                threadPool.info(LancePlugin.LANCE_COORDINATOR_THREAD_POOL).getMax()
+            ).expand(response, listener),
+            listener::onFailure
+        );
     }
 
     /**
@@ -727,7 +792,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             spec.trackTotalHitsUpTo(),
             spec.minScore(),
             spec.terminateAfter(),
-            spec.projection()
+            spec.projection(),
+            spec.rescores(),
+            spec.collapse()
         );
     }
 
@@ -974,7 +1041,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      */
     private record FragmentQuerySpec(FragmentPlan plan, QueryBuilder query, QueryBuilder postFilter, List<SortBuilder<?>> sorts,
         Object[] searchAfter, int from, int effectiveSize, AggregatorFactories.Builder aggregations, boolean trackScores,
-        int trackTotalHitsUpTo, Float minScore, int terminateAfter, HitProjection projection) {
+        int trackTotalHitsUpTo, Float minScore, int terminateAfter, HitProjection projection, List<RescorerBuilder<?>> rescores,
+        CollapseBuilder collapse) {
 
         /** The same spec carrying the plan derived for one target. */
         FragmentQuerySpec withPlan(FragmentPlan targetPlan) {
@@ -991,7 +1059,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 trackTotalHitsUpTo,
                 minScore,
                 terminateAfter,
-                projection
+                projection,
+                rescores,
+                collapse
             );
         }
 
@@ -1009,7 +1079,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 from,
                 effectiveSize,
                 aggregations,
-                minScore != null || terminateAfter > 0
+                minScore != null || terminateAfter > 0,
+                !rescores.isEmpty() || collapse != null
             );
         }
     }

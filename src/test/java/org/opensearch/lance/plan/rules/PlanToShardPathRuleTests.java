@@ -59,14 +59,16 @@ public class PlanToShardPathRuleTests extends OpenSearchTestCase {
         assertFallsBack("{\"query\":{\"match_all\":{}},\"highlight\":{\"fields\":{\"body\":{}}}}", ShardPathReason.HIGHLIGHT);
     }
 
-    public void testCollapseFallsBack() throws IOException {
-        assertFallsBack("{\"collapse\":{\"field\":\"category\"}}", ShardPathReason.COLLAPSE);
-    }
-
-    public void testRescoreFallsBack() throws IOException {
-        assertFallsBack(
-            "{\"query\":{\"match_all\":{}},\"rescore\":{\"window_size\":10,\"query\":{\"rescore_query\":{\"match_all\":{}}}}}",
-            ShardPathReason.RESCORE
+    public void testCollapseAndRescoreAreDispatchable() throws IOException {
+        // Both run on the fragment executors: the collapsing collector
+        // and the rescorers work over the Lucene collector's page.
+        assertDispatchable("{\"collapse\":{\"field\":\"category\"}}");
+        assertDispatchable(
+            "{\"query\":{\"match_all\":{}},\"rescore\":{\"window_size\":10,\"query\":{\"rescore_query\":{\"match_all\":{}}}}}"
+        );
+        assertDispatchable(
+            "{\"size\":5,\"collapse\":{\"field\":\"category\",\"inner_hits\":{\"name\":\"top\",\"size\":2}},"
+                + "\"query\":{\"term\":{\"rating\":5}}}"
         );
     }
 
@@ -87,11 +89,11 @@ public class PlanToShardPathRuleTests extends OpenSearchTestCase {
 
     public void testCombinedReasonsRideOneFallback() throws IOException {
         RelNode physical = plan(
-            "{\"size\":5,\"query\":{\"match_all\":{}},\"collapse\":{\"field\":\"category\"},"
-                + "\"rescore\":{\"window_size\":10,\"query\":{\"rescore_query\":{\"match_all\":{}}}}}"
+            "{\"size\":5,\"query\":{\"match_all\":{}},\"suggest\":{\"s\":{\"text\":\"hello\",\"term\":{\"field\":\"body\"}}},"
+                + "\"highlight\":{\"fields\":{\"body\":{}}}}"
         );
         assertTrue("the shard path operator answers the shape: " + physical, physical instanceof ShardPathFallbackExec);
-        assertEquals(List.of(ShardPathReason.COLLAPSE, ShardPathReason.RESCORE), ((ShardPathFallbackExec) physical).reasons());
+        assertEquals(List.of(ShardPathReason.SUGGEST, ShardPathReason.HIGHLIGHT), ((ShardPathFallbackExec) physical).reasons());
     }
 
     public void testCollectorKnobsAndProjectionsAreDispatchable() throws IOException {
@@ -140,11 +142,11 @@ public class PlanToShardPathRuleTests extends OpenSearchTestCase {
 
     public void testShardPathReasonsCollectEveryElement() throws IOException {
         SearchSourceBuilder source = PlanTestFixtures.parse(
-            "{\"size\":1,\"highlight\":{\"fields\":{\"body\":{}}},\"collapse\":{\"field\":\"category\"},"
-                + "\"rescore\":{\"window_size\":10,\"query\":{\"rescore_query\":{\"match_all\":{}}}}}"
+            "{\"size\":0,\"suggest\":{\"s\":{\"text\":\"hello\",\"term\":{\"field\":\"body\"}}},\"highlight\":{\"fields\":{\"body\":{}}},"
+                + "\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}},\"ab\":{\"avg_bucket\":{\"buckets_path\":\"by>_count\"}}}}"
         );
         assertEquals(
-            List.of(ShardPathReason.HIGHLIGHT, ShardPathReason.COLLAPSE, ShardPathReason.RESCORE),
+            List.of(ShardPathReason.SUGGEST, ShardPathReason.HIGHLIGHT, ShardPathReason.PIPELINE_AGG),
             SearchRequestToRel.shardPathReasons(source)
         );
     }

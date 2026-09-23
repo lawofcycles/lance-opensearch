@@ -10,6 +10,7 @@ import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -1662,21 +1663,38 @@ public final class LanceTableFactory {
      * @return absolute URI of the table.
      */
     public static String writeInterleavedTable(Path parent, String name, int fragments, int rowsPerFragment) throws Exception {
-        return withLocaleRoot(() -> writeInterleavedTableOnce(parent, name, fragments, rowsPerFragment));
+        return withLocaleRoot(() -> writeInterleavedTableOnce(parent, name, fragments, rowsPerFragment, false));
     }
 
-    private static String writeInterleavedTableOnce(Path parent, String name, int fragments, int rowsPerFragment) throws Exception {
+    /**
+     * {@link #writeInterleavedTable} with one more column, for tests of
+     * grouping by a numeric field: {@code bucket}, int64,
+     * {@code i % 4}, so every value repeats across fragments and a
+     * group's rows sit on different nodes once the fragments are dealt
+     * out. Public for the same reason as {@link #writeInterleavedTable}.
+     *
+     * @return absolute URI of the table.
+     */
+    public static String writeBucketedInterleavedTable(Path parent, String name, int fragments, int rowsPerFragment) throws Exception {
+        return withLocaleRoot(() -> writeInterleavedTableOnce(parent, name, fragments, rowsPerFragment, true));
+    }
+
+    private static String writeInterleavedTableOnce(Path parent, String name, int fragments, int rowsPerFragment, boolean withBucket)
+        throws Exception {
         Path tablePath = parent.resolve(name + ".lance");
         String uri = tablePath.toString();
-        Schema schema = new Schema(
+        List<Field> fields = new ArrayList<>(
             Arrays.asList(
                 new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
                 new Field(BODY_COLUMN, FieldType.nullable(new ArrowType.Utf8()), null),
                 new Field("category", FieldType.nullable(new ArrowType.Utf8()), null),
                 new Field("ts", FieldType.nullable(new ArrowType.Timestamp(TimeUnit.MICROSECOND, null)), null)
-            ),
-            Map.of()
+            )
         );
+        if (withBucket) {
+            fields.add(new Field("bucket", FieldType.nullable(new ArrowType.Int(64, true)), null));
+        }
+        Schema schema = new Schema(fields, Map.of());
         long epochMicros = Instant.parse("2024-01-01T00:00:00Z").toEpochMilli() * 1000L;
         long dayMicros = 24L * 60L * 60L * 1_000_000L;
 
@@ -1691,10 +1709,14 @@ public final class LanceTableFactory {
                     VarCharVector bodyVector = (VarCharVector) root.getVector(BODY_COLUMN);
                     VarCharVector categoryVector = (VarCharVector) root.getVector("category");
                     TimeStampMicroVector tsVector = (TimeStampMicroVector) root.getVector("ts");
+                    BigIntVector bucketVector = withBucket ? (BigIntVector) root.getVector("bucket") : null;
                     idVector.allocateNew(rowsPerFragment);
                     bodyVector.allocateNew();
                     categoryVector.allocateNew();
                     tsVector.allocateNew(rowsPerFragment);
+                    if (bucketVector != null) {
+                        bucketVector.allocateNew(rowsPerFragment);
+                    }
                     for (int slot = 0; slot < rowsPerFragment; slot++) {
                         int i = fragment + slot * fragments;
                         idVector.set(slot, i);
@@ -1702,11 +1724,17 @@ public final class LanceTableFactory {
                         bodyVector.setSafe(slot, body.getBytes(StandardCharsets.UTF_8));
                         categoryVector.setSafe(slot, ("c" + (i % 3)).getBytes(StandardCharsets.UTF_8));
                         tsVector.set(slot, epochMicros + i * dayMicros);
+                        if (bucketVector != null) {
+                            bucketVector.set(slot, i % 4);
+                        }
                     }
                     idVector.setValueCount(rowsPerFragment);
                     bodyVector.setValueCount(rowsPerFragment);
                     categoryVector.setValueCount(rowsPerFragment);
                     tsVector.setValueCount(rowsPerFragment);
+                    if (bucketVector != null) {
+                        bucketVector.setValueCount(rowsPerFragment);
+                    }
                     root.setRowCount(rowsPerFragment);
                     try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
                         writer.start();

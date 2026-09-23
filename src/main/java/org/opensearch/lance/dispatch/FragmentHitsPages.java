@@ -46,6 +46,8 @@ import org.apache.lucene.search.TopScoreDocCollectorManager;
 import org.apache.lucene.search.TotalHitCountCollector;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.Weight;
+import org.apache.lucene.search.grouping.CollapseTopFieldDocs;
+import org.apache.lucene.search.grouping.CollapsingTopDocsCollector;
 import org.apache.lucene.util.BytesRef;
 import org.lance.Dataset;
 import org.lance.ipc.ColumnOrdering;
@@ -59,8 +61,10 @@ import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceKnnQuery;
 import org.opensearch.search.SearchHit;
+import org.opensearch.search.collapse.CollapseContext;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
+import org.opensearch.search.rescore.RescoreContext;
 import org.opensearch.search.sort.SortAndFormats;
 
 /**
@@ -69,9 +73,12 @@ import org.opensearch.search.sort.SortAndFormats;
  * readers: {@link #viaIndexSearcher} through Lucene's top docs
  * collectors (with the request's {@code min_score} and
  * {@code terminate_after} composed around them, see
- * {@link CollectorKnobs}), or {@link #viaLanceSortedScan} from one
+ * {@link CollectorKnobs}), {@link #viaCollapsingCollector} through the
+ * collapsing collector of a {@code collapse} request, or
+ * {@link #viaLanceSortedScan} from one
  * ordered, limited Lance scan when the coordinator's plan pushed the
- * page into the scan. {@link #materialise} then renders the hits of
+ * page into the scan. {@link #rescore} re scores a collected first pass
+ * with the request's rescorers. {@link #materialise} then renders the hits of
  * either page through {@link FragmentFetchPhase}, so the hit envelope
  * ({@code _id}, {@code _source} under the request's source filter,
  * {@code stored_fields}, {@code docvalue_fields}, {@code fields},
@@ -234,6 +241,123 @@ final class FragmentHitsPages {
             }
         }
         return new CollectedPage(topDocs.scoreDocs, knobs.any() ? topDocs.totalHits : null, terminatedEarly);
+    }
+
+    /**
+     * Collect the top-{@code size} collapsed page of {@code query}: one
+     * hit per distinct value of the collapse field, the best hit of each
+     * group under the request's sort (score order without one), through
+     * {@link CollapseContext#createTopDocs} the way the shard path's
+     * {@code CollapsingTopDocsCollectorContext} does. One collapsing
+     * collector runs per slice and the slices' {@link CollapseTopFieldDocs}
+     * are merged with {@link CollapseTopFieldDocs#merge}, which is the
+     * reduce the shard path applies under concurrent segment search.
+     * {@code after} is the {@code search_after} cursor (the sort is then
+     * the collapse field alone, checked by the caller), pinned as in
+     * {@link #viaIndexSearcher}. The knobs compose around the collector
+     * as for a plain page; with either present the match count is the
+     * collapsing collector's document count, which is what the shard
+     * path reports for the same body. The page's {@link FieldDoc}s carry
+     * the group's sort values (the score, under score order); the
+     * collapse value of every hit reaches the coordinator as the doc
+     * value field the fetch phase adds for the collapse field.
+     */
+    static CollectedPage viaCollapsingCollector(
+        LanceFragmentIndexSearcher searcher,
+        Query query,
+        Weight sharedWeight,
+        CollapseContext collapse,
+        SortAndFormats sortAndFormats,
+        FieldDoc after,
+        int size,
+        CollectorKnobs knobs,
+        int trackTotalHitsUpTo
+    ) throws IOException {
+        if (size <= 0) {
+            // A count only request collapses nothing; the plain path
+            // counts it (or collects nothing without knobs).
+            return viaIndexSearcher(searcher, query, sharedWeight, sortAndFormats, after, size, false, knobs, trackTotalHitsUpTo);
+        }
+        int numHits = cappedNumHits(searcher, size);
+        FieldDoc cursor = after == null ? null : pinnedCursor(searcher, after);
+        Sort sort = sortAndFormats == null ? Sort.RELEVANCE : sortAndFormats.sort.rewrite(searcher);
+        CollectorKnobs.Wrapped<CollapsingTopDocsCollector<?>, CollapseTopFieldDocs> manager = knobs.wrap(
+            new CollapsingCollectorManager(collapse, sort, numHits, cursor)
+        );
+        Boolean terminatedEarly = knobs.terminatesEarly() ? Boolean.FALSE : null;
+        CollapseTopFieldDocs topDocs;
+        try {
+            topDocs = sharedWeight == null ? searcher.search(query, manager) : searcher.search(sharedWeight, manager);
+        } catch (CollectorKnobs.Terminated terminated) {
+            terminatedEarly = Boolean.TRUE;
+            topDocs = manager.reduceCreated();
+        }
+        return new CollectedPage(topDocs.scoreDocs, knobs.any() ? topDocs.totalHits : null, terminatedEarly);
+    }
+
+    /**
+     * One {@link CollapsingTopDocsCollector} per slice over the same
+     * collapse field, sort, group count and cursor; the reduce merges the
+     * slices' top groups so one hit per value survives, as the shard
+     * path's collapsing collector context reduces its slices.
+     */
+    private static final class CollapsingCollectorManager implements CollectorManager<CollapsingTopDocsCollector<?>, CollapseTopFieldDocs> {
+        private final CollapseContext collapse;
+        private final Sort sort;
+        private final int numHits;
+        private final FieldDoc after;
+
+        CollapsingCollectorManager(CollapseContext collapse, Sort sort, int numHits, FieldDoc after) {
+            this.collapse = collapse;
+            this.sort = sort;
+            this.numHits = numHits;
+            this.after = after;
+        }
+
+        @Override
+        public CollapsingTopDocsCollector<?> newCollector() {
+            return after == null ? collapse.createTopDocs(sort, numHits) : collapse.createTopDocs(sort, numHits, after);
+        }
+
+        @Override
+        public CollapseTopFieldDocs reduce(Collection<CollapsingTopDocsCollector<?>> collectors) throws IOException {
+            List<CollapseTopFieldDocs> perSlice = new ArrayList<>(collectors.size());
+            for (CollapsingTopDocsCollector<?> collector : collectors) {
+                perSlice.add(collector.getTopDocs());
+            }
+            if (perSlice.size() == 1) {
+                return perSlice.get(0);
+            }
+            return CollapseTopFieldDocs.merge(sort, 0, numHits, perSlice.toArray(new CollapseTopFieldDocs[0]));
+        }
+    }
+
+    /**
+     * Run the request's rescorers over a collected first pass, in body
+     * order, the way {@code RescoreProcessor} does on the shard path:
+     * each {@link RescoreContext}'s rescorer re scores the top
+     * {@code window_size} docs of the page with its query over the
+     * shared searcher, combines the two scores under the rescorer's
+     * weights and score mode, and re sorts the page by the new scores.
+     * The page is then cut to {@code size} (the executor's
+     * {@code from + size}), since the first pass collected the larger
+     * window. A rescore query that is a Lance full text or knn query
+     * runs its one shard level Lance scan when the rescorer asks the
+     * Weight for its first leaf, as on the shard path; the match count
+     * of the page stays the first pass count.
+     */
+    static CollectedPage rescore(CollectedPage page, List<RescoreContext> rescorers, LanceFragmentIndexSearcher searcher, int size)
+        throws IOException {
+        if (page.scoreDocs().length == 0 || rescorers.isEmpty()) {
+            return page;
+        }
+        TotalHits total = page.collected() == null ? new TotalHits(page.scoreDocs().length, TotalHits.Relation.EQUAL_TO) : page.collected();
+        TopDocs topDocs = new TopDocs(total, page.scoreDocs());
+        for (RescoreContext rescoreContext : rescorers) {
+            topDocs = rescoreContext.rescorer().rescore(topDocs, searcher, rescoreContext);
+        }
+        ScoreDoc[] scoreDocs = topDocs.scoreDocs.length > size ? Arrays.copyOf(topDocs.scoreDocs, size) : topDocs.scoreDocs;
+        return new CollectedPage(scoreDocs, page.collected(), page.terminatedEarly());
     }
 
     /**

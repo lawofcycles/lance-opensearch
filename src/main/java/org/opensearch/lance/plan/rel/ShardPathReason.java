@@ -29,22 +29,6 @@ public enum ShardPathReason {
     HIGHLIGHT,
 
     /**
-     * {@code collapse} groups hits by a field and can materialise
-     * {@code inner_hits} per group. The fragment executor does not
-     * synthesise the collapsing collector state, so hits would come
-     * back ungrouped and {@code inner_hits} would disappear silently.
-     */
-    COLLAPSE,
-
-    /**
-     * {@code rescore} layers a second-pass query on top of the first
-     * Sort/TopDocs window. The fragment executor drives a plain
-     * {@code IndexSearcher.search} and never runs the rescorer, so
-     * scores would stay at their first-pass values.
-     */
-    RESCORE,
-
-    /**
      * A pipeline aggregation (sibling like {@code avg_bucket} or parent
      * like {@code cumulative_sum}) hits an "Already been replayed"
      * IllegalStateException in the coordinator merge, because the

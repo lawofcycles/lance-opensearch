@@ -56,7 +56,7 @@ public class ShardPathFallbackExecTests extends OpenSearchTestCase {
     }
 
     public void testRowTypeIsTheResponseEnvelope() {
-        ShardPathFallbackExec exec = exec(ShardPathReason.COLLAPSE);
+        ShardPathFallbackExec exec = exec(ShardPathReason.HIGHLIGHT);
         assertEquals(List.of("_hits", "_aggregations"), exec.getRowType().getFieldNames());
     }
 
@@ -65,18 +65,18 @@ public class ShardPathFallbackExecTests extends OpenSearchTestCase {
         // replaces the logical shape with this operator, so the two
         // derivations must stay identical.
         LanceTableScan scan = scan();
-        LanceShardPathShape shape = new LanceShardPathShape(scan.getCluster(), scan.getTraitSet(), scan, List.of(ShardPathReason.RESCORE));
+        LanceShardPathShape shape = new LanceShardPathShape(scan.getCluster(), scan.getTraitSet(), scan, List.of(ShardPathReason.SUGGEST));
         ShardPathFallbackExec exec = new ShardPathFallbackExec(
             scan.getCluster(),
             scan.getCluster().traitSetOf(ShardPathConvention.INSTANCE),
             scan,
-            List.of(ShardPathReason.RESCORE)
+            List.of(ShardPathReason.SUGGEST)
         );
         assertEquals(shape.getRowType(), exec.getRowType());
     }
 
     public void testCostIsTheConstant() {
-        ShardPathFallbackExec exec = exec(ShardPathReason.RESCORE);
+        ShardPathFallbackExec exec = exec(ShardPathReason.HIGHLIGHT);
         RelOptPlanner planner = exec.getCluster().getPlanner();
         RelOptCost cost = exec.computeSelfCost(planner, exec.getCluster().getMetadataQuery());
         assertTrue(cost.equals(planner.getCostFactory().makeTinyCost().plus(planner.getCostFactory().makeCost(100, 100, 100))));
@@ -109,15 +109,15 @@ public class ShardPathFallbackExecTests extends OpenSearchTestCase {
     }
 
     public void testExplainCarriesTheReasons() {
-        ShardPathFallbackExec exec = exec(ShardPathReason.COLLAPSE, ShardPathReason.RESCORE);
+        ShardPathFallbackExec exec = exec(ShardPathReason.HIGHLIGHT, ShardPathReason.PIPELINE_AGG);
         String plan = RelOptUtil.toString(exec);
         assertTrue("names the operator: " + plan, plan.contains("ShardPathFallbackExec"));
-        assertTrue("carries the reasons: " + plan, plan.contains("COLLAPSE") && plan.contains("RESCORE"));
+        assertTrue("carries the reasons: " + plan, plan.contains("HIGHLIGHT") && plan.contains("PIPELINE_AGG"));
         assertTrue("the scan is the input: " + plan, plan.contains("LanceTableScan"));
     }
 
     public void testExplainKeepsDifferentReasonsApart() {
-        assertFalse(RelOptUtil.toString(exec(ShardPathReason.SUGGEST)).equals(RelOptUtil.toString(exec(ShardPathReason.RESCORE))));
+        assertFalse(RelOptUtil.toString(exec(ShardPathReason.SUGGEST)).equals(RelOptUtil.toString(exec(ShardPathReason.HIGHLIGHT))));
     }
 
     public void testEmptyReasonsAreRefused() {
@@ -132,10 +132,7 @@ public class ShardPathFallbackExecTests extends OpenSearchTestCase {
     public void testReasonKinds() {
         // The kinds the translator can attach; the executor and the
         // explain output spell them by name, so renames are breaking.
-        assertEquals(
-            List.of("SUGGEST", "HIGHLIGHT", "COLLAPSE", "RESCORE", "PIPELINE_AGG"),
-            Arrays.stream(ShardPathReason.values()).map(Enum::name).toList()
-        );
+        assertEquals(List.of("SUGGEST", "HIGHLIGHT", "PIPELINE_AGG"), Arrays.stream(ShardPathReason.values()).map(Enum::name).toList());
     }
 
     public void testRowEstimatePassesTheInputThrough() {

@@ -766,6 +766,110 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
+     * rescore and collapse across three data nodes, one fragment each.
+     * Every executor rescores its own window and collapses its own
+     * fragments; the coordinator merges the rescored pages by score and
+     * keeps one hit per collapse value across the nodes. The bucket
+     * column ({@code id % 4}) puts every group's rows on different
+     * nodes, so a merge that trusted one node's groups would return
+     * several hits per value. The expected answers are the shard path's
+     * (one shard over the whole table): identical for collapse, and for
+     * a rescore whose window covers every match; a window smaller than
+     * the matches is rescored per executor, as per shard on a multi
+     * shard index, so only the page's shape is pinned there.
+     */
+    public void testRescoreAndCollapseAcrossThreeNodes() throws Exception {
+        String suffix = "mn-second-pass-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 3;
+        int rowsPerFragment = 4;
+        LanceTableFactory.writeBucketedInterleavedTable(scratchDir, tableName, fragments, rowsPerFragment);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals("fixture assumes one fragment per data node", fragments, dataNodeCount());
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+
+            // Rescore with a window that covers every match: the merged
+            // page is the shard path's.
+            assertFragmentPathMatchesShardPath(
+                indexName,
+                "\"size\":5,\"query\":{\"range\":{\"id\":{\"gte\":2}}},"
+                    + "\"rescore\":{\"window_size\":12,\"query\":{\"rescore_query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}}}}"
+            );
+            assertFragmentPathMatchesShardPath(
+                indexName,
+                "\"size\":6,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}},"
+                    + "\"rescore\":{\"window_size\":12,\"query\":{\"rescore_query\":{\"term\":{\"bucket\":1}},"
+                    + "\"query_weight\":0.5,\"rescore_query_weight\":2.0}}"
+            );
+            // A window of two per executor: six rows are rescored in all
+            // (two per node), the page is five rows in score order and
+            // the count is the first pass count.
+            Map<String, Object> smallWindow = parse(
+                readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":5,\"query\":{\"match_all\":{}},"
+                            + "\"rescore\":{\"window_size\":2,\"query\":{\"rescore_query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}}}}}"
+                    )
+                )
+            );
+            assertEquals(12, extractIntPath(smallWindow, "hits", "total", "value"));
+            assertEquals(5, hitList(smallWindow).size());
+            List<Double> scores = scores(smallWindow);
+            for (int i = 1; i < scores.size(); i++) {
+                assertTrue("scores not descending: " + scores, scores.get(i - 1) >= scores.get(i));
+            }
+            // Each executor rescored the first two rows of its fragment
+            // (ids f and f + 3), which then score above 1.0 and lead the
+            // merged page in BM25 order.
+            assertEquals(List.of(5, 4, 3, 2, 1), sourceIds(smallWindow));
+
+            // Collapse on a value that spans the nodes, under a sort,
+            // under score order and with inner hits.
+            assertFragmentPathMatchesShardPath(indexName, "\"size\":10,\"sort\":[{\"id\":\"desc\"}],\"collapse\":{\"field\":\"bucket\"}");
+            assertFragmentPathMatchesShardPath(
+                indexName,
+                "\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}},\"collapse\":{\"field\":\"bucket\"}"
+            );
+            assertFragmentPathMatchesShardPath(
+                indexName,
+                "\"from\":1,\"size\":2,\"sort\":[{\"ts\":\"asc\"}],\"collapse\":{\"field\":\"bucket\"}"
+            );
+            String innerHits = "{\"size\":10,\"sort\":[{\"id\":\"asc\"}],\"collapse\":{\"field\":\"bucket\","
+                + "\"inner_hits\":{\"name\":\"rows\",\"size\":2,\"sort\":[{\"id\":\"desc\"}]}}}";
+            Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", innerHits)));
+            assertEquals(List.of(0, 1, 2, 3), sourceIds(fragmentPath));
+            // Bucket 0 holds ids 0, 4 and 8, one on each node; its inner
+            // hits are the group search the expansion issues. The shard
+            // path refuses inner_hits on a Lance field (mapped index:
+            // false), so the group search is the reference.
+            @SuppressWarnings("unchecked")
+            Map<String, Object> firstGroup = (Map<String, Object>) ((Map<String, Object>) hitList(fragmentPath).get(0).get("inner_hits"))
+                .get("rows");
+            assertEquals(3, extractIntPath(firstGroup, "hits", "total", "value"));
+            assertEquals(List.of(8, 4), sourceIds(firstGroup));
+            Map<String, Object> groupSearch = parse(
+                readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":2,\"sort\":[{\"id\":\"desc\"}],\"query\":{\"bool\":{\"filter\":[{\"match\":{\"bucket\":0}}]}}}"
+                    )
+                )
+            );
+            assertEquals(hitList(groupSearch), hitList(firstGroup));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
      * Attach is routed to the elected cluster manager, so a request that
      * lands on any other node has to succeed as well. The round-robin
      * {@link #client()} does not say which node answered, so this test

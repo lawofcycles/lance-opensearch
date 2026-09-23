@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.lucene.util.BytesRef;
+import org.opensearch.common.document.DocumentField;
 import org.opensearch.lance.plan.execute.MergeReducer;
 import org.opensearch.lance.plan.execute.MergeReducer.RankedHit;
 import org.opensearch.search.DocValueFormat;
@@ -224,6 +225,32 @@ public class CoordinatorHitMergeTests extends OpenSearchTestCase {
         assertTrue(MergeReducer.mergeHits(List.of(Collections.emptyList()), Collections.emptyList()).isEmpty());
         List<RankedHit> only = List.of(sorted("x", 0L, 1L), sorted("y", 1L, 2L));
         assertEquals(List.of("x", "y"), ids(MergeReducer.mergeHits(List.of(only), List.of(new FieldSortBuilder("id")))));
+    }
+
+    public void testCollapseKeepsTheFirstHitOfEveryValueInMergedOrder() {
+        // Each node returns its best hit per category; the merged order
+        // decides which node's representative survives, and hits without
+        // a value form the group of the missing value.
+        RankedHit a1 = collapsed(scored("a1", 3.0f, 0L), "c0");
+        RankedHit a2 = collapsed(scored("a2", 2.0f, 1L), "c1");
+        RankedHit a3 = collapsed(scored("a3", 0.5f, 2L), null);
+        RankedHit b1 = collapsed(scored("b1", 2.5f, 3L), "c0");
+        RankedHit b2 = collapsed(scored("b2", 1.0f, 4L), "c2");
+        RankedHit b3 = collapsed(scored("b3", 0.7f, 5L), null);
+
+        List<SearchHit> merged = MergeReducer.mergeHits(List.of(List.of(a1, a2, a3), List.of(b1, b2, b3)), Collections.emptyList());
+        assertEquals(List.of("a1", "b1", "a2", "b2", "b3", "a3"), ids(merged));
+
+        List<SearchHit> collapsed = MergeReducer.collapseHits(merged, "category");
+        assertEquals(List.of("a1", "a2", "b2", "b3"), ids(collapsed));
+        assertEquals("c0", MergeReducer.collapseValueOf(collapsed.get(0), "category"));
+        assertNull(MergeReducer.collapseValueOf(collapsed.get(3), "category"));
+    }
+
+    private static RankedHit collapsed(RankedHit ranked, String category) {
+        List<Object> values = category == null ? new ArrayList<>() : new ArrayList<>(List.of(category));
+        ranked.hit().setDocumentField("category", new DocumentField("category", values));
+        return ranked;
     }
 
     private static long rowAddr(int fragment, int offset) {

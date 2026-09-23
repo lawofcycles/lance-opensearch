@@ -22,7 +22,9 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.search.aggregations.AggregatorFactories;
+import org.opensearch.search.collapse.CollapseBuilder;
 import org.opensearch.search.internal.SearchContext;
+import org.opensearch.search.rescore.RescorerBuilder;
 import org.opensearch.search.sort.SortBuilder;
 import org.opensearch.tasks.Task;
 
@@ -57,6 +59,10 @@ import org.opensearch.tasks.Task;
  *   <li>{@link #projection()} — the per hit projections ({@code _source},
  *       {@code stored_fields}, {@code docvalue_fields}, {@code fields},
  *       {@code explain}) the executor's fetch phase renders.</li>
+ *   <li>{@link #rescores()}, {@link #collapse()} — the second pass over
+ *       the collected page: the {@code rescore} list the executor runs
+ *       over its first pass window, and the {@code collapse} whose
+ *       collapsing collector replaces the top docs collector.</li>
  * </ul>
  *
  * <p>{@link #plan()} is the per node plan the coordinator's planner
@@ -137,11 +143,28 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     private final int terminateAfter;
     /** The per hit projections of the body; {@link HitProjection#NONE} when it has none. */
     private final HitProjection projection;
+    /**
+     * The request's {@code rescore} list, empty when it has none. Each
+     * entry is the stock {@link RescorerBuilder}; the executor builds its
+     * {@link org.opensearch.search.rescore.RescoreContext} against the
+     * node's mapping and re scores the top {@code window_size} hits of
+     * its first pass with it, in list order.
+     */
+    private final List<RescorerBuilder<?>> rescores;
+    /**
+     * The request's {@code collapse}, or {@code null} when it has none.
+     * The executor builds the {@link org.opensearch.search.collapse.CollapseContext}
+     * against the node's mapping and collects one hit per distinct value
+     * of the field; the coordinator reads the field name to keep one hit
+     * per value across the executors and to expand {@code inner_hits}.
+     */
+    private final CollapseBuilder collapse;
 
     /**
-     * A request without collector knobs and without per hit projections:
-     * the full constructor with {@code minScore} null,
-     * {@code terminateAfter} 0 and {@link HitProjection#NONE}.
+     * A request without collector knobs, per hit projections, rescorers
+     * or collapse: the full constructor with {@code minScore} null,
+     * {@code terminateAfter} 0, {@link HitProjection#NONE}, no rescorers
+     * and no collapse.
      */
     public LanceFragmentQueryRequest(
         String tableUri,
@@ -176,7 +199,52 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             trackTotalHitsUpTo,
             null,
             0,
-            HitProjection.NONE
+            HitProjection.NONE,
+            Collections.emptyList(),
+            null
+        );
+    }
+
+    /** A request without rescorers and without collapse. */
+    public LanceFragmentQueryRequest(
+        String tableUri,
+        String indexName,
+        StorageOptions storageOptions,
+        long pinnedVersion,
+        FragmentPlan plan,
+        QueryBuilder query,
+        QueryBuilder postFilter,
+        List<SortBuilder<?>> sorts,
+        Object[] searchAfter,
+        int size,
+        AggregatorFactories.Builder aggregations,
+        List<Integer> fragmentIds,
+        boolean trackScores,
+        int trackTotalHitsUpTo,
+        Float minScore,
+        int terminateAfter,
+        HitProjection projection
+    ) {
+        this(
+            tableUri,
+            indexName,
+            storageOptions,
+            pinnedVersion,
+            plan,
+            query,
+            postFilter,
+            sorts,
+            searchAfter,
+            size,
+            aggregations,
+            fragmentIds,
+            trackScores,
+            trackTotalHitsUpTo,
+            minScore,
+            terminateAfter,
+            projection,
+            Collections.emptyList(),
+            null
         );
     }
 
@@ -197,7 +265,9 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         int trackTotalHitsUpTo,
         Float minScore,
         int terminateAfter,
-        HitProjection projection
+        HitProjection projection,
+        List<RescorerBuilder<?>> rescores,
+        CollapseBuilder collapse
     ) {
         this.tableUri = tableUri;
         this.indexName = indexName;
@@ -216,6 +286,8 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.minScore = minScore;
         this.terminateAfter = Math.max(0, terminateAfter);
         this.projection = projection == null ? HitProjection.NONE : projection;
+        this.rescores = rescores == null ? Collections.emptyList() : List.copyOf(rescores);
+        this.collapse = collapse;
     }
 
     public LanceFragmentQueryRequest(StreamInput in) throws IOException {
@@ -255,6 +327,17 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.minScore = in.readOptionalFloat();
         this.terminateAfter = in.readVInt();
         this.projection = HitProjection.read(in);
+        int rescoreCount = in.readVInt();
+        if (rescoreCount == 0) {
+            this.rescores = Collections.emptyList();
+        } else {
+            List<RescorerBuilder<?>> readRescores = new ArrayList<>(rescoreCount);
+            for (int i = 0; i < rescoreCount; i++) {
+                readRescores.add(in.readNamedWriteable(RescorerBuilder.class));
+            }
+            this.rescores = List.copyOf(readRescores);
+        }
+        this.collapse = in.readOptionalWriteable(CollapseBuilder::new);
     }
 
     @Override
@@ -296,6 +379,11 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         out.writeOptionalFloat(minScore);
         out.writeVInt(terminateAfter);
         projection.writeTo(out);
+        out.writeVInt(rescores.size());
+        for (RescorerBuilder<?> rescore : rescores) {
+            out.writeNamedWriteable(rescore);
+        }
+        out.writeOptionalWriteable(collapse);
     }
 
     @Override
@@ -487,6 +575,33 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     /** The per hit projections of the body, never {@code null}. */
     public HitProjection projection() {
         return projection;
+    }
+
+    /** The request's {@code rescore} list in body order, empty when it has none. */
+    public List<RescorerBuilder<?>> rescores() {
+        return rescores;
+    }
+
+    /** The request's {@code collapse}, or {@code null} when it has none. */
+    public CollapseBuilder collapse() {
+        return collapse;
+    }
+
+    /**
+     * The rows the executor's first pass collects before any rescorer
+     * runs: {@link #size()}, raised to the largest {@code window_size} of
+     * the rescorers the way {@code TopDocsCollectorContext} sizes the top
+     * docs collector when a rescore is present. Without rescorers this
+     * is {@link #size()}. A rescorer without an explicit window uses
+     * {@link RescorerBuilder#DEFAULT_WINDOW_SIZE}, as its context will.
+     */
+    public int firstPassSize() {
+        int firstPass = size;
+        for (RescorerBuilder<?> rescore : rescores) {
+            Integer window = rescore.windowSize();
+            firstPass = Math.max(firstPass, window == null ? RescorerBuilder.DEFAULT_WINDOW_SIZE : window);
+        }
+        return firstPass;
     }
 
     /**

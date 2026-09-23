@@ -330,25 +330,41 @@ public class LanceExplainIT extends LanceRestTestCase {
             // A body only the shard path serves: the route says so, the
             // reasons name the element, the physical root is the shard
             // path operator and no fragment plan is shipped.
-            String collapseBody = explainOk(indexName, "{\"size\":3,\"collapse\":{\"field\":\"id\"}}");
-            assertEquals("shard_path", stringPath(collapseBody, "route"));
-            assertEquals(List.of("COLLAPSE"), listOf(collapseBody, "reasons"));
-            String collapsePhysical = stringPath(collapseBody, "physical");
-            assertTrue("the shard path operator leads: " + collapsePhysical, collapsePhysical.startsWith("ShardPathFallbackExec("));
-            assertTrue("the operator carries the reason: " + collapsePhysical, collapsePhysical.contains("reasons=[[COLLAPSE]]"));
-            assertTrue(stringPath(collapseBody, "logical").contains("LanceShardPathShape"));
-            Map<String, Object> collapse = parseJson(collapseBody);
-            assertFalse("no fragment plan on the shard path: " + collapseBody, collapse.containsKey("fragment_plan"));
-            assertFalse("no refinements on the shard path: " + collapseBody, collapse.containsKey("refinements_possible"));
+            String highlightBody = explainOk(indexName, "{\"size\":3,\"highlight\":{\"fields\":{\"body\":{}}}}");
+            assertEquals("shard_path", stringPath(highlightBody, "route"));
+            assertEquals(List.of("HIGHLIGHT"), listOf(highlightBody, "reasons"));
+            String highlightPhysical = stringPath(highlightBody, "physical");
+            assertTrue("the shard path operator leads: " + highlightPhysical, highlightPhysical.startsWith("ShardPathFallbackExec("));
+            assertTrue("the operator carries the reason: " + highlightPhysical, highlightPhysical.contains("reasons=[[HIGHLIGHT]]"));
+            assertTrue(stringPath(highlightBody, "logical").contains("LanceShardPathShape"));
+            Map<String, Object> highlight = parseJson(highlightBody);
+            assertFalse("no fragment plan on the shard path: " + highlightBody, highlight.containsKey("fragment_plan"));
+            assertFalse("no refinements on the shard path: " + highlightBody, highlight.containsKey("refinements_possible"));
 
             // Two elements, both named, in the order the checks run.
             String twoReasons = explainOk(
                 indexName,
-                "{\"size\":3,\"query\":{\"term\":{\"id\":1}},\"highlight\":{\"fields\":{\"body\":{}}},"
-                    + "\"rescore\":{\"query\":{\"rescore_query\":{\"term\":{\"id\":2}}}}}"
+                "{\"size\":3,\"query\":{\"term\":{\"id\":1}},\"suggest\":{\"s\":{\"text\":\"hello\",\"term\":{\"field\":\"body\"}}},"
+                    + "\"highlight\":{\"fields\":{\"body\":{}}}}"
             );
             assertEquals("shard_path", stringPath(twoReasons, "route"));
-            assertEquals(List.of("HIGHLIGHT", "RESCORE"), listOf(twoReasons, "reasons"));
+            assertEquals(List.of("SUGGEST", "HIGHLIGHT"), listOf(twoReasons, "reasons"));
+
+            // collapse and rescore run on the fragment executors over
+            // the Lucene collector's page: the route stays fragment and
+            // the plan is the query root alone, with the second pass
+            // named as the unplanned element.
+            String collapseBody = explainOk(indexName, "{\"size\":3,\"collapse\":{\"field\":\"id\"}}");
+            assertEquals("fragment", stringPath(collapseBody, "route"));
+            assertEquals("LUCENE_TOPK", fragmentPlanOf(collapseBody).get("kind"));
+            assertEquals("rescore or collapse (a second pass over the Lucene collector's page)", stringPath(collapseBody, "unplanned"));
+            String rescoreBody = explainOk(
+                indexName,
+                "{\"size\":3,\"query\":{\"term\":{\"id\":1}},\"rescore\":{\"query\":{\"rescore_query\":{\"term\":{\"id\":2}}}}}"
+            );
+            assertEquals("fragment", stringPath(rescoreBody, "route"));
+            assertEquals("LUCENE_TOPK", fragmentPlanOf(rescoreBody).get("kind"));
+            assertEquals("id = 1", fragmentPlanOf(rescoreBody).get("filter_sql"));
 
             // min_score is served by the executors' collectors: the
             // route stays on the fragment path and the plan is the query

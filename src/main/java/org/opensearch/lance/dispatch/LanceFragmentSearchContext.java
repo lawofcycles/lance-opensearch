@@ -95,7 +95,8 @@ import org.opensearch.common.unit.TimeValue;
  * segment search does on the shard path. The fetch side
  * ({@link #fetchSourceContext()}, {@link #storedFieldsContext()},
  * {@link #docValuesContext()}, {@link #fetchFieldsContext()},
- * {@link #explain()}, {@link #rescore()} empty, {@link #highlight()} null)
+ * {@link #explain()}, {@link #rescore()}, {@link #collapse()},
+ * {@link #highlight()} null)
  * answers as {@code DefaultSearchContext} does for the same body, so the
  * stock fetch sub phases {@link FragmentFetchPhase} drives render the
  * hits the shard path would.
@@ -143,6 +144,13 @@ public final class LanceFragmentSearchContext extends SearchContext {
     private FetchDocValuesContext docValuesContext;
     private FetchFieldsContext fetchFieldsContext;
     private boolean explain;
+    // The second pass over the collected page: the rescore contexts the
+    // executor built from the request's rescorers (empty without
+    // rescore; ExplainPhase folds their explanations over the query's)
+    // and the collapse context whose field the fetch phase adds as a
+    // doc value field of every hit (null without collapse).
+    private List<RescoreContext> rescore = List.of();
+    private CollapseContext collapse;
 
     /**
      * Two-phase construction: {@link ContextIndexSearcher} keeps a
@@ -285,6 +293,23 @@ public final class LanceFragmentSearchContext extends SearchContext {
         this.docValuesContext = docValuesContext;
         this.fetchFieldsContext = fetchFieldsContext;
         this.explain = explain;
+        return this;
+    }
+
+    /**
+     * The second pass of the request: the {@link RescoreContext}s built
+     * from its {@code rescore} list (empty when it has none) and the
+     * {@link CollapseContext} built from its {@code collapse} (null when
+     * it has none). {@link #rescore()} hands the contexts to the fetch
+     * phase's {@code ExplainPhase}, which folds each rescorer's
+     * explanation over the query's for the hits the rescorer saw;
+     * {@link #collapse()} makes the fetch phase add the collapse field
+     * as a doc value field of every hit, the way {@code FetchContext}
+     * does on the shard path.
+     */
+    public LanceFragmentSearchContext withSecondPass(List<RescoreContext> rescore, CollapseContext collapse) {
+        this.rescore = rescore == null ? List.of() : List.copyOf(rescore);
+        this.collapse = collapse;
         return this;
     }
 
@@ -550,9 +575,7 @@ public final class LanceFragmentSearchContext extends SearchContext {
 
     @Override
     public List<RescoreContext> rescore() {
-        // ExplainPhase folds the rescorers' explanations over the
-        // query's; the fragment path runs none.
-        return List.of();
+        return rescore;
     }
 
     @Override
@@ -700,7 +723,7 @@ public final class LanceFragmentSearchContext extends SearchContext {
 
     @Override
     public CollapseContext collapse() {
-        return null;
+        return collapse;
     }
 
     @Override
