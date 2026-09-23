@@ -217,6 +217,16 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      */
     private static final int INDEX_SERVICE_RACE_RETRIES = 2;
 
+    /**
+     * Pool the intra request work (collection slices, column load
+     * group scans, aggregation pushdown scans) is submitted to. A
+     * separate constant so a test can pin the split between this pool
+     * and the handler's own SEARCH pool: the SEARCH queue admits
+     * requests, so filling it with intra request tasks turns load the
+     * node could serve into 429s.
+     */
+    static final String INTRA_REQUEST_POOL = ThreadPool.Names.INDEX_SEARCHER;
+
     private final ClusterService clusterService;
     private final IndicesService indicesService;
     private final BigArrays bigArrays;
@@ -239,13 +249,23 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     private final java.util.concurrent.Semaphore concurrencyLimit;
     /**
      * Pool the aggregation pushdown, the column loads and the collection
-     * slices run their extra work on: the SEARCH pool this action itself
-     * executes on. No pool is added for it. A group scan and a slice loop
-     * never block on a task the pool has not started (the calling thread
-     * runs whatever the pool does not pick up), so a saturated SEARCH
-     * pool degrades a request to one thread instead of parking it.
+     * slices run their extra work on: the {@code index_searcher} pool,
+     * the one core gives concurrent segment search its slices. It must
+     * not be the SEARCH pool this action itself executes on: a slice or
+     * scan task submitted there stays in the SEARCH queue as a spent
+     * entry after the calling thread has run it (the task executors
+     * below never wait for a task the pool has not started), and with
+     * every SEARCH thread parked at {@link #concurrencyLimit} those
+     * entries drain only when a request completes. Each waiting request
+     * then holds its tasks in the queue behind it, the population
+     * multiplies with the fan-in, and the queue rejects new fragment
+     * requests as 429 well below the load the node can serve. On the
+     * {@code index_searcher} pool the intra request work has its own
+     * queue; a full or rejecting pool degrades a request to one thread
+     * instead of failing it, because the group scans and the slice loop
+     * run rejected and unstarted tasks on the calling thread.
      */
-    private final Executor searchExecutor;
+    private final Executor intraRequestExecutor;
     /**
      * Reduce context ingredient for the slice level merge of the
      * aggregators; none of the allowed aggregations runs a script there.
@@ -286,7 +306,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         this.scriptService = scriptService;
         int permits = LancePlugin.FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING.get(clusterService.getSettings());
         this.concurrencyLimit = new java.util.concurrent.Semaphore(permits, /*fair*/ false);
-        this.searchExecutor = transportService.getThreadPool().executor(ThreadPool.Names.SEARCH);
+        this.intraRequestExecutor = transportService.getThreadPool().executor(INTRA_REQUEST_POOL);
         long nativeBudgetBytes = NativeMemoryLimit.parse(
             LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.get(clusterService.getSettings()),
             LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.getKey()
@@ -659,9 +679,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             ) {
                 // The searcher cuts the node's fragment leaves into up
                 // to lance.fragment_path.slices slices and collects
-                // them side by side on the SEARCH pool; the aggregators
-                // read the same count through the context to decide
-                // how they apply their shard thresholds.
+                // them side by side on the index_searcher pool; the
+                // aggregators read the same count through the context
+                // to decide how they apply their shard thresholds.
                 int slices = clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_SLICES_SETTING);
                 searchContext.withTargetMaxSliceCount(slices).withScriptService(scriptService);
                 LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(
@@ -669,7 +689,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     indexService.getIndexSettings(),
                     searchContext,
                     circuitBreakerService.getBreaker(CircuitBreaker.REQUEST),
-                    searchExecutor
+                    intraRequestExecutor
                 );
                 searchContext.withSearcher(searcher);
                 if (cancellation.hasTask()) {
@@ -838,14 +858,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     // aggregators nor computeMatched run for this request.
                     // The node's fragments are scanned in up to
                     // pushdown_parallelism groups; the extra scans run on
-                    // the SEARCH pool this request already executes on.
+                    // the index_searcher pool.
                     long pushdownStart = System.nanoTime();
                     LanceAggregateResults.Result result = pushdown.execute(
                         dataset,
                         effectiveFragmentIds,
                         request.filterSql(),
                         clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING),
-                        searchExecutor,
+                        intraRequestExecutor,
                         cancellation,
                         name -> emptyTopLevelAggregation(request, searchContext, qsc, name)
                     );
@@ -1970,13 +1990,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     ) throws IOException {
         // Column loads of this reader (the store's and the heap
         // fallback's) scan the node's fragments in up to
-        // lance.fragment_path.parallelism groups on the SEARCH pool,
-        // so a column is read into its arrays on several cores. The
-        // scan carries the request's cancellation so every group, on
-        // whichever thread it runs, stops at its next batch once the
-        // task is cancelled.
+        // lance.fragment_path.parallelism groups on the index_searcher
+        // pool, so a column is read into its arrays on several cores.
+        // The scan carries the request's cancellation so every group,
+        // on whichever thread it runs, stops at its next batch once
+        // the task is cancelled.
         FragmentGroupScan groupScan = new FragmentGroupScan(
-            searchExecutor,
+            intraRequestExecutor,
             clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_PARALLELISM_SETTING),
             cancellation
         );

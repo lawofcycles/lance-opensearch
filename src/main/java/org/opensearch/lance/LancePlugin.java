@@ -611,7 +611,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * sort paths that read a column into the off-heap store or into
      * heap). The executor cuts its fragments into that many contiguous
      * groups (fewer when it holds fewer fragments) and scans each group
-     * on the search pool. Lance decodes a scan on its own threads, but
+     * on the index_searcher pool. Lance decodes a scan on its own threads, but
      * the Java side that reads the batches into the column arrays is one
      * thread per scan, so a node holding many fragments loads a column
      * on one core unless the plugin splits the scan. Same default and
@@ -632,7 +632,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * How many slices a fragment path executor cuts its fragment leaves
      * into when it collects a page of hits or an aggregation, the way
      * concurrent segment search slices a shard's segments. Each slice
-     * collects on its own thread of the search pool with its own
+     * collects on its own thread of the index_searcher pool with its own
      * collector (its own aggregator tree), and the slice results are
      * reduced on the executor before the answer goes to the
      * coordinator. Without this an executor collected every fragment
