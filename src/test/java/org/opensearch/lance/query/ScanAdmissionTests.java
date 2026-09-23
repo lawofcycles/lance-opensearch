@@ -882,9 +882,12 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         assertEquals(4L, ScanAdmission.rejections());
         // No statistics installed and no dataset: the sorted page is
         // judged on its rows alone, and a disabled gate admits it.
-        expectThrows(CircuitBreakingException.class, () -> ScanAdmission.admitSortedPageScan("demo", null, "", 1_000L, 10L, 16L));
+        expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admitExecutorFilterScan("demo", null, "", 1_000L, 10L, 16L, "sorted page scan")
+        );
         ScanAdmission.setEnabled(false);
-        ScanAdmission.admitSortedPageScan("demo", null, "", 1_000L, 10L, 16L);
+        ScanAdmission.admitExecutorFilterScan("demo", null, "", 1_000L, 10L, 16L, "sorted page scan");
         ScanAdmission.admitFilterScan("demo", null, "rating = 5", 1_000L, 2, 0L, 8L, Long.MAX_VALUE, null);
         assertEquals(5L, ScanAdmission.rejections());
     }
@@ -899,7 +902,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         // admitted for the same request.
         ScanAdmission.admitFilterScan("demo", null, "rating = 5", 1_000L, 2, 0L, 8L, Long.MAX_VALUE, ticket);
         assertEquals(1, ScanAdmission.inFlightForTests());
-        ScanAdmission.admitSortedPageScan("demo", null, "", 1_000L, 10L, 16L);
+        ScanAdmission.admitExecutorFilterScan("demo", null, "", 1_000L, 10L, 16L, "sorted page scan");
         assertEquals("a ticketless path on the same thread counts on the thread", 2, ScanAdmission.inFlightForTests());
         ScanAdmission.requestEnded();
         assertEquals(1, ScanAdmission.inFlightForTests());

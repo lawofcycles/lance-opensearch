@@ -6,10 +6,7 @@
 package org.opensearch.lance.execute;
 
 import java.nio.ByteBuffer;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.Executor;
 
 import org.apache.arrow.vector.FieldVector;
@@ -32,7 +29,6 @@ import org.opensearch.lance.execute.GroupAggregationState.MetricBatch;
 import org.opensearch.lance.execute.GroupAggregationState.MetricState;
 import org.opensearch.lance.execute.GroupAggregationState.Partial;
 import org.opensearch.lance.execute.GroupAggregationState.TopKGroups;
-import org.opensearch.lance.plan.metadata.TableStatistics;
 import org.opensearch.lance.plan.substrait.LanceSubstraitProducer;
 import org.opensearch.lance.query.ScanAdmission;
 
@@ -168,7 +164,7 @@ final class AggregateScanRunner {
             dataset,
             filterSql,
             fragmentGroups.size(),
-            scannedRows(dataset, fragmentIds),
+            ScanAdmission.fragmentRows(dataset, fragmentIds),
             resolved.projectedRowBytes(),
             resolved.estimatedGroups(),
             resolved.allMetrics().size(),
@@ -197,29 +193,6 @@ final class AggregateScanRunner {
         } finally {
             ScanAdmission.scanFinished();
         }
-    }
-
-    /**
-     * Live rows of {@code fragmentIds} (null: every fragment) from the
-     * planner's statistics of {@code dataset}, 0 when they are not
-     * available.
-     */
-    private static long scannedRows(Dataset dataset, List<Integer> fragmentIds) {
-        Optional<TableStatistics> statistics = ScanAdmission.statisticsOf(dataset);
-        if (statistics.isEmpty()) {
-            return 0L;
-        }
-        if (fragmentIds == null) {
-            return statistics.get().rowCount();
-        }
-        Set<Integer> wanted = new HashSet<>(fragmentIds);
-        long rows = 0L;
-        for (TableStatistics.FragmentStats fragment : statistics.get().fragments()) {
-            if (wanted.contains(fragment.id())) {
-                rows += fragment.rows();
-            }
-        }
-        return rows;
     }
 
     /**

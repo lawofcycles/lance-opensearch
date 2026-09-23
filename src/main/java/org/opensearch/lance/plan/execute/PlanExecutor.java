@@ -537,10 +537,27 @@ public final class PlanExecutor {
             }
             return MatchedCount.exact(total);
         }
-        if (fragmentIds == null) {
-            return MatchedCount.exact(dataset.countRows(filterSql));
+        // The count evaluates the filter through its scalar index and
+        // materialises the matching row addresses the same way the hits
+        // scan does; the gate judges it as a filter scan before it runs.
+        ScanAdmission.admitExecutorFilterScan(
+            dataset.uri(),
+            dataset,
+            filterSql,
+            ScanAdmission.fragmentRows(dataset, fragmentIds),
+            0L,
+            ScanAdmission.ROW_ADDRESS_BYTES,
+            "filtered count scan"
+        );
+        ScanAdmission.scanStarted();
+        try {
+            if (fragmentIds == null) {
+                return MatchedCount.exact(dataset.countRows(filterSql));
+            }
+            return countScalarFilter(dataset, filterSql, fragmentIds, upTo, cancellation);
+        } finally {
+            ScanAdmission.scanFinished();
         }
-        return countScalarFilter(dataset, filterSql, fragmentIds, upTo, cancellation);
     }
 
     /**

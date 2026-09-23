@@ -487,7 +487,15 @@ final class FragmentHitsPages {
         for (String sortColumn : sortColumns) {
             rowWidth += ScanAdmission.columnWidthBytes(dataset.getSchema().getFields(), sortColumn);
         }
-        ScanAdmission.admitSortedPageScan(request.indexName(), dataset, filterSql == null ? "" : filterSql, nodeRows, fetch, rowWidth);
+        ScanAdmission.admitExecutorFilterScan(
+            request.indexName(),
+            dataset,
+            filterSql == null ? "" : filterSql,
+            nodeRows,
+            fetch,
+            rowWidth,
+            "sorted page scan"
+        );
         // Ordered (fragment id, row offset, raw sort values) triples in
         // the order Lance returned them, which is the response order.
         List<long[]> addresses = new ArrayList<>(fetch);

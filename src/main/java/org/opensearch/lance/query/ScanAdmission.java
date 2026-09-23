@@ -11,12 +11,14 @@ import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
@@ -1255,6 +1257,29 @@ public final class ScanAdmission {
         return type == IndexType.VECTOR || type.name().startsWith("IVF");
     }
 
+    /**
+     * Live rows of {@code fragmentIds} of {@code dataset} (null: every
+     * fragment) from the installed statistics, {@code 0} when they are
+     * not available; the rows a count or an aggregate scans.
+     */
+    public static long fragmentRows(Dataset dataset, List<Integer> fragmentIds) {
+        Optional<TableStatistics> statistics = statisticsOf(dataset);
+        if (statistics.isEmpty()) {
+            return 0L;
+        }
+        if (fragmentIds == null) {
+            return statistics.get().rowCount();
+        }
+        Set<Integer> wanted = new HashSet<>(fragmentIds);
+        long rows = 0L;
+        for (TableStatistics.FragmentStats fragment : statistics.get().fragments()) {
+            if (wanted.contains(fragment.id())) {
+                rows += fragment.rows();
+            }
+        }
+        return rows;
+    }
+
     /** Physical rows of the table {@code statistics} describe, {@code 0} when unknown. */
     static long tableRows(Optional<TableStatistics> statistics) {
         return statistics.map(s -> s.rowCount() + s.deletedRows()).orElse(0L);
@@ -1446,26 +1471,30 @@ public final class ScanAdmission {
     }
 
     /**
-     * Gate the sorted, limited scan of a pushed top-k page over
-     * {@code dataset}: the {@link Kind#SCALAR_INDEX} load of
-     * {@code filterSql}'s index when the page is filtered and the
+     * Gate a filtered scan the executor runs on its own thread: the
+     * sorted, limited scan of a pushed top-k page, or the count only
+     * scan of a scalar filter. First the {@link Kind#SCALAR_INDEX} load
+     * of {@code filterSql}'s index when the scan is filtered and the
      * statistics name one, then the {@link Kind#FILTER_SCAN} of the rows
      * the filter keeps (every row for an empty filter: Lance sorts after
-     * the scan, so the page reads the sort columns of all of them),
+     * the scan, so a page reads the sort columns of all of them),
      * streaming rows of {@code rowWidthBytes} (the row address plus the
-     * sort columns). {@code fetch} is the page's limit. No heap term:
-     * the page keeps {@code fetch} rows. The page runs on the executor's
-     * thread and the admission is counted there, released by the request's
-     * end on that thread.
+     * sort columns). {@code fetch} is the page's limit, 0 for a count.
+     * No heap term: the page keeps {@code fetch} rows, the count none.
+     * {@code shape} names the scan in the message. The admission is
+     * counted on the calling thread and released by the request's end
+     * on that thread.
      */
-    public static void admitSortedPageScan(
+    public static void admitExecutorFilterScan(
         String indexName,
         Dataset dataset,
         String filterSql,
         long nodeRows,
         long fetch,
-        long rowWidthBytes
+        long rowWidthBytes,
+        String shape
     ) {
+
         if (!enabled) {
             return;
         }
@@ -1483,7 +1512,7 @@ public final class ScanAdmission {
                 + index.get().name()
                 + "] over ["
                 + indexName
-                + "] answering the sorted page's filter ["
+                + "] answering the scan's filter ["
                 + filterSql
                 + "] with selectivity "
                 + String.format(Locale.ROOT, "%.4f", selectivity);
@@ -1491,7 +1520,8 @@ public final class ScanAdmission {
         }
         long matching = filterScanMatchingRows(nodeRows, selectivity, fetch, !boundedShapesGated);
         long estimate = filterScanEstimateBytes(nodeRows, matching, rowWidthBytes, batchReadahead(), shardShare);
-        String what = "sorted page scan over ["
+        String what = shape
+            + " over ["
             + indexName
             + "]"
             + (filtered ? " of [" + filterSql + "]" : "")
