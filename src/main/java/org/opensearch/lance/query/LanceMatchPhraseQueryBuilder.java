@@ -189,7 +189,7 @@ public class LanceMatchPhraseQueryBuilder extends AbstractQueryBuilder<LanceMatc
                     + "] no longer exists in the underlying Lance table; recreate the OpenSearch index to drop it"
             );
         }
-        return org.lance.ipc.FullTextQuery.phrase(query, field, slop);
+        return org.lance.ipc.FullTextQuery.phrase(textType.searchText(context, query), textType.lanceColumn(), slop);
     }
 
     @Override

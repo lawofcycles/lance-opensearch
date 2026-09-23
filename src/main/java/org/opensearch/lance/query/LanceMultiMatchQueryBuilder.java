@@ -261,6 +261,7 @@ public class LanceMultiMatchQueryBuilder extends AbstractQueryBuilder<LanceMulti
 
     @Override
     public FullTextQuery toLanceFullTextQuery(QueryShardContext context) {
+        List<LanceTextFieldMapper.LanceTextFieldType> textTypes = new ArrayList<>(fields.size());
         for (String field : fields) {
             MappedFieldType fieldType = context.fieldMapper(field);
             if (fieldType == null) {
@@ -278,8 +279,45 @@ public class LanceMultiMatchQueryBuilder extends AbstractQueryBuilder<LanceMulti
                         + "] no longer exists in the underlying Lance table; recreate the OpenSearch index to drop it"
                 );
             }
+            textTypes.add(textType);
         }
-        return FullTextQuery.multiMatch(query, fields, boosts, operator);
+        // Lance's multi_match runs one query string over every column,
+        // so analyzer-mode fields can only combine when they rewrite
+        // the query text identically: every field must use the same
+        // analyzer, and mixing an analyzer-mode field with a
+        // native-tokenizer field is refused rather than silently
+        // searching the wrong tokens on one of them.
+        String analyzerName = null;
+        boolean anyNative = false;
+        for (LanceTextFieldMapper.LanceTextFieldType textType : textTypes) {
+            String fieldAnalyzer = textType.analyzerName();
+            if (fieldAnalyzer == null) {
+                anyNative = true;
+            } else if (analyzerName == null) {
+                analyzerName = fieldAnalyzer;
+            } else if (!analyzerName.equals(fieldAnalyzer)) {
+                throw new IllegalArgumentException(
+                    "[lance_multi_match] fields use different analyzers ["
+                        + analyzerName
+                        + "] and ["
+                        + fieldAnalyzer
+                        + "]; combine fields that share one analyzer, or query them separately"
+                );
+            }
+        }
+        if (analyzerName != null && anyNative) {
+            throw new IllegalArgumentException(
+                "[lance_multi_match] mixes analyzer-mode fields (analyzer ["
+                    + analyzerName
+                    + "]) with fields on Lance's native tokenizer; combine fields that share one analyzer, or query them separately"
+            );
+        }
+        List<String> columns = new ArrayList<>(textTypes.size());
+        for (LanceTextFieldMapper.LanceTextFieldType textType : textTypes) {
+            columns.add(textType.lanceColumn());
+        }
+        String text = analyzerName != null ? textTypes.get(0).searchText(context, query) : query;
+        return FullTextQuery.multiMatch(text, columns, boosts, operator);
     }
 
     @Override

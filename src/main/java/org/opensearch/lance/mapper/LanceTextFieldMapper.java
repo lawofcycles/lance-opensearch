@@ -5,6 +5,8 @@
 
 package org.opensearch.lance.mapper;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -12,6 +14,8 @@ import java.util.Map;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.MultiTermQuery;
 import org.apache.lucene.search.Query;
+import org.lance.ipc.FullTextQuery;
+import org.opensearch.index.analysis.NamedAnalyzer;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParametrizedFieldMapper;
 import org.opensearch.index.mapper.ParseContext;
@@ -19,6 +23,7 @@ import org.opensearch.index.mapper.SourceValueFetcher;
 import org.opensearch.index.mapper.TextSearchInfo;
 import org.opensearch.index.mapper.ValueFetcher;
 import org.opensearch.index.query.QueryShardContext;
+import org.opensearch.lance.attach.LanceTextAnalyzerBackfill;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.lance.query.LanceStringPatternSql;
@@ -83,12 +88,65 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
             return CONTENT_TYPE;
         }
 
+        /** The derived tokens column term and match queries target, or {@code null} for the raw column. */
+        public String tokensColumn() {
+            return tokensColumn;
+        }
+
+        /** The Lance column term and match queries run against: {@link #tokensColumn()} when set, else the field's own column. */
+        public String lanceColumn() {
+            return tokensColumn != null ? tokensColumn : name();
+        }
+
+        /**
+         * The OpenSearch analyzer name of the RFC's analyzer mode
+         * ({@code meta.lance_analyzer}, written by the derivation for a
+         * {@code type: text_analyzer} override), or {@code null} when
+         * the field runs on Lance's native tokenizer.
+         */
+        public String analyzerName() {
+            return meta().get("lance_analyzer");
+        }
+
+        /**
+         * The query text as it should reach Lance: in the analyzer mode
+         * the text goes through the field's OpenSearch analyzer and the
+         * tokens are joined by single spaces, matching what the
+         * backfill stored in the tokens column (whose inverted index
+         * splits on whitespace); otherwise the text passes through
+         * untouched and Lance's own tokenizer handles it.
+         *
+         * @throws IllegalArgumentException when the analyzer named in
+         *     the mapping meta does not resolve on this index (the
+         *     analyzer definition disappeared after attach)
+         */
+        public String searchText(QueryShardContext context, String text) {
+            String analyzerName = analyzerName();
+            if (analyzerName == null) {
+                return text;
+            }
+            NamedAnalyzer analyzer = context.getIndexAnalyzers().get(analyzerName);
+            if (analyzer == null) {
+                throw new IllegalArgumentException(
+                    "field [" + name() + "] declares analyzer [" + analyzerName + "] which does not exist on this index"
+                );
+            }
+            try {
+                return LanceTextAnalyzerBackfill.joinTokens(analyzer, name(), text);
+            } catch (IOException e) {
+                throw new UncheckedIOException("failed to analyze query text for field [" + name() + "]", e);
+            }
+        }
+
         @Override
         public Query termQuery(Object value, QueryShardContext context) {
             rejectIfDropped();
-            String column = tokensColumn != null ? tokensColumn : name();
             String text = value instanceof org.apache.lucene.util.BytesRef b ? b.utf8ToString() : value.toString();
-            return new LanceFtsQuery(column, text);
+            // The FullTextQuery targets the Lance column (the derived
+            // tokens column in the analyzer mode); the FLS visibility
+            // set carries the mapped field name, because that is the
+            // name a security plugin's wrapper reader hides.
+            return new LanceFtsQuery(FullTextQuery.match(searchText(context, text), lanceColumn()), java.util.Set.of(name()));
         }
 
         @Override

@@ -6,11 +6,13 @@
 package org.opensearch.lance.mapper;
 
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.RegExp;
+import org.lance.ipc.FullTextQuery;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.test.OpenSearchTestCase;
@@ -42,9 +44,12 @@ public class LanceTextFieldMapperTests extends OpenSearchTestCase {
 
     public void testTermQueryRoutesToTokensColumnWhenSet() {
         // The RFC's analyzer mode uses tokens_column to redirect queries at the
-        // derived column that holds OpenSearch-analyzed tokens.
+        // derived column that holds OpenSearch-analyzed tokens. The FLS
+        // visibility set keeps the mapped field name: the derived column
+        // is not a mapped field, so its name would never appear in a
+        // reader's FieldInfos and the query would match nothing.
         Query query = fieldType("body_tokens").termQuery("camera", null);
-        assertEquals(new LanceFtsQuery("body_tokens", "camera"), query);
+        assertEquals(new LanceFtsQuery(FullTextQuery.match("camera", "body_tokens"), Set.of("body")), query);
     }
 
     public void testTermQueryUnwrapsBytesRef() {
@@ -190,6 +195,20 @@ public class LanceTextFieldMapperTests extends OpenSearchTestCase {
         assertTrue(regexp.getMessage(), regexp.getMessage().contains("no longer exists"));
         Exception prefix = expectThrows(IllegalArgumentException.class, () -> dropped.prefixQuery("h", null, false, null));
         assertTrue(prefix.getMessage(), prefix.getMessage().contains("no longer exists"));
+    }
+
+    public void testAnalyzerModeAccessors() {
+        LanceTextFieldMapper.LanceTextFieldType analyzerMode = new LanceTextFieldMapper.LanceTextFieldType(
+            "body",
+            "body__lance_tokens",
+            Map.of("lance_analyzer", "english")
+        );
+        assertEquals("english", analyzerMode.analyzerName());
+        assertEquals("body__lance_tokens", analyzerMode.lanceColumn());
+        assertEquals("body__lance_tokens", analyzerMode.tokensColumn());
+        assertNull(fieldType(null).analyzerName());
+        assertEquals("body", fieldType(null).lanceColumn());
+        assertNull(fieldType(null).tokensColumn());
     }
 
     public void testContentTypeConstantIsLanceText() {
