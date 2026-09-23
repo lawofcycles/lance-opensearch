@@ -86,14 +86,14 @@ public class CoordinatorPlanningTests extends OpenSearchSingleNodeTestCase {
         FragmentPlan planned = FragmentRequests.plan(
             getInstanceFromNode(ClusterService.class).state().metadata().index(indexName),
             getInstanceFromNode(LanceWarmCache.class),
-            new ExecutionShape(rewritten, null, List.of(), null, 0, 10, null, false)
+            new ExecutionShape(rewritten, null, List.of(), null, 0, 10, null, false, false)
         );
         assertEquals(FragmentPlan.Kind.PUSHED_SCAN, planned.kind());
         assertEquals("category = 'c0'", planned.filterSql());
         FragmentPlan unplanned = FragmentRequests.plan(
             getInstanceFromNode(ClusterService.class).state().metadata().index(indexName),
             getInstanceFromNode(LanceWarmCache.class),
-            new ExecutionShape(wrapped, null, List.of(), null, 0, 10, null, false)
+            new ExecutionShape(wrapped, null, List.of(), null, 0, 10, null, false, false)
         );
         assertEquals(FragmentPlan.Kind.LUCENE_TOPK, unplanned.kind());
         assertNull(unplanned.filterSql());

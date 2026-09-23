@@ -91,7 +91,7 @@ public final class FragmentRequests {
         boolean planAggregations = aggregations != null
             && clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_SETTING)
             && LanceAggregationSupport.isPushdownCandidate(aggregations);
-        ExecutionShape shape = new ExecutionShape(query, postFilter, sorts, searchAfter, 0, size, aggregations, planAggregations);
+        ExecutionShape shape = new ExecutionShape(query, postFilter, sorts, searchAfter, 0, size, aggregations, planAggregations, false);
         FragmentPlan plan = plan(metadata, warmCache, shape);
         return new LanceFragmentQueryRequest(
             tableUri,

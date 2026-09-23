@@ -55,7 +55,8 @@ public class RequestPlannerTests extends OpenSearchTestCase {
             from,
             size == 0 ? 0 : from + size,
             source.aggregations(),
-            planAggregations
+            planAggregations,
+            false
         );
     }
 

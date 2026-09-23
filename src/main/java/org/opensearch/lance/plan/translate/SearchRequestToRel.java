@@ -130,12 +130,18 @@ public final class SearchRequestToRel {
      * {@code post_filter}, the sort clauses and cursor, the leading hits
      * skipped ({@code from}), the rows every executor returns
      * ({@code fetch}, the request's {@code from + size}; 0 for a count
-     * or aggregation request), the aggregations, and whether the
+     * or aggregation request), the aggregations, whether the
      * aggregation tree may plan into the scan at all (the pushdown
-     * setting and the structural allow list, both read by the caller).
+     * setting and the structural allow list, both read by the caller),
+     * and whether the request carries a collector knob
+     * ({@code min_score} or {@code terminate_after}). The knobs apply
+     * inside Lucene's collectors on the executor, so neither the page
+     * nor the aggregate is pushed into the Lance scan for such a
+     * request: the query root alone is planned and the collector and
+     * the aggregators run over it.
      */
     public record ExecutionShape(QueryBuilder query, QueryBuilder postFilter, List<SortBuilder<?>> sorts, Object[] searchAfter, int from,
-        int fetch, AggregatorFactories.Builder aggregations, boolean planAggregations) {
+        int fetch, AggregatorFactories.Builder aggregations, boolean planAggregations, boolean collectorKnobs) {
 
         /**
          * The shape the coordinator plans a search body under:
@@ -230,6 +236,13 @@ public final class SearchRequestToRel {
         LanceShape lanceShape = detectLanceShape(shape.query());
         RelBuilder relBuilder = scanBuilder(model, factory);
         RelNode root = queryRoot(shape.query(), lanceShape, model, relBuilder);
+        if (shape.collectorKnobs()) {
+            // min_score and terminate_after apply inside Lucene's
+            // collectors: the count, the page and the aggregations are
+            // whatever those collectors saw, which no Lance side page or
+            // aggregate scan can reproduce.
+            return root;
+        }
         boolean hasAggregations = shape.hasAggregations();
         if (!shape.hits()) {
             if (!hasAggregations) {

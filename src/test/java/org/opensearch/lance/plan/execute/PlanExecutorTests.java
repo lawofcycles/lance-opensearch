@@ -96,6 +96,7 @@ public class PlanExecutorTests extends OpenSearchTestCase {
             10,
             false,
             false,
+            false,
             trackTotalHitsUpTo
         );
     }

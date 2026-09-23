@@ -19,6 +19,9 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchModule;
+import org.opensearch.search.fetch.StoredFieldsContext;
+import org.opensearch.search.fetch.subphase.FetchSourceContext;
+import org.opensearch.search.fetch.subphase.FieldAndFormat;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -151,6 +154,114 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         assertEquals(original.size(), restored.size());
         assertNull(restored.aggregations());
         assertEquals("allFragments asks for an exact count", SearchContext.TRACK_TOTAL_HITS_ACCURATE, restored.trackTotalHitsUpTo());
+    }
+
+    public void testRequestKnobsAndProjectionRoundTrip() throws Exception {
+        // min_score, terminate_after and the per hit projections travel
+        // as the stock Writeable classes the coordinator copies from the
+        // search body.
+        HitProjection projection = new HitProjection(
+            new FetchSourceContext(true, new String[] { "id", "ti*" }, new String[] { "body" }),
+            StoredFieldsContext.fromList(List.of("id", "_source")),
+            List.of(new FieldAndFormat("ts", "yyyy-MM-dd"), new FieldAndFormat("id", null)),
+            List.of(new FieldAndFormat("ti*", null)),
+            true
+        );
+        LanceFragmentQueryRequest original = new LanceFragmentQueryRequest(
+            "/tmp/table.lance",
+            "demo",
+            StorageOptions.empty(),
+            /* pinnedVersion */ -1L,
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, null),
+            /* query */ null,
+            /* postFilter */ null,
+            Collections.emptyList(),
+            /* searchAfter */ null,
+            5,
+            /* aggregations */ null,
+            Collections.emptyList(),
+            /* trackScores */ false,
+            SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO,
+            /* minScore */ 1.5f,
+            /* terminateAfter */ 7,
+            projection
+        );
+        LanceFragmentQueryRequest restored;
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                restored = new LanceFragmentQueryRequest(in);
+            }
+        }
+        assertEquals(1.5f, restored.minScore(), 0f);
+        assertEquals(7, restored.terminateAfter());
+        assertTrue(restored.hasCollectorKnobs());
+        assertEquals(projection, restored.projection());
+        assertTrue(restored.projection().fetchSource().fetchSource());
+        assertArrayEquals(new String[] { "id", "ti*" }, restored.projection().fetchSource().includes());
+        assertEquals(List.of("id", "_source"), restored.projection().storedFields().fieldNames());
+        assertEquals("yyyy-MM-dd", restored.projection().docValueFields().get(0).format);
+        assertEquals("ti*", restored.projection().fetchFields().get(0).field);
+        assertTrue(restored.projection().explain());
+    }
+
+    public void testRequestWithoutKnobsOrProjectionRoundTrip() throws Exception {
+        // The shorter constructor is a body without these elements:
+        // no min_score, no terminate_after, the empty projection, and
+        // nothing about them travels beyond the absent markers.
+        LanceFragmentQueryRequest original = new LanceFragmentQueryRequest(
+            "/tmp/table.lance",
+            "demo",
+            StorageOptions.empty(),
+            -1L,
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_COUNT, null),
+            null,
+            null,
+            Collections.emptyList(),
+            null,
+            0,
+            null,
+            Collections.emptyList(),
+            false,
+            SearchContext.TRACK_TOTAL_HITS_ACCURATE
+        );
+        LanceFragmentQueryRequest restored;
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                restored = new LanceFragmentQueryRequest(in);
+            }
+        }
+        assertNull(restored.minScore());
+        assertEquals(0, restored.terminateAfter());
+        assertFalse(restored.hasCollectorKnobs());
+        assertEquals(HitProjection.NONE, restored.projection());
+        assertTrue(restored.projection().isEmpty());
+    }
+
+    public void testResponseTerminatedEarlyRoundTrip() throws Exception {
+        // terminated_early is absent (null) without terminate_after and
+        // a boolean with it; all three states survive the wire.
+        for (Boolean terminatedEarly : new Boolean[] { null, Boolean.FALSE, Boolean.TRUE }) {
+            LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(
+                2L,
+                false,
+                1,
+                List.of(),
+                new long[0],
+                null,
+                terminatedEarly
+            );
+            LanceFragmentQueryResponse restored;
+            try (BytesStreamOutput out = new BytesStreamOutput()) {
+                original.writeTo(out);
+                try (StreamInput in = out.bytes().streamInput()) {
+                    restored = new LanceFragmentQueryResponse(in);
+                }
+            }
+            assertEquals(terminatedEarly, restored.terminatedEarly());
+        }
+        assertNull(new LanceFragmentQueryResponse(0L, false, 1, List.of(), new long[0], null).terminatedEarly());
     }
 
     public void testResponseRoundTrip() throws Exception {
