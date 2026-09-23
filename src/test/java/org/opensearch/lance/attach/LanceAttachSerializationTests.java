@@ -74,7 +74,24 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
         assertTrue(restored.tag().isEmpty());
         assertTrue(restored.storageOptions().isEmpty());
         assertTrue(restored.overrides().isEmpty());
+        assertFalse(restored.asyncDerive());
         assertEquals(ClusterManagerNodeRequest.DEFAULT_CLUSTER_MANAGER_NODE_TIMEOUT, restored.clusterManagerNodeTimeout());
+        assertNull(restored.validate());
+    }
+
+    public void testRequestWithTextAnalyzerAndAsyncDeriveRoundTrip() throws Exception {
+        LanceOverrides overrides = LanceOverrides.parseAttachClauses(
+            Map.of("body", Map.of("type", "text_analyzer", "analyzer", "english", "derived_column_name", "body_tokens")),
+            null
+        );
+        LanceAttachRequest original = new LanceAttachRequest("/tmp/demo.lance", null, null, null, null, overrides, null, true);
+
+        LanceAttachRequest restored = roundTrip(original);
+
+        assertTrue(restored.asyncDerive());
+        LanceOverrides.Column column = restored.overrides().textAnalyzerColumns().get("body");
+        assertEquals("english", column.analyzer());
+        assertEquals("body_tokens", column.derivedColumn());
         assertNull(restored.validate());
     }
 

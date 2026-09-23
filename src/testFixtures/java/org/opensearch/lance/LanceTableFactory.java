@@ -977,6 +977,47 @@ public final class LanceTableFactory {
         return withLocaleRoot(() -> writeJapaneseTableOnce(parent, name));
     }
 
+    /**
+     * The English sentences of {@link #writeEnglishTextTable}, chosen so
+     * an {@code english}-analyzed match on a stemmed form ({@code run})
+     * hits rows 0, 1, 3 and 5 while an unanalyzed exact match does not.
+     * Row 4 is Arrow null.
+     */
+    public static final String[] ENGLISH_SENTENCES = new String[] {
+        "The dogs are running quickly through the park",
+        "A dog runs across the wide field",
+        "Cats sleep all day on the warm windowsill",
+        "He ran to the store before it closed",
+        null,
+        "Runners run the marathon in the morning" };
+
+    /**
+     * Writes a two-column Lance table ({@code id} int32, {@code body}
+     * Utf8) holding {@link #ENGLISH_SENTENCES}, without an FTS index,
+     * so the attach derivation maps {@code body} as {@code keyword}
+     * unless a {@code type: text_analyzer} override selects the
+     * analyzer mode. Public because the analyzer-mode unit tests and
+     * ITs share it.
+     *
+     * @return absolute URI of the table, usable as-is for
+     *         {@code /_lance/attach} or namespace register.
+     */
+    public static String writeEnglishTextTable(Path parent, String name) throws Exception {
+        return withLocaleRoot(() -> {
+            Path tablePath = parent.resolve(name + ".lance");
+            String uri = tablePath.toString();
+            Schema schema = new Schema(
+                Arrays.asList(
+                    new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                    new Field(BODY_COLUMN, FieldType.nullable(new ArrowType.Utf8()), null)
+                ),
+                Map.of()
+            );
+            writeIdAndUtf8Table(uri, schema, BODY_COLUMN, ENGLISH_SENTENCES);
+            return uri;
+        });
+    }
+
     private static String writeJapaneseTableOnce(Path parent, String name) throws Exception {
         Path tablePath = parent.resolve(name + ".lance");
         String uri = tablePath.toString();
@@ -1012,7 +1053,9 @@ public final class LanceTableFactory {
                 textVector.allocateNew();
                 for (int i = 0; i < rowCount; i++) {
                     idVector.set(i, i);
-                    textVector.setSafe(i, values[i].getBytes(StandardCharsets.UTF_8));
+                    if (values[i] != null) {
+                        textVector.setSafe(i, values[i].getBytes(StandardCharsets.UTF_8));
+                    }
                 }
                 idVector.setValueCount(rowCount);
                 textVector.setValueCount(rowCount);

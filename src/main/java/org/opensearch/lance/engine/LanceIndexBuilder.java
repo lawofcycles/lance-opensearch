@@ -198,6 +198,30 @@ public final class LanceIndexBuilder {
         String tokenizer,
         boolean withPosition
     ) {
+        return ensureFtsIndexesWithParams(dataset, targetColumns, maxRows, fragmentIds, ftsParamsJson(tokenizer, withPosition));
+    }
+
+    /**
+     * Builds FTS indexes that reproduce pre-tokenized values verbatim:
+     * whitespace split only, positions stored, and every transformation
+     * Lance's inverted index applies by default turned off (lower
+     * casing, stemming, stop word removal, ascii folding, the 40
+     * character token cap). The analyzer mode's derived tokens columns
+     * use this: the OpenSearch analyzer already produced the final
+     * tokens at backfill time, so the index and the query tokenizer
+     * must not alter them further.
+     */
+    public static BuildResult ensureVerbatimWhitespaceFtsIndexes(Dataset dataset, Set<String> targetColumns) {
+        return ensureFtsIndexesWithParams(dataset, targetColumns, Long.MAX_VALUE, Optional.empty(), verbatimWhitespaceFtsParamsJson());
+    }
+
+    private static BuildResult ensureFtsIndexesWithParams(
+        Dataset dataset,
+        Set<String> targetColumns,
+        long maxRows,
+        Optional<List<Integer>> fragmentIds,
+        String ftsParamsJson
+    ) {
         BuildResult result = new BuildResult();
         if (targetColumns.isEmpty()) {
             return result;
@@ -205,7 +229,6 @@ public final class LanceIndexBuilder {
         if (rowsUnlessOverMaxRows(dataset, maxRows, "FTS", targetColumns, result).isEmpty()) {
             return result;
         }
-        String ftsParamsJson = ftsParamsJson(tokenizer, withPosition);
         for (Field field : dataset.getSchema().getFields()) {
             if (!(field.getType() instanceof ArrowType.Utf8)) {
                 continue;
@@ -235,10 +258,9 @@ public final class LanceIndexBuilder {
                 }
                 result.addBuilt(column, IndexType.INVERTED.name());
                 LOG.info(
-                    "built FTS index over column {} (tokenizer={}, with_position={}, fragmentIds={}, version {})",
+                    "built FTS index over column {} (params={}, fragmentIds={}, version {})",
                     column,
-                    tokenizer,
-                    withPosition,
+                    ftsParamsJson,
                     fragmentIds.orElse(null),
                     dataset.version()
                 );
@@ -260,6 +282,29 @@ public final class LanceIndexBuilder {
     private static String ftsParamsJson(String tokenizer, boolean withPosition) {
         try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
             builder.startObject().field("base_tokenizer", tokenizer).field("with_position", withPosition).endObject();
+            return builder.toString();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
+     * Inverted index params that index whitespace separated tokens
+     * exactly as stored: positions on (phrase queries need them) and
+     * Lance's default transformations off. {@code max_token_length}
+     * null lifts the default 40 character cap.
+     */
+    private static String verbatimWhitespaceFtsParamsJson() {
+        try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
+            builder.startObject()
+                .field("base_tokenizer", "whitespace")
+                .field("with_position", true)
+                .field("lower_case", false)
+                .field("stem", false)
+                .field("remove_stop_words", false)
+                .field("ascii_folding", false)
+                .nullField("max_token_length")
+                .endObject();
             return builder.toString();
         } catch (IOException e) {
             throw new UncheckedIOException(e);

@@ -8,6 +8,8 @@ package org.opensearch.lance.attach;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -19,10 +21,12 @@ import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.analysis.Analyzer;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.schema.LanceField;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
@@ -41,7 +45,9 @@ import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.index.analysis.AnalysisRegistry;
 import org.opensearch.lance.LanceInternalHeaders;
+import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.NativeMemoryLimit;
@@ -104,6 +110,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
     private final Client client;
     private final LanceNamespaceService namespaceService;
     private final AllowedTableRoots allowedRoots;
+    private final AnalysisRegistry analysisRegistry;
 
     @Inject
     public TransportLanceAttachAction(
@@ -114,7 +121,8 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         IndexNameExpressionResolver indexNameExpressionResolver,
         Client client,
         LanceNamespaceService namespaceService,
-        AllowedTableRoots allowedRoots
+        AllowedTableRoots allowedRoots,
+        AnalysisRegistry analysisRegistry
     ) {
         super(
             LanceAttachAction.NAME,
@@ -128,6 +136,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         this.client = client;
         this.namespaceService = namespaceService;
         this.allowedRoots = allowedRoots;
+        this.analysisRegistry = analysisRegistry;
     }
 
     @Override
@@ -196,6 +205,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                 }
             }
         }
+        ensureAnalyzerDerivedColumns(request, openVersion);
         RestAttachAction.Derivation derivation;
         long[] fragmentDocs;
         try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions(), openVersion)) {
@@ -234,6 +244,108 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             luceneBoundExceeded,
             listener
         );
+    }
+
+    /**
+     * The write side of the {@code type: text_analyzer} override, run
+     * before the mapping derivation so the derivation sees the derived
+     * tokens columns: resolve every declared analyzer name (unknown is
+     * a 400), then create, backfill and index the missing derived
+     * columns through {@link LanceTextAnalyzerBackfill}. With
+     * {@code derive: async} the backfill runs on the generic pool after
+     * this method returns and the derivation maps the base column by
+     * the default rules for now; the namespace poll re-derives the
+     * mapping when the backfill commit advances the manifest, which is
+     * when the column flips to the analyzer mode. A snapshot pinned by
+     * {@code version} or {@code tag} cannot be written, so every
+     * derived column must already exist there.
+     */
+    private void ensureAnalyzerDerivedColumns(LanceAttachRequest request, Optional<Long> openVersion) throws Exception {
+        Map<String, LanceOverrides.Column> textAnalyzer = request.overrides().textAnalyzerColumns();
+        if (textAnalyzer.isEmpty()) {
+            return;
+        }
+        Map<String, Analyzer> resolved = new LinkedHashMap<>();
+        for (Map.Entry<String, LanceOverrides.Column> entry : textAnalyzer.entrySet()) {
+            String analyzerName = entry.getValue().analyzer();
+            Analyzer analyzer;
+            try {
+                analyzer = analysisRegistry.getAnalyzer(analyzerName);
+            } catch (Exception e) {
+                throw new OpenSearchStatusException(
+                    "[overrides." + entry.getKey() + ".analyzer=" + analyzerName + "] could not be built: " + e.getMessage(),
+                    RestStatus.BAD_REQUEST,
+                    e
+                );
+            }
+            if (analyzer == null) {
+                throw new OpenSearchStatusException(
+                    "[overrides."
+                        + entry.getKey()
+                        + ".analyzer="
+                        + analyzerName
+                        + "] does not name a built-in OpenSearch analyzer; index-scoped custom analyzers are not resolvable at attach",
+                    RestStatus.BAD_REQUEST
+                );
+            }
+            resolved.put(entry.getKey(), analyzer);
+        }
+        if (openVersion.isPresent()) {
+            // A pinned snapshot is readonly by design: the backfill
+            // commit would land after the pin and never be visible. The
+            // attach may still pin a version where a derived column
+            // already exists (a re-attach of an already-derived table).
+            try (Dataset pinned = LanceRegistry.openDataset(request.table(), request.storageOptions(), openVersion)) {
+                Set<String> names = new HashSet<>();
+                for (LanceField field : pinned.getLanceSchema().fields()) {
+                    names.add(field.getName());
+                }
+                for (Map.Entry<String, LanceOverrides.Column> entry : textAnalyzer.entrySet()) {
+                    String derived = LanceOverrides.derivedColumnName(entry.getKey(), entry.getValue());
+                    if (!names.contains(derived)) {
+                        throw new OpenSearchStatusException(
+                            "[overrides."
+                                + entry.getKey()
+                                + ".type=text_analyzer] cannot backfill derived column ["
+                                + derived
+                                + "] on a snapshot pinned by [version] or [tag]; attach the latest version first, or pin a "
+                                + "version that already carries the derived column",
+                            RestStatus.BAD_REQUEST
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        if (request.asyncDerive()) {
+            String table = request.table();
+            threadPool.generic().execute(() -> {
+                try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions())) {
+                    LanceTextAnalyzerBackfill.Ensured ensured = LanceTextAnalyzerBackfill.ensureDerivedColumns(
+                        dataset,
+                        textAnalyzer,
+                        resolved::get,
+                        LanceRegistry.allocator()
+                    );
+                    LOG.info(
+                        "async text_analyzer backfill finished for table {}: created {}, already present {}",
+                        table,
+                        ensured.created(),
+                        ensured.existing()
+                    );
+                } catch (Exception e) {
+                    LOG.warn("async text_analyzer backfill failed for table {}; re-attach to retry", table, e);
+                }
+            });
+            return;
+        }
+        try (Dataset dataset = LanceRegistry.openDataset(request.table(), request.storageOptions())) {
+            try {
+                LanceTextAnalyzerBackfill.ensureDerivedColumns(dataset, textAnalyzer, resolved::get, LanceRegistry.allocator());
+            } catch (IllegalArgumentException e) {
+                throw new OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST, e);
+            }
+        }
     }
 
     /**
