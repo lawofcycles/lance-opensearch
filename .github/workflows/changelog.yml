@@ -19,7 +19,7 @@ jobs:
         run: |
           set -euo pipefail
           pr=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json files,labels,body)
-          fragments=$(jq -r '[.files[].path | select(startswith("changelog/unreleased/") and endswith(".md") and . != "changelog/unreleased/README.md")] | length' <<< "$pr")
+          fragments=$(jq -r '[.files[] | select((.path | startswith("changelog/unreleased/")) and (.path | endswith(".md")) and ((.path | split("/") | last) != "README.md") and (.additions > 0))] | length' <<< "$pr")
           labelled=$(jq -r '[.labels[].name] | index("skip-changelog") != null' <<< "$pr")
           in_body=$(jq -r '(.body // "") | split("\n") | map(gsub("^\\s+|\\s+$"; "")) | index("skip-changelog") != null' <<< "$pr")
           echo "fragments changed: $fragments, skip-changelog label: $labelled, skip-changelog line in body: $in_body"
