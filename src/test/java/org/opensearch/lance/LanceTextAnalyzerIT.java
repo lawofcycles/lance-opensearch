@@ -5,6 +5,7 @@
 
 package org.opensearch.lance;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
@@ -165,19 +166,21 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
             // manifest (the keyword to lance_text flip goes through the
             // established index rebuild), after which the analyzer mode
             // serves stemmed matches. Allow generous time for the poll
-            // and the rebuild.
+            // and the rebuild. The rebuild deletes and recreates the
+            // index, so a poll that lands in between answers 404, and a
+            // search against the fresh index may be refused before its
+            // shard is allocated; assertBusy retries only on
+            // AssertionError, so such responses are converted into one
+            // and count as "not yet".
             assertBusy(() -> {
-                String mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+                String mapping = readAll(performRetrying(new Request("GET", "/" + indexName + "/_mapping")));
                 assertTrue(
                     "mapping must flip to the analyzer mode: " + mapping,
                     mapping.contains("\"tokens_column\":\"body__lance_tokens\"")
                 );
-                String matchBody = readAll(
-                    postJson(
-                        "/" + indexName + "/_search",
-                        "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"running\"}}}"
-                    )
-                );
+                Request search = new Request("POST", "/" + indexName + "/_search");
+                search.setJsonEntity("{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"running\"}}}");
+                String matchBody = readAll(performRetrying(search));
                 assertEquals(
                     "running must hit the three run-stem rows: " + matchBody,
                     3,
@@ -225,6 +228,19 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
         );
         assertEquals(RestStatus.BAD_REQUEST.getStatus(), e.getResponse().getStatusLine().getStatusCode());
         assertTrue(e.getMessage(), e.getMessage().contains("pinned"));
+    }
+
+    /**
+     * Performs {@code request} and reports a non-2xx answer as an
+     * {@link AssertionError} so that an enclosing {@code assertBusy}
+     * retries it instead of failing on the first {@link ResponseException}.
+     */
+    private static Response performRetrying(Request request) throws IOException {
+        try {
+            return client().performRequest(request);
+        } catch (ResponseException e) {
+            throw new AssertionError("index temporarily unavailable during the rebuild: " + e.getMessage(), e);
+        }
     }
 
     private static void deleteIndexQuietly(String indexName) {
