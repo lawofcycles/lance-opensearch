@@ -84,6 +84,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicLong;
@@ -585,17 +586,50 @@ public final class PlanExecutor {
     }
 
     /**
+     * What one planned aggregation executes with: the resolved executor
+     * state and the Lance SQL its scans filter by, from
+     * {@link #scanFilterSql}.
+     */
+    public record PlannedAggregate(LanceAggregateResults results, String scanFilterSql) {
+    }
+
+    /**
+     * The filter SQL of a pushed scan's aggregate or query scan: the
+     * pushed aggregate's own filter when the planned tree carried the
+     * query filter under the aggregate, else the pushed filter's SQL,
+     * else {@code requestFilterSql}, the coordinator's translation of
+     * the query that arrived next to the plan. A plan built from the
+     * aggregation tree alone carries no filter of its own, so the
+     * request's SQL stands; a plan built from the whole search body
+     * carries it inside the pushed aggregate and the two spell the same
+     * predicate.
+     */
+    public static String scanFilterSql(LanceTableScan scan, String requestFilterSql) {
+        Optional<PushedAggregate> aggregate = scan.pushedAggregate();
+        if (aggregate.isPresent() && aggregate.get().filterSql() != null) {
+            return aggregate.get().filterSql();
+        }
+        Optional<PushedOperation.PushedFilter> filter = scan.pushedFilter();
+        if (filter.isPresent()) {
+            return filter.get().sql();
+        }
+        return requestFilterSql;
+    }
+
+    /**
      * Plan the request's aggregation tree into the Lance scan: the
      * translator accepts the tree, the Volcano run fires the pushdown
      * rule, and {@link LanceAggregateResults#resolve} pairs the
      * request's builders with the pushed aggregate's Substrait bytes.
-     * Returns null when the translator refuses the tree or the
-     * planner does not fold it, in which case the Lucene aggregators
-     * run; the caller has already checked the request envelope (the
-     * pushdown setting, {@code size} 0, no {@code post_filter}, a
-     * scalar query, no reader wrapper, the aggregation allow list).
+     * The scan filter is {@link #scanFilterSql} of the pushed scan and
+     * the request's SQL. Returns null when the translator refuses the
+     * tree or the planner does not fold it, in which case the Lucene
+     * aggregators run; the caller has already checked the request
+     * envelope (the pushdown setting, {@code size} 0, no
+     * {@code post_filter}, a scalar query, no reader wrapper, the
+     * aggregation allow list).
      */
-    public LanceAggregateResults plannedAggregate(
+    public PlannedAggregate plannedAggregate(
         LanceFragmentQueryRequest request,
         Dataset dataset,
         Map<String, LinkedHashMap<String, String>> multiFields,
@@ -618,7 +652,7 @@ public final class PlanExecutor {
             return null;
         }
         int maxGroups = LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
-        return LanceAggregateResults.resolve(
+        LanceAggregateResults results = LanceAggregateResults.resolve(
             pushed.aggregate(),
             pushed.substrait(),
             request.aggregations(),
@@ -627,6 +661,7 @@ public final class PlanExecutor {
             qsc,
             maxGroups
         );
+        return results == null ? null : new PlannedAggregate(results, scanFilterSql(scan, request.filterSql()));
     }
 
     /**

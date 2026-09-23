@@ -851,7 +851,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 }
                 InternalAggregations aggregations;
                 MatchedCount matched;
-                LanceAggregateResults pushdown = resolveAggregatePushdown(
+                PlanExecutor.PlannedAggregate pushdown = resolveAggregatePushdown(
                     request,
                     hasSecurityWrapper,
                     dataset,
@@ -867,15 +867,16 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     // pushdown_parallelism groups; the extra scans run on
                     // the index_searcher pool.
                     long pushdownStart = System.nanoTime();
-                    LanceAggregateResults.Result result = pushdown.execute(
-                        dataset,
-                        effectiveFragmentIds,
-                        request.filterSql(),
-                        clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING),
-                        intraRequestExecutor,
-                        cancellation,
-                        name -> emptyTopLevelAggregation(request, searchContext, qsc, name)
-                    );
+                    LanceAggregateResults.Result result = pushdown.results()
+                        .execute(
+                            dataset,
+                            effectiveFragmentIds,
+                            pushdown.scanFilterSql(),
+                            clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING),
+                            intraRequestExecutor,
+                            cancellation,
+                            name -> emptyTopLevelAggregation(request, searchContext, qsc, name)
+                        );
                     LOGGER.debug(
                         "lance.dispatch: aggregation pushdown for [{}] over {} rows in {} scans took {} us",
                         request.indexName(),
@@ -996,7 +997,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * pairs the request's builders with the pushed aggregate. Returns
      * {@code null} otherwise, in which case the Lucene aggregators run.
      */
-    private LanceAggregateResults resolveAggregatePushdown(
+    private PlanExecutor.PlannedAggregate resolveAggregatePushdown(
         LanceFragmentQueryRequest request,
         boolean hasSecurityWrapper,
         Dataset dataset,

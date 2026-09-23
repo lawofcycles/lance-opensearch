@@ -91,7 +91,7 @@ public class LancePlannerFactoryD2Tests extends OpenSearchTestCase {
 
     public void testUnfoldableAggregateReachesTheLuceneOperatorUnderTheCoordinatorLayer() throws IOException {
         RelNode physical = wrapAndPlan(
-            "{\"size\":0,\"query\":{\"term\":{\"category\":\"c0\"}},\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}",
+            "{\"size\":0,\"query\":{\"term\":{\"category\":\"c0\"}},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"rating\"}}}}",
             2
         );
         FanOutExec fan = coordinatorLayerOf(physical, MergeExec.ReduceKind.AGGREGATE_INTERNAL, 2);

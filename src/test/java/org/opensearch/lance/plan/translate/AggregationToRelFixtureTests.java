@@ -49,7 +49,8 @@ public class AggregationToRelFixtureTests extends OpenSearchTestCase {
         "nested_terms_date_histogram_sum",
         "composite_terms_date_histogram",
         "composite_with_after",
-        "two_metric_only_aggs"
+        "two_metric_only_aggs",
+        "query_term_terms"
     );
 
     private final String fixture;

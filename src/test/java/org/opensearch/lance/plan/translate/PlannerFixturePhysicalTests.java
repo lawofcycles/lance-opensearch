@@ -12,6 +12,7 @@ import io.substrait.proto.Plan;
 import io.substrait.proto.Rel;
 import org.apache.calcite.plan.volcano.VolcanoPlanner;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.Filter;
 import org.opensearch.lance.plan.calcite.LanceConvention;
 import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.LanceTableScan;
@@ -76,6 +77,12 @@ public class PlannerFixturePhysicalTests extends OpenSearchTestCase {
         PushedOperation.PushedAggregate pushed = ((LanceTableScan) physical).pushedAggregate().orElse(null);
         assertNotNull("the scan of [" + fixture + "] carries the pushed aggregate", pushed);
         assertEquals("row type of [" + fixture + "] survives the push", logical.getRowType(), physical.getRowType());
+        boolean filtered = containsFilter(logical);
+        assertEquals(
+            "the pushed aggregate of [" + fixture + "] carries the filter SQL exactly when the tree carried a query filter",
+            filtered,
+            pushed.filterSql() != null
+        );
 
         AggregateRel rel = decode(pushed.substrait());
         int cardinalities = 0;
@@ -97,6 +104,18 @@ public class PlannerFixturePhysicalTests extends OpenSearchTestCase {
             assertEquals("grouping lists of [" + fixture + "]", 1, rel.getGroupingsCount());
             assertEquals("grouping expressions of [" + fixture + "]", groupings, rel.getGroupings(0).getGroupingExpressionsCount());
         }
+    }
+
+    private static boolean containsFilter(RelNode node) {
+        if (node instanceof Filter) {
+            return true;
+        }
+        for (RelNode input : node.getInputs()) {
+            if (containsFilter(input)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static AggregateRel decode(ByteBuffer buffer) throws IOException {

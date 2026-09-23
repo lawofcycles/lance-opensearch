@@ -1,0 +1,4 @@
+LanceAggregate(group=[{0}], buckets=[[TERMS{name=by_cat, size=10, shardSize=25, minDocCount=1, order=COUNT_DESC}]])
+  LogicalProject(by_cat=[$4], id=[$0], rating=[$1], price=[$2], weight=[$3], category=[$4], body=[$5], flag=[$6], ts=[$7], day=[$8])
+    LogicalFilter(condition=[=($4, 'c0')])
+      LanceTableScan(table=[[lance, idx]])

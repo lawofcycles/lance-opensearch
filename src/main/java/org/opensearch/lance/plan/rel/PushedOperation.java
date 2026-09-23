@@ -180,13 +180,18 @@ public sealed interface PushedOperation permits PushedOperation.PushedAggregate,
      * An aggregate pushed into the scan: the {@link LanceAggregate} the
      * scan replaced (its input rebuilt to the concrete project / filter
      * / scan tree, so the Substrait producer can re-read it for the
-     * percentiles bin scans) and the Substrait bytes of the main scan.
+     * percentiles bin scans), the Substrait bytes of the main scan, and
+     * the SQL of the query filter the tree carried under the aggregate,
+     * which the executor hands to the scan's {@code filter(sql)} next to
+     * the bytes; null when the tree carried no filter. The filter never
+     * travels inside the bytes: Lance's consumer reads the
+     * {@code AggregateRel} only and evaluates the scan filter separately.
      *
      * <p>The buffer is treated as immutable; readers take
      * {@link #substrait()} for a positioned duplicate instead of
      * touching the stored buffer's position.
      */
-    record PushedAggregate(LanceAggregate aggregate, ByteBuffer bytes) implements PushedOperation {
+    record PushedAggregate(LanceAggregate aggregate, ByteBuffer bytes, String filterSql) implements PushedOperation {
 
         public PushedAggregate {
             Objects.requireNonNull(aggregate, "aggregate");
@@ -199,9 +204,10 @@ public sealed interface PushedOperation permits PushedOperation.PushedAggregate,
         }
 
         /**
-         * Prints the OpenSearch shape of the pushed aggregate, so the
-         * digest of two scans with different pushed aggregates differs
-         * and the explain output names what was pushed.
+         * Prints the OpenSearch shape of the pushed aggregate and the
+         * filter SQL, so the digest of two scans with different pushed
+         * aggregates (or the same aggregate over different filters)
+         * differs and the explain output names what was pushed.
          */
         @Override
         public String toString() {
@@ -211,6 +217,7 @@ public sealed interface PushedOperation permits PushedOperation.PushedAggregate,
                 + aggregate.bucketSpecs()
                 + ", metrics="
                 + aggregate.metricSpecs()
+                + (filterSql == null ? "" : ", filter=" + filterSql)
                 + "}";
         }
     }
