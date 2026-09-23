@@ -133,11 +133,13 @@ import org.opensearch.search.sort.SortOrder;
  * {@link InternalAggregations#topLevelReduce} merges them unchanged.
  *
  * <p>The decision that a request pushes down belongs to the planner:
- * the translator builds a {@link LanceAggregate}, the pushdown rule
- * asks the Substrait producer for the scan bytes, and the transport
- * action hands the pushed aggregate here. {@link #resolve} then pairs
- * the request's aggregation builders with the aggregate's specs and
- * prepares the response-side state the specs do not model (Lucene doc
+ * the coordinator's translator builds a {@link LanceAggregate}, the
+ * pushdown rule asks the Substrait producer for the scan bytes, and
+ * the plan the fragment request carries brings the bytes and the
+ * aggregate's shape (group key count, metric names and kinds) to the
+ * transport action, which hands them here. {@link #resolve} then pairs
+ * the request's aggregation builders with that shape and
+ * prepares the response-side state the plan does not model (Lucene doc
  * value formats, bucket orders, keyed flags, metadata, the terms top-k
  * selection and the group estimate bound); {@link #execute} runs the
  * scans and assembles the buckets. A null from {@link #resolve} sends
@@ -1727,7 +1729,8 @@ public final class LanceAggregateResults {
     private record Candidate(Object key, long count, List<Group> rows) {
     }
 
-    private final LanceAggregate aggregate;
+    /** Group key count and metric slots of the pushed aggregate, checked against the resolved tree; null for a test instance. */
+    private final PushedShape shape;
     private final ByteBuffer substrait;
     private final List<Level> levels;
     private final Composite composite;
@@ -1741,7 +1744,7 @@ public final class LanceAggregateResults {
      * production instances come only from {@link #resolve}.
      */
     LanceAggregateResults(
-        LanceAggregate aggregate,
+        PushedShape shape,
         ByteBuffer substrait,
         List<Level> levels,
         Composite composite,
@@ -1750,7 +1753,7 @@ public final class LanceAggregateResults {
         int percentilesBins,
         TopKSpec topK
     ) {
-        this.aggregate = aggregate;
+        this.shape = shape;
         this.substrait = substrait;
         this.levels = levels;
         this.composite = composite;
@@ -1957,7 +1960,7 @@ public final class LanceAggregateResults {
         double width = max > min ? (max - min) / percentilesBins : 1d;
         final double minBound = min;
         final double maxBound = max;
-        ByteBuffer bins = LanceSubstraitProducer.toLancePercentilesBins(aggregate, metric.slot(), min, max, percentilesBins)
+        ByteBuffer bins = LanceSubstraitProducer.toLancePercentilesBins(substrait, metric.slot(), min, max, percentilesBins)
             .orElseThrow(
                 () -> new IllegalStateException(
                     "the Substrait producer refused the percentiles bin scan of ["
@@ -3280,6 +3283,32 @@ public final class LanceAggregateResults {
     // ---------------------------------------------------------------
 
     /**
+     * The shape of the pushed aggregate the plan carries: how many group
+     * keys the scan groups by and, per aggregate call in call order, the
+     * request's aggregation name and the metric kind. This is what the
+     * resolution below checks the request's builders against.
+     */
+    public record PushedShape(int groupCount, List<MetricSlot> metrics) {
+
+        public PushedShape {
+            metrics = List.copyOf(metrics);
+        }
+
+        /** From the pushed operation the planner produced. */
+        public static PushedShape of(LanceAggregate aggregate) {
+            List<MetricSlot> slots = new ArrayList<>();
+            for (MetricSpec spec : aggregate.metricSpecs()) {
+                slots.add(new MetricSlot(spec.aggregationName(), spec.kind()));
+            }
+            return new PushedShape(aggregate.getGroupCount(), slots);
+        }
+    }
+
+    /** One aggregate call of the pushed aggregate: the request's aggregation name and the metric kind. */
+    public record MetricSlot(String name, MetricSpec.Kind kind) {
+    }
+
+    /**
      * Prepares the executor state of one pushed aggregate: walks the
      * request's builders the way the translator walked them, resolves
      * every field against the mapping (formats, key kinds, rounding),
@@ -3289,9 +3318,9 @@ public final class LanceAggregateResults {
      * terms order the top-k selection cannot honour), in which case the
      * request stays on the Lucene aggregators.
      *
-     * @param aggregate the pushed aggregate, its input rebuilt to the
-     *     concrete tree (what {@code PushedAggregate} carries)
-     * @param substrait the encoded main scan
+     * @param shape the pushed aggregate's group key count and metric
+     *     slots, as the plan the coordinator shipped carries them
+     * @param substrait the encoded main scan, a direct buffer
      * @param aggregations the request's aggregation builders
      * @param schema the dataset's Arrow schema
      * @param multiFields the index's keyword sub-field spec
@@ -3299,7 +3328,7 @@ public final class LanceAggregateResults {
      * @param maxGroups the bound on the estimated number of groups
      */
     public static LanceAggregateResults resolve(
-        LanceAggregate aggregate,
+        PushedShape shape,
         ByteBuffer substrait,
         AggregatorFactories.Builder aggregations,
         Schema schema,
@@ -3307,12 +3336,12 @@ public final class LanceAggregateResults {
         QueryShardContext qsc,
         int maxGroups
     ) {
-        return resolve(aggregate, substrait, aggregations, schema, multiFields, qsc, maxGroups, defaultPercentilesBins, defaultTopkSlack);
+        return resolve(shape, substrait, aggregations, schema, multiFields, qsc, maxGroups, defaultPercentilesBins, defaultTopkSlack);
     }
 
     /** As above with explicit percentiles bins and top-k slack, for tests. */
     static LanceAggregateResults resolve(
-        LanceAggregate aggregate,
+        PushedShape shape,
         ByteBuffer substrait,
         AggregatorFactories.Builder aggregations,
         Schema schema,
@@ -3332,11 +3361,11 @@ public final class LanceAggregateResults {
             List<Metric> metrics = resolveMetrics(top, schema, multiFields, qsc, allMetrics);
             resolved = metrics == null
                 ? null
-                : new LanceAggregateResults(aggregate, substrait, List.of(), null, metrics, allMetrics, bins, null);
+                : new LanceAggregateResults(shape, substrait, List.of(), null, metrics, allMetrics, bins, null);
         } else if (top.size() == 1 && top.get(0) instanceof CompositeAggregationBuilder composite) {
-            resolved = resolveCompositeShape(aggregate, substrait, composite, schema, multiFields, qsc, bins);
+            resolved = resolveCompositeShape(shape, substrait, composite, schema, multiFields, qsc, bins);
         } else if (top.size() == 1) {
-            resolved = resolveBucketTree(aggregate, substrait, top.get(0), schema, multiFields, qsc, maxGroups, bins, slack);
+            resolved = resolveBucketTree(shape, substrait, top.get(0), schema, multiFields, qsc, maxGroups, bins, slack);
         } else {
             return null;
         }
@@ -3345,27 +3374,27 @@ public final class LanceAggregateResults {
 
     /**
      * Whether the resolved levels and metrics line up with the pushed
-     * aggregate's specs: same key count, same metric count, and per
+     * aggregate's shape: same key count, same metric count, and per
      * slot the same kind and aggregation name. A mismatch means the
      * translator and this resolution disagree about the request's
      * shape; refusing keeps the request on the aggregators instead of
      * reading the scan's columns under wrong names.
      */
     private boolean matchesSpecs() {
-        if (aggregate == null) {
+        if (shape == null) {
             return true;
         }
-        if (aggregate.getGroupCount() != keyCount()) {
+        if (shape.groupCount() != keyCount()) {
             return false;
         }
-        List<MetricSpec> specs = aggregate.metricSpecs();
-        if (specs.size() != allMetrics.size()) {
+        List<MetricSlot> slots = shape.metrics();
+        if (slots.size() != allMetrics.size()) {
             return false;
         }
         for (int slot = 0; slot < allMetrics.size(); slot++) {
-            MetricSpec spec = specs.get(slot);
+            MetricSlot expected = slots.get(slot);
             Metric metric = allMetrics.get(slot);
-            if (!spec.kind().name().equals(metric.kind().name()) || !spec.aggregationName().equals(metric.name())) {
+            if (!expected.kind().name().equals(metric.kind().name()) || !expected.name().equals(metric.name())) {
                 return false;
             }
         }
@@ -3380,7 +3409,7 @@ public final class LanceAggregateResults {
      * order needs a top-k selection this tree does not support.
      */
     private static LanceAggregateResults resolveBucketTree(
-        LanceAggregate aggregate,
+        PushedShape shape,
         ByteBuffer substrait,
         AggregationBuilder root,
         Schema schema,
@@ -3534,7 +3563,7 @@ public final class LanceAggregateResults {
                 return null;
             }
         }
-        return new LanceAggregateResults(aggregate, substrait, levels, null, List.of(), allMetrics, bins, topK);
+        return new LanceAggregateResults(shape, substrait, levels, null, List.of(), allMetrics, bins, topK);
     }
 
     /**
@@ -3746,7 +3775,7 @@ public final class LanceAggregateResults {
      * {@code after} value is not of the type the source parses.
      */
     private static LanceAggregateResults resolveCompositeShape(
-        LanceAggregate aggregate,
+        PushedShape shape,
         ByteBuffer substrait,
         CompositeAggregationBuilder compositeBuilder,
         Schema schema,
@@ -3810,6 +3839,6 @@ public final class LanceAggregateResults {
             return null;
         }
         Composite composite = new Composite(compositeBuilder, sources, metrics);
-        return new LanceAggregateResults(aggregate, substrait, List.of(), composite, List.of(), allMetrics, bins, null);
+        return new LanceAggregateResults(shape, substrait, List.of(), composite, List.of(), allMetrics, bins, null);
     }
 }

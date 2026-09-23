@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 import org.opensearch.action.ActionRequest;
@@ -19,6 +20,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.SortBuilder;
@@ -51,15 +53,16 @@ import org.opensearch.tasks.Task;
  *       ({@link AggregatorFactories.Builder}), NamedWriteable-compatible.</li>
  * </ul>
  *
- * <p>{@link #filterSql()} is preserved alongside {@link #query()} for
- * Lance metadata-only counting via {@code Dataset.countRows(String)}.
- * When the query is a pure filter shape (term / range / bool / ...)
- * the coordinator sets both fields; when the query needs scoring
- * (match / knn) only {@link #query()} is set. The per-node executor
- * uses {@link #query()} for hits and aggregations, and
- * {@link #filterSql()} for {@code hits.total.value} counting when
- * available (metadata path), falling back to
- * {@link org.apache.lucene.search.IndexSearcher#count} otherwise.
+ * <p>{@link #plan()} is the per node plan the coordinator's planner
+ * chose for this request ({@link FragmentPlan}): the Lance SQL of the
+ * scalar predicate, the full text or knn clause the executor builds the
+ * Lance query from, and the page or aggregate the Lance scan computes
+ * when the planner pushed one. The executor runs the plan after its
+ * node local guards; the builders above stay on the wire because the
+ * Lucene side (aggregator construction, collectors, the fetch phase)
+ * needs them whatever the plan says. The wire format is internal to the
+ * plugin: every node runs the same plugin version, a mixed version
+ * cluster is not supported.
  */
 public final class LanceFragmentQueryRequest extends ActionRequest {
 
@@ -81,7 +84,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
      * the table's latest version.
      */
     private final long pinnedVersion;
-    private final String filterSql;
+    private final FragmentPlan plan;
     private final QueryBuilder query;
     private final QueryBuilder postFilter;
     private final List<SortBuilder<?>> sorts;
@@ -119,7 +122,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         String indexName,
         StorageOptions storageOptions,
         long pinnedVersion,
-        String filterSql,
+        FragmentPlan plan,
         QueryBuilder query,
         QueryBuilder postFilter,
         List<SortBuilder<?>> sorts,
@@ -134,7 +137,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.indexName = indexName;
         this.storageOptions = storageOptions;
         this.pinnedVersion = pinnedVersion;
-        this.filterSql = filterSql;
+        this.plan = Objects.requireNonNull(plan, "plan");
         this.query = query;
         this.postFilter = postFilter;
         this.sorts = sorts == null ? Collections.emptyList() : List.copyOf(sorts);
@@ -152,7 +155,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.indexName = in.readString();
         this.storageOptions = StorageOptions.readFromStream(in);
         this.pinnedVersion = in.readLong();
-        this.filterSql = in.readOptionalString();
+        this.plan = new FragmentPlan(in);
         this.query = in.readOptionalNamedWriteable(QueryBuilder.class);
         this.postFilter = in.readOptionalNamedWriteable(QueryBuilder.class);
         int sortCount = in.readVInt();
@@ -189,7 +192,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         out.writeString(indexName);
         storageOptions.writeTo(out);
         out.writeLong(pinnedVersion);
-        out.writeOptionalString(filterSql);
+        plan.writeTo(out);
         out.writeOptionalNamedWriteable(query);
         out.writeOptionalNamedWriteable(postFilter);
         out.writeVInt(sorts.size());
@@ -277,15 +280,13 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     }
 
     /**
-     * Lance SQL filter for metadata-only counting via
-     * {@code Dataset.countRows(String)}. May be {@code null} when
-     * the query is not a pure filter shape (e.g. match / knn); in
-     * that case the per-node executor falls back to
-     * {@link org.apache.lucene.search.IndexSearcher#count} against
-     * {@link #query()}.
+     * The per node plan the coordinator chose for this request. Never
+     * {@code null}: a request the planner could not spell carries a
+     * Lucene plan whose kind names the envelope and whose query parts
+     * are empty.
      */
-    public String filterSql() {
-        return filterSql;
+    public FragmentPlan plan() {
+        return plan;
     }
 
     /**
@@ -399,7 +400,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         String tableUri,
         String indexName,
         StorageOptions storageOptions,
-        String filterSql,
+        FragmentPlan plan,
         QueryBuilder query,
         List<SortBuilder<?>> sorts,
         int size,
@@ -410,7 +411,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             indexName,
             storageOptions,
             /* pinnedVersion */ -1L,
-            filterSql,
+            plan,
             query,
             /* postFilter */ null,
             sorts,

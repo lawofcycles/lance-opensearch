@@ -5,6 +5,7 @@
 
 package org.opensearch.lance.dispatch;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -18,8 +19,6 @@ import java.util.Set;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.arrow.vector.types.pojo.Schema;
-import org.apache.calcite.rel.RelNode;
-import org.apache.calcite.tools.RelBuilder;
 import org.apache.lucene.search.TotalHits;
 import org.lance.Dataset;
 import org.lance.Fragment;
@@ -42,6 +41,10 @@ import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.tasks.TaskId;
+import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryRewriteContext;
+import org.opensearch.index.query.Rewriteable;
+import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
@@ -54,12 +57,13 @@ import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.execute.FragmentFanOut;
+import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.plan.execute.MergeReducer;
 import org.opensearch.lance.plan.execute.PlanExecutor;
+import org.opensearch.lance.plan.execute.RequestPlanner;
 import org.opensearch.lance.plan.metadata.TableStatistics;
 import org.opensearch.lance.plan.metadata.TableStatisticsCache;
-import org.opensearch.lance.plan.rel.physical.MergeExec;
-import org.opensearch.lance.plan.translate.SearchRequestToRel;
+import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
@@ -133,8 +137,15 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     private final ScriptService scriptService;
     private final NodeClient client;
     /**
-     * Builds the translator and printer run that derives each target's
-     * filter SQL at plan time; the budgets mirror the explain action's.
+     * Supplies the coordinator rewrite context: the same shard-free
+     * {@code QueryRewriteContext} {@code TransportSearchAction} rewrites
+     * a search body with before the shard fan-out.
+     */
+    private final IndicesService indicesService;
+    /**
+     * Plans every target once: the translator, the Volcano run and the
+     * per node plan the fragment requests carry; the budgets mirror the
+     * explain action's.
      */
     private final LancePlannerFactory plannerFactory;
     /**
@@ -168,7 +179,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         BigArrays bigArrays,
         ScriptService scriptService,
         NodeClient client,
-        LanceWarmCache warmCache
+        LanceWarmCache warmCache,
+        IndicesService indicesService
     ) {
         super(LanceCoordinatorAction.NAME, transportService, actionFilters, SearchRequest::new, LancePlugin.LANCE_COORDINATOR_THREAD_POOL);
         this.transportService = transportService;
@@ -178,6 +190,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         this.bigArrays = bigArrays;
         this.scriptService = scriptService;
         this.client = client;
+        this.indicesService = indicesService;
         long nativeBudgetBytes = NativeMemoryLimit.parse(
             LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.get(clusterService.getSettings()),
             LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.getKey()
@@ -272,8 +285,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         SearchSourceBuilder source = searchRequest.source();
         FanOutPolicy policy = new FanOutPolicy(task, resolveTimeout(source), resolveAllowPartialSearchResults(searchRequest));
 
-        org.opensearch.index.query.QueryBuilder query = source == null ? null : source.query();
-        org.opensearch.index.query.QueryBuilder postFilter = source == null ? null : source.postFilter();
+        QueryBuilder query = rewriteAtCoordinator(source == null ? null : source.query(), start);
+        QueryBuilder postFilter = source == null ? null : source.postFilter();
         List<SortBuilder<?>> sorts = source == null || source.sorts() == null ? Collections.emptyList() : source.sorts();
         Object[] searchAfter = source == null ? null : source.searchAfter();
         AggregatorFactories.Builder aggregations = source == null ? null : source.aggregations();
@@ -305,19 +318,22 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         List<DiscoveryNode> nodeList = new ArrayList<>(dataNodes);
         nodeList.sort(Comparator.comparing(DiscoveryNode::getId));
 
-        // Per-index fan-out results, collected sequentially.
-        // filterSql is recomputed per target inside runIndexLoop so
-        // each target encodes literals against its own mapping; the
-        // value set here only survives when the mapping does not
-        // affect the emitted SQL.
+        // Per-index fan-out results, collected sequentially. The plan
+        // is derived per target inside runIndexLoop, against the
+        // target's own schema; the spec built here carries no plan yet.
+        boolean planAggregations = aggregations != null
+            && clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_SETTING)
+            && LanceAggregationSupport.isPushdownCandidate(aggregations);
         FragmentQuerySpec spec = new FragmentQuerySpec(
             null,
             query,
             postFilter,
             sorts,
             searchAfter,
+            from,
             perNodeSize,
             aggregations,
+            planAggregations,
             source != null && source.trackScores(),
             trackTotalHitsUpTo
         );
@@ -335,7 +351,25 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             seqNoAndPrimaryTermRequested,
             trackTotalHitsUpTo
         );
-        runIndexLoop(targets, 0, nodeList, spec, policy, source, merged, start, listener);
+        runIndexLoop(targets, 0, nodeList, spec, policy, merged, start, listener);
+    }
+
+    /**
+     * The coordinator rewrite of the top level query: the same
+     * shard-free {@code QueryRewriteContext} rewrite
+     * {@code TransportSearchAction} applies to a search body before its
+     * shard fan-out, so a query that folds itself away without a mapping
+     * ({@code wrapper}, a {@code bool} of one clause, ...) does so
+     * before it is planned, and the plan and the query the executors
+     * receive agree. Async rewrites (a {@code terms} lookup) are refused
+     * here as they are on the executors' shard-context rewrite.
+     */
+    QueryBuilder rewriteAtCoordinator(QueryBuilder query, long nowInMillis) throws IOException {
+        if (query == null) {
+            return null;
+        }
+        QueryRewriteContext rewriteContext = indicesService.getRewriteContext(() -> nowInMillis);
+        return Rewriteable.rewrite(query, rewriteContext, true);
     }
 
     /**
@@ -400,7 +434,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         List<DiscoveryNode> nodeList,
         FragmentQuerySpec spec,
         FanOutPolicy policy,
-        SearchSourceBuilder source,
         MergeReducer merged,
         long startMillis,
         ActionListener<SearchResponse> listener
@@ -415,11 +448,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 target,
                 nodeList,
                 spec,
-                source,
                 policy,
                 merged,
                 ActionListener.wrap(
-                    v -> runIndexLoop(targets, index + 1, nodeList, spec, policy, source, merged, startMillis, listener),
+                    v -> runIndexLoop(targets, index + 1, nodeList, spec, policy, merged, startMillis, listener),
                     listener::onFailure
                 )
             );
@@ -429,23 +461,22 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     }
 
     /**
-     * Enumerate fragments for one Lance-backed index, group them
-     * across the data-node list, and issue one
-     * {@link LanceFragmentQueryAction} per node, or several per node
-     * when the node's fragments hold more rows than one Lucene reader
-     * may (see {@link PlanExecutor#splitByRows}). The target's filter SQL is
-     * derived here, once per target while its dataset is open, because
-     * the planner's model needs the Arrow schema and the SQL literal
-     * encoding depends on the target's own columns: two indices in the
-     * same request may map the same field name to different types.
-     * Completion signals through {@code done} once every response is
-     * merged into {@code merged}.
+     * Enumerate fragments for one Lance-backed index, plan the request
+     * against the target once, group the fragments across the data-node
+     * list, and issue one {@link LanceFragmentQueryAction} per node, or
+     * several per node when the node's fragments hold more rows than one
+     * Lucene reader may (see {@link PlanExecutor#splitByRows}). The plan
+     * is derived here, once per target while its dataset is open,
+     * because the planner's model needs the Arrow schema and the SQL
+     * literal encoding depends on the target's own columns: two indices
+     * in the same request may map the same field name to different
+     * types. Completion signals through {@code done} once every response
+     * is merged into {@code merged}.
      */
     private void fanOutForTarget(
         IndexTarget target,
         List<DiscoveryNode> nodeList,
         FragmentQuerySpec baseSpec,
-        SearchSourceBuilder source,
         FanOutPolicy policy,
         MergeReducer merged,
         ActionListener<Void> done
@@ -462,10 +493,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // for the latest version themselves.
         long observedVersion;
         // The Arrow schema and the table statistics the planner model
-        // reads for the filter SQL derivation below, captured while the
-        // dataset is open. The statistics come from this node's cache
-        // under the observed version and are collected from the open
-        // dataset only on the first request of that version.
+        // reads for the plan below, captured while the dataset is open.
+        // The statistics come from this node's cache under the observed
+        // version and are collected from the open dataset only on the
+        // first request of that version.
         Schema arrowSchema;
         TableStatistics statistics = null;
         long tableRows = 0L;
@@ -510,17 +541,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 target.dateOverrideColumns(),
                 () -> totalRows
             );
-        FragmentQuerySpec spec = new FragmentQuerySpec(
-            PlanExecutor.resolveScanFilterSql(source == null ? null : source.query(), model, target.sqlExcludedColumns(), plannerFactory),
-            baseSpec.query(),
-            baseSpec.postFilter(),
-            baseSpec.sorts(),
-            baseSpec.searchAfter(),
-            baseSpec.effectiveSize(),
-            baseSpec.aggregations(),
-            baseSpec.trackScores(),
-            baseSpec.trackTotalHitsUpTo()
-        );
+        RequestPlanner.Planned planned = RequestPlanner.plan(baseSpec.executionShape(), model, target.sqlExcludedColumns(), plannerFactory);
+        FragmentQuerySpec spec = baseSpec.withPlan(planned.plan());
         if (allFragmentIds.isEmpty()) {
             if (spec.aggregations() == null) {
                 // Empty table with no aggregations requested: no
@@ -541,7 +563,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // via topLevelReduce. Same wire format as any other
             // fan-out; the only novel case is the reader being
             // shaped to maxDoc=0.
-            dispatchEmptyAggregationRun(model, target, observedVersion, nodeList.get(0), spec, policy, merged, done);
+            dispatchEmptyAggregationRun(planned, target, observedVersion, nodeList.get(0), spec, policy, merged, done);
             return;
         }
 
@@ -575,44 +597,12 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // dispatch is loopback aware, but any other node in the
         // cluster picks up its slice through the network.
         planExecutor.execute(
-            coordinatorPlan(model, spec, groups.size()),
+            planned.coordinatorPlan(spec.executionShape(), groups.size()),
             fanOutContext(groups, target, observedVersion, spec, policy),
             merged,
             target.indexName(),
             done
         );
-    }
-
-    /**
-     * The coordinator plan of one target: the {@code MergeExec}
-     * whose reduce kind matches the request shape (the stock
-     * aggregation reduce for a request carrying aggregations, the
-     * hit page merge for one asking for hits, the count sum for a
-     * {@code size} 0 request without aggregations), over the
-     * {@code FanOutExec} of the per-node requests, over the target's
-     * bare scan. The per-node plan detail below the fan-out is owned
-     * by the fragment executors, which plan their own requests
-     * against the open dataset; the coordinator's tree mirrors the
-     * distribution and the reduce, which is what it executes. A
-     * schema with a column no Calcite type spells (a geo_point over
-     * FixedSizeList) refuses the scan's row type; a one column
-     * values placeholder stands in for the scan then, because the
-     * per-node subtree carries no execution detail here anyway.
-     */
-    private RelNode coordinatorPlan(LanceSchemas.IndexModel model, FragmentQuerySpec spec, int fanOut) {
-        boolean hasAggregations = spec.aggregations() != null && !spec.aggregations().getAggregatorFactories().isEmpty();
-        MergeExec.ReduceKind reduceKind = hasAggregations ? MergeExec.ReduceKind.AGGREGATE_INTERNAL
-            : spec.effectiveSize() > 0 ? MergeExec.ReduceKind.HITS_TOP_K
-            : MergeExec.ReduceKind.COUNT_SUM;
-        RelNode perNode;
-        try {
-            RelBuilder relBuilder = plannerFactory.relBuilder(model.schema());
-            relBuilder.scan(LancePlannerFactory.SCHEMA_NAME, model.indexName());
-            perNode = relBuilder.build();
-        } catch (UnsupportedOperationException unsupportedColumn) {
-            perNode = plannerFactory.relBuilder(model.schema()).values(new String[] { "row" }, 0).build();
-        }
-        return SearchRequestToRel.withCoordinatorLayer(perNode, reduceKind, fanOut);
     }
 
     /**
@@ -680,7 +670,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             target.indexName(),
             target.storageOptions(),
             observedVersion,
-            spec.filterSql(),
+            spec.plan(),
             spec.query(),
             spec.postFilter(),
             spec.sorts(),
@@ -740,7 +730,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * ran, no data" shape.
      */
     private void dispatchEmptyAggregationRun(
-        LanceSchemas.IndexModel model,
+        RequestPlanner.Planned planned,
         IndexTarget target,
         long observedVersion,
         DiscoveryNode host,
@@ -757,7 +747,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         );
         List<PlanExecutor.FragmentGroup> groups = List.of(new PlanExecutor.FragmentGroup(host, Collections.emptyList(), 0L, 0, 1));
         planExecutor.execute(
-            coordinatorPlan(model, spec, 1),
+            planned.coordinatorPlan(spec.executionShape(), 1),
             new PlanExecutor.FanOutContext(
                 groups,
                 group -> fragmentRequest(target, observedVersion, spec, group.fragmentIds()),
@@ -928,12 +918,36 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
     /**
      * Immutable bundle of the query-time settings the coordinator
-     * resolves once and threads through the per-index fan-out. Keeps
-     * the recursive {@link #runIndexLoop} / {@link #fanOutForTarget}
-     * signatures short even as new wire-format fields are added.
+     * resolves once and threads through the per-index fan-out, plus the
+     * per node plan derived for the current target ({@code plan}, null
+     * until {@link #fanOutForTarget} planned it). Keeps the recursive
+     * {@link #runIndexLoop} / {@link #fanOutForTarget} signatures short
+     * even as new wire-format fields are added.
      */
-    private record FragmentQuerySpec(String filterSql, org.opensearch.index.query.QueryBuilder query,
-        org.opensearch.index.query.QueryBuilder postFilter, List<org.opensearch.search.sort.SortBuilder<?>> sorts, Object[] searchAfter,
-        int effectiveSize, AggregatorFactories.Builder aggregations, boolean trackScores, int trackTotalHitsUpTo) {
+    private record FragmentQuerySpec(FragmentPlan plan, QueryBuilder query, QueryBuilder postFilter, List<SortBuilder<?>> sorts,
+        Object[] searchAfter, int from, int effectiveSize, AggregatorFactories.Builder aggregations, boolean planAggregations,
+        boolean trackScores, int trackTotalHitsUpTo) {
+
+        /** The same spec carrying the plan derived for one target. */
+        FragmentQuerySpec withPlan(FragmentPlan targetPlan) {
+            return new FragmentQuerySpec(
+                targetPlan,
+                query,
+                postFilter,
+                sorts,
+                searchAfter,
+                from,
+                effectiveSize,
+                aggregations,
+                planAggregations,
+                trackScores,
+                trackTotalHitsUpTo
+            );
+        }
+
+        /** What the planner reads of the request. */
+        ExecutionShape executionShape() {
+            return new ExecutionShape(query, postFilter, sorts, searchAfter, from, effectiveSize, aggregations, planAggregations);
+        }
     }
 }
