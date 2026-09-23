@@ -90,6 +90,35 @@ public class LanceExplainIT extends LanceRestTestCase {
             );
             assertTrue("the pushed shape names the bucket: " + bucketPhysical, bucketPhysical.contains("TERMS{name=by_id"));
 
+            // A bucket tree over a query filter has no aggregate
+            // pushdown operand, so the planner answers with the Lucene
+            // convention operator over the bare scan instead of the
+            // pushed scan or the logical fallback.
+            Response filteredBucket = explain(
+                indexName,
+                "{\"size\":0,\"query\":{\"term\":{\"id\":3}},\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\"}}}}"
+            );
+            assertEquals(RestStatus.OK.getStatus(), filteredBucket.getStatusLine().getStatusCode());
+            String filteredBucketPhysical = stringPath(readAll(filteredBucket), "physical");
+            assertTrue(
+                "the Lucene aggregate operator is the physical root: " + filteredBucketPhysical,
+                filteredBucketPhysical.startsWith("LuceneAggregateExec(")
+            );
+            assertTrue("the operator runs over the scan: " + filteredBucketPhysical, filteredBucketPhysical.contains("LanceTableScan"));
+            assertFalse("nothing is pushed into the scan: " + filteredBucketPhysical, filteredBucketPhysical.contains("pushed=[["));
+
+            // A page mixing the score order with a column collation
+            // stays on Lucene's collector, so the physical plan shows
+            // the heap top-k operator.
+            Response mixedSortPage = explain(
+                indexName,
+                "{\"size\":5,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"sort\":[\"_score\",{\"id\":\"asc\"}]}"
+            );
+            assertEquals(RestStatus.OK.getStatus(), mixedSortPage.getStatusLine().getStatusCode());
+            String mixedSortPhysical = stringPath(readAll(mixedSortPage), "physical");
+            assertTrue("the heap top-k operator is the physical root: " + mixedSortPhysical, mixedSortPhysical.startsWith("HeapTopKExec("));
+            assertTrue("the operator carries the FTS clause: " + mixedSortPhysical, mixedSortPhysical.contains("fts="));
+
             ResponseException terms = expectThrows(
                 ResponseException.class,
                 () -> explain(indexName, "{\"size\":0,\"aggs\":{\"t\":{\"top_hits\":{\"size\":1}}}}")
