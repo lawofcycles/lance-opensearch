@@ -5,9 +5,13 @@
 
 package org.opensearch.lance.query;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.Query;
@@ -39,9 +43,17 @@ import org.opensearch.monitor.os.OsProbe;
  * starts. {@link #admit} estimates the document set as
  * {@link NativeMemoryLimit#invertedIndexEntryEstimateBytes} (zero when
  * the index fits the shard share, so a cached index passes without
- * arithmetic against free memory) and answers
- * {@link CircuitBreakingException} (HTTP 429) when the node's free
- * physical memory minus a headroom cannot hold it. The check runs
+ * arithmetic against available memory) and answers
+ * {@link CircuitBreakingException} (HTTP 429) when the node's
+ * available physical memory minus a headroom cannot hold it. Available
+ * memory is the kernel's {@code MemAvailable} from
+ * {@code /proc/meminfo}, which counts the reclaimable page cache and
+ * slab the kernel would hand to the scan on top of the free pages;
+ * {@code MemFree} alone reads close to zero on a node whose page cache
+ * is warm from serving queries, and a gate judging it refused scans
+ * the node could serve. Where the file or the line does not exist
+ * (macOS, Windows) the probe falls back to {@link OsProbe}'s free
+ * physical memory. The check runs
  * before {@code Dataset.newScan} is created for the scan, so a refusal
  * allocates nothing native. Bounded top-k pages (no sort, no
  * aggregations, no {@code post_filter}) are not gated: they rebuild
@@ -64,9 +76,13 @@ public final class FtsAdmission {
     /** Default for {@code lance.fts.admission.headroom}. */
     public static final ByteSizeValue DEFAULT_HEADROOM = new ByteSizeValue(8, ByteSizeUnit.GB);
 
+    /** The kernel's memory accounting on Linux. */
+    private static final Path PROC_MEMINFO = Path.of("/proc/meminfo");
+
     private static volatile boolean enabled = true;
     private static volatile long headroomBytes = DEFAULT_HEADROOM.getBytes();
     private static volatile long shardShareOverrideBytes = 0L;
+    private static volatile LongSupplier memoryProbe = FtsAdmission::readAvailablePhysicalMemory;
 
     /** Unbounded full-text scans this node refused since it started. */
     private static final AtomicLong REJECTIONS = new AtomicLong();
@@ -116,10 +132,67 @@ public final class FtsAdmission {
     }
 
     /**
+     * The available physical memory the next decision would be judged
+     * against: the kernel's {@code MemAvailable} where
+     * {@code /proc/meminfo} reports it, else {@link OsProbe}'s free
+     * physical memory. Also reported as {@code fts.admission.available_bytes}
+     * in {@code GET /_lance/stats}.
+     */
+    public static long availablePhysicalMemoryBytes() {
+        return memoryProbe.getAsLong();
+    }
+
+    /**
+     * {@code MemAvailable} of {@code /proc/meminfo} in bytes, or the
+     * {@link OsProbe} free physical memory where the file or the line
+     * does not exist (macOS, Windows, kernels before 3.14).
+     */
+    static long readAvailablePhysicalMemory() {
+        long memAvailable = memAvailableBytes();
+        return memAvailable >= 0L ? memAvailable : OsProbe.getInstance().getFreePhysicalMemorySize();
+    }
+
+    /** {@code MemAvailable} in bytes, {@code -1} when it cannot be read. */
+    private static long memAvailableBytes() {
+        if (!Files.isReadable(PROC_MEMINFO)) {
+            return -1L;
+        }
+        try {
+            return parseMemAvailableBytes(Files.readAllLines(PROC_MEMINFO));
+        } catch (IOException e) {
+            return -1L;
+        }
+    }
+
+    /**
+     * The {@code MemAvailable} line of {@code /proc/meminfo} content,
+     * converted from the kernel's kibibytes to bytes; {@code -1} when
+     * the line is absent or malformed. Package private for tests.
+     */
+    static long parseMemAvailableBytes(List<String> memInfoLines) {
+        for (String line : memInfoLines) {
+            if (line.startsWith("MemAvailable:") == false) {
+                continue;
+            }
+            String[] fields = line.split("\\s+");
+            if (fields.length < 2) {
+                return -1L;
+            }
+            try {
+                return Long.parseLong(fields[1]) * 1024L;
+            } catch (NumberFormatException e) {
+                return -1L;
+            }
+        }
+        return -1L;
+    }
+
+    /**
      * One admission decision: whether the scan may start, the document
      * set estimate it was judged on ({@code 0} when the index fits the
-     * shard share) and the free memory left after the headroom (which
-     * can be negative when the headroom exceeds free memory).
+     * shard share) and the available memory left after the headroom
+     * (which can be negative when the headroom exceeds the node's
+     * available memory).
      */
     public record Decision(boolean admitted, long estimateBytes, long availableBytes) {
     }
@@ -131,13 +204,13 @@ public final class FtsAdmission {
      * when it fits {@code shardShareBytes} (the same comparison the
      * attach-time WARN makes): a document set the cache holds is not
      * rebuilt per scan. A non-zero estimate is admitted only when the
-     * free physical memory minus the headroom is positive and holds it;
-     * a disabled gate admits everything.
+     * available physical memory minus the headroom is positive and
+     * holds it; a disabled gate admits everything.
      */
-    public static Decision decide(long rows, long shardShareBytes, long freePhysicalMemoryBytes, boolean enabled, long headroomBytes) {
+    public static Decision decide(long rows, long shardShareBytes, long availableMemoryBytes, boolean enabled, long headroomBytes) {
         long entry = NativeMemoryLimit.invertedIndexEntryEstimateBytes(rows);
         long estimate = entry <= shardShareBytes ? 0L : entry;
-        long available = freePhysicalMemoryBytes - headroomBytes;
+        long available = availableMemoryBytes - headroomBytes;
         boolean admitted = !enabled || estimate == 0L || (available > 0L && estimate <= available);
         return new Decision(admitted, estimate, available);
     }
@@ -145,14 +218,14 @@ public final class FtsAdmission {
     /**
      * Gate one unbounded full-text scan over {@code indexName}, a table
      * of {@code rows} physical rows. Reads the shard share from the
-     * installed Session (or the test override), the free physical
-     * memory from {@link OsProbe} and the settings from the static
-     * holders, records the estimate, and throws
+     * installed Session (or the test override), the available physical
+     * memory from {@link #availablePhysicalMemoryBytes} and the settings
+     * from the static holders, records the estimate, and throws
      * {@link CircuitBreakingException} on a rejection.
      */
     public static void admit(String indexName, long rows) {
         long shardShare = shardShareBytes();
-        Decision decision = decide(rows, shardShare, OsProbe.getInstance().getFreePhysicalMemorySize(), enabled, headroomBytes);
+        Decision decision = decide(rows, shardShare, memoryProbe.getAsLong(), enabled, headroomBytes);
         LAST_ESTIMATE_BYTES.set(decision.estimateBytes());
         if (decision.admitted()) {
             return;
@@ -251,7 +324,13 @@ public final class FtsAdmission {
         enabled = true;
         headroomBytes = DEFAULT_HEADROOM.getBytes();
         shardShareOverrideBytes = 0L;
+        memoryProbe = FtsAdmission::readAvailablePhysicalMemory;
         REJECTIONS.set(0L);
         LAST_ESTIMATE_BYTES.set(0L);
+    }
+
+    /** Replace the available-memory probe, for tests; {@link #resetForTests} restores the real one. */
+    static void setMemoryProbeForTests(LongSupplier probe) {
+        memoryProbe = probe;
     }
 }
