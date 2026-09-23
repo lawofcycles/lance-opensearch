@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.hc.core5.http.HttpHost;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -2073,6 +2074,92 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assignments.put(node, fragments);
         }
         return assignments;
+    }
+
+    /**
+     * Freshness runs on the node that holds the shard, not on the elected
+     * cluster manager. The manager is kept from holding the shard with an
+     * allocation exclusion set before the attach, so the index lands on a
+     * follower; an append and a new column are then picked up through
+     * {@code POST /{index}/_lance/sync}, which the single shard routing
+     * sends to that follower: the mapping gains the column, the holder's
+     * {@code freshness.checks} counter moves and the manager's does not.
+     * The counters are cumulative since node start and other tests in this
+     * class may have left checks on the manager, so the assertion compares
+     * before and after rather than expecting zero.
+     */
+    public void testFreshnessRunsOnTheNodeHoldingTheShardNotOnTheManager() throws Exception {
+        String suffix = "mn-freshness-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String managerName = clusterManagerNodeName();
+        try {
+            updateClusterSetting("cluster.routing.allocation.exclude._name", managerName);
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=30s"));
+            String holder = readAll(client().performRequest(new Request("GET", "/_cat/shards/" + indexName + "?h=node"))).trim();
+            assertFalse("_cat/shards names the node holding the shard", holder.isEmpty());
+            assertNotEquals("the shard must not sit on the manager [" + managerName + "]", managerName, holder);
+
+            Map<String, Long> checksBefore = freshnessChecksByNode();
+            assertTrue("every node reports a freshness block: " + checksBefore, checksBefore.containsKey(managerName));
+            assertTrue("every node reports a freshness block: " + checksBefore, checksBefore.containsKey(holder));
+
+            LanceTableFactory.appendRows(tableUri, 6, 4);
+            LanceTableFactory.addColumn(tableUri, "score", new ArrowType.Int(64, true));
+            Response sync = postJson("/" + indexName + "/_lance/sync", "");
+            assertEquals(RestStatus.OK.getStatus(), sync.getStatusLine().getStatusCode());
+            String syncBody = readAll(sync);
+            assertTrue("the check ran: " + syncBody, syncBody.contains("\"checked\":true"));
+            // The scheduled check on the holder (1s cadence) may have taken
+            // the move before the sync; the mapping has the column either way.
+            assertBusy(() -> {
+                try {
+                    String mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+                    assertTrue("the mapping gained the column: " + mapping, mapping.contains("\"score\":{"));
+                } catch (ResponseException e) {
+                    throw new AssertionError("index temporarily unavailable: " + e.getMessage(), e);
+                }
+            });
+            String search = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
+            assertEquals(10, extractIntPath(search, "hits", "total", "value"));
+
+            Map<String, Long> checksAfter = freshnessChecksByNode();
+            assertTrue(
+                "the node holding the shard ran the check: before " + checksBefore + ", after " + checksAfter,
+                checksAfter.get(holder) > checksBefore.get(holder)
+            );
+            assertEquals(
+                "the manager ran no check for the index it does not hold: before " + checksBefore + ", after " + checksAfter,
+                checksBefore.get(managerName),
+                checksAfter.get(managerName)
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+            try {
+                updateClusterSetting("cluster.routing.allocation.exclude._name", null);
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** {@code freshness.checks} of every node in {@code GET /_lance/stats}, keyed by node name. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Long> freshnessChecksByNode() throws IOException {
+        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
+        Map<String, Long> checks = new HashMap<>();
+        for (Object value : nodes.values()) {
+            Map<String, Object> node = (Map<String, Object>) value;
+            Map<String, Object> freshness = (Map<String, Object>) node.get("freshness");
+            checks.put((String) node.get("name"), ((Number) freshness.get("checks")).longValue());
+        }
+        return checks;
     }
 
     public void testNamespaceRegisterPropagatesToAllNodes() throws Exception {

@@ -17,6 +17,8 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.namespace.LanceNamespaceListAction;
 import org.opensearch.lance.namespace.LanceNamespaceListRequest;
 import org.opensearch.lance.namespace.LanceNamespaceMetadata;
+import org.opensearch.lance.namespace.LanceNamespacePollAction;
+import org.opensearch.lance.namespace.LanceNamespacePollRequest;
 import org.opensearch.lance.namespace.LanceNamespaceUpdateAction;
 import org.opensearch.lance.namespace.LanceNamespaceUpdateRequest;
 import org.opensearch.lance.namespace.LanceNamespaceUpdateResponse;
@@ -26,6 +28,7 @@ import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.RestResponse;
 import org.opensearch.rest.action.RestBuilderListener;
 import org.opensearch.rest.action.RestStatusToXContentListener;
+import org.opensearch.rest.action.RestToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
@@ -46,6 +49,11 @@ import org.opensearch.transport.client.node.NodeClient;
  *   <li>{@code GET /_lance/namespace} lists the registrations and
  *       {@code POST /_lance/namespace/tables} lists the tables of one
  *       registration, both through {@link LanceNamespaceListAction}.</li>
+ *   <li>{@code POST /_lance/namespace/_poll} runs one catalog listing
+ *       cycle now on the cluster manager through
+ *       {@link LanceNamespacePollAction}; {@code ?name=} (a registration
+ *       name, or a directory registration's path) limits it to one
+ *       registration.</li>
  * </ul>
  *
  * <p>The handler only parses the body and hands the request to the
@@ -67,7 +75,8 @@ public class RestNamespaceAction extends BaseRestHandler {
             new Route(RestRequest.Method.POST, "/_lance/namespace"),
             new Route(RestRequest.Method.GET, "/_lance/namespace"),
             new Route(RestRequest.Method.DELETE, "/_lance/namespace"),
-            new Route(RestRequest.Method.POST, "/_lance/namespace/tables")
+            new Route(RestRequest.Method.POST, "/_lance/namespace/tables"),
+            new Route(RestRequest.Method.POST, "/_lance/namespace/_poll")
         );
     }
 
@@ -78,6 +87,17 @@ public class RestNamespaceAction extends BaseRestHandler {
                 LanceNamespaceListAction.INSTANCE,
                 LanceNamespaceListRequest.namespaces(),
                 new RestStatusToXContentListener<>(channel)
+            );
+        }
+        if (request.path().endsWith("/_poll")) {
+            // The trigger takes its optional registration from the query
+            // string: it has no body of its own, and the answer is the
+            // cycle's report.
+            String name = request.param("name");
+            return channel -> client.execute(
+                LanceNamespacePollAction.INSTANCE,
+                new LanceNamespacePollRequest(name == null || name.isEmpty() ? null : name),
+                new RestToXContentListener<>(channel)
             );
         }
         Map<String, Object> body = request.hasContent()
