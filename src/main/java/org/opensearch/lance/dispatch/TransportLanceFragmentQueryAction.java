@@ -710,23 +710,30 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     indexService.mapperService()
                 );
 
-                // Unbounded full-text scans (a full-text clause the
-                // resolver left without a scan limit, or a bounded
-                // page whose exact match count would run the unbounded
-                // count-only scan) rebuild the inverted index document
+                // Full-text scans rebuild the inverted index document
                 // set in native memory when the index does not fit the
-                // cache shard. Refuse the request with 429 before any
-                // Lance scan of it is created when the node's free
-                // memory cannot hold that rebuild. The estimate is per
-                // table, so it is judged on the table's physical rows,
-                // not this executor's share: Lance rebuilds the whole
-                // document set whichever fragments the scan keeps.
-                if (FtsAdmission.runsUnboundedFtsScan(query, request.trackTotalHitsUpTo() == SearchContext.TRACK_TOTAL_HITS_ACCURATE)) {
+                // cache shard — the unbounded shapes (a full-text
+                // clause the resolver left without a scan limit, or a
+                // bounded page whose exact match count would run the
+                // unbounded count-only scan) and the bounded top-k
+                // pages alike, because Lance rebuilds the whole set
+                // whatever the page size. Refuse the request with 429
+                // before any Lance scan of it is created when the
+                // node's free memory cannot hold the estimated rebuild
+                // plus the scan buffers. The estimate is per table, so
+                // it is judged on the table's physical rows, not this
+                // executor's share: Lance rebuilds the whole document
+                // set whichever fragments the scan keeps.
+                FtsAdmission.Shape ftsShape = FtsAdmission.classify(
+                    query,
+                    request.trackTotalHitsUpTo() == SearchContext.TRACK_TOTAL_HITS_ACCURATE
+                );
+                if (FtsAdmission.gates(ftsShape)) {
                     long tableRows = 0L;
                     for (LanceWarmCache.FragmentMeta fragment : snapshot.fragments()) {
                         tableRows += fragment.physicalRows();
                     }
-                    FtsAdmission.admit(request.indexName(), tableRows);
+                    FtsAdmission.admit(request.indexName(), tableRows, ftsShape);
                 }
 
                 // A bare Lance clause at the top level (LanceFtsQuery,
