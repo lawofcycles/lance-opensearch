@@ -1390,9 +1390,10 @@ public class LanceAggregationIT extends LanceRestTestCase {
 
     /**
      * {@code assertEquals} over parsed JSON, except that two numbers are
-     * equal when they are within a relative 1e-9 of each other (or both
-     * are NaN); maps and lists recurse, everything else compares with
-     * {@code equals}. {@code path} names the element in the failure.
+     * equal when they are within 1e-9 of each other relative to the
+     * larger of their magnitudes and one (or both are NaN); maps and
+     * lists recurse, everything else compares with {@code equals}.
+     * {@code path} names the element in the failure.
      */
     @SuppressWarnings("unchecked")
     private static void assertJsonClose(String path, Object expected, Object actual) {
@@ -1416,8 +1417,11 @@ public class LanceAggregationIT extends LanceRestTestCase {
             if (Double.isNaN(e) && Double.isNaN(a)) {
                 return;
             }
-            double scale = Math.max(Math.abs(e), Math.abs(a));
-            assertTrue(path + ": expected " + e + " got " + a, Math.abs(e - a) <= 1e-9 * Math.max(scale, 1e-300) || e == a);
+            // Relative below one part in a billion; absolute at that
+            // scale near zero, where a moment that is zero in exact
+            // arithmetic comes out as rounding noise on either path.
+            double scale = Math.max(1d, Math.max(Math.abs(e), Math.abs(a)));
+            assertTrue(path + ": expected " + e + " got " + a, Math.abs(e - a) <= 1e-9 * scale || e == a);
             return;
         }
         assertEquals(path, expected, actual);
