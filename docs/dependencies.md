@@ -239,7 +239,7 @@ shape it.
   operations, so no `FilePermission` in the plugin policy widens or
   narrows what a table URI may point at; `lance.allowed_table_roots` is
   the control. The plugin's own Java file access outside the core grants
-  is the read of `/proc/meminfo` by `FtsAdmission`, which has an explicit
+  is the read of `/proc/meminfo` by `ScanAdmission`, which has an explicit
   grant; its read of `/proc/self/status` is covered by the core policy's
   default grant.
 
