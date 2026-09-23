@@ -23,13 +23,11 @@ grant {
   permission java.lang.RuntimePermission "loadLibrary.*";
 
   // org.opensearch.lance.query.FtsAdmission reads MemAvailable from
-  // /proc/meminfo and VmRSS from /proc/self/status to size full text scans.
-  // The core policy grants every codebase /proc/self/status but not
-  // /proc/meminfo; both are listed so the plugin's reads are visible here.
-  // Read only, inside doPrivileged, so only the plugin's own domain is
-  // consulted.
+  // /proc/meminfo to size full text scans; the core policy grants
+  // /proc/self/status (which FtsAdmission also reads) to every codebase but
+  // not /proc/meminfo. Read only, inside doPrivileged, so only the plugin's
+  // own domain is consulted.
   permission java.io.FilePermission "/proc/meminfo", "read";
-  permission java.io.FilePermission "/proc/self/status", "read";
 
   // Reflection. TransportLanceFragmentQueryAction and TransportLanceStatsAction
   // call the package private IndexService.getReaderWrapper through
