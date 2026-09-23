@@ -42,8 +42,26 @@ import java.util.Optional;
  * a pushed aggregate stands in for the whole aggregate it replaced, so
  * its row type is the aggregate's row type and its row estimate is the
  * aggregate's group estimate.
+ *
+ * <p>The scan's cost ({@link #computeSelfCost}) is where the aggregation
+ * routing settings act: a pushed aggregate the run's {@link CostInputs}
+ * forbid (the pushdown setting off, or a group estimate over the group
+ * bound) costs infinity, and a pushed aggregate with a {@code cardinality}
+ * metric over a table below the fitted model's range carries the
+ * placeholder penalty described there, so the Lucene operator wins both
+ * comparisons without any rule refusing to push.
  */
 public class LanceTableScan extends TableScan implements LanceRel {
+
+    /**
+     * Placeholder regime only: added to the pushed form of a tree with a
+     * {@code cardinality} metric on top of its groups and twice the
+     * table's rows. The Lucene form's placeholder is the bare scan's
+     * rows (nudged to one on an empty table) plus
+     * {@code LuceneAggregateExec}'s constant of two, so this keeps the
+     * pushed form strictly above it whatever the row count.
+     */
+    static final double PLACEHOLDER_CARDINALITY_PENALTY_MS = 4;
 
     private final ImmutableList<PushedOperation> pushedOperations;
 
@@ -306,31 +324,64 @@ public class LanceTableScan extends TableScan implements LanceRel {
      * Native and heap bytes are not modelled, so the budget check in
      * the cost ordering cannot fire on a scan.
      *
+     * <p>A scan carrying a pushed aggregate is infinite, at every table
+     * size, when the run's {@link CostInputs} forbid the pushed form:
+     * {@code lance.aggregation.pushdown} is off, or the group rows the
+     * executor would hold ({@link AggregateProfile#mergedGroups}: the
+     * statistics based group estimate, cut to the top-k retention for a
+     * single level terms ordered by count or by a metric) exceed
+     * {@code lance.aggregation.pushdown_max_groups} while every key's
+     * domain is known ({@link AggregateProfile#groupsKnown}). A domain
+     * the statistics cannot answer is guessed as a share of the rows,
+     * which would put any large table over the bound regardless of the
+     * data, so such an estimate is not judged here and the executor's
+     * own bound from the request shape stands alone. The Volcano
+     * planner then implements the aggregate through the Lucene operator,
+     * which exists for every aggregate the translator accepts, so the
+     * two settings are cost inputs rather than gates outside the
+     * planner and explain shows the choice they force.
+     *
      * <p>Over a table in the fitted model's range
      * ({@link CostModel#usesFittedModel}), a scan carrying a pushed
      * aggregate costs what {@link CostModel#pushedAggregateMillis}
-     * predicts for the shape under the run's {@link CostInputs}, and a
-     * bare scan costs nothing: a bare scan is only ever the input of a
-     * Lucene operator, whose own cost accounts for the rows it reads
-     * from the column store. Every other case, and every table below
-     * the range, keeps the placeholder: rows read (a bare scan) or
-     * groups returned (a pushed aggregate) stand in for milliseconds.
-     * The hits shapes (a pushed top-k, FTS or knn) have no measured
-     * alternative, so the placeholder is their model in both regimes.
+     * predicts for the shape under the run's inputs, and a bare scan
+     * costs nothing: a bare scan is only ever the input of a Lucene
+     * operator, whose own cost accounts for the rows it reads from the
+     * column store. Every other case, and every table below the range,
+     * keeps the placeholder: rows read (a bare scan) or groups returned
+     * (a pushed aggregate) stand in for milliseconds. One placeholder
+     * carries a penalty: a pushed aggregate with a {@code cardinality}
+     * metric feeds every distinct value into the HyperLogLog++ sketch
+     * on one thread, which the fitted model prices above the Lucene
+     * aggregator on every measured table, so below the range it is
+     * charged the table's rows twice over on top of its groups plus
+     * {@link #PLACEHOLDER_CARDINALITY_PENALTY_MS}, which lands above the
+     * Lucene form's placeholder (the bare scan's rows plus the
+     * operator's constant) at every table size and keeps the small
+     * table choice in line with the large table one. The hits shapes
+     * (a pushed top-k, FTS or knn) have no measured alternative, so the
+     * placeholder is their model in both regimes.
      */
     @Override
     public RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
         double rows = estimateRowCount(mq);
-        if (CostModel.usesFittedModel(table.getRowCount())) {
-            Optional<PushedAggregate> pushed = pushedAggregate();
-            if (pushed.isPresent()) {
-                AggregateProfile shape = AggregateProfile.of(pushed.get().aggregate(), this, mq);
-                double millis = CostModel.pushedAggregateMillis(CostInputsHolder.inputsOf(planner), shape);
+        Optional<PushedAggregate> pushed = pushedAggregate();
+        if (pushed.isPresent()) {
+            CostInputs inputs = CostInputsHolder.inputsOf(planner);
+            AggregateProfile shape = AggregateProfile.of(pushed.get().aggregate(), this, mq);
+            if (!inputs.pushdownEnabled() || (shape.groupsKnown() && shape.mergedGroups() > inputs.maxGroups())) {
+                return planner.getCostFactory().makeInfiniteCost();
+            }
+            if (CostModel.usesFittedModel(table.getRowCount())) {
+                double millis = CostModel.pushedAggregateMillis(inputs, shape);
                 return planner.getCostFactory().makeCost(millis, pushedOperations.size(), 0);
             }
-            if (pushedOperations.isEmpty()) {
-                return planner.getCostFactory().makeZeroCost();
+            if (shape.cardinality()) {
+                double millis = rows + 2 * table.getRowCount() + PLACEHOLDER_CARDINALITY_PENALTY_MS;
+                return planner.getCostFactory().makeCost(millis, pushedOperations.size(), 0);
             }
+        } else if (pushedOperations.isEmpty() && CostModel.usesFittedModel(table.getRowCount())) {
+            return planner.getCostFactory().makeZeroCost();
         }
         return planner.getCostFactory().makeCost(rows, pushedOperations.size(), 0);
     }

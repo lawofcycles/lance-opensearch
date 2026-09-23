@@ -30,14 +30,15 @@ import java.util.List;
 
 /**
  * Runs the Volcano planner with the pushdown rules over every
- * translation fixture and asserts it terminates with the expected
- * physical root: the scan carrying the pushed aggregate for every
- * shape without a {@code cardinality} metric, because the producer
- * covers everything the translator accepts, and the Lucene aggregate
- * operator for the shapes with one, because the pushdown rule's
- * operand rejects them. The pushed bytes must deserialize to a
- * Substrait plan whose aggregate carries the measures and groupings
- * the shape's specs expand to.
+ * translation fixture, demanding the Lance convention at the root, and
+ * asserts it terminates with the scan carrying the pushed aggregate:
+ * the producer covers everything the translator accepts, a
+ * {@code cardinality} metric included. The pushed bytes must
+ * deserialize to a Substrait plan whose aggregate carries the measures
+ * and groupings the shape's specs expand to. A shape with a
+ * {@code cardinality} additionally loses the cost comparison to the
+ * Lucene aggregate operator when the factory plans it with both
+ * conventions available, which is the choice the coordinator sees.
  */
 public class PlannerFixturePhysicalTests extends OpenSearchTestCase {
 
@@ -62,12 +63,11 @@ public class PlannerFixturePhysicalTests extends OpenSearchTestCase {
             .stream()
             .anyMatch(spec -> spec.kind() == MetricSpec.Kind.CARDINALITY);
         if (cardinality) {
-            RelNode physical = PlanTestFixtures.factory().plan(logical);
+            RelNode chosen = PlanTestFixtures.factory().plan(PlanTestFixtures.translate(PlanTestFixtures.parse(body())));
             assertTrue(
-                "physical root of [" + fixture + "] is the Lucene aggregate operator: " + physical,
-                physical instanceof LuceneAggregateExec
+                "the factory answers [" + fixture + "] with the Lucene aggregate operator: " + chosen,
+                chosen instanceof LuceneAggregateExec
             );
-            return;
         }
         VolcanoPlanner planner = (VolcanoPlanner) logical.getCluster().getPlanner();
         RelNode root = planner.changeTraits(logical, logical.getTraitSet().replace(LanceConvention.INSTANCE));

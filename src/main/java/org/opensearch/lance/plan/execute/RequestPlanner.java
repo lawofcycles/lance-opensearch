@@ -110,7 +110,9 @@ public final class RequestPlanner {
     /**
      * The cost inputs a coordinator plans with: the data nodes the
      * request fans out over, the storage kind of the table URI, this
-     * node's CPUs and the two parallelism settings at their current
+     * node's CPUs, the two parallelism settings and the two aggregation
+     * routing settings ({@code lance.aggregation.pushdown},
+     * {@code lance.aggregation.pushdown_max_groups}) at their current
      * values. The coordinator and the explain endpoint both build their
      * inputs here, so the two plan the same request the same way.
      */
@@ -120,7 +122,9 @@ public final class RequestPlanner {
             tableUri,
             NativeMemoryLimit.availableCpus(),
             clusterSettings.get(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING),
-            clusterSettings.get(LancePlugin.FRAGMENT_PATH_SLICES_SETTING)
+            clusterSettings.get(LancePlugin.FRAGMENT_PATH_SLICES_SETTING),
+            clusterSettings.get(LancePlugin.AGGREGATION_PUSHDOWN_SETTING),
+            clusterSettings.get(LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING)
         );
     }
 

@@ -17,6 +17,7 @@ import org.opensearch.lance.plan.rel.physical.LuceneAggregateExec;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -35,7 +36,15 @@ public class CostModelPlannerTests extends OpenSearchTestCase {
     private static final String TERMS_RATING = "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"rating\"}}}}";
     private static final String SORTED_PAGE = "{\"size\":10,\"sort\":[{\"ts\":\"desc\"}]}";
 
-    private static final CostInputs PERF1B_FOUR_NODES_S3 = CostInputs.forCluster(4, "s3://bench/perf1b.lance", 16, 8, 8);
+    private static final CostInputs PERF1B_FOUR_NODES_S3 = CostInputs.forCluster(
+        4,
+        "s3://bench/perf1b.lance",
+        16,
+        8,
+        8,
+        true,
+        CostInputs.DEFAULT_MAX_GROUPS
+    );
     /** One 4xlarge node over local NVMe with the aggregator path collecting on one thread, the configuration the 20M rows were measured in. */
     private static final CostInputs PERF20M_ONE_NODE_LOCAL_UNSLICED = new CostInputs(1, StorageKind.LOCAL, 16, 8, 1);
     private static final CostInputs PERF20M_ONE_NODE_LOCAL = CostInputs.local(16);
@@ -135,6 +144,101 @@ public class CostModelPlannerTests extends OpenSearchTestCase {
                 physical instanceof LanceTableScan
             );
             assertTrue(((LanceTableScan) physical).pushedAggregate().isPresent());
+        }
+    }
+
+    public void testPushdownOffPricesThePushedScanAsInfiniteAtEverySize() throws IOException {
+        // lance.aggregation.pushdown: false is a cost input: the pushed
+        // scan costs infinity, so the Lucene operator wins for the
+        // shapes the pushed scan otherwise takes (the unsliced local
+        // node, where all three shapes measured faster pushed), on the
+        // tiny table (placeholder regime) as on twenty million local
+        // rows (fitted regime), and nothing is refused upstream of the
+        // planner.
+        LanceSchemas.IndexModel tiny = PerfTableFixture.model("tiny", 6L, 1);
+        for (LanceSchemas.IndexModel model : List.of(tiny, PerfTableFixture.perf20m())) {
+            for (String body : new String[] { TERMS_CATEGORY, SUM_PRICE, TERMS_RATING }) {
+                RelNode off = plan(model, body, PERF20M_ONE_NODE_LOCAL_UNSLICED.withPushdownEnabled(false));
+                assertTrue(
+                    String.format(Locale.ROOT, "%s on %s goes to the aggregators with the pushdown off: %s", body, model.indexName(), off),
+                    off instanceof LuceneAggregateExec
+                );
+                RelNode on = plan(model, body, PERF20M_ONE_NODE_LOCAL_UNSLICED);
+                assertTrue(
+                    String.format(Locale.ROOT, "%s on %s stays pushed with the pushdown on: %s", body, model.indexName(), on),
+                    on instanceof LanceTableScan && ((LanceTableScan) on).pushedAggregate().isPresent()
+                );
+            }
+        }
+    }
+
+    public void testGroupBoundPricesThePushedScanAsInfiniteWhenTheEstimateExceedsIt() throws IOException {
+        // terms(category) estimates 200 groups from the bitmap index and
+        // the count ordered top-k keeps 100 of them per scan (shard_size
+        // 25, four times over); a bound of 99 sends it to the
+        // aggregators and a bound of 100 keeps it pushed. sum(price) is
+        // one group and stays pushed even under a bound of 1. Both
+        // regimes, since the bound is read before the fitted /
+        // placeholder split.
+        LanceSchemas.IndexModel tiny = PerfTableFixture.model("tiny", 6L, 1);
+        RelNode boundedTiny = plan(tiny, TERMS_CATEGORY, PERF20M_ONE_NODE_LOCAL_UNSLICED.withMaxGroups(5L));
+        assertTrue("six rows cap the estimate at six, above a bound of five: " + boundedTiny, boundedTiny instanceof LuceneAggregateExec);
+        RelNode bounded = plan(PerfTableFixture.perf20m(), TERMS_CATEGORY, PERF20M_ONE_NODE_LOCAL_UNSLICED.withMaxGroups(99L));
+        assertTrue("100 retained groups exceed a bound of 99: " + bounded, bounded instanceof LuceneAggregateExec);
+        RelNode atBound = plan(PerfTableFixture.perf20m(), TERMS_CATEGORY, PERF20M_ONE_NODE_LOCAL_UNSLICED.withMaxGroups(100L));
+        assertTrue("100 retained groups fit a bound of 100: " + atBound, atBound instanceof LanceTableScan);
+        for (LanceSchemas.IndexModel model : List.of(tiny, PerfTableFixture.perf20m())) {
+            RelNode metric = plan(model, SUM_PRICE, PERF20M_ONE_NODE_LOCAL_UNSLICED.withMaxGroups(1L));
+            assertTrue("one group fits a bound of one on " + model.indexName() + ": " + metric, metric instanceof LanceTableScan);
+        }
+    }
+
+    public void testGroupBoundIsNotJudgedOnAGuessedDomain() throws IOException {
+        // rating has a BTree index and no distinct count, so its domain
+        // is Calcite's share of the rows (two million at 20M, a hundred
+        // million at 1B), which no default bound would admit although
+        // the column holds five values. Such an estimate is not judged
+        // against the bound: terms(rating) stays pushed where it
+        // measured faster, under the default bound and under a bound of
+        // one alike, and the executor's bound from the request shape
+        // stands alone. A nested tree over the same key is priced by
+        // the fitted model (the merge of the guessed groups sends it to
+        // the aggregators) and the bound does not enter: the answer is
+        // the same under both bounds.
+        for (CostInputs inputs : List.of(PERF20M_ONE_NODE_LOCAL_UNSLICED, PERF20M_ONE_NODE_LOCAL_UNSLICED.withMaxGroups(1L))) {
+            RelNode single = plan(PerfTableFixture.perf20m(), TERMS_RATING, inputs);
+            assertTrue(TERMS_RATING + " stays pushed under " + inputs + ": " + single, single instanceof LanceTableScan);
+        }
+        String nested =
+            "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\"}}}}}}";
+        RelNode nestedDefault = plan(PerfTableFixture.perf20m(), nested, PERF20M_ONE_NODE_LOCAL_UNSLICED);
+        RelNode nestedTight = plan(PerfTableFixture.perf20m(), nested, PERF20M_ONE_NODE_LOCAL_UNSLICED.withMaxGroups(1L));
+        assertEquals("the bound does not decide a guessed nested estimate", nestedDefault.getClass(), nestedTight.getClass());
+    }
+
+    public void testCardinalityLosesToTheAggregatorsInBothRegimes() throws IOException {
+        // No rule refuses the cardinality any more: the pushed scan is
+        // enumerated and loses on cost, through the fitted model on the
+        // measured tables and through the placeholder penalty below the
+        // fitted range, alone and under a bucket.
+        String cardinality = "{\"size\":0,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"user_id\"}}}}";
+        String bucketed =
+            "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"user_id\"}}}}}}";
+        LanceSchemas.IndexModel tiny = PerfTableFixture.model("tiny", 6L, 1);
+        for (LanceSchemas.IndexModel model : List.of(tiny, PerfTableFixture.perf20m(), PerfTableFixture.perf1b())) {
+            for (CostInputs inputs : List.of(
+                PERF20M_ONE_NODE_LOCAL,
+                PERF1B_FOUR_NODES_S3,
+                new CostInputs(1, StorageKind.LOCAL, 64, 32, 1)
+            )) {
+                for (String body : new String[] { cardinality, bucketed }) {
+                    RelNode physical = plan(model, body, inputs);
+                    assertTrue(
+                        String.format(Locale.ROOT, "%s on %s under %s: %s", body, model.indexName(), inputs, explain(physical)),
+                        physical instanceof LuceneAggregateExec
+                    );
+                }
+            }
         }
     }
 }

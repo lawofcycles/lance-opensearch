@@ -14,7 +14,6 @@ import org.apache.calcite.tools.RelBuilderFactory;
 import org.opensearch.lance.plan.lancesql.RexToLanceSql;
 import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.LanceTableScan;
-import org.opensearch.lance.plan.rel.MetricSpec;
 import org.opensearch.lance.plan.substrait.LanceSubstraitProducer;
 
 import java.nio.ByteBuffer;
@@ -47,16 +46,13 @@ import java.util.Optional;
  * Lucene side; dropping the filter or pushing the aggregate without it
  * would answer over the wrong rows.
  *
- * <p>An aggregate carrying a {@code cardinality} metric never matches:
- * the pushed form asks Lance for the field's distinct values and feeds
- * them one by one into the HyperLogLog++ sketch on a single thread,
- * which measures slower than Lucene's cardinality aggregator by more
- * than an order of magnitude on large tables while returning the same
- * count. Leaving the rule unmatched lets the {@code LuceneAggregateExec}
- * alternative from {@link LanceToLuceneConverterRule} answer such trees.
- * The guard sits on the operand rather than in the cost model because
- * the cost model's constants are not yet fitted to measurements; remove
- * it when the pushed cardinality implementation beats the aggregator.
+ * <p>The operands carry no shape predicate beyond what the translator
+ * accepts: every {@link LanceAggregate} the translator builds is offered
+ * to the producer, and whether the pushed form runs is the cost model's
+ * decision. A tree with a {@code cardinality} metric is pushed like any
+ * other and loses the cost comparison to the {@code LuceneAggregateExec}
+ * alternative (see {@link LanceTableScan#computeSelfCost}), as do the
+ * trees the routing settings forbid.
  *
  * <p>The scan the rule produces carries a pushed aggregate and is not
  * a bare {@code LanceTableScan} under a {@code LanceAggregate}, so the
@@ -69,11 +65,6 @@ public final class PushAggregateIntoLanceScan extends RelRule<PushAggregateIntoL
 
     private PushAggregateIntoLanceScan(Config config) {
         super(config);
-    }
-
-    /** True when no metric of the aggregate is a {@code cardinality}, the trees the rule may push. */
-    static boolean withoutCardinality(LanceAggregate aggregate) {
-        return aggregate.metricSpecs().stream().noneMatch(metric -> metric.kind() == MetricSpec.Kind.CARDINALITY);
     }
 
     /** The four rules to register, one per operand shape. */
@@ -130,16 +121,13 @@ public final class PushAggregateIntoLanceScan extends RelRule<PushAggregateIntoL
         /** The aggregate directly over the scan. */
         public static final Config DIRECT = new Config(
             "PushAggregateIntoLanceScan",
-            b0 -> b0.operand(LanceAggregate.class)
-                .predicate(PushAggregateIntoLanceScan::withoutCardinality)
-                .oneInput(b1 -> b1.operand(LanceTableScan.class).noInputs())
+            b0 -> b0.operand(LanceAggregate.class).oneInput(b1 -> b1.operand(LanceTableScan.class).noInputs())
         );
 
         /** The aggregate over the projection of the group key expressions. */
         public static final Config PROJECT = new Config(
             "PushAggregateIntoLanceScan(Project)",
             b0 -> b0.operand(LanceAggregate.class)
-                .predicate(PushAggregateIntoLanceScan::withoutCardinality)
                 .oneInput(b1 -> b1.operand(Project.class).oneInput(b2 -> b2.operand(LanceTableScan.class).noInputs()))
         );
 
@@ -147,7 +135,6 @@ public final class PushAggregateIntoLanceScan extends RelRule<PushAggregateIntoL
         public static final Config FILTER = new Config(
             "PushAggregateIntoLanceScan(Filter)",
             b0 -> b0.operand(LanceAggregate.class)
-                .predicate(PushAggregateIntoLanceScan::withoutCardinality)
                 .oneInput(b1 -> b1.operand(Filter.class).oneInput(b2 -> b2.operand(LanceTableScan.class).noInputs()))
         );
 
@@ -155,7 +142,6 @@ public final class PushAggregateIntoLanceScan extends RelRule<PushAggregateIntoL
         public static final Config PROJECT_FILTER = new Config(
             "PushAggregateIntoLanceScan(Project,Filter)",
             b0 -> b0.operand(LanceAggregate.class)
-                .predicate(PushAggregateIntoLanceScan::withoutCardinality)
                 .oneInput(
                     b1 -> b1.operand(Project.class)
                         .oneInput(b2 -> b2.operand(Filter.class).oneInput(b3 -> b3.operand(LanceTableScan.class).noInputs()))

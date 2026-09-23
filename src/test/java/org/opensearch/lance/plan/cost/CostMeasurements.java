@@ -147,6 +147,7 @@ final class CostMeasurements {
             Double.parseDouble(c.get("rows")),
             Double.parseDouble(c.get("groups")),
             Double.parseDouble(c.get("merged_groups")),
+            true,
             Integer.parseInt(c.get("columns_read")),
             Double.parseDouble(c.get("bytes_per_row")),
             Integer.parseInt(c.get("scan_passes")),

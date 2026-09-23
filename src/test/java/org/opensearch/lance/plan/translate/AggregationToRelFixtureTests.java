@@ -80,7 +80,8 @@ public class AggregationToRelFixtureTests extends OpenSearchTestCase {
         assertEquals("plan of fixture [" + fixture + "]", expected, actual);
     }
 
-    private String resource(String name) throws IOException {
+    /** The text of one fixture file under {@code translate/aggregations/}. */
+    static String resource(String name) throws IOException {
         String path = "/translate/aggregations/" + name;
         try (InputStream in = AggregationToRelFixtureTests.class.getResourceAsStream(path)) {
             if (in == null) {

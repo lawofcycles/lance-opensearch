@@ -54,6 +54,12 @@ import java.util.OptionalLong;
  * @param mergedGroups group rows one node's parallel scans hand to the
  *     merge: {@code groups}, or the terms top-k retention when a
  *     single level terms ordered by count or by a metric cuts them
+ * @param groupsKnown whether every key domain behind {@code groups}
+ *     came from the statistics or from the request itself (a bitmap
+ *     distinct count, a range or filter count, a date interval) rather
+ *     than from Calcite's default share of the rows for a key without
+ *     an estimate; a guessed domain grows with the table, so a bound
+ *     on the groups is only judged when this is true
  * @param columnsRead distinct table columns the keys, metrics and
  *     filter reference
  * @param bytesPerRow estimated stored bytes per row across those columns
@@ -75,9 +81,9 @@ import java.util.OptionalLong;
  * @param filterSelectivity share of the rows the query filter keeps; 1
  *     without a filter
  */
-public record AggregateProfile(double tableRows, double groups, double mergedGroups, int columnsRead, double bytesPerRow, int scanPasses,
-    int stringKeys, int numericKeys, int dateKeys, int rangeKeys, int filterKeys, int compositeDateKeys, boolean composite,
-    int simpleMetrics, boolean extendedStats, boolean percentiles, boolean cardinality, double cardinalityDistinct,
+public record AggregateProfile(double tableRows, double groups, double mergedGroups, boolean groupsKnown, int columnsRead,
+    double bytesPerRow, int scanPasses, int stringKeys, int numericKeys, int dateKeys, int rangeKeys, int filterKeys, int compositeDateKeys,
+    boolean composite, int simpleMetrics, boolean extendedStats, boolean percentiles, boolean cardinality, double cardinalityDistinct,
     double filterSelectivity) {
 
     private static final double MILLIS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1000;
@@ -149,6 +155,7 @@ public record AggregateProfile(double tableRows, double groups, double mergedGro
         int compositeDateKeys = 0;
         boolean composite = false;
         double groups = 1.0;
+        boolean groupsKnown = true;
         for (int key = 0; key < keyCount; key++) {
             BucketSpec spec = aggregate.bucket(key);
             RexNode keyExpression = project != null
@@ -164,11 +171,14 @@ public record AggregateProfile(double tableRows, double groups, double mergedGro
                     } else {
                         numericKeys++;
                     }
-                    groups *= termsDomain(keyColumns, statistics, scanRowType, rows);
+                    OptionalLong distinct = distinctOf(keyColumns, statistics, scanRowType);
+                    groupsKnown &= distinct.isPresent();
+                    groups *= termsDomain(distinct, rows);
                     composite |= spec.kind() == BucketSpec.Kind.COMPOSITE_TERMS;
                 }
                 case HISTOGRAM -> {
                     dateKeys++;
+                    groupsKnown = false;
                     groups *= rows * CostCoefficients.UNKNOWN_KEY_DISTINCT_SHARE;
                 }
                 case DATE_HISTOGRAM_FIXED -> {
@@ -256,6 +266,7 @@ public record AggregateProfile(double tableRows, double groups, double mergedGro
             rows,
             groups,
             mergedGroups,
+            groupsKnown,
             read.cardinality(),
             bytes,
             percentiles ? 2 : 1,
@@ -285,14 +296,8 @@ public record AggregateProfile(double tableRows, double groups, double mergedGro
         return RelOptUtil.InputFinder.bits(expression);
     }
 
-    /** Distinct values of a terms key: the smallest index estimate over its columns, else Calcite's default share of the rows. */
-    private static double termsDomain(
-        ImmutableBitSet keyColumns,
-        Optional<TableStatistics> statistics,
-        RelDataType scanRowType,
-        double rows
-    ) {
-        OptionalLong distinct = distinctOf(keyColumns, statistics, scanRowType);
+    /** Distinct values of a terms key: the index estimate when there is one, else Calcite's default share of the rows. */
+    private static double termsDomain(OptionalLong distinct, double rows) {
         return distinct.isPresent() ? Math.min(distinct.getAsLong(), rows) : rows * CostCoefficients.UNKNOWN_KEY_DISTINCT_SHARE;
     }
 
