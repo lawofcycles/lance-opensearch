@@ -21,7 +21,6 @@ import java.util.concurrent.RejectedExecutionException;
 
 import org.lance.Dataset;
 import org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsRequest;
-import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.IndexService;
@@ -34,7 +33,6 @@ import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.indices.IndicesService;
-import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
@@ -49,10 +47,11 @@ import org.opensearch.lance.execute.LanceAggregateResults;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.rel.LanceTableScan;
+import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.plan.rel.PushedOperation;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
+import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
-import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.script.Script;
 import org.opensearch.search.aggregations.AggregationBuilder;
@@ -84,7 +83,6 @@ import org.opensearch.search.aggregations.metrics.InternalTDigestPercentileRanks
 import org.opensearch.search.aggregations.metrics.InternalTDigestPercentiles;
 import org.opensearch.search.aggregations.metrics.Percentile;
 import org.opensearch.search.aggregations.metrics.PercentilesMethod;
-import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.SortOrder;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
 import org.opensearch.threadpool.ThreadPool;
@@ -818,7 +816,7 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
                     setPushdown(false);
                     LanceFragmentQueryResponse viaAggregators;
                     try {
-                        viaAggregators = execute(request);
+                        viaAggregators = execute(request(tableUri, indexName, query, tree, fragments));
                     } finally {
                         setPushdown(null);
                     }
@@ -1718,7 +1716,7 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
                 setPushdown(false);
                 LanceFragmentQueryResponse viaAggregators;
                 try {
-                    viaAggregators = execute(request);
+                    viaAggregators = execute(request(tableUri, indexName, query, tree, List.of()));
                 } finally {
                     setPushdown(null);
                 }
@@ -2222,11 +2220,11 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
     }
 
     /**
-     * The full routing decision as the transport action makes it: the
-     * structural gate, the translator, the Volcano planner with the
-     * pushdown rule, and the executor's resolution against the mapping.
-     * Null when any of them refuses, in which case the aggregators
-     * answer.
+     * The full routing decision as the coordinator makes it and the
+     * executor completes it: the structural gate, the translator, the
+     * Volcano planner with the pushdown rule, and the executor's
+     * resolution against the mapping. Null when any of them refuses, in
+     * which case the aggregators answer.
      */
     private static LanceAggregateResults planned(
         Dataset dataset,
@@ -2240,12 +2238,11 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
         }
         LancePlannerFactory factory = new LancePlannerFactory(1L << 30, 1L << 30);
         LanceSchemas.IndexModel model = LanceSchemas.model("idx", dataset.getSchema(), multiFields, () -> 600L);
-        RelNode logical;
-        try {
-            logical = SearchRequestToRel.translateAggregations(tree, model, factory);
-        } catch (UnsupportedOperationException unsupported) {
-            return null;
-        }
+        RelNode logical = SearchRequestToRel.translateForExecution(
+            new ExecutionShape(new MatchAllQueryBuilder(), null, List.of(), null, 0, 0, tree, true),
+            model,
+            factory
+        );
         RelNode physical = factory.plan(logical);
         if (!(physical instanceof LanceTableScan scan)) {
             return null;
@@ -2255,7 +2252,7 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
             return null;
         }
         return LanceAggregateResults.resolve(
-            pushed.aggregate(),
+            LanceAggregateResults.PushedShape.of(pushed.aggregate()),
             pushed.substrait(),
             tree,
             dataset.getSchema(),
@@ -2301,10 +2298,13 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
             assertNotNull("tree must take the pushdown: " + tree, planned(dataset, Map.of(), qsc, tree));
         }
         LanceFragmentQueryRequest request = request(tableUri, indexName, query, tree, fragmentIds);
+        assertEquals("the plan carries the pushed aggregate: " + tree, FragmentPlan.Kind.PUSHED_SCAN, request.plan().kind());
         LanceFragmentQueryResponse pushed = execute(request);
         setPushdown(false);
         try {
-            LanceFragmentQueryResponse viaAggregators = execute(request);
+            LanceFragmentQueryRequest unplanned = request(tableUri, indexName, query, tree, fragmentIds);
+            assertEquals("the setting keeps the aggregate on Lucene", FragmentPlan.Kind.LUCENE_AGGREGATE, unplanned.plan().kind());
+            LanceFragmentQueryResponse viaAggregators = execute(unplanned);
             String label = tree + " with " + query + " on fragments " + fragmentIds;
             assertEquals(label, viaAggregators.matched(), pushed.matched());
             assertEquals(label, viaAggregators.aggregations(), pushed.aggregations());
@@ -2348,8 +2348,10 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
     }
 
     /**
-     * A per node request as the coordinator builds it: the query and,
-     * when the query translates, its Lance SQL.
+     * A per node request as the coordinator builds it: planned against
+     * the index, under the pushdown setting in force when it is built.
+     * The query must translate, so the plan's scalar filter is the
+     * query's Lance SQL (null for match_all).
      */
     private LanceFragmentQueryRequest request(
         String tableUri,
@@ -2358,39 +2360,22 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
         AggregatorFactories.Builder aggregations,
         List<Integer> fragmentIds
     ) {
-        IndexMetadata metadata = getInstanceFromNode(ClusterService.class).state().metadata().index(indexName);
-        String filterSql;
-        try {
-            LanceSchemas.IndexModel model = LanceSchemas.build(metadata, getInstanceFromNode(LanceWarmCache.class));
-            filterSql = PlanExecutor.resolveScanFilterSql(
-                query,
-                model,
-                PlanExecutor.sqlExcludedColumns(LanceOverrides.of(metadata.getSettings())),
-                new LancePlannerFactory(1L << 30, 1L << 30)
-            );
-        } catch (java.io.IOException e) {
-            throw new AssertionError(e);
-        }
-        assertTrue(
-            "the coordinator translates the routed query to Lance SQL: " + query,
-            query instanceof MatchAllQueryBuilder || filterSql != null
-        );
-        return new LanceFragmentQueryRequest(
+        LanceFragmentQueryRequest request = FragmentRequests.planned(
+            getInstanceFromNode(ClusterService.class),
+            getInstanceFromNode(LanceWarmCache.class),
             tableUri,
             indexName,
-            StorageOptions.empty(),
-            -1L,
-            filterSql,
             query,
-            null,
             List.of(),
-            null,
             0,
             aggregations,
-            fragmentIds,
-            false,
-            SearchContext.TRACK_TOTAL_HITS_ACCURATE
+            fragmentIds
         );
+        assertTrue(
+            "the coordinator translates the routed query to Lance SQL: " + query,
+            query instanceof MatchAllQueryBuilder || request.plan().filterSql() != null
+        );
+        return request;
     }
 
 }

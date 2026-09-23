@@ -4,6 +4,7 @@
  */
 package org.opensearch.lance.dispatch;
 
+import org.opensearch.lance.engine.LanceWarmCache;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.io.IOException;
@@ -34,7 +35,6 @@ import org.opensearch.lance.attach.LanceAttachResponse;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.search.SearchHit;
-import org.opensearch.search.internal.SearchContext;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
 
 /**
@@ -108,21 +108,16 @@ public class TempIndexServiceReaderWrapperTests extends OpenSearchSingleNodeTest
         TransportLanceFragmentQueryAction executor = getInstanceFromNode(TransportLanceFragmentQueryAction.class);
         Index index = getInstanceFromNode(ClusterService.class).state().metadata().index(indexName).getIndex();
 
-        LanceFragmentQueryRequest request = new LanceFragmentQueryRequest(
+        LanceFragmentQueryRequest request = FragmentRequests.planned(
+            getInstanceFromNode(ClusterService.class),
+            getInstanceFromNode(LanceWarmCache.class),
             tableUri,
             indexName,
-            StorageOptions.empty(),
-            /* pinnedVersion */ -1L,
-            /* filterSql */ null,
             /* query */ null,
-            /* postFilter */ null,
             List.of(),
-            /* searchAfter */ null,
             ROWS,
             /* aggregations */ null,
-            List.of(),
-            false,
-            SearchContext.TRACK_TOTAL_HITS_ACCURATE
+            List.of()
         );
 
         // With the node's own IndexService the wrapper is applied the way

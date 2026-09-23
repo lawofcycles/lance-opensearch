@@ -4,6 +4,8 @@
  */
 package org.opensearch.lance.dispatch;
 
+import org.opensearch.lance.engine.LanceWarmCache;
+import org.opensearch.cluster.service.ClusterService;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.nio.file.Path;
@@ -30,7 +32,6 @@ import org.opensearch.lance.query.LanceInvalidInput;
 import org.opensearch.lance.query.LanceMatchPhraseQueryBuilder;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.plugins.Plugin;
-import org.opensearch.search.internal.SearchContext;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
 
 /**
@@ -82,22 +83,17 @@ public class FragmentExecutorInvalidInputTests extends OpenSearchSingleNodeTestC
         return tableUri;
     }
 
-    private static LanceFragmentQueryRequest request(String tableUri, String indexName, QueryBuilder query) {
-        return new LanceFragmentQueryRequest(
+    private LanceFragmentQueryRequest request(String tableUri, String indexName, QueryBuilder query) {
+        return FragmentRequests.planned(
+            getInstanceFromNode(ClusterService.class),
+            getInstanceFromNode(LanceWarmCache.class),
             tableUri,
             indexName,
-            StorageOptions.empty(),
-            /* pinnedVersion */ -1L,
-            /* filterSql */ null,
             query,
-            /* postFilter */ null,
             List.of(),
-            /* searchAfter */ null,
             10,
             /* aggregations */ null,
-            /* fragmentIds */ List.of(),
-            /* trackScores */ false,
-            SearchContext.TRACK_TOTAL_HITS_ACCURATE
+            /* fragmentIds */ List.of()
         );
     }
 

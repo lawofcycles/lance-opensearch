@@ -11,6 +11,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.index.query.QueryBuilder;
@@ -22,6 +23,7 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
 import org.opensearch.lance.attach.LanceAttachRequest;
 import org.opensearch.lance.attach.LanceAttachResponse;
+import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.plugins.Plugin;
@@ -101,7 +103,8 @@ public class FragmentExecutorSingleScanTests extends OpenSearchSingleNodeTestCas
         }
     }
 
-    private static LanceFragmentQueryRequest request(
+    /** A request planned the way the coordinator plans it, so the executor receives the plan a real fan-out would ship. */
+    private LanceFragmentQueryRequest request(
         String tableUri,
         String indexName,
         QueryBuilder query,
@@ -110,12 +113,11 @@ public class FragmentExecutorSingleScanTests extends OpenSearchSingleNodeTestCas
         int size,
         AggregatorFactories.Builder aggregations
     ) {
-        return new LanceFragmentQueryRequest(
+        return FragmentRequests.planned(
+            getInstanceFromNode(ClusterService.class),
+            getInstanceFromNode(LanceWarmCache.class),
             tableUri,
             indexName,
-            StorageOptions.empty(),
-            /* pinnedVersion */ -1L,
-            /* filterSql */ null,
             query,
             postFilter,
             sorts,

@@ -6,6 +6,7 @@
 package org.opensearch.lance.stats;
 
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -98,8 +99,18 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             ),
             List.of(new LanceNodeStats.LocalCloneStats("cloned", 4321L, 9L)),
             5,
-            123L
+            123L,
+            planRefinements(2L, 0L, 1L)
         );
+    }
+
+    /** The refinement counters in the collector's key order, one per reason. */
+    private static Map<String, Long> planRefinements(long securityWrapper, long sortFieldType, long aggregateResolution) {
+        Map<String, Long> counts = new LinkedHashMap<>();
+        counts.put("security_wrapper", securityWrapper);
+        counts.put("sort_field_type", sortFieldType);
+        counts.put("aggregate_resolution", aggregateResolution);
+        return counts;
     }
 
     public void testNodeStatsRoundTrip() throws Exception {
@@ -136,7 +147,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"indexes\":[{\"name\":\"rating_idx\",\"type\":\"BTree\",\"column\":\"rating\",\"state\":\"done\",\"seconds\":0.4},"
                     + "{\"name\":\"body_idx\",\"type\":\"Inverted\",\"column\":\"body\",\"state\":\"failed\",\"seconds\":1.25,"
                     + "\"detail\":\"boom\"}]}]},"
-                    + "\"plan\":{\"statistics\":{\"tables\":5,\"collect_millis_total\":123}},"
+                    + "\"plan\":{\"statistics\":{\"tables\":5,\"collect_millis_total\":123},"
+                    + "\"refinements\":{\"security_wrapper\":2,\"sort_field_type\":0,\"aggregate_resolution\":1}},"
                     + "\"indices\":{\"big\":{\"rows\":3000000000,\"shard_reader_rows\":2000000000,\"nested_docs\":0,"
                     + "\"lucene_bound_exceeded\":true,\"index_types\":{},"
                     + "\"renamed_fields\":[{\"from\":\"ts\",\"to\":\"event_ts\",\"lance_field_id\":1}]},"
@@ -221,6 +233,11 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         assertTrue(stats.warmUps().isEmpty());
         assertEquals(0, stats.planStatisticsTables());
         assertEquals(0L, stats.planStatisticsCollectMillisTotal());
+        assertEquals(
+            "every refinement reason is reported, zero when it never fired",
+            List.of("security_wrapper", "sort_field_type", "aggregate_resolution"),
+            List.copyOf(stats.planRefinements().keySet())
+        );
     }
 
     public void testCollectorReadsTheWarmCache() throws Exception {
