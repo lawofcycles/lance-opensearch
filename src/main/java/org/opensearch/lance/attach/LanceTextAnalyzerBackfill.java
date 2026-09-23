@@ -364,6 +364,9 @@ public final class LanceTextAnalyzerBackfill {
         private boolean sourceExhausted;
         private long rowsEmitted;
         private volatile Exception failure;
+        // Runs on the task thread between completing a batch's future
+        // and releasing its permit; a test hook to hold that gap open.
+        private volatile Runnable beforePermitRelease = () -> {};
 
         TokenizingReader(
             ArrowReader source,
@@ -387,6 +390,16 @@ public final class LanceTextAnalyzerBackfill {
         /** Rows handed to the consumer so far. */
         long rowsEmitted() {
             return rowsEmitted;
+        }
+
+        /**
+         * Test hook: {@code hook} runs on the task thread after a
+         * batch's future is completed and before its permit is
+         * released, so a test can hold the permit while the producer
+         * observes an empty window. Set before the first batch is read.
+         */
+        void beforePermitRelease(Runnable hook) {
+            this.beforePermitRelease = hook;
         }
 
         @Override
@@ -469,6 +482,7 @@ public final class LanceTextAnalyzerBackfill {
                     executor.execute(() -> {
                         try {
                             future.complete(tokenize(values));
+                            beforePermitRelease.run();
                         } catch (Throwable t) {
                             future.completeExceptionally(t);
                         } finally {

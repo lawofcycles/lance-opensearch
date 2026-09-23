@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
@@ -305,11 +306,10 @@ public class LanceTextAnalyzerBackfillTests extends OpenSearchTestCase {
                 LanceRegistry.allocator(),
                 new LanceTextAnalyzerBackfill.Options(threadPool.generic(), 7, () -> false)
             );
-            // One permit on a real pool: the producer has to wait for the
-            // permit of the batch it just emitted, which the task releases
-            // right after completing its future. AddColumns refuses a
-            // stream that ends before every row has a value, so the
-            // commit succeeding is the assertion.
+            // One permit on a real pool, end to end through AddColumns
+            // (which refuses a stream that ends before every row has a
+            // value). The race this exercises by chance is forced on
+            // every run by testEmptyWindowWaitsForTheUnreleasedPermit.
             LanceTextAnalyzerBackfill.backfill(
                 dataset,
                 "body",
@@ -339,6 +339,81 @@ public class LanceTextAnalyzerBackfillTests extends OpenSearchTestCase {
                 }
             }
             assertEquals(rows, compared);
+        } finally {
+            terminate(threadPool);
+        }
+    }
+
+    /**
+     * The gap between a task completing its future and releasing its
+     * permit: with one permit the producer, woken by the completed
+     * future, empties its window and comes back for the next batch
+     * while the permit is still held. The producer must wait for the
+     * permit there rather than take the failed {@code tryAcquire} for
+     * the end of the scan. The hook holds every task's permit until
+     * the producer has entered its next {@code loadNextBatch} (seen
+     * through the cancel poll that starts it) and parked on the
+     * permit, so the empty window with an unreleased permit happens
+     * on every batch of every run; a producer that gave up instead
+     * returns {@code false} early and the row count below is short.
+     */
+    public void testEmptyWindowWaitsForTheUnreleasedPermit() throws Exception {
+        int rows = 50_000;
+        Path scratchDir = createTempDir();
+        String uri = writeGeneratedTextTable(scratchDir, "gap-" + getTestName().toLowerCase(Locale.ROOT), rows, 10_000);
+        ThreadPool threadPool = new TestThreadPool(getTestName());
+        Thread producerThread = Thread.currentThread();
+        AtomicInteger loads = new AtomicInteger();
+        AtomicInteger completed = new AtomicInteger();
+        AtomicBoolean finished = new AtomicBoolean();
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty()); Analyzer english = new EnglishAnalyzer()) {
+            ScanOptions scan = new ScanOptions.Builder().columns(new ArrayList<>(List.of("body")))
+                .batchSize(LanceTextAnalyzerBackfill.BATCH_ROWS)
+                .scanInOrder(true)
+                .build();
+            long emitted = 0;
+            int batches = 0;
+            try (
+                LanceScanner scanner = dataset.newScan(scan);
+                ArrowReader source = scanner.scanBatches();
+                LanceTextAnalyzerBackfill.TokenizingReader producer = new LanceTextAnalyzerBackfill.TokenizingReader(
+                    source,
+                    "body",
+                    "body__lance_tokens",
+                    english,
+                    LanceRegistry.allocator(),
+                    new LanceTextAnalyzerBackfill.Options(threadPool.generic(), 1, () -> {
+                        loads.incrementAndGet();
+                        return false;
+                    })
+                )
+            ) {
+                producer.beforePermitRelease(() -> {
+                    // Task i completes during loadNextBatch i + 1; hold
+                    // the permit until the producer is inside
+                    // loadNextBatch i + 2 and parked (on the permit, the
+                    // only thing it can wait for with an empty window),
+                    // or until the producer has given up and the test
+                    // is unwinding.
+                    int mine = completed.getAndIncrement();
+                    while (!finished.get()) {
+                        Thread.State state = producerThread.getState();
+                        if (loads.get() >= mine + 2 && (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING)) {
+                            return;
+                        }
+                        Thread.onSpinWait();
+                    }
+                });
+                while (producer.loadNextBatch()) {
+                    emitted += producer.getVectorSchemaRoot().getRowCount();
+                    batches++;
+                }
+            } finally {
+                finished.set(true);
+            }
+            assertEquals("every row must reach the consumer", rows, emitted);
+            assertTrue("the scan must produce more than one batch, saw " + batches, batches > 1);
+            assertEquals("every task went through the gap", batches, completed.get());
         } finally {
             terminate(threadPool);
         }
