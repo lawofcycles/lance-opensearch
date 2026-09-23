@@ -15,7 +15,6 @@ import org.apache.arrow.vector.types.DateUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
-import org.opensearch.client.ResponseException;
 import org.opensearch.core.rest.RestStatus;
 
 /**
@@ -102,12 +101,13 @@ public class LanceRenameIT extends LanceRestTestCase {
             );
             assertEquals(0, extractIntPath(staleRange, "hits", "total", "value"));
 
-            // The explain endpoint names the rename.
+            // The explain endpoint names the rename: the aggregation
+            // stays on the aggregators and the unplanned element says why.
             Request explain = new Request("GET", "/" + indexName + "/_lance/explain");
             explain.setJsonEntity("{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"label\"}}}}");
-            ResponseException refused = expectThrows(ResponseException.class, () -> client().performRequest(explain));
-            assertEquals(400, refused.getResponse().getStatusLine().getStatusCode());
-            String reason = readAll(refused.getResponse());
+            String explained = readAll(client().performRequest(explain));
+            assertEquals("LUCENE_AGGREGATE", stringPath(explained, "fragment_plan", "kind"));
+            String reason = stringPath(explained, "unplanned");
             assertTrue("explain must name the rename: " + reason, reason.contains("field [label] was renamed to [tag] in the Lance table"));
 
             // The stats list what to update in clients.
