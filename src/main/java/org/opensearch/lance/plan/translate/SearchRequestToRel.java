@@ -38,6 +38,7 @@ import org.opensearch.lance.query.LanceMultiMatchQueryBuilder;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.SortBuilder;
 
 import java.util.ArrayList;
@@ -80,10 +81,13 @@ import java.util.List;
  * request's envelope on Lucene as {@code unplanned}, so the message
  * shape is part of the endpoint's contract.
  *
- * <p>{@code timeout}, {@code track_total_hits} and the named writeable
+ * <p>{@code timeout} and the named writeable
  * envelope flags that only shape a response no plan produces yet are
  * ignored rather than rejected: they select execution behaviour, not
- * plan structure.
+ * plan structure. {@code track_total_hits} selects no structure either,
+ * but an explicit bound demands an exact count of the plan, which the
+ * coordinator's planner turns into an {@code Accuracy} requirement
+ * ({@link ExecutionShape#exactCount()}).
  */
 public final class SearchRequestToRel {
 
@@ -145,12 +149,18 @@ public final class SearchRequestToRel {
      * element: the translator accepts or refuses the tree's shape and
      * the cost model, fed the routing settings through
      * {@code CostInputs}, chooses between the pushed scan and the Lucene
-     * operator.
+     * operator. {@code trackTotalHitsUpTo} is the request's
+     * {@code track_total_hits} in the encoding
+     * {@link SearchSourceBuilder#trackTotalHitsUpTo()} uses, resolved to
+     * {@link SearchContext#DEFAULT_TRACK_TOTAL_HITS_UP_TO} when the body
+     * leaves the flag out, exactly as the coordinator resolves it; it
+     * selects no plan structure but a trait the planner must satisfy
+     * ({@link #exactCount()}).
      */
     public record ExecutionShape(QueryBuilder query, QueryBuilder postFilter, List<SortBuilder<?>> sorts, Object[] searchAfter, int from,
-        int fetch, AggregatorFactories.Builder aggregations, boolean collectorKnobs, boolean secondPass) {
+        int fetch, AggregatorFactories.Builder aggregations, boolean collectorKnobs, boolean secondPass, int trackTotalHitsUpTo) {
 
-        /** A shape without a {@code rescore} or a {@code collapse}. */
+        /** A shape without a {@code rescore} or a {@code collapse}, counting up to the default bound. */
         public ExecutionShape(
             QueryBuilder query,
             QueryBuilder postFilter,
@@ -162,6 +172,32 @@ public final class SearchRequestToRel {
             boolean collectorKnobs
         ) {
             this(query, postFilter, sorts, searchAfter, from, fetch, aggregations, collectorKnobs, false);
+        }
+
+        /** A shape counting up to the default {@code track_total_hits} bound. */
+        public ExecutionShape(
+            QueryBuilder query,
+            QueryBuilder postFilter,
+            List<SortBuilder<?>> sorts,
+            Object[] searchAfter,
+            int from,
+            int fetch,
+            AggregatorFactories.Builder aggregations,
+            boolean collectorKnobs,
+            boolean secondPass
+        ) {
+            this(
+                query,
+                postFilter,
+                sorts,
+                searchAfter,
+                from,
+                fetch,
+                aggregations,
+                collectorKnobs,
+                secondPass,
+                SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO
+            );
         }
 
         /**
@@ -190,7 +226,10 @@ public final class SearchRequestToRel {
                 from + size,
                 source == null ? null : source.aggregations(),
                 collectorKnobs,
-                secondPass
+                secondPass,
+                source == null || source.trackTotalHitsUpTo() == null
+                    ? SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO
+                    : source.trackTotalHitsUpTo()
             );
         }
 
@@ -200,6 +239,26 @@ public final class SearchRequestToRel {
 
         public boolean hits() {
             return fetch > 0;
+        }
+
+        /** Whether the request carries a {@code search_after} cursor. */
+        public boolean hasCursor() {
+            return searchAfter != null && searchAfter.length > 0;
+        }
+
+        /**
+         * Whether the request asks for an exact {@code hits.total}: it
+         * named {@code track_total_hits} as {@code true} or as a bound
+         * other than the default. Such a request demands
+         * {@link org.opensearch.lance.plan.traits.Accuracy#EXACT} of the
+         * plan. A bound equal to the default, {@code false}, or an absent
+         * flag demands nothing: the coordinator resolves an absent flag
+         * to the default bound, so the two cannot be told apart here and
+         * the default counts as the request's silence.
+         */
+        public boolean exactCount() {
+            return trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE
+                || (trackTotalHitsUpTo > 0 && trackTotalHitsUpTo != SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO);
         }
     }
 

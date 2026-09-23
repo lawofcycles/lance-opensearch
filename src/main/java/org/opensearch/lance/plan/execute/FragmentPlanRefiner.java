@@ -73,6 +73,21 @@ import java.util.function.Predicate;
  * collector and aggregators; {@link #executedCounts} exposes both
  * counters so a test can tell that a data node executed the shipped
  * plan rather than rebuilding the request from its builders.
+ *
+ * <p>The traits the coordinator's planner satisfied
+ * ({@code Accuracy}, {@code TieStability}) do not travel with the plan
+ * and are not read here; every downgrade keeps them by construction.
+ * A pushed aggregate moving to the aggregators keeps the tree's
+ * accuracy, because both forms compute the same sketches for
+ * {@code cardinality} and {@code percentiles} and exact figures for
+ * everything else ({@code EXACT} to {@code EXACT},
+ * {@code APPROXIMATE} to {@code APPROXIMATE}). A pushed page moving to
+ * the collector keeps the page's tie stability, because the collector
+ * orders by the same sort columns over the same fragment readers, and
+ * the page the sort field guard moves is a column ordered page in both
+ * forms. A pushed full text clause moving to the Lucene composition
+ * keeps the exact count and, without a page in the plan, has no order
+ * to keep.
  */
 public final class FragmentPlanRefiner {
 
