@@ -98,6 +98,8 @@ public final class LanceEngineFactory implements EngineFactory {
 
     private final LanceWarmCache warmCache;
     private final LongSupplier maxDocsPerReader;
+    /** Where the engines publish the version they serve, or {@code null} (tests). */
+    private final LanceServedVersions servedVersions;
 
     /** Factory whose engines open their own dataset per reader. */
     public LanceEngineFactory() {
@@ -123,8 +125,19 @@ public final class LanceEngineFactory implements EngineFactory {
      *                         lowered it)
      */
     public LanceEngineFactory(LanceWarmCache warmCache, LongSupplier maxDocsPerReader) {
+        this(warmCache, maxDocsPerReader, null);
+    }
+
+    /**
+     * @param servedVersions node scoped registry the engines publish their
+     *                       served manifest version to while open, so the
+     *                       freshness check reads it without acquiring a
+     *                       searcher; {@code null} publishes nothing
+     */
+    public LanceEngineFactory(LanceWarmCache warmCache, LongSupplier maxDocsPerReader, LanceServedVersions servedVersions) {
         this.warmCache = warmCache;
         this.maxDocsPerReader = maxDocsPerReader;
+        this.servedVersions = servedVersions;
     }
 
     public static final String TABLE_SETTING = "index.lance.table";
@@ -277,7 +290,8 @@ public final class LanceEngineFactory implements EngineFactory {
             warmCache,
             indexUuid,
             maxDocsPerReader,
-            nodeLocal
+            nodeLocal,
+            servedVersions
         );
     }
 
@@ -325,6 +339,10 @@ public final class LanceEngineFactory implements EngineFactory {
          */
         final boolean nodeLocal;
         private final LanceReaderManager lanceReaderManager;
+        /** Registry the served version is published to while the engine is open, or {@code null}. */
+        private final LanceServedVersions servedVersions;
+        /** The entry published to {@link #servedVersions}, removed again in {@link #closeNoLock}. */
+        private final LongSupplier servedVersionEntry;
 
         LanceReadOnlyEngine(
             EngineConfig config,
@@ -339,7 +357,21 @@ public final class LanceEngineFactory implements EngineFactory {
             String indexUuid,
             LongSupplier maxDocsPerReader
         ) {
-            this(config, table, field, pkType, shardId, pinnedVersion, tag, storageOptions, warmCache, indexUuid, maxDocsPerReader, false);
+            this(
+                config,
+                table,
+                field,
+                pkType,
+                shardId,
+                pinnedVersion,
+                tag,
+                storageOptions,
+                warmCache,
+                indexUuid,
+                maxDocsPerReader,
+                false,
+                null
+            );
         }
 
         LanceReadOnlyEngine(
@@ -354,7 +386,8 @@ public final class LanceEngineFactory implements EngineFactory {
             LanceWarmCache warmCache,
             String indexUuid,
             LongSupplier maxDocsPerReader,
-            boolean nodeLocal
+            boolean nodeLocal,
+            LanceServedVersions servedVersions
         ) {
             super(config, null, null, true, Function.identity(), true);
             this.tablePath = table;
@@ -445,6 +478,19 @@ public final class LanceEngineFactory implements EngineFactory {
                 throw new EngineException(config.getShardId(), "Failed to open initial Lance reader", t);
             }
             this.lanceReaderManager = manager;
+            this.servedVersions = servedVersions;
+            // Published only once the manager exists, so a reader of the
+            // registry never sees a half built engine; the entry is the
+            // manager's own counter, which refreshIfNeeded advances.
+            this.servedVersionEntry = manager::servedVersion;
+            if (servedVersions != null) {
+                servedVersions.register(config.getShardId(), servedVersionEntry);
+            }
+        }
+
+        /** Manifest version the shard's reader serves right now. */
+        long servedVersion() {
+            return lanceReaderManager.servedVersion();
         }
 
         /**
@@ -755,6 +801,9 @@ public final class LanceEngineFactory implements EngineFactory {
             // Null while the constructor is still opening the Lance side and
             // rolls back through close(); there is no Lance reader to release
             // yet, only what ReadOnlyEngine took.
+            if (servedVersions != null && servedVersionEntry != null) {
+                servedVersions.unregister(config().getShardId(), servedVersionEntry);
+            }
             if (lanceReaderManager != null) {
                 try {
                     lanceReaderManager.close();
@@ -1026,6 +1075,16 @@ public final class LanceEngineFactory implements EngineFactory {
             this.current = initial;
             this.engine = engine;
             this.servedVersion = initialVersion;
+        }
+
+        /**
+         * Manifest version the current reader serves: the version the
+         * last {@link #refreshIfNeeded} opened, or the initial one. For a
+         * {@code node_local} shard this is the source version the clone
+         * was created at, not the clone's own version.
+         */
+        long servedVersion() {
+            return servedVersion;
         }
 
         @Override

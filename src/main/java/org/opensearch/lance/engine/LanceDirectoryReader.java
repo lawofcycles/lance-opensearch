@@ -726,22 +726,6 @@ public final class LanceDirectoryReader extends DirectoryReader {
     }
 
     /**
-     * Manifest version of the Lance dataset this reader was opened over:
-     * the snapshot's version when the reader leases a
-     * {@link LanceWarmCache.Snapshot}, otherwise the checkout version of
-     * the dataset the reader owns. For the shard engine's whole table
-     * reader this is the version the shard serves, which is what the
-     * freshness check on the shard's node compares the table's latest
-     * manifest against.
-     */
-    public long datasetVersion() {
-        if (lease != null) {
-            return lease.snapshot().version();
-        }
-        return dataset.version();
-    }
-
-    /**
      * The {@link LanceDirectoryReader} behind an arbitrary reader handed
      * out by the engine (unwrapping the {@link FilterDirectoryReader}
      * chain as {@link #dataFileSizesOf} does), or {@code null} when the

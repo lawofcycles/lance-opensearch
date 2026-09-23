@@ -43,6 +43,7 @@ import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
+import org.opensearch.lance.engine.LanceServedVersions;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.client.NoOpClient;
@@ -70,7 +71,7 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         client = new RecordingClient(threadPool);
         // A one hour cadence keeps the scheduled check from firing during
         // a test; the tests drive check() themselves.
-        service = new LanceIndexFreshnessService(client, threadPool, TimeValue.timeValueHours(1), null);
+        service = new LanceIndexFreshnessService(client, threadPool, TimeValue.timeValueHours(1), null, new LanceServedVersions());
     }
 
     @Override
@@ -259,6 +260,28 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         assertEquals(0, service.stats().failures());
     }
 
+    public void testFailedRebuildIsAFailureNotARebuild() throws Exception {
+        String tableUri = writeTable("rebuildfail");
+        FakeShard shard = FakeShard.overTable("rebuildfail", tableUri, Settings.EMPTY);
+        LanceIndexFreshnessService.Tracked entry = service.track(shard);
+        service.check(entry);
+
+        // The delete the rebuild starts with is refused: the check throws
+        // (the manual sync answers with the error), counts a failure, and
+        // the index is neither recreated nor refreshed.
+        shard.typeConflict = true;
+        client.failing = DeleteIndexAction.NAME;
+        LanceTableFactory.appendRows(tableUri, 6, 1);
+        IllegalStateException failure = expectThrows(IllegalStateException.class, () -> service.check(entry));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("rebuild of rebuildfail"));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("delete refused"));
+        assertEquals(1, client.count(DeleteIndexAction.NAME));
+        assertEquals(0, client.count(CreateIndexAction.NAME));
+        assertEquals(0, shard.refreshes.get());
+        assertEquals("the attempt is counted", 1, service.stats().rebuilds());
+        assertEquals("and so is the failure", 1, service.stats().failures());
+    }
+
     private static String writeTable(String hint) throws Exception {
         Path dir = createTempDir();
         String name = "demo-" + hint.toLowerCase(Locale.ROOT) + "-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
@@ -357,10 +380,11 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         }
     }
 
-    /** A no-op client that records the requests it receives. */
+    /** A no-op client that records the requests it receives, and fails the one action named in {@link #failing}. */
     private static final class RecordingClient extends NoOpClient {
         private final List<String> actionNames = new CopyOnWriteArrayList<>();
         private final List<ActionRequest> requests = new CopyOnWriteArrayList<>();
+        volatile String failing;
 
         RecordingClient(ThreadPool threadPool) {
             super(threadPool);
@@ -374,6 +398,10 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         ) {
             actionNames.add(action.name());
             requests.add(request);
+            if (action.name().equals(failing)) {
+                listener.onFailure(new IllegalStateException(action.name() + " refused: delete refused by the test client"));
+                return;
+            }
             super.doExecute(action, request, listener);
         }
 

@@ -24,18 +24,16 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
-import org.opensearch.index.engine.Engine;
 import org.opensearch.index.mapper.DocumentMapper;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexShard;
-import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
-import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceLocalClones;
+import org.opensearch.lance.engine.LanceServedVersions;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.lance.stats.LanceNodeStats;
@@ -53,7 +51,10 @@ import org.opensearch.transport.client.Client;
  *
  * <p>A check opens the table's latest manifest and compares the version
  * the index should serve (the latest, or the version the followed tag
- * points at) with the version the shard reader serves. When they differ,
+ * points at) with the version the shard's engine serves, read from the
+ * node's {@link LanceServedVersions} (the engine publishes its reader
+ * manager's counter there, so no searcher is acquired and no reader
+ * wrapper is looked past). When they differ,
  * the mapping is derived again from the schema of the version about to be
  * served, with the stored overrides followed across renames and resets,
  * and applied only when it differs from the mapping the index has: the
@@ -153,6 +154,8 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
     private final TimeValue cadence;
     /** Snapshot cache to retire the left behind version from, or {@code null} when there is none. */
     private final LanceWarmCache warmCache;
+    /** The served version of every open Lance engine on this node. */
+    private final LanceServedVersions servedVersions;
     private final LanceSchemaDriftDetector driftDetector;
     private final Map<String, Tracked> tracked = new ConcurrentHashMap<>();
     /** Indexes whose `wait` uncovered fragment policy has been explained once. */
@@ -166,11 +169,18 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
     private final LongAdder failures = new LongAdder();
     private volatile long lastCheckMillis;
 
-    public LanceIndexFreshnessService(Client client, ThreadPool threadPool, TimeValue cadence, LanceWarmCache warmCache) {
+    public LanceIndexFreshnessService(
+        Client client,
+        ThreadPool threadPool,
+        TimeValue cadence,
+        LanceWarmCache warmCache,
+        LanceServedVersions servedVersions
+    ) {
         this.client = client;
         this.threadPool = threadPool;
         this.cadence = cadence;
         this.warmCache = warmCache;
+        this.servedVersions = servedVersions;
         this.driftDetector = new LanceSchemaDriftDetector(client);
     }
 
@@ -178,7 +188,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
     public void afterIndexShardStarted(IndexShard indexShard) {
         // Called on the cluster state applier thread: only bookkeeping
         // and a schedule here, the check itself runs on the generic pool.
-        track(new IndexShardHandle(indexShard));
+        track(new IndexShardHandle(indexShard, servedVersions));
     }
 
     @Override
@@ -256,7 +266,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             if (settings.getAsLong(LanceEngineFactory.VERSION_SETTING, -1L) >= 0) {
                 return Outcome.notChecked(indexName, "the index is pinned to index.lance.version and never advances");
             }
-            entry = track(new IndexShardHandle(indexShard));
+            entry = track(new IndexShardHandle(indexShard, servedVersions));
             if (entry == null) {
                 return Outcome.notChecked(indexName, "the index is not Lance backed");
             }
@@ -431,6 +441,11 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
      * again with the new mapping. The Lance table keeps its data. The
      * closing shard unregisters itself from this service and the new
      * shard registers when it starts.
+     *
+     * <p>A failed delete or create is thrown to the caller: the check
+     * counts it as a failure and the manual sync answers with the error
+     * instead of reporting a rebuild that did not happen. The rebuild
+     * counter counts attempts.
      */
     private void rebuild(
         String indexName,
@@ -457,8 +472,10 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             created.actionGet();
             LOG.info("rebuilt index {} for table {} at version {}", indexName, table, target);
         } catch (Exception e) {
-            failures.increment();
-            LOG.warn("rebuild after type change failed for {}: {}", indexName, e.getMessage());
+            throw new IllegalStateException(
+                "rebuild of " + indexName + " after a keyword <-> lance_text type change failed: " + e.getMessage(),
+                e
+            );
         }
     }
 
@@ -499,9 +516,11 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
     static final class IndexShardHandle implements TrackedShard {
 
         private final IndexShard shard;
+        private final LanceServedVersions servedVersions;
 
-        IndexShardHandle(IndexShard shard) {
+        IndexShardHandle(IndexShard shard, LanceServedVersions servedVersions) {
             this.shard = shard;
+            this.servedVersions = servedVersions;
         }
 
         @Override
@@ -522,22 +541,14 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         }
 
         /**
-         * The version behind the shard's current reader, read through a
-         * searcher acquired and released here (the engine itself is not
-         * reachable from the shard).
+         * The version the shard's engine serves, from the registry the
+         * engine publishes its reader manager's counter to. {@code -1}
+         * when the engine is not open (below any real version, so the
+         * first check after it opens counts as a move).
          */
         @Override
         public long servedVersion() {
-            if (shard.state() != IndexShardState.STARTED) {
-                return -1L;
-            }
-            try (Engine.Searcher searcher = shard.acquireSearcher(REFRESH_SOURCE)) {
-                LanceDirectoryReader reader = LanceDirectoryReader.unwrap(searcher.getDirectoryReader());
-                return reader == null ? -1L : reader.datasetVersion();
-            } catch (Exception e) {
-                LOG.debug("cannot read the served version of {}: {}", shard.shardId(), e.toString());
-                return -1L;
-            }
+            return servedVersions.servedVersion(shard.shardId());
         }
 
         /**

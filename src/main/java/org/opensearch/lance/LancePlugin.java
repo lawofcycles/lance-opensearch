@@ -25,6 +25,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.unit.ByteSizeValue;
+import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.mapper.Mapper;
@@ -37,6 +38,7 @@ import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.engine.LanceLocalClones;
+import org.opensearch.lance.engine.LanceServedVersions;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.index.LanceBuildIndexesAction;
 import org.opensearch.lance.index.LanceBuildIndexesNodesAction;
@@ -911,7 +913,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     @Override
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
         if (indexSettings.getSettings().get(LanceEngineFactory.TABLE_SETTING) != null) {
-            return Optional.of(new LanceEngineFactory(warmCache, () -> maxDocsPerReader));
+            return Optional.of(new LanceEngineFactory(warmCache, () -> maxDocsPerReader, servedVersions));
         }
         return Optional.empty();
     }
@@ -929,7 +931,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * built before the components exist (a test harness).
      */
     @Override
-    public void onIndexModule(org.opensearch.index.IndexModule indexModule) {
+    public void onIndexModule(IndexModule indexModule) {
         LanceIndexFreshnessService freshness = freshnessService;
         if (freshness != null && indexModule.getSettings().get(LanceEngineFactory.TABLE_SETTING) != null) {
             indexModule.addIndexEventListener(freshness);
@@ -938,6 +940,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
 
     private LanceNamespaceService namespaceService;
     private volatile LanceIndexFreshnessService freshnessService;
+    /** Served manifest version of every open Lance engine on this node, published by the engines. */
+    private final LanceServedVersions servedVersions = new LanceServedVersions();
     private org.opensearch.threadpool.ThreadPool threadPool;
     private AllowedTableRoots allowedTableRoots;
     private LanceDispatchActionFilter dispatchActionFilter;
@@ -1099,7 +1103,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // Freshness of the Lance-backed shards this node holds: one
         // scheduled check per started shard at the namespace poll
         // cadence, registered through onIndexModule.
-        this.freshnessService = new LanceIndexFreshnessService(client, threadPool, cadence, warmCache);
+        this.freshnessService = new LanceIndexFreshnessService(client, threadPool, cadence, warmCache, servedVersions);
         LanceStatsCollector statsCollector = new LanceStatsCollector(warmCache, () -> {
             Session session = LanceRegistry.currentSession();
             return session == null || session.isClosed() ? 0L : session.sizeBytes();
