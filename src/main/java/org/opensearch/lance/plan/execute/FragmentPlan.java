@@ -67,9 +67,20 @@ import java.util.Optional;
  * {@link #kind()} names which physical root produced the plan.
  *
  * <p>The wire format is internal to the plugin and assumes every node
- * runs the same plugin version; there is no version negotiation.
+ * runs the same plugin version. The stream opens with
+ * {@link #WIRE_VERSION}, and a reader that finds another number
+ * refuses the plan with an {@link IOException} naming both, so a
+ * fragment request between nodes of different plugin versions fails
+ * at the plan's first byte with a message that says why, instead of
+ * misreading the fields that follow. The number is bumped whenever a
+ * field is added, removed or retyped; no reader decodes an older
+ * number today, so the marker detects a mismatch without negotiating
+ * it.
  */
 public final class FragmentPlan implements Writeable, ToXContentObject {
+
+    /** The wire format's version, the first field written and the first read. */
+    public static final int WIRE_VERSION = 1;
 
     /** Which physical root the plan came from, and so how the envelope executes. */
     public enum Kind {
@@ -406,7 +417,7 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
 
     public FragmentPlan(StreamInput in) throws IOException {
         this(
-            Kind.read(in),
+            readWireVersion(in),
             in.readOptionalString(),
             in.readOptionalNamedWriteable(QueryBuilder.class),
             in.readOptionalWriteable(TopK::read),
@@ -414,8 +425,24 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         );
     }
 
+    /** Reads the version marker and the kind after it, refusing a stream written by another wire version. */
+    private static Kind readWireVersion(StreamInput in) throws IOException {
+        int version = in.readVInt();
+        if (version != WIRE_VERSION) {
+            throw new IOException(
+                "FragmentPlan wire version ["
+                    + version
+                    + "] does not match this node's ["
+                    + WIRE_VERSION
+                    + "]: every node must run the same plugin version"
+            );
+        }
+        return Kind.read(in);
+    }
+
     @Override
     public void writeTo(StreamOutput out) throws IOException {
+        out.writeVInt(WIRE_VERSION);
         out.writeEnum(kind);
         out.writeOptionalString(filterSql);
         out.writeOptionalNamedWriteable(lanceClause);
