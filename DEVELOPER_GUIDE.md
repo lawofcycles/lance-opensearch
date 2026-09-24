@@ -159,8 +159,13 @@ Test results are written as JUnit XML under `build/test-results/<task>/TEST-*.xm
 * `jarHell`: no class appears twice on the runtime classpath.
 * `thirdPartyAudit`: bundled third party jars reference no missing classes and no `sun.misc.Unsafe` user is unaccounted for. The ignore lists in `build.gradle` are grouped by the jar that holds the reference, one comment per group.
 * `dependencyLicenses`: every bundled jar has a matching `licenses/<jar>.sha1`, `LICENSE` and `NOTICE` file. After changing a dependency version run `./gradlew updateShas` and commit the new `.sha1` files.
-* `testingConventions`, `filepermissions`, `validateNebulaPom`.
+* `testingConventions`: every class with test methods ends in `Tests` or `IT` and extends the expected base class, so no test class is skipped silently (see [Integration tests](#integration-tests)).
+* `filepermissions`: no source file carries the executable bit.
+* `forbiddenPatterns`: no source file contains a tab character or a `nocommit` marker.
+* `validatePom`: aggregates the per publication POM checks `validatePluginZipPom` (the `pluginZip` publication) and `validateNebulaPom` (the `nebula` publication); each checks that the generated POM carries the coordinates, name, description, url, license, developer and SCM entries a Maven release requires.
 * `spotlessJavaCheck`: the formatting described above.
+
+All ten precommit tasks (`forbiddenApis`, `licenseHeaders`, `jarHell`, `thirdPartyAudit`, `dependencyLicenses`, `testingConventions`, `filepermissions`, `forbiddenPatterns`, `validatePluginZipPom`, `validatePom`) run under `precommit`, which `check` and therefore `build` depend on.
 
 Run them without the tests:
 
