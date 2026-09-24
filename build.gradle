@@ -307,6 +307,20 @@ File testClustersDir = new File(project.buildDir, "testclusters")
 // skip). Everything else in the suite runs regardless.
 String lanceLanguageModelHome = System.getenv('LANCE_LANGUAGE_MODEL_HOME')
 
+// The glue namespace IT authenticates its in-test Glue endpoint from a
+// shared credentials file, the way an operator relies on the AWS SDK's
+// default chain instead of static keys in the registration. The plugin
+// policy grants that read under ${user.home}/.aws only, so the file has
+// to live there; a project specific sub directory keeps it apart from the
+// operator's own ~/.aws/credentials and lets several worktrees run the IT
+// at once. The test JVM writes and removes the file (the path arrives as
+// tests.lance.aws_credentials_file); the cluster JVM reads it through the
+// SDK's AWS_SHARED_CREDENTIALS_FILE setting, and AWS_CONFIG_FILE points at
+// an absent sibling so the developer's ~/.aws/config plays no part.
+File integTestAwsDir = new File(System.getProperty('user.home'), ".aws/lance-opensearch-it/${project.projectDir.name}")
+File integTestAwsCredentialsFile = new File(integTestAwsDir, 'credentials')
+File integTestAwsConfigFile = new File(integTestAwsDir, 'config')
+
 integTest {
     systemProperty 'tests.security.manager', 'false'
     systemProperty 'arrow.allocation.manager.type', 'Unsafe'
@@ -316,6 +330,7 @@ integTest {
         sharedRepoDir.mkdirs()
     }
     systemProperty 'tests.lance.shared_tables_dir', sharedTablesDir.absolutePath
+    systemProperty 'tests.lance.aws_credentials_file', integTestAwsCredentialsFile.absolutePath
     if (lanceLanguageModelHome != null) {
         systemProperty 'tests.lance.language_model_home', lanceLanguageModelHome
     }
@@ -350,6 +365,8 @@ testClusters.integTest {
     // slot (its merge), so nothing else is refused.
     setting 'thread_pool.lance_coordinator.size', '1'
     setting 'thread_pool.lance_coordinator.queue_size', '1'
+    environment 'AWS_SHARED_CREDENTIALS_FILE', integTestAwsCredentialsFile.absolutePath
+    environment 'AWS_CONFIG_FILE', integTestAwsConfigFile.absolutePath
     if (lanceLanguageModelHome != null) {
         environment 'LANCE_LANGUAGE_MODEL_HOME', lanceLanguageModelHome
     }
