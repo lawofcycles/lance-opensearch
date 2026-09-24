@@ -24,6 +24,7 @@ import org.opensearch.lance.plan.rel.physical.MergeExec;
 import org.opensearch.lance.plan.traits.Accuracy;
 import org.opensearch.lance.plan.traits.PlanRequirement;
 import org.opensearch.lance.plan.traits.TieStability;
+import org.opensearch.lance.plan.traits.TraitEnforcement;
 import org.opensearch.lance.plan.traits.UnmetPlanRequirementException;
 import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
@@ -75,26 +76,39 @@ public final class RequestPlanner {
      * The outcome of planning one target: the plan the fragment
      * requests carry, the logical tree the planner ran over, the per
      * node physical subtree the coordinator layer wraps
-     * ({@link SearchRequestToRel#withCoordinatorLayer}), and the
+     * ({@link SearchRequestToRel#withCoordinatorLayer}), the
      * element the translator refused when the tree is the query root
      * alone (or the query itself, for a query outside the vocabulary),
-     * null when everything the request asked for translated.
+     * null when everything the request asked for translated, and how
+     * the request's trait demand was met ({@link TraitEnforcement#NONE}
+     * for a query outside the vocabulary, which places no demand).
      */
-    public record Planned(FragmentPlan plan, RelNode logical, RelNode perNode, String unplanned) {
+    public record Planned(FragmentPlan plan, RelNode logical, RelNode perNode, String unplanned, TraitEnforcement enforcement) {
 
         public Planned {
             Objects.requireNonNull(plan, "plan");
             Objects.requireNonNull(logical, "logical");
             Objects.requireNonNull(perNode, "perNode");
+            Objects.requireNonNull(enforcement, "enforcement");
         }
 
         /** The coordinator plan over {@code fanOut} per node requests, with the reduce the shape selects. */
         public RelNode coordinatorPlan(ExecutionShape shape, int fanOut) {
-            MergeExec.ReduceKind reduceKind = shape.hasAggregations() ? MergeExec.ReduceKind.AGGREGATE_INTERNAL
-                : shape.hits() ? MergeExec.ReduceKind.HITS_TOP_K
-                : MergeExec.ReduceKind.COUNT_SUM;
-            return SearchRequestToRel.withCoordinatorLayer(perNode, reduceKind, fanOut);
+            return RequestPlanner.coordinatorPlan(perNode, shape, fanOut);
         }
+    }
+
+    /**
+     * {@code perNode} under the coordinator's merge and fan out, with
+     * the reduce the request shape selects: the stock aggregation
+     * reduce for aggregations, the sorted page merge for hits, the
+     * count sum otherwise.
+     */
+    public static RelNode coordinatorPlan(RelNode perNode, ExecutionShape shape, int fanOut) {
+        MergeExec.ReduceKind reduceKind = shape.hasAggregations() ? MergeExec.ReduceKind.AGGREGATE_INTERNAL
+            : shape.hits() ? MergeExec.ReduceKind.HITS_TOP_K
+            : MergeExec.ReduceKind.COUNT_SUM;
+        return SearchRequestToRel.withCoordinatorLayer(perNode, reduceKind, fanOut);
     }
 
     /**
@@ -162,13 +176,15 @@ public final class RequestPlanner {
      * @param sqlExcludedColumns the override columns whose predicates
      *     never travel to Lance SQL
      * @throws IllegalArgumentException for a filtered {@code lance_knn}
-     *     whose filter cannot travel to the Lance scan, for an
+     *     whose filter cannot travel to the Lance scan, or for an
      *     aggregation the fragment executors cannot run
-     *     ({@link SearchRequestToRel#checkAggregationsExecutable}), and
-     *     for a request whose trait requirement ({@code requirementOf})
-     *     no plan meets: the message starts with {@code plan_failed} and
-     *     names the demanded trait and what the plan offers (all answer
-     *     400)
+     *     ({@link SearchRequestToRel#checkAggregationsExecutable}) (both
+     *     answer 400)
+     * @throws UnmetPlanRequirementException for a request whose trait
+     *     requirement ({@code requirementOf}) no plan meets: the message
+     *     starts with {@code plan_failed} and names the demanded trait
+     *     and what the plan offers (an {@link IllegalArgumentException},
+     *     so it answers 400 as well)
      */
     public static Planned plan(
         ExecutionShape shape,
@@ -207,12 +223,8 @@ public final class RequestPlanner {
         }
         RelNode logical = translation.root();
         PlanRequirement requirement = requirementOf(shape, translation);
-        RelNode physical;
-        try {
-            physical = factory.plan(logical, inputs, requirement);
-        } catch (UnmetPlanRequirementException unmet) {
-            throw new IllegalArgumentException(unmet.getMessage(), unmet);
-        }
+        LancePlannerFactory.PlanOutcome outcome = factory.planUnder(logical, inputs, requirement);
+        RelNode physical = outcome.plan();
         FragmentPlan plan = FragmentPlan.of(physical, shape.hasAggregations(), shape.hits(), inputs);
         if (filteredKnn != null && (plan.lanceClause() == null || plan.filterSql() == null)) {
             throw knnFilterRefusal(filteredKnn, "the filter has no Lance SQL form");
@@ -220,7 +232,7 @@ public final class RequestPlanner {
         if (LOGGER.isDebugEnabled()) {
             LOGGER.debug("lance.plan: index [{}] planned [{}]\n{}", model.indexName(), plan, RelOptUtil.toString(physical));
         }
-        return new Planned(plan, logical, physical, translation.unplanned());
+        return new Planned(plan, logical, physical, translation.unplanned(), outcome.enforcement());
     }
 
     /**
@@ -291,7 +303,7 @@ public final class RequestPlanner {
         }
         FragmentPlan plan = FragmentPlan.lucene(FragmentPlan.luceneKind(shape.hasAggregations(), shape.hits()), null);
         LOGGER.debug("lance.plan: index [{}] planned [{}] (query outside the planner's vocabulary)", model.indexName(), plan);
-        return new Planned(plan, perNode, perNode, unplanned);
+        return new Planned(plan, perNode, perNode, unplanned, TraitEnforcement.NONE);
     }
 
     /**

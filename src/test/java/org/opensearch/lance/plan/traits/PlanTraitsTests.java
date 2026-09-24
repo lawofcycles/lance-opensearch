@@ -360,9 +360,59 @@ public class PlanTraitsTests extends OpenSearchTestCase {
             "{\"size\":5,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},"
                 + "\"sort\":[{\"category\":\"asc\"},{\"id\":\"asc\"}],\"search_after\":[\"c0\",3]}"
         );
-        RelNode physical = PlanTestFixtures.factory()
-            .plan(logical, CostInputs.local(), PlanRequirement.NONE.withTieStability(TieStability.STABLE_KEY, "search_after"));
-        assertTrue(physical.toString(), physical instanceof HeapTopKExec);
-        assertSame(TieStability.STABLE_KEY, tieStabilityOf(physical));
+        PlanRequirement requirement = PlanRequirement.NONE.withTieStability(TieStability.STABLE_KEY, "search_after");
+        LancePlannerFactory.PlanOutcome outcome = PlanTestFixtures.factory().planUnder(logical, CostInputs.local(), requirement);
+        assertTrue(outcome.plan().toString(), outcome.plan() instanceof HeapTopKExec);
+        assertSame(TieStability.STABLE_KEY, tieStabilityOf(outcome.plan()));
+        assertFalse("the first pass met the demand, the enforcer did not fire", outcome.enforcement().fired());
+        assertEquals("none", outcome.enforcement().describe());
+        assertSame(requirement, outcome.enforcement().requirement());
+    }
+
+    public void testOutcomeOfARefusalCarriesTheLogicalTreeAndTheCheapestPlan() throws IOException {
+        RelNode logical = translate("{\"size\":0,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"category\"}}}}");
+        PlanRequirement requirement = PlanRequirement.NONE.withAccuracy(Accuracy.EXACT, "track_total_hits");
+        UnmetPlanRequirementException refused = expectThrows(
+            UnmetPlanRequirementException.class,
+            () -> PlanTestFixtures.factory().planUnder(logical, CostInputs.local(), requirement)
+        );
+        assertTrue("an IllegalArgumentException, so the coordinator answers 400", refused instanceof IllegalArgumentException);
+        assertSame(logical, refused.logical());
+        assertTrue(refused.offered().toString(), refused.offered() instanceof LuceneAggregateExec);
+        TraitEnforcement enforcement = refused.enforcement();
+        assertTrue(enforcement.fired());
+        assertFalse(enforcement.met());
+        assertSame(Accuracy.APPROXIMATE, enforcement.cheapestAccuracy());
+        assertSame(TieStability.UNSTABLE, enforcement.cheapestTieStability());
+        assertEquals(
+            "track_total_hits demanded Accuracy [EXACT], the cheapest plan offered [APPROXIMATE]; no plan declares the demand (plan_failed)",
+            enforcement.describe()
+        );
+    }
+
+    public void testEnforcementDescriptions() {
+        RelTraitSet cheapest = PlanTestFixtures.factory().newCluster().traitSetOf(LuceneConvention.INSTANCE);
+        assertEquals("none", TraitEnforcement.NONE.describe());
+        assertFalse(TraitEnforcement.NONE.fired());
+        PlanRequirement both = PlanRequirement.NONE.withAccuracy(Accuracy.EXACT, "track_total_hits")
+            .withTieStability(TieStability.STABLE_KEY, "search_after");
+        assertEquals("none", TraitEnforcement.satisfied(both).describe());
+        TraitEnforcement enforced = TraitEnforcement.enforced(both, cheapest);
+        assertTrue(enforced.fired());
+        assertTrue(enforced.met());
+        assertEquals(
+            "track_total_hits demanded Accuracy [EXACT], the cheapest plan offered [APPROXIMATE]; "
+                + "search_after demanded TieStability [STABLE_KEY], the cheapest plan offered [UNSTABLE]; "
+                + "a costlier plan declaring the demand was chosen",
+            enforced.describe()
+        );
+        // A cheapest plan that met one of the two demands is named for the other alone.
+        TraitEnforcement halfMet = TraitEnforcement.unmet(both, cheapest.plus(Accuracy.EXACT));
+        assertEquals(
+            "search_after demanded TieStability [STABLE_KEY], the cheapest plan offered [UNSTABLE]; no plan declares the demand (plan_failed)",
+            halfMet.describe()
+        );
+        expectThrows(IllegalArgumentException.class, () -> new TraitEnforcement(both, null, null, false));
+        expectThrows(IllegalArgumentException.class, () -> new TraitEnforcement(both, Accuracy.EXACT, null, true));
     }
 }

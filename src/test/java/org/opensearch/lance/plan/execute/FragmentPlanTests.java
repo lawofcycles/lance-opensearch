@@ -98,6 +98,28 @@ public class FragmentPlanTests extends OpenSearchTestCase {
         assertEquals(count, roundTrip(count));
     }
 
+    public void testStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws IOException {
+        FragmentPlan plan = FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_COUNT, "rating = 5");
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            plan.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                assertEquals(FragmentPlan.WIRE_VERSION, in.readVInt());
+            }
+        }
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.writeVInt(FragmentPlan.WIRE_VERSION + 1);
+            out.writeEnum(FragmentPlan.Kind.LUCENE_COUNT);
+            out.writeOptionalString("rating = 5");
+            try (StreamInput in = out.bytes().streamInput()) {
+                IOException refused = expectThrows(IOException.class, () -> new FragmentPlan(in));
+                assertEquals(
+                    "FragmentPlan wire version [2] does not match this node's [1]: every node must run the same plugin version",
+                    refused.getMessage()
+                );
+            }
+        }
+    }
+
     public void testPushedFilterScanCarriesTheSql() throws IOException {
         RelNode root = physical("{\"size\":0,\"query\":{\"term\":{\"rating\":5}}}");
         assertTrue(root instanceof LanceTableScan scan && scan.pushedFilter().isPresent());

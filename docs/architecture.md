@@ -382,9 +382,16 @@ into the scan; converter rules produce the Lucene alternative for the same tree;
 planner picks by cost. A
 tree the planner cannot handle at all falls back to Lucene execution — a planner failure never
 surfaces as a request error. `GET /{index}/_lance/explain` runs exactly the coordinator's
-planning entry without executing anything and prints the route, both plans, the per node
-`FragmentPlan` it would ship and the refinements a data node could still apply; it is the first
-tool to reach for when developing a rule.
+planning entry without executing anything and prints the route, both plans (every physical
+operator with the traits it declares and the cost the planner charged it), the per node
+`FragmentPlan` it would ship, the refinements a data node could still apply and the trait
+demand the body placed; it is the first tool to reach for when developing a rule.
+
+[query-plan.md](query-plan.md) is the reference for all of this from the reader's side: the
+explain response field by field with an example, one line per physical operator, how the cost is
+computed and what moves it between explain and runtime, the four refinements and the order they
+fire in, the two traits and when the enforcer fires, and the wire format the plan travels in.
+The rest of this section explains the design; go there for the vocabulary.
 
 Two request demandable traits sit next to the convention in every operator's trait set
 (`plan/traits/`). `Accuracy` says whether an operator's figures are exact or come from a sketch:
@@ -512,8 +519,9 @@ explain endpoint prints is the plan the coordinator ships (the endpoint calls th
 `RequestPlanner` entry with the same cost inputs and renders its result), and `GET /_lance/stats` counts every
 downgrade under `plan.refinements` by reason and, under `plan.executed`, how many requests each
 node answered through the Lance scan and through Lucene. The per node plan is a wire format internal to the
-plugin: every node is assumed to run the same plugin version, there is no version negotiation, and
-a fragment request between nodes of different plugin versions fails rather than falling back to the
+plugin: every node is assumed to run the same plugin version, the stream opens with a version
+marker a reader of another version refuses by name, nothing decodes an older marker, and a
+fragment request between nodes of different plugin versions fails rather than falling back to the
 shard path, so a rolling upgrade is not supported for the fragment path.
 
 The planner was delivered in phases, and the later ones are still in flight: first the
@@ -523,7 +531,7 @@ convention operators with fan-out and merge as plan operators, then the shard-pa
 plan operator, then the cost model fitted to the measured aggregation shapes, then the two stage
 planning that ships the per node plan from the coordinator and the node local refinement of the
 plan on column store warmth, then accuracy and tie-stability as planner traits a request can
-demand, and ahead: the traits printed by the explain endpoint. The CHANGELOG tracks what has
+demand, then the traits and costs printed by the explain endpoint. The CHANGELOG tracks what has
 landed.
 
 ## Memory

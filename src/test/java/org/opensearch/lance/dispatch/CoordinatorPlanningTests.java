@@ -159,7 +159,7 @@ public class CoordinatorPlanningTests extends OpenSearchSingleNodeTestCase {
             aggregationExplain.fragmentPlan(),
             aggregationRequest.plan()
         );
-        assertTrue(aggregationPhysical, aggregationPhysical.startsWith("MergeExec(reduce=[AGGREGATE_INTERNAL])"));
+        assertTrue(aggregationPhysical, aggregationPhysical.startsWith("MergeExec(reduce=[AGGREGATE_INTERNAL], accuracy=[EXACT]"));
         assertTrue(aggregationPhysical, aggregationPhysical.contains("FanOutExec(fanOut=[1]"));
         assertTrue(aggregationPhysical, aggregationPhysical.contains("LanceTableScan("));
         assertEquals(LanceExplainResponse.Route.FRAGMENT, aggregationExplain.route());
@@ -198,7 +198,7 @@ public class CoordinatorPlanningTests extends OpenSearchSingleNodeTestCase {
             pageExplain.fragmentPlan(),
             pageRequest.plan()
         );
-        assertTrue(pagePhysical, pagePhysical.startsWith("MergeExec(reduce=[HITS_TOP_K])"));
+        assertTrue(pagePhysical, pagePhysical.startsWith("MergeExec(reduce=[HITS_TOP_K], accuracy=[EXACT]"));
         assertTrue(pagePhysical, pagePhysical.contains("LanceTableScan("));
         assertEquals(pageRequest.plan(), pageExplain.fragmentPlan());
         assertEquals(List.of(), pageExplain.refinementsPossible());
@@ -235,7 +235,7 @@ public class CoordinatorPlanningTests extends OpenSearchSingleNodeTestCase {
             knnExplain.fragmentPlan(),
             knnRequest.plan()
         );
-        assertTrue(knnPhysical, knnPhysical.startsWith("MergeExec(reduce=[HITS_TOP_K])"));
+        assertTrue(knnPhysical, knnPhysical.startsWith("MergeExec(reduce=[HITS_TOP_K], accuracy=[EXACT]"));
         assertTrue(knnPhysical, knnPhysical.contains("LanceTableScan("));
         assertEquals(knnRequest.plan(), knnExplain.fragmentPlan());
         assertTrue(knnPhysical, knnPhysical.contains("knn{"));
