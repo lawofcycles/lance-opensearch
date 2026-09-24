@@ -603,9 +603,9 @@ The plan text format will change as the planner grows; read it, do not parse it.
 
 ## 6. Refresh behaviour when Lance moves forward
 
-If you rewrite the table externally (Python `dataset.append`, `dataset.update`, `merge_insert`, or a Ray / Spark writer), the poll picks up the new manifest version within one cadence period and issues an internal refresh. Queries reflect the new data after the next poll fires. No `_refresh`, `_close`, or shard reallocation is needed.
+If you rewrite the table externally (Python `dataset.append`, `dataset.update`, `merge_insert`, or a Ray / Spark writer), the freshness check on the node holding the index's shard picks up the new manifest version within one cadence period and swaps the shard's reader. Queries reflect the new data after the next check fires. No `_refresh`, `_close`, or shard reallocation is needed.
 
-Force a faster poll by lowering `lance.namespace.poll_cadence` (node-level setting, minimum 1s) in `opensearch.yml`:
+Force a faster check by lowering `lance.namespace.poll_cadence` (node-level setting, minimum 1s; it is the cadence of both the catalog listing on the cluster manager and the freshness check on the shard's node) in `opensearch.yml`, or run the check now with `POST /demo/_lance/sync`:
 
 ```
 lance.namespace.poll_cadence: 1s
@@ -637,7 +637,7 @@ Runs `Dataset.optimizeIndices` so every existing index folds in fragments that a
 
 ### Append visibility
 
-When Lance advances to a new version, the plugin exposes it as soon as the next poll observes the change. The appended fragments do not have to be covered by every existing index first: Lance's own scanner produces a mixed execution plan for FTS and knn (covered fragments use the existing index, uncovered fragments run a flat scan, and the results are unioned by the query engine), so an incremental append never slows down queries hitting the previously-covered fragments. Whenever uncovered fragments accumulate to the point that flat-scan latency becomes noticeable, call `POST /_lance/build_indexes/{index}` with `{"optimize": true}` to fold them into the existing indexes.
+When Lance advances to a new version, the plugin exposes it as soon as the next freshness check observes the change. The appended fragments do not have to be covered by every existing index first: Lance's own scanner produces a mixed execution plan for FTS and knn (covered fragments use the existing index, uncovered fragments run a flat scan, and the results are unioned by the query engine), so an incremental append never slows down queries hitting the previously-covered fragments. Whenever uncovered fragments accumulate to the point that flat-scan latency becomes noticeable, call `POST /_lance/build_indexes/{index}` with `{"optimize": true}` to fold them into the existing indexes.
 
 The `index.lance.uncovered_fragment_policy` setting still accepts `wait` alongside the default `immediate`. Both values currently expose the new version immediately; `wait` is reserved for a future async-optimize implementation, and setting it today logs an informational message so operators are aware that the plugin does not run auto-optimize.
 
@@ -898,12 +898,18 @@ Both are static node settings. When the pool is full, the request fails with HTT
 
 ## 7. Cleanup and restart
 
-The namespace registry is held in process memory. Restarting OpenSearch clears the registrations, and any Lance-backed indices survive as regular OpenSearch indices without a live sync loop. To resume auto-surface after a restart:
+Namespace registrations live in the cluster state and are persisted with it, so a restart of OpenSearch keeps them: the catalogs re-initialise, the surfaced indexes reopen their tables, and the catalog listing and the freshness check resume on their own. Nothing has to be registered or attached again after a restart.
 
-1. Delete any Lance-backed indices you want to re-surface (`curl -X DELETE http://localhost:9200/demo`).
-2. `POST /_lance/namespace` again with the same path.
+To stop surfacing tables from a namespace, unregister it (`path` identifies a directory registration, `name` any other type). The indexes it surfaced stay in place until you delete them:
 
-Alternatively, keep the surviving indices and reattach each one explicitly with `POST /_lance/attach` if you only need to reconnect the poll cycle for a specific table.
+```
+curl -X DELETE http://localhost:9200/_lance/namespace \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"/tables"}'
+curl -X DELETE http://localhost:9200/demo
+```
+
+Deleting a Lance-backed index while its namespace is still registered is honoured for `lance.namespace.resurface_guard_grace` (default one hour); after that the catalog listing recreates the index if the table is still there.
 
 ## 8. Troubleshooting
 
