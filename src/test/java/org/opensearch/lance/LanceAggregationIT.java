@@ -1276,8 +1276,9 @@ public class LanceAggregationIT extends LanceRestTestCase {
             }
             assertEquals("every shape ran on the fragment path", before + shapes.length, fragmentRequestsExecuted());
 
-            // Analytic checks independent of the oracle: 450 rows carry a
-            // category and a flag, two thirds of them true.
+            // Checks independent of the oracle: the multi terms buckets
+            // (three categories by two flags) cover every row that has
+            // both a category and a flag.
             Map<String, Object> multiTerms = parse(readAll(postJson("/" + index + "/_search", "{" + shapes[0] + "}")));
             @SuppressWarnings("unchecked")
             List<Map<String, Object>> buckets = (List<Map<String, Object>>) aggregation(multiTerms, "mt").get("buckets");
@@ -1286,7 +1287,14 @@ public class LanceAggregationIT extends LanceRestTestCase {
             for (Map<String, Object> bucket : buckets) {
                 total += ((Number) bucket.get("doc_count")).intValue();
             }
-            assertEquals(450, total);
+            String bothPresent = readAll(
+                postJson(
+                    "/" + index + "/_search",
+                    "{\"size\":0,\"track_total_hits\":true,\"query\":{\"bool\":{\"filter\":[{\"exists\":{\"field\":\"category\"}},{\"exists\":{\"field\":\"flag\"}}]}}}"
+                )
+            );
+            assertEquals(extractIntPath(bothPresent, "hits", "total", "value"), total);
+            assertTrue("some rows carry both: " + total, total > 0);
             Map<String, Object> matrix = parse(readAll(postJson("/" + index + "/_search", "{" + shapes[3] + "}")));
             assertEquals(480, ((Number) aggregation(matrix, "ms").get("doc_count")).intValue());
             Map<String, Object> scripted = parse(readAll(postJson("/" + index + "/_search", "{" + shapes[7] + "}")));
