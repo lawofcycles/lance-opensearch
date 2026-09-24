@@ -16,7 +16,7 @@ The plugin implements [RFC #22643](https://github.com/opensearch-project/OpenSea
 
 This plugin is in preview and is not production ready. The read side works end to end against real Lance tables; interfaces, settings and response shapes can still change between releases without a deprecation period.
 
-Built against OpenSearch 3.8.0 with Lance 12.0.0. Every node of a cluster must run the same plugin version: rolling upgrades between plugin versions are not supported yet.
+Built against OpenSearch 3.8.0 with Lance 12.0.0. A cluster can run the current and the previous plugin version at once while its nodes are upgraded one at a time: the messages the plugin sends between nodes carry a version marker and append the fields of each later version as a block, so a node of the previous version reads what it knows and steps over the rest. A request that a node of the previous version could not answer correctly fails with a message naming both versions instead of answering wrongly ([docs/design/wire-format-compat.md](docs/design/wire-format-compat.md)). Running more than two plugin versions at once is not supported.
 
 ## Quick start
 

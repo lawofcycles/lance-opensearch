@@ -74,10 +74,10 @@ import org.opensearch.tasks.Task;
  * node local guards; the builders above stay on the wire because the
  * Lucene side (aggregator construction, collectors, the fetch phase)
  * needs them whatever the plan says. The wire format is internal to the
- * plugin: every node runs the same plugin version, a mixed version
- * cluster is not supported. The request opens with {@link #WIRE_VERSION}
- * (see {@link WireVersion}), so an executor of another plugin version
- * refuses it by name before reading a field.
+ * plugin and opens with {@link #WIRE_VERSION} (see {@link WireVersion}),
+ * whose block framing lets an executor of the previous plugin version
+ * read the request during a rolling upgrade; the plan inside carries a
+ * marker of its own.
  */
 public final class LanceFragmentQueryRequest extends ActionRequest {
 

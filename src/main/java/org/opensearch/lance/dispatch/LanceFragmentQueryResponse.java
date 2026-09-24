@@ -67,8 +67,8 @@ import org.opensearch.search.aggregations.InternalAggregations;
  * conversion.
  *
  * <p>The response opens with {@link #WIRE_VERSION} (see
- * {@link WireVersion}), so a coordinator of another plugin version
- * refuses it by name before reading a field.
+ * {@link WireVersion}), whose block framing lets a coordinator of the
+ * previous plugin version read it during a rolling upgrade.
  */
 public final class LanceFragmentQueryResponse extends ActionResponse {
 
