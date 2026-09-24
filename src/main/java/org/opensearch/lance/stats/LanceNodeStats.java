@@ -19,6 +19,7 @@ import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.ToXContentFragment;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceMappingMeta;
+import org.opensearch.lance.WireVersion;
 import org.opensearch.lance.query.ScanAdmission;
 
 /**
@@ -49,8 +50,17 @@ import org.opensearch.lance.query.ScanAdmission;
  * holds against their tables ({@link FreshnessStats});
  * {@code indices} the shard reader of every Lance-backed shard the node
  * hosts.
+ *
+ * <p>The stream opens with {@link #WIRE_VERSION} (see
+ * {@link WireVersion}): the stats are the whole payload of the per node
+ * response {@link LanceStatsNodeResponse} carries back to the
+ * coordinator, and a coordinator of another plugin version refuses
+ * them by name before reading a figure.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
+
+    /** The wire format's version, the first field written and the first read. */
+    public static final int WIRE_VERSION = 1;
 
     private final boolean cacheEnabled;
     private final int snapshotCount;
@@ -456,6 +466,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     }
 
     public LanceNodeStats(StreamInput in) throws IOException {
+        WireVersion.read(in, "LanceNodeStats", WIRE_VERSION);
         this.cacheEnabled = in.readBoolean();
         this.snapshotCount = in.readVInt();
         this.retiredSnapshotCount = in.readVInt();
@@ -500,6 +511,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
+        WireVersion.write(out, WIRE_VERSION);
         out.writeBoolean(cacheEnabled);
         out.writeVInt(snapshotCount);
         out.writeVInt(retiredSnapshotCount);

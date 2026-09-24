@@ -5,12 +5,19 @@
 
 package org.opensearch.lance.index;
 
+import java.io.IOException;
+import java.util.Collections;
 import java.util.List;
 
+import org.opensearch.Version;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.lance.index.LanceBuildIndexesResponse.BuiltResult;
 import org.opensearch.lance.index.LanceBuildIndexesResponse.ColumnResult;
@@ -207,6 +214,77 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
             )
         );
         assertFalse("status is transport metadata, not body", json.contains("status"));
+    }
+
+    public void testNodeRequestStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws Exception {
+        LanceBuildIndexesRequest build = new LanceBuildIndexesRequest("demo", null, null, null, false, false, null, false, null);
+        LanceBuildIndexesNodeRequest original = new LanceBuildIndexesNodeRequest(build, 9L);
+        // The marker follows the parent task id the TransportRequest
+        // base class writes.
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                TaskId.readFromStream(in);
+                assertEquals(LanceBuildIndexesNodeRequest.WIRE_VERSION, in.readVInt());
+            }
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceBuildIndexesNodeRequest restored = new LanceBuildIndexesNodeRequest(in);
+                assertEquals("demo", restored.request().index());
+                assertEquals(9L, restored.sourceVersion());
+            }
+        }
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            TaskId.EMPTY_TASK_ID.writeTo(out);
+            out.writeVInt(LanceBuildIndexesNodeRequest.WIRE_VERSION + 1);
+            build.writeTo(out);
+            out.writeLong(9L);
+            try (StreamInput in = out.bytes().streamInput()) {
+                IOException refused = expectThrows(IOException.class, () -> new LanceBuildIndexesNodeRequest(in));
+                assertEquals(
+                    "LanceBuildIndexesNodeRequest wire version [2] does not match this node's [1]: every node must run the same plugin version",
+                    refused.getMessage()
+                );
+            }
+        }
+    }
+
+    public void testNodeResponseStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws Exception {
+        DiscoveryNode node = new DiscoveryNode(
+            "node-1",
+            "node-1",
+            new TransportAddress(TransportAddress.META_ADDRESS, 9300),
+            Collections.emptyMap(),
+            DiscoveryNodeRole.BUILT_IN_ROLES,
+            Version.CURRENT
+        );
+        KindResult empty = new KindResult(List.of(), List.of(), List.of());
+        LanceBuildIndexesNodeResponse original = new LanceBuildIndexesNodeResponse(node, empty, empty, empty, RestStatus.OK, null);
+        // The marker follows the node the BaseNodeResponse base class writes.
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                new DiscoveryNode(in);
+                assertEquals(LanceBuildIndexesNodeResponse.WIRE_VERSION, in.readVInt());
+            }
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceBuildIndexesNodeResponse restored = new LanceBuildIndexesNodeResponse(in);
+                assertEquals("node-1", restored.getNode().getId());
+                assertEquals(RestStatus.OK, restored.status());
+                assertNull(restored.mappingJson());
+            }
+        }
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            node.writeToWithAttribute(out);
+            out.writeVInt(LanceBuildIndexesNodeResponse.WIRE_VERSION + 1);
+            empty.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                IOException refused = expectThrows(IOException.class, () -> new LanceBuildIndexesNodeResponse(in));
+                assertEquals(
+                    "LanceBuildIndexesNodeResponse wire version [2] does not match this node's [1]: every node must run the same plugin version",
+                    refused.getMessage()
+                );
+            }
+        }
     }
 
     private static LanceBuildIndexesRequest roundTrip(LanceBuildIndexesRequest original) throws Exception {

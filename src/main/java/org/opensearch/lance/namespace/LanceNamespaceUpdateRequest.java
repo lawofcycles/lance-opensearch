@@ -15,15 +15,20 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.WireVersion;
 
 /**
  * Transport request the plugin routes to the cluster manager to add
  * or remove an entry in {@link LanceNamespaceMetadata}. Wraps the
  * two mutations in a single request class so a shared
  * {@link org.opensearch.action.support.clustermanager.TransportClusterManagerNodeAction}
- * can serve them without duplicating the routing plumbing.
+ * can serve them without duplicating the routing plumbing. Opens with
+ * {@link #WIRE_VERSION} (see {@link WireVersion}).
  */
 public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest<LanceNamespaceUpdateRequest> implements AckedRequest {
+
+    /** The wire format's version, the first field the request writes after its base class. */
+    public static final int WIRE_VERSION = 1;
 
     /** Which of the two supported mutations the manager should perform. */
     public enum Operation {
@@ -106,6 +111,7 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
 
     public LanceNamespaceUpdateRequest(StreamInput in) throws IOException {
         super(in);
+        WireVersion.read(in, "LanceNamespaceUpdateRequest", WIRE_VERSION);
         this.operation = Operation.values()[in.readVInt()];
         this.name = in.readString();
         this.type = in.readOptionalString();
@@ -118,6 +124,7 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
+        WireVersion.write(out, WIRE_VERSION);
         out.writeVInt(operation.ordinal());
         out.writeString(name);
         out.writeOptionalString(type);

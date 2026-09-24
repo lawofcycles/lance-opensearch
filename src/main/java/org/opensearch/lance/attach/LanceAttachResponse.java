@@ -17,13 +17,18 @@ import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.ToXContentObject;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.lance.WireVersion;
 
 /**
  * Response for {@link LanceAttachAction}: what the derivation found in
  * the table plus whether the index already existed for the same table.
  * {@link #toXContent} produces the {@code POST /_lance/attach} body.
+ * Opens with {@link #WIRE_VERSION} (see {@link WireVersion}).
  */
 public final class LanceAttachResponse extends ActionResponse implements ToXContentObject {
+
+    /** The wire format's version, the first field the response writes. */
+    public static final int WIRE_VERSION = 1;
 
     private final String index;
     private final String table;
@@ -129,6 +134,7 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
 
     public LanceAttachResponse(StreamInput in) throws IOException {
         super(in);
+        WireVersion.read(in, "LanceAttachResponse", WIRE_VERSION);
         this.index = in.readString();
         this.table = in.readString();
         this.version = in.readLong();
@@ -144,6 +150,7 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
+        WireVersion.write(out, WIRE_VERSION);
         out.writeString(index);
         out.writeString(table);
         out.writeLong(version);

@@ -12,14 +12,21 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.lance.WireVersion;
 
 /**
  * One data node's outcome of a {@code node_local} index build: which
  * Lance indexes were built into this node's clone, which columns were
  * skipped or failed, and the status the node would have answered on its
- * own ({@link TransportLanceBuildIndexesAction#statusOf}).
+ * own ({@link TransportLanceBuildIndexesAction#statusOf}). Opens with
+ * {@link #WIRE_VERSION} (see {@link WireVersion}); the nested
+ * {@link LanceBuildIndexesResponse.KindResult} has no marker of its
+ * own, so a change to its fields bumps this number.
  */
 public final class LanceBuildIndexesNodeResponse extends BaseNodeResponse {
+
+    /** The wire format's version, the first field the response writes after its base class. */
+    public static final int WIRE_VERSION = 1;
 
     private final LanceBuildIndexesResponse.KindResult fts;
     private final LanceBuildIndexesResponse.KindResult scalar;
@@ -51,6 +58,7 @@ public final class LanceBuildIndexesNodeResponse extends BaseNodeResponse {
 
     public LanceBuildIndexesNodeResponse(StreamInput in) throws IOException {
         super(in);
+        WireVersion.read(in, "LanceBuildIndexesNodeResponse", WIRE_VERSION);
         this.fts = new LanceBuildIndexesResponse.KindResult(in);
         this.scalar = new LanceBuildIndexesResponse.KindResult(in);
         this.vector = new LanceBuildIndexesResponse.KindResult(in);
@@ -61,6 +69,7 @@ public final class LanceBuildIndexesNodeResponse extends BaseNodeResponse {
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
+        WireVersion.write(out, WIRE_VERSION);
         fts.writeTo(out);
         scalar.writeTo(out);
         vector.writeTo(out);

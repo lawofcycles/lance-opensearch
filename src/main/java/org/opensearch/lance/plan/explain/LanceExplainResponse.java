@@ -12,6 +12,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.ToXContentObject;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.lance.WireVersion;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
 import org.opensearch.lance.plan.rel.ShardPathReason;
@@ -66,9 +67,10 @@ import java.util.Objects;
  * with the demand on the root, fired ({@code enforcer}, {@code none}
  * when the cheapest plan already met the demand or there was none).
  *
- * <p>The stream opens with {@link #WIRE_VERSION}; a reader that finds
- * another number refuses the response naming both. The plugin has no
- * mixed version story, as the backwards-compatibility policy on
+ * <p>The stream opens with {@link #WIRE_VERSION} (see
+ * {@link WireVersion}); a reader that finds another number refuses the
+ * response naming both. The plugin has no mixed version story, as the
+ * backwards-compatibility policy on
  * {@link org.opensearch.lance.namespace.LanceNamespaceMetadata} spells
  * out; the marker makes a mismatch fail at the first field instead of
  * misreading the ones that follow.
@@ -280,16 +282,7 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
 
     public LanceExplainResponse(StreamInput in) throws IOException {
         super(in);
-        int version = in.readVInt();
-        if (version != WIRE_VERSION) {
-            throw new IOException(
-                "LanceExplainResponse wire version ["
-                    + version
-                    + "] does not match this node's ["
-                    + WIRE_VERSION
-                    + "]: every node must run the same plugin version"
-            );
-        }
+        WireVersion.read(in, "LanceExplainResponse", WIRE_VERSION);
         this.index = in.readString();
         this.route = in.readEnum(Route.class);
         this.reasons = in.readList(input -> input.readEnum(ShardPathReason.class));
@@ -303,7 +296,7 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
-        out.writeVInt(WIRE_VERSION);
+        WireVersion.write(out, WIRE_VERSION);
         out.writeString(index);
         out.writeEnum(route);
         out.writeCollection(reasons, StreamOutput::writeEnum);

@@ -5,6 +5,7 @@
 
 package org.opensearch.lance.stats;
 
+import java.io.IOException;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -20,6 +21,7 @@ import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.transport.TransportAddress;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceMappingMeta;
@@ -246,6 +248,50 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         }
         assertArrayEquals(new String[] { "a", "b" }, restored.nodesIds());
         assertNull(restored.validate());
+    }
+
+    public void testNodeStatsStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws Exception {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            sample().writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                assertEquals(LanceNodeStats.WIRE_VERSION, in.readVInt());
+            }
+        }
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.writeVInt(LanceNodeStats.WIRE_VERSION + 1);
+            out.writeBoolean(true);
+            try (StreamInput in = out.bytes().streamInput()) {
+                IOException refused = expectThrows(IOException.class, () -> new LanceNodeStats(in));
+                assertEquals(
+                    "LanceNodeStats wire version [2] does not match this node's [1]: every node must run the same plugin version",
+                    refused.getMessage()
+                );
+            }
+        }
+    }
+
+    public void testNodeRequestStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws Exception {
+        // The per node request carries only the marker, after the parent
+        // task id its TransportRequest base class writes.
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            new LanceStatsNodeRequest().writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                TaskId.readFromStream(in);
+                assertEquals(LanceStatsNodeRequest.WIRE_VERSION, in.readVInt());
+                assertEquals("nothing follows the marker", -1, in.read());
+            }
+        }
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            TaskId.EMPTY_TASK_ID.writeTo(out);
+            out.writeVInt(LanceStatsNodeRequest.WIRE_VERSION + 1);
+            try (StreamInput in = out.bytes().streamInput()) {
+                IOException refused = expectThrows(IOException.class, () -> new LanceStatsNodeRequest(in));
+                assertEquals(
+                    "LanceStatsNodeRequest wire version [2] does not match this node's [1]: every node must run the same plugin version",
+                    refused.getMessage()
+                );
+            }
+        }
     }
 
     public void testCollectorWithoutACacheReportsZeroCacheFigures() {
