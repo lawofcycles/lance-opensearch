@@ -102,6 +102,8 @@ Build everything, including the precommit checks and all three test suites, exac
 
 The plugin declares that version in its `plugin-descriptor.properties`, so the zip only installs into an OpenSearch distribution of the same version.
 
+The CI runs `./gradlew build` in three lanes, one per OpenSearch version: `3.8.0` (the release the plugin is built for) and the `3.9.0-SNAPSHOT` and `3.10.0-SNAPSHOT` snapshots of the next two minors. Only the `build (3.8.0)` check is required for a pull request to merge. The two snapshot lanes are informational (`continue-on-error`), so a failure there points at an API drift in the upcoming OpenSearch version and is worth reading, but it does not block the pull request.
+
 ## Run the plugin in a local cluster
 
 The OpenSearch plugin build tools register a `./gradlew run` task, but `build.gradle` does not configure that cluster with the two JVM options the plugin requires, so use it only after adding them to a `testClusters.run` block. The supported way to try the plugin is to install the zip into an OpenSearch 3.8.0 distribution. [`docs/getting-started.md`](docs/getting-started.md) walks through it for Docker and for a native distribution, and continues with preparing a Lance table and running every query shape. The two options every node needs are:
