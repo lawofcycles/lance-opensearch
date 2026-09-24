@@ -490,30 +490,37 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
     }
 
     /**
-     * The query types that read postings or term statistics the fragment
-     * leaves do not carry are not refused: the Lucene composition runs
-     * them over empty structures and they match nothing, on both paths,
-     * while the same text matches through the Lance inverted index.
+     * The query types that need postings or term statistics answer 400
+     * on both paths: a span query extracts a Lucene term from the field
+     * type's term query, which the Lance full text query does not carry,
+     * and {@code more_like_this} accepts {@code text} and {@code keyword}
+     * fields only. The same text matches through the Lance inverted
+     * index.
      */
-    public void testQueryTypesWithoutPostingsMatchNothingOnBothPaths() throws Exception {
+    public void testQueryTypesWithoutPostingsAreRefusedOnBothPaths() throws Exception {
         try (LanceTestCluster fixture = LanceTestCluster.setUp(6, "querydsl-nopostings")) {
             String indexName = fixture.indexName();
             String control = "{\"size\":0,\"track_total_hits\":true,\"query\":{\"match\":{\"body\":\"hello\"}}}";
             assertEquals(3, extractIntPath(assertSameAsStockSearch(indexName, control, false), "hits", "total", "value"));
-            for (String query : List.of(
-                "{\"span_term\":{\"body\":\"hello\"}}",
-                "{\"span_near\":{\"clauses\":[{\"span_term\":{\"body\":\"hello\"}},{\"span_term\":{\"body\":\"lance\"}}],\"slop\":0,\"in_order\":true}}",
-                "{\"more_like_this\":{\"fields\":[\"body\"],\"like\":\"hello lance\",\"min_term_freq\":1,\"min_doc_freq\":1}}"
-            )) {
-                String body = "{\"size\":0,\"track_total_hits\":true,\"query\":" + query + "}";
-                assertEquals(query, 0, extractIntPath(assertSameAsStockSearch(indexName, body, false), "hits", "total", "value"));
-            }
+            String noTerm = "Cannot extract a term from a query of type class org.opensearch.lance.query.LanceFtsQuery";
+            assertSameRefusalAsStockSearch(indexName, "{\"query\":{\"span_term\":{\"body\":\"hello\"}}}", noTerm);
+            assertSameRefusalAsStockSearch(
+                indexName,
+                "{\"query\":{\"span_near\":{\"clauses\":[{\"span_term\":{\"body\":\"hello\"}},{\"span_term\":{\"body\":\"lance\"}}],"
+                    + "\"slop\":0,\"in_order\":true}}}",
+                noTerm
+            );
+            assertSameRefusalAsStockSearch(
+                indexName,
+                "{\"query\":{\"more_like_this\":{\"fields\":[\"body\"],\"like\":\"hello lance\",\"min_term_freq\":1,\"min_doc_freq\":1}}}",
+                "more_like_this only supports text/keyword fields: [body]"
+            );
         }
     }
 
     /**
      * Assert that {@code body} is refused with 400 on both paths with a
-     * root cause reason ending in {@code reason} (the shard level query
+     * root cause reason containing {@code reason} (the shard level query
      * build prefixes {@code failed to create query: }); see
      * {@code LanceHitShapeIT} for why the oracle target asks for no
      * partial results.
@@ -525,7 +532,7 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
         assertEquals(shardPath.body(), 400, shardPath.status());
         String fragmentReason = stringPath(fragmentPath.body(), "error", "root_cause", "0", "reason");
         String shardReason = stringPath(shardPath.body(), "error", "root_cause", "0", "reason");
-        assertTrue(fragmentReason, fragmentReason.endsWith(reason));
-        assertTrue(shardReason, shardReason.endsWith(reason));
+        assertTrue(fragmentReason, fragmentReason.contains(reason));
+        assertTrue(shardReason, shardReason.contains(reason));
     }
 }

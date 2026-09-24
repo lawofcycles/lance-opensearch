@@ -12,14 +12,17 @@ Every `_search` over a Lance backed target runs on the fragment executors. A bod
 
 A request Lance refuses as invalid input (for example `lance_match_phrase` on an FTS index built without `with_position: true`) answers 400 `illegal_argument_exception` with Lance's message.
 
-## Query types not served
+## Query types the field types refuse
 
-The fragment leaves carry doc values, the Lance full text and vector indexes, and the parent join of nested columns, but no postings, positions, term statistics or points ([features.md](features.md#query-dsl-matrix) lists every query type and what evaluates it). The query types that read what the leaves do not carry are not refused by the plugin; the Lucene composition runs them over empty structures and they answer no hits on both paths:
+The fragment leaves carry doc values, the Lance full text and vector indexes, and the parent join of nested columns, but no postings, positions, term statistics or points ([features.md](features.md#query-dsl-matrix) lists every query type and what evaluates it). The query types that read what the leaves do not carry are refused by the field types themselves, with 400 on both paths and the same message on OpenSearch's stock search action over the whole table reader:
 
-- `span_term`, `span_near`, `span_first` and the other `span_*` queries read postings and positions.
-- `more_like_this` reads term statistics (`docFreq`) to pick its query terms; every term falls below `min_doc_freq` and the query matches nothing.
+- `intervals`: `Can only use interval queries on text fields - not on [body] which is of type [lance_text]`.
+- `match_phrase_prefix`: `Can only use phrase prefix queries on text fields - not on [body] which is of type [lance_text]`.
+- `span_term`, `span_near`, `span_first` and the other `span_*` queries: `Cannot extract a term from a query of type class org.opensearch.lance.query.LanceFtsQuery: ...`; the span builders extract a Lucene term from the field type's term query, and the Lance full text query is not a term query.
+- `more_like_this`: `more_like_this only supports text/keyword fields: [body]`.
+- `has_child`, `has_parent`, `parent_id`: `[has_child] no join field has been configured`; no join field is derived from a Lance table.
 
-`intervals` and `match_phrase_prefix` are refused by the `lance_text` field type itself (400, `Can only use interval queries on text fields - not on [body] which is of type [lance_text]` and `Can only use phrase prefix queries on text fields - not on [body] which is of type [lance_text]`), and `has_child`, `has_parent` and `parent_id` by the join module (`[has_child] no join field has been configured`), on both paths. Lance's inverted index exposes neither positions nor term statistics through the Java SDK; span, interval and more like this queries wait on that API.
+Lance's inverted index exposes neither positions nor term statistics through the Java SDK; span, interval and more like this queries wait on that API.
 
 ## `ids` outside the translator
 
