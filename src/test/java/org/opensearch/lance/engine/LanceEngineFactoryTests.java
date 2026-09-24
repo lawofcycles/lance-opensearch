@@ -226,7 +226,7 @@ public class LanceEngineFactoryTests extends EngineTestCase {
                 }
                 assertEquals(1, initial.refCount());
 
-                // The shard path reads through the snapshot: _stats and GET.
+                // The shard engine reads through the snapshot: _stats and GET.
                 DocsStats docStats = engine.docStats();
                 assertEquals(200, docStats.getCount());
                 assertEquals(0, docStats.getDeleted());

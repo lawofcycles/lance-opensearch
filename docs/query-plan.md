@@ -31,8 +31,8 @@ entry with the same inputs and renders what it produced, without executing anyth
 
 Two vocabularies appear throughout. The Calcite one: a logical tree (what the translator built),
 a physical tree (what the planner chose), operators, traits and costs. The plugin one: the fragment
-route (the coordinator fans the request out to the data nodes) and the shard path route (the
-stock shard search answers, for bodies holding `suggest` or `highlight`), the pushed scan, the
+route (the coordinator fans the request out to the data nodes) and the unsupported route (no
+plan answers the body, which holds `suggest` or `highlight`; a search refuses it), the pushed scan, the
 Lucene operators, the refinements and the two stats counters `plan.refinements` and
 `plan.executed` under `GET /_lance/stats`.
 
@@ -80,12 +80,14 @@ The fields, in the order they appear.
 
 `index` is the index the body was planned against.
 
-`route` is `fragment` when the coordinator fans the body out to the data nodes, `shard_path` when
-the body holds an element only the standard shard search serves. On the shard path the answer
-adds `reasons`, the list of those elements as the planner names them (`SUGGEST`, `HIGHLIGHT`),
-the physical tree is the `ShardPathFallbackExec` root over the bare scan, and `fragment_plan` and
-`refinements_possible` are absent. The dispatch filter's aggregation allow list and its mixed
-target check are applied outside the plan and are not reflected in `route`.
+`route` is `fragment` when the coordinator fans the body out to the data nodes, `unsupported`
+when the body carries an element no plan answers (`suggest` or `highlight`, see
+[limitations.md](limitations.md#search-body-elements-the-plugin-refuses)). On the unsupported
+route `unplanned` carries the message a `_search` with the same body is refused with (400), and
+`logical`, `physical`, `fragment_plan`, `refinements_possible` and `traits` are absent, since
+nothing was planned; the endpoint answers 200 because it reports rather than executes. The
+dispatch filter's mixed target check (a target that is not Lance backed sends the whole request to
+the stock search action) is applied outside the plan and is not reflected in `route`.
 
 `logical` is the tree the translator built, one operator per line, indented by depth, as Calcite
 prints it. `physical` is the tree the planner chose, printed the same way. On the fragment route
@@ -135,7 +137,8 @@ shipped plan, predicted from the mapping and the plan, in the order of the
 [refinement reasons](#refinements): `security_wrapper` before `sort_field_type` before
 `aggregate_resolution` before `column_store_warm`. Only the first two are predicted today (the
 other two depend on inputs only the data node has), so the array holds zero, one or two entries
-and reads the same for every caller. It is empty when none applies and absent on the shard path.
+and reads the same for every caller. It is empty when none applies and absent on the unsupported
+route.
 
 `traits` summarises the trait side of the plan, see [Traits](#traits): `requested` is what the
 body demanded of the plan root, `declared` what the root declares, `enforcer` whether the second
@@ -160,12 +163,12 @@ where the work runs; converting between conventions is a costed step the planner
 | `LuceneHandoffExec` | Lucene | The zero cost conversion of a Lance scan to the Lucene root the planner demands; unwrapped by the planner factory, so it never appears in the printed plan. |
 | `FanOutExec` | Lucene (coordinator) | One per node request per fragment group; `fanOut` is the width, `partitioning` how the fragments are cut (`EQUAL_FRAGMENT_GROUPS`: round robin over the sorted data node list, a node's share split further only when its rows exceed what one Lucene reader may hold). Run by the plan executor as the transport fan out. |
 | `MergeExec` | Lucene (coordinator) | The reduce of the per node answers: `AGGREGATE_INTERNAL` (the stock aggregation reduce, pipelines included), `HITS_TOP_K` (the sorted page merge) or `COUNT_SUM`. Run by the plan executor as the merge reducer. |
-| `ShardPathFallbackExec` | Shard path | The whole request forwarded to the stock shard search; `reasons` names the elements that sent it there. Its presence at the root is the routing decision. |
 
 The Lance convention is where the native scan computes; the Lucene convention is where Lucene's
-machinery over the fragment leaf readers computes, plus the coordinator's distribution; the shard
-path convention is OpenSearch's regular shard search. A plan folded entirely into the scan reaches
-the Lucene root through the handoff, so both physical forms of a tree compete under one root.
+machinery over the fragment leaf readers computes, plus the coordinator's distribution. A plan
+folded entirely into the scan reaches the Lucene root through the handoff, so both physical forms
+of a tree compete under one root. A body with no plan under either convention (`suggest`,
+`highlight`) never reaches the planner: the translator refuses it first.
 
 ## Cost
 
@@ -298,9 +301,9 @@ itself. The trait def's default (what a root demands when the request asks for n
 a logical operator declares) is `APPROXIMATE`, the weakest value.
 
 `TieStability` says whether the order of rows that compare equal under the request's sort is
-reproducible between two calls. `STABLE_ROWADDR` is Lance row address order: a bare scan, a page
-without a sort over a scalar query, and the shard path fallback (Lucene doc order over the whole
-table reader is the same order). `STABLE_KEY` is the order of a stored column with ties resolved
+reproducible between two calls. `STABLE_ROWADDR` is Lance row address order: a bare scan and a
+page without a sort over a scalar query (Lucene doc order over the whole table reader is the same
+order). `STABLE_KEY` is the order of a stored column with ties resolved
 the same way on every call: a page whose last collation is a stored column, on the pushed scan
 and on `HeapTopKExec` alike, whether or not a score collation precedes it. `UNSTABLE` is a page
 cut in score order alone out of a full text or knn scan, whose equal scores land in whatever
@@ -352,15 +355,15 @@ travels from the coordinator to every data node inside the per node fragment req
 nobody: the data node logs it and executes it. `LanceExplainResponse` travels from the node that
 planned the explain body to the node that received the REST call when they differ.
 
-Both streams open with an integer `WIRE_VERSION` (`FragmentPlan.WIRE_VERSION`,
-`LanceExplainResponse.WIRE_VERSION`, each `1` today), written first and read first through the
+Both streams open with an integer `WIRE_VERSION` (`FragmentPlan.WIRE_VERSION` is `1` today,
+`LanceExplainResponse.WIRE_VERSION` is `2`), written first and read first through the
 `WireVersion` helper. A reader that finds another number refuses the stream with an `IOException`
 naming both numbers (`FragmentPlan wire version [2] does not match this node's [1]: every node must
 run the same plugin version`), so a mismatch fails at the first field with a message that says why,
 instead of misreading the fields that follow into a generic stream corruption error. The number is
 bumped whenever a field is added, removed or retyped. No reader decodes an older number: the marker
 detects a mismatch, it does not negotiate one, and the fragment request between two plugin versions
-fails rather than falling back to the shard path.
+fails.
 
 The same marker opens every other plugin internal message that crosses nodes, each with its own
 `WIRE_VERSION` constant and its own name in the message. The fragment request and response around
@@ -397,7 +400,8 @@ After the marker, `FragmentPlan` writes its kind, the optional filter SQL, the o
 clause as a named writeable query builder, the optional pushed page (orderings, fetch, cursor
 SQL) and the optional pushed aggregate (the Substrait bytes, the group count, the metric slots,
 the two shipped cost predictions and the column names the aggregators would read).
-`LanceExplainResponse` writes the index, the route, the shard path reasons, the two plan texts,
-the optional fragment plan, the optional unplanned message, the predicted refinements and the
-traits object (the requested accuracy, whether a tie stability was demanded and which, the
-declared pair, and the enforcer text).
+`LanceExplainResponse` writes the index, the route, the two optional plan texts, the optional
+fragment plan, the optional unplanned message, the predicted refinements and the optional traits
+object (the requested accuracy, whether a tie stability was demanded and which, the declared pair,
+and the enforcer text); on the unsupported route only the index, the route and the message are
+set.

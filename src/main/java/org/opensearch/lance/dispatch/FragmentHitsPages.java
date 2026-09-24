@@ -168,7 +168,7 @@ final class FragmentHitsPages {
      * request's sort, or null. Its {@code doc} is pinned to the reader's
      * last doc: Lucene reads the field as the tie break for docs sharing
      * the cursor's sort values, and any value at or past the end of the
-     * reader excludes the tied docs, which is the shard path's
+     * reader excludes the tied docs, which is the stock search path's
      * {@code Integer.MAX_VALUE} semantics without tripping the
      * {@code doc >= maxDoc} pre-flight of {@code IndexSearcher.searchAfter}.
      *
@@ -247,11 +247,11 @@ final class FragmentHitsPages {
      * Collect the top-{@code size} collapsed page of {@code query}: one
      * hit per distinct value of the collapse field, the best hit of each
      * group under the request's sort (score order without one), through
-     * {@link CollapseContext#createTopDocs} the way the shard path's
+     * {@link CollapseContext#createTopDocs} the way the stock search path's
      * {@code CollapsingTopDocsCollectorContext} does. One collapsing
      * collector runs per slice and the slices' {@link CollapseTopFieldDocs}
      * are merged with {@link CollapseTopFieldDocs#merge}, which is the
-     * reduce the shard path applies under concurrent segment search.
+     * reduce the stock search path applies under concurrent segment search.
      * {@code after} is the {@code search_after} cursor (the sort is then
      * the collapse field alone, checked by the caller), pinned as in
      * {@link #viaIndexSearcher}. The knobs compose around the collector
@@ -334,7 +334,7 @@ final class FragmentHitsPages {
 
     /**
      * Run the request's rescorers over a collected first pass, in body
-     * order, the way {@code RescoreProcessor} does on the shard path:
+     * order, the way {@code RescoreProcessor} does on the stock search path:
      * each {@link RescoreContext}'s rescorer re scores the top
      * {@code window_size} docs of the page with its query over the
      * shared searcher, combines the two scores under the rescorer's
@@ -343,7 +343,7 @@ final class FragmentHitsPages {
      * {@code from + size}), since the first pass collected the larger
      * window. A rescore query that is a Lance full text or knn query
      * runs its one shard level Lance scan when the rescorer asks the
-     * Weight for its first leaf, as on the shard path; the match count
+     * Weight for its first leaf, as on the stock search path; the match count
      * of the page stays the first pass count.
      */
     static CollectedPage rescore(CollectedPage page, List<RescoreContext> rescorers, LanceFragmentIndexSearcher searcher, int size)
@@ -452,7 +452,7 @@ final class FragmentHitsPages {
      * phase over the page's doc ids, then the score and, for a sorted
      * page, the sort values of every hit from its {@link ScoreDoc} (a
      * {@code _score} clause's value becoming the hit's score), as
-     * {@code SearchPhaseController} stamps them on the shard path. The
+     * {@code SearchPhaseController} stamps them on the stock search path. The
      * row address of every hit rides along for the coordinator.
      */
     static HitsPage materialise(
@@ -473,7 +473,7 @@ final class FragmentHitsPages {
         SearchHit[] hits = fetchPhase.fetch(searchContext, docIds);
         // A sort with a _score clause carries the score as that clause's
         // sort value; SearchPhaseController copies it into _score on the
-        // shard path, whether or not track_scores is set.
+        // stock search path, whether or not track_scores is set.
         int sortScoreIndex = -1;
         if (sortAndFormats != null) {
             SortField[] sortFields = sortAndFormats.sort.getSort();

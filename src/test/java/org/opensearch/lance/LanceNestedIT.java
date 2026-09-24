@@ -23,7 +23,7 @@ import org.opensearch.core.rest.RestStatus;
  * parent doc, a {@code nested} query matches several attributes of the
  * same element (and not the same attributes spread across elements),
  * {@code _source} and GET render the array, the {@code nested} and
- * {@code reverse_nested} aggregations answer the shard path's buckets
+ * {@code reverse_nested} aggregations answer the stock search path's buckets
  * from the fragment executors, and counts stay on the parents.
  *
  * <p>Fixture ({@link LanceTableFactory#writeNestedTable}): six rows,
@@ -151,7 +151,7 @@ public class LanceNestedIT extends LanceRestTestCase {
 
             // nested and reverse_nested aggregations run on the fragment
             // path (the leaf reader carries the parent join the stock
-            // aggregators read) and answer what the shard path answers:
+            // aggregators read) and answer what the stock search path answers:
             // seven elements over the five surviving rows, red on rows 0,
             // 1 and 3 (titles alpha, beta), qty summing to 28.
             String nestedAggs = "{\"size\":0,\"aggs\":{\"n\":{\"nested\":{\"path\":\"items\"},\"aggs\":{"
@@ -164,17 +164,17 @@ public class LanceNestedIT extends LanceRestTestCase {
             assertEquals(7, extractIntPath(nestedAggBody, "aggregations", "n", "doc_count"));
             assertEquals(28.0d, extractDoublePath(nestedAggBody, "aggregations", "n", "qty", "value"), 0d);
             Map<String, Object> shardPath = parseJson(
-                readAll(postJson("/" + indexName + "/_search?request_cache=false", onShardPath(nestedAggs)))
+                readAll(postJson("/" + withStockOracle(indexName) + "/_search?request_cache=false", nestedAggs))
             );
-            assertEquals(withoutShardPathOracle(shardPath.get("aggregations")), parseJson(nestedAggBody).get("aggregations"));
+            assertEquals(shardPath.get("aggregations"), parseJson(nestedAggBody).get("aggregations"));
             String filteredNested =
                 "{\"size\":0,\"query\":{\"term\":{\"title\":\"alpha\"}},\"aggs\":{\"n\":{\"nested\":{\"path\":\"items\"},"
                     + "\"aggs\":{\"colors\":{\"terms\":{\"field\":\"items.color\",\"order\":{\"_key\":\"asc\"}}}}}}}";
-            Map<String, Object> filteredShardPath = parseJson(
-                readAll(postJson("/" + indexName + "/_search?request_cache=false", onShardPath(filteredNested)))
+            Map<String, Object> filteredStockSearch = parseJson(
+                readAll(postJson("/" + withStockOracle(indexName) + "/_search?request_cache=false", filteredNested))
             );
             assertEquals(
-                withoutShardPathOracle(filteredShardPath.get("aggregations")),
+                filteredStockSearch.get("aggregations"),
                 parseJson(readAll(postJson("/" + indexName + "/_search", filteredNested))).get("aggregations")
             );
 

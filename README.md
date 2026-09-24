@@ -36,7 +36,7 @@ Built against OpenSearch 3.8.0 with Lance 12.0.0.
 - Follows the Lance manifest forward automatically. `"version": N` on attach also pins a readonly snapshot.
 - Accepts per-table `storage_options` (S3, GCS, Azure) so a single JVM can address multiple buckets with different credentials.
 
-See [docs/features.md](docs/features.md) for the full feature list and [docs/limitations.md](docs/limitations.md) for known limitations and shapes routed to the shard path.
+See [docs/features.md](docs/features.md) for the full feature list and [docs/limitations.md](docs/limitations.md) for known limitations and refused shapes.
 
 ## Requirements
 
@@ -68,7 +68,7 @@ The end-to-end walkthrough (install into OpenSearch, prepare a Lance table, regi
 
 - [docs/getting-started.md](docs/getting-started.md) — Build, install, prepare a table, run the query shapes.
 - [docs/features.md](docs/features.md) — Feature reference by concern.
-- [docs/limitations.md](docs/limitations.md) — Known limitations and shard-path fall-throughs.
+- [docs/limitations.md](docs/limitations.md) — Known limitations and refused shapes.
 - [docs/architecture.md](docs/architecture.md) — How the plugin is put together: components, request paths, planner design, design intent.
 - [CHANGELOG.md](CHANGELOG.md) — Release notes.
 

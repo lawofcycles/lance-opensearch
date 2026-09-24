@@ -19,7 +19,6 @@ import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
 import org.opensearch.lance.plan.rel.MetricSpec;
-import org.opensearch.lance.plan.rel.ShardPathReason;
 import org.opensearch.lance.plan.traits.Accuracy;
 import org.opensearch.lance.plan.traits.PlanRequirement;
 import org.opensearch.lance.plan.traits.TieStability;
@@ -31,14 +30,15 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * The explain response: both routes survive the stream round trip
- * with every field, and the JSON carries the route, the reasons on the
- * shard path, the fragment plan, the unplanned element and the
- * predicted refinements on the fragment route, and the traits object on
- * both. The stream opens with the wire version and a reader refuses
- * another one.
+ * with every field, and the JSON carries the route, the refusal message
+ * alone on the unsupported route, and the fragment plan, the unplanned
+ * element, the predicted refinements and the traits object on the
+ * fragment route. The stream opens with the wire version and a reader
+ * refuses another one.
  */
 public class LanceExplainResponseTests extends OpenSearchTestCase {
 
@@ -99,12 +99,10 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
         );
         assertEquals(response, roundTrip(response));
         assertEquals(LanceExplainResponse.Route.FRAGMENT, response.route());
-        assertTrue(response.reasons().isEmpty());
 
         Map<String, Object> json = json(response);
         assertEquals("demo", json.get("index"));
         assertEquals("fragment", json.get("route"));
-        assertFalse("no reasons on the fragment route", json.containsKey("reasons"));
         assertTrue(json.get("physical").toString().startsWith("MergeExec("));
         assertFalse("nothing unplanned", json.containsKey("unplanned"));
         assertEquals(List.of("sort_field_type"), json.get("refinements_possible"));
@@ -165,32 +163,26 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
         assertEquals("LUCENE_TOPK", object(json, "fragment_plan").get("kind"));
     }
 
-    public void testShardPathRouteCarriesTheReasonsAndNoFragmentPlan() throws IOException {
-        LanceExplainResponse response = LanceExplainResponse.shardPath(
-            "demo",
-            List.of(ShardPathReason.SUGGEST, ShardPathReason.HIGHLIGHT),
-            "LanceShardPathShape(reasons=[[SUGGEST, HIGHLIGHT]])\n  LanceTableScan\n",
-            "ShardPathFallbackExec(reasons=[[SUGGEST, HIGHLIGHT]])\n  LanceTableScan\n",
-            NO_DEMAND
-        );
+    public void testUnsupportedRouteCarriesTheRefusalAndNothingElse() throws IOException {
+        String refusal = "search body carries a `highlight` clause which needs full-text APIs Lance does not surface.";
+        LanceExplainResponse response = LanceExplainResponse.unsupported("demo", refusal);
         assertEquals(response, roundTrip(response));
+        assertEquals(LanceExplainResponse.Route.UNSUPPORTED, response.route());
+        assertNull(response.logical());
+        assertNull(response.physical());
         assertNull(response.fragmentPlan());
-        assertNull(response.unplanned());
+        assertNull(response.traits());
+        assertEquals(refusal, response.unplanned());
+        assertTrue(response.refinementsPossible().isEmpty());
         Map<String, Object> json = json(response);
-        assertEquals("shard_path", json.get("route"));
-        assertEquals(List.of("SUGGEST", "HIGHLIGHT"), json.get("reasons"));
-        assertFalse(json.containsKey("fragment_plan"));
-        assertFalse(json.containsKey("unplanned"));
-        assertFalse("the data node refines nothing on the shard path", json.containsKey("refinements_possible"));
-        assertTrue(json.get("physical").toString().startsWith("ShardPathFallbackExec("));
-        Map<String, Object> traits = object(json, "traits");
-        assertEquals(Map.of("accuracy", "APPROXIMATE", "tie_stability", "NONE"), traits.get("requested"));
-        assertEquals(Map.of("accuracy", "EXACT", "tie_stability", "STABLE_ROWADDR"), traits.get("declared"));
-        assertEquals("none", traits.get("enforcer"));
+        assertEquals("demo", json.get("index"));
+        assertEquals("unsupported", json.get("route"));
+        assertEquals(refusal, json.get("unplanned"));
+        assertEquals("nothing was planned: " + json, Set.of("index", "route", "unplanned"), json.keySet());
     }
 
-    public void testShardPathRouteNeedsAReason() {
-        expectThrows(IllegalArgumentException.class, () -> LanceExplainResponse.shardPath("demo", List.of(), "l", "p", NO_DEMAND));
+    public void testUnsupportedRouteNeedsAMessage() {
+        expectThrows(NullPointerException.class, () -> LanceExplainResponse.unsupported("demo", null));
     }
 
     public void testTraitsWithADemandRoundTripAndRender() throws IOException {
@@ -256,7 +248,7 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
     }
 
     public void testReaderRefusesAnotherWireVersion() throws IOException {
-        LanceExplainResponse response = LanceExplainResponse.shardPath("demo", List.of(ShardPathReason.SUGGEST), "l", "p", NO_DEMAND);
+        LanceExplainResponse response = LanceExplainResponse.unsupported("demo", "no plan");
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             out.writeVInt(LanceExplainResponse.WIRE_VERSION + 1);
             try (BytesStreamOutput rest = new BytesStreamOutput()) {
@@ -268,7 +260,11 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
             try (StreamInput in = out.bytes().streamInput()) {
                 IOException refused = expectThrows(IOException.class, () -> new LanceExplainResponse(in));
                 assertEquals(
-                    "LanceExplainResponse wire version [2] does not match this node's [1]: every node must run the same plugin version",
+                    "LanceExplainResponse wire version ["
+                        + (LanceExplainResponse.WIRE_VERSION + 1)
+                        + "] does not match this node's ["
+                        + LanceExplainResponse.WIRE_VERSION
+                        + "]: every node must run the same plugin version",
                     refused.getMessage()
                 );
             }

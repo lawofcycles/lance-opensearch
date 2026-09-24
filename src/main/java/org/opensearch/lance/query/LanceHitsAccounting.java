@@ -37,7 +37,7 @@ import org.opensearch.core.common.breaker.NoopCircuitBreaker;
  * of every Lance scan of the request are counted together and are
  * returned together when the executor closes its search context. A
  * searcher exposes its instance through {@link Provider}; a Weight
- * created against any other searcher (unit tests, the shard path)
+ * created against any other searcher (unit tests, the shard engine)
  * counts against a {@link NoopCircuitBreaker}, which keeps the code
  * path identical but never trips.
  */

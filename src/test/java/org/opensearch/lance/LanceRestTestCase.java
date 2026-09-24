@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -29,6 +30,7 @@ import org.opensearch.client.RestClient;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.test.rest.OpenSearchRestTestCase;
 
@@ -267,47 +269,68 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
         }
     }
 
-    /**
-     * Name of the unmapped field {@link #onShardPath} highlights. The
-     * name is kept as a key the tests strip from the shard path's
-     * aggregations block ({@link #withoutShardPathOracle}) from the days
-     * the oracle was an aggregation of that name.
-     */
-    static final String SHARD_PATH_ORACLE = "shard_path_oracle";
+    /** Suffix of the empty ordinary index {@link #withStockOracle} puts next to a Lance index. */
+    private static final String STOCK_ORACLE_SUFFIX = "-stock-oracle";
 
     /**
-     * {@code body} (a complete {@code _search} JSON body) with a
-     * {@code highlight} of the unmapped field {@link #SHARD_PATH_ORACLE}
-     * added. A highlighter is a {@code ShardPathReason}, so the dispatch
-     * filter hands the request to the shard path: the oracle the fragment
-     * path tests compare against. The highlight phase skips a field the
-     * mapping does not know, so the added element changes nothing about
-     * the hits, the count or the aggregations.
+     * {@code target} (a {@code _search} index expression) with an empty
+     * ordinary index appended, so the request runs on OpenSearch's stock
+     * search action instead of the fragment coordinator. The dispatch
+     * filter hands a target with an index that is not Lance backed to the
+     * stock action, which searches the Lance index through the shard
+     * engine's whole table reader: one shard's Lucene query phase over
+     * the same rows the fragment executors read. That answer is the
+     * oracle the fragment path tests compare against. The appended index
+     * holds no document, so it adds no hit, no count and no bucket; it
+     * copies the mapping of the target's first index so that a sort, a
+     * collapse, a nested aggregation or a doc values clause resolves on
+     * its shard too, and both shards refuse the same requests with the
+     * same message (a failure on one shard alone would answer 200 with
+     * partial results). The index is created on first use and the test
+     * framework wipes it with every other index after each test.
      */
-    static String onShardPath(String body) {
-        Map<String, Object> map = new java.util.LinkedHashMap<>(parseJson(body));
-        map.put("highlight", Map.of("fields", Map.of(SHARD_PATH_ORACLE, Map.of())));
-        try (org.opensearch.core.xcontent.XContentBuilder builder = MediaTypeRegistry.JSON.contentBuilder()) {
-            builder.map(map);
-            return builder.toString();
-        } catch (IOException e) {
-            throw new AssertionError("could not rebuild JSON: " + body, e);
+    @SuppressWarnings("unchecked")
+    static String withStockOracle(String target) throws IOException {
+        String first = target.split(",")[0];
+        String oracle = first.replaceAll("[^a-z0-9_-]", "-") + STOCK_ORACLE_SUFFIX;
+        Request exists = new Request("HEAD", "/" + oracle);
+        exists.addParameter("ignore", "404");
+        if (client().performRequest(exists).getStatusLine().getStatusCode() == 404) {
+            Map<String, Object> mappingResponse = parseJson(
+                readAll(client().performRequest(new Request("GET", "/" + first + "/_mapping")))
+            );
+            Map<String, Object> mappings = new LinkedHashMap<>(
+                (Map<String, Object>) ((Map<String, Object>) mappingResponse.values().iterator().next()).get("mappings")
+            );
+            mappings.remove("_meta");
+            Map<String, Object> body = Map.of(
+                "settings",
+                Map.of("index.number_of_shards", 1, "index.number_of_replicas", 0),
+                "mappings",
+                mappings
+            );
+            try (XContentBuilder builder = MediaTypeRegistry.JSON.contentBuilder()) {
+                builder.map(body);
+                Request create = new Request("PUT", "/" + oracle);
+                create.setJsonEntity(builder.toString());
+                client().performRequest(create);
+            }
         }
+        return target + "," + oracle;
     }
 
     /**
-     * {@code aggregations} without the {@link #SHARD_PATH_ORACLE} key, for
-     * comparing the two paths' blocks; {@code null} when nothing else is
-     * left, as a response without aggregations has no block at all.
+     * {@code aggregations} as the block to compare between the two
+     * paths: the map itself, or {@code null} when the response carries
+     * no block or an empty one, as a response without aggregations has
+     * no block at all.
      */
     @SuppressWarnings("unchecked")
-    static Map<String, Object> withoutShardPathOracle(Object aggregations) {
-        if (!(aggregations instanceof Map<?, ?> map)) {
+    static Map<String, Object> aggregationsBlock(Object aggregations) {
+        if (!(aggregations instanceof Map<?, ?> map) || map.isEmpty()) {
             return null;
         }
-        Map<String, Object> copy = new java.util.LinkedHashMap<>((Map<String, Object>) map);
-        copy.remove(SHARD_PATH_ORACLE);
-        return copy.isEmpty() ? null : copy;
+        return (Map<String, Object>) map;
     }
 
     /**
@@ -315,7 +338,8 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
      * the sum over the nodes of {@code plan.executed} (both the Lance
      * scan and the Lucene counters) in {@code GET /_lance/stats}. A
      * request served by the fragment path advances it by one per
-     * executor; a request the shard path served leaves it unchanged.
+     * executor; a request the stock search action served leaves it
+     * unchanged.
      */
     @SuppressWarnings("unchecked")
     static long fragmentRequestsExecuted() throws IOException {
@@ -337,7 +361,7 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
      * included) except {@code _shard} and {@code _node}, which
      * {@code explain: true} adds and which name the node that rendered
      * the hit (the coordinating node on the fragment path, the data
-     * node on the shard path).
+     * node on the stock search action).
      */
     @SuppressWarnings("unchecked")
     static List<Map<String, Object>> fullHitsOf(String searchBody) {

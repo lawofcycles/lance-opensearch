@@ -1710,25 +1710,17 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             );
             assertEquals(400, extractIntPath(body, "status"));
 
-            // The same query with a highlighter runs on the shard
-            // path (see docs/limitations.md). Lucene's query phase wraps
-            // the failure in QueryPhaseExecutionException, which
-            // OpenSearch answers as 500; Lance's message still reaches
-            // the client. The 500 below is the documented limitation,
-            // not the wanted behaviour: when the shard path learns to
-            // answer 400 this assertion is expected to flip to 400 and
-            // the limitations entry goes away with it.
-            String explained = onShardPath("{\"query\":{\"lance_match_phrase\":{\"field\":\"label\",\"query\":\"row 3\"}}}");
-            ResponseException shardPath = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", explained));
-            String shardBody = readAll(shardPath.getResponse());
+            // The same query with a highlighter is refused before it
+            // reaches Lance: no plan answers a highlighter, so the 400
+            // names the element rather than the positions.
+            String highlighted = "{\"query\":{\"lance_match_phrase\":{\"field\":\"label\",\"query\":\"row 3\"}},"
+                + "\"highlight\":{\"fields\":{\"label\":{}}}}";
+            ResponseException refused = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", highlighted));
+            String refusedBody = readAll(refused.getResponse());
+            assertEquals(refusedBody, 400, refused.getResponse().getStatusLine().getStatusCode());
             assertEquals(
-                "shard path status for a phrase query without positions: " + shardBody,
-                500,
-                shardPath.getResponse().getStatusLine().getStatusCode()
-            );
-            assertTrue(
-                "expected Lance's message about positions on the shard path: " + shardBody,
-                shardBody.contains("position is not found but required for phrase queries")
+                "search body carries a `highlight` clause which needs full-text APIs Lance does not surface.",
+                extractStringPath(refusedBody, "error", "reason")
             );
         }
     }

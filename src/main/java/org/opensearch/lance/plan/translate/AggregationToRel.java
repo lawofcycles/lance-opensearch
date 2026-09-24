@@ -155,7 +155,7 @@ final class AggregationToRel {
      * full text or knn clause, ...).
      *
      * <ul>
-     *   <li>{@code global}: the shard path collects it in a second pass
+     *   <li>{@code global}: the stock search path collects it in a second pass
      *       over every document of the index ({@code AggregationPhase}
      *       runs the global aggregators under a match all query); the
      *       fragment executor collects one pass under the request's

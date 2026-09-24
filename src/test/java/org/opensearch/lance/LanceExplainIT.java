@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -239,7 +240,7 @@ public class LanceExplainIT extends LanceRestTestCase {
             // An aggregation off the pushdown shapes (multi_terms) reaches
             // the translator, which refuses it by name: the aggregators
             // run over the bare scan. Nothing about the aggregation tree
-            // sends a body to the shard path.
+            // makes a body unsupported.
             String multiTerms = explainOk(
                 indexName,
                 "{\"size\":0,\"aggs\":{\"t\":{\"multi_terms\":{\"terms\":[{\"field\":\"id\"},{\"field\":\"title\"}]}}}}"
@@ -460,22 +461,11 @@ public class LanceExplainIT extends LanceRestTestCase {
             assertTrue(sketchPhysical, sketchPhysical.contains("accuracy=[APPROXIMATE], tie_stability=[UNSTABLE], cost=[{ms="));
             assertEquals("APPROXIMATE", stringPath(sketch, "traits", "declared", "accuracy"));
 
-            // The shard path root declares the fallback's traits and
-            // demands nothing.
+            // A body no plan answers carries no traits: nothing was
+            // planned.
             String highlight = explainOk(indexName, "{\"size\":2,\"highlight\":{\"fields\":{\"body\":{}}}}");
-            assertEquals("shard_path", stringPath(highlight, "route"));
-            String highlightPhysical = stringPath(highlight, "physical");
-            assertTrue(
-                highlightPhysical,
-                highlightPhysical.startsWith(
-                    "ShardPathFallbackExec(reasons=[[HIGHLIGHT]], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms="
-                )
-            );
-            assertEquals("APPROXIMATE", stringPath(highlight, "traits", "requested", "accuracy"));
-            assertEquals("NONE", stringPath(highlight, "traits", "requested", "tie_stability"));
-            assertEquals("EXACT", stringPath(highlight, "traits", "declared", "accuracy"));
-            assertEquals("STABLE_ROWADDR", stringPath(highlight, "traits", "declared", "tie_stability"));
-            assertEquals("none", stringPath(highlight, "traits", "enforcer"));
+            assertEquals("unsupported", stringPath(highlight, "route"));
+            assertFalse("no traits on the unsupported route: " + highlight, parseJson(highlight).containsKey("traits"));
 
             // The logical tree renders without the terms.
             assertFalse("the logical tree carries no cost: " + stringPath(sum, "logical"), stringPath(sum, "logical").contains("cost=["));
@@ -484,7 +474,7 @@ public class LanceExplainIT extends LanceRestTestCase {
         }
     }
 
-    public void testExplainAcceptsTheRuntimeEnvelopeAndReportsTheShardPathRoute() throws Exception {
+    public void testExplainAcceptsTheRuntimeEnvelopeAndReportsTheUnsupportedRoute() throws Exception {
         String suffix = "explain-env-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -525,28 +515,42 @@ public class LanceExplainIT extends LanceRestTestCase {
             Map<String, Object> emptyTopK = (Map<String, Object>) fragmentPlanOf(emptyBody).get("top_k");
             assertEquals(10, emptyTopK.get("fetch"));
 
-            // A body only the shard path serves: the route says so, the
-            // reasons name the element, the physical root is the shard
-            // path operator and no fragment plan is shipped.
-            String highlightBody = explainOk(indexName, "{\"size\":3,\"highlight\":{\"fields\":{\"body\":{}}}}");
-            assertEquals("shard_path", stringPath(highlightBody, "route"));
-            assertEquals(List.of("HIGHLIGHT"), listOf(highlightBody, "reasons"));
-            String highlightPhysical = stringPath(highlightBody, "physical");
-            assertTrue("the shard path operator leads: " + highlightPhysical, highlightPhysical.startsWith("ShardPathFallbackExec("));
-            assertTrue("the operator carries the reason: " + highlightPhysical, highlightPhysical.contains("reasons=[[HIGHLIGHT]]"));
-            assertTrue(stringPath(highlightBody, "logical").contains("LanceShardPathShape"));
+            // A body no plan answers (a highlighter): the endpoint reports
+            // rather than executes, so it answers 200 with the route
+            // unsupported and the refusal message under unplanned, and
+            // nothing is planned: no trees, no fragment plan, no
+            // refinements. A search with the same body answers 400 with
+            // the same message.
+            String highlightRequest = "{\"size\":3,\"highlight\":{\"fields\":{\"body\":{}}}}";
+            String highlightRefusal = "search body carries a `highlight` clause which needs full-text APIs Lance does not surface.";
+            String highlightBody = explainOk(indexName, highlightRequest);
+            assertEquals("unsupported", stringPath(highlightBody, "route"));
+            assertEquals(highlightRefusal, stringPath(highlightBody, "unplanned"));
             Map<String, Object> highlight = parseJson(highlightBody);
-            assertFalse("no fragment plan on the shard path: " + highlightBody, highlight.containsKey("fragment_plan"));
-            assertFalse("no refinements on the shard path: " + highlightBody, highlight.containsKey("refinements_possible"));
-
-            // Two elements, both named, in the order the checks run.
-            String twoReasons = explainOk(
-                indexName,
-                "{\"size\":3,\"query\":{\"term\":{\"id\":1}},\"suggest\":{\"s\":{\"text\":\"hello\",\"term\":{\"field\":\"body\"}}},"
-                    + "\"highlight\":{\"fields\":{\"body\":{}}}}"
+            assertEquals(highlightBody, Set.of("index", "route", "unplanned"), highlight.keySet());
+            ResponseException highlightSearch = expectThrows(
+                ResponseException.class,
+                () -> postJson("/" + indexName + "/_search", highlightRequest)
             );
-            assertEquals("shard_path", stringPath(twoReasons, "route"));
-            assertEquals(List.of("SUGGEST", "HIGHLIGHT"), listOf(twoReasons, "reasons"));
+            assertEquals(400, highlightSearch.getResponse().getStatusLine().getStatusCode());
+            assertEquals(highlightRefusal, stringPath(readAll(highlightSearch.getResponse()), "error", "reason"));
+
+            // Two unsupported elements: the suggester is named, as it
+            // is checked first.
+            String suggestRequest =
+                "{\"size\":3,\"query\":{\"term\":{\"id\":1}},\"suggest\":{\"s\":{\"text\":\"hello\",\"term\":{\"field\":\"body\"}}},"
+                    + "\"highlight\":{\"fields\":{\"body\":{}}}}";
+            String suggestRefusal =
+                "search body carries a `suggest` clause which needs full-text APIs Lance does not surface. See `docs/limitations.md`.";
+            String twoElements = explainOk(indexName, suggestRequest);
+            assertEquals("unsupported", stringPath(twoElements, "route"));
+            assertEquals(suggestRefusal, stringPath(twoElements, "unplanned"));
+            ResponseException suggestSearch = expectThrows(
+                ResponseException.class,
+                () -> postJson("/" + indexName + "/_search", suggestRequest)
+            );
+            assertEquals(400, suggestSearch.getResponse().getStatusLine().getStatusCode());
+            assertEquals(suggestRefusal, stringPath(readAll(suggestSearch.getResponse()), "error", "reason"));
 
             // collapse and rescore run on the fragment executors over
             // the Lucene collector's page: the route stays fragment and

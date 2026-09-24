@@ -24,7 +24,7 @@ import org.opensearch.search.fetch.subphase.FieldAndFormat;
  * {@link FieldAndFormat}, empty when absent) and {@code explain}. The
  * executor hands them to the stock fetch sub phases over its search
  * context, so a hit carries the same fields, filtered source and
- * explanation the shard path's fetch phase would attach.
+ * explanation the stock search path's fetch phase would attach.
  *
  * @param fetchSource the body's {@code _source} element, null when absent
  * @param storedFields the body's {@code stored_fields} element, null when absent

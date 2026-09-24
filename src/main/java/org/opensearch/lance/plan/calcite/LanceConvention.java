@@ -23,7 +23,7 @@ public final class LanceConvention extends Convention.Impl {
     }
 
     /**
-     * Conversions between the Lance, Lucene, and shard path conventions are
+     * Conversions between the Lance and Lucene conventions are
      * expressed by dedicated converter rules, never by Calcite's abstract
      * converters.
      */

@@ -28,7 +28,7 @@ import org.opensearch.transport.client.node.NodeClient;
 
 /**
  * The {@code inner_hits} expansion of a collapsed page, the step
- * {@code ExpandSearchPhase} runs on the shard path after the fetch
+ * {@code ExpandSearchPhase} runs on the stock search path after the fetch
  * phase: one {@link MultiSearchRequest} through the node client with,
  * per collapsed hit and per {@code inner_hits} block, the request's
  * query wrapped in a {@code bool} that pins the hit's collapse value
@@ -43,7 +43,7 @@ import org.opensearch.transport.client.node.NodeClient;
  * and runs on the fragment path (it carries no {@code collapse} unless
  * the block nests one, and a nested collapse expands in turn, so the
  * recursion ends with the body). {@code max_concurrent_group_searches}
- * bounds the multi search's concurrency as on the shard path. The
+ * bounds the multi search's concurrency as on the stock search path. The
  * results attach to each hit as its {@code inner_hits}; a failed group
  * search fails the request.
  */

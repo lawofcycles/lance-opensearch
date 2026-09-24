@@ -13,7 +13,7 @@ import org.opensearch.test.OpenSearchTestCase;
  * {@link MergeReducer#totalHits} composes
  * {@code hits.total} from the summed per-node matched count, the
  * lower-bound flag any executor raised, and the request's
- * {@code track_total_hits}. The contract is the shard path's
+ * {@code track_total_hits}. The contract is the stock search path's
  * {@code SearchPhaseController.TopDocsStats#getTotalHits}: whenever the
  * relation is {@code gte} the value is the bound itself.
  */

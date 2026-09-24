@@ -23,7 +23,7 @@ import org.opensearch.core.rest.RestStatus;
  * ({@code geohash_grid}, {@code geotile_grid}, {@code geo_distance},
  * {@code geo_centroid}, {@code geo_bounds}, run by the fragment
  * executors' aggregators over the encoded doc values and compared with
- * the shard path), {@code _source} rendering the point as a
+ * the stock search path), {@code _source} rendering the point as a
  * {@code {lat, lon}} object, and {@code exists} skipping the Arrow
  * null row. The FixedSizeList fixture is stored {@code (lon, lat)}
  * and attached with {@code order: lon_lat}, so it must answer the same
@@ -217,7 +217,7 @@ public class LanceGeoPointIT extends LanceRestTestCase {
 
         // The fragment executors served both (one executor on this
         // cluster), and every geo aggregation type answers what the
-        // shard path answers over the same encoded doc values.
+        // stock search path answers over the same encoded doc values.
         long before = fragmentRequestsExecuted();
         for (String shape : new String[] {
             "{\"size\":0,\"aggs\":{\"c\":{\"geo_centroid\":{\"field\":\"location\"}}}}",
@@ -229,9 +229,9 @@ public class LanceGeoPointIT extends LanceRestTestCase {
                 + ",\"unit\":\"km\",\"ranges\":[{\"to\":10},{\"from\":10}]},\"aggs\":{\"c\":{\"geo_centroid\":{\"field\":\"location\"}}}}}}" }) {
             Map<String, Object> fragmentPath = parseJson(readAll(postJson("/" + indexName + "/_search", shape)));
             Map<String, Object> shardPath = parseJson(
-                readAll(postJson("/" + indexName + "/_search?request_cache=false", onShardPath(shape)))
+                readAll(postJson("/" + withStockOracle(indexName) + "/_search?request_cache=false", shape))
             );
-            assertEquals(shape, withoutShardPathOracle(shardPath.get("aggregations")), fragmentPath.get("aggregations"));
+            assertEquals(shape, shardPath.get("aggregations"), fragmentPath.get("aggregations"));
         }
         assertEquals("every geo aggregation ran on the fragment path", before + 5, fragmentRequestsExecuted());
     }

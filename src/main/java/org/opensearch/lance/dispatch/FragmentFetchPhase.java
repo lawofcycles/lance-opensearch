@@ -32,7 +32,7 @@ import org.opensearch.search.lookup.SearchLookup;
 /**
  * The fetch phase of the fragment executor: renders the {@link SearchHit}
  * of every doc of a page through OpenSearch's stored fields visitor and
- * the stock fetch sub phases, so a hit carries what the shard path's
+ * the stock fetch sub phases, so a hit carries what the stock search path's
  * fetch phase attaches for the same body. The sub phases are the ones
  * {@code SearchModule} registers for the elements the executor serves,
  * in the module's order: {@link ExplainPhase} ({@code explain}),
@@ -64,7 +64,7 @@ import org.opensearch.search.lookup.SearchLookup;
  *
  * <p>The hits come back in the page's order with the top level doc id
  * as {@link SearchHit#docId()}; the caller sets the score and the sort
- * values, as {@code SearchPhaseController} does on the shard path.
+ * values, as {@code SearchPhaseController} does on the stock search path.
  */
 final class FragmentFetchPhase extends FetchPhase {
 
@@ -147,7 +147,7 @@ final class FragmentFetchPhase extends FetchPhase {
      * source bytes are handed to the hit's {@code SourceLookup} for the
      * source, doc value and fields sub phases. A null visitor
      * ({@code stored_fields: _none_}) yields a hit without {@code _id}
-     * and without stored fields, as on the shard path.
+     * and without stored fields, as on the stock search path.
      */
     private static FetchSubPhase.HitContext prepareHitContext(
         LanceFragmentSearchContext context,

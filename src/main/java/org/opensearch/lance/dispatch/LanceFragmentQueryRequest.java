@@ -493,10 +493,10 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
      * them (JSON numbers arrive as Integer / Long / Double). {@code null}
      * when the request is not paginated with {@code search_after}. The
      * executor types them against its Lucene sort through
-     * {@code SearchAfterBuilder.buildFieldDoc}, the way the shard path
+     * {@code SearchAfterBuilder.buildFieldDoc}, the way the stock search path
      * does, and refuses a cursor whose request builds no sort
      * ({@code sort} absent, or a lone descending {@code _score}) with
-     * the shard path's message.
+     * the stock search path's message.
      */
     public Object[] searchAfter() {
         return searchAfter;

@@ -124,7 +124,7 @@ public final class LanceShardColumnCache {
     /**
      * Off-heap column store of the node's {@link LanceWarmCache} and the
      * snapshot key the leaves belong to, or {@code null} when the reader
-     * was opened outside the cache (shard path, cache disabled, tests).
+     * was opened outside the cache (the shard engine, cache disabled, tests).
      * When present, numeric, boolean and keyword loads go to the store
      * first and only fall back to the heap arrays when the store has no
      * room.

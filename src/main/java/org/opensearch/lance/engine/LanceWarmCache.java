@@ -237,7 +237,7 @@ public final class LanceWarmCache implements Closeable {
      * Everything shared by every leaf view over one table version. The
      * dataset stays open for the life of the snapshot and is shared by
      * every request that holds a lease; Lance's {@code Dataset} is safe
-     * for concurrent scans, as the shard path's reader manager already
+     * for concurrent scans, as the shard engine's reader manager already
      * relies on.
      */
     public static final class Snapshot {
