@@ -197,8 +197,8 @@ public class LanceFtsBoostQueryBuilder extends AbstractQueryBuilder<LanceFtsBoos
                     + "]"
             );
         }
-        FullTextQuery positiveFtq = pos.toLanceFullTextQuery(context);
-        FullTextQuery negativeFtq = neg.toLanceFullTextQuery(context);
+        FullTextQuery positiveFtq = LanceFtsQueryBuilder.boosted(pos.toLanceFullTextQuery(context), positive.boost(), NAME);
+        FullTextQuery negativeFtq = LanceFtsQueryBuilder.boosted(neg.toLanceFullTextQuery(context), negative.boost(), NAME);
         return negativeBoost != null
             ? FullTextQuery.boost(positiveFtq, negativeFtq, negativeBoost)
             : FullTextQuery.boost(positiveFtq, negativeFtq);
