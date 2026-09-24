@@ -80,8 +80,8 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
     /**
      * The wire format's version, the first field written and the first
      * read. Bumped when a field is added, removed or retyped; 2 dropped
-     * the shard path reasons list and made the plan texts and the
-     * traits optional for the unsupported route.
+     * the reasons list of the retired fallback route and made the plan
+     * texts and the traits optional for the unsupported route.
      */
     public static final int WIRE_VERSION = 2;
 

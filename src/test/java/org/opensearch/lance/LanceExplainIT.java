@@ -461,22 +461,11 @@ public class LanceExplainIT extends LanceRestTestCase {
             assertTrue(sketchPhysical, sketchPhysical.contains("accuracy=[APPROXIMATE], tie_stability=[UNSTABLE], cost=[{ms="));
             assertEquals("APPROXIMATE", stringPath(sketch, "traits", "declared", "accuracy"));
 
-            // The shard path root declares the fallback's traits and
-            // demands nothing.
+            // A body no plan answers carries no traits: nothing was
+            // planned.
             String highlight = explainOk(indexName, "{\"size\":2,\"highlight\":{\"fields\":{\"body\":{}}}}");
-            assertEquals("shard_path", stringPath(highlight, "route"));
-            String highlightPhysical = stringPath(highlight, "physical");
-            assertTrue(
-                highlightPhysical,
-                highlightPhysical.startsWith(
-                    "ShardPathFallbackExec(reasons=[[HIGHLIGHT]], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms="
-                )
-            );
-            assertEquals("APPROXIMATE", stringPath(highlight, "traits", "requested", "accuracy"));
-            assertEquals("NONE", stringPath(highlight, "traits", "requested", "tie_stability"));
-            assertEquals("EXACT", stringPath(highlight, "traits", "declared", "accuracy"));
-            assertEquals("STABLE_ROWADDR", stringPath(highlight, "traits", "declared", "tie_stability"));
-            assertEquals("none", stringPath(highlight, "traits", "enforcer"));
+            assertEquals("unsupported", stringPath(highlight, "route"));
+            assertFalse("no traits on the unsupported route: " + highlight, parseJson(highlight).containsKey("traits"));
 
             // The logical tree renders without the terms.
             assertFalse("the logical tree carries no cost: " + stringPath(sum, "logical"), stringPath(sum, "logical").contains("cost=["));

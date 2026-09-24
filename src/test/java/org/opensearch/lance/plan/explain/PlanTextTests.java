@@ -7,10 +7,8 @@ package org.opensearch.lance.plan.explain;
 
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.rel.RelNode;
-import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.execute.RequestPlanner;
 import org.opensearch.lance.plan.translate.PlanTestFixtures;
-import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchTestCase;
@@ -129,20 +127,6 @@ public class PlanTextTests extends OpenSearchTestCase {
             text.contains("LanceTableScan(table=[[lance, idx]], accuracy=[EXACT]")
         );
         assertFalse("the total sits on the root alone, and the root is logical: " + text, text.contains("total_cost"));
-    }
-
-    public void testShardPathRootCarriesTheFallbackTraits() throws IOException {
-        SearchSourceBuilder source = PlanTestFixtures.parse("{\"size\":5,\"highlight\":{\"fields\":{\"body\":{}}}}");
-        LancePlannerFactory factory = PlanTestFixtures.factory();
-        RelNode logical = SearchRequestToRel.translateDispatch(source, PlanTestFixtures.model(), factory);
-        String text = PlanText.render(factory.plan(logical));
-        assertTrue(
-            text,
-            lines(text).get(0)
-                .startsWith("ShardPathFallbackExec(reasons=[[HIGHLIGHT]], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms=100")
-        );
-        assertTrue("the total adds the scan below: " + text, lines(text).get(0).contains("total_cost=[{ms="));
-        assertFalse(text, lines(text).get(0).contains("total_cost=[{ms=100,"));
     }
 
     public void testRenderWithoutTermsMatchesCalciteForLogicalTrees() throws IOException {

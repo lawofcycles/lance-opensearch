@@ -13,7 +13,6 @@ import org.apache.calcite.sql.SqlExplainLevel;
 import org.apache.calcite.util.Pair;
 import org.opensearch.lance.plan.calcite.LanceRel;
 import org.opensearch.lance.plan.calcite.LuceneRel;
-import org.opensearch.lance.plan.calcite.ShardPathRel;
 import org.opensearch.lance.plan.traits.PlanRequirement;
 
 import java.io.PrintWriter;
@@ -27,9 +26,8 @@ import java.util.Locale;
 /**
  * Renders a plan tree for the explain response, one operator per line
  * as {@code RelOptUtil.toString} does, and appends to every physical
- * operator (a {@link LanceRel}, {@link LuceneRel} or
- * {@link ShardPathRel}) the trait values it declares and the cost the
- * planner charged it:
+ * operator (a {@link LanceRel} or {@link LuceneRel}) the trait values
+ * it declares and the cost the planner charged it:
  *
  * <pre>
  * MergeExec(reduce=[COUNT_SUM], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms=1, native_bytes=1, heap_bytes=0}], total_cost=[{ms=8, native_bytes=2, heap_bytes=0}])
@@ -91,7 +89,7 @@ final class PlanText extends RelWriterImpl {
 
     /** Whether {@code rel} is one of the plugin's physical operators, the ones that declare traits and are costed. */
     static boolean physical(RelNode rel) {
-        return rel instanceof LanceRel || rel instanceof LuceneRel || rel instanceof ShardPathRel;
+        return rel instanceof LanceRel || rel instanceof LuceneRel;
     }
 
     /** {@code {ms=..., native_bytes=..., heap_bytes=...}}, each slot rounded to two significant digits; {@code unknown} without a cost. */
