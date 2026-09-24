@@ -548,7 +548,7 @@ For OpenSearch's dedicated `hybrid` query (per-sub-query top-K with a score-norm
 
 ### Where a request runs: the explain endpoint
 
-`GET /{index}/_lance/explain` takes a search body and answers what the coordinator would execute for it, without running the search. The plugin plans every `_search` once, on the coordinating node, through a Calcite planner: the body is translated to a logical tree over the table, the planner picks the cheapest physical form, and the per node part of that form ships to the data nodes with each fragment request. The explain endpoint runs the same planning entry and prints the result, so what it shows is what a search with the same body executes. [features.md](features.md#query-plan-preview) describes every field; this section shows the two answers the examples above produce.
+`GET /{index}/_lance/explain` takes a search body and answers what the coordinator would execute for it, without running the search. The plugin plans every `_search` once, on the coordinating node, through a Calcite planner: the body is translated to a logical tree over the table, the planner picks the cheapest physical form that declares the traits the request demands, and the per node part of that form ships to the data nodes with each fragment request. The explain endpoint runs the same planning entry and prints the result, so what it shows is what a search with the same body executes. [query-plan.md](query-plan.md) is the reference for every field, the operators, the cost model, the refinements and the traits; this section shows the two answers the examples above produce.
 
 A stock `match` is outside the translator's vocabulary, so the plan carries no query part and the executors run Lucene's collector over the query the field type built (`LUCENE_TOPK`); `unplanned` names the element that kept the request on the Lucene side:
 
@@ -563,23 +563,28 @@ curl -s -X GET 'http://localhost:9200/demo/_lance/explain?pretty' \
   "index" : "demo",
   "route" : "fragment",
   "logical" : "LanceTableScan(table=[[lance, demo]])\n",
-  "physical" : "MergeExec(reduce=[HITS_TOP_K])\n  FanOutExec(fanOut=[1], partitioning=[EQUAL_FRAGMENT_GROUPS])\n    LanceTableScan(table=[[lance, demo]])\n",
+  "physical" : "MergeExec(reduce=[HITS_TOP_K], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms=1, native_bytes=1, heap_bytes=0}], total_cost=[{ms=18, native_bytes=2, heap_bytes=0}])\n  FanOutExec(fanOut=[1], partitioning=[EQUAL_FRAGMENT_GROUPS], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms=1, native_bytes=1, heap_bytes=0}])\n    LanceTableScan(table=[[lance, demo]], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms=16, native_bytes=0, heap_bytes=0}])\n",
   "fragment_plan" : {
     "kind" : "LUCENE_TOPK"
   },
   "unplanned" : "query type [match]",
-  "refinements_possible" : [ ]
+  "refinements_possible" : [ ],
+  "traits" : {
+    "requested" : { "accuracy" : "APPROXIMATE", "tie_stability" : "NONE" },
+    "declared" : { "accuracy" : "EXACT", "tie_stability" : "STABLE_ROWADDR" },
+    "enforcer" : "none"
+  }
 }
 ```
 
-The same `bool` with `lance_match` in `must` is a shape the translator spells: the `range` becomes the Lance SQL `rating >= 3` and rides on the pushed full text operation as its prefilter, the page is pushed too (`PUSHED_SCAN`), and nothing is `unplanned`:
+The same `bool` with `lance_match` in `must` is a shape the translator spells: the `range` becomes the Lance SQL `rating >= 3` and rides on the pushed full text operation as its prefilter, the page is pushed too (`PUSHED_SCAN`), and nothing is `unplanned`. The physical lines carry the same three terms as above (`accuracy`, `tie_stability`, `cost`), cut here for width:
 
 ```json
 {
   "index" : "demo",
   "route" : "fragment",
   "logical" : "LanceHitShape(columns=[[id, body, title, rating, embedding]], source=[true], id=[true], score=[true], sortValues=[false])\n  LanceTopK(collations=[[]], fetch=[3], offset=[0])\n    LanceFtsMatch(kind=[MATCH], columns=[[body]], query=[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\",\"boost\":1.0}}])\n      LogicalFilter(condition=[>=(CAST($3):BIGINT NOT NULL, 3)])\n        LanceTableScan(table=[[lance, demo]])\n",
-  "physical" : "MergeExec(reduce=[HITS_TOP_K])\n  FanOutExec(fanOut=[1], partitioning=[EQUAL_FRAGMENT_GROUPS])\n    LanceTableScan(table=[[lance, demo]], pushed=[[fts{kind=MATCH, columns=[body], query={\"lance_match\":{\"field\":\"body\",\"query\":\"hello\",\"boost\":1.0}}, filter=rating >= 3}, topk{collations=[], fetch=3, offset=0, hits{columns=[id, body, title, rating, embedding], source=true, id=true, score=true, sortValues=false}}]])\n",
+  "physical" : "MergeExec(reduce=[HITS_TOP_K], ...)\n  FanOutExec(fanOut=[1], partitioning=[EQUAL_FRAGMENT_GROUPS], ...)\n    LanceTableScan(table=[[lance, demo]], pushed=[[fts{kind=MATCH, columns=[body], query={\"lance_match\":{\"field\":\"body\",\"query\":\"hello\",\"boost\":1.0}}, filter=rating >= 3}, topk{collations=[], fetch=3, offset=0, hits{columns=[id, body, title, rating, embedding], source=true, id=true, score=true, sortValues=false}}]], ...)\n",
   "fragment_plan" : {
     "kind" : "PUSHED_SCAN",
     "filter_sql" : "rating >= 3",
@@ -589,17 +594,23 @@ The same `bool` with `lance_match` in `must` is a shape the translator spells: t
       "fetch" : 3
     }
   },
-  "refinements_possible" : [ ]
+  "refinements_possible" : [ ],
+  "traits" : {
+    "requested" : { "accuracy" : "APPROXIMATE", "tie_stability" : "NONE" },
+    "declared" : { "accuracy" : "EXACT", "tie_stability" : "UNSTABLE" },
+    "enforcer" : "none"
+  }
 }
 ```
 
 How to read the fields:
 
 - `route` is `fragment` for everything the coordinator fans out to the data nodes, which is every body except one holding `suggest` or `highlight`; those answer `route: shard_path` with the element named under `reasons`, and the stock shard search serves them.
-- `logical` is the tree the translator built and `physical` the tree the planner chose: `MergeExec` (how the per node answers combine) over `FanOutExec` (how many data nodes the request fans out to) over the per node plan, a `LanceTableScan` carrying its pushed operations (`filter{sql=...}`, `fts{...}`, `knn{...}`, `topk{...}`, `aggregate{...}`), or a `HeapTopKExec` / `LuceneAggregateExec` operator over the bare scan when Lucene's collector or aggregators run the request.
+- `logical` is the tree the translator built and `physical` the tree the planner chose: `MergeExec` (how the per node answers combine) over `FanOutExec` (how many data nodes the request fans out to) over the per node plan, a `LanceTableScan` carrying its pushed operations (`filter{sql=...}`, `fts{...}`, `knn{...}`, `topk{...}`, `aggregate{...}`), or a `HeapTopKExec` / `LuceneAggregateExec` operator over the bare scan when Lucene's collector or aggregators run the request. Every physical line ends with the `accuracy` and `tie_stability` the operator declares and the `cost` the planner charged it; the root adds `total_cost`, the figure the candidates were compared by. Below a million rows the milliseconds are placeholders (a bare scan charges one per row, which is where the `16` above comes from); at a million rows and above an aggregation is priced by the fitted model described in [query-plan.md](query-plan.md#cost).
 - `fragment_plan` is what every data node receives: `kind` (`PUSHED_SCAN`, `LUCENE_TOPK`, `LUCENE_COUNT`, `LUCENE_AGGREGATE`), the `filter_sql` of the scalar predicate when there is one, the `lance_clause` the executor builds its Lance query from, and the pushed `top_k` page or `aggregate`.
 - `unplanned` is present only when some element kept the request, or the whole query, on the Lucene side, and names it (`query type [match]`, `sort type [_geo_distance]`, `aggregation type [multi_terms]`, `size [5] (only 0 with aggregations)`, `pipeline aggregation`). It is absent when the planner's cost model chose the Lucene operator for a tree that did translate; the physical plan shows that choice.
 - `refinements_possible` lists the downgrades a data node could still apply to the shipped plan for what only it knows (`security_wrapper` when a DLS / FLS reader wrapper is installed, `sort_field_type` for a page sorted by an `ip` column). `GET /_lance/stats` counts what the nodes did under `plan.refinements` and `plan.executed`, see step 6.
+- `traits` is what the body demanded of the plan (`requested`: an explicit `track_total_hits` demands `EXACT` accuracy, a `search_after` cursor demands a reproducible tie order; `APPROXIMATE` and `NONE` mean no demand) against what the chosen plan declares (`declared`). The bare scan above returns rows in Lance row address order (`STABLE_ROWADDR`); a page cut in score order out of a full text or knn scan is `UNSTABLE`, which is why `search_after` over a `lance_match` page sorted by `_score` alone is refused. `enforcer` says whether the planner had to replace the cheapest plan with one meeting the demand.
 
 The plan text format will change as the planner grows; read it, do not parse it.
 
@@ -832,9 +843,9 @@ Every aggregation type OpenSearch ships runs on the fragment path, that is on th
 
 Five types cannot run on the fragment executors and answer 400 `illegal_argument_exception` naming the builder (`aggregation type [global] on [g] is not supported for Lance-backed indices: ...`), from `_search` and from the explain endpoint alike: `global`, `top_hits`, `rare_terms`, `significant_terms`, `significant_text`. The reasons are in [limitations.md](limitations.md#aggregations-the-fragment-path-does-not-serve).
 
-Between the two ways the planner decides by cost, and explain shows the decision. A tree the translator spells is planned in both forms, the pushed scan and `LuceneAggregateExec`, and each is priced by a latency model fitted to measurements of the aggregation shapes on 20M, 100M and 1B row tables across 1 to 6 node clusters: a fixed cost per request, an object store open latency for `s3://` / `gs://` / `az://` tables, the per row work divided by the fan out node count and by the thread settings below, the object store transfer of the columns read, a penalty above a million groups. On tables under a million rows the pushed scan always wins; above it the choice depends on the table size, the node count and the storage kind (a keyword `terms` over a billion rows on S3 plans as `LuceneAggregateExec` on a four node cluster, the same tree over twenty million rows on local disk as the pushed scan), and `cardinality` always loses the comparison because feeding Lance's distinct values into the sketch measured slower than the aggregator. When the cost chose the aggregators, explain shows `LuceneAggregateExec` and nothing under `unplanned`; `unplanned` appears only when the translator could not spell the tree (`aggregation type [multi_terms]`, `bucket tree deeper than 3 levels`, ...). Two settings are inputs to the same cost comparison rather than switches in front of it: `lance.aggregation.pushdown: false` prices every pushed aggregate as infinite, and `lance.aggregation.pushdown_max_groups` (node setting, default `1000000`) does the same for a tree whose group rows, estimated from the table statistics, exceed the bound.
+Between the two ways the planner decides by cost ([query-plan.md](query-plan.md#cost) has the model), and explain shows the decision. A tree the translator spells is planned in both forms, the pushed scan and `LuceneAggregateExec`, and each is priced by a latency model fitted to measurements of the aggregation shapes on 20M, 100M and 1B row tables across 1 to 6 node clusters: a fixed cost per request, an object store open latency for `s3://` / `gs://` / `az://` tables, the per row work divided by the fan out node count and by the thread settings below, the object store transfer of the columns read, a penalty above a million groups. On tables under a million rows the pushed scan always wins; above it the choice depends on the table size, the node count and the storage kind (a keyword `terms` over a billion rows on S3 plans as `LuceneAggregateExec` on a four node cluster, the same tree over twenty million rows on local disk as the pushed scan), and `cardinality` always loses the comparison because feeding Lance's distinct values into the sketch measured slower than the aggregator. When the cost chose the aggregators, explain shows `LuceneAggregateExec` and nothing under `unplanned`; `unplanned` appears only when the translator could not spell the tree (`aggregation type [multi_terms]`, `bucket tree deeper than 3 levels`, ...). Two settings are inputs to the same cost comparison rather than switches in front of it: `lance.aggregation.pushdown: false` prices every pushed aggregate as infinite, and `lance.aggregation.pushdown_max_groups` (node setting, default `1000000`) does the same for a tree whose group rows, estimated from the table statistics, exceed the bound.
 
-A data node may still move a pushed aggregate (or a pushed page or full text clause) to the Lucene side for what only it can judge. There are four such reasons, counted per node under `plan.refinements` in `GET /_lance/stats`, and the two the coordinator can predict from the mapping are listed under `refinements_possible` by the explain endpoint:
+A data node may still move a pushed aggregate (or a pushed page or full text clause) to the Lucene side for what only it can judge. There are four such reasons ([query-plan.md](query-plan.md#refinements)), counted per node under `plan.refinements` in `GET /_lance/stats`, and the two the coordinator can predict from the mapping are listed under `refinements_possible` by the explain endpoint:
 
 - `security_wrapper`: a reader wrapper (the security plugin's DLS / FLS) is installed on the index, so a pushed aggregate, a pushed page and a pushed full text clause go to the aggregators, the collector and the Lucene composition of the query, which the wrapper filters. A pushed `lance_knn` and the filter SQL survive the wrapper.
 - `sort_field_type`: the pushed page orders by a column whose Lucene sort field carries a format the scan cannot type its sort values from (an `ip` override column), so the page goes to the collector.
@@ -917,7 +928,8 @@ Alternatively, keep the surviving indices and reattach each one explicitly with 
 
 ## Next steps
 
-- Full feature reference: [features.md](features.md), with the query plan and explain endpoint under [Query plan (preview)](features.md#query-plan-preview).
+- Full feature reference: [features.md](features.md).
+- The query plan and the explain endpoint in full (operators, cost model, refinements, traits, wire format): [query-plan.md](query-plan.md).
 - Known limitations and shapes routed to the shard path: [limitations.md](limitations.md).
 - How the plugin is put together, including the planner design: [architecture.md](architecture.md).
 - The plugin's design and the invariants it upholds live in the RFC: [opensearch-project/OpenSearch#22643](https://github.com/opensearch-project/OpenSearch/issues/22643).
