@@ -1,6 +1,6 @@
 # Getting started
 
-Walkthrough for building the plugin, installing it into OpenSearch, and driving it through the query shapes it supports (match, phrase, multi-field match, score-composing boost / bool, GET, vector kNN, aggregation). Aimed at people evaluating the plugin against their own Lance tables and at reviewers who want to reproduce the behaviour claimed in the RFC.
+Walkthrough for building the plugin, installing it into OpenSearch, and driving it through the query shapes it supports (`match`, `match_phrase`, `multi_match`, `bool`, the `lance_*` full text queries, GET by primary key, `lance_knn`, aggregations, and the explain endpoint that shows where each request runs). Aimed at people evaluating the plugin against their own Lance tables and at reviewers who want to reproduce the behaviour claimed in the RFC.
 
 ## Prerequisites
 
@@ -79,15 +79,17 @@ You need at least one Lance table on a path or object store URI the OpenSearch p
 
 ### Option A: use your own table
 
-Any Lance table works. The plugin derives the mapping from the Arrow schema. Supported column types today: int32/int64, boolean, date/timestamp, string (mapped to `lance_text` when the column has a Lance FTS index, otherwise `keyword`), fixed-size list of float (mapped to `knn_vector`), list of string (multi-valued `keyword`), and binary.
+Any Lance table works. The plugin derives the mapping from the Arrow schema. Supported column types today: int8 to int64 (`byte` to `long`), float32/float64, boolean, date/timestamp (`date`), string (mapped to `lance_text` when the column has a Lance FTS index, otherwise `keyword`), fixed-size list of float32 (`lance_vector`, the type `lance_knn` queries), list of string (multi-valued `keyword`), struct (`object`), list of struct (`nested`), and binary. The full table is in [features.md](features.md#mapping-type-coverage).
 
 Place the table under the directory you mounted in step 2. The rest of this walkthrough assumes it is at `/tables/demo.lance` and has these columns:
 
 - `id: int32` — used as the primary key; the column carries `lance-schema:unenforced-primary-key` field metadata and is non-nullable (without that metadata the table attaches fine but `GET /<index>/_doc/<id>` returns 404)
-- `body: string` with a Lance FTS index — matched by the `match` query
-- `title: string` with a Lance FTS index — used together with `body` by the `lance_multi_match` / `lance_fts_boost` / `lance_fts_bool` examples
-- `embedding: fixed_size_list<float>[8]` — used by the `lance_knn` query
-- `rating: int32` — used by the aggregation example
+- `body: string` with a Lance FTS index — mapped as `lance_text`; matched by the `match` / `match_phrase` and `lance_match` / `lance_match_phrase` examples
+- `title: string` with a Lance FTS index — mapped as `lance_text`; used together with `body` by the `multi_match` and `bool` examples and by their `lance_multi_match` / `lance_fts_boost` / `lance_fts_bool` equivalents
+- `embedding: fixed_size_list<float>[8]` — mapped as `lance_vector`; used by the `lance_knn` query
+- `rating: int32` — mapped as `integer`; used by the `bool.filter` and aggregation examples
+
+Once attached, `curl -s http://localhost:9200/demo/_mapping` shows exactly these types; the mapping is the contract the queries below rely on. Only a `lance_text` field sends `match` and its relatives to the Lance FTS index, so a string column that has no inverted index in the table (mapped as `keyword`) needs one built first (see "How the plugin thinks about indexes" in step 6).
 
 ### Option B: create a sample table with Python
 
@@ -126,7 +128,10 @@ data = {
 
 table = pa.table(data, schema=schema)
 dataset = lance.write_dataset(table, "/absolute/path/to/tables/demo.lance", mode="create")
-dataset.create_scalar_index("body", index_type="INVERTED")
+# with_position stores token positions, which lance_match_phrase needs
+# (pylance defaults it to False); title has no phrase example, so it is
+# indexed without them
+dataset.create_scalar_index("body", index_type="INVERTED", with_position=True)
 dataset.create_scalar_index("title", index_type="INVERTED")
 print(f"wrote {dataset.count_rows()} rows to {dataset.uri}")
 ```
@@ -185,7 +190,10 @@ dataset = lance.write_dataset(
     mode="create",
     storage_options=storage_options,
 )
-dataset.create_scalar_index("body", index_type="INVERTED")
+# with_position stores token positions, which lance_match_phrase needs
+# (pylance defaults it to False); title has no phrase example, so it is
+# indexed without them
+dataset.create_scalar_index("body", index_type="INVERTED", with_position=True)
 dataset.create_scalar_index("title", index_type="INVERTED")
 print(f"wrote {dataset.count_rows()} rows to {dataset.uri}")
 ```
@@ -263,9 +271,11 @@ Values must be strings. The plugin does not enumerate a fixed allowlist; whateve
 
 Options are persisted as `index.lance.storage_options.<key>` on the created index, so a single node can address two buckets with different credentials at the same time. They are stored in plain index settings today; treat them the way you would treat any other index setting.
 
-## 5. Verify: run the four query shapes
+## 5. Verify: run the query shapes
 
 Each command below assumes the index name `demo` from step 4.
+
+Full text queries come in two forms. The stock OpenSearch syntax (`match`, `match_phrase`, `multi_match`, and `bool` around them) works on every `lance_text` field and is the form to start with: on a `lance_text` field the plugin's field type answers OpenSearch's `match` family with a Lance `MatchQuery` over the query text, so the hits and the BM25 scores come from the Lance inverted index, not from a Lucene index. The `lance_*` form (`lance_match`, `lance_match_phrase`, `lance_multi_match`, `lance_fts_bool`, `lance_fts_boost`) hands the same Lance queries every parameter the stock parsers do not pass through: AND / OR operator, fuzziness, phrase order and slop, per-field boosts inside one Lance query, and score composition on Lance's side. It is also the form the planner recognises, so a `lance_*` clause with scalar `filter` / `must_not` companions runs as one Lance scan with the filter as a prefilter, while the same `bool` around a stock `match` runs each clause as its own Lance scan and lets Lucene combine them. Use the stock syntax when it does what you need and reach for the `lance_*` form for the parameters and the single scan; each subsection below shows the stock form first and the explicit form under it. [limitations.md](limitations.md#fts-query-behaviour-on-stock-match--match_phrase) has the short list of what the stock form ignores.
 
 ### Full-text search (match)
 
@@ -277,11 +287,13 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
   -d '{"query":{"match":{"body":"hello"}}}'
 ```
 
-Expected `hits.total.value`: 8 (every even row).
+Expected `hits.total.value`: 8 (every even row). `_score` is Lance's BM25 for the row.
 
-### AND / OR match (lance_match)
+Lance's own tokenizer splits several words and Lance ORs the terms: `{"match":{"body":"hello lance"}}` returns 8 and `{"match":{"body":"hello quick"}}` returns 16, because every row contains one of the two words.
 
-The stock `match` above passes the whole query text through Lance as one token, so `operator: and` on OpenSearch's built-in `match` is ignored. Use `lance_match` to push AND / OR control into Lance's own FTS engine:
+What the stock form does not carry: the whole query text reaches Lance as one string, so `operator: and` and `minimum_should_match` on `match` are ignored (`{"match":{"body":{"query":"hello quick","operator":"and"}}}` still returns 16), and `fuzziness` on `match` returns 400 (`Can only use fuzzy queries on keyword and text fields`). The explicit form below carries them.
+
+#### Explicit form: lance_match (operator, fuzziness)
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
@@ -289,25 +301,9 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
   -d '{"query":{"lance_match":{"field":"body","query":"hello lance","operator":"and"}}}'
 ```
 
-Expected `hits.total.value`: 8 (every even row contains both `hello` and `lance`).
+Expected `hits.total.value`: 8 (every even row contains both `hello` and `lance`). Swapping the query text to `"hello quick"` returns 16 hits with the default operator (OR) and 0 hits with `operator: and`, because no row contains both words.
 
-Swapping the query text to `"hello quick"` returns 16 hits with the default operator (OR) and 0 hits with `operator: and`, because no row contains both `hello` and `quick`.
-
-### Phrase order (lance_match_phrase)
-
-The stock `match_phrase` collapses to a single token for the same reason and ignores order. Use `lance_match_phrase`:
-
-```
-curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
-  -H 'Content-Type: application/json' \
-  -d '{"query":{"lance_match_phrase":{"field":"body","query":"hello lance"}}}'
-```
-
-Returns 8 hits. Reversing the phrase to `"lance hello"` returns 0. Non-zero slop lets tokens sit further apart: `{"field":"body","query":"quick fox","slop":1}` matches every `quick brown fox <i>` because `brown` sits one position between `quick` and `fox`.
-
-### Fuzziness (lance_match)
-
-`lance_match` accepts `fuzziness` (non-negative integer edit distance), `prefix_length`, and `max_expansions`. OpenSearch's `AUTO` fuzziness is not supported because Lance takes an explicit integer.
+`lance_match` also accepts `fuzziness` (non-negative integer edit distance), `prefix_length`, and `max_expansions`. OpenSearch's `AUTO` fuzziness is not supported because Lance takes an explicit integer.
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
@@ -317,9 +313,48 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
 
 Expected `hits.total.value`: 8. `helo` is edit distance 1 from `hello`, so the eight even rows still match. Without `fuzziness` the same query returns 0.
 
-### Multi-field match (lance_multi_match)
+### Phrase (match_phrase)
 
-Push a single query text across multiple `lance_text` fields with optional per-field boosts. Even rows have `title = "sunny morning i"`; odd rows have `title = "cloudy morning i"`.
+```
+curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"match_phrase":{"body":"hello lance"}}}'
+```
+
+Expected `hits.total.value`: 8. The stock `match_phrase` reaches Lance the same way `match` does, as one string for a Lance `MatchQuery`, so word order and `slop` are not enforced: `{"match_phrase":{"body":"lance hello"}}` also returns 8. Use the explicit form when the order matters.
+
+#### Explicit form: lance_match_phrase (order, slop)
+
+```
+curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"lance_match_phrase":{"field":"body","query":"hello lance"}}}'
+```
+
+Returns 8 hits. Reversing the phrase to `"lance hello"` returns 0. Non-zero slop lets tokens sit further apart: `{"field":"body","query":"quick fox","slop":1}` matches every `quick brown fox <i>` because `brown` sits one position between `quick` and `fox`.
+
+`lance_match_phrase` needs an inverted index that stores token positions (the `with_position=True` argument in the step 3 scripts; `"with_position": true` on `POST /_lance/build_indexes/{index}` when the plugin builds the index). On an index built without positions Lance answers 400 with `position is not found but required for phrase queries`.
+
+### Multi-field match (multi_match)
+
+Even rows have `title = "sunny morning i"`; odd rows have `title = "cloudy morning i"`.
+
+```
+curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "query": {
+          "multi_match": {
+            "query": "hello cloudy",
+            "fields": ["body", "title^2"]
+          }
+        }
+      }'
+```
+
+Expected `hits.total.value`: 16. `hello` hits every even row on `body`; `cloudy` hits every odd row on `title`; the two are unioned. The stock `multi_match` builds one Lance `MatchQuery` per field and Lucene combines the per-field scores (`best_fields`, the default, keeps the best field's score; `most_fields` sums them); the `^2` boost applies to the `title` clause's Lance score. `operator`, `minimum_should_match` and `type: phrase` are ignored for the same reason as on `match`.
+
+#### Explicit form: lance_multi_match (one Lance query, shared operator, boosts)
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
@@ -335,31 +370,53 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
       }'
 ```
 
-Expected `hits.total.value`: 16. `hello` hits every even row on `body`; `cloudy` hits every odd row on `title`; the OR default unions them. Restricting to `["body"]` drops the odd-row matches; adding `"operator":"and"` returns 0 hits because no row contains both terms.
+Expected `hits.total.value`: 16, the same rows as above, scored by Lance's `MultiMatchQuery` in one scan. Restricting to `["body"]` drops the odd-row matches; adding `"operator":"and"` returns 0 hits because no row contains both words in one field.
 
-### Score composition (lance_fts_boost)
+### Composition with bool
 
-Compose two Lance FTS clauses so hits are defined by `positive` and hits that also match `negative` get their score multiplied by `negative_boost`. All hits still come from the positive set.
+A `bool` composes full text clauses with each other and with scalar filters. With the stock `match` inside, every clause runs as its own Lance FTS scan and Lucene applies the `must` / `should` / `must_not` / `filter` logic over the per-fragment results, so the scores and counts are what OpenSearch gives the same `bool` over Lucene fields. `rating` is `(i % 5) + 1`, so the even rows carry the ratings 1, 3, 5, 2, 4, 1, 3, 5.
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
   -H 'Content-Type: application/json' \
   -d '{
         "query": {
-          "lance_fts_boost": {
-            "positive": {"lance_match": {"field": "body", "query": "hello"}},
-            "negative": {"lance_match": {"field": "body", "query": "lance"}},
-            "negative_boost": 0.1
+          "bool": {
+            "must":   [{"match": {"body": "hello"}}],
+            "filter": [{"range": {"rating": {"gte": 3}}}]
           }
         }
       }'
 ```
 
-Expected `hits.total.value`: 8. The positive `hello` matches every even row; every even row also matches the negative `lance`, so each hit's score is multiplied by `0.1`. Compare `_score` against the plain `lance_match {"field":"body","query":"hello"}` to see the reduction. Both `positive` and `negative` must themselves be Lance FTS DSLs (`lance_match`, `lance_match_phrase`, `lance_multi_match`, or a nested `lance_fts_boost` / `lance_fts_bool`); passing a stock `match` returns 400.
+Expected `hits.total.value`: 5 (rows 2, 4, 8, 12, 14: even, and rating 3 or above). Other compositions on the same table:
 
-### Bool composition (lance_fts_bool)
+- `must: [{"match":{"body":"hello"}}, {"match":{"title":"sunny"}}]` returns 8: both words sit on the even rows.
+- `must: [{"match":{"body":"hello"}}], must_not: [{"match":{"body":"lance"}}]` returns 0: every row with `hello` also has `lance`.
+- `should: [{"match":{"body":"hello"}}, {"match":{"title":"cloudy"}}]` returns 16, each row scored by the one clause it matches.
 
-Compose FTS clauses using `must` / `should` / `must_not` lists. Every clause must itself be a Lance FTS DSL.
+#### Explicit form: a lance_* clause with scalar filters, one Lance scan
+
+When the `bool` holds exactly one `lance_*` clause in `must` and only scalar clauses (`term`, `terms`, `range`, `exists`, `match_all`, `wildcard`, `regexp`, `prefix`, or a `bool` of those) in `filter` / `must_not`, the planner translates the scalar clauses to Lance SQL and runs one Lance FTS scan with that SQL as a prefilter: Lance evaluates the predicate first (through the column's scalar index when it has one) and looks the inverted index up only for the selected rows.
+
+```
+curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "query": {
+          "bool": {
+            "must":   [{"lance_match": {"field": "body", "query": "hello"}}],
+            "filter": [{"range": {"rating": {"gte": 3}}}]
+          }
+        }
+      }'
+```
+
+Expected `hits.total.value`: 5, the same rows as the stock `bool` above. "Where a request runs" below shows how to see the difference between the two plans.
+
+#### Explicit form: lance_fts_bool and lance_fts_boost, composition on Lance's side
+
+`lance_fts_bool` composes `must` / `should` / `must_not` lists of full text clauses inside one Lance query; `lance_fts_boost` defines the hits by a `positive` clause and multiplies the score of the hits that also match `negative` by `negative_boost`. Every clause must itself be a `lance_*` full text query (`lance_match`, `lance_match_phrase`, `lance_multi_match`, or a nested `lance_fts_bool` / `lance_fts_boost`); a stock `match` inside either returns 400.
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
@@ -378,7 +435,23 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
       }'
 ```
 
-Expected `hits.total.value`: 0. `must` on `body:hello` selects the eight even rows; `must_not` on `body:lance` removes every row that also contains `lance`, which is all of them. Replace the `must_not` with a `should` on `title:sunny` to see the intersection (`must ∩ should` = eight even rows) and score composition on Lance's side.
+Expected `hits.total.value`: 0, as for the stock `bool` with the same clauses. Replace the `must_not` with a `should` on `title:sunny` to see the intersection (`must ∩ should` = eight even rows) with the `should` clause's score added on Lance's side.
+
+```
+curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "query": {
+          "lance_fts_boost": {
+            "positive": {"lance_match": {"field": "body", "query": "hello"}},
+            "negative": {"lance_match": {"field": "body", "query": "lance"}},
+            "negative_boost": 0.1
+          }
+        }
+      }'
+```
+
+Expected `hits.total.value`: 8. The positive `hello` matches every even row; every even row also matches the negative `lance`, so each hit's score is multiplied by `0.1`. Compare `_score` against the plain `lance_match {"field":"body","query":"hello"}` to see the reduction. The stock `boosting` query is not translated to this; use `lance_fts_boost` when the negative clause has to be applied inside Lance's scoring.
 
 ### Primary key lookup
 
@@ -390,7 +463,7 @@ Expected `_source.body`: `quick brown fox 3` (odd `id`).
 
 ### Vector nearest neighbour (lance_knn)
 
-Each row `i` lives at coordinate `(i, 0, 0, ..., 0)`. The query vector `(2.4, 0, ...)` is nearest to row 2, then row 3.
+`lance_knn` is the one query without a stock counterpart in this plugin (the `knn` query name belongs to the k-NN plugin). Each row `i` lives at coordinate `(i, 0, 0, ..., 0)`. The query vector `(2.4, 0, ...)` is nearest to row 2, then row 3.
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=2' \
@@ -410,7 +483,7 @@ Expected `hits.hits[0]._source.id = 2`, `hits.hits[1]._source.id = 3`.
 
 Scores are `boost / (1 + distance)`. Compare within one query, not across queries.
 
-`lance_knn` accepts an inner `filter` clause that Lance evaluates before applying the K-nearest cutoff (a pre-filter). Any `bool` combination of `match_all`, `term`, `terms`, `exists`, and `range` clauses works; anything else returns 400.
+`lance_knn` accepts an inner `filter` clause that Lance evaluates before applying the K-nearest cutoff (a pre-filter). Any `bool` combination of `match_all`, `term`, `terms`, `exists`, `range`, `wildcard`, `regexp` and `prefix` clauses works; anything else, a `match` included, returns 400 (`[lance_knn] filter type [MatchQueryBuilder] ...`).
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=2' \
@@ -429,7 +502,7 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=2' \
 
 Expected `hits.hits[0]._source.id = 10`, `hits.hits[1]._source.id = 11` (`k=2` stays populated because the filter is applied before the cutoff).
 
-### Aggregation combined with bool
+### Aggregation combined with a full text query
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=0' \
@@ -440,11 +513,13 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=0' \
       }'
 ```
 
-Expected: one bucket per distinct `rating` value seen in matching rows.
+Expected: five buckets over the eight even rows, `1` and `3` and `5` with `doc_count` 2, `2` and `4` with `doc_count` 1.
+
+An aggregation under a full text or `lance_knn` query always runs through OpenSearch's aggregators over the fragment leaf readers, with the doc values of the aggregated column fetched for the matched rows only. The aggregation pushdown into the Lance scan (a group by evaluated inside Lance) applies to `size: 0` requests over `match_all` or a scalar filter; "Aggregations: where they run" in step 6 walks through that and through the settings that steer it.
 
 ### Hybrid shape (bool.should combining FTS and vector)
 
-FTS and vector sub-queries compose inside `bool.should`. Row `i` has body-token "hello" only on even `i`, and its vector coordinate on the first axis is `i`. `lance_match` on "hello" hits every even row, `lance_knn` near `(0.5, 0, ..., 0)` with `k=2` hits rows 0 and 1. The union has 9 rows; row 0 satisfies both clauses and sums to the highest `_score`.
+Full text and vector sub-queries compose inside `bool.should`. Row `i` has body token `hello` only on even `i`, and its vector coordinate on the first axis is `i`. `match` on `hello` hits every even row, `lance_knn` near `(0.5, 0, ..., 0)` with `k=2` hits rows 0 and 1. The union has 9 rows; row 0 satisfies both clauses and sums to the highest `_score`.
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=16' \
@@ -453,7 +528,7 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=16' \
         "query": {
           "bool": {
             "should": [
-              { "lance_match": { "field": "body", "query": "hello" } },
+              { "match": { "body": "hello" } },
               { "lance_knn": {
                   "field": "embedding",
                   "vector": [0.5, 0, 0, 0, 0, 0, 0, 0],
@@ -467,9 +542,66 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=16' \
 
 Expected `hits.total.value`: 9, with `hits[0]._source.id = 0`.
 
-The same shape works with stock `match` on `body` in place of `lance_match`: on a `lance_text` field, `match` is rewritten to Lance FTS, so per-shard composition is identical.
+The same shape works with `lance_match {"field":"body","query":"hello"}` in place of the stock `match`; both are a Lance FTS scan per fragment, and Lucene's `bool.should` composition over them is identical.
 
 For OpenSearch's dedicated `hybrid` query (per-sub-query top-K with a score-normalising search pipeline), install the [`neural-search`](https://opensearch.org/docs/latest/search-plugins/hybrid-search/) plugin alongside this one and follow its docs. Per-shard sub-query execution goes through the same Lucene `createWeight` / `Scorer` path the `bool.should` example above exercises.
+
+### Where a request runs: the explain endpoint
+
+`GET /{index}/_lance/explain` takes a search body and answers what the coordinator would execute for it, without running the search. The plugin plans every `_search` once, on the coordinating node, through a Calcite planner: the body is translated to a logical tree over the table, the planner picks the cheapest physical form, and the per node part of that form ships to the data nodes with each fragment request. The explain endpoint runs the same planning entry and prints the result, so what it shows is what a search with the same body executes. [features.md](features.md#query-plan-preview) describes every field; this section shows the two answers the examples above produce.
+
+A stock `match` is outside the translator's vocabulary, so the plan carries no query part and the executors run Lucene's collector over the query the field type built (`LUCENE_TOPK`); `unplanned` names the element that kept the request on the Lucene side:
+
+```
+curl -s -X GET 'http://localhost:9200/demo/_lance/explain?pretty' \
+  -H 'Content-Type: application/json' \
+  -d '{"size":3,"query":{"bool":{"must":[{"match":{"body":"hello"}}],"filter":[{"range":{"rating":{"gte":3}}}]}}}'
+```
+
+```json
+{
+  "index" : "demo",
+  "route" : "fragment",
+  "logical" : "LanceTableScan(table=[[lance, demo]])\n",
+  "physical" : "MergeExec(reduce=[HITS_TOP_K])\n  FanOutExec(fanOut=[1], partitioning=[EQUAL_FRAGMENT_GROUPS])\n    LanceTableScan(table=[[lance, demo]])\n",
+  "fragment_plan" : {
+    "kind" : "LUCENE_TOPK"
+  },
+  "unplanned" : "query type [match]",
+  "refinements_possible" : [ ]
+}
+```
+
+The same `bool` with `lance_match` in `must` is a shape the translator spells: the `range` becomes the Lance SQL `rating >= 3` and rides on the pushed full text operation as its prefilter, the page is pushed too (`PUSHED_SCAN`), and nothing is `unplanned`:
+
+```json
+{
+  "index" : "demo",
+  "route" : "fragment",
+  "logical" : "LanceHitShape(columns=[[id, body, title, rating, embedding]], source=[true], id=[true], score=[true], sortValues=[false])\n  LanceTopK(collations=[[]], fetch=[3], offset=[0])\n    LanceFtsMatch(kind=[MATCH], columns=[[body]], query=[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\",\"boost\":1.0}}])\n      LogicalFilter(condition=[>=(CAST($3):BIGINT NOT NULL, 3)])\n        LanceTableScan(table=[[lance, demo]])\n",
+  "physical" : "MergeExec(reduce=[HITS_TOP_K])\n  FanOutExec(fanOut=[1], partitioning=[EQUAL_FRAGMENT_GROUPS])\n    LanceTableScan(table=[[lance, demo]], pushed=[[fts{kind=MATCH, columns=[body], query={\"lance_match\":{\"field\":\"body\",\"query\":\"hello\",\"boost\":1.0}}, filter=rating >= 3}, topk{collations=[], fetch=3, offset=0, hits{columns=[id, body, title, rating, embedding], source=true, id=true, score=true, sortValues=false}}]])\n",
+  "fragment_plan" : {
+    "kind" : "PUSHED_SCAN",
+    "filter_sql" : "rating >= 3",
+    "lance_clause" : "lance_match",
+    "top_k" : {
+      "orderings" : [ ],
+      "fetch" : 3
+    }
+  },
+  "refinements_possible" : [ ]
+}
+```
+
+How to read the fields:
+
+- `route` is `fragment` for everything the coordinator fans out to the data nodes, which is every body except one holding `suggest` or `highlight`; those answer `route: shard_path` with the element named under `reasons`, and the stock shard search serves them.
+- `logical` is the tree the translator built and `physical` the tree the planner chose: `MergeExec` (how the per node answers combine) over `FanOutExec` (how many data nodes the request fans out to) over the per node plan, a `LanceTableScan` carrying its pushed operations (`filter{sql=...}`, `fts{...}`, `knn{...}`, `topk{...}`, `aggregate{...}`), or a `HeapTopKExec` / `LuceneAggregateExec` operator over the bare scan when Lucene's collector or aggregators run the request.
+- `fragment_plan` is what every data node receives: `kind` (`PUSHED_SCAN`, `LUCENE_TOPK`, `LUCENE_COUNT`, `LUCENE_AGGREGATE`), the `filter_sql` of the scalar predicate when there is one, the `lance_clause` the executor builds its Lance query from, and the pushed `top_k` page or `aggregate`.
+- `unplanned` is present only when some element kept the request, or the whole query, on the Lucene side, and names it (`query type [match]`, `sort type [_geo_distance]`, `aggregation type [multi_terms]`, `size [5] (only 0 with aggregations)`, `pipeline aggregation`). It is absent when the planner's cost model chose the Lucene operator for a tree that did translate; the physical plan shows that choice.
+- `refinements_possible` lists the downgrades a data node could still apply to the shipped plan for what only it knows (`security_wrapper` when a DLS / FLS reader wrapper is installed, `sort_field_type` for a page sorted by an `ip` column). `GET /_lance/stats` counts what the nodes did under `plan.refinements` and `plan.executed`, see step 6.
+
+The plan text format will change as the planner grows; read it, do not parse it.
 
 ## 6. Refresh behaviour when Lance moves forward
 
@@ -621,11 +753,23 @@ curl -sS localhost:9200/_lance/stats?pretty
             ]
           }
         ]
+      },
+      "plan" : {
+        "statistics" : { "tables" : 1, "collect_millis_total" : 94 },
+        "refinements" : {
+          "security_wrapper" : 0,
+          "sort_field_type" : 0,
+          "aggregate_resolution" : 0,
+          "column_store_warm" : 0
+        },
+        "executed" : { "pushed_scan" : 6, "lucene" : 51 }
       }
     }
   }
 }
 ```
+
+The response carries three more sections than shown (`freshness`, `indices`, `local_clones`); the ones above are the ones this walkthrough refers to.
 
 How to read it:
 
@@ -635,6 +779,7 @@ How to read it:
 - `native_memory.estimated_bytes` is what the breaker enforces against `lance.native_memory.limit`; it lags `session_bytes + column_store_bytes` by at most one `lance.native_memory.circuit_breaker.poll_interval`. Compare it with the process RSS to see how much of the native footprint the plugin accounts for.
 - `native_memory.index_cache_capacity`, `index_cache_shards` and `index_cache_shard_share` are the index cache the plugin handed Lance at startup and the shard layout Lance derives from it (see "Cap Lance's native memory footprint"). `index_cache_shard_share` is the heaviest entry the cache admits; a table whose inverted index is heavier than it (about 52 bytes per row per full-text column) is reloaded on every full-text query.
 - `warm_up` is the index warm-up of the section below: `mode` is the value of `lance.attach.warm_indexes` on the node, and `tables` has one entry per Lance-backed index the node has seen since it started, with the table, the manifest version the warm-up read, the mode it ran under, its `state` (`pending`, `running`, `done`, `failed`, `skipped` for mode `none`, `cancelled` when the index was deleted first), when it started, how long it took, and one entry per Lance index (`name`, `type`, `column`, `state`, `seconds`, and a `detail` when it failed or was skipped). A table whose entry stays `running` for minutes on an object store is reading its indexes page by page; the INFO log shows one line per index as it finishes.
+- `plan` is what the node did with the plans the coordinator shipped: `refinements` counts, per reason, the pushed operations the node moved to the Lucene side, and `executed` counts the fragment requests the Lance scan answered against the ones Lucene's collector and aggregators answered. "Aggregations: where they run" below explains the four reasons.
 
 The endpoint is read only. With the security plugin, grant `cluster:monitor/lance/stats`.
 
@@ -678,18 +823,50 @@ lance.admission.bounded_shapes_gated: true # default; false admits bounded full 
 
 The 429 message names the kind of scan (`fts`, `scalar_index`, `vector_index`, `filter_scan`, `aggregate_scan`, `column_load`), the estimate, the available memory, the headroom and what to relax. `GET /_lance/stats` reports the decisions under `admission`, with one rejection counter per kind. The estimates are a model whose coefficients are pinned to the measurements the project has; a 429 on a table whose scan does not fit the node is the intended answer, and the shapes that never scan (`GET /_doc`, `_count` without a filter, `match_all` pages) are never gated.
 
-### Aggregations computed inside the scan
+### Aggregations: where they run
 
-A `size: 0` request over `match_all` or a scalar filter whose aggregations are metrics only (`stats`, `cardinality` and tdigest `percentiles` included), or a chain of `terms` / `histogram` / `date_histogram` / `range` / `date_range` / `filter` / `filters` / `missing` levels with metric children, is answered by a group by inside the Lance scan instead of the Lucene aggregators (the shapes are listed in [features.md](features.md#aggregation-pushdown)). Four dynamic cluster settings control it:
+Every aggregation type OpenSearch ships runs on the fragment path, that is on the data nodes over the fragments each one holds, with the coordinator reducing the per node results the way `SearchPhaseController` reduces shards. No aggregation tree sends a request to the stock shard path. Within the fragment path there are two ways to compute one:
+
+- Inside the Lance scan. A `size: 0` request over `match_all` or a scalar filter (`term`, `terms`, `range`, `exists`, `bool` of those) whose tree is metrics only (`stats`, tdigest `percentiles` and `percentile_ranks` included), a chain of up to three `terms` / `histogram` / `date_histogram` / `range` / `date_range` / `filter` / `filters` / `missing` levels with metric children, or one `composite` over `terms` / `date_histogram` sources, is translated to a Substrait `AggregateRel` and evaluated by Lance's DataFusion kernel as a group by; each executor gets one row per group and builds the same `InternalAggregation` the aggregators would. The explain endpoint shows it as `aggregate{...}` among the scan's pushed operations and `fragment_plan.kind: PUSHED_SCAN`. The shapes are listed in [features.md](features.md#aggregation-pushdown).
+- Through OpenSearch's aggregators over the fragment leaf readers (`LuceneAggregateExec` in the physical plan, `fragment_plan.kind: LUCENE_AGGREGATE`). This serves every other tree: `multi_terms`, `matrix_stats`, `weighted_avg`, `median_absolute_deviation`, `variable_width_histogram`, `adjacency_matrix`, `sampler`, `nested`, the geo aggregations over a `geo_point` override column (`geo_distance`, `geohash_grid`, `geotile_grid`, `geo_centroid`, `geo_bounds`), scripted aggregations, `cardinality`, any tree under a full text or `lance_knn` query, a `post_filter`, a page (`size > 0`), or a pipeline aggregation (the bucket tree runs on the executors and the pipelines on the coordinator's final reduce). The `terms` over `rating` under `match` in step 5 is one of these.
+
+Five types cannot run on the fragment executors and answer 400 `illegal_argument_exception` naming the builder (`aggregation type [global] on [g] is not supported for Lance-backed indices: ...`), from `_search` and from the explain endpoint alike: `global`, `top_hits`, `rare_terms`, `significant_terms`, `significant_text`. The reasons are in [limitations.md](limitations.md#aggregations-the-fragment-path-does-not-serve).
+
+Between the two ways the planner decides by cost, and explain shows the decision. A tree the translator spells is planned in both forms, the pushed scan and `LuceneAggregateExec`, and each is priced by a latency model fitted to measurements of the aggregation shapes on 20M, 100M and 1B row tables across 1 to 6 node clusters: a fixed cost per request, an object store open latency for `s3://` / `gs://` / `az://` tables, the per row work divided by the fan out node count and by the thread settings below, the object store transfer of the columns read, a penalty above a million groups. On tables under a million rows the pushed scan always wins; above it the choice depends on the table size, the node count and the storage kind (a keyword `terms` over a billion rows on S3 plans as `LuceneAggregateExec` on a four node cluster, the same tree over twenty million rows on local disk as the pushed scan), and `cardinality` always loses the comparison because feeding Lance's distinct values into the sketch measured slower than the aggregator. When the cost chose the aggregators, explain shows `LuceneAggregateExec` and nothing under `unplanned`; `unplanned` appears only when the translator could not spell the tree (`aggregation type [multi_terms]`, `bucket tree deeper than 3 levels`, ...). Two settings are inputs to the same cost comparison rather than switches in front of it: `lance.aggregation.pushdown: false` prices every pushed aggregate as infinite, and `lance.aggregation.pushdown_max_groups` (node setting, default `1000000`) does the same for a tree whose group rows, estimated from the table statistics, exceed the bound.
+
+A data node may still move a pushed aggregate (or a pushed page or full text clause) to the Lucene side for what only it can judge. There are four such reasons, counted per node under `plan.refinements` in `GET /_lance/stats`, and the two the coordinator can predict from the mapping are listed under `refinements_possible` by the explain endpoint:
+
+- `security_wrapper`: a reader wrapper (the security plugin's DLS / FLS) is installed on the index, so a pushed aggregate, a pushed page and a pushed full text clause go to the aggregators, the collector and the Lucene composition of the query, which the wrapper filters. A pushed `lance_knn` and the filter SQL survive the wrapper.
+- `sort_field_type`: the pushed page orders by a column whose Lucene sort field carries a format the scan cannot type its sort values from (an `ip` override column), so the page goes to the collector.
+- `aggregate_resolution`: the pushed aggregate's fields do not resolve against the node's mapping, or the executor's own group estimate from the request shape (the product of the `terms` levels' `shard_size`, a `range` / `filters` level as its bucket count plus one) exceeds `lance.aggregation.pushdown_max_groups`; the aggregators run.
+- `column_store_warm`: over an object store table, the node's off heap column store already holds every column the aggregators would read for every fragment of the request, and the aggregators over resident columns are predicted cheaper than scanning the object store again (the coordinator ships both predicted costs with the plan). Nothing warms the column store at attach, so this fires only after a Lucene side request has loaded the columns; over a local table it never fires.
+
+`plan.executed` next to it counts, per node, the fragment requests the Lance scan answered (`pushed_scan`) and the ones Lucene's collector and aggregators answered (`lucene`, which includes every full text or `lance_knn` page), so a request whose explain says `PUSHED_SCAN` should move the first counter:
+
+```json
+"plan" : {
+  "statistics" : { "tables" : 1, "collect_millis_total" : 94 },
+  "refinements" : {
+    "security_wrapper" : 0,
+    "sort_field_type" : 0,
+    "aggregate_resolution" : 0,
+    "column_store_warm" : 0
+  },
+  "executed" : { "pushed_scan" : 6, "lucene" : 51 }
+}
+```
+
+Settings that steer the pushed scan, all dynamic cluster settings unless noted:
 
 ```
-lance.aggregation.pushdown: true              # default; false answers every aggregation through the aggregators
+lance.aggregation.pushdown: true              # default; false prices every pushed aggregate as infinite, so the aggregators answer
 lance.aggregation.pushdown_parallelism: 4     # default: half the CPUs the JVM sees (at least 1, at most 32)
+lance.aggregation.pushdown_max_groups: 1000000 # node setting; bound on the estimated group rows of a pushed tree
 lance.aggregation.percentiles_bins: 4096      # default; bins of a pushed down tdigest percentiles histogram (16 to 1000000)
 lance.aggregation.pushdown_topk_slack: 4      # default; per scan retention of a top-k ordered terms, in multiples of shard_size (1 to 64)
 ```
 
-Lance aggregates one scan on a single thread, so a node that holds many fragments cuts them into `pushdown_parallelism` contiguous groups, scans the groups at once on the `index_searcher` thread pool and merges the group rows before it builds its buckets. Set it to `1` to compare against a single scan; raise it up to the node's core count when a `terms` over many rows is slower than the same request with the setting off.
+Lance aggregates one scan on a single thread, so a node that holds many fragments cuts them into `pushdown_parallelism` contiguous groups, scans the groups at once on the `index_searcher` thread pool and merges the group rows before it builds its buckets. Set it to `1` to compare against a single scan; raise it up to the node's core count when a `terms` over many rows is slower than the same request with the pushdown priced out.
 
 A tdigest `percentiles` is sketched from a histogram of `percentiles_bins` equal width bins over the field's range instead of from every document: the histogram is accurate to one bin width, and the TDigest built from it interpolates a little less accurately than one built from every document (see [limitations.md](limitations.md)). Raise the bin count when a percentile needs to be closer than `(max - min) / 4096`; every bin the data fills is one row the executor reads per bucket.
 
@@ -704,7 +881,7 @@ lance.fragment_path.parallelism: 4            # default: half the CPUs the JVM s
 lance.fragment_path.slices: 4                 # default: half the CPUs the JVM sees (at least 1, at most 32)
 ```
 
-`parallelism` is the number of Lance scans an executor runs side by side when it reads a column into memory. `slices` is the number of slices it cuts its fragments into when it collects: each slice collects on its own `index_searcher` pool thread with its own collector, the way concurrent segment search does on the shard path, and the slice results are reduced on the executor. Set `slices` to `1` to collect on one thread in fragment order (the tdigest `percentiles` and `cardinality` sketches are then built once per executor instead of once per slice); raise it towards the node's core count when an aggregation that the scan does not compute (`composite`, `percentiles`, `cardinality`, `stats`, or `terms` with the pushdown off) keeps one core busy while the others idle. With the log level of `org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction` at `DEBUG`, each request logs the number of leaves and slices it collected.
+`parallelism` is the number of Lance scans an executor runs side by side when it reads a column into memory. `slices` is the number of slices it cuts its fragments into when it collects: each slice collects on its own `index_searcher` pool thread with its own collector, the way concurrent segment search does on the shard path, and the slice results are reduced on the executor. Set `slices` to `1` to collect on one thread in fragment order (the tdigest `percentiles` and `cardinality` sketches are then built once per executor instead of once per slice); raise it towards the node's core count when an aggregation that the scan does not compute (`multi_terms`, `cardinality`, any tree under a full text or `lance_knn` query, or `terms` with `lance.aggregation.pushdown: false`) keeps one core busy while the others idle. With the log level of `org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction` at `DEBUG`, each request logs the number of leaves and slices it collected.
 
 ### The coordinator thread pool
 
@@ -732,9 +909,16 @@ Alternatively, keep the surviving indices and reattach each one explicitly with 
 
 **A query on a mapped column returns zero hits when Python `dataset.to_table()` shows data.** Inspect the OpenSearch mapping (`curl -s http://localhost:9200/<index>/_mapping`). If the column is missing there, its Arrow type is not yet covered by the mapping derivation; open an issue with the schema.
 
+**`match` returns hits `operator: and` should have excluded, or `match_phrase` ignores word order.** Expected: on a `lance_text` field the stock queries hand the whole text to a Lance `MatchQuery` and the operator, `minimum_should_match`, phrase order and `slop` do not reach Lance. Use `lance_match` / `lance_match_phrase` (step 5).
+
+**`lance_match_phrase` answers 400 `position is not found but required for phrase queries`.** The inverted index was built without token positions. Rebuild it with `with_position=True` (pylance) or `"with_position": true` on `POST /_lance/build_indexes/{index}`; positions are fixed when the index is created.
+
+**A request is slower than expected and you want to know where it ran.** `GET /<index>/_lance/explain` with the same body (step 5) prints the plan and names what kept it on the Lucene side under `unplanned`; `GET /_lance/stats` shows under `plan` whether the data nodes executed the shipped plan or downgraded it, and why.
+
 ## Next steps
 
-- Full feature reference: [features.md](features.md).
+- Full feature reference: [features.md](features.md), with the query plan and explain endpoint under [Query plan (preview)](features.md#query-plan-preview).
 - Known limitations and shapes routed to the shard path: [limitations.md](limitations.md).
+- How the plugin is put together, including the planner design: [architecture.md](architecture.md).
 - The plugin's design and the invariants it upholds live in the RFC: [opensearch-project/OpenSearch#22643](https://github.com/opensearch-project/OpenSearch/issues/22643).
 - Known unfinished work is tracked as issues in this repository.
