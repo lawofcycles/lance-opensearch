@@ -79,27 +79,31 @@ public class LanceHitShapeIT extends LanceRestTestCase {
     /**
      * The nested bool query of depth {@code depth} the Substrait filter
      * test runs, and the rows of the twelve row multi fragment fixture
-     * it selects: level {@code i} wraps the tree so far in a
-     * {@code filter} with {@code id <= 11 - i / 3} when {@code i % 3 == 0},
+     * it selects. Level {@code i} wraps the tree so far: in a
+     * {@code filter} with {@code id <= 11 - i / 4} when {@code i % 4 == 0},
      * in a {@code should} with a {@code prefix} on {@code title}
-     * ({@code "cloudy"}, the odd rows) when {@code i % 3 == 1}, and in a
+     * ({@code "cloudy"}, the odd rows) when {@code i % 4 == 1}, in a
      * {@code filter} with a {@code must_not} on {@code body}
-     * ({@code "hello lance " + i}, one even row) when {@code i % 3 == 2}.
-     * The tree crosses three columns and alternates conjunctions,
-     * disjunctions and negations, the shape whose SQL and Substrait
-     * spellings differ most.
+     * ({@code "hello lance " + i}, one even row) when {@code i % 4 == 2},
+     * and in a {@code should} with {@code id >= 10} when {@code i % 4 == 3}.
+     * The tree crosses three columns and alternates conjunctions and
+     * disjunctions level by level (two conjunctions in a row would nest
+     * an AND inside an AND, which the translator does not flatten below
+     * the root), the shape whose SQL and Substrait spellings differ
+     * most.
      */
     private static String deepBoolQuery(int depth) {
         String tree = "{\"range\":{\"id\":{\"gte\":1}}}";
         for (int level = 0; level < depth; level++) {
-            switch (level % 3) {
-                case 0 -> tree = "{\"bool\":{\"filter\":[" + tree + ",{\"range\":{\"id\":{\"lte\":" + (11 - level / 3) + "}}}]}}";
+            switch (level % 4) {
+                case 0 -> tree = "{\"bool\":{\"filter\":[" + tree + ",{\"range\":{\"id\":{\"lte\":" + (11 - level / 4) + "}}}]}}";
                 case 1 -> tree = "{\"bool\":{\"should\":[" + tree + ",{\"prefix\":{\"title\":\"cloudy\"}}]}}";
-                default -> tree = "{\"bool\":{\"filter\":["
+                case 2 -> tree = "{\"bool\":{\"filter\":["
                     + tree
                     + "],\"must_not\":[{\"wildcard\":{\"body\":\"hello lance "
                     + level
                     + "\"}}]}}";
+                default -> tree = "{\"bool\":{\"should\":[" + tree + ",{\"range\":{\"id\":{\"gte\":10}}}]}}";
             }
         }
         return tree;
@@ -111,10 +115,11 @@ public class LanceHitShapeIT extends LanceRestTestCase {
         for (int id = 0; id < 12; id++) {
             boolean matches = id >= 1;
             for (int level = 0; level < depth; level++) {
-                switch (level % 3) {
-                    case 0 -> matches = matches && id <= 11 - level / 3;
+                switch (level % 4) {
+                    case 0 -> matches = matches && id <= 11 - level / 4;
                     case 1 -> matches = matches || id % 2 == 1;
-                    default -> matches = matches && !(id % 2 == 0 && id == level);
+                    case 2 -> matches = matches && !(id % 2 == 0 && id == level);
+                    default -> matches = matches || id >= 10;
                 }
             }
             if (matches) {
