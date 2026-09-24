@@ -1268,7 +1268,6 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"script\":{\"script\":{\"source\":\"doc['id'].value % 2 == 0\"}}}}}",
                 "\"size\":0,\"aggs\":{\"w\":{\"weighted_avg\":{\"value\":{\"field\":\"rating\"},\"weight\":{\"field\":\"id\"}}}}",
                 "\"size\":0,\"aggs\":{\"m\":{\"median_absolute_deviation\":{\"field\":\"rating\"}}}",
-                "\"size\":0,\"aggs\":{\"v\":{\"variable_width_histogram\":{\"field\":\"rating\",\"buckets\":3}}}",
                 "\"size\":0,\"aggs\":{\"a\":{\"adjacency_matrix\":{\"filters\":{\"x\":{\"term\":{\"flag\":true}},\"y\":{\"term\":{\"category\":\"c0\"}}}}}}",
                 "\"size\":2,\"query\":{\"term\":{\"category\":\"c1\"}},\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"category\"},{\"field\":\"flag\"}]}}}" };
             long before = fragmentRequestsExecuted();
@@ -1292,6 +1291,31 @@ public class LanceAggregationIT extends LanceRestTestCase {
             assertEquals(480, ((Number) aggregation(matrix, "ms").get("doc_count")).intValue());
             Map<String, Object> scripted = parse(readAll(postJson("/" + index + "/_search", "{" + shapes[7] + "}")));
             assertEquals(600, ((Number) aggregation(scripted, "sm").get("value")).intValue());
+
+            // variable_width_histogram clusters the values it sees in
+            // collection order, so its bucket bounds are approximate on
+            // both paths and need not agree bucket for bucket; the three
+            // clusters cover the 480 rated rows and span the rating range
+            // in order on the fragment path.
+            String variableWidth = "{\"size\":0,\"aggs\":{\"v\":{\"variable_width_histogram\":{\"field\":\"rating\",\"buckets\":3}}}}";
+            long beforeClustering = fragmentRequestsExecuted();
+            Map<String, Object> clustered = parse(readAll(postJson("/" + index + "/_search", variableWidth)));
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> clusters = (List<Map<String, Object>>) aggregation(clustered, "v").get("buckets");
+            assertEquals(3, clusters.size());
+            int clusteredRows = 0;
+            double previousMax = Double.NEGATIVE_INFINITY;
+            for (Map<String, Object> cluster : clusters) {
+                clusteredRows += ((Number) cluster.get("doc_count")).intValue();
+                double min = ((Number) cluster.get("min")).doubleValue();
+                double max = ((Number) cluster.get("max")).doubleValue();
+                assertTrue(clusters.toString(), min > previousMax && max >= min);
+                previousMax = max;
+            }
+            assertEquals(480, clusteredRows);
+            assertEquals(0.0d, ((Number) clusters.get(0).get("min")).doubleValue(), 0d);
+            assertEquals(999.0d, ((Number) clusters.get(2).get("max")).doubleValue(), 0d);
+            assertEquals("the fragment path served it", beforeClustering + 1, fragmentRequestsExecuted());
         } finally {
             putTransientSetting("lance.fragment_path.slices", null);
         }
