@@ -7,10 +7,8 @@ package org.opensearch.lance.plan.substrait;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
@@ -21,7 +19,6 @@ import io.substrait.expression.Expression;
 import io.substrait.expression.ExpressionCreator;
 import io.substrait.expression.FieldReference;
 import io.substrait.expression.FunctionArg;
-import io.substrait.extension.SimpleExtension;
 import io.substrait.isthmus.CallConverter;
 import io.substrait.isthmus.TypeConverter;
 import io.substrait.isthmus.expression.CallConverters;
@@ -189,7 +186,7 @@ public final class LanceSubstraitProducer {
             ByteBuffer view = mainPlan.asReadOnlyBuffer();
             byte[] bytes = new byte[view.remaining()];
             view.get(bytes);
-            Plan plan = new ProtoPlanConverter(Extensions.COLLECTION).from(io.substrait.proto.Plan.parseFrom(bytes));
+            Plan plan = new ProtoPlanConverter(LanceSubstraitExtensions.COLLECTION).from(io.substrait.proto.Plan.parseFrom(bytes));
             if (plan.getRoots().size() != 1) {
                 return Optional.empty();
             }
@@ -481,7 +478,7 @@ public final class LanceSubstraitProducer {
 
     private static io.substrait.relation.Aggregate.Measure measure(String function, Type outputType, Expression... arguments) {
         AggregateFunctionInvocation invocation = ExpressionCreator.aggregateFunction(
-            Extensions.aggregate(function),
+            LanceSubstraitExtensions.aggregate(function),
             outputType,
             Expression.AggregationPhase.INITIAL_TO_RESULT,
             List.of(),
@@ -505,9 +502,9 @@ public final class LanceSubstraitProducer {
         List<CallConverter> converters = new ArrayList<>();
         converters.add(new LanceCallConverter());
         converters.addAll(CallConverters.defaults(TypeConverter.DEFAULT));
-        converters.add(new ScalarFunctionConverter(Extensions.COLLECTION.scalarFunctions(), typeFactory));
+        converters.add(new ScalarFunctionConverter(LanceSubstraitExtensions.COLLECTION.scalarFunctions(), typeFactory));
         converters.add(CallConverters.CREATE_SEARCH_CONV.apply(new RexBuilder(typeFactory)));
-        WindowFunctionConverter windows = new WindowFunctionConverter(Extensions.COLLECTION.windowFunctions(), typeFactory);
+        WindowFunctionConverter windows = new WindowFunctionConverter(LanceSubstraitExtensions.COLLECTION.windowFunctions(), typeFactory);
         return new RexExpressionConverter(null, converters, windows, TypeConverter.DEFAULT);
     }
 
@@ -725,7 +722,7 @@ public final class LanceSubstraitProducer {
     }
 
     private static Expression scalar(String function, Type outputType, Expression... arguments) {
-        return ExpressionCreator.scalarFunction(Extensions.scalar(function), outputType, arguments);
+        return ExpressionCreator.scalarFunction(LanceSubstraitExtensions.scalar(function), outputType, arguments);
     }
 
     private static Expression cast(Type type, Expression input) {
@@ -820,94 +817,5 @@ public final class LanceSubstraitProducer {
             return true;
         }
         return false;
-    }
-
-    // ---------------------------------------------------------------
-    // Extension declarations
-    // ---------------------------------------------------------------
-
-    /**
-     * The function declarations the producer emits references to. The
-     * standard catalog carries everything except {@code date_trunc}
-     * (DataFusion's datetime UDF, not a Substrait standard function)
-     * and {@code is_true}, which a small inline extension supplies.
-     * Lance's consumer reads only the name before the signature colon
-     * and ignores the extension URIs, so the first variant of a name
-     * is as good as any.
-     */
-    private static final class Extensions {
-
-        private static final String LANCE_FUNCTIONS = """
-            %YAML 1.2
-            ---
-            scalar_functions:
-              - name: "date_trunc"
-                description: >-
-                  DataFusion's date_trunc: the first instant of the calendar
-                  unit that contains the timestamp, as a timestamp of the
-                  same unit.
-                impls:
-                  - args:
-                      - name: unit
-                        value: string
-                      - name: value
-                        value: timestamp
-                    return: timestamp
-                  - args:
-                      - name: unit
-                        value: string
-                      - name: value
-                        value: timestamp_tz
-                    return: timestamp_tz
-              - name: "is_true"
-                description: >-
-                  True when the argument is true, false when it is false or
-                  null; the two valued collapse a must_not clause needs.
-                impls:
-                  - args:
-                      - name: value
-                        value: boolean?
-                    return: boolean
-            """;
-
-        static final SimpleExtension.ExtensionCollection COLLECTION = SimpleExtension.loadDefaults()
-            .merge(SimpleExtension.load("extension:org.opensearch.lance:functions_lance", LANCE_FUNCTIONS));
-
-        private static final Map<String, SimpleExtension.ScalarFunctionVariant> SCALARS = indexScalars();
-        private static final Map<String, SimpleExtension.AggregateFunctionVariant> AGGREGATES = indexAggregates();
-
-        private static Map<String, SimpleExtension.ScalarFunctionVariant> indexScalars() {
-            Map<String, SimpleExtension.ScalarFunctionVariant> byName = new LinkedHashMap<>();
-            for (SimpleExtension.ScalarFunctionVariant variant : COLLECTION.scalarFunctions()) {
-                byName.putIfAbsent(variant.name(), variant);
-            }
-            return byName;
-        }
-
-        private static Map<String, SimpleExtension.AggregateFunctionVariant> indexAggregates() {
-            Map<String, SimpleExtension.AggregateFunctionVariant> byName = new LinkedHashMap<>();
-            for (SimpleExtension.AggregateFunctionVariant variant : COLLECTION.aggregateFunctions()) {
-                byName.putIfAbsent(variant.name(), variant);
-            }
-            return byName;
-        }
-
-        static SimpleExtension.ScalarFunctionVariant scalar(String name) {
-            SimpleExtension.ScalarFunctionVariant variant = SCALARS.get(name);
-            if (variant == null) {
-                throw new IllegalArgumentException("no declaration for scalar function " + name);
-            }
-            return variant;
-        }
-
-        static SimpleExtension.AggregateFunctionVariant aggregate(String name) {
-            SimpleExtension.AggregateFunctionVariant variant = AGGREGATES.get(name);
-            if (variant == null) {
-                throw new IllegalArgumentException("no declaration for aggregate function " + name);
-            }
-            return variant;
-        }
-
-        private Extensions() {}
     }
 }
