@@ -7,13 +7,7 @@ package org.opensearch.lance.dispatch;
 
 import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
 
-import org.apache.arrow.vector.types.pojo.ArrowType;
-import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.FieldType;
-import org.apache.arrow.vector.types.pojo.Schema;
-import org.apache.calcite.rel.RelNode;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
@@ -38,13 +32,7 @@ import org.opensearch.index.query.DisMaxQueryBuilder;
 import org.opensearch.index.query.NestedQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.LancePlugin;
-import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.engine.LanceEngineFactory;
-import org.opensearch.lance.plan.calcite.LancePlannerFactory;
-import org.opensearch.lance.plan.calcite.LanceSchemas;
-import org.opensearch.lance.plan.execute.PlanExecutor;
-import org.opensearch.lance.plan.rel.physical.ShardPathFallbackExec;
-import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
@@ -58,19 +46,15 @@ import org.opensearch.transport.client.Client;
  *
  * <p>The filter owns three responsibilities:
  * <ul>
- *   <li>Recognise whether the request is fragment-dispatchable
- *       ({@link #allLanceBacked} plus {@link #isDispatchable}). The
- *       shape decision is planned: {@link SearchRequestToRel#translateDispatch}
- *       marks a body holding an element the fragment executor cannot
- *       answer correctly — suggester, highlighter — and the planner
- *       answers such a body with a {@link ShardPathFallbackExec}
- *       root, which routes the request to the shard path. The
- *       aggregation tree plays no part in the decision: every
- *       aggregation type goes to the fragment path, where the
- *       coordinator's translator either pushes it into the Lance
- *       scan, leaves it to the Lucene aggregators over the fragment
- *       leaves, or refuses it with 400 naming the builder
- *       ({@code AggregationToRel.checkExecutable}).</li>
+ *   <li>Recognise whether every target is Lance backed
+ *       ({@link #allLanceBacked}). Nothing about the request body
+ *       takes part in that decision: the coordinator plans every body
+ *       over a Lance backed target, and a body no plan answers
+ *       ({@code suggest}, {@code highlight}) is refused there with 400
+ *       naming the element
+ *       ({@code SearchRequestToRel.checkEnvelopeSupported}), as an
+ *       aggregation the executors cannot run is refused by the
+ *       coordinator's translator ({@code AggregationToRel.checkExecutable}).</li>
  *   <li>Delegate the request to {@link LanceCoordinatorAction} via
  *       {@link Client#execute(org.opensearch.action.ActionType,
  *       org.opensearch.action.ActionRequest, ActionListener)} on the
@@ -81,16 +65,15 @@ import org.opensearch.transport.client.Client;
  *       one local hop. When the pool refuses the request, the
  *       request fails with the pool's rejection (HTTP 429).</li>
  *   <li>Fall through to the standard shard fan-out via
- *       {@code chain.proceed} for anything else (a target that is not
- *       Lance backed, alone or next to Lance backed ones, and a body
- *       holding a suggester or a highlighter). The shard path still
- *       exists as a
- *       safety net for shapes the fragment executor has not yet
- *       taken over; it is never used because of load. A Lance-backed
- *       target whose table has more rows than one Lucene reader may
- *       hold is not handed to it (the shard reader holds part of the
- *       table); such a request fails with 400 instead
- *       ({@link #proceedOnShardPath}).</li>
+ *       {@code chain.proceed} when a target is not Lance backed,
+ *       alone or next to Lance backed ones. That is the only request
+ *       over a Lance backed index the stock search action still
+ *       serves; a Lance backed target alone never leaves the
+ *       fragment path, whatever its body. Until every request shape
+ *       ran on the fragment executors, a body they did not serve
+ *       (a suggester, a highlighter, aggregation types off an allow
+ *       list) proceeded here onto the stock action over the shard's
+ *       whole table reader; that fallback route is gone.</li>
  * </ul>
  *
  * <p>The heavy lifting — opening the Lance dataset, enumerating
@@ -110,21 +93,6 @@ public class LanceDispatchActionFilter implements ActionFilter {
     private final IndexNameExpressionResolver indexNameExpressionResolver;
     private final Client client;
     private final ThreadPool threadPool;
-    private final PlanExecutor planExecutor;
-
-    /**
-     * The planner model the dispatch decision plans against. The
-     * decision depends only on the request body's envelope, never on
-     * the target's schema, so one synthetic single-column model serves
-     * every request and no Lance dataset is opened on the transport
-     * thread this filter runs on.
-     */
-    private static final LanceSchemas.IndexModel DISPATCH_MODEL = LanceSchemas.model(
-        "dispatch",
-        new Schema(List.of(new Field("id", FieldType.nullable(new ArrowType.Int(64, true)), null))),
-        Map.of(),
-        () -> 0L
-    );
 
     public LanceDispatchActionFilter(
         ClusterService clusterService,
@@ -136,11 +104,6 @@ public class LanceDispatchActionFilter implements ActionFilter {
         this.indexNameExpressionResolver = indexNameExpressionResolver;
         this.client = client;
         this.threadPool = threadPool;
-        long nativeBudgetBytes = NativeMemoryLimit.parse(
-            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.get(clusterService.getSettings()),
-            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.getKey()
-        );
-        this.planExecutor = new PlanExecutor(new LancePlannerFactory(nativeBudgetBytes, Runtime.getRuntime().maxMemory()));
     }
 
     @Override
@@ -189,16 +152,6 @@ public class LanceDispatchActionFilter implements ActionFilter {
             return;
         }
 
-        RelNode dispatchPlan = planDispatch(searchRequest);
-        if (!isDispatchable(dispatchPlan)) {
-            // The planner answered the body with a shard path fallback:
-            // it carries an element (suggest, highlighter) the fragment
-            // executor does not serve. Fall through so the standard
-            // path can still answer.
-            planExecutor.executeShardPath(dispatchPlan, () -> proceedOnShardPath(task, action, request, listener, chain, concrete));
-            return;
-        }
-
         // Delegate to the coordinator transport action. It has
         // TransportService injected and can fan out fragment
         // queries to every data node. In single-node clusters
@@ -221,9 +174,10 @@ public class LanceDispatchActionFilter implements ActionFilter {
         //
         // A rejected fork fails the request with the pool's
         // OpenSearchRejectedExecutionException (HTTP 429). It is not
-        // retried on the shard path: that would run the whole table
-        // through one node's shard under the very load that made the
-        // fragment path refuse, and hide the overload from the client.
+        // retried on the stock search action: that would run the whole
+        // table through one node's shard under the very load that made
+        // the fragment path refuse, and hide the overload from the
+        // client.
         //
         // The coordinator's task is registered as a child of this
         // search task: cancelling the search task (a client that
@@ -336,84 +290,6 @@ public class LanceDispatchActionFilter implements ActionFilter {
     }
 
     /**
-     * Hand a request over Lance-backed indexes whose shape the fragment
-     * path does not serve to the shard path, unless a target table has
-     * more rows than one Lucene reader may hold. The shard engine's
-     * reader of such a table holds the leading fragments that fit
-     * ({@link org.opensearch.lance.engine.LanceDirectoryReader}), so the
-     * shard path would answer from part of the table without saying so;
-     * the request fails with 400 instead, naming the rows the table has
-     * and the rows the shard reader holds.
-     *
-     * <p>Deciding that means reading each table's manifest, which is
-     * Lance I/O and does not belong on the transport thread this filter
-     * runs on, so the check and the {@code chain.proceed} it may end in
-     * run on the {@code lance_coordinator} pool, the pool the fragment
-     * path's entry runs on. The pool preserves the thread context, so
-     * the shard path sees the caller's headers as it would from here.
-     * A refused fork fails the request with the pool's rejection (HTTP
-     * 429), as for the fragment path.
-     */
-    private <Request extends ActionRequest, Response extends ActionResponse> void proceedOnShardPath(
-        Task task,
-        String action,
-        Request request,
-        ActionListener<Response> listener,
-        ActionFilterChain<Request, Response> chain,
-        Index[] concrete
-    ) {
-        AbstractRunnable check = new AbstractRunnable() {
-            @Override
-            protected void doRun() {
-                long maxDocs = clusterService.getClusterSettings().get(LancePlugin.MAX_DOCS_PER_READER_SETTING);
-                Metadata metadata = clusterService.state().metadata();
-                for (Index index : concrete) {
-                    IndexMetadata indexMetadata = metadata.index(index);
-                    if (indexMetadata == null) {
-                        continue;
-                    }
-                    TransportLanceCoordinatorAction.ReaderBound bound = TransportLanceCoordinatorAction.readerBound(indexMetadata, maxDocs);
-                    if (bound.exceeded()) {
-                        throw new IllegalArgumentException(
-                            "table of index ["
-                                + index.getName()
-                                + "] has "
-                                + bound.tableRows()
-                                + " rows, above the Lucene bound of "
-                                + maxDocs
-                                + " rows per reader; this request shape is served by the shard path and would see only "
-                                + bound.readerRows()
-                                + " rows. Use a shape the fragment path serves (see docs/limitations.md)"
-                        );
-                    }
-                }
-                chain.proceed(task, action, request, listener);
-            }
-
-            @Override
-            public void onRejection(Exception e) {
-                LOGGER.warn("shard path entry rejected for {}; returning 429: {}", Arrays.toString(concrete), e.getMessage());
-                listener.onFailure(e);
-            }
-
-            @Override
-            public void onFailure(Exception e) {
-                listener.onFailure(e);
-            }
-
-            @Override
-            public String toString() {
-                return "lance dispatch shard path entry for " + Arrays.toString(concrete);
-            }
-        };
-        try {
-            threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL).execute(check);
-        } catch (Exception e) {
-            listener.onFailure(e);
-        }
-    }
-
-    /**
      * True when every concrete index is Lance-backed, judged by the
      * presence of {@link LanceEngineFactory#TABLE_SETTING} on the
      * index metadata. That setting is stamped by
@@ -434,44 +310,5 @@ public class LanceDispatchActionFilter implements ActionFilter {
             }
         }
         return true;
-    }
-
-    /**
-     * Plan the request's dispatch decision. The body translates
-     * through {@link SearchRequestToRel#translateDispatch}, which marks
-     * a body holding an element only the shard path serves with the
-     * shard path shape node, and the Volcano run lowers that shape to
-     * the {@link ShardPathFallbackExec} operator carrying the fallback
-     * reasons; a body without such an element plans to the Lance scan.
-     * Planning is pure computation over the already-parsed body — no
-     * Lance dataset is opened and no I/O runs — so it is safe on the
-     * transport thread this filter runs on.
-     *
-     * <p>Accepted shapes (fragment path answers end-to-end) include
-     * any top-level query the local {@link
-     * org.opensearch.index.query.QueryShardContext} can translate
-     * (match on {@code lance_text}, knn on {@code lance_knn}, term /
-     * terms / range / exists / bool combinations, ...): the receiving
-     * node ships the {@link QueryBuilder} across the wire and
-     * re-parses it via {@code QueryShardContext.toQuery}, so the
-     * dispatch decision never depends on the planner spelling the
-     * query itself; sort clauses; and every aggregation tree (the
-     * coordinator's translator decides per tree between the pushed
-     * scan, the Lucene aggregators and a 400). The rejected
-     * elements and their rationale live on
-     * {@link org.opensearch.lance.plan.rel.ShardPathReason}.
-     */
-    private RelNode planDispatch(SearchRequest searchRequest) {
-        LancePlannerFactory plannerFactory = planExecutor.plannerFactory();
-        return plannerFactory.plan(SearchRequestToRel.translateDispatch(searchRequest.source(), DISPATCH_MODEL, plannerFactory));
-    }
-
-    /**
-     * Whether the fragment executor can answer the planned request: a
-     * {@link ShardPathFallbackExec} root is the planner's decision
-     * that only the standard shard search path serves it.
-     */
-    private static boolean isDispatchable(RelNode dispatchPlan) {
-        return !(dispatchPlan instanceof ShardPathFallbackExec);
     }
 }

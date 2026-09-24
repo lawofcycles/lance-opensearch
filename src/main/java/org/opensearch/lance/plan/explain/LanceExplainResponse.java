@@ -15,7 +15,6 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.WireVersion;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
-import org.opensearch.lance.plan.rel.ShardPathReason;
 import org.opensearch.lance.plan.traits.Accuracy;
 import org.opensearch.lance.plan.traits.PlanRequirement;
 import org.opensearch.lance.plan.traits.TieStability;
@@ -32,17 +31,18 @@ import java.util.Objects;
  * Response for {@link LanceExplainAction}: what the coordinator would
  * do with the search body against the index.
  *
- * <p>{@code route} says which path answers the request: {@code fragment}
+ * <p>{@code route} says what happens to the request: {@code fragment}
  * when the coordinator fans the request out to the data nodes, or
- * {@code shard_path} when the body holds an element only OpenSearch's
- * regular shard search serves, in which case {@code reasons} lists the
- * {@link ShardPathReason}s. {@code logical} is the tree the translator
- * built and {@code physical} the tree the planner chose, each one node
- * per line as {@code PlanText} renders them, every physical operator
- * carrying its {@link Accuracy}, its {@link TieStability} and its cost;
- * on the fragment route the physical tree is the coordinator's
- * {@code MergeExec(FanOutExec(per node plan))}, on the shard path the
- * {@code ShardPathFallbackExec} root. The text is for humans.
+ * {@code unsupported} when the body carries an element no plan answers
+ * ({@code suggest}, {@code highlight}), in which case {@code unplanned}
+ * carries the message the search endpoint refuses the same body with
+ * (400) and nothing else is planned or rendered. On the fragment route
+ * {@code logical} is the tree the translator built and {@code physical}
+ * the tree the planner chose, each one node per line as
+ * {@code PlanText} renders them, every physical operator carrying its
+ * {@link Accuracy}, its {@link TieStability} and its cost; the physical
+ * tree is the coordinator's {@code MergeExec(FanOutExec(per node plan))}.
+ * The text is for humans.
  *
  * <p>On the fragment route, {@code fragment_plan} is the
  * {@link FragmentPlan} the coordinator ships with every per node
@@ -80,12 +80,12 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
     /** The wire format's version, the first field written and the first read. */
     public static final int WIRE_VERSION = 1;
 
-    /** Which path answers the request. */
+    /** What happens to the request. */
     public enum Route {
         /** The coordinator fans the request out to the data nodes. */
         FRAGMENT,
-        /** OpenSearch's regular shard search answers the request. */
-        SHARD_PATH;
+        /** No plan answers the body; the search endpoint refuses it with 400. */
+        UNSUPPORTED;
 
         /** The JSON value: the constant name in lower case. */
         public String jsonName() {
@@ -178,7 +178,6 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
 
     private final String index;
     private final Route route;
-    private final List<ShardPathReason> reasons;
     private final String logical;
     private final String physical;
     private final FragmentPlan fragmentPlan;
@@ -205,13 +204,12 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         return new LanceExplainResponse(
             index,
             Route.FRAGMENT,
-            List.of(),
-            logical,
-            physical,
+            Objects.requireNonNull(logical, "logical"),
+            Objects.requireNonNull(physical, "physical"),
             Objects.requireNonNull(fragmentPlan, "fragmentPlan"),
             unplanned,
             refinementsPossible,
-            traits
+            Objects.requireNonNull(traits, "traits")
         );
     }
 
@@ -227,34 +225,36 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         return new LanceExplainResponse(
             index,
             Route.FRAGMENT,
-            List.of(),
-            logical,
-            physical,
+            Objects.requireNonNull(logical, "logical"),
+            Objects.requireNonNull(physical, "physical"),
             null,
             Objects.requireNonNull(planFailed, "planFailed"),
             List.of(),
-            traits
+            Objects.requireNonNull(traits, "traits")
         );
     }
 
-    /** A shard path answer: {@code reasons} must not be empty. */
-    public static LanceExplainResponse shardPath(
-        String index,
-        List<ShardPathReason> reasons,
-        String logical,
-        String physical,
-        Traits traits
-    ) {
-        if (reasons.isEmpty()) {
-            throw new IllegalArgumentException("a shard path route needs at least one reason");
-        }
-        return new LanceExplainResponse(index, Route.SHARD_PATH, reasons, logical, physical, null, null, List.of(), traits);
+    /**
+     * An unsupported route answer: nothing was planned, and
+     * {@code unplanned} carries the message the search endpoint refuses
+     * the body with. No trees, no fragment plan, no traits.
+     */
+    public static LanceExplainResponse unsupported(String index, String unplanned) {
+        return new LanceExplainResponse(
+            index,
+            Route.UNSUPPORTED,
+            null,
+            null,
+            null,
+            Objects.requireNonNull(unplanned, "unplanned"),
+            List.of(),
+            null
+        );
     }
 
     private LanceExplainResponse(
         String index,
         Route route,
-        List<ShardPathReason> reasons,
         String logical,
         String physical,
         FragmentPlan fragmentPlan,
@@ -264,13 +264,12 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
     ) {
         this.index = Objects.requireNonNull(index, "index");
         this.route = Objects.requireNonNull(route, "route");
-        this.reasons = List.copyOf(reasons);
-        this.logical = Objects.requireNonNull(logical, "logical");
-        this.physical = Objects.requireNonNull(physical, "physical");
+        this.logical = logical;
+        this.physical = physical;
         this.fragmentPlan = fragmentPlan;
         this.unplanned = unplanned;
         this.refinementsPossible = inReasonOrder(refinementsPossible);
-        this.traits = Objects.requireNonNull(traits, "traits");
+        this.traits = traits;
     }
 
     /** {@code reasons} sorted in {@link FragmentPlanRefiner.Reason} order, so the array reads the same for every caller. */
@@ -285,13 +284,12 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         WireVersion.read(in, "LanceExplainResponse", WIRE_VERSION);
         this.index = in.readString();
         this.route = in.readEnum(Route.class);
-        this.reasons = in.readList(input -> input.readEnum(ShardPathReason.class));
-        this.logical = in.readString();
-        this.physical = in.readString();
+        this.logical = in.readOptionalString();
+        this.physical = in.readOptionalString();
         this.fragmentPlan = in.readOptionalWriteable(FragmentPlan::new);
         this.unplanned = in.readOptionalString();
         this.refinementsPossible = inReasonOrder(in.readList(input -> input.readEnum(FragmentPlanRefiner.Reason.class)));
-        this.traits = Traits.read(in);
+        this.traits = in.readBoolean() ? Traits.read(in) : null;
     }
 
     @Override
@@ -299,13 +297,15 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         WireVersion.write(out, WIRE_VERSION);
         out.writeString(index);
         out.writeEnum(route);
-        out.writeCollection(reasons, StreamOutput::writeEnum);
-        out.writeString(logical);
-        out.writeString(physical);
+        out.writeOptionalString(logical);
+        out.writeOptionalString(physical);
         out.writeOptionalWriteable(fragmentPlan);
         out.writeOptionalString(unplanned);
         out.writeCollection(refinementsPossible, StreamOutput::writeEnum);
-        traits.writeTo(out);
+        out.writeBoolean(traits != null);
+        if (traits != null) {
+            traits.writeTo(out);
+        }
     }
 
     public String index() {
@@ -316,35 +316,36 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         return route;
     }
 
-    /** The shard path reasons; empty on the fragment route. */
-    public List<ShardPathReason> reasons() {
-        return reasons;
-    }
-
+    /** The logical tree the translator built; null on the unsupported route. */
     public String logical() {
         return logical;
     }
 
+    /** The physical tree the planner chose; null on the unsupported route. */
     public String physical() {
         return physical;
     }
 
-    /** The plan the coordinator ships; null on the shard path route and when the plan failed. */
+    /** The plan the coordinator ships; null on the unsupported route and when the plan failed. */
     public FragmentPlan fragmentPlan() {
         return fragmentPlan;
     }
 
-    /** The element the translator refused, or the {@code plan_failed} message, or null. */
+    /**
+     * The element the translator refused, the {@code plan_failed}
+     * message, or the refusal message on the unsupported route; null
+     * when everything translated.
+     */
     public String unplanned() {
         return unplanned;
     }
 
-    /** The predicted node local downgrades in reason order; empty when none applies or on the shard path route. */
+    /** The predicted node local downgrades in reason order; empty when none applies or on the unsupported route. */
     public List<FragmentPlanRefiner.Reason> refinementsPossible() {
         return refinementsPossible;
     }
 
-    /** The trait side of the plan. */
+    /** The trait side of the plan; null on the unsupported route, where nothing was planned. */
     public Traits traits() {
         return traits;
     }
@@ -354,15 +355,12 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         builder.startObject();
         builder.field("index", index);
         builder.field("route", route.jsonName());
-        if (route == Route.SHARD_PATH) {
-            builder.startArray("reasons");
-            for (ShardPathReason reason : reasons) {
-                builder.value(reason.name());
-            }
-            builder.endArray();
+        if (logical != null) {
+            builder.field("logical", logical);
         }
-        builder.field("logical", logical);
-        builder.field("physical", physical);
+        if (physical != null) {
+            builder.field("physical", physical);
+        }
         if (fragmentPlan != null) {
             builder.field("fragment_plan");
             fragmentPlan.toXContent(builder, params);
@@ -377,8 +375,10 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
             }
             builder.endArray();
         }
-        builder.field("traits");
-        traits.toXContent(builder);
+        if (traits != null) {
+            builder.field("traits");
+            traits.toXContent(builder);
+        }
         return builder.endObject();
     }
 
@@ -392,17 +392,16 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         }
         return index.equals(other.index)
             && route == other.route
-            && reasons.equals(other.reasons)
-            && logical.equals(other.logical)
-            && physical.equals(other.physical)
+            && Objects.equals(logical, other.logical)
+            && Objects.equals(physical, other.physical)
             && Objects.equals(fragmentPlan, other.fragmentPlan)
             && Objects.equals(unplanned, other.unplanned)
             && refinementsPossible.equals(other.refinementsPossible)
-            && traits.equals(other.traits);
+            && Objects.equals(traits, other.traits);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(index, route, reasons, logical, physical, fragmentPlan, unplanned, refinementsPossible, traits);
+        return Objects.hash(index, route, logical, physical, fragmentPlan, unplanned, refinementsPossible, traits);
     }
 }

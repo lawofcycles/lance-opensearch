@@ -29,8 +29,6 @@ import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.cost.CostInputs;
 import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.lance.plan.execute.RequestPlanner;
-import org.opensearch.lance.plan.rel.ShardPathReason;
-import org.opensearch.lance.plan.traits.TraitEnforcement;
 import org.opensearch.lance.plan.traits.UnmetPlanRequirementException;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
@@ -51,12 +49,13 @@ import java.util.List;
  * the same body executes. No Lance scan is issued and no request
  * executes through the planner.
  *
- * <p>The route comes first. A body holding an element only the shard
- * path serves ({@link SearchRequestToRel#shardPathReasons}) is planned
- * through {@link SearchRequestToRel#translateDispatch}, the same tree
- * the dispatch filter reads its routing decision from, and answers with
- * the {@code ShardPathFallbackExec} root and the reasons; nothing else
- * is planned for it. Every other body takes the fragment route: the
+ * <p>The route comes first. A body carrying an element no plan answers
+ * ({@link SearchRequestToRel#unsupportedElement}: {@code suggest},
+ * {@code highlight}) answers {@code route: unsupported} with the message
+ * the search endpoint refuses the same body with under
+ * {@code unplanned}; nothing else is planned for it, and the endpoint
+ * answers 200 because it reports rather than executes. Every other body
+ * takes the fragment route: the
  * query is rewritten with the shard free {@link QueryRewriteContext}
  * the coordinator applies ({@link RequestPlanner#rewriteAtCoordinator}),
  * the {@link ExecutionShape} is built the way
@@ -70,16 +69,18 @@ import java.util.List;
  * tree over a fan out of one request per data node; at execution the
  * width can differ when the table has fewer fragments than nodes or a
  * node's share exceeds the Lucene reader bound. The request accepts
- * every envelope the runtime accepts; the only refusal left is the one
+ * every envelope the runtime accepts; the refusals left are the ones
  * the runtime answers with the same 400, a filtered {@code lance_knn}
- * whose filter has no Lance SQL form. A request whose trait demand no
+ * whose filter has no Lance SQL form and an aggregation the executors
+ * cannot run. A request whose trait demand no
  * plan meets, which the runtime answers 400 with a {@code plan_failed}
  * message, is described rather than refused: the answer carries the
  * cheapest plan the demand refused as {@code physical}, the message
  * under {@code unplanned}, no {@code fragment_plan}, and the refusal
- * under {@code traits.enforcer}. The aggregation allow list of
- * the fragment path and the multi index checks the dispatch filter
- * applies outside the plan are not reflected here.
+ * under {@code traits.enforcer}. The multi index check the dispatch
+ * filter applies outside the plan (a target that is not Lance backed
+ * sends the whole request to the stock search action) is not reflected
+ * here.
  *
  * <p>Both plan texts come from {@code PlanText}: every physical
  * operator line carries the {@code Accuracy} and {@code TieStability}
@@ -152,23 +153,13 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
 
     private LanceExplainResponse explain(IndexMetadata metadata, SearchSourceBuilder source) throws IOException {
         String indexName = metadata.getIndex().getName();
+        String unsupported = SearchRequestToRel.unsupportedElement(source);
+        if (unsupported != null) {
+            return LanceExplainResponse.unsupported(indexName, unsupported);
+        }
         LanceSchemas.IndexModel model = LanceSchemas.build(metadata, warmCache);
         String tableUri = metadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
         CostInputs inputs = RequestPlanner.clusterInputs(dataNodes(), tableUri, clusterService.getClusterSettings());
-
-        List<ShardPathReason> reasons = SearchRequestToRel.shardPathReasons(source);
-        if (!reasons.isEmpty()) {
-            RelNode logical = SearchRequestToRel.translateDispatch(source, model, plannerFactory);
-            String logicalText = RelOptUtil.toString(logical);
-            RelNode physical = plannerFactory.plan(logical, inputs);
-            return LanceExplainResponse.shardPath(
-                indexName,
-                reasons,
-                logicalText,
-                PlanText.render(physical),
-                LanceExplainResponse.Traits.of(TraitEnforcement.NONE, physical.getTraitSet())
-            );
-        }
 
         LanceOverrides overrides = LanceOverrides.of(metadata.getSettings());
         QueryBuilder query = RequestPlanner.rewriteAtCoordinator(

@@ -21,7 +21,6 @@ import org.apache.logging.log4j.Logger;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.lucene.search.TotalHits;
 import org.lance.Dataset;
-import org.lance.Fragment;
 import org.opensearch.action.admin.cluster.node.tasks.cancel.CancelTasksRequest;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
@@ -49,7 +48,6 @@ import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.StorageOptions;
-import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
@@ -61,6 +59,7 @@ import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.lance.plan.execute.RequestPlanner;
 import org.opensearch.lance.plan.metadata.TableStatistics;
 import org.opensearch.lance.plan.metadata.TableStatisticsCache;
+import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
@@ -279,13 +278,17 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * fan-out per index. A request over several Lance-backed indexes
      * runs one fan-out per index sequentially; the {@link MergeReducer}
      * merges the hit pages across the indexes and reduces their
-     * aggregation trees together, as the shard path reduces the trees
+     * aggregation trees together, as the stock search path reduces the trees
      * of the shards of several indexes.
      */
     private void executeCoordinated(CancellableTask task, SearchRequest searchRequest, ActionListener<SearchResponse> listener)
         throws Exception {
         long start = System.currentTimeMillis();
         SearchSourceBuilder source = searchRequest.source();
+        // A body no plan answers (suggest, highlight) is refused before
+        // a target is resolved or a table opened; the explain endpoint
+        // reports the same message under route unsupported.
+        SearchRequestToRel.checkEnvelopeSupported(source);
         FanOutPolicy policy = new FanOutPolicy(task, resolveTimeout(source), resolveAllowPartialSearchResults(searchRequest));
 
         QueryBuilder query = rewriteAtCoordinator(source == null ? null : source.query(), start);
@@ -295,7 +298,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             ? null
             : source.searchAfter();
         if (searchAfter != null && sorts.isEmpty()) {
-            // The shard path's SearchAfterBuilder.buildFieldDoc refuses
+            // The stock search path's SearchAfterBuilder.buildFieldDoc refuses
             // a cursor without a sort with this message; a request whose
             // sort builds no Lucene sort (a lone descending _score) is
             // refused with the same message on the executor, where the
@@ -307,7 +310,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         int from = resolveFrom(source);
         // Each per-node executor needs from + size docs so the coordinator
         // has enough hits after skipping `from`. Deep pagination costs
-        // linear memory per node just like the shard path — no additional
+        // linear memory per node just like the stock search path — no additional
         // fragment-level penalty.
         int perNodeSize = from + size;
         int trackTotalHitsUpTo = resolveTrackTotalHitsUpTo(source);
@@ -319,7 +322,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         if (collapse != null) {
             // The two combinations SearchService.parseSource refuses
             // before any mapping is consulted, with its messages; the
-            // shard path reports them as a search exception (500), here
+            // stock search path reports them as a search exception (500), here
             // they are the client's error and answer 400. The rest of
             // the collapse checks need the mapping and run on the
             // executors.
@@ -448,7 +451,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * {@code timeout}, else the cluster's
      * {@code search.default_search_timeout}
      * ({@link SearchService#DEFAULT_SEARCH_TIMEOUT_SETTING}), else none
-     * ({@code null}). The same resolution order the shard path applies
+     * ({@code null}). The same resolution order the stock search path applies
      * to its query phase; the plugin adds no default of its own.
      */
     private TimeValue resolveTimeout(SearchSourceBuilder source) {
@@ -483,7 +486,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * {@link SearchSourceBuilder#trackTotalHitsUpTo()} uses. A request
      * that leaves the flag out counts up to
      * {@link SearchContext#DEFAULT_TRACK_TOTAL_HITS_UP_TO} (10,000),
-     * the same default the shard path applies; {@code true} maps to
+     * the same default the stock search path applies; {@code true} maps to
      * {@link SearchContext#TRACK_TOTAL_HITS_ACCURATE} and {@code false}
      * to {@link SearchContext#TRACK_TOTAL_HITS_DISABLED}.
      */
@@ -499,7 +502,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * {@code SearchService.parseSource} checks them: {@code stored_fields:
      * _none_} cannot be combined with a requested {@code _source} or with
      * {@code fields}, because both read the source the request just
-     * switched off. The shard path reports these two as a 500
+     * switched off. The stock search path reports these two as a 500
      * {@code search_exception}; here they are the client's error and
      * answer 400.
      */
@@ -664,7 +667,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             }
             // Empty table + aggregations requested: the coordinator
             // still needs an aggregations block in the response
-            // (matching shard path behaviour for an empty index).
+            // (matching stock search path behaviour for an empty index).
             // Send a single fan-out to the first data node with an
             // empty fragment set. The per-node executor opens a
             // LanceDirectoryReader with zero leaves, runs the
@@ -699,7 +702,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // of time (or whose executor was cancelled): under
         // allow_partial_search_results the request answers from the
         // other nodes and says so with timed_out: true, the contract
-        // of the shard path's timeout.
+        // of the stock search path's timeout.
         //
         // Dispatch goes through TransportService so remote data nodes
         // receive the requests. For the local node this still executes
@@ -948,45 +951,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             pinnedVersion = LanceRegistry.resolveTagVersion(tableUri, storageOptions, tag);
         }
         return pinnedVersion;
-    }
-
-    /**
-     * How much of the table behind a Lance-backed index one Lucene
-     * reader holds under {@code maxDocs}: the table's physical rows at
-     * the version the index reads, and the rows of the leading fragments
-     * that fit ({@link LanceDirectoryReader#leadingFragmentsWithinBound}),
-     * which is what the shard engine's reader serves. Opens the table
-     * (metadata only) and must not run on a transport thread.
-     */
-    static ReaderBound readerBound(IndexMetadata indexMetadata, long maxDocs) {
-        String tableUri = indexMetadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
-        StorageOptions storageOptions = StorageOptions.fromIndexSettings(indexMetadata.getSettings());
-        long pinnedVersion = resolvePinnedVersion(indexMetadata, tableUri, storageOptions);
-        Optional<Long> version = pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();
-        try (Dataset dataset = LanceRegistry.openDataset(tableUri, storageOptions, version)) {
-            List<Fragment> fragments = dataset.getFragments();
-            long[] rows = new long[fragments.size()];
-            for (int i = 0; i < rows.length; i++) {
-                rows[i] = fragments.get(i).metadata().getPhysicalRows();
-            }
-            int held = LanceDirectoryReader.leadingFragmentsWithinBound(rows, maxDocs);
-            long tableRows = 0L;
-            long readerRows = 0L;
-            for (int i = 0; i < rows.length; i++) {
-                tableRows += rows[i];
-                if (i < held) {
-                    readerRows += rows[i];
-                }
-            }
-            return new ReaderBound(tableRows, readerRows);
-        }
-    }
-
-    /** Physical rows of a table and the rows of it one shard reader holds. */
-    record ReaderBound(long tableRows, long readerRows) {
-        boolean exceeded() {
-            return readerRows < tableRows;
-        }
     }
 
     private SearchResponse emptyResponse(long took) {
