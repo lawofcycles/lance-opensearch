@@ -85,6 +85,7 @@ import org.opensearch.lance.query.LanceHintingWeight;
 import org.opensearch.lance.query.LanceHitsAccounting;
 import org.opensearch.lance.query.LanceInvalidInput;
 import org.opensearch.lance.query.LanceKnnQuery;
+import org.opensearch.lance.query.LanceScanFilter;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.aggregations.Aggregation;
@@ -148,8 +149,8 @@ import org.opensearch.transport.TransportService;
  * </ul>
  *
  * <p>The {@code matched} row count comes from Lance's metadata-only
- * path ({@link Fragment#countRows()} sums when no filter is set;
- * {@link Dataset#countRows(String)} otherwise). This keeps
+ * path ({@link Fragment#countRows()} sums when no filter is set; a
+ * native count of the filtered scan otherwise). This keeps
  * hits.total.value cheap; the aggregator does not need to be
  * consulted for it. Under {@code min_score} or {@code terminate_after}
  * the count is what the hits collection saw through those collectors
@@ -1040,7 +1041,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                             request.fragmentIdsOrNull() == null && effectiveFragmentIds.size() == snapshot.fragments().size()
                                 ? null
                                 : effectiveFragmentIds,
-                            effective.scalarFilterSql(),
+                            effective.scalarFilter(),
                             searcher,
                             countQuery,
                             hasSecurityWrapper,
@@ -1168,7 +1169,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             return fts.withScanLimit(LanceFtsQuery.SCAN_LIMIT_UNBOUNDED);
         }
         if (query instanceof LanceScanFilterQuery scan && scan.scanLimit() != LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED) {
-            return new LanceScanFilterQuery(scan.filterSql(), LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED);
+            return new LanceScanFilterQuery(scan.filter(), LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED);
         }
         return query;
     }
@@ -1192,13 +1193,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *       intersecting two full scans. A plain FTS clause takes the
      *       scan limit {@link #resolveScanFilterTopK} allows; a boosted
      *       one stays unbounded like the unplanned boosted path.</li>
-     *   <li>{@link FragmentPlan#filterSql()} — the planner spelled the
-     *       whole top-level query tree as Lance SQL (bool / term / terms
-     *       / range / exists / match_all over mapped columns). Wrapped
-     *       in {@link LanceScanFilterQuery} so one Lance native scan per
-     *       shard evaluates the predicate and yields the matching row
-     *       addresses, optionally clipped to {@code size} when the shape
-     *       allows. This beats the Lucene translation of the same tree
+     *   <li>{@link FragmentPlan#scalarFilter()} — the planner spelled the
+     *       whole top-level query tree for Lance (bool / term / terms
+     *       / range / exists / match_all over mapped columns), as Lance
+     *       SQL or as Substrait bytes, whichever it costed cheaper.
+     *       Wrapped in {@link LanceScanFilterQuery} so one Lance native
+     *       scan per shard evaluates the predicate and yields the
+     *       matching row addresses, optionally clipped to {@code size}
+     *       when the shape allows. This beats the Lucene translation of the same tree
      *       (PointRange / term queries that fall back to doc values on a
      *       reader without points), which has to load every referenced
      *       column through the doc value path before it can match a
@@ -1252,8 +1254,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 "the planned Lance clause [" + plan.lanceClause().getWriteableName() + "] built " + clause.getClass().getSimpleName()
             );
         }
-        if (plan.filterSql() != null) {
-            return new LanceScanFilterQuery(plan.filterSql(), scanLimit);
+        LanceScanFilter scalarFilter = plan.scalarFilter();
+        if (scalarFilter != null) {
+            return new LanceScanFilterQuery(scalarFilter, scanLimit);
         }
         if (request.query() != null) {
             // Rewrite before toQuery so that shapes which rely on
@@ -1324,8 +1327,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *
      * <p>{@code hits.total.value} is served by
      * {@link PlanExecutor#computeMatched}, which for the scalar-filter shape
-     * dispatches straight to {@link Dataset#countRows(String)} and
-     * therefore is not affected by the scan clip.
+     * runs its own count only scan of the filter and therefore is not
+     * affected by the scan clip.
      *
      * <p>Returns {@link LanceScanFilterQuery#SCAN_LIMIT_UNBOUNDED}
      * when top-k pushdown is not safe.

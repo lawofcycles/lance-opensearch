@@ -34,6 +34,7 @@ import org.opensearch.lance.plan.rel.physical.FanOutExec;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
 import org.opensearch.lance.query.ScanAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
+import org.opensearch.lance.query.LanceScanFilter;
 import org.opensearch.search.approximate.ApproximateScoreQuery;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
@@ -341,14 +342,15 @@ public final class PlanExecutor {
      * {@link LanceFragmentQueryRequest#trackTotalHitsUpTo()} asks.
      * Uses Lance's metadata-only counting whenever the query is a
      * pure filter shape the coordinator's plan spells as Lance SQL
-     * ({@code filterSql}, the plan's scalar filter; null for a scoring
-     * query, an absent query or {@code match_all}):
+     * ({@code filter}, the plan's scalar filter in the encoding the
+     * planner chose, SQL or Substrait bytes; null for a scoring query,
+     * an absent query or {@code match_all}):
      * <ul>
      *   <li>No filter: sum {@link Fragment#countRows()}
      *       across the assigned fragments (Lance metadata, no
      *       scan).</li>
-     *   <li>Filter set, no fragment list: use
-     *       {@link Dataset#countRows(String)}.</li>
+     *   <li>Filter set, no fragment list: a native count of the
+     *       filtered scan over the whole table.</li>
      *   <li>Filter set, fragment list: {@link #countScalarFilter},
      *       which asks Lance to count the matches of the listed
      *       fragments natively when the request wants an accurate
@@ -376,7 +378,7 @@ public final class PlanExecutor {
      *
      * <p>For every other scoring shape (knn, a bool mixing FTS with
      * other scoring clauses, post_filter over any query) the
-     * coordinator leaves filterSql null and only ships the
+     * coordinator leaves the filter null and only ships the
      * {@link QueryBuilder}. We cannot express those in Lance SQL, so
      * we ask Lucene through
      * {@link org.apache.lucene.search.IndexSearcher#count(Query)}
@@ -407,7 +409,7 @@ public final class PlanExecutor {
         Dataset dataset,
         LanceFragmentQueryRequest request,
         List<Integer> fragmentIds,
-        String filterSql,
+        LanceScanFilter filter,
         ContextIndexSearcher searcher,
         Query luceneQuery,
         boolean hasSecurityWrapper,
@@ -467,7 +469,7 @@ public final class PlanExecutor {
             }
             return MatchedCount.exact(countThroughLiveDocs(searcher, luceneQuery));
         }
-        boolean hasScoringQuery = request.query() != null && filterSql == null;
+        boolean hasScoringQuery = request.query() != null && filter == null;
         boolean hasPostFilter = request.postFilter() != null;
         if (hasScoringQuery && !hasPostFilter && luceneQuery instanceof LanceFtsQuery fts) {
             // Pure FTS shape (no post_filter, no other scoring
@@ -510,7 +512,7 @@ public final class PlanExecutor {
             // shard-level nearest scan the Weight already cached.
             return MatchedCount.exact(searcher.count(luceneQuery));
         }
-        if (filterSql == null) {
+        if (filter == null) {
             if (fragmentIds == null) {
                 return MatchedCount.exact(dataset.countRows());
             }
@@ -529,7 +531,7 @@ public final class PlanExecutor {
         ScanAdmission.admitExecutorFilterScan(
             dataset.uri(),
             dataset,
-            filterSql,
+            filter.sql(),
             ScanAdmission.fragmentRows(dataset, fragmentIds),
             0L,
             ScanAdmission.ROW_ADDRESS_BYTES,
@@ -538,9 +540,15 @@ public final class PlanExecutor {
         ScanAdmission.scanStarted();
         try {
             if (fragmentIds == null) {
-                return MatchedCount.exact(dataset.countRows(filterSql));
+                // The whole table: Lance's native count of the filtered
+                // scan, the same call Dataset.countRows(sql) makes, over
+                // whichever encoding the filter carries.
+                cancellation.checkCancelled();
+                try (LanceScanner scanner = dataset.newScan(countOnlyScan(filter, null).build())) {
+                    return MatchedCount.exact(scanner.countRows());
+                }
             }
-            return countScalarFilter(dataset, filterSql, fragmentIds, upTo, cancellation);
+            return countScalarFilter(dataset, filter, fragmentIds, upTo, cancellation);
         } finally {
             ScanAdmission.scanFinished();
         }
@@ -598,23 +606,24 @@ public final class PlanExecutor {
      * count from a batch loop that happens to return the same number.
      */
     public static MatchedCount countScalarFilter(Dataset dataset, String filterSql, List<Integer> fragmentIds, int upTo) throws Exception {
-        return countScalarFilter(dataset, filterSql, fragmentIds, upTo, LanceCancellation.NONE);
+        return countScalarFilter(dataset, LanceScanFilter.sql(filterSql), fragmentIds, upTo, LanceCancellation.NONE);
     }
 
     /**
-     * {@link #countScalarFilter(Dataset, String, List, int)} whose bounded
-     * scan stops once {@code cancellation} reports a cancelled task. The
-     * native count of an exact request runs inside Lance in one call and
-     * has no batch boundary to stop at.
+     * {@link #countScalarFilter(Dataset, String, List, int)} over the
+     * filter in whichever encoding it carries, whose bounded scan stops
+     * once {@code cancellation} reports a cancelled task. The native
+     * count of an exact request runs inside Lance in one call and has
+     * no batch boundary to stop at.
      */
     public static MatchedCount countScalarFilter(
         Dataset dataset,
-        String filterSql,
+        LanceScanFilter filter,
         List<Integer> fragmentIds,
         int upTo,
         LanceCancellation cancellation
     ) throws Exception {
-        ScanOptions.Builder builder = countOnlyScan(filterSql, fragmentIds);
+        ScanOptions.Builder builder = countOnlyScan(filter, fragmentIds);
         if (upTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
             cancellation.checkCancelled();
             try (LanceScanner scanner = dataset.newScan(builder.build())) {
@@ -643,14 +652,15 @@ public final class PlanExecutor {
 
     /**
      * Scan options for a count-only scalar filter scan over
-     * {@code fragmentIds}: no columns, no row address, no row id.
+     * {@code fragmentIds} (every fragment when null): no columns, no row
+     * address, no row id.
      */
-    private static ScanOptions.Builder countOnlyScan(String filterSql, List<Integer> fragmentIds) {
-        return new ScanOptions.Builder().filter(filterSql)
-            .fragmentIds(fragmentIds)
-            .columns(Collections.emptyList())
-            .withRowAddress(false)
-            .withRowId(false);
+    private static ScanOptions.Builder countOnlyScan(LanceScanFilter filter, List<Integer> fragmentIds) {
+        ScanOptions.Builder builder = filter.apply(new ScanOptions.Builder());
+        if (fragmentIds != null) {
+            builder = builder.fragmentIds(fragmentIds);
+        }
+        return builder.columns(Collections.emptyList()).withRowAddress(false).withRowId(false);
     }
 
     /**

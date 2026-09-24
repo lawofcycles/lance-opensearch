@@ -32,10 +32,11 @@ import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 
 /**
- * Lucene {@link org.apache.lucene.search.Query} that expresses a Lance SQL
- * filter as a Lucene scorer. The Weight runs one Lance native scan per
- * shard against the fragment ids of every Lance-backed leaf under the
- * searcher, with the SQL filter applied, buckets the returned row
+ * Lucene {@link org.apache.lucene.search.Query} that expresses a Lance
+ * scalar filter (a {@link LanceScanFilter}: Lance SQL or Substrait bytes,
+ * whichever the planner chose) as a Lucene scorer. The Weight runs one
+ * Lance native scan per shard against the fragment ids of every
+ * Lance-backed leaf under the searcher, with the filter applied, buckets the returned row
  * addresses by fragment, and exposes each fragment's matching offsets as
  * doc ids through a {@link BitSetIterator}. Every returned doc is scored
  * 1.0f (no BM25, no ranking); this class is a bit-mask carrier for use as
@@ -51,17 +52,17 @@ import org.opensearch.lance.engine.LanceFragmentLeafReader;
  *
  * <p>Not {@link org.opensearch.core.common.io.stream.Writeable}: Lucene
  * {@code Query} objects live per-node during a single search cycle and never
- * cross the transport boundary. The coordinator ships {@code filterSql} as a
- * plain string in {@link org.opensearch.lance.dispatch.LanceFragmentQueryRequest};
- * each data node instantiates its own {@code LanceScanFilterQuery} from that
- * string.
+ * cross the transport boundary. The coordinator ships the filter's SQL and
+ * Substrait bytes inside the plan of
+ * {@link org.opensearch.lance.dispatch.LanceFragmentQueryRequest}; each data
+ * node instantiates its own {@code LanceScanFilterQuery} from them.
  */
 public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
 
     /** Sentinel that disables top-k pushdown; the scan is bounded only by fragment maxDoc. */
     public static final int SCAN_LIMIT_UNBOUNDED = 0;
 
-    private final String filterSql;
+    private final LanceScanFilter filter;
     /**
      * Upper bound on rows the shard-level Lance scan is allowed to return.
      * {@link #SCAN_LIMIT_UNBOUNDED} lets the scan return every match.
@@ -93,18 +94,31 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
     }
 
     public LanceScanFilterQuery(String filterSql, int scanLimit) {
-        this.filterSql = Objects.requireNonNull(filterSql, "filterSql must not be null");
-        if (filterSql.isEmpty()) {
-            throw new IllegalArgumentException("filterSql must not be empty; use MatchAllDocsQuery for the null-filter case");
-        }
+        this(LanceScanFilter.sql(Objects.requireNonNull(filterSql, "filterSql must not be null")), scanLimit);
+    }
+
+    /** The query over {@code filter} in whichever encoding it carries, clipped to {@code scanLimit} rows. */
+    public LanceScanFilterQuery(LanceScanFilter filter, int scanLimit) {
+        this.filter = Objects.requireNonNull(filter, "filter must not be null; use MatchAllDocsQuery for the null-filter case");
         if (scanLimit < 0) {
             throw new IllegalArgumentException("scanLimit must not be negative, was " + scanLimit);
         }
         this.scanLimit = scanLimit;
     }
 
+    /** The filter the scan evaluates. */
+    public LanceScanFilter filter() {
+        return filter;
+    }
+
+    /**
+     * The Lance SQL of the filter: what the scan evaluates for a SQL
+     * filter, the companion spelling of a Substrait filter (for the
+     * admission estimate, which reads column names out of the SQL), or
+     * null for a Substrait filter without one.
+     */
     public String filterSql() {
-        return filterSql;
+        return filter.sql();
     }
 
     public int scanLimit() {
@@ -113,19 +127,17 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
 
     @Override
     public String toString(String field) {
-        return "LanceScanFilterQuery{filter=" + filterSql + ", scanLimit=" + scanLimit + "}";
+        return "LanceScanFilterQuery{filter=" + filter + ", scanLimit=" + scanLimit + "}";
     }
 
     @Override
     public boolean equals(Object o) {
-        return sameClassAs(o)
-            && filterSql.equals(((LanceScanFilterQuery) o).filterSql)
-            && scanLimit == ((LanceScanFilterQuery) o).scanLimit;
+        return sameClassAs(o) && filter.equals(((LanceScanFilterQuery) o).filter) && scanLimit == ((LanceScanFilterQuery) o).scanLimit;
     }
 
     @Override
     public int hashCode() {
-        return classHash() ^ filterSql.hashCode() ^ Integer.hashCode(scanLimit);
+        return classHash() ^ filter.hashCode() ^ Integer.hashCode(scanLimit);
     }
 
     @Override
@@ -274,8 +286,8 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
                 accounting.breakerRoomBytes(),
                 accounting
             );
-            ScanOptions.Builder builder = new ScanOptions.Builder().fragmentIds(fragmentIds)
-                .filter(query().filterSql())
+            ScanOptions.Builder builder = query().filter()
+                .apply(new ScanOptions.Builder().fragmentIds(fragmentIds))
                 .columns(Collections.emptyList())
                 .withRowAddress(true);
             if (scanLimit != SCAN_LIMIT_UNBOUNDED) {
