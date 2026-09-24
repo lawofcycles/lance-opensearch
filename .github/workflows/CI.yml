@@ -11,9 +11,19 @@ concurrency:
 
 jobs:
   build:
-    name: build
+    # One lane per OpenSearch version. The release lane (3.8.0, the
+    # version the plugin declares) is the required check; the two snapshot
+    # lanes build against the next minors so an API drift shows up here
+    # before the release ships, and continue-on-error keeps them from
+    # blocking a pull request.
+    name: build (${{ matrix.opensearch }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        opensearch: ['3.8.0', '3.9.0-SNAPSHOT', '3.10.0-SNAPSHOT']
+    continue-on-error: ${{ endsWith(matrix.opensearch, '-SNAPSHOT') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,13 +35,13 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Build, precommit, unit, integTest, multiNodeIntegTest
-        run: ./gradlew --no-daemon --console=plain build
+        run: ./gradlew --no-daemon --console=plain build -Dopensearch.version=${{ matrix.opensearch }}
 
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results
+          name: test-results-${{ matrix.opensearch }}
           path: |
             build/test-results/**/TEST-*.xml
             build/testclusters/*/logs/*.log
