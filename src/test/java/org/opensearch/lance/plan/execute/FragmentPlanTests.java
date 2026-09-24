@@ -113,7 +113,7 @@ public class FragmentPlanTests extends OpenSearchTestCase {
             try (StreamInput in = out.bytes().streamInput()) {
                 IOException refused = expectThrows(IOException.class, () -> new FragmentPlan(in));
                 assertEquals(
-                    "FragmentPlan wire version [2] does not match this node's [1]: every node must run the same plugin version",
+                    "FragmentPlan wire version [3] does not match this node's [2]: every node must run the same plugin version",
                     refused.getMessage()
                 );
             }

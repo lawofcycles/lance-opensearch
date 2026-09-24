@@ -160,6 +160,26 @@ public class TableStatisticsCollectorTests extends OpenSearchTestCase {
         }
     }
 
+    public void testReadZoneMapsReadsTheNamedZoneMappedColumnsOnly() {
+        TableStatistics statistics = collect();
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            // rating carries a BTree, not a zone map; naming it reads nothing.
+            statistics.readZoneMaps(dataset, Set.of("rating", "body"));
+            assertEquals(Optional.empty(), statistics.column("id").get().zoneMapIfRead());
+            assertEquals(Optional.empty(), statistics.column("rating").get().zoneMapIfRead());
+            // An empty field set reads nothing either.
+            statistics.readZoneMaps(dataset, Set.of());
+            assertEquals(Optional.empty(), statistics.column("id").get().zoneMapIfRead());
+            // A dotted path below the column names it.
+            statistics.readZoneMaps(dataset, Set.of("id.raw"));
+            assertEquals(4, statistics.column("id").get().zoneMapIfRead().orElseThrow().size());
+        }
+        assertTrue(TableStatistics.namesColumn(Set.of("meta.region"), "meta"));
+        assertTrue(TableStatistics.namesColumn(Set.of("meta.region"), "meta.region"));
+        assertFalse(TableStatistics.namesColumn(Set.of("metadata"), "meta"));
+        assertFalse(TableStatistics.namesColumn(Set.of("meta"), "meta.region"));
+    }
+
     public void testDeletedAndUnindexedRowsAfterDeleteAndPartialIndex() throws Exception {
         // A fresh three fragment table: an inverted index over body
         // covers every fragment, a BTree over rating is built for the

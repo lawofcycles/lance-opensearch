@@ -84,6 +84,17 @@ public final class ColumnStatistics {
         this.indexes = List.copyOf(indexes);
     }
 
+    /**
+     * Statistics whose zone map is already known, so no dataset read is
+     * needed: {@link #zoneMap(Dataset)} and {@link #zoneMapIfRead()}
+     * answer {@code zoneMap} from the start. For callers that hold the
+     * zones themselves (tests, fixtures).
+     */
+    public ColumnStatistics(String column, List<IndexSummary> indexes, List<ZoneStats> zoneMap) {
+        this(column, indexes);
+        this.zoneMap = List.copyOf(zoneMap);
+    }
+
     /** Column name. */
     public String column() {
         return column;
