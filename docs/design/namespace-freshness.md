@@ -70,6 +70,17 @@ reason. `POST /{index}/_lance/sync` runs the freshness check of one index on the
 shard and answers whether the version moved, the served and the target version, and whether the
 mapping changed.
 
+The runtime cost of the freshness service follows from the shard lifecycle. Each tracked index
+has one scheduled task on the generic thread pool at `lance.namespace.poll_cadence`, and each
+task opens the latest manifest of the table through the node-scoped `LanceRegistry.SESSION`. A
+node holding N Lance backed shards therefore runs N tasks per cycle, and the object store reads
+grow linearly with the number of Lance backed shards on the node. The freshness check and the
+search coordinator open the same table URI from different pools (generic for freshness,
+`lance_coordinator` for search). They share the node-scoped `Session`, so the index cache and the
+metadata cache are one per node, and they share the Arrow allocator; the `Dataset` handles
+themselves are independent, and each is closed by the code that opened it, on the pool that
+opened it.
+
 ## Direction
 
 The next step follows from the mapping being a derived cache: the request path already has the
