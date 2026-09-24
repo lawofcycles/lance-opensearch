@@ -30,6 +30,7 @@ import org.opensearch.lance.plan.cost.CostInputs;
 import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.lance.plan.execute.RequestPlanner;
 import org.opensearch.lance.plan.traits.UnmetPlanRequirementException;
+import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -156,16 +157,18 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
         if (unsupported != null) {
             return LanceExplainResponse.unsupported(indexName, unsupported);
         }
-        LanceSchemas.IndexModel model = LanceSchemas.build(metadata, warmCache);
-        String tableUri = metadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
-        CostInputs inputs = RequestPlanner.clusterInputs(dataNodes(), tableUri, clusterService.getClusterSettings());
-
         LanceOverrides overrides = LanceOverrides.of(metadata.getSettings());
         QueryBuilder query = RequestPlanner.rewriteAtCoordinator(
             indicesService,
             source == null ? null : source.query(),
             System.currentTimeMillis()
         );
+        // The model reads the zone maps of the query's columns while it
+        // holds the table, so the plan below prunes the same fragments
+        // the coordinator's plan for this body would.
+        LanceSchemas.IndexModel model = LanceSchemas.build(metadata, warmCache, QueryToRex.referencedFields(query));
+        String tableUri = metadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+        CostInputs inputs = RequestPlanner.clusterInputs(dataNodes(), tableUri, clusterService.getClusterSettings());
         ExecutionShape shape = ExecutionShape.of(source, query);
         RequestPlanner.Planned planned;
         try {

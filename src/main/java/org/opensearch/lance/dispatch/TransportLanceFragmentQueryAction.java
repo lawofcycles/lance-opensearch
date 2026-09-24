@@ -474,9 +474,25 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 allFragmentIds.add(fragment.id());
             }
             int fragmentCount = request.fragmentIds().isEmpty() ? allFragmentIds.size() : request.fragmentIds().size();
-            List<Integer> effectiveFragmentIds = (request.fragmentIdsOrNull() == null || request.fragmentIdsOrNull().isEmpty())
+            List<Integer> requestedFragmentIds = (request.fragmentIdsOrNull() == null || request.fragmentIdsOrNull().isEmpty())
                 ? allFragmentIds
                 : request.fragmentIdsOrNull();
+            // The fragments the coordinator's zone map pruning proved
+            // empty of matching rows leave every scan of this request.
+            // An empty remainder is a legitimate scan of nothing: the
+            // reader opens with zero leaves and the aggregators, the
+            // collector and the counts answer as over an empty table.
+            List<Integer> effectiveFragmentIds = request.plan().retainedFragments(requestedFragmentIds);
+            int pruned = requestedFragmentIds.size() - effectiveFragmentIds.size();
+            if (pruned > 0) {
+                FragmentPlanRefiner.recordPruned(pruned);
+                LOGGER.debug(
+                    "lance.plan: index [{}] zone map pruning skips {} of {} fragments on this node",
+                    request.indexName(),
+                    pruned,
+                    requestedFragmentIds.size()
+                );
+            }
 
             // The executor needs an IndexService for the mapping, the
             // QueryShardContext, the bitset cache and the reader
@@ -1017,6 +1033,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         matched = PlanExecutor.computeMatched(
                             dataset,
                             request,
+                            // The Lance side counts read the fragments
+                            // left after pruning: the executor's list, or
+                            // the whole table when the request named no
+                            // fragments and pruning removed none.
+                            request.fragmentIdsOrNull() == null && effectiveFragmentIds.size() == snapshot.fragments().size()
+                                ? null
+                                : effectiveFragmentIds,
                             effective.scalarFilterSql(),
                             searcher,
                             countQuery,

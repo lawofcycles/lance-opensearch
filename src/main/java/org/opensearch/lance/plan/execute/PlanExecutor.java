@@ -397,10 +397,16 @@ public final class PlanExecutor {
      * ({@link #countThroughLiveDocs}), so the count matches the hits,
      * and {@code _count} (which takes this same path) agrees with
      * {@code _search}.
+     *
+     * @param fragmentIds the fragments the Lance side counts read, or
+     *     null for the whole table; the executor's fragments after the
+     *     plan's exclusions, which is what the reader behind
+     *     {@code searcher} covers
      */
     public static MatchedCount computeMatched(
         Dataset dataset,
         LanceFragmentQueryRequest request,
+        List<Integer> fragmentIds,
         String filterSql,
         ContextIndexSearcher searcher,
         Query luceneQuery,
@@ -461,7 +467,6 @@ public final class PlanExecutor {
             }
             return MatchedCount.exact(countThroughLiveDocs(searcher, luceneQuery));
         }
-        List<Integer> fragmentIds = request.fragmentIdsOrNull();
         boolean hasScoringQuery = request.query() != null && filterSql == null;
         boolean hasPostFilter = request.postFilter() != null;
         if (hasScoringQuery && !hasPostFilter && luceneQuery instanceof LanceFtsQuery fts) {

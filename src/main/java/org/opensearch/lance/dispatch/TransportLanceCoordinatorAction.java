@@ -59,6 +59,7 @@ import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.lance.plan.execute.RequestPlanner;
 import org.opensearch.lance.plan.metadata.TableStatistics;
 import org.opensearch.lance.plan.metadata.TableStatisticsCache;
+import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
 import org.opensearch.script.ScriptService;
@@ -626,6 +627,18 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 // correctness: the model falls back to the physical
                 // row count rather than failing the search.
                 LOGGER.warn("lance.dispatch: table statistics of [{}] unavailable, planning without them", target.indexName(), e);
+            }
+            if (statistics != null) {
+                // The zone maps of the columns the query names, read
+                // while the dataset is open so the planner can exclude
+                // the fragments the predicate cannot match. Memoised
+                // inside the statistics entry, so this reads once per
+                // column per manifest version.
+                try {
+                    statistics.readZoneMaps(dataset, QueryToRex.referencedFields(baseSpec.executionShape().query()));
+                } catch (RuntimeException e) {
+                    LOGGER.warn("lance.dispatch: zone maps of [{}] unavailable, planning without pruning", target.indexName(), e);
+                }
             }
         }
         final long totalRows = tableRows;
