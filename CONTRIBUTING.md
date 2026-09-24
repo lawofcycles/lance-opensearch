@@ -11,7 +11,7 @@ OpenSearch Lance is a community project that is built and maintained by people j
 - [Changelog](#changelog)
 - [Pull Request Template](#pull-request-template)
 - [Review Process](#review-process)
-- [Backports](#backports)
+- [Security Issues](#security-issues)
 
 
 ## First Things First
@@ -132,7 +132,7 @@ New files in your code contributions should contain the following license header
 
 ## Changelog
 
-This repository keeps a version specific changelog in [CHANGELOG.md](CHANGELOG.md), following the [Keep A Changelog](https://keepachangelog.com/en/1.0.0/) format. The purpose of the changelog is for the contributors and maintainers to incrementally build the release notes throughout the development process to avoid a painful and error-prone process of attempting to compile the release notes at release time. On each release the unreleased entries are assembled into a new release block of `CHANGELOG.md` and copied into the release notes document under [`release-notes/`](release-notes/).
+This repository keeps a version specific changelog in [CHANGELOG.md](CHANGELOG.md), following the [Keep A Changelog](https://keepachangelog.com/en/1.0.0/) format. The purpose of the changelog is for the contributors to incrementally build the release notes throughout the development process to avoid a painful and error-prone process of attempting to compile the release notes at release time. On each release the unreleased entries are assembled into a new release block of `CHANGELOG.md`.
 
 ### Which changes require a changelog entry?
 
@@ -158,11 +158,11 @@ Do **not** edit `CHANGELOG.md` directly. Every pull request records its entry as
 2. Write one or more markdown list items in the file in the style of the existing `CHANGELOG.md` entries: what changed, why, and what a user observes. Put the issue reference at the end of the item as `(#N)`.
 3. Commit the fragment together with your change.
 
-A pull request that does not add a fragment fails the `changelog` workflow. If the contributor and maintainers agree that no changelog entry is required, apply the `skip-changelog` label to the pull request, or put a line reading only `skip-changelog` in its description, and the workflow passes.
+A pull request that does not add a fragment fails the `changelog` workflow. If no changelog entry is required, apply the `skip-changelog` label to the pull request, or put a line reading only `skip-changelog` in its description, and the workflow passes.
 
 ## Pull Request Template
 
-The pull request description follows [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md). Fill every section: the issue the pull request closes, what changes and why, the files outside the issue's scope, the hot files touched, what you verified (the commands you ran and their results, with numbers) and what you could not verify. The template also carries the organization's check list; tick the items that apply.
+The pull request description follows [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md). Fill every section: the issue the pull request closes, what changes and why, the files outside the issue's scope, the hot files touched, what you verified (the commands you ran and their results, with numbers) and what you could not verify. The template ends with a check list; tick the items that apply.
 
 ## Review Process
 
@@ -170,10 +170,10 @@ We deeply appreciate everyone who takes the time to make a contribution. We will
 
 During the PR process, expect that there will be some back-and-forth. Please try to respond to comments in a timely fashion, and if you don't wish to continue with the PR, let us know. If a PR takes too many iterations for its complexity or size, we may reject it. Additionally, if you stop responding we may close the PR as abandoned. In either case, if you feel this was done in error, please add a comment on the PR.
 
-If we accept the PR, we will merge your change and usually take care of backporting it to appropriate branches ourselves.
+If we accept the PR, we will merge your change into `main`. Every change goes to `main`; there are no release branches yet.
 
 If we reject the PR, we will close the pull request with a comment explaining why. This decision isn't always final: if you feel we have misunderstood your intended change or otherwise think that we should reconsider then please continue the conversation with a comment on the PR and we'll do our best to address any further points you raise.
 
-## Backports
+## Security Issues
 
-This repository has not yet been submitted to the opensearch-project organization and has no release branches; every change goes to `main` and there is nothing to backport. Once release branches exist, the organization's backport workflow will create backport pull requests automatically for merged pull requests that carry a `backport <branch>` label, and this section will describe it. See [RELEASING.md](RELEASING.md) for the steps that enable it.
+If you find a potential security issue in this plugin, open a [GitHub issue](https://github.com/lawofcycles/lance-opensearch/issues/new/choose) describing it.
