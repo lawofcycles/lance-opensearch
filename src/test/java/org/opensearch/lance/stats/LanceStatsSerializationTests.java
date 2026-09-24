@@ -5,7 +5,6 @@
 
 package org.opensearch.lance.stats;
 
-import java.io.IOException;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -19,6 +18,7 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.tasks.TaskId;
@@ -30,6 +30,7 @@ import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.NativeMemoryLimit.IndexCacheSizing;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.WireVersionTestSupport;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.query.ScanAdmission;
@@ -251,27 +252,68 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         assertNull(restored.validate());
     }
 
-    public void testNodeStatsStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws Exception {
+    public void testNodeStatsStreamOpensWithTheWireVersionAndCarriesThePrunedCounterAsABlock() throws Exception {
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             sample().writeTo(out);
             try (StreamInput in = out.bytes().streamInput()) {
                 assertEquals(LanceNodeStats.WIRE_VERSION, in.readVInt());
             }
         }
+        // The stream a version 3 data node would return: today's fields
+        // and one optional block this coordinator steps over.
+        BytesReference newer = WireVersionTestSupport.asNextVersion(
+            sample(),
+            WireVersionTestSupport.NO_PRELUDE,
+            false,
+            o -> o.writeVLong(77L)
+        );
+        try (StreamInput in = newer.streamInput()) {
+            LanceNodeStats restored = new LanceNodeStats(in);
+            assertEquals(9L, restored.planPrunedFragments());
+            assertEquals(sample().freshness(), restored.freshness());
+            assertEquals("the reader consumed the block", -1, in.read());
+        }
+    }
+
+    public void testMixedPluginVersionAVersion1CoordinatorReadsTodaysStatsWithoutThePrunedCounter() throws Exception {
         try (BytesStreamOutput out = new BytesStreamOutput()) {
-            out.writeVInt(LanceNodeStats.WIRE_VERSION + 1);
-            out.writeBoolean(true);
+            sample().writeTo(out);
             try (StreamInput in = out.bytes().streamInput()) {
-                IOException refused = expectThrows(IOException.class, () -> new LanceNodeStats(in));
-                assertEquals(
-                    "LanceNodeStats wire version [3] does not match this node's [2]: every node must run the same plugin version",
-                    refused.getMessage()
-                );
+                LanceNodeStats asVersion1 = LanceNodeStats.read(in, 1);
+                assertEquals("the counter the older coordinator does not know falls back to zero", 0L, asVersion1.planPrunedFragments());
+                assertEquals(sample().planExecuted(), asVersion1.planExecuted());
+                assertEquals(sample().freshness(), asVersion1.freshness());
+                assertEquals("the reader consumed the block", -1, in.read());
             }
         }
     }
 
-    public void testNodeRequestStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws Exception {
+    public void testMixedPluginVersionTodaysCoordinatorReadsAVersion1NodesStats() throws Exception {
+        // The stream a version 1 data node writes: today's fields without
+        // the pruned block, and no block at all.
+        BytesReference version1;
+        try (BytesStreamOutput out = new BytesStreamOutput(); BytesStreamOutput today = new BytesStreamOutput()) {
+            sample().writeTo(today);
+            try (StreamInput in = today.bytes().streamInput()) {
+                assertEquals(2, in.readVInt());
+                byte[] rest = in.readAllBytes();
+                // The block is the last thing written: flag, length and the counter.
+                int blockLength = 1 + 1 + 1;
+                out.writeVInt(1);
+                out.writeBytes(rest, 0, rest.length - blockLength);
+            }
+            version1 = out.bytes();
+        }
+        try (StreamInput in = version1.streamInput()) {
+            LanceNodeStats restored = new LanceNodeStats(in);
+            assertEquals(0L, restored.planPrunedFragments());
+            assertEquals(sample().planExecuted(), restored.planExecuted());
+            assertEquals(sample().freshness(), restored.freshness());
+            assertEquals(-1, in.read());
+        }
+    }
+
+    public void testNodeRequestStreamOpensWithTheWireVersionAndANewerOptionalBlockIsSteppedOver() throws Exception {
         // The per node request carries only the marker, after the parent
         // task id its TransportRequest base class writes.
         try (BytesStreamOutput out = new BytesStreamOutput()) {
@@ -282,16 +324,15 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals("nothing follows the marker", -1, in.read());
             }
         }
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            TaskId.EMPTY_TASK_ID.writeTo(out);
-            out.writeVInt(LanceStatsNodeRequest.WIRE_VERSION + 1);
-            try (StreamInput in = out.bytes().streamInput()) {
-                IOException refused = expectThrows(IOException.class, () -> new LanceStatsNodeRequest(in));
-                assertEquals(
-                    "LanceStatsNodeRequest wire version [2] does not match this node's [1]: every node must run the same plugin version",
-                    refused.getMessage()
-                );
-            }
+        BytesReference newer = WireVersionTestSupport.asNextVersion(
+            new LanceStatsNodeRequest(),
+            o -> TaskId.EMPTY_TASK_ID.writeTo(o),
+            false,
+            o -> o.writeBoolean(true)
+        );
+        try (StreamInput in = newer.streamInput()) {
+            new LanceStatsNodeRequest(in);
+            assertEquals("the reader consumed the block", -1, in.read());
         }
     }
 

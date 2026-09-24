@@ -13,14 +13,17 @@ import java.util.Optional;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.query.InnerHitBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.WireVersionTestSupport;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchModule;
@@ -449,7 +452,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         assertTrue(e.getMessage(), e.getMessage().contains("0 entries for 1 hits"));
     }
 
-    public void testRequestStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws Exception {
+    public void testRequestStreamOpensWithTheWireVersionAndANewerOptionalBlockIsSteppedOver() throws Exception {
         LanceFragmentQueryRequest original = LanceFragmentQueryRequest.allFragments(
             "/tmp/table.lance",
             "demo",
@@ -469,23 +472,36 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceFragmentQueryRequest.WIRE_VERSION, in.readVInt());
             }
         }
-        // A stream of another version is refused by name before the
-        // first field is read, and the message names both numbers.
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            TaskId.EMPTY_TASK_ID.writeTo(out);
-            out.writeVInt(LanceFragmentQueryRequest.WIRE_VERSION + 1);
-            out.writeString("/tmp/table.lance");
-            try (StreamInput in = out.bytes().streamInput()) {
-                IOException refused = expectThrows(IOException.class, () -> new LanceFragmentQueryRequest(in));
-                assertEquals(
-                    "LanceFragmentQueryRequest wire version [2] does not match this node's [1]: every node must run the same plugin version",
-                    refused.getMessage()
-                );
-            }
+        // The stream a version 2 coordinator would write: today's fields
+        // followed by one optional block this version does not know. The
+        // request is read whole and the block is stepped over.
+        Writeable prelude = o -> TaskId.EMPTY_TASK_ID.writeTo(o);
+        BytesReference optional = WireVersionTestSupport.asNextVersion(original, prelude, false, o -> o.writeString("a version 2 hint"));
+        try (StreamInput in = new NamedWriteableAwareStreamInput(optional.streamInput(), AGG_REGISTRY)) {
+            LanceFragmentQueryRequest restored = new LanceFragmentQueryRequest(in);
+            assertEquals(original.tableUri(), restored.tableUri());
+            assertEquals(original.plan(), restored.plan());
+            assertEquals("the reader consumed the block", -1, in.read());
+        }
+        // A critical block of a version this node does not know is
+        // refused by name, before the request is executed.
+        BytesReference critical = WireVersionTestSupport.asNextVersion(
+            original,
+            prelude,
+            true,
+            o -> o.writeString("a version 2 constraint")
+        );
+        try (StreamInput in = new NamedWriteableAwareStreamInput(critical.streamInput(), AGG_REGISTRY)) {
+            IOException refused = expectThrows(IOException.class, () -> new LanceFragmentQueryRequest(in));
+            assertEquals(
+                "LanceFragmentQueryRequest wire version [2] adds fields in version [2] that this node's [1] cannot ignore: "
+                    + "upgrade this node before sending it this message",
+                refused.getMessage()
+            );
         }
     }
 
-    public void testResponseStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws Exception {
+    public void testResponseStreamOpensWithTheWireVersionAndANewerOptionalBlockIsSteppedOver() throws Exception {
         LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(2L, false, 1, List.of(), new long[0], null);
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             original.writeTo(out);
@@ -493,16 +509,18 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceFragmentQueryResponse.WIRE_VERSION, in.readVInt());
             }
         }
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            out.writeVInt(LanceFragmentQueryResponse.WIRE_VERSION + 1);
-            out.writeVLong(2L);
-            try (StreamInput in = out.bytes().streamInput()) {
-                IOException refused = expectThrows(IOException.class, () -> new LanceFragmentQueryResponse(in));
-                assertEquals(
-                    "LanceFragmentQueryResponse wire version [2] does not match this node's [1]: every node must run the same plugin version",
-                    refused.getMessage()
-                );
-            }
+        // The stream a version 2 data node would write back to a version
+        // 1 coordinator: today's fields and one optional block.
+        BytesReference newer = WireVersionTestSupport.asNextVersion(
+            original,
+            WireVersionTestSupport.NO_PRELUDE,
+            false,
+            o -> o.writeVLong(11L)
+        );
+        try (StreamInput in = new NamedWriteableAwareStreamInput(newer.streamInput(), AGG_REGISTRY)) {
+            LanceFragmentQueryResponse restored = new LanceFragmentQueryResponse(in);
+            assertEquals(2L, restored.matched());
+            assertEquals("the reader consumed the block", -1, in.read());
         }
     }
 }

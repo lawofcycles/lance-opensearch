@@ -520,14 +520,15 @@ also checks the query predicate against the zone maps of the columns it names (`
 reading the zone maps the statistics entry memoised while the table was open) and lists the
 fragments no matching row can come from on the plan; each executor drops them from its fragment
 list before it opens a reader or a scan and counts them under `plan.pruned`. The per node plan is a wire format internal to the
-plugin: every node is assumed to run the same plugin version, the stream opens with a version
-marker a reader of another version refuses by name, nothing decodes an older marker, and a
-fragment request between nodes of different plugin versions fails, so a rolling upgrade is not
-supported for the fragment path. The same marker opens
+plugin: the stream opens with a version marker, the fields of version 1 follow inline and every
+later version appends a block an older reader steps over or, when the writer flagged it critical,
+refuses by name, so a cluster running the current and the previous plugin version keeps answering
+through a rolling upgrade. The same marker opens
 every other plugin internal message that crosses nodes (the fragment request and response around
 the plan, the per node stats and build messages, the sync, poll, namespace update and attach
-messages), each with a `WIRE_VERSION` of its own written and checked through `WireVersion`;
-[docs/query-plan.md](query-plan.md#wire-format) lists them and the bump policy.
+messages), each with a `WIRE_VERSION` of its own written and read through `WireVersion`;
+[docs/query-plan.md](query-plan.md#wire-format) lists them and
+[docs/design/wire-format-compat.md](design/wire-format-compat.md) holds the rules and the version history.
 
 The planner was delivered in phases, and the later ones are still in flight: first the
 foundations (dependencies, schema, conventions, cost, the explain endpoint), then the aggregation

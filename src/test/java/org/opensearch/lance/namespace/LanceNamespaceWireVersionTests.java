@@ -11,11 +11,14 @@ import java.util.Map;
 
 import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.WireVersion;
+import org.opensearch.lance.WireVersionTestSupport;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -23,10 +26,18 @@ import org.opensearch.test.OpenSearchTestCase;
  * nodes: the sync request and response the shard's node answers, and
  * the poll and update requests and responses the cluster manager
  * answers. Each opens with its {@code WIRE_VERSION} right after the
- * fields its OpenSearch base class writes, and refuses a stream of
- * another version by name.
+ * fields its OpenSearch base class writes, steps over an optional block
+ * of a version it does not know, and refuses a critical one by name.
  */
 public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
+
+    /** What a {@link ClusterManagerNodeRequest} writes before the marker: the parent task id and its own timeout. */
+    private static Writeable clusterManagerPrelude(ClusterManagerNodeRequest<?> request) {
+        return out -> {
+            TaskId.EMPTY_TASK_ID.writeTo(out);
+            out.writeTimeValue(request.clusterManagerNodeTimeout());
+        };
+    }
 
     public void testSyncRequest() throws Exception {
         LanceIndexSyncRequest original = new LanceIndexSyncRequest("demo");
@@ -43,13 +54,13 @@ public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
                 assertEquals("demo", new LanceIndexSyncRequest(in).index());
             }
         }
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
+        Writeable prelude = out -> {
             TaskId.EMPTY_TASK_ID.writeTo(out);
             out.writeOptionalWriteable(null);
             out.writeOptionalString("demo");
-            out.writeVInt(LanceIndexSyncRequest.WIRE_VERSION + 1);
-            assertRefused("LanceIndexSyncRequest", out, in -> new LanceIndexSyncRequest(in));
-        }
+        };
+        assertEquals("demo", ((LanceIndexSyncRequest) readNextVersion(original, prelude, LanceIndexSyncRequest::new)).index());
+        assertRefusesCritical("LanceIndexSyncRequest", original, prelude, LanceIndexSyncRequest::new);
     }
 
     public void testSyncResponse() throws Exception {
@@ -64,11 +75,9 @@ public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
                 assertEquals(outcome, new LanceIndexSyncResponse(in).outcome());
             }
         }
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            out.writeVInt(LanceIndexSyncResponse.WIRE_VERSION + 1);
-            out.writeString("demo");
-            assertRefused("LanceIndexSyncResponse", out, in -> new LanceIndexSyncResponse(in));
-        }
+        Writeable prelude = WireVersionTestSupport.NO_PRELUDE;
+        assertEquals(outcome, ((LanceIndexSyncResponse) readNextVersion(original, prelude, LanceIndexSyncResponse::new)).outcome());
+        assertRefusesCritical("LanceIndexSyncResponse", original, prelude, LanceIndexSyncResponse::new);
     }
 
     public void testPollRequest() throws Exception {
@@ -85,13 +94,9 @@ public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
                 assertEquals("catalog", new LanceNamespacePollRequest(in).name());
             }
         }
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            TaskId.EMPTY_TASK_ID.writeTo(out);
-            out.writeTimeValue(ClusterManagerNodeRequest.DEFAULT_CLUSTER_MANAGER_NODE_TIMEOUT);
-            out.writeVInt(LanceNamespacePollRequest.WIRE_VERSION + 1);
-            out.writeOptionalString("catalog");
-            assertRefused("LanceNamespacePollRequest", out, in -> new LanceNamespacePollRequest(in));
-        }
+        Writeable prelude = clusterManagerPrelude(original);
+        assertEquals("catalog", ((LanceNamespacePollRequest) readNextVersion(original, prelude, LanceNamespacePollRequest::new)).name());
+        assertRefusesCritical("LanceNamespacePollRequest", original, prelude, LanceNamespacePollRequest::new);
     }
 
     public void testPollResponse() throws Exception {
@@ -110,11 +115,9 @@ public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
                 assertEquals(report, new LanceNamespacePollResponse(in).report());
             }
         }
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            out.writeVInt(LanceNamespacePollResponse.WIRE_VERSION + 1);
-            out.writeStringCollection(List.of("demo"));
-            assertRefused("LanceNamespacePollResponse", out, in -> new LanceNamespacePollResponse(in));
-        }
+        Writeable prelude = WireVersionTestSupport.NO_PRELUDE;
+        assertEquals(report, ((LanceNamespacePollResponse) readNextVersion(original, prelude, LanceNamespacePollResponse::new)).report());
+        assertRefusesCritical("LanceNamespacePollResponse", original, prelude, LanceNamespacePollResponse::new);
     }
 
     public void testUpdateRequest() throws Exception {
@@ -132,13 +135,14 @@ public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
                 assertEquals("/data/root", restored.rootUri());
             }
         }
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            TaskId.EMPTY_TASK_ID.writeTo(out);
-            out.writeTimeValue(ClusterManagerNodeRequest.DEFAULT_CLUSTER_MANAGER_NODE_TIMEOUT);
-            out.writeVInt(LanceNamespaceUpdateRequest.WIRE_VERSION + 1);
-            out.writeVInt(LanceNamespaceUpdateRequest.Operation.REGISTER.ordinal());
-            assertRefused("LanceNamespaceUpdateRequest", out, in -> new LanceNamespaceUpdateRequest(in));
-        }
+        Writeable prelude = clusterManagerPrelude(original);
+        LanceNamespaceUpdateRequest restored = (LanceNamespaceUpdateRequest) readNextVersion(
+            original,
+            prelude,
+            LanceNamespaceUpdateRequest::new
+        );
+        assertEquals("/data/root", restored.rootUri());
+        assertRefusesCritical("LanceNamespaceUpdateRequest", original, prelude, LanceNamespaceUpdateRequest::new);
     }
 
     public void testUpdateResponse() throws Exception {
@@ -156,25 +160,41 @@ public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
                 assertFalse(restored.changed());
             }
         }
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            out.writeBoolean(true);
-            out.writeVInt(LanceNamespaceUpdateResponse.WIRE_VERSION + 1);
-            out.writeBoolean(false);
-            assertRefused("LanceNamespaceUpdateResponse", out, in -> new LanceNamespaceUpdateResponse(in));
-        }
+        Writeable prelude = out -> out.writeBoolean(true);
+        LanceNamespaceUpdateResponse restored = (LanceNamespaceUpdateResponse) readNextVersion(
+            original,
+            prelude,
+            LanceNamespaceUpdateResponse::new
+        );
+        assertTrue(restored.isAcknowledged());
+        assertFalse(restored.changed());
+        assertRefusesCritical("LanceNamespaceUpdateResponse", original, prelude, LanceNamespaceUpdateResponse::new);
     }
 
     private interface Reader {
         Object read(StreamInput in) throws IOException;
     }
 
-    /** Reads {@code out} with {@code reader} and asserts the refusal names {@code format} and both numbers. */
-    private static void assertRefused(String format, BytesStreamOutput out, Reader reader) throws IOException {
-        try (StreamInput in = out.bytes().streamInput()) {
+    /** Reads the stream of the next version with one optional block appended, asserting the block is consumed. */
+    private static Object readNextVersion(Writeable original, Writeable prelude, Reader reader) throws IOException {
+        BytesReference newer = WireVersionTestSupport.asNextVersion(original, prelude, false, out -> out.writeString("a later field"));
+        try (StreamInput in = newer.streamInput()) {
+            Object read = reader.read(in);
+            assertEquals("the reader consumed the block", -1, in.read());
+            return read;
+        }
+    }
+
+    /** Reads the stream of the next version with one critical block appended and asserts the refusal names {@code format}. */
+    private static void assertRefusesCritical(String format, Writeable original, Writeable prelude, Reader reader) throws IOException {
+        BytesReference newer = WireVersionTestSupport.asNextVersion(original, prelude, true, out -> out.writeString("a later constraint"));
+        try (StreamInput in = newer.streamInput()) {
             IOException refused = expectThrows(IOException.class, () -> reader.read(in));
-            assertEquals(WireVersion.mismatchMessage(format, 2, 1), refused.getMessage());
+            assertEquals(WireVersion.criticalBlockMessage(format, 2, 2, 1), refused.getMessage());
             assertEquals(
-                format + " wire version [2] does not match this node's [1]: every node must run the same plugin version",
+                format
+                    + " wire version [2] adds fields in version [2] that this node's [1] cannot ignore: "
+                    + "upgrade this node before sending it this message",
                 refused.getMessage()
             );
         }

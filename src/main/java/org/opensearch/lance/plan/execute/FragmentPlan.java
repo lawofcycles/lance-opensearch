@@ -78,23 +78,27 @@ import java.util.Optional;
  * leaves them out of every scan of the request. Empty when nothing was
  * pruned.
  *
- * <p>The wire format is internal to the plugin and assumes every node
- * runs the same plugin version. The stream opens with
- * {@link #WIRE_VERSION} (see {@link WireVersion}), and a reader that
- * finds another number refuses the plan with an {@link IOException}
- * naming both, so a fragment request between nodes of different plugin
- * versions fails at the plan's first byte with a message that says why,
- * instead of misreading the fields that follow. The number is bumped
- * whenever a field of the plan or of its nested records is added,
- * removed or retyped; no reader decodes an older number today, so the
- * marker detects a mismatch without negotiating it. The plan travels
- * inside {@link org.opensearch.lance.dispatch.LanceFragmentQueryRequest}
+ * <p>The wire format is internal to the plugin. The stream opens with
+ * {@link #WIRE_VERSION} (see {@link WireVersion}), followed by the
+ * base fields of version 1 (the kind, the filter SQL, the Lance
+ * clause, the pushed page and the pushed aggregate) and one block per
+ * later version: version 2 added the excluded fragment ids, version 3
+ * the Substrait filter bytes. A reader of an older plugin version
+ * steps over the pruning block, because scanning the pruned fragments
+ * too still answers correctly, and refuses a plan whose Substrait
+ * filter it cannot evaluate, because ignoring the filter would answer
+ * wrongly; a reader of a newer version takes the fallbacks of the
+ * blocks an older writer did not send. The plan travels inside
+ * {@link org.opensearch.lance.dispatch.LanceFragmentQueryRequest}
  * and {@link org.opensearch.lance.plan.explain.LanceExplainResponse},
  * which carry markers of their own for the fields around it.
  */
 public final class FragmentPlan implements Writeable, ToXContentObject {
 
-    /** The wire format's version, the first field written and the first read. */
+    /**
+     * The wire format's version, the first field written and the first
+     * read; 2 added the excluded fragment ids, 3 the Substrait filter.
+     */
     public static final int WIRE_VERSION = 3;
 
     private static final int[] NO_EXCLUDED_FRAGMENTS = new int[0];
@@ -489,25 +493,35 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
     }
 
     public FragmentPlan(StreamInput in) throws IOException {
-        this(
-            readWireVersion(in),
-            in.readOptionalString(),
-            readOptionalBytes(in),
-            in.readOptionalNamedWriteable(QueryBuilder.class),
-            in.readOptionalWriteable(TopK::read),
-            in.readOptionalWriteable(Aggregate::read),
-            in.readVIntArray()
-        );
+        this(read(in, WIRE_VERSION));
+    }
+
+    private FragmentPlan(FragmentPlan read) {
+        this(read.kind, read.filterSql, read.filterSubstrait, read.lanceClause, read.topK, read.aggregate, read.excludedFragmentIds);
+    }
+
+    /**
+     * Reads a plan as a node whose plugin is at wire version
+     * {@code asVersion} would: the blocks of later versions are stepped
+     * over or refused as {@link WireVersion.Reader} describes. The
+     * transport reads with {@link #WIRE_VERSION}; the mixed version
+     * tests read with the versions before it.
+     */
+    static FragmentPlan read(StreamInput in, int asVersion) throws IOException {
+        WireVersion.Reader reader = WireVersion.read(in, "FragmentPlan", asVersion);
+        Kind kind = Kind.read(in);
+        String filterSql = in.readOptionalString();
+        QueryBuilder lanceClause = in.readOptionalNamedWriteable(QueryBuilder.class);
+        TopK topK = in.readOptionalWriteable(TopK::read);
+        Aggregate aggregate = in.readOptionalWriteable(Aggregate::read);
+        int[] excludedFragmentIds = reader.block(2, StreamInput::readVIntArray, NO_EXCLUDED_FRAGMENTS);
+        byte[] filterSubstrait = reader.block(3, FragmentPlan::readOptionalBytes, null);
+        reader.finish();
+        return new FragmentPlan(kind, filterSql, filterSubstrait, lanceClause, topK, aggregate, excludedFragmentIds);
     }
 
     private static byte[] readOptionalBytes(StreamInput in) throws IOException {
         return in.readBoolean() ? in.readByteArray() : null;
-    }
-
-    /** Reads the version marker and the kind after it, refusing a stream written by another wire version. */
-    private static Kind readWireVersion(StreamInput in) throws IOException {
-        WireVersion.read(in, "FragmentPlan", WIRE_VERSION);
-        return Kind.read(in);
     }
 
     @Override
@@ -515,14 +529,22 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         WireVersion.write(out, WIRE_VERSION);
         out.writeEnum(kind);
         out.writeOptionalString(filterSql);
-        out.writeBoolean(filterSubstrait != null);
-        if (filterSubstrait != null) {
-            out.writeByteArray(filterSubstrait);
-        }
         out.writeOptionalNamedWriteable(lanceClause);
         out.writeOptionalWriteable(topK);
         out.writeOptionalWriteable(aggregate);
-        out.writeVIntArray(excludedFragmentIds);
+        // An older node that ignores the pruning list scans the pruned
+        // fragments too and still answers correctly, so the block is
+        // never critical.
+        WireVersion.writeBlock(out, false, o -> o.writeVIntArray(excludedFragmentIds));
+        // An older node that ignores the Substrait filter would scan
+        // without the predicate, so the block is critical whenever a
+        // filter is set.
+        WireVersion.writeBlock(out, filterSubstrait != null, o -> {
+            o.writeBoolean(filterSubstrait != null);
+            if (filterSubstrait != null) {
+                o.writeByteArray(filterSubstrait);
+            }
+        });
     }
 
     /**

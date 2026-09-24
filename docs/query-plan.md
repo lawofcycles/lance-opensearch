@@ -436,15 +436,21 @@ travels from the coordinator to every data node inside the per node fragment req
 nobody: the data node logs it and executes it. `LanceExplainResponse` travels from the node that
 planned the explain body to the node that received the REST call when they differ.
 
-Both streams open with an integer `WIRE_VERSION` (`FragmentPlan.WIRE_VERSION` is `2` today,
+Both streams open with an integer `WIRE_VERSION` (`FragmentPlan.WIRE_VERSION` is `3` today,
 `LanceExplainResponse.WIRE_VERSION` is `2`), written first and read first through the
-`WireVersion` helper. A reader that finds another number refuses the stream with an `IOException`
-naming both numbers (`FragmentPlan wire version [3] does not match this node's [2]: every node must
-run the same plugin version`), so a mismatch fails at the first field with a message that says why,
-instead of misreading the fields that follow into a generic stream corruption error. The number is
-bumped whenever a field is added, removed or retyped. No reader decodes an older number: the marker
-detects a mismatch, it does not negotiate one, and the fragment request between two plugin versions
-fails.
+`WireVersion` helper. The marker is followed by the fields the message had at version 1, inline,
+and then by one block per later version: a flag and the fields that version added as a length
+prefixed byte array. A reader of a newer plugin version takes a fallback for every block an older
+writer did not send; a reader of an older plugin version steps over the blocks it does not know,
+and refuses the message by name when such a block is flagged critical, which the writer does when
+ignoring the block would change the answer (`FragmentPlan wire version [3] adds fields in version
+[3] that this node's [2] cannot ignore: upgrade this node before sending it this message`). The
+plugin supports a rolling upgrade between the current and the previous plugin version this way:
+the cluster keeps answering while the nodes are upgraded one at a time, and a request that a node
+of the previous version cannot answer correctly fails at once with that message instead of
+answering wrongly. The number is bumped whenever a field is added; nothing is removed from or
+retyped in a layout that shipped. [docs/design/wire-format-compat.md](design/wire-format-compat.md)
+holds the rules, the version history of every message and the compatibility matrix.
 
 The same marker opens every other plugin internal message that crosses nodes, each with its own
 `WIRE_VERSION` constant and its own name in the message. The fragment request and response around
@@ -464,26 +470,25 @@ acknowledged bit of an acknowledged response), which OpenSearch versions itself,
 first field the plugin owns. A `Writeable` nested in one of these messages without a marker of its
 own (`LanceBuildIndexesRequest` inside the node request, `KindResult` inside the node response, the
 records inside `LanceNodeStats`) is covered by the enclosing message's number, so a change to its
-fields bumps that number. Messages the plugin only executes on the node that received the REST
-call (`LanceExplainRequest`, `LanceRefsRequest`, `LanceNamespaceListRequest`,
+fields is a new block of that message. Messages the plugin only executes on the node that received
+the REST call (`LanceExplainRequest`, `LanceRefsRequest`, `LanceNamespaceListRequest`,
 `LanceBuildIndexesRequest` at the top level, and their responses) carry no marker: a
 `HandledTransportAction` invoked through the node client never serialises them.
 `LanceNamespaceMetadata` carries none either: it is cluster state, versioned and published by
 OpenSearch's own mechanism, and its backwards-compatibility policy is written on the class.
 
-The contract that follows is the plugin's for now: every node in the cluster runs the same plugin
-version, and a rolling upgrade is not supported for the fragment path. The
-backwards-compatibility policy on `LanceNamespaceMetadata` states the same for the cluster state
-the plugin writes. When the plugin has releases to upgrade between, a reader can branch on the
-marker to decode the previous format; the marker is where that branch goes.
-
-After the marker, `FragmentPlan` writes its kind, the optional filter SQL, the optional Substrait
-filter bytes, the optional Lance clause as a named writeable query builder, the optional pushed
-page (orderings, fetch, cursor SQL), the optional pushed aggregate (the Substrait bytes, the group
-count, the metric slots, the two shipped cost predictions and the column names the aggregators
-would read) and the excluded fragment ids as an integer array (empty when nothing was pruned).
-`LanceExplainResponse` writes the index, the route, the two optional plan texts, the optional
-fragment plan, the optional unplanned message, the predicted refinements and the optional traits
-object (the requested accuracy, whether a tie stability was demanded and which, the declared pair,
-and the enforcer text); on the unsupported route only the index, the route and the message are
-set.
+After the marker, `FragmentPlan` writes its version 1 fields: the kind, the optional filter SQL,
+the optional Lance clause as a named writeable query builder, the optional pushed page (orderings,
+fetch, cursor SQL) and the optional pushed aggregate (the Substrait bytes, the group count, the
+metric slots, the two shipped cost predictions and the column names the aggregators would read).
+Then come its two blocks: version 2 the excluded fragment ids as an integer array (empty when
+nothing was pruned; optional, because a node that scans the pruned fragments too still answers
+correctly) and version 3 the optional Substrait filter bytes (critical while a filter is set,
+because a node that ignored it would scan without the predicate). `LanceExplainResponse` writes
+the index, the route, the two optional plan texts, the optional fragment plan, the optional
+unplanned message, the predicted refinements and the optional traits object (the requested
+accuracy, whether a tie stability was demanded and which, the declared pair, and the enforcer
+text); on the unsupported route only the index, the route and the message are set. A reader of
+this version still decodes the version 1 explain stream, which carried the retired shard path
+route: such an answer is read as an unsupported one whose message is
+`LanceExplainResponse.SHARD_PATH_RETIRED`.

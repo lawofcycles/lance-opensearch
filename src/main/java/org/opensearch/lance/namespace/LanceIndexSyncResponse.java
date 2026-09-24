@@ -35,7 +35,7 @@ public final class LanceIndexSyncResponse extends ActionResponse implements ToXC
 
     public LanceIndexSyncResponse(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceIndexSyncResponse", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceIndexSyncResponse", WIRE_VERSION);
         this.outcome = new LanceIndexFreshnessService.Outcome(
             in.readString(),
             in.readBoolean(),
@@ -46,6 +46,7 @@ public final class LanceIndexSyncResponse extends ActionResponse implements ToXC
             in.readBoolean(),
             in.readBoolean()
         );
+        reader.finish();
     }
 
     @Override

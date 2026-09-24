@@ -38,8 +38,9 @@ public final class LanceNamespacePollRequest extends ClusterManagerNodeRequest<L
 
     public LanceNamespacePollRequest(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceNamespacePollRequest", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceNamespacePollRequest", WIRE_VERSION);
         this.name = in.readOptionalString();
+        reader.finish();
     }
 
     @Override

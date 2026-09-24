@@ -99,28 +99,22 @@ public class FragmentPlanTests extends OpenSearchTestCase {
         assertEquals(count, roundTrip(count));
     }
 
-    public void testStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws IOException {
+    public void testStreamOpensWithTheWireVersionAndCarriesTwoBlocks() throws IOException {
         FragmentPlan plan = FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_COUNT, "rating = 5");
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             plan.writeTo(out);
             try (StreamInput in = out.bytes().streamInput()) {
                 assertEquals(FragmentPlan.WIRE_VERSION, in.readVInt());
-            }
-        }
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            out.writeVInt(FragmentPlan.WIRE_VERSION + 1);
-            out.writeEnum(FragmentPlan.Kind.LUCENE_COUNT);
-            out.writeOptionalString("rating = 5");
-            try (StreamInput in = out.bytes().streamInput()) {
-                IOException refused = expectThrows(IOException.class, () -> new FragmentPlan(in));
-                assertEquals(
-                    "FragmentPlan wire version ["
-                        + (FragmentPlan.WIRE_VERSION + 1)
-                        + "] does not match this node's ["
-                        + FragmentPlan.WIRE_VERSION
-                        + "]: every node must run the same plugin version",
-                    refused.getMessage()
-                );
+                assertEquals(FragmentPlan.Kind.LUCENE_COUNT, in.readEnum(FragmentPlan.Kind.class));
+                assertEquals("rating = 5", in.readOptionalString());
+                assertFalse("no Lance clause", in.readBoolean());
+                assertFalse("no pushed page", in.readBoolean());
+                assertFalse("no pushed aggregate", in.readBoolean());
+                assertEquals("the pruning block is optional", 0, in.readVInt());
+                assertArrayEquals(new int[0], StreamInput.wrap(in.readByteArray()).readVIntArray());
+                assertEquals("the Substrait block is optional while no filter is set", 0, in.readVInt());
+                assertFalse(StreamInput.wrap(in.readByteArray()).readBoolean());
+                assertEquals("nothing follows", -1, in.read());
             }
         }
     }

@@ -58,12 +58,13 @@ public final class LanceBuildIndexesNodeResponse extends BaseNodeResponse {
 
     public LanceBuildIndexesNodeResponse(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceBuildIndexesNodeResponse", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceBuildIndexesNodeResponse", WIRE_VERSION);
         this.fts = new LanceBuildIndexesResponse.KindResult(in);
         this.scalar = new LanceBuildIndexesResponse.KindResult(in);
         this.vector = new LanceBuildIndexesResponse.KindResult(in);
         this.status = RestStatus.readFrom(in);
         this.mappingJson = in.readOptionalString();
+        reader.finish();
     }
 
     @Override
