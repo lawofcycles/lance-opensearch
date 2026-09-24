@@ -1,1 +1,2 @@
-error: full text or knn clause in [must_not]
+LanceFtsMatch(kind=[FTS_BOOL], columns=[[body]], query=[{"lance_fts_bool":{"must":[{"lance_match":{"field":"body","query":"hello","boost":1.0}}],"must_not":[{"lance_match":{"field":"body","query":"stale","boost":1.0}}],"boost":1.0}}])
+  LanceTableScan(table=[[lance, idx]])

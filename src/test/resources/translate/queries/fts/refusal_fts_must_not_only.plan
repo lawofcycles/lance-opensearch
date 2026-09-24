@@ -1,0 +1,1 @@
+error: full text clause in [must_not] without a [must] or [should] full text clause

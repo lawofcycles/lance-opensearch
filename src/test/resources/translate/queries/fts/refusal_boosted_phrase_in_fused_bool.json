@@ -1,0 +1,1 @@
+{"query":{"bool":{"must":[{"lance_match":{"field":"body","query":"hello"}},{"lance_match_phrase":{"field":"body","query":"hello lance","boost":2.0}}]}}}

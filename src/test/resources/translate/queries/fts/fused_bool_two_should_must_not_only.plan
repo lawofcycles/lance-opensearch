@@ -1,0 +1,3 @@
+LanceFtsMatch(kind=[FTS_BOOL], columns=[[body, category]], query=[{"lance_fts_bool":{"should":[{"lance_match":{"field":"body","query":"hello","boost":1.0}},{"lance_match_phrase":{"field":"category","query":"c0 c1","boost":1.0}}],"boost":1.0}}])
+  LogicalFilter(condition=[NOT(IS TRUE(=(CAST($0):BIGINT NOT NULL, 6)))])
+    LanceTableScan(table=[[lance, idx]])
