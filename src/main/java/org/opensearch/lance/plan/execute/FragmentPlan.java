@@ -15,6 +15,7 @@ import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.ToXContentObject;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.lance.WireVersion;
 import org.opensearch.lance.execute.LanceAggregateResults;
 import org.opensearch.lance.plan.cost.AggregateProfile;
 import org.opensearch.lance.plan.cost.CostInputs;
@@ -68,14 +69,17 @@ import java.util.Optional;
  *
  * <p>The wire format is internal to the plugin and assumes every node
  * runs the same plugin version. The stream opens with
- * {@link #WIRE_VERSION}, and a reader that finds another number
- * refuses the plan with an {@link IOException} naming both, so a
- * fragment request between nodes of different plugin versions fails
- * at the plan's first byte with a message that says why, instead of
- * misreading the fields that follow. The number is bumped whenever a
- * field is added, removed or retyped; no reader decodes an older
- * number today, so the marker detects a mismatch without negotiating
- * it.
+ * {@link #WIRE_VERSION} (see {@link WireVersion}), and a reader that
+ * finds another number refuses the plan with an {@link IOException}
+ * naming both, so a fragment request between nodes of different plugin
+ * versions fails at the plan's first byte with a message that says why,
+ * instead of misreading the fields that follow. The number is bumped
+ * whenever a field of the plan or of its nested records is added,
+ * removed or retyped; no reader decodes an older number today, so the
+ * marker detects a mismatch without negotiating it. The plan travels
+ * inside {@link org.opensearch.lance.dispatch.LanceFragmentQueryRequest}
+ * and {@link org.opensearch.lance.plan.explain.LanceExplainResponse},
+ * which carry markers of their own for the fields around it.
  */
 public final class FragmentPlan implements Writeable, ToXContentObject {
 
@@ -427,22 +431,13 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
 
     /** Reads the version marker and the kind after it, refusing a stream written by another wire version. */
     private static Kind readWireVersion(StreamInput in) throws IOException {
-        int version = in.readVInt();
-        if (version != WIRE_VERSION) {
-            throw new IOException(
-                "FragmentPlan wire version ["
-                    + version
-                    + "] does not match this node's ["
-                    + WIRE_VERSION
-                    + "]: every node must run the same plugin version"
-            );
-        }
+        WireVersion.read(in, "FragmentPlan", WIRE_VERSION);
         return Kind.read(in);
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
-        out.writeVInt(WIRE_VERSION);
+        WireVersion.write(out, WIRE_VERSION);
         out.writeEnum(kind);
         out.writeOptionalString(filterSql);
         out.writeOptionalNamedWriteable(lanceClause);
