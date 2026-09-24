@@ -41,6 +41,7 @@ import org.opensearch.lance.plan.rules.PushSortLimitIntoLanceScan;
 import org.opensearch.lance.plan.traits.Accuracy;
 import org.opensearch.lance.plan.traits.PlanRequirement;
 import org.opensearch.lance.plan.traits.TieStability;
+import org.opensearch.lance.plan.traits.TraitEnforcement;
 import org.opensearch.lance.plan.traits.UnmetPlanRequirementException;
 
 /**
@@ -200,6 +201,34 @@ public final class LancePlannerFactory {
      *     declares the demanded traits
      */
     public RelNode plan(RelNode logical, CostInputs inputs, PlanRequirement requirement) {
+        return planUnder(logical, inputs, requirement).plan();
+    }
+
+    /**
+     * The best plan together with how the demand was met: whether the
+     * first pass already satisfied it, or the second pass replaced the
+     * cheapest plan with one declaring the demanded traits
+     * ({@link TraitEnforcement#fired()}). The convention fallbacks (the
+     * shard path root, the logical plan) report
+     * {@link TraitEnforcement#satisfied} for the requirement, as
+     * {@link #plan(RelNode, CostInputs, PlanRequirement)} never turns
+     * them into an error.
+     *
+     * @param plan the best plan, the pushed scan unwrapped from its handoff
+     * @param enforcement how the requirement was met
+     */
+    public record PlanOutcome(RelNode plan, TraitEnforcement enforcement) {
+    }
+
+    /**
+     * {@link #plan(RelNode, CostInputs, PlanRequirement)}, also
+     * answering how the demand was met. The explain endpoint renders
+     * the outcome's enforcement under {@code traits.enforcer}.
+     *
+     * @throws UnmetPlanRequirementException when a plan exists but none
+     *     declares the demanded traits
+     */
+    public PlanOutcome planUnder(RelNode logical, CostInputs inputs, PlanRequirement requirement) {
         VolcanoPlanner planner = (VolcanoPlanner) logical.getCluster().getPlanner();
         CostInputsHolder holder = planner.getContext().unwrap(CostInputsHolder.class);
         if (holder != null) {
@@ -212,23 +241,24 @@ public final class LancePlannerFactory {
         try {
             best = planner.findBestExp();
         } catch (RelOptPlanner.CannotPlanException noLucenePlan) {
-            return shardPathPlan(planner, logical);
+            return new PlanOutcome(shardPathPlan(planner, logical), TraitEnforcement.satisfied(requirement));
         } catch (RuntimeException plannerFailure) {
             LOGGER.warn(
                 "lance.plan: Volcano planning failed, keeping the logical plan: {}: {}",
                 plannerFailure.getClass().getName(),
                 plannerFailure.getMessage()
             );
-            return logical;
+            return new PlanOutcome(logical, TraitEnforcement.satisfied(requirement));
         }
         if (requirement.isNone() || requirement.satisfiedBy(best.getTraitSet())) {
-            return unwrapHandoff(best);
+            return new PlanOutcome(unwrapHandoff(best), TraitEnforcement.satisfied(requirement));
         }
         try {
             planner.setRoot(planner.changeTraits(logical, requirement.applyTo(luceneRoot)));
-            return unwrapHandoff(planner.findBestExp());
+            RelNode enforced = planner.findBestExp();
+            return new PlanOutcome(unwrapHandoff(enforced), TraitEnforcement.enforced(requirement, best.getTraitSet()));
         } catch (RelOptPlanner.CannotPlanException nothingMeetsTheDemand) {
-            throw new UnmetPlanRequirementException(requirement, best.getTraitSet());
+            throw new UnmetPlanRequirementException(requirement, logical, unwrapHandoff(best));
         }
     }
 
