@@ -7,6 +7,7 @@ package org.opensearch.lance;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.test.OpenSearchTestCase;
@@ -62,6 +63,24 @@ public class LanceMappingMetaTests extends OpenSearchTestCase {
         assertTrue(LanceMappingMeta.renamedFields(null).isEmpty());
         MappingMetadata metadata = mapping(Map.of("plain", Map.of("type", "keyword")));
         assertTrue(LanceMappingMeta.renamedFields(metadata).isEmpty());
+    }
+
+    public void testLanceTextFieldsListsTheLanceTextTypedFields() {
+        MappingMetadata metadata = mapping(
+            Map.of(
+                "body",
+                Map.of("type", "lance_text", "tokens_column", "body__lance_tokens"),
+                "old_title",
+                field("lance_text", "3", "Utf8", true),
+                "category",
+                field("keyword", "4", "Utf8", false),
+                "id",
+                field("integer", "0", "Int(32, true)", false)
+            )
+        );
+        assertEquals(Set.of("body", "old_title"), LanceMappingMeta.lanceTextFields(metadata));
+        assertTrue(LanceMappingMeta.lanceTextFields(null).isEmpty());
+        assertTrue(LanceMappingMeta.lanceTextFields(new MappingMetadata("_doc", Map.of())).isEmpty());
     }
 
     public void testIsDroppedReadsTheMarker() {
