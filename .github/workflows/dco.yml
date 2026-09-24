@@ -1,0 +1,45 @@
+name: dco
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  dco:
+    name: dco
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Every commit of the pull request must carry a Developer Certificate
+      # of Origin trailer (`Signed-off-by: Name <email>`, added by
+      # `git commit -s`). The DCO does not require the trailer's email to
+      # match the commit author, so only the presence of the trailer is
+      # checked. Written with gh and jq rather than a third party action so
+      # the check pulls in no extra supply chain.
+      - name: Require a Signed-off-by trailer on every commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          commits=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/commits" --paginate \
+            --jq '.[] | {sha: .sha, message: .commit.message}')
+          total=$(jq -s 'length' <<< "$commits")
+          missing=$(jq -r '
+            select(
+              [ .message | split("\n")[] | sub("\r$"; "")
+                | select(test("^Signed-off-by: .+ <.+@.+>$")) ] | length == 0)
+            | "\(.sha) \(.message | split("\n")[0])"' <<< "$commits")
+          echo "checked $total commit(s) on pull request #$PR_NUMBER"
+          if [ -n "$missing" ]; then
+            while IFS= read -r line; do
+              echo "::error::commit ${line%% *} has no Signed-off-by trailer: ${line#* }"
+            done <<< "$missing"
+            echo "::error::Sign every commit with git commit -s (CONTRIBUTING.md, Developer Certificate of Origin) and push again."
+            exit 1
+          fi
+          echo "every commit carries a Signed-off-by trailer"
