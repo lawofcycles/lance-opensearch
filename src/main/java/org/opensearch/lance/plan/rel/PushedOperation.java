@@ -154,25 +154,63 @@ public sealed interface PushedOperation permits PushedOperation.PushedAggregate,
 
     /**
      * A filter pushed into the scan: the predicate over the scan row
-     * type and the Lance SQL string the printer produced from it, which
-     * the executor hands to the dataset scan's {@code filter(sql)}. The
-     * row type does not change; only the row count does.
+     * type and its Lance spelling. Two encodings exist and the planner
+     * costs them as separate scans: the Lance SQL string the printer
+     * produced, which the executor hands to the dataset scan's
+     * {@code filter(sql)}, and the Substrait {@code ExtendedExpression}
+     * bytes the Substrait producer encoded, which it hands to
+     * {@code substraitFilter(bytes)}. A scan whose bytes are set
+     * evaluates the bytes; its SQL, when the printer could spell the
+     * predicate as well, travels next to them for the executor's
+     * column loads, which take SQL only. At least one encoding is
+     * present. The row type does not change; only the row count does.
+     *
+     * <p>The buffer is treated as immutable; readers take
+     * {@link #substrait()} for a positioned duplicate instead of
+     * touching the stored buffer's position.
      */
-    record PushedFilter(RexNode condition, String sql) implements PushedOperation {
+    record PushedFilter(RexNode condition, String sql, ByteBuffer bytes) implements PushedOperation {
 
         public PushedFilter {
             Objects.requireNonNull(condition, "condition");
-            Objects.requireNonNull(sql, "sql");
+            if (sql == null && bytes == null) {
+                throw new IllegalArgumentException("a pushed filter needs its SQL, its Substrait bytes or both");
+            }
+        }
+
+        /** A filter spelled as Lance SQL only. */
+        public PushedFilter(RexNode condition, String sql) {
+            this(condition, Objects.requireNonNull(sql, "sql"), null);
+        }
+
+        /** Whether the executor evaluates the Substrait bytes rather than the SQL. */
+        public boolean usesSubstrait() {
+            return bytes != null;
+        }
+
+        /** The encoded predicate as a read only view with its own position, or null for a SQL only filter. */
+        public ByteBuffer substrait() {
+            return bytes == null ? null : bytes.asReadOnlyBuffer();
+        }
+
+        /** The encoded predicate's size in bytes, zero for a SQL only filter. */
+        public int substraitLength() {
+            return bytes == null ? 0 : bytes.remaining();
         }
 
         /**
-         * Prints the predicate and its SQL, so the digest of two scans
-         * with different pushed filters differs and the explain output
-         * names what was pushed.
+         * Prints the predicate, its SQL and the size of its Substrait
+         * bytes, so the digest of two scans with different pushed
+         * filters (or the same predicate in the other encoding) differs
+         * and the explain output names what was pushed.
          */
         @Override
         public String toString() {
-            return "filter{condition=" + condition + ", sql=" + sql + "}";
+            return "filter{condition="
+                + condition
+                + (sql == null ? "" : ", sql=" + sql)
+                + (bytes == null ? "" : ", substrait_bytes=" + bytes.remaining())
+                + "}";
         }
     }
 

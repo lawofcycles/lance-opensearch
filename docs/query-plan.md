@@ -101,7 +101,20 @@ and `cost` (what the planner charged that operator, see [Cost](#cost)); the root
 it is the translator's tree before any cost was computed, and its operators (`LanceAggregate`,
 `LanceHitShape`, `LanceTopK`, `LogicalFilter`, the bare `LanceTableScan`) print their own terms
 only. In the `physical` text a logical operator the planner kept (a tree it could not lower)
-prints the same way, without the three terms. The request's `query` clause plans as a filter over the scan; a query filter under an aggregation the
+prints the same way, without the three terms. The request's `query` clause plans as a filter over the scan. A scalar filter with nothing above it
+(a `size: 0` count) folds into the scan as a pushed `filter{...}` in one of two encodings the
+planner registers side by side and costs against each other: `filter{condition=..., sql=...}`
+is the Lance SQL the scan evaluates through `filter(sql)`, and
+`filter{condition=..., sql=..., substrait_bytes=N}` is the Substrait `ExtendedExpression` of
+the same predicate the scan evaluates through `substraitFilter(bytes)`, with the SQL printed
+next to it because the executor's column loads take SQL only (the `sql=` is absent when the SQL
+printer has no spelling for the predicate, which today is arithmetic in a comparison). Both
+encodings decode to the same DataFusion expression inside Lance and run through the same
+planning, so the cost that orders them is the encoding's size on the wire and a tie break in
+favour of the Substrait form (`CostCoefficients.FILTER_SQL_TIE_BREAK_MS`): a short predicate
+ships as Substrait, a long `terms` list on a wide cluster as SQL. A predicate on a struct child
+(`meta.region`) has a SQL spelling only, a predicate the SQL printer refuses a Substrait spelling
+only, and the planner takes whichever exists. A query filter under an aggregation the
 pushdown computes folds into one pushed aggregate whose `filter=` names the Lance SQL the scan
 evaluates; a top level Lance FTS clause (`lance_match`, `lance_match_phrase`, `lance_multi_match`,
 `lance_fts_bool`, `lance_fts_boost`, or a stock `match` / `match_phrase` / `multi_match` on a
@@ -118,7 +131,16 @@ same object a data node logs under `lance.plan` at debug level. `kind` is `PUSHE
 scan computes the page or the aggregate, `LUCENE_AGGREGATE`, `LUCENE_TOPK` or `LUCENE_COUNT`
 when Lucene's aggregators, collector or count run over the planned query. `filter_sql` is the
 Lance SQL of the scalar predicate, or of the prefilter of a full text or knn clause, absent when
-the query has no Lance spelling. `lance_clause` is the query name of the full text or knn clause
+the query has no Lance spelling. `filter_substrait_bytes` is the length of the Substrait
+encoding of the same scalar predicate and is present when the planner chose that encoding: the
+executor's filter scans (the `LanceScanFilterQuery` behind Lucene's collector and aggregators,
+and the count only scan behind `hits.total`) then evaluate the Substrait bytes, and the
+`filter_sql` next to it is only read by the fragment leaf reader's column loads, which take SQL.
+When `filter_substrait_bytes` is absent every scan evaluates `filter_sql`. A Lucene kind plan
+whose filter stayed in the wrapped tree (a page the top-k pushdown did not fold, an aggregation
+the aggregate pushdown did not fold) chooses its encoding with the same cost comparison the
+pushed forms compete under; a pushed page (`top_k`) and the prefilter of a full text or knn
+clause take SQL only. `lance_clause` is the query name of the full text or knn clause
 the executor builds its Lance query from (`lance_knn`, `lance_match`, ...), absent for a scalar
 shape. `top_k` describes a pushed page (`orderings` with `column`, `ascending`, `nulls_first`;
 `fetch`; `cursor_sql` for a `search_after` page) and `aggregate` a pushed aggregate
@@ -168,7 +190,7 @@ where the work runs; converting between conventions is a costed step the planner
 
 | Operator | Convention | What it does |
 | --- | --- | --- |
-| `LanceTableScan` | Lance | One Lance scan per fragment group, carrying its pushed operations: `filter{sql=...}`, `fts{...}`, `knn{...}`, `topk{...}`, `aggregate{...}`. The only operator of the convention. |
+| `LanceTableScan` | Lance | One Lance scan per fragment group, carrying its pushed operations: `filter{sql=...}` or `filter{sql=..., substrait_bytes=N}`, `fts{...}`, `knn{...}`, `topk{...}`, `aggregate{...}`. The only operator of the convention. |
 | `LuceneAggregateExec` | Lucene | The stock OpenSearch aggregators over the per fragment leaf readers, run by the fragment executor's aggregation phase; its terms print the aggregate it wraps and the filter below it. |
 | `HeapTopKExec` | Lucene | Lucene's top docs collector cutting the page, run by the executor's hits phase; its terms print the collations, bounds, cursor, hit envelope and the filter, FTS or knn below it. |
 | `LuceneHandoffExec` | Lucene | The zero cost conversion of a Lance scan to the Lucene root the planner demands; unwrapped by the planner factory, so it never appears in the printed plan. |
@@ -455,11 +477,11 @@ backwards-compatibility policy on `LanceNamespaceMetadata` states the same for t
 the plugin writes. When the plugin has releases to upgrade between, a reader can branch on the
 marker to decode the previous format; the marker is where that branch goes.
 
-After the marker, `FragmentPlan` writes its kind, the optional filter SQL, the optional Lance
-clause as a named writeable query builder, the optional pushed page (orderings, fetch, cursor
-SQL), the optional pushed aggregate (the Substrait bytes, the group count, the metric slots,
-the two shipped cost predictions and the column names the aggregators would read) and the
-excluded fragment ids as an integer array (empty when nothing was pruned).
+After the marker, `FragmentPlan` writes its kind, the optional filter SQL, the optional Substrait
+filter bytes, the optional Lance clause as a named writeable query builder, the optional pushed
+page (orderings, fetch, cursor SQL), the optional pushed aggregate (the Substrait bytes, the group
+count, the metric slots, the two shipped cost predictions and the column names the aggregators
+would read) and the excluded fragment ids as an integer array (empty when nothing was pruned).
 `LanceExplainResponse` writes the index, the route, the two optional plan texts, the optional
 fragment plan, the optional unplanned message, the predicted refinements and the optional traits
 object (the requested accuracy, whether a tie stability was demanded and which, the declared pair,

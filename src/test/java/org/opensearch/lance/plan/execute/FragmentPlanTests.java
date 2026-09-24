@@ -26,6 +26,7 @@ import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
 import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
+import org.opensearch.lance.query.LanceScanFilter;
 import org.opensearch.search.SearchModule;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchTestCase;
@@ -113,21 +114,62 @@ public class FragmentPlanTests extends OpenSearchTestCase {
             try (StreamInput in = out.bytes().streamInput()) {
                 IOException refused = expectThrows(IOException.class, () -> new FragmentPlan(in));
                 assertEquals(
-                    "FragmentPlan wire version [3] does not match this node's [2]: every node must run the same plugin version",
+                    "FragmentPlan wire version ["
+                        + (FragmentPlan.WIRE_VERSION + 1)
+                        + "] does not match this node's ["
+                        + FragmentPlan.WIRE_VERSION
+                        + "]: every node must run the same plugin version",
                     refused.getMessage()
                 );
             }
         }
     }
 
-    public void testPushedFilterScanCarriesTheSql() throws IOException {
+    public void testPushedFilterScanCarriesTheSqlAndTheSubstraitBytes() throws IOException {
         RelNode root = physical("{\"size\":0,\"query\":{\"term\":{\"rating\":5}}}");
         assertTrue(root instanceof LanceTableScan scan && scan.pushedFilter().isPresent());
+        // The planner picks the Substrait encoding for a scalar filter;
+        // the SQL travels next to the bytes for the column loads.
+        assertTrue(((LanceTableScan) root).pushedFilter().orElseThrow().usesSubstrait());
         FragmentPlan plan = of(root, false, false);
         assertEquals(FragmentPlan.Kind.LUCENE_COUNT, plan.kind());
         assertEquals("rating = 5", plan.filterSql());
         assertEquals("rating = 5", plan.scalarFilterSql());
+        assertNotNull(plan.filterSubstrait());
+        assertTrue(plan.filterSubstrait().length > 0);
+        LanceScanFilter scalar = plan.scalarFilter();
+        assertTrue(scalar.usesSubstrait());
+        assertEquals("rating = 5", scalar.sql());
+        assertArrayEquals(plan.filterSubstrait(), scalar.substraitBytes());
+        FragmentPlan back = roundTrip(plan);
+        assertEquals(plan, back);
+        assertArrayEquals(plan.filterSubstrait(), back.filterSubstrait());
+        assertTrue(plan.toString().contains("filterSubstraitBytes=" + plan.filterSubstrait().length));
+        // The bytes survive the exclusion of a fragment.
+        FragmentPlan pruned = plan.withExcludedFragments(new int[] { 1 });
+        assertArrayEquals(plan.filterSubstrait(), pruned.filterSubstrait());
+        assertEquals(pruned, roundTrip(pruned));
+    }
+
+    public void testSqlOnlyPlanHasNoSubstraitBytes() throws IOException {
+        FragmentPlan plan = FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_COUNT, "rating = 5");
+        assertNull(plan.filterSubstrait());
+        assertFalse(plan.scalarFilter().usesSubstrait());
+        assertEquals("rating = 5", plan.scalarFilter().sql());
         assertEquals(plan, roundTrip(plan));
+        assertNotEquals(plan, new FragmentPlan(FragmentPlan.Kind.LUCENE_COUNT, "rating = 5", new byte[] { 1, 2, 3 }, null, null, null));
+    }
+
+    public void testSubstraitBytesRefuseAClauseAndAnEmptyArray() {
+        LanceMatchQueryBuilder clause = new LanceMatchQueryBuilder("body", "hello");
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> new FragmentPlan(FragmentPlan.Kind.LUCENE_COUNT, "rating = 5", new byte[] { 1 }, clause, null, null)
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> new FragmentPlan(FragmentPlan.Kind.LUCENE_COUNT, "rating = 5", new byte[0], null, null, null)
+        );
     }
 
     public void testPushedFtsScanCarriesTheClauseAndPrefilter() throws IOException {

@@ -8,6 +8,7 @@ package org.opensearch.lance.plan.execute;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Project;
+import org.apache.calcite.rex.RexNode;
 import org.lance.ipc.ColumnOrdering;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -34,9 +35,11 @@ import org.opensearch.lance.plan.rel.PushedOperation.PushedFilter;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedFts;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedKnn;
 import org.opensearch.lance.plan.rel.PushedOperation.PushedTopK;
+import org.opensearch.lance.plan.substrait.LanceSubstraitFilterProducer;
 import org.opensearch.lance.plan.rel.physical.HeapTopKExec;
 import org.opensearch.lance.plan.rel.physical.LuceneAggregateExec;
 import org.opensearch.lance.query.LanceKnnQueryBuilder;
+import org.opensearch.lance.query.LanceScanFilter;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -57,11 +60,14 @@ import java.util.Optional;
  * kind: {@link #filterSql()} is the Lance SQL of the scalar predicate
  * (a pushed filter, the prefilter of a pushed full text or knn
  * operation, the filter under a pushed aggregate, or the {@code Filter}
- * below a Lucene operator printed by {@link RexToLanceSql}) and
- * {@link #lanceClause()} the full text or knn clause whose Lucene
- * {@code Query} the executor builds through the mapping; both are null
- * when the query has no Lance spelling and the executor builds the
- * Lucene query from the request's own builder. The envelope part is
+ * below a Lucene operator printed by {@link RexToLanceSql}),
+ * {@link #filterSubstrait()} the Substrait bytes of the same predicate
+ * when the planner chose a Substrait pushed filter (the scalar scans
+ * then evaluate the bytes and the SQL, when present, only feeds the
+ * column loads that take SQL), and {@link #lanceClause()} the full text
+ * or knn clause whose Lucene {@code Query} the executor builds through
+ * the mapping; all are null when the query has no Lance spelling and
+ * the executor builds the Lucene query from the request's own builder. The envelope part is
  * one of {@link #topK()} (an ordered, cut page the Lance scan returns)
  * or {@link #aggregate()} (a Substrait aggregate the Lance scan
  * computes), or neither when Lucene's collector and aggregators run.
@@ -89,7 +95,7 @@ import java.util.Optional;
 public final class FragmentPlan implements Writeable, ToXContentObject {
 
     /** The wire format's version, the first field written and the first read. */
-    public static final int WIRE_VERSION = 2;
+    public static final int WIRE_VERSION = 3;
 
     private static final int[] NO_EXCLUDED_FRAGMENTS = new int[0];
 
@@ -408,23 +414,55 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
 
     private final Kind kind;
     private final String filterSql;
+    private final byte[] filterSubstrait;
     private final QueryBuilder lanceClause;
     private final TopK topK;
     private final Aggregate aggregate;
     private final int[] excludedFragmentIds;
 
+    /** A plan whose scalar predicate, when set, is spelled as Lance SQL only, excluding no fragment. */
     public FragmentPlan(Kind kind, String filterSql, QueryBuilder lanceClause, TopK topK, Aggregate aggregate) {
-        this(kind, filterSql, lanceClause, topK, aggregate, NO_EXCLUDED_FRAGMENTS);
+        this(kind, filterSql, null, lanceClause, topK, aggregate, NO_EXCLUDED_FRAGMENTS);
     }
 
     /**
+     * A plan whose scalar predicate, when set, is spelled as Lance SQL only.
+     *
      * @param excludedFragmentIds the fragments the executor leaves out
      *     of its scans, in ascending order without duplicates; the empty
      *     array when nothing was pruned
      */
     public FragmentPlan(Kind kind, String filterSql, QueryBuilder lanceClause, TopK topK, Aggregate aggregate, int[] excludedFragmentIds) {
+        this(kind, filterSql, null, lanceClause, topK, aggregate, excludedFragmentIds);
+    }
+
+    /** A plan excluding no fragment. */
+    public FragmentPlan(Kind kind, String filterSql, byte[] filterSubstrait, QueryBuilder lanceClause, TopK topK, Aggregate aggregate) {
+        this(kind, filterSql, filterSubstrait, lanceClause, topK, aggregate, NO_EXCLUDED_FRAGMENTS);
+    }
+
+    /**
+     * @param filterSql the Lance SQL of the scalar predicate, or null
+     * @param filterSubstrait the Substrait bytes of the scalar predicate
+     *     the scans evaluate instead of the SQL, or null; only a scalar
+     *     shape carries them (a full text or knn clause takes its
+     *     prefilter as SQL)
+     * @param excludedFragmentIds the fragments the executor leaves out
+     *     of its scans, in ascending order without duplicates; the empty
+     *     array when nothing was pruned
+     */
+    public FragmentPlan(
+        Kind kind,
+        String filterSql,
+        byte[] filterSubstrait,
+        QueryBuilder lanceClause,
+        TopK topK,
+        Aggregate aggregate,
+        int[] excludedFragmentIds
+    ) {
         this.kind = Objects.requireNonNull(kind, "kind");
         this.filterSql = filterSql;
+        this.filterSubstrait = filterSubstrait == null ? null : filterSubstrait.clone();
         this.lanceClause = lanceClause;
         this.topK = topK;
         this.aggregate = aggregate;
@@ -434,6 +472,12 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         }
         if (kind != Kind.PUSHED_SCAN && (topK != null || aggregate != null)) {
             throw new IllegalArgumentException("only a " + Kind.PUSHED_SCAN + " plan carries a pushed page or aggregate, got " + kind);
+        }
+        if (filterSubstrait != null && lanceClause != null) {
+            throw new IllegalArgumentException("a full text or knn clause takes its prefilter as SQL, not as Substrait bytes");
+        }
+        if (filterSubstrait != null && filterSubstrait.length == 0) {
+            throw new IllegalArgumentException("the Substrait filter must not be empty");
         }
         for (int i = 1; i < this.excludedFragmentIds.length; i++) {
             if (this.excludedFragmentIds[i] <= this.excludedFragmentIds[i - 1]) {
@@ -448,11 +492,16 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         this(
             readWireVersion(in),
             in.readOptionalString(),
+            readOptionalBytes(in),
             in.readOptionalNamedWriteable(QueryBuilder.class),
             in.readOptionalWriteable(TopK::read),
             in.readOptionalWriteable(Aggregate::read),
             in.readVIntArray()
         );
+    }
+
+    private static byte[] readOptionalBytes(StreamInput in) throws IOException {
+        return in.readBoolean() ? in.readByteArray() : null;
     }
 
     /** Reads the version marker and the kind after it, refusing a stream written by another wire version. */
@@ -466,6 +515,10 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         WireVersion.write(out, WIRE_VERSION);
         out.writeEnum(kind);
         out.writeOptionalString(filterSql);
+        out.writeBoolean(filterSubstrait != null);
+        if (filterSubstrait != null) {
+            out.writeByteArray(filterSubstrait);
+        }
         out.writeOptionalNamedWriteable(lanceClause);
         out.writeOptionalWriteable(topK);
         out.writeOptionalWriteable(aggregate);
@@ -504,22 +557,32 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
      * {@link HeapTopKExec} root names its kind directly. Any other root
      * (a logical tree the planner could not lower) takes the shape's
      * kind. In every case the query part is read from the chain between
-     * the root and the scan: a {@code Filter} prints to Lance SQL, a
+     * the root and the scan: a {@code Filter} is encoded for Lance, a
      * full text or knn node contributes its clause, a scan its pushed
-     * operations. A {@code Filter} the printer cannot spell leaves the
-     * whole query to the Lucene side (both parts null), because the
-     * Lucene composition of the request's builder is the only form that
-     * evaluates every clause.
+     * operations. A {@code Filter} left in a Lucene operator's wrapped
+     * tree (a page or an aggregation the pushdown rules did not fold)
+     * is the scalar query of a Lucene kind plan, so it takes the
+     * encoding the pushed filter of the same predicate would have
+     * taken: both encodings are produced and
+     * {@link CostModel#filterEncodingMillis} orders them under
+     * {@code inputs}, the same comparison the planner makes between the
+     * two pushed forms. A {@code Filter} neither encoder can spell
+     * leaves the whole query to the Lucene side (both parts null),
+     * because the Lucene composition of the request's builder is the
+     * only form that evaluates every clause; a {@code Filter} under a
+     * full text or knn node is that node's prefilter and travels as SQL
+     * only.
      *
      * @param root the physical (or unlowered logical) per node plan
      * @param hasAggregations whether the request carries aggregations
      * @param hits whether the request asks for a page ({@code size} above 0)
      * @param inputs the cost inputs the planner chose {@code root} under,
-     *     which a pushed aggregate's alternative cost is computed with
+     *     which a pushed aggregate's alternative cost and a wrapped
+     *     filter's encoding are computed with
      */
     public static FragmentPlan of(RelNode root, boolean hasAggregations, boolean hits, CostInputs inputs) {
         Kind shapeKind = luceneKind(hasAggregations, hits);
-        QueryPart query = queryPart(root);
+        QueryPart query = queryPart(root, inputs);
         if (root instanceof LanceTableScan scan) {
             Optional<PushedAggregate> pushedAggregate = scan.pushedAggregate();
             if (pushedAggregate.isPresent()) {
@@ -539,58 +602,79 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
                     orderings.add(ScanOrdering.of(ordering));
                 }
                 TopK topK = new TopK(orderings, pushed.fetch(), pushed.cursorSql());
-                return new FragmentPlan(Kind.PUSHED_SCAN, query.filterSql(), query.lanceClause(), topK, null);
+                return new FragmentPlan(Kind.PUSHED_SCAN, query.filterSql(), query.filterSubstrait(), query.lanceClause(), topK, null);
             }
-            return new FragmentPlan(shapeKind, query.filterSql(), query.lanceClause(), null, null);
+            return new FragmentPlan(shapeKind, query.filterSql(), query.filterSubstrait(), query.lanceClause(), null, null);
         }
         if (root instanceof LuceneAggregateExec) {
-            return new FragmentPlan(Kind.LUCENE_AGGREGATE, query.filterSql(), query.lanceClause(), null, null);
+            return new FragmentPlan(Kind.LUCENE_AGGREGATE, query.filterSql(), query.filterSubstrait(), query.lanceClause(), null, null);
         }
         if (root instanceof HeapTopKExec) {
-            return new FragmentPlan(Kind.LUCENE_TOPK, query.filterSql(), query.lanceClause(), null, null);
+            return new FragmentPlan(Kind.LUCENE_TOPK, query.filterSql(), query.filterSubstrait(), query.lanceClause(), null, null);
         }
-        return new FragmentPlan(shapeKind, query.filterSql(), query.lanceClause(), null, null);
+        return new FragmentPlan(shapeKind, query.filterSql(), query.filterSubstrait(), query.lanceClause(), null, null);
     }
 
     /** The query part read off a plan chain. */
-    private record QueryPart(String filterSql, QueryBuilder lanceClause) {
-        static final QueryPart NONE = new QueryPart(null, null);
+    private record QueryPart(String filterSql, byte[] filterSubstrait, QueryBuilder lanceClause) {
+        static final QueryPart NONE = new QueryPart(null, null, null);
     }
 
-    private static QueryPart queryPart(RelNode root) {
+    private static QueryPart queryPart(RelNode root, CostInputs inputs) {
         String filterSql = null;
+        RexNode filterCondition = null;
         QueryBuilder clause = null;
         RelNode node = root;
         while (node != null) {
             if (node instanceof LanceTableScan scan) {
                 Optional<PushedAggregate> aggregate = scan.pushedAggregate();
                 if (aggregate.isPresent()) {
-                    return new QueryPart(aggregate.get().filterSql(), null);
+                    return new QueryPart(aggregate.get().filterSql(), null, null);
                 }
                 Optional<PushedFts> fts = scan.pushedFts();
                 if (fts.isPresent()) {
-                    return new QueryPart(fts.get().filterSql(), fts.get().fts().ftsClause());
+                    return new QueryPart(fts.get().filterSql(), null, fts.get().fts().ftsClause());
                 }
                 Optional<PushedKnn> knn = scan.pushedKnn();
                 if (knn.isPresent()) {
-                    return new QueryPart(knn.get().filterSql(), knn.get().knn().knnClause());
+                    return new QueryPart(knn.get().filterSql(), null, knn.get().knn().knnClause());
                 }
                 Optional<PushedFilter> filter = scan.pushedFilter();
                 if (filter.isPresent()) {
-                    return new QueryPart(filter.get().sql(), clause);
+                    // A pushed filter under a full text or knn node is
+                    // the node's prefilter, which travels as SQL only.
+                    byte[] bytes = clause == null ? substraitBytes(filter.get()) : null;
+                    return new QueryPart(filter.get().sql(), bytes, clause);
                 }
-                return new QueryPart(filterSql, clause);
+                if (filterCondition != null && clause == null) {
+                    // The Filter stayed in a Lucene operator's tree:
+                    // encode it as the pushed filter of the same
+                    // predicate would be, and let the cost order the two.
+                    PushedFilter chosen = encodeWrappedFilter(filterCondition, scan, inputs);
+                    if (chosen == null) {
+                        return QueryPart.NONE;
+                    }
+                    return new QueryPart(chosen.sql(), substraitBytes(chosen), null);
+                }
+                return new QueryPart(filterSql, null, clause);
             }
             if (node instanceof LuceneAggregateExec exec) {
                 node = exec.aggregate();
             } else if (node instanceof HeapTopKExec exec) {
                 node = exec.topK();
             } else if (node instanceof Filter filter) {
-                Optional<String> sql = RexToLanceSql.print(filter.getCondition(), filter.getInput().getRowType());
-                if (sql.isEmpty()) {
+                if (filterCondition != null) {
+                    // Two filters in one chain never occur in a translated
+                    // tree; leave the whole query to the Lucene side.
                     return QueryPart.NONE;
                 }
-                filterSql = sql.get();
+                Optional<String> sql = RexToLanceSql.print(filter.getCondition(), filter.getInput().getRowType());
+                if (sql.isEmpty() && clause != null) {
+                    // A prefilter travels as SQL only.
+                    return QueryPart.NONE;
+                }
+                filterSql = sql.orElse(null);
+                filterCondition = filter.getCondition();
                 node = filter.getInput();
             } else if (node instanceof LanceFtsMatch fts) {
                 clause = fts.ftsClause();
@@ -610,6 +694,45 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         return QueryPart.NONE;
     }
 
+    /**
+     * The encoding a {@code Filter} left in a Lucene operator's tree
+     * takes: the SQL and the Substrait candidates of {@code condition}
+     * over {@code scan}, ordered by {@link CostModel#filterEncodingMillis}
+     * under {@code inputs} exactly as the scan's cost orders the two
+     * pushed forms; null when neither encoder can spell the predicate.
+     */
+    private static PushedFilter encodeWrappedFilter(RexNode condition, LanceTableScan scan, CostInputs inputs) {
+        Optional<String> sql = RexToLanceSql.print(condition, scan.getRowType());
+        Optional<ByteBuffer> bytes = LanceSubstraitFilterProducer.toLanceFilter(
+            condition,
+            scan.getRowType(),
+            scan.getCluster().getTypeFactory()
+        );
+        if (bytes.isEmpty() && sql.isEmpty()) {
+            return null;
+        }
+        if (bytes.isEmpty()) {
+            return new PushedFilter(condition, sql.get());
+        }
+        PushedFilter substrait = new PushedFilter(condition, sql.orElse(null), bytes.get());
+        if (sql.isEmpty()) {
+            return substrait;
+        }
+        PushedFilter plain = new PushedFilter(condition, sql.get());
+        return CostModel.filterEncodingMillis(inputs, substrait) <= CostModel.filterEncodingMillis(inputs, plain) ? substrait : plain;
+    }
+
+    /** The pushed filter's Substrait bytes as a heap array, or null for a SQL only filter. */
+    private static byte[] substraitBytes(PushedFilter filter) {
+        ByteBuffer bytes = filter.substrait();
+        if (bytes == null) {
+            return null;
+        }
+        byte[] copy = new byte[bytes.remaining()];
+        bytes.get(copy);
+        return copy;
+    }
+
     public Kind kind() {
         return kind;
     }
@@ -617,10 +740,23 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
     /**
      * The Lance SQL of the scalar predicate: the whole query for a
      * scalar shape, the prefilter of a full text or knn shape, null when
-     * the query has no Lance spelling or is {@code match_all}.
+     * the query has no Lance spelling or is {@code match_all}. When
+     * {@link #filterSubstrait()} is set as well, the scans evaluate the
+     * bytes and this SQL only feeds the column loads that take SQL.
      */
     public String filterSql() {
         return filterSql;
+    }
+
+    /**
+     * The Substrait {@code ExtendedExpression} bytes of the scalar
+     * predicate, which the scalar scans hand to
+     * {@code ScanOptions.substraitFilter} instead of the SQL; null when
+     * the planner chose the SQL encoding or the query has no scalar
+     * predicate. A copy: the array is never shared.
+     */
+    public byte[] filterSubstrait() {
+        return filterSubstrait == null ? null : filterSubstrait.clone();
     }
 
     /**
@@ -631,6 +767,22 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
      */
     public String scalarFilterSql() {
         return lanceClause == null ? filterSql : null;
+    }
+
+    /**
+     * The scalar filter the executor's scalar scans evaluate, in the
+     * encoding the planner chose: the Substrait bytes when present, the
+     * SQL otherwise; null when a full text or knn clause carries the
+     * query or the query has no scalar predicate.
+     */
+    public LanceScanFilter scalarFilter() {
+        if (lanceClause != null) {
+            return null;
+        }
+        if (filterSubstrait != null) {
+            return LanceScanFilter.substrait(filterSubstrait, filterSql);
+        }
+        return filterSql == null ? null : LanceScanFilter.sql(filterSql);
     }
 
     /** The full text or knn clause the executor builds the Lance query from, or null for a scalar shape. */
@@ -691,7 +843,7 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         if (Arrays.equals(fragmentIds, excludedFragmentIds)) {
             return this;
         }
-        return new FragmentPlan(kind, filterSql, lanceClause, topK, aggregate, fragmentIds);
+        return new FragmentPlan(kind, filterSql, filterSubstrait, lanceClause, topK, aggregate, fragmentIds);
     }
 
     /** The same plan with the pushed aggregate dropped: the aggregators run over the same query. */
@@ -699,7 +851,7 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         if (aggregate == null) {
             return this;
         }
-        return new FragmentPlan(Kind.LUCENE_AGGREGATE, filterSql, lanceClause, null, null, excludedFragmentIds);
+        return new FragmentPlan(Kind.LUCENE_AGGREGATE, filterSql, filterSubstrait, lanceClause, null, null, excludedFragmentIds);
     }
 
     /** The same plan with the pushed page dropped: the collector cuts the page over the same query. */
@@ -707,7 +859,7 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         if (topK == null) {
             return this;
         }
-        return new FragmentPlan(Kind.LUCENE_TOPK, filterSql, lanceClause, null, null, excludedFragmentIds);
+        return new FragmentPlan(Kind.LUCENE_TOPK, filterSql, filterSubstrait, lanceClause, null, null, excludedFragmentIds);
     }
 
     /**
@@ -722,7 +874,7 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         if (lanceClause == null) {
             return this;
         }
-        return new FragmentPlan(kind, null, null, topK, aggregate, excludedFragmentIds);
+        return new FragmentPlan(kind, null, null, null, topK, aggregate, excludedFragmentIds);
     }
 
     @Override
@@ -735,6 +887,7 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         }
         return kind == other.kind
             && Objects.equals(filterSql, other.filterSql)
+            && Arrays.equals(filterSubstrait, other.filterSubstrait)
             && Objects.equals(lanceClause, other.lanceClause)
             && Objects.equals(topK, other.topK)
             && Objects.equals(aggregate, other.aggregate)
@@ -743,7 +896,15 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
 
     @Override
     public int hashCode() {
-        return Objects.hash(kind, filterSql, lanceClause, topK, aggregate, Arrays.hashCode(excludedFragmentIds));
+        return Objects.hash(
+            kind,
+            filterSql,
+            Arrays.hashCode(filterSubstrait),
+            lanceClause,
+            topK,
+            aggregate,
+            Arrays.hashCode(excludedFragmentIds)
+        );
     }
 
     /** Names the kind and every set part, for the executor's debug log. */
@@ -752,6 +913,9 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         StringBuilder sb = new StringBuilder(kind.name());
         if (filterSql != null) {
             sb.append(" filter=").append(filterSql);
+        }
+        if (filterSubstrait != null) {
+            sb.append(" filterSubstraitBytes=").append(filterSubstrait.length);
         }
         if (lanceClause != null) {
             sb.append(" clause=").append(lanceClause.getWriteableName());
@@ -774,7 +938,10 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
 
     /**
      * The same parts {@link #toString} names, as JSON for the explain
-     * endpoint: {@code kind}, then {@code filter_sql}, {@code lance_clause}
+     * endpoint: {@code kind}, then {@code filter_sql},
+     * {@code filter_substrait_bytes} (the length of the Substrait
+     * encoding the scans evaluate, present only when the planner chose
+     * it), {@code lance_clause}
      * (the clause's query name), {@code top_k} ({@code orderings} with
      * {@code column} / {@code ascending} / {@code nulls_first},
      * {@code fetch}, {@code cursor_sql}), {@code aggregate}
@@ -790,6 +957,9 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         builder.field("kind", kind.name());
         if (filterSql != null) {
             builder.field("filter_sql", filterSql);
+        }
+        if (filterSubstrait != null) {
+            builder.field("filter_substrait_bytes", filterSubstrait.length);
         }
         if (lanceClause != null) {
             builder.field("lance_clause", lanceClause.getWriteableName());

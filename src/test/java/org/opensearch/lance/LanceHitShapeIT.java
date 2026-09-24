@@ -76,6 +76,128 @@ public class LanceHitShapeIT extends LanceRestTestCase {
         }
     }
 
+    /**
+     * The nested bool query of depth {@code depth} the Substrait filter
+     * test runs, and the rows of the twelve row multi fragment fixture
+     * it selects. Level {@code i} wraps the tree so far: in a
+     * {@code filter} with {@code id <= 11 - i / 4} when {@code i % 4 == 0},
+     * in a {@code should} with a {@code prefix} on {@code title}
+     * ({@code "cloudy"}, the odd rows) when {@code i % 4 == 1}, in a
+     * {@code filter} with a {@code must_not} on {@code body}
+     * ({@code "hello lance " + i}, one even row) when {@code i % 4 == 2},
+     * and in a {@code should} with {@code id >= 10} when {@code i % 4 == 3}.
+     * The tree crosses three columns and alternates conjunctions and
+     * disjunctions level by level (two conjunctions in a row would nest
+     * an AND inside an AND, which the translator does not flatten below
+     * the root), the shape whose SQL and Substrait spellings differ
+     * most.
+     */
+    private static String deepBoolQuery(int depth) {
+        String tree = "{\"range\":{\"id\":{\"gte\":1}}}";
+        for (int level = 0; level < depth; level++) {
+            switch (level % 4) {
+                case 0 -> tree = "{\"bool\":{\"filter\":[" + tree + ",{\"range\":{\"id\":{\"lte\":" + (11 - level / 4) + "}}}]}}";
+                case 1 -> tree = "{\"bool\":{\"should\":[" + tree + ",{\"prefix\":{\"title\":\"cloudy\"}}]}}";
+                case 2 -> tree = "{\"bool\":{\"filter\":["
+                    + tree
+                    + "],\"must_not\":[{\"wildcard\":{\"body\":\"hello lance "
+                    + level
+                    + "\"}}]}}";
+                default -> tree = "{\"bool\":{\"should\":[" + tree + ",{\"range\":{\"id\":{\"gte\":10}}}]}}";
+            }
+        }
+        return tree;
+    }
+
+    /** The ids the fixture rows {@link #deepBoolQuery} of {@code depth} selects, in id order. */
+    private static List<Integer> deepBoolExpected(int depth) {
+        List<Integer> selected = new java.util.ArrayList<>();
+        for (int id = 0; id < 12; id++) {
+            boolean matches = id >= 1;
+            for (int level = 0; level < depth; level++) {
+                switch (level % 4) {
+                    case 0 -> matches = matches && id <= 11 - level / 4;
+                    case 1 -> matches = matches || id % 2 == 1;
+                    case 2 -> matches = matches && !(id % 2 == 0 && id == level);
+                    default -> matches = matches || id >= 10;
+                }
+            }
+            if (matches) {
+                selected.add(id);
+            }
+        }
+        return selected;
+    }
+
+    public void testDeepMultiColumnBoolTreeRunsAsASubstraitFilter() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUpMultiFragment(12, 4, "substraitfilter")) {
+            String indexName = fixture.indexName();
+            int depth = 10;
+            String query = deepBoolQuery(depth);
+            List<Integer> expected = deepBoolExpected(depth);
+            assertTrue("the fixture predicate selects a proper subset: " + expected, expected.size() > 2 && expected.size() < 12);
+
+            // The count shape plans the filter into the scan; the
+            // planner picks the Substrait encoding and the plan carries
+            // the SQL next to the bytes.
+            String countBody = "{\"size\":0,\"query\":" + query + "}";
+            String explained = explainBody(indexName, countBody);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> countPlan = (Map<String, Object>) parseJson(explained).get("fragment_plan");
+            assertNotNull("the fragment route carries a plan: " + explained, countPlan);
+            assertEquals("LUCENE_COUNT", countPlan.get("kind"));
+            String filterSql = (String) countPlan.get("filter_sql");
+            assertNotNull("the SQL travels next to the bytes: " + explained, filterSql);
+            int substraitBytes = ((Number) countPlan.get("filter_substrait_bytes")).intValue();
+            assertTrue("the planner chose the Substrait encoding: " + explained, substraitBytes > 0);
+            assertTrue(
+                "the physical plan names the encoding: " + explained,
+                stringPath(explained, "physical").contains("substrait_bytes=")
+            );
+            logger.info(
+                "deep bool tree of depth {}: Lance SQL {} chars, Substrait {} bytes; sql={}",
+                depth,
+                filterSql.length(),
+                substraitBytes,
+                filterSql
+            );
+
+            // hits.total comes from the Substrait count scan.
+            String counted = readAll(postJson("/" + indexName + "/_search", countBody));
+            assertEquals(expected.size(), extractIntPath(counted, "hits", "total", "value"));
+            String count = readAll(postJson("/" + indexName + "/_count", "{\"query\":" + query + "}"));
+            assertEquals(expected.size(), extractIntPath(count, "count"));
+
+            // A page the top-k pushdown does not fold (a score sort next
+            // to a column sort) runs the same filter through Lucene's
+            // collector: the plan is a Lucene page whose scalar filter
+            // carries both encodings, and the hits are the expected rows.
+            String pageBody = "{\"size\":12,\"query\":" + query + ",\"sort\":[\"_score\",{\"id\":\"asc\"}]}";
+            @SuppressWarnings("unchecked")
+            Map<String, Object> pagePlan = (Map<String, Object>) parseJson(explainBody(indexName, pageBody)).get("fragment_plan");
+            assertEquals("LUCENE_TOPK", pagePlan.get("kind"));
+            assertEquals(filterSql, pagePlan.get("filter_sql"));
+            assertEquals(substraitBytes, ((Number) pagePlan.get("filter_substrait_bytes")).intValue());
+            List<Map<String, Object>> hits = hitsOf(readAll(postJson("/" + indexName + "/_search", pageBody)));
+            List<Integer> ids = new java.util.ArrayList<>();
+            for (Map<String, Object> hit : hits) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> source = (Map<String, Object>) hit.get("_source");
+                ids.add((Integer) source.get("id"));
+            }
+            assertEquals(expected, ids);
+
+            // The same predicate on the sorted page the pushdown folds
+            // takes the SQL encoding and agrees with the collector.
+            String sortedBody = "{\"size\":12,\"query\":" + query + ",\"sort\":[{\"id\":\"asc\"}]}";
+            @SuppressWarnings("unchecked")
+            Map<String, Object> sortedPlan = (Map<String, Object>) parseJson(explainBody(indexName, sortedBody)).get("fragment_plan");
+            assertEquals("PUSHED_SCAN", sortedPlan.get("kind"));
+            assertFalse("a pushed page takes SQL only: " + sortedPlan, sortedPlan.containsKey("filter_substrait_bytes"));
+            assertEquals(hits.size(), hitsOf(readAll(postJson("/" + indexName + "/_search", sortedBody))).size());
+        }
+    }
+
     public void testSearchAfterFoldsAndPagesLikeTheLuceneCollector() throws Exception {
         try (LanceTestCluster fixture = LanceTestCluster.setUpNullable("hitsafter")) {
             String indexName = fixture.indexName();

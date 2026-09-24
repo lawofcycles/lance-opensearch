@@ -99,7 +99,7 @@ public final class PlanTestFixtures {
     }
 
     /** The {@link #QUERY_SCHEMA} model with {@code id} as primary key, for the query translation fixtures. */
-    static LanceSchemas.IndexModel queryModel() {
+    public static LanceSchemas.IndexModel queryModel() {
         LinkedHashMap<String, String> bodySubs = new LinkedHashMap<>();
         bodySubs.put("raw", "keyword");
         return LanceSchemas.model("idx", QUERY_SCHEMA, Map.of("body", bodySubs), "id", () -> 512L);
