@@ -56,12 +56,15 @@ import org.opensearch.lance.query.ScanAdmission;
  * <p>The stream opens with {@link #WIRE_VERSION} (see
  * {@link WireVersion}): the stats are the whole payload of the per node
  * response {@link LanceStatsNodeResponse} carries back to the
- * coordinator, and a coordinator of another plugin version refuses
- * them by name before reading a figure.
+ * coordinator. Version 1 laid out every figure but the pruned fragment
+ * counter, which version 2 added as a block a coordinator of the
+ * previous plugin version steps over, so a mixed version cluster
+ * answers {@code GET /_lance/stats} without that counter instead of
+ * failing.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
-    /** The wire format's version, the first field written and the first read. */
+    /** The wire format's version, the first field written and the first read; 2 added the pruned fragment counter. */
     public static final int WIRE_VERSION = 2;
 
     private final boolean cacheEnabled;
@@ -479,7 +482,22 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     }
 
     public LanceNodeStats(StreamInput in) throws IOException {
-        WireVersion.read(in, "LanceNodeStats", WIRE_VERSION);
+        this(in, WIRE_VERSION);
+    }
+
+    /**
+     * Reads the stats as a coordinator whose plugin is at wire version
+     * {@code asVersion} would: the blocks of later versions are stepped
+     * over as {@link WireVersion.Reader} describes. The transport reads
+     * with {@link #WIRE_VERSION}; the mixed version tests read with the
+     * versions before it.
+     */
+    static LanceNodeStats read(StreamInput in, int asVersion) throws IOException {
+        return new LanceNodeStats(in, asVersion);
+    }
+
+    private LanceNodeStats(StreamInput in, int asVersion) throws IOException {
+        WireVersion.Reader reader = WireVersion.read(in, "LanceNodeStats", asVersion);
         this.cacheEnabled = in.readBoolean();
         this.snapshotCount = in.readVInt();
         this.retiredSnapshotCount = in.readVInt();
@@ -519,8 +537,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.planStatisticsCollectMillisTotal = in.readVLong();
         this.planRefinements = Collections.unmodifiableMap(in.readOrderedMap(StreamInput::readString, StreamInput::readVLong));
         this.planExecuted = Collections.unmodifiableMap(in.readOrderedMap(StreamInput::readString, StreamInput::readVLong));
-        this.planPrunedFragments = in.readVLong();
         this.freshness = new FreshnessStats(in);
+        this.planPrunedFragments = reader.block(2, StreamInput::readVLong, 0L);
+        reader.finish();
     }
 
     @Override
@@ -563,8 +582,10 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         out.writeVLong(planStatisticsCollectMillisTotal);
         out.writeMap(planRefinements, StreamOutput::writeString, StreamOutput::writeVLong);
         out.writeMap(planExecuted, StreamOutput::writeString, StreamOutput::writeVLong);
-        out.writeVLong(planPrunedFragments);
         freshness.writeTo(out);
+        // A coordinator that ignores the counter shows the stats
+        // without it, so the block is never critical.
+        WireVersion.writeBlock(out, false, o -> o.writeVLong(planPrunedFragments));
     }
 
     @Override

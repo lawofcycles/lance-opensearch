@@ -37,7 +37,7 @@ public final class LanceNamespacePollResponse extends ActionResponse implements 
 
     public LanceNamespacePollResponse(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceNamespacePollResponse", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceNamespacePollResponse", WIRE_VERSION);
         List<String> surfaced = in.readStringList();
         int skippedCount = in.readVInt();
         List<LanceNamespaceService.PollReport.SkippedTable> skipped = new ArrayList<>(skippedCount);
@@ -53,6 +53,7 @@ public final class LanceNamespacePollResponse extends ActionResponse implements 
         }
         Map<String, String> unavailable = in.readOrderedMap(StreamInput::readString, StreamInput::readString);
         this.report = new LanceNamespaceService.PollReport(surfaced, skipped, unavailable);
+        reader.finish();
     }
 
     @Override

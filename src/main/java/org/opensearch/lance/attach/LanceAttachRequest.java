@@ -111,7 +111,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
 
     public LanceAttachRequest(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceAttachRequest", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceAttachRequest", WIRE_VERSION);
         this.table = in.readString();
         this.indexName = in.readOptionalString();
         this.pinnedVersion = in.readOptionalLong();
@@ -124,6 +124,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         this.overrides = LanceOverrides.parse(in.readString());
         this.indexPlacement = in.readOptionalString();
         this.asyncDerive = in.readBoolean();
+        reader.finish();
     }
 
     @Override

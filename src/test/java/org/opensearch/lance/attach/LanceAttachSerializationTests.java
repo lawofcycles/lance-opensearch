@@ -5,7 +5,6 @@
 
 package org.opensearch.lance.attach;
 
-import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -15,11 +14,14 @@ import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.Strings;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.WireVersionTestSupport;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -179,7 +181,7 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
         assertTrue(json, json.contains("\"backfill\":{\"estimated_bytes\":123456789,\"spool_path\":\"none\",\"threads\":8}"));
     }
 
-    public void testRequestStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws Exception {
+    public void testRequestStreamOpensWithTheWireVersionAndANewerOptionalBlockIsSteppedOver() throws Exception {
         LanceAttachRequest original = new LanceAttachRequest("/tmp/demo.lance", null, null, null, null, null);
         // The marker follows the parent task id and the manager node
         // timeout the ClusterManagerNodeRequest base class writes.
@@ -191,22 +193,21 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceAttachRequest.WIRE_VERSION, in.readVInt());
             }
         }
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            TaskId.EMPTY_TASK_ID.writeTo(out);
-            out.writeTimeValue(ClusterManagerNodeRequest.DEFAULT_CLUSTER_MANAGER_NODE_TIMEOUT);
-            out.writeVInt(LanceAttachRequest.WIRE_VERSION + 1);
-            out.writeString("/tmp/demo.lance");
-            try (StreamInput in = out.bytes().streamInput()) {
-                IOException refused = expectThrows(IOException.class, () -> new LanceAttachRequest(in));
-                assertEquals(
-                    "LanceAttachRequest wire version [2] does not match this node's [1]: every node must run the same plugin version",
-                    refused.getMessage()
-                );
-            }
+        // The stream the next plugin version writes, with one optional
+        // block this version steps over.
+        Writeable prelude = o -> {
+            TaskId.EMPTY_TASK_ID.writeTo(o);
+            o.writeTimeValue(ClusterManagerNodeRequest.DEFAULT_CLUSTER_MANAGER_NODE_TIMEOUT);
+        };
+        BytesReference newer = WireVersionTestSupport.asNextVersion(original, prelude, false, o -> o.writeOptionalString("later"));
+        try (StreamInput in = newer.streamInput()) {
+            LanceAttachRequest restored = new LanceAttachRequest(in);
+            assertEquals(original.table(), restored.table());
+            assertEquals("the reader consumed the block", -1, in.read());
         }
     }
 
-    public void testResponseStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws Exception {
+    public void testResponseStreamOpensWithTheWireVersionAndANewerOptionalBlockIsSteppedOver() throws Exception {
         LanceAttachResponse original = new LanceAttachResponse("demo", "/tmp/demo.lance", 3L, 1L, 1, "id", "{}", List.of(), false, false);
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             original.writeTo(out);
@@ -214,16 +215,16 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceAttachResponse.WIRE_VERSION, in.readVInt());
             }
         }
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            out.writeVInt(LanceAttachResponse.WIRE_VERSION + 1);
-            out.writeString("demo");
-            try (StreamInput in = out.bytes().streamInput()) {
-                IOException refused = expectThrows(IOException.class, () -> new LanceAttachResponse(in));
-                assertEquals(
-                    "LanceAttachResponse wire version [2] does not match this node's [1]: every node must run the same plugin version",
-                    refused.getMessage()
-                );
-            }
+        BytesReference newer = WireVersionTestSupport.asNextVersion(
+            original,
+            WireVersionTestSupport.NO_PRELUDE,
+            false,
+            o -> o.writeVLong(9L)
+        );
+        try (StreamInput in = newer.streamInput()) {
+            LanceAttachResponse restored = new LanceAttachResponse(in);
+            assertEquals(original.index(), restored.index());
+            assertEquals("the reader consumed the block", -1, in.read());
         }
     }
 

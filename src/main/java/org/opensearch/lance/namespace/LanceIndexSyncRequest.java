@@ -32,7 +32,7 @@ public final class LanceIndexSyncRequest extends SingleShardRequest<LanceIndexSy
 
     public LanceIndexSyncRequest(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceIndexSyncRequest", WIRE_VERSION);
+        WireVersion.read(in, "LanceIndexSyncRequest", WIRE_VERSION).finish();
     }
 
     @Override

@@ -68,22 +68,30 @@ import java.util.Objects;
  * when the cheapest plan already met the demand or there was none).
  *
  * <p>The stream opens with {@link #WIRE_VERSION} (see
- * {@link WireVersion}); a reader that finds another number refuses the
- * response naming both. The plugin has no mixed version story, as the
- * backwards-compatibility policy on
- * {@link org.opensearch.lance.namespace.LanceNamespaceMetadata} spells
- * out; the marker makes a mismatch fail at the first field instead of
- * misreading the ones that follow.
+ * {@link WireVersion}). Version 1 carried the retired shard path route
+ * with a reasons list, and plan texts and traits that were always
+ * present; version 2 dropped the list and made those optional for the
+ * unsupported route. A reader of this version decodes a version 1
+ * stream by mapping a shard path answer to an unsupported one whose
+ * message is {@link #SHARD_PATH_RETIRED}, and reads a fragment answer
+ * field by field. The response travels from the node that planned the
+ * explain body to the node that received the REST call when they
+ * differ.
  */
 public final class LanceExplainResponse extends ActionResponse implements ToXContentObject {
 
     /**
      * The wire format's version, the first field written and the first
-     * read. Bumped when a field is added, removed or retyped; 2 dropped
-     * the reasons list of the retired fallback route and made the plan
-     * texts and the traits optional for the unsupported route.
+     * read. Bumped when a field is added; 2 dropped the reasons list of
+     * the retired fallback route and made the plan texts and the traits
+     * optional for the unsupported route, the last change to the base
+     * fields the format allows.
      */
     public static final int WIRE_VERSION = 2;
+
+    /** The {@code unplanned} message of a shard path answer read from a version 1 stream. */
+    public static final String SHARD_PATH_RETIRED =
+        "the node that planned this request routed it to OpenSearch's shard search, a route this plugin version no longer has";
 
     /** What happens to the request. */
     public enum Route {
@@ -286,15 +294,54 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
 
     public LanceExplainResponse(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceExplainResponse", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceExplainResponse", WIRE_VERSION, 2);
         this.index = in.readString();
-        this.route = in.readEnum(Route.class);
-        this.logical = in.readOptionalString();
-        this.physical = in.readOptionalString();
-        this.fragmentPlan = in.readOptionalWriteable(FragmentPlan::new);
-        this.unplanned = in.readOptionalString();
-        this.refinementsPossible = inReasonOrder(in.readList(input -> input.readEnum(FragmentPlanRefiner.Reason.class)));
-        this.traits = in.readBoolean() ? Traits.read(in) : null;
+        if (reader.marker() == 1) {
+            // Version 1 laid the response out for the retired shard path
+            // route: a reasons list after the route, plan texts and
+            // traits that were always present. A shard path answer
+            // becomes an unsupported answer, which is what the search
+            // endpoint does with such a body today; the reasons are
+            // constants of a type that no longer exists, so they are
+            // read past and the message names the route instead.
+            int routeOrdinal = in.readVInt();
+            int reasonCount = in.readVInt();
+            for (int i = 0; i < reasonCount; i++) {
+                in.readVInt();
+            }
+            String readLogical = in.readString();
+            String readPhysical = in.readString();
+            FragmentPlan readPlan = in.readOptionalWriteable(FragmentPlan::new);
+            String readUnplanned = in.readOptionalString();
+            List<FragmentPlanRefiner.Reason> readRefinements = in.readList(input -> input.readEnum(FragmentPlanRefiner.Reason.class));
+            Traits readTraits = Traits.read(in);
+            if (routeOrdinal == 0) {
+                this.route = Route.FRAGMENT;
+                this.logical = readLogical;
+                this.physical = readPhysical;
+                this.fragmentPlan = readPlan;
+                this.unplanned = readUnplanned;
+                this.refinementsPossible = inReasonOrder(readRefinements);
+                this.traits = readTraits;
+            } else {
+                this.route = Route.UNSUPPORTED;
+                this.logical = null;
+                this.physical = null;
+                this.fragmentPlan = null;
+                this.unplanned = SHARD_PATH_RETIRED;
+                this.refinementsPossible = List.of();
+                this.traits = null;
+            }
+        } else {
+            this.route = in.readEnum(Route.class);
+            this.logical = in.readOptionalString();
+            this.physical = in.readOptionalString();
+            this.fragmentPlan = in.readOptionalWriteable(FragmentPlan::new);
+            this.unplanned = in.readOptionalString();
+            this.refinementsPossible = inReasonOrder(in.readList(input -> input.readEnum(FragmentPlanRefiner.Reason.class)));
+            this.traits = in.readBoolean() ? Traits.read(in) : null;
+        }
+        reader.finish();
     }
 
     @Override

@@ -125,7 +125,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
 
     public LanceFragmentQueryResponse(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceFragmentQueryResponse", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceFragmentQueryResponse", WIRE_VERSION);
         this.matched = in.readVLong();
         this.matchedIsLowerBound = in.readBoolean();
         this.fragmentCount = in.readVInt();
@@ -141,6 +141,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         }
         this.aggregations = in.readBoolean() ? InternalAggregations.readFrom(in) : null;
         this.terminatedEarly = in.readOptionalBoolean();
+        reader.finish();
     }
 
     @Override

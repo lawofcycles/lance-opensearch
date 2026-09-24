@@ -134,7 +134,7 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
 
     public LanceAttachResponse(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceAttachResponse", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceAttachResponse", WIRE_VERSION);
         this.index = in.readString();
         this.table = in.readString();
         this.version = in.readLong();
@@ -146,6 +146,7 @@ public final class LanceAttachResponse extends ActionResponse implements ToXCont
         this.alreadyAttached = in.readBoolean();
         this.luceneBoundExceeded = in.readBoolean();
         this.backfill = in.readOptionalWriteable(Backfill::new);
+        reader.finish();
     }
 
     @Override

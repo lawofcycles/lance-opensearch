@@ -28,7 +28,7 @@ public final class LanceStatsNodeRequest extends TransportRequest {
 
     public LanceStatsNodeRequest(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceStatsNodeRequest", WIRE_VERSION);
+        WireVersion.read(in, "LanceStatsNodeRequest", WIRE_VERSION).finish();
     }
 
     @Override

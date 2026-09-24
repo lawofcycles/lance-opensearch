@@ -40,8 +40,9 @@ public final class LanceNamespaceUpdateResponse extends AcknowledgedResponse {
 
     public LanceNamespaceUpdateResponse(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceNamespaceUpdateResponse", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceNamespaceUpdateResponse", WIRE_VERSION);
         this.changed = in.readBoolean();
+        reader.finish();
     }
 
     @Override

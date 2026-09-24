@@ -111,7 +111,7 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
 
     public LanceNamespaceUpdateRequest(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceNamespaceUpdateRequest", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceNamespaceUpdateRequest", WIRE_VERSION);
         this.operation = Operation.values()[in.readVInt()];
         this.name = in.readString();
         this.type = in.readOptionalString();
@@ -119,6 +119,7 @@ public final class LanceNamespaceUpdateRequest extends ClusterManagerNodeRequest
         this.storageOptions = StorageOptions.readFromStream(in);
         this.config = in.readMap(StreamInput::readString, StreamInput::readString);
         this.overridesJson = in.readString();
+        reader.finish();
     }
 
     @Override

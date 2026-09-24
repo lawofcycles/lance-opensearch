@@ -298,7 +298,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
 
     public LanceFragmentQueryRequest(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceFragmentQueryRequest", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceFragmentQueryRequest", WIRE_VERSION);
         this.tableUri = in.readString();
         this.indexName = in.readString();
         this.storageOptions = StorageOptions.readFromStream(in);
@@ -345,6 +345,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             this.rescores = List.copyOf(readRescores);
         }
         this.collapse = in.readOptionalWriteable(CollapseBuilder::new);
+        reader.finish();
     }
 
     @Override

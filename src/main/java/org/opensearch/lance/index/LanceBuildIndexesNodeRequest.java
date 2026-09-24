@@ -35,9 +35,10 @@ public final class LanceBuildIndexesNodeRequest extends TransportRequest {
 
     public LanceBuildIndexesNodeRequest(StreamInput in) throws IOException {
         super(in);
-        WireVersion.read(in, "LanceBuildIndexesNodeRequest", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceBuildIndexesNodeRequest", WIRE_VERSION);
         this.request = new LanceBuildIndexesRequest(in);
         this.sourceVersion = in.readLong();
+        reader.finish();
     }
 
     @Override

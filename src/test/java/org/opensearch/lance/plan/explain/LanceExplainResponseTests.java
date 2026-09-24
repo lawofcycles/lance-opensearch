@@ -13,9 +13,12 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.WireVersion;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
 import org.opensearch.lance.plan.rel.MetricSpec;
@@ -37,8 +40,9 @@ import java.util.Set;
  * with every field, and the JSON carries the route, the refusal message
  * alone on the unsupported route, and the fragment plan, the unplanned
  * element, the predicted refinements and the traits object on the
- * fragment route. The stream opens with the wire version and a reader
- * refuses another one.
+ * fragment route. The stream opens with the wire version; a version 1
+ * stream is decoded with the retired route mapped to unsupported, and
+ * a newer optional block is stepped over.
  */
 public class LanceExplainResponseTests extends OpenSearchTestCase {
 
@@ -247,8 +251,16 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
         );
     }
 
-    public void testReaderRefusesAnotherWireVersion() throws IOException {
+    public void testStreamOpensWithTheWireVersionAndANewerOptionalBlockIsSteppedOver() throws IOException {
         LanceExplainResponse response = LanceExplainResponse.unsupported("demo", "no plan");
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            response.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                assertEquals(LanceExplainResponse.WIRE_VERSION, in.readVInt());
+            }
+        }
+        // The stream a version 3 node would write: today's fields and one
+        // optional block this version does not know.
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             out.writeVInt(LanceExplainResponse.WIRE_VERSION + 1);
             try (BytesStreamOutput rest = new BytesStreamOutput()) {
@@ -257,17 +269,105 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
                 assertEquals(LanceExplainResponse.WIRE_VERSION, written.readVInt());
                 out.writeBytes(written.readAllBytes());
             }
+            WireVersion.writeBlock(out, false, o -> o.writeString("a field of version 3"));
             try (StreamInput in = out.bytes().streamInput()) {
-                IOException refused = expectThrows(IOException.class, () -> new LanceExplainResponse(in));
-                assertEquals(
-                    "LanceExplainResponse wire version ["
-                        + (LanceExplainResponse.WIRE_VERSION + 1)
-                        + "] does not match this node's ["
-                        + LanceExplainResponse.WIRE_VERSION
-                        + "]: every node must run the same plugin version",
-                    refused.getMessage()
-                );
+                assertEquals(response, new LanceExplainResponse(in));
+                assertEquals("the reader consumed the block", -1, in.read());
             }
+        }
+    }
+
+    /**
+     * The stream a version 1 node writes: the route enum had
+     * {@code FRAGMENT} and {@code SHARD_PATH}, a reasons list followed
+     * the route, the plan texts and the traits were always present.
+     */
+    private static void writeVersion1(
+        BytesStreamOutput out,
+        int routeOrdinal,
+        int[] reasonOrdinals,
+        String logical,
+        String physical,
+        Writeable plan,
+        String unplanned,
+        List<FragmentPlanRefiner.Reason> refinements,
+        LanceExplainResponse.Traits traits
+    ) throws IOException {
+        out.writeVInt(1);
+        out.writeString("demo");
+        out.writeVInt(routeOrdinal);
+        out.writeVInt(reasonOrdinals.length);
+        for (int ordinal : reasonOrdinals) {
+            out.writeVInt(ordinal);
+        }
+        out.writeString(logical);
+        out.writeString(physical);
+        out.writeOptionalWriteable(plan);
+        out.writeOptionalString(unplanned);
+        out.writeCollection(refinements, StreamOutput::writeEnum);
+        traits.writeTo(out);
+    }
+
+    private static LanceExplainResponse read(BytesStreamOutput out) throws IOException {
+        try (
+            StreamInput raw = out.bytes().streamInput();
+            NamedWriteableAwareStreamInput in = new NamedWriteableAwareStreamInput(raw, REGISTRY)
+        ) {
+            LanceExplainResponse response = new LanceExplainResponse(in);
+            assertEquals("the reader consumed the whole response", -1, in.read());
+            return response;
+        }
+    }
+
+    public void testMixedPluginVersionAVersion1FragmentAnswerReadsFieldByField() throws IOException {
+        FragmentPlan plan = FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, "rating = 5");
+        // A version 1 node ships a version 1 plan inside its answer.
+        Writeable version1Plan = o -> {
+            o.writeVInt(1);
+            o.writeEnum(FragmentPlan.Kind.LUCENE_TOPK);
+            o.writeOptionalString("rating = 5");
+            o.writeOptionalNamedWriteable(null);
+            o.writeOptionalWriteable(null);
+            o.writeOptionalWriteable(null);
+        };
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            writeVersion1(
+                out,
+                0,
+                new int[0],
+                "logical",
+                "physical",
+                version1Plan,
+                "collapse",
+                List.of(FragmentPlanRefiner.Reason.SORT_FIELD_TYPE),
+                NO_DEMAND
+            );
+            LanceExplainResponse response = read(out);
+            assertEquals(
+                LanceExplainResponse.fragment(
+                    "demo",
+                    "logical",
+                    "physical",
+                    plan,
+                    "collapse",
+                    List.of(FragmentPlanRefiner.Reason.SORT_FIELD_TYPE),
+                    NO_DEMAND
+                ),
+                response
+            );
+        }
+    }
+
+    public void testMixedPluginVersionAVersion1ShardPathAnswerBecomesUnsupported() throws IOException {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            writeVersion1(out, 1, new int[] { 0, 2 }, "logical", "physical", null, null, List.of(), NO_DEMAND);
+            LanceExplainResponse response = read(out);
+            assertEquals(LanceExplainResponse.unsupported("demo", LanceExplainResponse.SHARD_PATH_RETIRED), response);
+            Map<String, Object> json = json(response);
+            assertEquals("unsupported", json.get("route"));
+            assertEquals(LanceExplainResponse.SHARD_PATH_RETIRED, json.get("unplanned"));
+            assertFalse("no plan texts on the unsupported route: " + json, json.containsKey("logical"));
+            assertFalse("no traits on the unsupported route: " + json, json.containsKey("traits"));
         }
     }
 }
