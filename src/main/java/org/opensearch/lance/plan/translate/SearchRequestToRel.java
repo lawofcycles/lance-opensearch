@@ -22,9 +22,7 @@ import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.LanceFtsMatch;
 import org.opensearch.lance.plan.rel.LanceHitShape;
 import org.opensearch.lance.plan.rel.LanceKnnSearch;
-import org.opensearch.lance.plan.rel.LanceShardPathShape;
 import org.opensearch.lance.plan.rel.LanceTopK;
-import org.opensearch.lance.plan.rel.ShardPathReason;
 import org.opensearch.lance.plan.rel.physical.FanOutExec;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
 import org.opensearch.lance.plan.rules.SortResolution;
@@ -87,6 +85,13 @@ import java.util.List;
  * but an explicit bound demands an exact count of the plan, which the
  * coordinator's planner turns into an {@code Accuracy} requirement
  * ({@link ExecutionShape#exactCount()}).
+ *
+ * <p>Two envelope elements have no plan under any entry: {@code suggest}
+ * and {@code highlight}. {@link #checkEnvelopeSupported} refuses a body
+ * carrying one before the coordinator translates it, and
+ * {@link #unsupportedElement} names the refused element for the explain
+ * endpoint; the runtime's 400 and the explain endpoint's
+ * {@code unplanned} carry the same message.
  */
 public final class SearchRequestToRel {
 
@@ -536,55 +541,48 @@ public final class SearchRequestToRel {
     }
 
     /**
-     * Translates one search body for the dispatch decision: whether the
-     * fragment fan-out or the standard shard search path serves it. The
-     * result is the index's bare scan when the fragment path can answer
-     * the request's envelope, or the scan wrapped in a
-     * {@link LanceShardPathShape} carrying the {@link ShardPathReason}s
-     * when the body holds an element only the shard path serves.
-     * {@code LancePlannerFactory.plan} then answers the shard path tree
-     * with a {@code ShardPathFallbackExec} root, which is the routing
-     * decision the dispatch filter reads.
-     *
-     * <p>Unlike {@link #translate}, nothing here throws for an
-     * unsupported element: the fragment path accepts every query type
-     * and most envelope elements by shipping the request to the
-     * per-node executors as OpenSearch builders, so a shape this
-     * translator cannot spell in relational form is still
-     * dispatchable. Only the elements {@link #shardPathReasons} names
-     * route away. The query tree itself plays no part in the decision,
-     * so the scan stays bare instead of carrying it.
+     * The message the coordinator refuses {@code source} with when the
+     * body carries an element no plan of the fragment path answers, or
+     * null when every element has a plan. Two elements have none:
+     * {@code suggest} and {@code highlight}, which need full text APIs
+     * (candidate terms, term positions in the stored text) the Lance
+     * Java SDK does not surface. {@code suggest} is checked first, so a
+     * body carrying both is refused for its suggester. The search
+     * endpoint answers the message as 400
+     * ({@link #checkEnvelopeSupported}); the explain endpoint reports
+     * the same message under {@code unplanned} with the route
+     * {@code unsupported}, so the two agree on which bodies have no
+     * plan.
      *
      * @param source the parsed search body; null stands for an empty
-     *     body and is dispatchable
+     *     body, which every plan answers
      */
-    public static RelNode translateDispatch(SearchSourceBuilder source, LanceSchemas.IndexModel model, LancePlannerFactory factory) {
-        List<ShardPathReason> reasons = shardPathReasons(source);
-        RelNode scan = scanBuilder(model, factory).build();
-        if (reasons.isEmpty()) {
-            return scan;
+    public static String unsupportedElement(SearchSourceBuilder source) {
+        if (source == null) {
+            return null;
         }
-        return new LanceShardPathShape(scan.getCluster(), scan.getCluster().traitSetOf(Convention.NONE), scan, reasons);
+        if (source.suggest() != null) {
+            return "search body carries a `suggest` clause which needs full-text APIs Lance does not surface. See `docs/limitations.md`.";
+        }
+        if (source.highlighter() != null) {
+            return "search body carries a `highlight` clause which needs full-text APIs Lance does not surface.";
+        }
+        return null;
     }
 
     /**
-     * The request elements of {@code source} only the shard path
-     * serves, in the fixed order the checks run; empty when the
-     * fragment fan-out can answer the envelope. Each check's rationale
-     * is on its {@link ShardPathReason} constant.
+     * Refuses a search body carrying an element no plan answers with
+     * {@link IllegalArgumentException} carrying
+     * {@link #unsupportedElement}'s message, which the search endpoint
+     * reports as 400. The coordinator calls this before it resolves a
+     * target or opens a table, so the refusal costs nothing but the
+     * body's parse. A body every plan answers passes.
      */
-    public static List<ShardPathReason> shardPathReasons(SearchSourceBuilder source) {
-        if (source == null) {
-            return List.of();
+    public static void checkEnvelopeSupported(SearchSourceBuilder source) {
+        String unsupported = unsupportedElement(source);
+        if (unsupported != null) {
+            throw new IllegalArgumentException(unsupported);
         }
-        List<ShardPathReason> reasons = new ArrayList<>();
-        if (source.suggest() != null) {
-            reasons.add(ShardPathReason.SUGGEST);
-        }
-        if (source.highlighter() != null) {
-            reasons.add(ShardPathReason.HIGHLIGHT);
-        }
-        return reasons;
     }
 
     /**

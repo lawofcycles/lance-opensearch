@@ -55,7 +55,10 @@ import java.util.Set;
  * A filtered {@code lance_knn} is the exception: its filter is a
  * prefilter by contract and silently dropping it would return wrong
  * nearest rows, so the request is refused with the 400 the executor
- * used to answer.
+ * used to answer. A body carrying {@code suggest} or {@code highlight}
+ * never reaches the planner either: no plan answers those elements,
+ * and the coordinator refuses the body before it builds the shape
+ * ({@link SearchRequestToRel#checkEnvelopeSupported}).
  *
  * <p>Two request elements select no plan structure but a trait the plan
  * root must declare ({@code requirementOf}): an explicit

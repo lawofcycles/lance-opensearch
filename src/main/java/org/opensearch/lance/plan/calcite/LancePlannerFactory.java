@@ -34,7 +34,6 @@ import org.opensearch.lance.plan.rules.CoordinatorLayerRules;
 import org.opensearch.lance.plan.rules.FuseFtsWithFilter;
 import org.opensearch.lance.plan.rules.FuseKnnWithFilter;
 import org.opensearch.lance.plan.rules.LanceToLuceneConverterRule;
-import org.opensearch.lance.plan.rules.PlanToShardPathRule;
 import org.opensearch.lance.plan.rules.PushAggregateIntoLanceScan;
 import org.opensearch.lance.plan.rules.PushFilterIntoLanceScan;
 import org.opensearch.lance.plan.rules.PushSortLimitIntoLanceScan;
@@ -122,9 +121,6 @@ public final class LancePlannerFactory {
         for (RelOptRule rule : CoordinatorLayerRules.rules()) {
             planner.addRule(rule);
         }
-        for (RelOptRule rule : PlanToShardPathRule.rules()) {
-            planner.addRule(rule);
-        }
         RelOptCluster cluster = RelOptCluster.create(planner, new RexBuilder(new SqlTypeFactoryImpl(LanceTypeSystem.INSTANCE)));
         cluster.setMetadataProvider(LanceRelMetadataProvider.INSTANCE);
         return cluster;
@@ -158,21 +154,13 @@ public final class LancePlannerFactory {
      * milliseconds, so the answer depends on the table size, the node
      * count and the storage kind; for a smaller table, and for every
      * hits tree, the Lucene operator's constant is pinned above the
-     * handoff so the Lance form wins whenever both exist. A tree the
-     * translator marked with a
-     * {@link org.opensearch.lance.plan.rel.LanceShardPathShape} has no
-     * form under either of those conventions; for such a tree the
-     * planner is asked again with {@link ShardPathConvention} demanded
-     * at the root, and the best plan arrives as the
-     * {@code ShardPathFallbackExec} the shard path rule produced, whose
-     * presence at the root is the routing decision the dispatch filter
-     * reads. When neither form exists (a query tree
-     * without a top-k or aggregate that no rule fused), or when the
-     * planner fails for any other reason, the logical plan itself is
-     * returned: the caller reads the root's type to see what was
-     * planned, and the fragment routing promises a Lucene fallback for
-     * every plan it does not push, so a planner failure must not
-     * surface as a request error.
+     * handoff so the Lance form wins whenever both exist. When neither
+     * form exists (a query tree without a top-k or aggregate that no
+     * rule fused), or when the planner fails for any other reason, the
+     * logical plan itself is returned: the caller reads the root's type
+     * to see what was planned, and the fragment routing promises a
+     * Lucene fallback for every plan it does not push, so a planner
+     * failure must not surface as a request error.
      */
     public RelNode plan(RelNode logical, CostInputs inputs) {
         return plan(logical, inputs, PlanRequirement.NONE);
@@ -192,10 +180,9 @@ public final class LancePlannerFactory {
      * {@code CannotPlanException} and this method raises
      * {@link UnmetPlanRequirementException} naming the demand and what
      * the cheapest plan offers, which the caller answers as the
-     * request's error. The convention fallbacks of the first pass (the
-     * shard path root, the logical plan) are untouched: they are only
-     * reached when nothing plans at all, and a demand never turns them
-     * into an error.
+     * request's error. The logical plan the first pass falls back to
+     * is untouched: it is only reached when nothing plans at all, and a
+     * demand never turns it into an error.
      *
      * @throws UnmetPlanRequirementException when a plan exists but none
      *     declares the demanded traits
@@ -208,11 +195,10 @@ public final class LancePlannerFactory {
      * The best plan together with how the demand was met: whether the
      * first pass already satisfied it, or the second pass replaced the
      * cheapest plan with one declaring the demanded traits
-     * ({@link TraitEnforcement#fired()}). The convention fallbacks (the
-     * shard path root, the logical plan) report
-     * {@link TraitEnforcement#satisfied} for the requirement, as
-     * {@link #plan(RelNode, CostInputs, PlanRequirement)} never turns
-     * them into an error.
+     * ({@link TraitEnforcement#fired()}). The logical plan the first
+     * pass falls back to reports {@link TraitEnforcement#satisfied} for
+     * the requirement, as {@link #plan(RelNode, CostInputs, PlanRequirement)}
+     * never turns it into an error.
      *
      * @param plan the best plan, the pushed scan unwrapped from its handoff
      * @param enforcement how the requirement was met
@@ -241,7 +227,7 @@ public final class LancePlannerFactory {
         try {
             best = planner.findBestExp();
         } catch (RelOptPlanner.CannotPlanException noLucenePlan) {
-            return new PlanOutcome(shardPathPlan(planner, logical), TraitEnforcement.satisfied(requirement));
+            return new PlanOutcome(logical, TraitEnforcement.satisfied(requirement));
         } catch (RuntimeException plannerFailure) {
             LOGGER.warn(
                 "lance.plan: Volcano planning failed, keeping the logical plan: {}: {}",
@@ -265,31 +251,6 @@ public final class LancePlannerFactory {
     /** The scan itself for a plan that arrived as the zero cost handoff over it, {@code best} otherwise. */
     private static RelNode unwrapHandoff(RelNode best) {
         return best instanceof LuceneHandoffExec handoff ? handoff.getInput() : best;
-    }
-
-    /**
-     * The second demand of {@link #plan}: no Lucene form exists, so ask
-     * for a {@link ShardPathConvention} root. The Volcano planner keeps
-     * every alternative the first pass registered, so this re-plans the
-     * same cluster with a new root subset rather than starting over.
-     * When no shard path form exists either, or when the planner fails
-     * for any other reason, the logical plan itself is returned, as
-     * {@link #plan} promises.
-     */
-    private RelNode shardPathPlan(VolcanoPlanner planner, RelNode logical) {
-        try {
-            planner.setRoot(planner.changeTraits(logical, logical.getTraitSet().replace(ShardPathConvention.INSTANCE)));
-            return planner.findBestExp();
-        } catch (RelOptPlanner.CannotPlanException nothingPlanned) {
-            return logical;
-        } catch (RuntimeException plannerFailure) {
-            LOGGER.warn(
-                "lance.plan: shard path planning failed, keeping the logical plan: {}: {}",
-                plannerFailure.getClass().getName(),
-                plannerFailure.getMessage()
-            );
-            return logical;
-        }
     }
 
     /** A fresh Hep planner over an empty program; no rules exist to run yet. */
