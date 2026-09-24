@@ -84,7 +84,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
     /**
      * Whether the executor stopped collecting at the request's
      * {@code terminate_after}: {@code null} when the request carried
-     * none, otherwise the flag the shard path reports per shard as
+     * none, otherwise the flag the stock search path reports per shard as
      * {@code terminated_early}. The coordinator ORs the flags of every
      * executor into the response.
      */

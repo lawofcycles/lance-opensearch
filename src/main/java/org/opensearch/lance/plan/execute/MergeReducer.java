@@ -70,13 +70,13 @@ public final class MergeReducer {
     // append/rewrite, not per-doc versioned), so populated
     // values are constant: version=1, seqNo=0, primaryTerm=1.
     // The flags exist so the coordinator only stamps hits when
-    // the caller explicitly asked, matching shard path
+    // the caller explicitly asked, matching stock search path
     // behaviour where these fields default off.
     private final boolean versionRequested;
     private final boolean seqNoAndPrimaryTermRequested;
     // Whether the request asked for track_scores; with a sort that is
     // not score ordered it decides whether max_score is reported, as
-    // the shard path's TopDocsCollectorContext decides it.
+    // the stock search path's TopDocsCollectorContext decides it.
     private final boolean trackScores;
     // track_total_hits bound the executors counted up to; decides
     // the hits.total relation in buildResponse.
@@ -97,7 +97,7 @@ public final class MergeReducer {
     // terminated_early of the response: null (left out of the
     // response) unless an executor reported the flag, which only
     // happens when the request carried terminate_after; then true
-    // when any executor stopped early, as the shard path reports the
+    // when any executor stopped early, as the stock search path reports the
     // flag when any shard did.
     private Boolean terminatedEarly = null;
     // One entry per per-node response, in fan-out order (target
@@ -286,13 +286,13 @@ public final class MergeReducer {
             int end = Math.min(hits.size(), from + size);
             paged = hits.subList(from, end).toArray(new SearchHit[0]);
         }
-        // max_score follows the shard path's TopDocsCollectorContext: a
+        // max_score follows the stock search path's TopDocsCollectorContext: a
         // score ordered page (no sort, or a leading descending _score
         // clause) reports its top score, a sort with track_scores the
         // largest score of the merged window, and any other sort NaN,
         // although its hits carry a score when a _score clause sits
         // among the sort clauses. The window is read before the from
-        // cut, as the shard path reads each shard's top docs before the
+        // cut, as the stock search path reads each shard's top docs before the
         // coordinator skips from (a rescored page reports the best
         // rescored score whatever from is). NaN also when no hit
         // survives the merge.
@@ -318,7 +318,7 @@ public final class MergeReducer {
             // coordinator calls topLevelReduce. The context is the
             // final one, with the request's pipeline tree, as
             // SearchService.aggReduceContextBuilder builds it for the
-            // shard path's SearchPhaseController: topLevelReduce then
+            // stock search path's SearchPhaseController: topLevelReduce then
             // runs the parent pipelines (cumulative_sum, derivative,
             // bucket_sort, ...) inside each reduced tree and the
             // sibling pipelines (avg_bucket, stats_bucket, ...) over
@@ -339,7 +339,7 @@ public final class MergeReducer {
         // so there is no failed shard to count; the coordinator's
         // WARN log names the node, the fragment count and the
         // timeout. Aggregations are the reduce of the nodes that
-        // answered, as on the shard path. terminated_early is left
+        // answered, as on the stock search path. terminated_early is left
         // out unless the request carried terminate_after.
         SearchResponseSections sections = new SearchResponseSections(searchHits, aggregations, null, timedOut, terminatedEarly, null, 1);
         // Hide the Lance fragment fan-out from the response
@@ -367,7 +367,7 @@ public final class MergeReducer {
     /**
      * Whether the page is in score order: no sort clause, or a leading
      * {@code _score} clause in its default descending direction (the
-     * {@code SortField.FIELD_SCORE} the shard path reads the top score
+     * {@code SortField.FIELD_SCORE} the stock search path reads the top score
      * from).
      */
     private static boolean scoreOrdered(List<SortBuilder<?>> sorts) {
@@ -451,10 +451,10 @@ public final class MergeReducer {
      * survives, which is the group's best hit under the request's sort
      * across every executor, and the rest of the group is dropped. This
      * is the walk {@code CollapseTopFieldDocs.merge} does over the
-     * shards' collapsed pages on the shard path, with the merged order
+     * shards' collapsed pages on the stock search path, with the merged order
      * standing in for its priority queue. The value is read from the
      * doc value field the executor's fetch phase added for the collapse
-     * field (the same field the shard path's response carries); a hit
+     * field (the same field the stock search path's response carries); a hit
      * without a value belongs to the group of the missing value, as it
      * does in the collapsing collector.
      */
@@ -594,7 +594,7 @@ public final class MergeReducer {
      * Lance picks among tied rows differently on every executor, the
      * shares can add up to less than the bound even though every scan
      * filled. Clients read {@code gte} with the bound as "more than the
-     * bound" (the shard path never reports a smaller value with
+     * bound" (the stock search path never reports a smaller value with
      * {@code gte}), so the sum is only reported when it is exact.
      *
      * @param totalMatched sum of the per-node matched counts

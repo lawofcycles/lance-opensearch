@@ -24,7 +24,7 @@ import java.util.Locale;
  * <ul>
  *   <li>{@link #STABLE_ROWADDR}: rows come in Lance row address order,
  *   the order of a bare scan and of a page without a sort over a scalar
- *   query. The shard path's answer (Lucene doc order over the whole
+ *   query. The stock search path's answer (Lucene doc order over the whole
  *   table reader) is the same order.</li>
  *   <li>{@link #STABLE_KEY}: rows come in the order of a stored column,
  *   with ties resolved by the executor the same way on every call (the

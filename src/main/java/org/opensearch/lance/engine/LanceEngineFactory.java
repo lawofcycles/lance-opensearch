@@ -73,10 +73,10 @@ import org.opensearch.lance.StorageOptions;
  *   <li>Refresh lifecycle: {@link Engine#refresh(String)} advances the
  *       shared reader when the Lance manifest version advances, so the
  *       fragment executors that open per-fragment leaves see the latest
- *       version. The reader is also the safety net for the handful of
- *       {@code _search} shapes that {@code LanceDispatchActionFilter}
- *       falls through to the shard path ({@code suggest},
- *       {@code highlighter}, {@code search_after} without {@code sort}).</li>
+ *       version. The reader also serves {@code GET /_doc/{id}},
+ *       {@code _stats}, and a {@code _search} whose target mixes a
+ *       Lance backed index with an ordinary one, which the dispatch
+ *       filter leaves to the stock search action.</li>
  * </ul>
  *
  * <p>Under the hood, the empty Lucene commit created at shard bootstrap
@@ -1148,7 +1148,7 @@ public final class LanceEngineFactory implements EngineFactory {
          * again after the next {@code POST /_lance/build_indexes}. A build
          * commit into the current clone (the clone's own latest version
          * moved past the version the reader holds) swaps the reader so GET
-         * and the shard-path shapes see the new indexes; the served base
+         * and the mixed target searches see the new indexes; the served base
          * version does not change in that case.
          */
         private OpenSearchDirectoryReader refreshNodeLocal(OpenSearchDirectoryReader referenceToRefresh, long sourceTarget)

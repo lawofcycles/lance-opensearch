@@ -39,7 +39,7 @@ import org.opensearch.common.lucene.MinimumScoreCollector;
  * collectors it obtained from the manager itself, since the searcher
  * never reached {@code reduce}. A collector that answers its count from
  * {@code Weight.count} (Lucene's {@code TotalHitCountCollector} over
- * {@code match_all}) keeps that count: the shard path reports the full
+ * {@code match_all}) keeps that count: the stock search path reports the full
  * count next to {@code terminated_early: true} for a {@code size: 0}
  * request, and this composition does the same.
  *

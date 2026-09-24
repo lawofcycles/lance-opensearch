@@ -92,14 +92,14 @@ import org.opensearch.common.unit.TimeValue;
  * and {@link #partialOnShard()} carry the executor's slice count into the
  * searcher and the aggregators so a request collects its fragments on
  * several threads and merges the slice results the way concurrent
- * segment search does on the shard path. The fetch side
+ * segment search does on the stock search path. The fetch side
  * ({@link #fetchSourceContext()}, {@link #storedFieldsContext()},
  * {@link #docValuesContext()}, {@link #fetchFieldsContext()},
  * {@link #explain()}, {@link #rescore()}, {@link #collapse()},
  * {@link #highlight()} null)
  * answers as {@code DefaultSearchContext} does for the same body, so the
  * stock fetch sub phases {@link FragmentFetchPhase} drives render the
- * hits the shard path would.
+ * hits the stock search path would.
  * Every other {@link SearchContext} method throws
  * {@link UnsupportedOperationException} naming the method on purpose: if
  * a code path the fragment handler drives ever needs one (the highlight
@@ -305,7 +305,7 @@ public final class LanceFragmentSearchContext extends SearchContext {
      * explanation over the query's for the hits the rescorer saw;
      * {@link #collapse()} makes the fetch phase add the collapse field
      * as a doc value field of every hit, the way {@code FetchContext}
-     * does on the shard path.
+     * does on the stock search path.
      */
     public LanceFragmentSearchContext withSecondPass(List<RescoreContext> rescore, CollapseContext collapse) {
         this.rescore = rescore == null ? List.of() : List.copyOf(rescore);

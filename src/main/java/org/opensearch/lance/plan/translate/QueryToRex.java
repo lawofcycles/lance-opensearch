@@ -220,7 +220,7 @@ public final class QueryToRex {
             Target target = resolve(regexp.fieldName(), context, relBuilder);
             requireStringColumn(target, "regexp", regexp.fieldName(), context);
             // Same flag handling as RegexpQueryBuilder.doToQuery, so the
-            // shard path and this translator agree on which Lucene
+            // stock search path and this translator agree on which Lucene
             // operators the pattern may use and on case folding.
             int syntaxFlags = regexp.flags() & (RegExp.ALL | RegExp.DEPRECATED_COMPLEMENT);
             boolean caseInsensitive = regexp.caseInsensitive();
@@ -438,7 +438,7 @@ public final class QueryToRex {
 
     /**
      * Refuses a pattern query on a column that is not a string: the
-     * shard path answers those with 400 from the field type, and
+     * stock search path answers those with 400 from the field type, and
      * lowering them would hand DataFusion a pattern call on a numeric
      * column and surface its planning error instead.
      */
@@ -808,7 +808,7 @@ public final class QueryToRex {
      * {@code columns}, or a dotted child of one. The callers that turn
      * a translated predicate into executable Lance SQL use this as a
      * pre-flight for the {@code ip} and {@code geo_point} override
-     * columns: an ip column stores raw strings while the shard path
+     * columns: an ip column stores raw strings while the stock search path
      * compares 16 byte encoded forms, and a geo column's children are
      * hidden by the geo_point mapping, so no predicate on them may
      * travel to Lance SQL and the caller keeps the query on the Lucene
