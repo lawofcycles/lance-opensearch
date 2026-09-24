@@ -537,8 +537,7 @@ convention operators with fan-out and merge as plan operators, then the cost mod
 measured aggregation shapes, then the two stage
 planning that ships the per node plan from the coordinator and the node local refinement of the
 plan on column store warmth, then accuracy and tie-stability as planner traits a request can
-demand, then the traits and costs printed by the explain endpoint. The CHANGELOG tracks what has
-landed.
+demand, then the traits and costs printed by the explain endpoint.
 
 ## Memory
 
@@ -639,7 +638,6 @@ In this repository:
 - [features.md](features.md) — what each surface does, by concern.
 - [limitations.md](limitations.md) — known gaps and refused shapes.
 - [getting-started.md](getting-started.md) — end-to-end walkthrough.
-- [CHANGELOG.md](../CHANGELOG.md) — what has landed, release by release.
 - [design/namespace-freshness.md](design/namespace-freshness.md) — why freshness runs on the
   node holding the shard, and where the mapping goes from here.
 - Class Javadoc — the per-file reference this document deliberately stops short of.

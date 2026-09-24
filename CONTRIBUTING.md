@@ -8,7 +8,6 @@ OpenSearch Lance is a community project that is built and maintained by people j
 - [Ways to Contribute](#ways-to-contribute)
 - [Developer Certificate of Origin](#developer-certificate-of-origin)
 - [License Headers](#license-headers)
-- [Changelog](#changelog)
 - [Pull Request Template](#pull-request-template)
 - [Review Process](#review-process)
 - [Security Issues](#security-issues)
@@ -129,36 +128,6 @@ New files in your code contributions should contain the following license header
 # Copyright OpenSearch Contributors
 # SPDX-License-Identifier: Apache-2.0
 ```
-
-## Changelog
-
-This repository keeps a version specific changelog in [CHANGELOG.md](CHANGELOG.md), following the [Keep A Changelog](https://keepachangelog.com/en/1.0.0/) format. The purpose of the changelog is for the contributors to incrementally build the release notes throughout the development process to avoid a painful and error-prone process of attempting to compile the release notes at release time. On each release the unreleased entries are assembled into a new release block of `CHANGELOG.md`.
-
-### Which changes require a changelog entry?
-
-Changelogs are intended for operators/administrators, developers integrating with the plugin, and end-users interacting with the REST API (collectively referred to as "user"). In short, any change that a user of the plugin might want to be aware of should be included in the changelog. The changelog is _not_ intended to replace the git commit log that developers of the plugin itself rely upon. The following are some examples of changes that should be in the changelog:
-
-- A newly added feature
-- A fix for a user-facing bug
-- Dependency updates
-- Fixes for security issues
-
-The following are some examples where a changelog entry is not necessary:
-
-- Adding, modifying, or fixing tests
-- An incremental PR for a larger feature (such features should include _one_ changelog entry for the feature)
-- Documentation typo fixes or code refactoring
-- Build-related changes
-
-### How to add my changes to the changelog?
-
-Do **not** edit `CHANGELOG.md` directly. Every pull request records its entry as a fragment file instead, so that parallel pull requests do not conflict on the same lines. The rules are in [`changelog/unreleased/README.md`](changelog/unreleased/README.md); in short:
-
-1. Create `changelog/unreleased/<section>/<topic>.md`, where `<section>` is one of `features`, `changed`, `fixed`, `infrastructure`, `documentation`, `maintenance`, `testing` and `<topic>` is a short name for your change (usually your branch name).
-2. Write one or more markdown list items in the file in the style of the existing `CHANGELOG.md` entries: what changed, why, and what a user observes. Put the issue reference at the end of the item as `(#N)`.
-3. Commit the fragment together with your change.
-
-A pull request that does not add a fragment fails the `changelog` workflow. If no changelog entry is required, apply the `skip-changelog` label to the pull request, or put a line reading only `skip-changelog` in its description, and the workflow passes.
 
 ## Pull Request Template
 
