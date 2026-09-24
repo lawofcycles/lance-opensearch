@@ -32,7 +32,6 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.index.mapper.DateFieldMapper;
-import org.opensearch.lance.dispatch.LanceAggregationSupport;
 import org.opensearch.lance.plan.calcite.LanceOperatorTable;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.rel.BucketSpec;
@@ -51,6 +50,7 @@ import org.opensearch.search.aggregations.bucket.composite.TermsValuesSourceBuil
 import org.opensearch.search.aggregations.bucket.filter.FilterAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.filter.FiltersAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.filter.FiltersAggregator;
+import org.opensearch.search.aggregations.bucket.global.GlobalAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.histogram.Histogram;
@@ -60,6 +60,9 @@ import org.opensearch.search.aggregations.bucket.range.AbstractRangeBuilder;
 import org.opensearch.search.aggregations.bucket.range.DateRangeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.range.RangeAggregator;
 import org.opensearch.search.aggregations.bucket.terms.IncludeExclude;
+import org.opensearch.search.aggregations.bucket.terms.RareTermsAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.terms.SignificantTermsAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.terms.SignificantTextAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregator;
 import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
@@ -72,6 +75,7 @@ import org.opensearch.search.aggregations.metrics.PercentilesAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.PercentilesConfig;
 import org.opensearch.search.aggregations.metrics.StatsAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.SumAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.TopHitsAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.ValueCountAggregationBuilder;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
 import org.opensearch.search.sort.SortOrder;
@@ -107,12 +111,18 @@ import java.util.Map;
  * does not model ride along as {@link BucketSpec} / {@link MetricSpec}.
  *
  * <p>Every shape the pushdown refuses throws
- * {@link UnsupportedOperationException} naming the element; the explain
- * endpoint reports the message as a 400. Field resolution follows the
+ * {@link UnsupportedOperationException} naming the element; the
+ * request then runs its aggregations through OpenSearch's aggregators
+ * over the fragment leaves, and the explain endpoint reports the
+ * message as {@code unplanned}. Field resolution follows the
  * pushdown's rules against the Arrow schema and the attach declared
  * multi fields; the mapping type checks of the executor's
  * {@code QueryShardContext} have no equivalent on the coordinating
  * node, so the Arrow column type stands in for the mapping type.
+ *
+ * <p>The translator is also where an aggregation the fragment
+ * executors cannot run at all is refused ({@link #checkExecutable}):
+ * a 400 naming the builder and the reason, instead of a plan.
  */
 final class AggregationToRel {
 
@@ -121,8 +131,84 @@ final class AggregationToRel {
     /** Deepest bucket chain the pushdown builds ({@code terms > terms > terms}). */
     static final int MAX_BUCKET_DEPTH = 3;
 
-    /** Most conditions a {@code CASE WHEN} bit mask encodes without touching the sign bit. */
-    static final int MAX_MASK_CONDITIONS = LanceAggregationSupport.MAX_MASK_CONDITIONS;
+    /**
+     * Most conditions a {@code CASE WHEN} bit mask group key encodes
+     * without touching the sign bit of its {@code i64} value: the bound
+     * on the ranges of a range aggregation and the filters of a filters
+     * aggregation.
+     */
+    static final int MAX_MASK_CONDITIONS = 62;
+
+    /**
+     * Refuses an aggregation tree that holds a builder the fragment
+     * executors cannot run, throwing {@link IllegalArgumentException}
+     * (a 400 at the coordinator and from the explain endpoint) whose
+     * message names the builder and why. The refusals are the shapes
+     * whose stock aggregator needs something the fragment executor's
+     * search context does not carry; every other aggregation runs on
+     * the fragment path, pushed into the Lance scan when
+     * {@link #translate} spells it and otherwise through OpenSearch's
+     * aggregators over the fragment leaves, which serve any aggregator
+     * that reads doc values ({@code multi_terms}, {@code matrix_stats},
+     * {@code nested}, the geo aggregations over a {@code geo_point}
+     * column, scripted builders, {@code filter} buckets over a Lance
+     * full text or knn clause, ...).
+     *
+     * <ul>
+     *   <li>{@code global}: the shard path collects it in a second pass
+     *       over every document of the index ({@code AggregationPhase}
+     *       runs the global aggregators under a match all query); the
+     *       fragment executor collects one pass under the request's
+     *       query, so the bucket would hold the filtered count.</li>
+     *   <li>{@code top_hits}: builds its hits through the search
+     *       context's fetch phase, which the fragment executor's context
+     *       does not carry (its own hits go through a separate fetch).</li>
+     *   <li>{@code rare_terms}: its aggregator seeds itself from
+     *       {@code indexShard().shardId()}; the fragment executor runs
+     *       without a shard.</li>
+     *   <li>{@code significant_terms} / {@code significant_text}: score
+     *       terms against background frequencies read from the inverted
+     *       index, which Lance leaves do not carry (the stock factory
+     *       refuses the fields as not searchable).</li>
+     * </ul>
+     *
+     * @param aggregations the request's tree; null or empty passes
+     */
+    static void checkExecutable(AggregatorFactories.Builder aggregations) {
+        if (aggregations == null) {
+            return;
+        }
+        for (AggregationBuilder top : aggregations.getAggregatorFactories()) {
+            checkExecutable(top);
+        }
+    }
+
+    private static void checkExecutable(AggregationBuilder builder) {
+        String reason = null;
+        if (builder instanceof GlobalAggregationBuilder) {
+            reason = "it is collected over every document of the index in a pass of its own, "
+                + "which the fragment executor's single collection under the request's query does not run";
+        } else if (builder instanceof TopHitsAggregationBuilder) {
+            reason = "it builds its hits through the search context's fetch phase, which the fragment executor's context does not carry";
+        } else if (builder instanceof RareTermsAggregationBuilder) {
+            reason = "its aggregator seeds itself from the shard id, and the fragment executor runs without a shard";
+        } else if (builder instanceof SignificantTermsAggregationBuilder || builder instanceof SignificantTextAggregationBuilder) {
+            reason = "it scores terms against background frequencies from an inverted index, which Lance leaves do not carry";
+        }
+        if (reason != null) {
+            throw new IllegalArgumentException(
+                "aggregation type ["
+                    + builder.getType()
+                    + "] on ["
+                    + builder.getName()
+                    + "] is not supported for Lance-backed indices: "
+                    + reason
+            );
+        }
+        for (AggregationBuilder sub : builder.getSubAggregations()) {
+            checkExecutable(sub);
+        }
+    }
 
     /**
      * Translates the request's aggregations over the scan the builder

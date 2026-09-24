@@ -8,6 +8,7 @@ package org.opensearch.lance;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
+import java.util.Map;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -18,10 +19,11 @@ import org.opensearch.core.rest.RestStatus;
  * both accepted Arrow shapes. Mapping shape, {@code geo_distance}
  * around a Tokyo landmark, {@code geo_bounding_box} over Kanto,
  * {@code geo_polygon} over the same region, sort by
- * {@code _geo_distance} with sort values, {@code geohash_grid} and
- * {@code geo_distance} aggregations (which route through the shard
- * path — geo aggregation types are off the fragment allow list — and
- * read the same doc values), {@code _source} rendering the point as a
+ * {@code _geo_distance} with sort values, the geo aggregations
+ * ({@code geohash_grid}, {@code geotile_grid}, {@code geo_distance},
+ * {@code geo_centroid}, {@code geo_bounds}, run by the fragment
+ * executors' aggregators over the encoded doc values and compared with
+ * the shard path), {@code _source} rendering the point as a
  * {@code {lat, lon}} object, and {@code exists} skipping the Arrow
  * null row. The FixedSizeList fixture is stored {@code (lon, lat)}
  * and attached with {@code order: lon_lat}, so it must answer the same
@@ -181,8 +183,9 @@ public class LanceGeoPointIT extends LanceRestTestCase {
     }
 
     /**
-     * Geo aggregations route through the shard path (their types are off
-     * the fragment allow list) and read the same encoded doc values.
+     * Geo aggregations run on the fragment path through the stock
+     * aggregators over the encoded doc values, and answer what the shard
+     * path answers.
      */
     private void assertGeoAggregations(String indexName) throws Exception {
         // geohash_grid at precision 1: every fixture point falls in the
@@ -211,5 +214,25 @@ public class LanceGeoPointIT extends LanceRestTestCase {
         assertEquals(4, extractIntPath(rings, "aggregations", "rings", "buckets", "0", "doc_count"));
         assertEquals(1, extractIntPath(rings, "aggregations", "rings", "buckets", "1", "doc_count"));
         assertEquals(2, extractIntPath(rings, "aggregations", "rings", "buckets", "2", "doc_count"));
+
+        // The fragment executors served both (one executor on this
+        // cluster), and every geo aggregation type answers what the
+        // shard path answers over the same encoded doc values.
+        long before = fragmentRequestsExecuted();
+        for (String shape : new String[] {
+            "{\"size\":0,\"aggs\":{\"c\":{\"geo_centroid\":{\"field\":\"location\"}}}}",
+            "{\"size\":0,\"aggs\":{\"b\":{\"geo_bounds\":{\"field\":\"location\"}}}}",
+            "{\"size\":0,\"aggs\":{\"g\":{\"geohash_grid\":{\"field\":\"location\",\"precision\":3}}}}",
+            "{\"size\":0,\"aggs\":{\"g\":{\"geotile_grid\":{\"field\":\"location\",\"precision\":8}}}}",
+            "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":1}}},\"aggs\":{\"rings\":{\"geo_distance\":{\"field\":\"location\",\"origin\":"
+                + TOKYO
+                + ",\"unit\":\"km\",\"ranges\":[{\"to\":10},{\"from\":10}]},\"aggs\":{\"c\":{\"geo_centroid\":{\"field\":\"location\"}}}}}}" }) {
+            Map<String, Object> fragmentPath = parseJson(readAll(postJson("/" + indexName + "/_search", shape)));
+            Map<String, Object> shardPath = parseJson(
+                readAll(postJson("/" + indexName + "/_search?request_cache=false", onShardPath(shape)))
+            );
+            assertEquals(shape, withoutShardPathOracle(shardPath.get("aggregations")), fragmentPath.get("aggregations"));
+        }
+        assertEquals("every geo aggregation ran on the fragment path", before + 5, fragmentRequestsExecuted());
     }
 }

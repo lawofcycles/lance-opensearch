@@ -611,7 +611,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             assertEquals(first, again);
             assertEquals(rejectionsBefore + 1, longNumber(columnStoreStats().get("heap_fallback_rejections")));
 
-            // The shard path reader (a global aggregation routes there)
+            // The shard path reader (a highlighter routes there)
             // stays open for the life of the shard, so its heap column
             // stays charged and the gauge shows it until the index goes
             // away.
@@ -836,6 +836,9 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "{\"size\":0,\"aggs\":{\"d\":{\"composite\":{\"sources\":[{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}}]}}}}",
                 "{\"size\":0,\"aggs\":{\"d\":{\"composite\":{\"sources\":[{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"time_zone\":\"+09:00\"}}}]}}}}" };
             assertPushdownAgreesWithAggregators(indexName, shapes, aggregatorShapes);
+            // auto_date_histogram is served by the aggregators and equals
+            // the shard path.
+            assertShardPathAgrees(indexName, "\"size\":0,\"aggs\":{\"d\":{\"auto_date_histogram\":{\"field\":\"ts\",\"buckets\":3}}}");
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
@@ -1224,12 +1227,161 @@ public class LanceAggregationIT extends LanceRestTestCase {
     }
 
     /**
+     * Every aggregation type the coordinator's former allow list sent to
+     * the shard path now runs on the fragment path, through the stock
+     * aggregators over the fragment leaves, and answers what the shard
+     * path answers: {@code multi_terms}, {@code matrix_stats},
+     * {@code sampler} / {@code diversified_sampler}, scripted builders,
+     * {@code filter} / {@code filters} over a Lance full text or knn
+     * clause or over a query outside the pushdown's vocabulary, and the
+     * multi value and clustering metrics. The samplers keep
+     * {@code shard_size} documents per collection slice, as they do per
+     * slice under concurrent segment search, so the collection runs in
+     * one slice to equal the single slice shard path. The executed
+     * counter proves the fragment path served every shape.
+     */
+    public void testAggregationsOffTheFormerAllowListRunOnTheFragmentPath() throws Exception {
+        putTransientSetting("lance.fragment_path.slices", "1");
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "former-allow-list")) {
+            String index = fixture.indexName();
+            String[] shapes = new String[] {
+                "\"size\":0,\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"category\"},{\"field\":\"flag\"}]}}}",
+                "\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":100}}},\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"category\"},{\"field\":\"flag\"}],\"size\":3},"
+                    + "\"aggs\":{\"a\":{\"avg\":{\"field\":\"rating\"}}}}}",
+                "\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"flag\"},{\"field\":\"tags\"}],\"size\":2}}}}}",
+                "\"size\":0,\"aggs\":{\"ms\":{\"matrix_stats\":{\"fields\":[\"rating\",\"id\"]}}}",
+                "\"size\":0,\"query\":{\"term\":{\"flag\":true}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"ms\":{\"matrix_stats\":{\"fields\":[\"rating\",\"id\"]}}}}}",
+                "\"size\":0,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"aggs\":{\"sm\":{\"sampler\":{\"shard_size\":50},"
+                    + "\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}",
+                "\"size\":0,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"aggs\":{\"ds\":{\"diversified_sampler\":{\"shard_size\":50,\"field\":\"category\"},"
+                    + "\"aggs\":{\"f\":{\"terms\":{\"field\":\"flag\"}}}}}",
+                "\"size\":0,\"aggs\":{\"sm\":{\"scripted_metric\":{\"init_script\":\"state.n = 0\",\"map_script\":\"state.n += 1\","
+                    + "\"combine_script\":\"return state.n\",\"reduce_script\":\"long t = 0; for (s in states) { t += s } return t\"}}}",
+                "\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"rating\",\"script\":{\"source\":\"_value * 2\"},\"size\":3,\"order\":{\"_key\":\"asc\"}}}}",
+                "\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"script\":{\"source\":\"doc['rating'].size() == 0 ? 0 : doc['rating'].value\"}}}}",
+                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}",
+                "\"size\":0,\"aggs\":{\"fs\":{\"filters\":{\"filters\":{\"a\":{\"term\":{\"category\":\"c0\"}},\"b\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}}}}}}",
+                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":[250.4,0,0,0,0,0,0,0],\"k\":5}},"
+                    + "\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}}",
+                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"match\":{\"body\":\"grp7\"}}}}",
+                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"prefix\":{\"category\":\"c\"}}}}",
+                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"script\":{\"script\":{\"source\":\"doc['id'].value % 2 == 0\"}}}}}",
+                "\"size\":0,\"aggs\":{\"w\":{\"weighted_avg\":{\"value\":{\"field\":\"rating\"},\"weight\":{\"field\":\"id\"}}}}",
+                "\"size\":0,\"aggs\":{\"m\":{\"median_absolute_deviation\":{\"field\":\"rating\"}}}",
+                "\"size\":0,\"aggs\":{\"a\":{\"adjacency_matrix\":{\"filters\":{\"x\":{\"term\":{\"flag\":true}},\"y\":{\"term\":{\"category\":\"c0\"}}}}}}",
+                "\"size\":2,\"query\":{\"term\":{\"category\":\"c1\"}},\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"category\"},{\"field\":\"flag\"}]}}}" };
+            long before = fragmentRequestsExecuted();
+            for (String shape : shapes) {
+                assertShardPathAgrees(index, shape);
+            }
+            assertEquals("every shape ran on the fragment path", before + shapes.length, fragmentRequestsExecuted());
+
+            // Checks independent of the oracle: the multi terms buckets
+            // (three categories by two flags) cover every row that has
+            // both a category and a flag.
+            Map<String, Object> multiTerms = parse(readAll(postJson("/" + index + "/_search", "{" + shapes[0] + "}")));
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> buckets = (List<Map<String, Object>>) aggregation(multiTerms, "mt").get("buckets");
+            assertEquals(6, buckets.size());
+            int total = 0;
+            for (Map<String, Object> bucket : buckets) {
+                total += ((Number) bucket.get("doc_count")).intValue();
+            }
+            String bothPresent = readAll(
+                postJson(
+                    "/" + index + "/_search",
+                    "{\"size\":0,\"track_total_hits\":true,\"query\":{\"bool\":{\"filter\":[{\"exists\":{\"field\":\"category\"}},{\"exists\":{\"field\":\"flag\"}}]}}}"
+                )
+            );
+            assertEquals(extractIntPath(bothPresent, "hits", "total", "value"), total);
+            assertTrue("some rows carry both: " + total, total > 0);
+            Map<String, Object> matrix = parse(readAll(postJson("/" + index + "/_search", "{" + shapes[3] + "}")));
+            assertEquals(480, ((Number) aggregation(matrix, "ms").get("doc_count")).intValue());
+            Map<String, Object> scripted = parse(readAll(postJson("/" + index + "/_search", "{" + shapes[7] + "}")));
+            assertEquals(600, ((Number) aggregation(scripted, "sm").get("value")).intValue());
+
+            // variable_width_histogram clusters the values it sees in
+            // collection order, so its bucket bounds are approximate on
+            // both paths and need not agree bucket for bucket; the three
+            // clusters cover the 480 rated rows and span the rating range
+            // in order on the fragment path.
+            String variableWidth = "{\"size\":0,\"aggs\":{\"v\":{\"variable_width_histogram\":{\"field\":\"rating\",\"buckets\":3}}}}";
+            long beforeClustering = fragmentRequestsExecuted();
+            Map<String, Object> clustered = parse(readAll(postJson("/" + index + "/_search", variableWidth)));
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> clusters = (List<Map<String, Object>>) aggregation(clustered, "v").get("buckets");
+            assertEquals(3, clusters.size());
+            int clusteredRows = 0;
+            double previousMax = Double.NEGATIVE_INFINITY;
+            for (Map<String, Object> cluster : clusters) {
+                clusteredRows += ((Number) cluster.get("doc_count")).intValue();
+                double min = ((Number) cluster.get("min")).doubleValue();
+                double max = ((Number) cluster.get("max")).doubleValue();
+                assertTrue(clusters.toString(), min > previousMax && max >= min);
+                previousMax = max;
+            }
+            assertEquals(480, clusteredRows);
+            assertEquals(0.0d, ((Number) clusters.get(0).get("min")).doubleValue(), 0d);
+            assertEquals(999.0d, ((Number) clusters.get(2).get("max")).doubleValue(), 0d);
+            assertEquals("the fragment path served it", beforeClustering + 1, fragmentRequestsExecuted());
+        } finally {
+            putTransientSetting("lance.fragment_path.slices", null);
+        }
+    }
+
+    /**
+     * The aggregation types the fragment executors cannot run answer 400
+     * at the coordinator, naming the builder and the reason, wherever
+     * the builder sits and whatever the query or the page: the same
+     * refusal the explain endpoint gives. Nothing reaches an executor.
+     */
+    public void testUnservableAggregationsAnswer400() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "unservable")) {
+            String index = fixture.indexName();
+            String[][] refused = new String[][] {
+                {
+                    "{\"size\":0,\"aggs\":{\"g\":{\"global\":{},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}}}",
+                    "aggregation type [global] on [g]" },
+                {
+                    "{\"size\":5,\"query\":{\"term\":{\"category\":\"c1\"}},\"aggs\":{\"g\":{\"global\":{}}}}",
+                    "aggregation type [global] on [g]" },
+                {
+                    "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"t\":{\"top_hits\":{\"size\":1}}}}}}",
+                    "aggregation type [top_hits] on [t]" },
+                {
+                    "{\"size\":0,\"query\":{\"match\":{\"body\":\"hello\"}},\"aggs\":{\"t\":{\"top_hits\":{\"size\":1}}}}",
+                    "aggregation type [top_hits] on [t]" },
+                {
+                    "{\"size\":0,\"aggs\":{\"r\":{\"rare_terms\":{\"field\":\"rating\",\"max_doc_count\":1}}}}",
+                    "aggregation type [rare_terms] on [r]" },
+                {
+                    "{\"size\":0,\"aggs\":{\"st\":{\"significant_terms\":{\"field\":\"category\"}}}}",
+                    "aggregation type [significant_terms] on [st]" },
+                {
+                    "{\"size\":0,\"aggs\":{\"sx\":{\"significant_text\":{\"field\":\"body\"}}}}",
+                    "aggregation type [significant_text] on [sx]" } };
+            long before = fragmentRequestsExecuted();
+            for (String[] shape : refused) {
+                ConcurrentResult result = postForStatus("/" + index + "/_search", shape[0]);
+                assertEquals(shape[0] + " -> " + result.body(), RestStatus.BAD_REQUEST.getStatus(), result.status());
+                assertTrue(result.body(), result.body().contains("illegal_argument_exception"));
+                assertTrue(result.body(), result.body().contains(shape[1] + " is not supported for Lance-backed indices: "));
+            }
+            assertEquals("no executor saw a refused request", before, fragmentRequestsExecuted());
+        }
+    }
+
+    /**
      * Run {@code shape} (a {@code _search} body without its outer braces)
-     * through the fragment path and, with the {@link #onShardPath} global
-     * aggregation added, through the shard path, and assert the two
+     * through the fragment path and, with the {@link #onShardPath}
+     * highlighter added, through the shard path, and assert the two
      * responses carry the same {@code hits.total} and the same
-     * {@code aggregations} block (the oracle's own key aside). Returns
-     * the fragment path response.
+     * {@code aggregations} block (the oracle's own key aside). Numbers
+     * are compared with a relative tolerance of 1e-9: the two paths add
+     * the same values in a different order (one collector per fragment
+     * leaf against one over the whole reader), so the last bits of a
+     * floating point moment ({@code matrix_stats} variance, skewness)
+     * can differ. Returns the fragment path response.
      */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> assertShardPathAgrees(String index, String shape) throws IOException {
@@ -1252,7 +1404,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             ((Map<String, Object>) shardPath.get("hits")).get("total"),
             ((Map<String, Object>) fragmentPath.get("hits")).get("total")
         );
-        assertEquals(shape, withoutShardPathOracle(shardPath.get("aggregations")), fragmentPath.get("aggregations"));
+        assertJsonClose(shape, withoutShardPathOracle(shardPath.get("aggregations")), fragmentPath.get("aggregations"));
         return fragmentPath;
     }
 
@@ -1266,6 +1418,45 @@ public class LanceAggregationIT extends LanceRestTestCase {
         options.setWarningsHandler(WarningsHandler.PERMISSIVE);
         request.setOptions(options);
         return client().performRequest(request);
+    }
+
+    /**
+     * {@code assertEquals} over parsed JSON, except that two numbers are
+     * equal when they are within 1e-9 of each other relative to the
+     * larger of their magnitudes and one (or both are NaN); maps and
+     * lists recurse, everything else compares with {@code equals}.
+     * {@code path} names the element in the failure.
+     */
+    @SuppressWarnings("unchecked")
+    private static void assertJsonClose(String path, Object expected, Object actual) {
+        if (expected instanceof Map<?, ?> expectedMap && actual instanceof Map<?, ?> actualMap) {
+            assertEquals(path + ": keys", expectedMap.keySet(), actualMap.keySet());
+            for (Map.Entry<?, ?> entry : expectedMap.entrySet()) {
+                assertJsonClose(path + "." + entry.getKey(), entry.getValue(), actualMap.get(entry.getKey()));
+            }
+            return;
+        }
+        if (expected instanceof List<?> expectedList && actual instanceof List<?> actualList) {
+            assertEquals(path + ": size", expectedList.size(), actualList.size());
+            for (int i = 0; i < expectedList.size(); i++) {
+                assertJsonClose(path + "[" + i + "]", expectedList.get(i), actualList.get(i));
+            }
+            return;
+        }
+        if (expected instanceof Number expectedNumber && actual instanceof Number actualNumber) {
+            double e = expectedNumber.doubleValue();
+            double a = actualNumber.doubleValue();
+            if (Double.isNaN(e) && Double.isNaN(a)) {
+                return;
+            }
+            // Relative below one part in a billion; absolute at that
+            // scale near zero, where a moment that is zero in exact
+            // arithmetic comes out as rounding noise on either path.
+            double scale = Math.max(1d, Math.max(Math.abs(e), Math.abs(a)));
+            assertTrue(path + ": expected " + e + " got " + a, Math.abs(e - a) <= 1e-9 * scale || e == a);
+            return;
+        }
+        assertEquals(path, expected, actual);
     }
 
     @SuppressWarnings("unchecked")
@@ -1390,12 +1581,12 @@ public class LanceAggregationIT extends LanceRestTestCase {
             long fanOut = fanOutLogLines(index);
             assertEquals("every request above took the fragment path", fanOutBefore + requests, fanOut);
 
-            // A filter bucket over a Lance query and a scripted metric stay
-            // on the shard path: they answer, and leave no fan-out line.
-            String ftsFilter = "{\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}}}}}";
-            Map<String, Object> viaShardOnly = parse(readAll(postJson("/" + index + "/_search", ftsFilter)));
-            assertEquals(48, ((Number) aggregation(viaShardOnly, "f").get("doc_count")).intValue());
-            assertEquals(fanOut, fanOutLogLines(index));
+            // A filter bucket over a Lance query runs on the fragment path
+            // too and answers what the shard path answers.
+            String ftsFilter = "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}}}}";
+            Map<String, Object> ftsBucket = assertShardPathAgrees(index, ftsFilter);
+            assertEquals(48, ((Number) aggregation(ftsBucket, "f").get("doc_count")).intValue());
+            assertEquals(fanOut + 1, fanOutLogLines(index));
         }
     }
 

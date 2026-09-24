@@ -74,7 +74,7 @@ import java.util.List;
  * element throws {@link UnsupportedOperationException} naming the
  * first unsupported element ({@code query type [match]},
  * {@code size [10] (only 0 with aggregations)},
- * {@code aggregation type [top_hits]}, {@code sort type
+ * {@code aggregation type [multi_terms]}, {@code sort type
  * [_geo_distance]}, {@code post_filter}, {@code _source}, ...); the
  * explain endpoint reports the message of the element that kept a
  * request's envelope on Lucene as {@code unplanned}, so the message
@@ -109,8 +109,14 @@ public final class SearchRequestToRel {
      *     with
      * @throws UnsupportedOperationException naming the first unsupported
      *     element of the request
+     * @throws IllegalArgumentException for an aggregation the fragment
+     *     executors cannot run ({@link #checkAggregationsExecutable}),
+     *     checked before every other element
      */
     public static RelNode translate(SearchSourceBuilder source, LanceSchemas.IndexModel model, LancePlannerFactory factory) {
+        if (source != null) {
+            checkAggregationsExecutable(source.aggregations());
+        }
         LanceShape shape = source == null ? null : detectLanceShape(source.query());
         validate(source, shape != null);
         RelBuilder relBuilder = scanBuilder(model, factory);
@@ -266,7 +272,7 @@ public final class SearchRequestToRel {
      * planner runs over, and the element that kept the request's
      * envelope off the tree when the tree is the query root alone (the
      * translator's message, {@code sort type [_geo_distance]} or
-     * {@code aggregation type [top_hits]}, or the structural reason,
+     * {@code aggregation type [multi_terms]}, or the structural reason,
      * {@code aggregations with a post_filter}); null when the envelope
      * translated, or when the request has no envelope to translate (a
      * count).
@@ -289,6 +295,10 @@ public final class SearchRequestToRel {
      * translator's vocabulary throws {@link UnsupportedOperationException}
      * naming the element, and the caller decides between a Lucene plan
      * over the request's own builder and a refusal (a filtered knn).
+     * An aggregation the fragment executors cannot run at all
+     * ({@link #checkAggregationsExecutable}) throws
+     * {@link IllegalArgumentException} before anything is translated,
+     * which the coordinator and the explain endpoint answer as 400.
      * Every other element is best effort, the way the fragment executor
      * used to decide it per part: an aggregation tree the translator
      * refuses, a sort clause without a collation spelling, a page next
@@ -299,6 +309,20 @@ public final class SearchRequestToRel {
      */
     public static RelNode translateForExecution(ExecutionShape shape, LanceSchemas.IndexModel model, LancePlannerFactory factory) {
         return translateExecution(shape, model, factory).root();
+    }
+
+    /**
+     * Refuses an aggregation tree holding a builder the fragment
+     * executors cannot run ({@code global}, {@code top_hits},
+     * {@code rare_terms}, {@code significant_terms},
+     * {@code significant_text}) with {@link IllegalArgumentException}
+     * naming the builder and the reason. Null or empty passes. The
+     * coordinator's planner calls this before it decides anything else
+     * about the request, so the refusal does not depend on whether the
+     * query translates.
+     */
+    public static void checkAggregationsExecutable(AggregatorFactories.Builder aggregations) {
+        AggregationToRel.checkExecutable(aggregations);
     }
 
     /**
@@ -313,6 +337,7 @@ public final class SearchRequestToRel {
         LanceSchemas.IndexModel model,
         LancePlannerFactory factory
     ) {
+        checkAggregationsExecutable(shape.aggregations());
         LanceShape lanceShape = detectLanceShape(shape.query());
         RelBuilder relBuilder = scanBuilder(model, factory);
         RelNode root = queryRoot(shape.query(), lanceShape, model, relBuilder);

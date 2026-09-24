@@ -41,7 +41,6 @@ import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
-import org.opensearch.lance.dispatch.LanceAggregationSupport;
 import org.opensearch.lance.execute.GroupAggregationState.GroupState;
 import org.opensearch.lance.execute.GroupAggregationState.MetricState;
 import org.opensearch.lance.execute.LanceAggregateResults.PushedShape;
@@ -565,7 +564,7 @@ final class AggregateSpecResolver {
             return null;
         }
         ResolvedAggregate resolved;
-        if (LanceAggregationSupport.isPushdownMetric(top.get(0))) {
+        if (AggregatePushdownShapes.isPushdownMetric(top.get(0))) {
             List<Metric> allMetrics = new ArrayList<>();
             List<Metric> metrics = resolveMetrics(top, schema, multiFields, qsc, allMetrics);
             resolved = metrics == null ? null : new ResolvedAggregate(shape, substrait, List.of(), null, metrics, allMetrics, bins, null);
@@ -607,7 +606,7 @@ final class AggregateSpecResolver {
         if (InternalOrder.isCountDesc(order)) {
             return new TopKSpec(level.keyKind(), -1, false, limit);
         }
-        LanceAggregationSupport.AggregationOrder aggregationOrder = LanceAggregationSupport.aggregationOrder(order);
+        AggregatePushdownShapes.AggregationOrder aggregationOrder = AggregatePushdownShapes.aggregationOrder(order);
         if (aggregationOrder == null) {
             return null;
         }
@@ -982,7 +981,7 @@ final class AggregateSpecResolver {
                     if (!column.isDate()) {
                         return null;
                     }
-                    String calendarUnit = LanceAggregationSupport.calendarUnit(dateHistogram);
+                    String calendarUnit = AggregatePushdownShapes.calendarUnit(dateHistogram);
                     if (calendarUnit != null) {
                         // date_trunc truncates in the column's zone, which
                         // has to be UTC to match the aggregator's rounding
@@ -1033,7 +1032,7 @@ final class AggregateSpecResolver {
             List<Metric> metrics = new ArrayList<>();
             AggregationBuilder nested = null;
             for (AggregationBuilder sub : current.getSubAggregations()) {
-                if (LanceAggregationSupport.isPushdownMetric(sub)) {
+                if (AggregatePushdownShapes.isPushdownMetric(sub)) {
                     Metric metric = resolveMetric(sub, schema, multiFields, qsc, allMetrics);
                     if (metric == null) {
                         return null;
@@ -1286,7 +1285,7 @@ final class AggregateSpecResolver {
         QueryShardContext qsc,
         int bins
     ) {
-        if (!LanceAggregationSupport.isPushdownComposite(compositeBuilder)) {
+        if (!AggregatePushdownShapes.isPushdownComposite(compositeBuilder)) {
             return null;
         }
         Map<String, Object> after = afterKey(compositeBuilder);

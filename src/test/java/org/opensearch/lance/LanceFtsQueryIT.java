@@ -1710,7 +1710,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             );
             assertEquals(400, extractIntPath(body, "status"));
 
-            // The same query with a global aggregation runs on the shard
+            // The same query with a highlighter runs on the shard
             // path (see docs/limitations.md). Lucene's query phase wraps
             // the failure in QueryPhaseExecutionException, which
             // OpenSearch answers as 500; Lance's message still reaches

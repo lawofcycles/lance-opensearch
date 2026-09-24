@@ -162,10 +162,13 @@ public final class RequestPlanner {
      * @param sqlExcludedColumns the override columns whose predicates
      *     never travel to Lance SQL
      * @throws IllegalArgumentException for a filtered {@code lance_knn}
-     *     whose filter cannot travel to the Lance scan, and for a request
-     *     whose trait requirement ({@code requirementOf}) no plan meets:
-     *     the message starts with {@code plan_failed} and names the
-     *     demanded trait and what the plan offers (both answer 400)
+     *     whose filter cannot travel to the Lance scan, for an
+     *     aggregation the fragment executors cannot run
+     *     ({@link SearchRequestToRel#checkAggregationsExecutable}), and
+     *     for a request whose trait requirement ({@code requirementOf})
+     *     no plan meets: the message starts with {@code plan_failed} and
+     *     names the demanded trait and what the plan offers (all answer
+     *     400)
      */
     public static Planned plan(
         ExecutionShape shape,
@@ -174,6 +177,9 @@ public final class RequestPlanner {
         LancePlannerFactory factory,
         CostInputs inputs
     ) {
+        // Before the query decides between the planned and the Lucene
+        // form: a refused aggregation is a 400 whatever the query is.
+        SearchRequestToRel.checkAggregationsExecutable(shape.aggregations());
         QueryBuilder query = shape.query();
         LanceKnnQueryBuilder filteredKnn = query instanceof LanceKnnQueryBuilder knn && knn.filter() != null ? knn : null;
         if (filteredKnn != null && QueryToRex.referencesAny(filteredKnn.filter(), sqlExcludedColumns)) {
