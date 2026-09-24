@@ -9,6 +9,7 @@ import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
@@ -43,7 +44,8 @@ import org.opensearch.core.rest.RestStatus;
  * specific sub directory of {@code ~/.aws}, because the plugin policy
  * grants the read under that directory only and the operator's own
  * {@code ~/.aws/credentials} must stay untouched. The file and the
- * directories the test created are removed when the test ends.
+ * directories the test created are removed when the test ends, and by
+ * a shutdown hook when the test JVM dies before that.
  *
  * <p>The suppression covers {@code com.sun.net.httpserver}: the test
  * needs an HTTP listener inside the test JVM with no extra dependency,
@@ -69,6 +71,17 @@ public class LanceGlueCatalogNamespaceIT extends LanceRestTestCase {
         String accessKeyId = "AKIALANCEIT" + randomAlphaOfLength(9).toUpperCase(Locale.ROOT);
         String secretAccessKey = randomAlphaOfLength(40);
         List<Path> createdDirectories = writeCredentialsFile(credentialsFile, accessKeyId, secretAccessKey);
+        // The file sits under the operator's real ~/.aws, so a test JVM
+        // killed between the write and the finally block must not leave
+        // it behind: a shutdown hook runs the same cleanup.
+        Thread cleanupOnExit = new Thread(() -> {
+            try {
+                removeCredentialsFile(credentialsFile, createdDirectories);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }, "lance-glue-it-credentials-cleanup");
+        Runtime.getRuntime().addShutdownHook(cleanupOnExit);
 
         List<String> authorizationHeaders = new CopyOnWriteArrayList<>();
         HttpServer server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
@@ -133,6 +146,7 @@ public class LanceGlueCatalogNamespaceIT extends LanceRestTestCase {
                 deleteJson("/_lance/namespace", "{\"name\":\"" + namespaceName + "\"}");
             } catch (Exception ignored) {}
             removeCredentialsFile(credentialsFile, createdDirectories);
+            Runtime.getRuntime().removeShutdownHook(cleanupOnExit);
         }
     }
 
