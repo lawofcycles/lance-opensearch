@@ -84,7 +84,10 @@ public class LanceExplainIT extends LanceRestTestCase {
             // fan out (one request per data node of this single node
             // cluster) over the per node scan carrying the aggregate.
             String physical = stringPath(body, "physical");
-            assertTrue("the coordinator merge leads: " + physical, physical.startsWith("MergeExec(reduce=[AGGREGATE_INTERNAL])"));
+            assertTrue(
+                "the coordinator merge leads: " + physical,
+                physical.startsWith("MergeExec(reduce=[AGGREGATE_INTERNAL], accuracy=[EXACT]")
+            );
             assertTrue("the fan out width is the data node count: " + physical, physical.contains("FanOutExec(fanOut=[1]"));
             assertTrue("the pushed aggregate appears in the physical plan: " + physical, physical.contains("pushed=[[aggregate{"));
             assertFalse("no filter is pushed without a query: " + physical, physical.contains("filter{"));
@@ -193,7 +196,10 @@ public class LanceExplainIT extends LanceRestTestCase {
                 "{\"size\":5,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"sort\":[\"_score\",{\"id\":\"asc\"}]}"
             );
             String mixedSortPhysical = stringPath(mixedSortBody, "physical");
-            assertTrue("the coordinator merge leads: " + mixedSortPhysical, mixedSortPhysical.startsWith("MergeExec(reduce=[HITS_TOP_K])"));
+            assertTrue(
+                "the coordinator merge leads: " + mixedSortPhysical,
+                mixedSortPhysical.startsWith("MergeExec(reduce=[HITS_TOP_K], accuracy=[EXACT]")
+            );
             assertTrue(
                 "the heap top-k operator appears in the physical plan: " + mixedSortPhysical,
                 mixedSortPhysical.contains("HeapTopKExec(")
@@ -299,7 +305,7 @@ public class LanceExplainIT extends LanceRestTestCase {
         }
     }
 
-    public void testExplainRefusesATraitDemandNoPlanMeets() throws Exception {
+    public void testExplainDescribesATraitDemandNoPlanMeets() throws Exception {
         String suffix = "explain-trait-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -312,41 +318,167 @@ public class LanceExplainIT extends LanceRestTestCase {
             // An explicit track_total_hits demands an exact count of the
             // plan root; a cardinality metric is a sketch on the pushed
             // scan and on the aggregators alike, so no plan meets the
-            // demand and the body is refused naming the trait. The same
-            // body without the bound plans on the aggregators, and the
-            // bound over an exact metric plans as before.
+            // demand. The search endpoint refuses the body naming the
+            // trait; explain describes the refusal instead: the cheapest
+            // plan the demand refused, the plan_failed message under
+            // unplanned, no fragment plan, and the enforcer under traits.
             String sketch = "{\"size\":0,\"track_total_hits\":500,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"id\"}}}}";
-            ResponseException refused = expectThrows(ResponseException.class, () -> explain(indexName, sketch));
-            assertEquals(RestStatus.BAD_REQUEST.getStatus(), refused.getResponse().getStatusLine().getStatusCode());
-            String reason = readAll(refused.getResponse());
+            String refused = explainOk(indexName, sketch);
+            assertEquals("fragment", stringPath(refused, "route"));
+            String reason = stringPath(refused, "unplanned");
+            assertTrue("the message starts with plan_failed: " + reason, reason.startsWith("plan_failed"));
             assertTrue("the message names the demand: " + reason, reason.contains("track_total_hits requires Accuracy [exact]"));
             assertTrue("the message names what the plan offers: " + reason, reason.contains("Accuracy [approximate]"));
+            assertFalse("nothing ships: " + refused, parseJson(refused).containsKey("fragment_plan"));
+            assertEquals(List.of(), listOf(refused, "refinements_possible"));
+            String refusedPhysical = stringPath(refused, "physical");
+            assertTrue("the cheapest plan is shown: " + refusedPhysical, refusedPhysical.contains("LuceneAggregateExec("));
+            assertTrue("with the trait that failed the demand: " + refusedPhysical, refusedPhysical.contains("accuracy=[APPROXIMATE]"));
+            assertEquals("EXACT", stringPath(refused, "traits", "requested", "accuracy"));
+            assertEquals("NONE", stringPath(refused, "traits", "requested", "tie_stability"));
+            assertEquals("APPROXIMATE", stringPath(refused, "traits", "declared", "accuracy"));
+            assertEquals("UNSTABLE", stringPath(refused, "traits", "declared", "tie_stability"));
+            assertEquals(
+                "track_total_hits demanded Accuracy [EXACT], the cheapest plan offered [APPROXIMATE]; no plan declares the demand (plan_failed)",
+                stringPath(refused, "traits", "enforcer")
+            );
+            String refusedLogical = stringPath(refused, "logical");
+            assertTrue("the logical tree is the translator's: " + refusedLogical, refusedLogical.contains("CARDINALITY{name=u}"));
 
+            // The same body without the bound plans on the aggregators
+            // and demands nothing; the bound over an exact metric is met
+            // by the cheapest plan, so the enforcer does not fire.
             String unbounded = explainOk(indexName, "{\"size\":0,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"id\"}}}}");
             assertEquals("LUCENE_AGGREGATE", fragmentPlanOf(unbounded).get("kind"));
+            assertEquals("APPROXIMATE", stringPath(unbounded, "traits", "requested", "accuracy"));
+            assertEquals("APPROXIMATE", stringPath(unbounded, "traits", "declared", "accuracy"));
+            assertEquals("none", stringPath(unbounded, "traits", "enforcer"));
             String exact = explainOk(indexName, "{\"size\":0,\"track_total_hits\":500,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
             assertEquals("PUSHED_SCAN", fragmentPlanOf(exact).get("kind"));
+            assertEquals("EXACT", stringPath(exact, "traits", "requested", "accuracy"));
+            assertEquals("EXACT", stringPath(exact, "traits", "declared", "accuracy"));
+            assertEquals("none", stringPath(exact, "traits", "enforcer"));
 
-            // The search endpoint plans through the same entry, so it
-            // refuses the same body the same way.
+            // The search endpoint plans through the same entry and
+            // refuses the body with the message explain carried.
             ResponseException searchRefused = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", sketch));
             assertEquals(RestStatus.BAD_REQUEST.getStatus(), searchRefused.getResponse().getStatusLine().getStatusCode());
             assertTrue(readAll(searchRefused.getResponse()).contains("track_total_hits requires Accuracy [exact]"));
 
             // A search_after cursor over a page in score order has no
-            // reproducible tie order on either form and is refused
-            // naming TieStability; the same page without the cursor
-            // folds into the scan.
+            // reproducible tie order on either form: the search refuses
+            // it naming TieStability and explain describes the same
+            // refusal; the same page without the cursor folds into the
+            // scan and demands nothing.
             String scoredCursor = "{\"size\":2,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},"
                 + "\"sort\":[\"_score\"],\"search_after\":[0.5]}";
-            ResponseException cursorRefused = expectThrows(ResponseException.class, () -> explain(indexName, scoredCursor));
-            assertEquals(RestStatus.BAD_REQUEST.getStatus(), cursorRefused.getResponse().getStatusLine().getStatusCode());
-            assertTrue(readAll(cursorRefused.getResponse()).contains("search_after requires TieStability [stable_key]"));
+            String cursorRefused = explainOk(indexName, scoredCursor);
+            assertTrue(stringPath(cursorRefused, "unplanned").contains("search_after requires TieStability [stable_key]"));
+            assertEquals("STABLE_KEY", stringPath(cursorRefused, "traits", "requested", "tie_stability"));
+            assertEquals("UNSTABLE", stringPath(cursorRefused, "traits", "declared", "tie_stability"));
+            assertEquals(
+                "search_after demanded TieStability [STABLE_KEY], the cheapest plan offered [UNSTABLE]; no plan declares the demand (plan_failed)",
+                stringPath(cursorRefused, "traits", "enforcer")
+            );
+            ResponseException cursorSearchRefused = expectThrows(
+                ResponseException.class,
+                () -> postJson("/" + indexName + "/_search", scoredCursor)
+            );
+            assertEquals(RestStatus.BAD_REQUEST.getStatus(), cursorSearchRefused.getResponse().getStatusLine().getStatusCode());
+            assertTrue(readAll(cursorSearchRefused.getResponse()).contains("search_after requires TieStability [stable_key]"));
             String scored = explainOk(
                 indexName,
                 "{\"size\":2,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"sort\":[\"_score\"]}"
             );
             assertEquals("PUSHED_SCAN", fragmentPlanOf(scored).get("kind"));
+            assertEquals("NONE", stringPath(scored, "traits", "requested", "tie_stability"));
+            assertEquals("UNSTABLE", stringPath(scored, "traits", "declared", "tie_stability"));
+        } finally {
+            deleteQuietly(indexName);
+        }
+    }
+
+    public void testExplainPrintsTraitsAndCostOnEveryPhysicalOperator() throws Exception {
+        String suffix = "explain-render-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            attach(tableUri);
+
+            // A pushed sum: every operator line (merge, fan out, scan)
+            // carries both traits and a cost, the root the total; the
+            // scan's cost is not zero (its rows below the fitted range).
+            String sum = explainOk(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
+            logger.info("explain of a pushed sum, as rendered:\n{}", sum);
+            String[] sumLines = stringPath(sum, "physical").split("\n");
+            assertEquals(stringPath(sum, "physical"), 3, sumLines.length);
+            for (String line : sumLines) {
+                assertTrue("every physical operator declares its accuracy: " + line, line.contains("accuracy=["));
+                assertTrue("every physical operator declares its tie stability: " + line, line.contains("tie_stability=["));
+                assertTrue("every physical operator is costed: " + line, line.contains("cost=[{ms="));
+            }
+            assertTrue(
+                sumLines[0],
+                sumLines[0].startsWith("MergeExec(reduce=[AGGREGATE_INTERNAL], accuracy=[EXACT], tie_stability=[UNSTABLE], cost=[{ms=")
+            );
+            assertTrue("the root carries the total: " + sumLines[0], sumLines[0].contains("total_cost=[{ms="));
+            assertFalse("only the root carries the total: " + sumLines[1], sumLines[1].contains("total_cost"));
+            assertTrue(sumLines[2], sumLines[2].contains("LanceTableScan(") && sumLines[2].contains("pushed=[[aggregate{"));
+            assertFalse("the scan's cost is not zero: " + sumLines[2], sumLines[2].contains("cost=[{ms=0,"));
+            assertEquals("APPROXIMATE", stringPath(sum, "traits", "requested", "accuracy"));
+            assertEquals("NONE", stringPath(sum, "traits", "requested", "tie_stability"));
+            assertEquals("EXACT", stringPath(sum, "traits", "declared", "accuracy"));
+            assertEquals("UNSTABLE", stringPath(sum, "traits", "declared", "tie_stability"));
+            assertEquals("none", stringPath(sum, "traits", "enforcer"));
+
+            // A bare count: row address order.
+            String count = explainOk(indexName, "{\"size\":0}");
+            assertEquals("STABLE_ROWADDR", stringPath(count, "traits", "declared", "tie_stability"));
+            assertTrue(stringPath(count, "physical"), stringPath(count, "physical").contains("tie_stability=[STABLE_ROWADDR]"));
+
+            // A column ordered page with a cursor demands the key order
+            // and the pushed scan declares it, so the enforcer is none.
+            String cursor = explainOk(indexName, "{\"size\":2,\"sort\":[{\"id\":\"asc\"}],\"search_after\":[2]}");
+            assertEquals("PUSHED_SCAN", fragmentPlanOf(cursor).get("kind"));
+            assertEquals("STABLE_KEY", stringPath(cursor, "traits", "requested", "tie_stability"));
+            assertEquals("STABLE_KEY", stringPath(cursor, "traits", "declared", "tie_stability"));
+            assertEquals("none", stringPath(cursor, "traits", "enforcer"));
+            assertTrue(stringPath(cursor, "physical"), stringPath(cursor, "physical").contains("tie_stability=[STABLE_KEY]"));
+
+            // A full text page in score order: unstable ties.
+            String scored = explainOk(indexName, "{\"size\":2,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}}");
+            assertEquals("UNSTABLE", stringPath(scored, "traits", "declared", "tie_stability"));
+            assertEquals("EXACT", stringPath(scored, "traits", "declared", "accuracy"));
+
+            // The Lucene aggregate operator over a sketch: approximate.
+            String sketch = explainOk(indexName, "{\"size\":0,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"id\"}}}}");
+            String sketchPhysical = stringPath(sketch, "physical");
+            assertTrue(sketchPhysical, sketchPhysical.contains("LuceneAggregateExec("));
+            assertTrue(sketchPhysical, sketchPhysical.contains("accuracy=[APPROXIMATE], tie_stability=[UNSTABLE], cost=[{ms="));
+            assertEquals("APPROXIMATE", stringPath(sketch, "traits", "declared", "accuracy"));
+
+            // The shard path root declares the fallback's traits and
+            // demands nothing.
+            String highlight = explainOk(indexName, "{\"size\":2,\"highlight\":{\"fields\":{\"body\":{}}}}");
+            assertEquals("shard_path", stringPath(highlight, "route"));
+            String highlightPhysical = stringPath(highlight, "physical");
+            assertTrue(
+                highlightPhysical,
+                highlightPhysical.startsWith(
+                    "ShardPathFallbackExec(reasons=[[HIGHLIGHT]], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms="
+                )
+            );
+            assertEquals("APPROXIMATE", stringPath(highlight, "traits", "requested", "accuracy"));
+            assertEquals("NONE", stringPath(highlight, "traits", "requested", "tie_stability"));
+            assertEquals("EXACT", stringPath(highlight, "traits", "declared", "accuracy"));
+            assertEquals("STABLE_ROWADDR", stringPath(highlight, "traits", "declared", "tie_stability"));
+            assertEquals("none", stringPath(highlight, "traits", "enforcer"));
+
+            // The logical tree renders without the terms.
+            assertFalse("the logical tree carries no cost: " + stringPath(sum, "logical"), stringPath(sum, "logical").contains("cost=["));
         } finally {
             deleteQuietly(indexName);
         }

@@ -30,6 +30,8 @@ import org.opensearch.lance.plan.cost.CostInputs;
 import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.lance.plan.execute.RequestPlanner;
 import org.opensearch.lance.plan.rel.ShardPathReason;
+import org.opensearch.lance.plan.traits.TraitEnforcement;
+import org.opensearch.lance.plan.traits.UnmetPlanRequirementException;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -70,9 +72,21 @@ import java.util.List;
  * node's share exceeds the Lucene reader bound. The request accepts
  * every envelope the runtime accepts; the only refusal left is the one
  * the runtime answers with the same 400, a filtered {@code lance_knn}
- * whose filter has no Lance SQL form. The aggregation allow list of
+ * whose filter has no Lance SQL form. A request whose trait demand no
+ * plan meets, which the runtime answers 400 with a {@code plan_failed}
+ * message, is described rather than refused: the answer carries the
+ * cheapest plan the demand refused as {@code physical}, the message
+ * under {@code unplanned}, no {@code fragment_plan}, and the refusal
+ * under {@code traits.enforcer}. The aggregation allow list of
  * the fragment path and the multi index checks the dispatch filter
  * applies outside the plan are not reflected here.
+ *
+ * <p>Both plan texts come from {@code PlanText}: every physical
+ * operator line carries the {@code Accuracy} and {@code TieStability}
+ * it declares and the cost the planner charged it, the root the total.
+ * The {@code traits} object summarises the same for the plan: what the
+ * request demanded, what the root declares and whether the enforcer
+ * (the second Volcano pass with the demand on the root) fired.
  *
  * <p>Threading: the cluster state lookup runs wherever the request
  * arrives; the model build and the planning are handed to the plugin's
@@ -147,7 +161,13 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
             RelNode logical = SearchRequestToRel.translateDispatch(source, model, plannerFactory);
             String logicalText = RelOptUtil.toString(logical);
             RelNode physical = plannerFactory.plan(logical, inputs);
-            return LanceExplainResponse.shardPath(indexName, reasons, logicalText, RelOptUtil.toString(physical));
+            return LanceExplainResponse.shardPath(
+                indexName,
+                reasons,
+                logicalText,
+                PlanText.render(physical),
+                LanceExplainResponse.Traits.of(TraitEnforcement.NONE, physical.getTraitSet())
+            );
         }
 
         LanceOverrides overrides = LanceOverrides.of(metadata.getSettings());
@@ -157,23 +177,33 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
             System.currentTimeMillis()
         );
         ExecutionShape shape = ExecutionShape.of(source, query);
-        RequestPlanner.Planned planned = RequestPlanner.plan(
-            shape,
-            model,
-            PlanExecutor.sqlExcludedColumns(overrides),
-            plannerFactory,
-            inputs
-        );
+        RequestPlanner.Planned planned;
+        try {
+            planned = RequestPlanner.plan(shape, model, PlanExecutor.sqlExcludedColumns(overrides), plannerFactory, inputs);
+        } catch (UnmetPlanRequirementException unmet) {
+            // The search endpoint answers this 400; explain describes it
+            // instead: the cheapest plan the demand refused, with its
+            // traits, and the refusal under traits.enforcer.
+            RelNode refused = RequestPlanner.coordinatorPlan(unmet.offered(), shape, inputs.nodes());
+            return LanceExplainResponse.planFailed(
+                indexName,
+                RelOptUtil.toString(unmet.logical()),
+                PlanText.render(refused),
+                unmet.getMessage(),
+                LanceExplainResponse.Traits.of(unmet.enforcement(), refused.getTraitSet())
+            );
+        }
         String logicalText = RelOptUtil.toString(planned.logical());
-        String physicalText = RelOptUtil.toString(planned.coordinatorPlan(shape, inputs.nodes()));
+        RelNode coordinatorPlan = planned.coordinatorPlan(shape, inputs.nodes());
         boolean readerWrapper = ReaderWrapperProbe.installed(indicesService, metadata.getIndex());
         return LanceExplainResponse.fragment(
             indexName,
             logicalText,
-            physicalText,
+            PlanText.render(coordinatorPlan),
             planned.plan(),
             planned.unplanned(),
-            ExplainRefinements.predict(planned.plan(), readerWrapper, overrides.ipColumns())
+            ExplainRefinements.predict(planned.plan(), readerWrapper, overrides.ipColumns()),
+            LanceExplainResponse.Traits.of(planned.enforcement(), coordinatorPlan.getTraitSet())
         );
     }
 
