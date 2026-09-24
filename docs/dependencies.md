@@ -84,11 +84,24 @@ Hive metastore clients are not bundled.
 | httpcore5 5.4 | 953 KB | httpclient5, httpcore5-h2, `RestClient`. |
 | httpcore5-h2 5.4 | 263 KB | httpclient5's HTTP/2 classes reference it; the audit needs it present. |
 
-impls-core compiles against httpclient5 5.2.1. The bundled versions are
-the ones OpenSearch's test framework puts on the test classpath through
-`opensearch-rest-client`; the plugin has to match them or the
-`opensearchplugin` version conflict check fails. All 24 HttpClient methods
+impls-core compiles against httpclient5 5.2.1. All 24 HttpClient methods
 impls-core and the three clients call resolve against 5.6.1 / 5.4.
+
+The bundled versions do not follow `opensearch.version`: the zip carries
+httpclient5 5.6.1 and httpcore5 5.4 whichever OpenSearch version the
+build targets. OpenSearch's test framework brings its own copies through
+`opensearch-rest-client`, at the version that OpenSearch release chose,
+and the `opensearchplugin` build fails on any version conflict. So
+`build.gradle` forces the two test classpaths (`testCompileClasspath`,
+`testRuntimeClasspath`) to the bundled versions; the rest client the
+tests use runs on them because 5.6.x and 5.4.x are patch releases of one
+API. The versions each lane would otherwise pull in are:
+
+| OpenSearch version | httpclient5 via `opensearch-rest-client` | httpcore5 / httpcore5-h2 | on the test classpath after the force |
+|---|---|---|---|
+| 3.8.0 | 5.6.1 | 5.4 | 5.6.1 / 5.4 (no change) |
+| 3.9.0-SNAPSHOT | 5.6.4 | 5.4.3 | 5.6.1 / 5.4 |
+| 3.10.0-SNAPSHOT | 5.6.4 | 5.4.3 | 5.6.1 / 5.4 |
 
 ### AWS SDK for Java 2 (Glue)
 
