@@ -207,11 +207,15 @@ public final class WireVersion {
          * Steps over the blocks of the versions this reader does not
          * know, refusing a critical one.
          *
+         * @throws IllegalStateException when the reading class did not
+         *     call {@link #block} for a version it knows, whatever the
+         *     writer's marker: the fallback would otherwise stand in
+         *     for the block reader that was meant to run
          * @throws IOException when a block this reader does not know is
          *     critical
          */
         public void finish() throws IOException {
-            if (next <= Math.min(current, marker)) {
+            if (next <= current) {
                 throw new IllegalStateException(format + " did not read wire version block [" + next + "]");
             }
             while (next <= marker) {

@@ -515,13 +515,19 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         TopK topK = in.readOptionalWriteable(TopK::read);
         Aggregate aggregate = in.readOptionalWriteable(Aggregate::read);
         int[] excludedFragmentIds = reader.block(2, StreamInput::readVIntArray, NO_EXCLUDED_FRAGMENTS);
-        byte[] filterSubstrait = reader.block(3, FragmentPlan::readOptionalBytes, null);
+        byte[] filterSubstrait = reader.block(3, FragmentPlan::readSubstraitBlock, null);
         reader.finish();
         return new FragmentPlan(kind, filterSql, filterSubstrait, lanceClause, topK, aggregate, excludedFragmentIds);
     }
 
-    private static byte[] readOptionalBytes(StreamInput in) throws IOException {
-        return in.readBoolean() ? in.readByteArray() : null;
+    /**
+     * The Substrait block's fields: the filter bytes, or null when the
+     * block is empty. The block itself is the flag: a writer without a
+     * filter writes an empty block, so the bytes need no boolean in
+     * front of them.
+     */
+    private static byte[] readSubstraitBlock(StreamInput in) throws IOException {
+        return in.available() == 0 ? null : in.readByteArray();
     }
 
     @Override
@@ -538,9 +544,9 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         WireVersion.writeBlock(out, false, o -> o.writeVIntArray(excludedFragmentIds));
         // An older node that ignores the Substrait filter would scan
         // without the predicate, so the block is critical whenever a
-        // filter is set.
+        // filter is set. Without a filter the block is empty, which is
+        // what the reader takes as absent.
         WireVersion.writeBlock(out, filterSubstrait != null, o -> {
-            o.writeBoolean(filterSubstrait != null);
             if (filterSubstrait != null) {
                 o.writeByteArray(filterSubstrait);
             }

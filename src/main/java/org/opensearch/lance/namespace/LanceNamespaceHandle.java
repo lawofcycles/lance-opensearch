@@ -73,6 +73,11 @@ final class LanceNamespaceHandle {
      * {@code ~/.aws/credentials} and {@code ~/.aws/config} of the
      * process user; the frame here stops the walk at the plugin's own
      * jars, whose policy carries the read grant for that directory.
+     * Every namespace type (rest, iceberg, polaris, unity, glue) passes
+     * through this method, and all of them run under the same
+     * privileged frame on purpose: this is the one choke point for
+     * catalog calls, and the plugin policy is narrow enough that the
+     * types which read no local file gain nothing from the elevation.
      *
      * @throws ReleasedException if the handle has been released
      */
