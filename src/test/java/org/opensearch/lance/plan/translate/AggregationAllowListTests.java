@@ -42,15 +42,14 @@ import java.util.Map;
 
 /**
  * The translator alone decides which aggregation trees reach the
- * planner: every shape the coordinator's former structural allow lists
- * ({@code LanceAggregationSupport.isPushdownCandidate} and
- * {@code LanceAggregationSupport.isSupported}) accepted translates to
- * a {@link LanceAggregate}, every shape the pushdown does not spell is
- * refused by {@link SearchRequestToRel#translateExecution} with the
- * translator's own message and runs on the aggregators, and the few
- * shapes the fragment executors cannot run at all are refused outright
- * with an {@link IllegalArgumentException}. The shapes are the ones
- * those tests enumerated, spelled over the shared fixture schema.
+ * planner: every shape of a plain field metric, bucket, composite or
+ * scalar filter tree translates to a {@link LanceAggregate}, every
+ * shape the pushdown does not spell is refused by
+ * {@link SearchRequestToRel#translateExecution} with the translator's
+ * own message and runs on the aggregators, and the few shapes the
+ * fragment executors cannot run at all are refused outright with an
+ * {@link IllegalArgumentException}. The shapes are spelled over the
+ * shared fixture schema.
  */
 public class AggregationAllowListTests extends OpenSearchTestCase {
 
