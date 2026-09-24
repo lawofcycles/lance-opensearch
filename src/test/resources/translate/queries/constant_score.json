@@ -1,0 +1,1 @@
+{"query":{"constant_score":{"filter":{"term":{"category":"c0"}},"boost":2.5}}}
