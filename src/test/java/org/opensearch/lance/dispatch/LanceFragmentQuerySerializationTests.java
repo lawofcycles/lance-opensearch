@@ -5,6 +5,7 @@
 
 package org.opensearch.lance.dispatch;
 
+import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
@@ -15,6 +16,7 @@ import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.query.InnerHitBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
@@ -445,5 +447,62 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             () -> new LanceFragmentQueryResponse(1L, false, 1, List.of(hit), new long[0], null)
         );
         assertTrue(e.getMessage(), e.getMessage().contains("0 entries for 1 hits"));
+    }
+
+    public void testRequestStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws Exception {
+        LanceFragmentQueryRequest original = LanceFragmentQueryRequest.allFragments(
+            "/tmp/table.lance",
+            "demo",
+            StorageOptions.empty(),
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_COUNT, null),
+            /* query */ null,
+            Collections.emptyList(),
+            0,
+            /* aggregations */ null
+        );
+        // The marker is the first field after the parent task id the
+        // ActionRequest base class writes.
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                TaskId.readFromStream(in);
+                assertEquals(LanceFragmentQueryRequest.WIRE_VERSION, in.readVInt());
+            }
+        }
+        // A stream of another version is refused by name before the
+        // first field is read, and the message names both numbers.
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            TaskId.EMPTY_TASK_ID.writeTo(out);
+            out.writeVInt(LanceFragmentQueryRequest.WIRE_VERSION + 1);
+            out.writeString("/tmp/table.lance");
+            try (StreamInput in = out.bytes().streamInput()) {
+                IOException refused = expectThrows(IOException.class, () -> new LanceFragmentQueryRequest(in));
+                assertEquals(
+                    "LanceFragmentQueryRequest wire version [2] does not match this node's [1]: every node must run the same plugin version",
+                    refused.getMessage()
+                );
+            }
+        }
+    }
+
+    public void testResponseStreamOpensWithTheWireVersionAndAnotherOneIsRefused() throws Exception {
+        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(2L, false, 1, List.of(), new long[0], null);
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                assertEquals(LanceFragmentQueryResponse.WIRE_VERSION, in.readVInt());
+            }
+        }
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.writeVInt(LanceFragmentQueryResponse.WIRE_VERSION + 1);
+            out.writeVLong(2L);
+            try (StreamInput in = out.bytes().streamInput()) {
+                IOException refused = expectThrows(IOException.class, () -> new LanceFragmentQueryResponse(in));
+                assertEquals(
+                    "LanceFragmentQueryResponse wire version [2] does not match this node's [1]: every node must run the same plugin version",
+                    refused.getMessage()
+                );
+            }
+        }
     }
 }
