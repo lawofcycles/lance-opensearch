@@ -50,20 +50,21 @@ plan, including a body the search endpoint refuses with `plan_failed` (see
 [Traits](#traits)): explain describes the refusal instead of repeating it.
 
 Example, for `{"size": 0, "aggs": {"s": {"sum": {"field": "id"}}}}` against a single node cluster
-and a six row table:
+and a six row table (the pushed aggregate returns one group row, so the scan below the fitted
+model's range is charged one millisecond, and the coordinator layer adds its two constants):
 
 ```json
 {
   "index": "demo",
   "route": "fragment",
-  "logical": "LanceAggregate(group=[{}], s=[SUM($0)], metrics=[[SUM{name=s}]])\n  LanceTableScan(table=[[lance, demo]], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms=6, native_bytes=0, heap_bytes=0}])\n",
-  "physical": "MergeExec(reduce=[AGGREGATE_INTERNAL], accuracy=[EXACT], tie_stability=[UNSTABLE], cost=[{ms=1, native_bytes=1, heap_bytes=0}], total_cost=[{ms=8, native_bytes=3, heap_bytes=0}])\n  FanOutExec(fanOut=[1], partitioning=[EQUAL_FRAGMENT_GROUPS], accuracy=[EXACT], tie_stability=[UNSTABLE], cost=[{ms=1, native_bytes=1, heap_bytes=0}])\n    LanceTableScan(table=[[lance, demo]], pushed=[[aggregate{groups=0, metrics=[SUM{name=s}]}]], accuracy=[EXACT], tie_stability=[UNSTABLE], cost=[{ms=6, native_bytes=1, heap_bytes=0}])\n",
+  "logical": "LanceAggregate(group=[{}], s=[SUM($0)], metrics=[[SUM{name=s}]])\n  LanceTableScan(table=[[lance, demo]])\n",
+  "physical": "MergeExec(reduce=[AGGREGATE_INTERNAL], accuracy=[EXACT], tie_stability=[UNSTABLE], cost=[{ms=1, native_bytes=1, heap_bytes=0}], total_cost=[{ms=3, native_bytes=3, heap_bytes=0}])\n  FanOutExec(fanOut=[1], partitioning=[EQUAL_FRAGMENT_GROUPS], accuracy=[EXACT], tie_stability=[UNSTABLE], cost=[{ms=1, native_bytes=1, heap_bytes=0}])\n    LanceTableScan(table=[[lance, demo]], pushed=[[aggregate{groups=0, buckets=[], metrics=[SUM{name=s}]}]], accuracy=[EXACT], tie_stability=[UNSTABLE], cost=[{ms=1, native_bytes=1, heap_bytes=0}])\n",
   "fragment_plan": {
     "kind": "PUSHED_SCAN",
     "aggregate": {
       "group_count": 0,
       "metrics": [{"name": "s", "kind": "SUM"}],
-      "substrait_bytes": 143
+      "substrait_bytes": 290
     }
   },
   "refinements_possible": [],
@@ -93,10 +94,11 @@ execution the fan out width is lower when the table has fewer fragments than dat
 higher when a node's share exceeds the Lucene reader bound. Every physical operator line carries
 three extra terms: `accuracy` and `tie_stability` (the [traits](#traits) the operator declares)
 and `cost` (what the planner charged that operator, see [Cost](#cost)); the root carries
-`total_cost` as well, the sum over the whole tree. The logical operators (`LanceAggregate`,
-`LanceHitShape`, `LanceTopK`, `LogicalFilter`, ...) carry none of the three; the `LanceTableScan`
-does wherever it appears, because it is a physical operator even under a logical root. The
-request's `query` clause plans as a filter over the scan; a query filter under an aggregation the
+`total_cost` as well, the sum over the whole tree. The `logical` text carries none of the three:
+it is the translator's tree before any cost was computed, and its operators (`LanceAggregate`,
+`LanceHitShape`, `LanceTopK`, `LogicalFilter`, the bare `LanceTableScan`) print their own terms
+only. In the `physical` text a logical operator the planner kept (a tree it could not lower)
+prints the same way, without the three terms. The request's `query` clause plans as a filter over the scan; a query filter under an aggregation the
 pushdown computes folds into one pushed aggregate whose `filter=` names the Lance SQL the scan
 evaluates; a top level Lance FTS clause (`lance_match`, `lance_match_phrase`, `lance_multi_match`,
 `lance_fts_bool`, `lance_fts_boost`, alone or as the single `must` of a `bool` with scalar
