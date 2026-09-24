@@ -7,6 +7,13 @@ on:
 permissions:
   contents: write
 
+# Two pushes of the same tag must not race to create the same release; the
+# second run waits for the first instead of being cancelled, so a release
+# that is half created is never abandoned.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     name: release
@@ -14,6 +21,20 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A v* tag can point at any commit. Only commits on main are released,
+      # so a tag on a side branch stops here.
+      - name: Check that the tagged commit is on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag $GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main; only commits on main are released"
+            exit 1
+          fi
+          echo "$GITHUB_SHA is on main"
 
       - uses: actions/setup-java@v4
         with:
@@ -55,14 +76,17 @@ jobs:
       # The release notes are the `## [<version>]` block of CHANGELOG.md
       # (written by scripts/assemble-changelog.py before the tag), without
       # its heading and up to the next `## ` heading. When CHANGELOG.md has
-      # no block for the version the notes point at the file instead.
+      # no block for the version the notes point at the file instead. The
+      # version reaches awk through the environment, not through the shell
+      # quoted program text, so no character in it is interpreted.
       - name: Extract the release notes from CHANGELOG.md
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           notes="$RUNNER_TEMP/release-notes.md"
-          awk -v heading="## [$VERSION]" '
+          awk '
+            BEGIN { heading = "## [" ENVIRON["VERSION"] "]" }
             index($0, heading) == 1 { inside = 1; next }
             inside && /^## / { exit }
             inside && NF == 0 && count == 0 { next }
