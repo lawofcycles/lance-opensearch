@@ -115,11 +115,12 @@ dependencies {
     implementation "org.lance:lance-namespace-unity:${lance_namespace_impls_version}"
 
     // Apache HttpClient 5, the transport of impls-core's RestClient
-    // (Iceberg, Polaris, Unity). 5.6.1 / core 5.4 are the versions the
-    // OpenSearch test framework puts on the test classpath through
-    // opensearch-rest-client; the plugin has to match them or the strict
-    // version conflict check fails. impls-core compiles against 5.2.1 and
-    // every method it references resolves against these versions.
+    // (Iceberg, Polaris, Unity). impls-core compiles against 5.2.1 and
+    // every method it references resolves against these versions. The
+    // OpenSearch test framework carries its own httpclient5 and httpcore5
+    // (through opensearch-rest-client) at the version that OpenSearch
+    // release chose; the test classpaths are forced to the versions
+    // bundled here, see the configurations block after this one.
     implementation "org.apache.httpcomponents.client5:httpclient5:${httpclient5_version}"
     implementation "org.apache.httpcomponents.core5:httpcore5:${httpcore5_version}"
     implementation "org.apache.httpcomponents.core5:httpcore5-h2:${httpcore5_version}"
@@ -253,6 +254,26 @@ dependencies {
         exclude group: 'org.apache.httpcomponents.client5'
         exclude group: 'org.apache.httpcomponents.core5'
     }
+}
+
+// The OpenSearch test framework depends on opensearch-rest-client, which
+// brings httpclient5 and httpcore5 at the version that OpenSearch release
+// chose: 5.6.1 / 5.4 for 3.8.0, 5.6.4 / 5.4.3 for the 3.9 and 3.10
+// snapshots. The opensearchplugin build fails on any version conflict,
+// so one declared pair cannot satisfy every opensearch.version on its
+// own. The two resolvable test configurations are therefore forced to
+// the versions the plugin bundles: a forced version is not a conflict,
+// the plugin zip resolves to the same jars whichever OpenSearch version
+// the build targets (its runtime classpath never sees the rest client),
+// and the rest client runs on them because 5.6.x and 5.4.x are patch
+// releases of one API. Bumping the bundled versions means updating
+// gradle.properties and the sha1 files under licenses/, nothing here.
+configurations.matching { it.name == 'testCompileClasspath' || it.name == 'testRuntimeClasspath' }.configureEach {
+    resolutionStrategy.force(
+        "org.apache.httpcomponents.client5:httpclient5:${httpclient5_version}",
+        "org.apache.httpcomponents.core5:httpcore5:${httpcore5_version}",
+        "org.apache.httpcomponents.core5:httpcore5-h2:${httpcore5_version}"
+    )
 }
 
 // ---------------------------------------------------------------------
