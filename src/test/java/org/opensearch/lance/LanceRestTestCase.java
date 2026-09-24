@@ -357,6 +357,24 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
     }
 
     /**
+     * How many fragments the data nodes' executors have skipped under
+     * zone map pruning so far: the sum over the nodes of
+     * {@code plan.pruned.fragments} in {@code GET /_lance/stats}.
+     */
+    @SuppressWarnings("unchecked")
+    static long prunedFragments() throws IOException {
+        Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
+        long total = 0L;
+        for (Object node : nodes.values()) {
+            Map<String, Object> plan = (Map<String, Object>) ((Map<String, Object>) node).get("plan");
+            Map<String, Object> pruned = (Map<String, Object>) plan.get("pruned");
+            total += ((Number) pruned.get("fragments")).longValue();
+        }
+        return total;
+    }
+
+    /**
      * The hits of {@code searchBody} with every rendered key ({@code _score}
      * included) except {@code _shard} and {@code _node}, which
      * {@code explain: true} adds and which name the node that rendered
