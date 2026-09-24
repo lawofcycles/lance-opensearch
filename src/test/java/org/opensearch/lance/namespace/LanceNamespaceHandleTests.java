@@ -121,6 +121,36 @@ public class LanceNamespaceHandleTests extends OpenSearchTestCase {
         assertEquals(listingsBefore, recording.listTablesIds.size());
     }
 
+    public void testCallRunsBelowAPrivilegedFrame() throws Exception {
+        // The agent's permission check walks the stack up to the nearest
+        // doPrivileged frame; the handle has to put that frame between
+        // the caller and the catalog implementation so the AWS SDK's
+        // credential file reads are judged against the plugin's policy.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.tables = Set.of("orders");
+        LanceNamespaceHandle handle = new LanceNamespaceHandle(recording);
+        assertFalse("a direct call must not see the frame", RecordingLanceNamespace.privilegedFrameOnStack());
+        ListTablesResponse response = handle.call(namespace -> namespace.listTables(new ListTablesRequest()));
+        assertEquals(Set.of("orders"), response.getTables());
+        assertTrue("listTables did not run below a doPrivileged frame", recording.listTablesPrivileged);
+    }
+
+    public void testCallPropagatesTheImplementationException() {
+        // doPrivilegedChecked must pass checked and unchecked failures
+        // through unchanged so the service's error handling keeps
+        // seeing the catalog's own exception.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.childNamespaces = Set.of("db1");
+        LanceNamespaceHandle handle = new LanceNamespaceHandle(recording);
+        IllegalArgumentException unchecked = expectThrows(
+            IllegalArgumentException.class,
+            () -> handle.call(namespace -> namespace.listTables(new ListTablesRequest()))
+        );
+        assertTrue(unchecked.getMessage(), unchecked.getMessage().contains("cannot be null or empty"));
+        Exception checked = expectThrows(Exception.class, () -> handle.call(namespace -> { throw new Exception("checked failure"); }));
+        assertEquals("checked failure", checked.getMessage());
+    }
+
     public void testCloseSkipsImplementationsThatAreNotCloseable() throws Exception {
         // The HTTP client based catalogs do not implement AutoCloseable;
         // the handle still stops accepting calls once released.

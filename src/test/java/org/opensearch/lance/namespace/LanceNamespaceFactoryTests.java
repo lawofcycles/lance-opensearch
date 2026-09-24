@@ -98,6 +98,31 @@ public class LanceNamespaceFactoryTests extends OpenSearchTestCase {
         assertEquals(config, recording.initializeCalls.get(0));
     }
 
+    public void testCreateRunsConstructionAndInitializeBelowAPrivilegedFrame() {
+        // The Glue client build reads the process user's ~/.aws files
+        // through the AWS SDK; the agent judges that read against every
+        // domain on the stack up to the nearest doPrivileged frame, so
+        // the factory has to supply the frame for both the instantiation
+        // and the initialize call.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        boolean[] instantiatedPrivileged = new boolean[1];
+        LanceNamespaceFactory.setInstantiatorForTests(type -> {
+            instantiatedPrivileged[0] = RecordingLanceNamespace.privilegedFrameOnStack();
+            return recording;
+        });
+        assertFalse("the test thread itself must not carry the frame", RecordingLanceNamespace.privilegedFrameOnStack());
+        LanceNamespaceMetadata.Entry entry = new LanceNamespaceMetadata.Entry(
+            "glue-tokyo",
+            LanceNamespaceMetadata.Entry.TYPE_GLUE,
+            null,
+            StorageOptions.empty(),
+            Map.of("region", "ap-northeast-1")
+        );
+        LanceNamespaceFactory.create(entry, null);
+        assertTrue("instantiation did not run below a doPrivileged frame", instantiatedPrivileged[0]);
+        assertTrue("initialize did not run below a doPrivileged frame", recording.initializePrivileged);
+    }
+
     public void testInitializeFailurePropagatesToTheCaller() {
         RecordingLanceNamespace recording = new RecordingLanceNamespace();
         recording.initializeFailure = new IllegalStateException("bad credentials");
