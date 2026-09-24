@@ -9,6 +9,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.lance.namespace.LanceNamespace;
 import org.opensearch.common.CheckedFunction;
+import org.opensearch.secure_sm.AccessController;
 
 /**
  * A cached catalog handle whose release waits for the calls in flight
@@ -62,6 +63,17 @@ final class LanceNamespaceHandle {
     /**
      * Run {@code call} against the namespace while holding it open.
      *
+     * <p>The call runs inside {@code doPrivileged}. The Java agent's
+     * permission check intersects every protection domain on the stack
+     * up to the nearest {@code doPrivileged} frame, and the callers (the
+     * poll's schedule on the cluster manager, the tables preview's fork)
+     * reach here through server frames whose domain has no read grant
+     * under the user's home. The Glue client resolves the AWS SDK's
+     * default credential chain on its first request, which reads
+     * {@code ~/.aws/credentials} and {@code ~/.aws/config} of the
+     * process user; the frame here stops the walk at the plugin's own
+     * jars, whose policy carries the read grant for that directory.
+     *
      * @throws ReleasedException if the handle has been released
      */
     <T> T call(CheckedFunction<LanceNamespace, T, Exception> call) throws Exception {
@@ -70,7 +82,7 @@ final class LanceNamespaceHandle {
             if (closed) {
                 throw new ReleasedException();
             }
-            return call.apply(namespace);
+            return AccessController.doPrivilegedChecked(() -> call.apply(namespace));
         } finally {
             lock.readLock().unlock();
         }

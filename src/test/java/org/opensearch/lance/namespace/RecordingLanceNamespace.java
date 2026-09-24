@@ -44,10 +44,21 @@ import org.lance.namespace.model.ListTablesResponse;
  * reports that a call has reached that point. Together with
  * {@link #closeCalls} and {@link #closedWhileListing} they let a test pin
  * the order of an in-flight listing and the handle's release.
+ *
+ * <p>{@link #initializePrivileged} and {@link #listTablesPrivileged}
+ * record whether a {@code doPrivileged} frame of the agent's
+ * {@code AccessController} was on the stack when the call arrived, the
+ * frame the Java agent stops its protection domain walk at.
  */
 class RecordingLanceNamespace implements LanceNamespace, AutoCloseable {
 
+    private static final String ACCESS_CONTROLLER = "org.opensearch.secure_sm.AccessController";
+
     final List<Map<String, String>> initializeCalls = new ArrayList<>();
+    /** Whether the last {@code initialize} ran below a {@code doPrivileged} frame. */
+    boolean initializePrivileged;
+    /** Whether the last {@code listTables} ran below a {@code doPrivileged} frame. */
+    volatile boolean listTablesPrivileged;
     RuntimeException initializeFailure;
     Set<String> tables = Set.of();
     Set<String> childNamespaces;
@@ -69,9 +80,25 @@ class RecordingLanceNamespace implements LanceNamespace, AutoCloseable {
     final List<List<String>> listTablesIds = new CopyOnWriteArrayList<>();
     final List<List<String>> listNamespacesIds = new CopyOnWriteArrayList<>();
 
+    /**
+     * Whether the calling thread's stack holds the frame the agent's
+     * {@code StackCallerProtectionDomainChainExtractor} cuts at: a
+     * {@code doPrivileged} or {@code doPrivilegedChecked} method of
+     * {@code org.opensearch.secure_sm.AccessController}.
+     */
+    static boolean privilegedFrameOnStack() {
+        return StackWalker.getInstance()
+            .walk(
+                frames -> frames.anyMatch(
+                    frame -> ACCESS_CONTROLLER.equals(frame.getClassName()) && frame.getMethodName().startsWith("doPrivileged")
+                )
+            );
+    }
+
     @Override
     public void initialize(Map<String, String> properties, BufferAllocator allocator) {
         initializeCalls.add(Map.copyOf(properties));
+        initializePrivileged = privilegedFrameOnStack();
         if (initializeFailure != null) {
             throw initializeFailure;
         }
@@ -89,6 +116,7 @@ class RecordingLanceNamespace implements LanceNamespace, AutoCloseable {
     @Override
     public ListTablesResponse listTables(ListTablesRequest request) {
         listTablesIds.add(request.getId() == null ? List.of() : List.copyOf(request.getId()));
+        listTablesPrivileged = privilegedFrameOnStack();
         listingsInFlight.incrementAndGet();
         try {
             CountDownLatch gate = listTablesGate;

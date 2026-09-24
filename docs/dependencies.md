@@ -239,14 +239,24 @@ shape it.
   operations, so no `FilePermission` in the plugin policy widens or
   narrows what a table URI may point at; `lance.allowed_table_roots` is
   the control. The plugin's own Java file access outside the core grants
-  is the read of `/proc/meminfo` by `ScanAdmission`, which has an explicit
-  grant; its read of `/proc/self/status` is covered by the core policy's
-  default grant.
+  is the read of `/proc/meminfo` by `ScanAdmission` and the AWS SDK's
+  read of the process user's `~/.aws/credentials` and `~/.aws/config`
+  for a `glue` registration without static keys; both have an explicit
+  read grant and run inside `doPrivileged` (`ScanAdmission` itself,
+  `LanceNamespaceFactory.create` for the client build and
+  `LanceNamespaceHandle.call` for every catalog call), because the agent
+  intersects every protection domain on the stack up to that frame and
+  the server frames below it hold neither grant. The read of
+  `/proc/self/status` is covered by the core policy's default grant.
 
-The policy language expands system properties (`${java.io.tmpdir}`,
-`${/}`) and the `${codebase.<jar>}` names of the plugin's own jars; it has
-no `${path.data}` style expansion, which is why the core grants the data
-path itself.
+The agent's policy parser (`org.opensearch.secure_sm.policy.PolicyFile`)
+expands three shapes in a permission name: `${java.home}/` and
+`${user.home}/` written with a literal slash right after the placeholder
+(the `${user.home}/.aws/-` grant relies on this), and `${{property}}` for
+any other system property. It does not expand `${/}` or single brace
+`${property}` names there, and it has no `${path.data}` style expansion,
+which is why the core grants the data path itself. The `${codebase.<jar>}`
+names of the plugin's own jars are expanded in codebase URLs only.
 
 ## Checking a dependency change
 

@@ -17,6 +17,7 @@ import org.lance.namespace.glue.GlueNamespace;
 import org.lance.namespace.iceberg.IcebergNamespace;
 import org.lance.namespace.polaris.PolarisNamespace;
 import org.lance.namespace.unity.UnityNamespace;
+import org.opensearch.secure_sm.AccessController;
 
 /**
  * Builds the runtime {@link LanceNamespace} handle for a cluster-state
@@ -42,15 +43,32 @@ public final class LanceNamespaceFactory {
      */
     private static volatile Function<String, LanceNamespace> instantiator = LanceNamespaceFactory::newImplementation;
 
-    /** Instantiate and initialise the implementation for {@code entry}. */
+    /**
+     * Instantiate and initialise the implementation for {@code entry}.
+     *
+     * <p>Construction runs inside {@code doPrivileged}. The Java agent's
+     * permission check intersects every protection domain on the
+     * stack, and the callers (the poll's schedule, the tables preview's
+     * fork) reach here through server frames whose domain has no read
+     * grant under the user's home. {@code GlueClient.builder().build()}
+     * resolves the SDK's auth scheme preference from the default profile
+     * file of the process user ({@code ~/.aws/credentials} and
+     * {@code ~/.aws/config}) during the build, so without the cut the
+     * read is denied whatever the plugin policy grants and the
+     * registration never initialises. The frame stops the walk at the
+     * plugin's own jars, whose policy carries the read grant for
+     * {@code ~/.aws}.
+     */
     public static LanceNamespace create(LanceNamespaceMetadata.Entry entry, BufferAllocator allocator) {
-        LanceNamespace namespace = instantiator.apply(entry.type());
-        Map<String, String> properties = new HashMap<>(entry.config());
-        if (LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(entry.type())) {
-            properties.put("root", entry.rootUri());
-        }
-        namespace.initialize(properties, allocator);
-        return namespace;
+        return AccessController.doPrivileged(() -> {
+            LanceNamespace namespace = instantiator.apply(entry.type());
+            Map<String, String> properties = new HashMap<>(entry.config());
+            if (LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(entry.type())) {
+                properties.put("root", entry.rootUri());
+            }
+            namespace.initialize(properties, allocator);
+            return namespace;
+        });
     }
 
     private static LanceNamespace newImplementation(String type) {
