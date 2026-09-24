@@ -1,0 +1,1 @@
+{"query":{"dis_max":{"tie_breaker":0.7,"queries":[{"term":{"category":"c0"}},{"range":{"rating":{"gte":10}}}]}}}

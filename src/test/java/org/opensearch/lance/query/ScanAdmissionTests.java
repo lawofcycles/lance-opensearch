@@ -45,6 +45,14 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
     private static final ScanAdmission.Shape UNBOUNDED = new ScanAdmission.Shape(true, true, 0L);
 
     @Override
+    public void setUp() throws Exception {
+        super.setUp();
+        // Another test class in the same JVM may have admitted a scan
+        // and left the static last kind and counters behind.
+        ScanAdmission.resetForTests();
+    }
+
+    @Override
     public void tearDown() throws Exception {
         ScanAdmission.resetForTests();
         super.tearDown();

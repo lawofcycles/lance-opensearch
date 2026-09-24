@@ -1,0 +1,1 @@
+{"query":{"function_score":{"query":{"range":{"rating":{"gte":10}}},"functions":[{"filter":{"term":{"category":"c0"}},"weight":2},{"field_value_factor":{"field":"rating","missing":1}}],"boost_mode":"multiply"}}}

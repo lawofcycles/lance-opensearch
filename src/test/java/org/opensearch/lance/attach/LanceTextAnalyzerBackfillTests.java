@@ -502,8 +502,9 @@ public class LanceTextAnalyzerBackfillTests extends OpenSearchTestCase {
      * The regular files directly under {@code tmpdir}, which is where a
      * spool would appear. Other test JVMs of the same Gradle run share
      * the directory: they create per suite directories and Lance
-     * extracts its native library there as {@code jnilib-*.tmp}, so
-     * directories and those files are left out.
+     * extracts its native library there as {@code jnilib-*.tmp} or
+     * {@code liblance_jni*.so}, so directories and those files are left
+     * out.
      */
     private static Set<Path> listTmpdir(Path tmpdir) throws IOException {
         if (!Files.isDirectory(tmpdir)) {
@@ -511,7 +512,10 @@ public class LanceTextAnalyzerBackfillTests extends OpenSearchTestCase {
         }
         try (Stream<Path> entries = Files.list(tmpdir)) {
             Set<Path> files = new HashSet<>();
-            entries.filter(Files::isRegularFile).filter(p -> !p.getFileName().toString().startsWith("jnilib-")).forEach(files::add);
+            entries.filter(Files::isRegularFile)
+                .filter(p -> !p.getFileName().toString().startsWith("jnilib-"))
+                .filter(p -> !p.getFileName().toString().startsWith("liblance_jni"))
+                .forEach(files::add);
             return files;
         }
     }

@@ -546,6 +546,82 @@ public class RequestPlannerTests extends OpenSearchTestCase {
         assertNull(plan("{\"size\":5,\"sort\":[{\"rating\":\"desc\"}]}").unplanned());
     }
 
+    /**
+     * The score shaping compounds translate to the rows they match when
+     * the envelope reads no score (a count, an aggregation, a page ordered
+     * by columns) and stay on the Lucene composition when it does (a page
+     * in score order, a sort naming {@code _score}, {@code track_scores},
+     * {@code min_score}, a {@code rescore}), so the page keeps the order
+     * the query asks for.
+     */
+    public void testScoreShapingCompoundsTranslateOnlyWhereNoScoreIsRead() throws IOException {
+        String disMax =
+            "{\"dis_max\":{\"tie_breaker\":0.7,\"queries\":[{\"term\":{\"category\":\"c0\"}},{\"range\":{\"rating\":{\"gte\":10}}}]}}";
+        String sql = "(category = 'c0' OR rating >= 10)";
+        LanceSchemas.IndexModel model = PlanTestFixtures.model();
+
+        RequestPlanner.Planned count = planRuntime("{\"size\":0,\"query\":" + disMax + "}", model);
+        assertEquals(FragmentPlan.Kind.LUCENE_COUNT, count.plan().kind());
+        assertEquals(sql, count.plan().filterSql());
+        assertNull(count.unplanned());
+
+        RequestPlanner.Planned aggregation = planRuntime(
+            "{\"size\":0,\"query\":" + disMax + ",\"aggs\":{\"s\":{\"sum\":{\"field\":\"price\"}}}}",
+            model
+        );
+        assertEquals(FragmentPlan.Kind.PUSHED_SCAN, aggregation.plan().kind());
+        assertEquals(sql, aggregation.plan().filterSql());
+        assertNull(aggregation.unplanned());
+
+        RequestPlanner.Planned sorted = planRuntime("{\"size\":5,\"query\":" + disMax + ",\"sort\":[{\"rating\":\"desc\"}]}", model);
+        assertEquals(FragmentPlan.Kind.PUSHED_SCAN, sorted.plan().kind());
+        assertEquals(sql, sorted.plan().filterSql());
+        assertNull(sorted.unplanned());
+
+        for (String scored : List.of(
+            "{\"size\":5,\"query\":" + disMax + "}",
+            "{\"size\":5,\"query\":" + disMax + ",\"sort\":[\"_score\",{\"rating\":\"desc\"}]}",
+            "{\"size\":5,\"query\":" + disMax + ",\"sort\":[{\"rating\":\"desc\"}],\"track_scores\":true}",
+            "{\"size\":5,\"query\":" + disMax + ",\"sort\":[{\"rating\":\"desc\"}],\"min_score\":0.5}",
+            "{\"size\":5,\"query\":" + disMax + ",\"rescore\":{\"query\":{\"rescore_query\":{\"term\":{\"flag\":true}}}}}"
+        )) {
+            RequestPlanner.Planned planned = planRuntime(scored, model);
+            assertEquals(scored, FragmentPlan.Kind.LUCENE_TOPK, planned.plan().kind());
+            assertNull(scored, planned.plan().filterSql());
+            assertEquals(scored, "query type [dis_max] on a scored request", planned.unplanned());
+        }
+
+        // The other three compounds take the same gate.
+        String constantScore = "{\"constant_score\":{\"filter\":{\"term\":{\"category\":\"c0\"}},\"boost\":2}}";
+        assertEquals("category = 'c0'", planRuntime("{\"size\":0,\"query\":" + constantScore + "}", model).plan().filterSql());
+        assertEquals(
+            "query type [constant_score] on a scored request",
+            planRuntime("{\"size\":5,\"query\":" + constantScore + "}", model).unplanned()
+        );
+        String boosting =
+            "{\"boosting\":{\"positive\":{\"term\":{\"category\":\"c0\"}},\"negative\":{\"term\":{\"flag\":true}},\"negative_boost\":0.2}}";
+        assertEquals("category = 'c0'", planRuntime("{\"size\":0,\"query\":" + boosting + "}", model).plan().filterSql());
+        assertEquals(
+            "query type [boosting] on a scored request",
+            planRuntime("{\"size\":5,\"query\":" + boosting + "}", model).unplanned()
+        );
+        String functionScore =
+            "{\"function_score\":{\"query\":{\"term\":{\"category\":\"c0\"}},\"field_value_factor\":{\"field\":\"rating\",\"missing\":1}}}";
+        assertEquals("category = 'c0'", planRuntime("{\"size\":0,\"query\":" + functionScore + "}", model).plan().filterSql());
+        assertEquals(
+            "query type [function_score] on a scored request",
+            planRuntime("{\"size\":5,\"query\":" + functionScore + "}", model).unplanned()
+        );
+        // A script keeps a function_score on the Lucene side whatever the
+        // envelope: the script runs there, and fails there.
+        String scriptScore =
+            "{\"function_score\":{\"query\":{\"term\":{\"category\":\"c0\"}},\"script_score\":{\"script\":{\"source\":\"1\"}}}}";
+        assertEquals(
+            "function_score with a script_score function",
+            planRuntime("{\"size\":0,\"query\":" + scriptScore + "}", model).unplanned()
+        );
+    }
+
     private static ExecutionShape runtimeShape(String json) throws IOException {
         SearchSourceBuilder source = PlanTestFixtures.parse(json);
         return ExecutionShape.of(source, source.query());

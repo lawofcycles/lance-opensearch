@@ -36,6 +36,7 @@ import org.opensearch.lance.query.LanceMultiMatchQueryBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.internal.SearchContext;
+import org.opensearch.search.sort.ScoreSortBuilder;
 import org.opensearch.search.sort.SortBuilder;
 
 import java.util.ArrayList;
@@ -69,7 +70,15 @@ import java.util.List;
  * collations, the page size and the {@code search_after} cursor, and a
  * {@link org.opensearch.lance.plan.rel.LanceHitShape} naming the hit
  * envelope. A full text or knn request with {@code size} 0 keeps the
- * bare query tree (it asks for the count, not a page). Every other
+ * bare query tree (it asks for the count, not a page). The query
+ * translates under {@link QueryToRex.Scores}: a count, an aggregation
+ * request or a page ordered by stored columns reads no score, so a
+ * {@code constant_score}, {@code dis_max}, {@code boosting} or
+ * {@code function_score} reduces to the rows it matches; a page in
+ * score order, a sort naming {@code _score}, {@code track_scores},
+ * {@code min_score}, {@code rescore} and {@code collapse} read scores
+ * and keep those compounds on the Lucene composition
+ * ({@code query type [dis_max] on a scored request}). Every other
  * element throws {@link UnsupportedOperationException} naming the
  * first unsupported element ({@code query type [match]},
  * {@code size [10] (only 0 with aggregations)},
@@ -127,7 +136,11 @@ public final class SearchRequestToRel {
         validate(source, shape != null);
         RelBuilder relBuilder = scanBuilder(model, factory);
         int size = source.size() < 0 ? 10 : source.size();
-        RelNode root = queryRoot(source.query(), shape, model, relBuilder);
+        // A size 0 body is a count or an aggregation request and reads no
+        // score; a page reads them unless it is ordered by stored columns
+        // (validate refused track_scores above).
+        QueryToRex.Scores scores = size == 0 ? QueryToRex.Scores.UNUSED : scoresOf(source.sorts());
+        RelNode root = queryRoot(source.query(), shape, model, relBuilder, scores);
         if (shape != null) {
             // A size 0 full text or knn request keeps the bare query
             // tree: it asks for the count, not a page.
@@ -166,10 +179,14 @@ public final class SearchRequestToRel {
      * {@link SearchContext#DEFAULT_TRACK_TOTAL_HITS_UP_TO} when the body
      * leaves the flag out, exactly as the coordinator resolves it; it
      * selects no plan structure but a trait the planner must satisfy
-     * ({@link #exactCount()}).
+     * ({@link #exactCount()}). {@code trackScores} is the request's
+     * {@code track_scores}: a sorted page that reports scores reads them,
+     * which decides with the sort and the knobs whether the query's
+     * score shaping compounds translate ({@link #scores()}).
      */
     public record ExecutionShape(QueryBuilder query, QueryBuilder postFilter, List<SortBuilder<?>> sorts, Object[] searchAfter, int from,
-        int fetch, AggregatorFactories.Builder aggregations, boolean collectorKnobs, boolean secondPass, int trackTotalHitsUpTo) {
+        int fetch, AggregatorFactories.Builder aggregations, boolean collectorKnobs, boolean secondPass, int trackTotalHitsUpTo,
+        boolean trackScores) {
 
         /** A shape without a {@code rescore} or a {@code collapse}, counting up to the default bound. */
         public ExecutionShape(
@@ -183,6 +200,22 @@ public final class SearchRequestToRel {
             boolean collectorKnobs
         ) {
             this(query, postFilter, sorts, searchAfter, from, fetch, aggregations, collectorKnobs, false);
+        }
+
+        /** A shape without {@code track_scores}. */
+        public ExecutionShape(
+            QueryBuilder query,
+            QueryBuilder postFilter,
+            List<SortBuilder<?>> sorts,
+            Object[] searchAfter,
+            int from,
+            int fetch,
+            AggregatorFactories.Builder aggregations,
+            boolean collectorKnobs,
+            boolean secondPass,
+            int trackTotalHitsUpTo
+        ) {
+            this(query, postFilter, sorts, searchAfter, from, fetch, aggregations, collectorKnobs, secondPass, trackTotalHitsUpTo, false);
         }
 
         /** A shape counting up to the default {@code track_total_hits} bound. */
@@ -240,7 +273,8 @@ public final class SearchRequestToRel {
                 secondPass,
                 source == null || source.trackTotalHitsUpTo() == null
                     ? SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO
-                    : source.trackTotalHitsUpTo()
+                    : source.trackTotalHitsUpTo(),
+                source != null && source.trackScores()
             );
         }
 
@@ -255,6 +289,29 @@ public final class SearchRequestToRel {
         /** Whether the request carries a {@code search_after} cursor. */
         public boolean hasCursor() {
             return searchAfter != null && searchAfter.length > 0;
+        }
+
+        /**
+         * Whether the request reads document scores, which decides
+         * whether the query's score shaping compounds
+         * ({@code constant_score}, {@code dis_max}, {@code boosting},
+         * {@code function_score}) translate to the rows they match
+         * ({@link QueryToRex.Scores}). Scores are read by a page in
+         * score order (no sort, or a sort naming {@code _score}), by
+         * {@code track_scores}, by the collector knobs ({@code min_score}
+         * filters on the score; {@code terminate_after} rides with it) and
+         * by a {@code rescore} or a {@code collapse}. A count, an
+         * aggregation request and a page ordered by stored columns read
+         * none.
+         */
+        public QueryToRex.Scores scores() {
+            if (collectorKnobs || secondPass || trackScores) {
+                return QueryToRex.Scores.USED;
+            }
+            if (!hits()) {
+                return QueryToRex.Scores.UNUSED;
+            }
+            return scoresOf(sorts);
         }
 
         /**
@@ -346,7 +403,7 @@ public final class SearchRequestToRel {
         checkAggregationsExecutable(shape.aggregations());
         LanceShape lanceShape = detectLanceShape(shape.query());
         RelBuilder relBuilder = scanBuilder(model, factory);
-        RelNode root = queryRoot(shape.query(), lanceShape, model, relBuilder);
+        RelNode root = queryRoot(shape.query(), lanceShape, model, relBuilder, shape.scores());
         if (shape.collectorKnobs()) {
             // min_score and terminate_after apply inside Lucene's
             // collectors: the count, the page and the aggregations are
@@ -407,8 +464,17 @@ public final class SearchRequestToRel {
      * builder as well: the {@link LanceFtsMatch} / {@link LanceKnnSearch}
      * node of a detected shape, the {@code Filter} of a scalar query, or
      * the bare scan for an absent or {@code match_all} query.
+     *
+     * @param scores whether the request reads document scores, which
+     *     decides whether the score shaping compounds translate
      */
-    private static RelNode queryRoot(QueryBuilder query, LanceShape shape, LanceSchemas.IndexModel model, RelBuilder relBuilder) {
+    private static RelNode queryRoot(
+        QueryBuilder query,
+        LanceShape shape,
+        LanceSchemas.IndexModel model,
+        RelBuilder relBuilder,
+        QueryToRex.Scores scores
+    ) {
         if (shape != null) {
             RelNode root = lanceShapeRel(shape, model, relBuilder);
             relBuilder.push(root);
@@ -420,10 +486,28 @@ public final class SearchRequestToRel {
             // stays a Filter node instead of folding into empty Values.
             // Flattening turns the translator's nested AND / OR chains
             // into the n-ary calls LogicalFilter requires.
-            RexNode predicate = RexUtil.flatten(relBuilder.getRexBuilder(), QueryToRex.translate(query, model, relBuilder));
+            RexNode predicate = RexUtil.flatten(relBuilder.getRexBuilder(), QueryToRex.translate(query, model, relBuilder, scores));
             relBuilder.push(LogicalFilter.create(relBuilder.build(), predicate));
         }
         return relBuilder.peek();
+    }
+
+    /**
+     * Whether a page under {@code sorts} reads document scores: it does
+     * without a sort (the page is in score order) and when a clause
+     * names {@code _score}; a page ordered by stored columns alone reads
+     * none.
+     */
+    static QueryToRex.Scores scoresOf(List<SortBuilder<?>> sorts) {
+        if (sorts == null || sorts.isEmpty()) {
+            return QueryToRex.Scores.USED;
+        }
+        for (SortBuilder<?> sort : sorts) {
+            if (sort instanceof ScoreSortBuilder) {
+                return QueryToRex.Scores.USED;
+            }
+        }
+        return QueryToRex.Scores.UNUSED;
     }
 
     /**
@@ -533,12 +617,13 @@ public final class SearchRequestToRel {
      * {@code lance_knn} becomes {@link LanceKnnSearch}, each over the
      * scan or over a {@code Filter} carrying the shape's scalar
      * clauses; any other query becomes the {@code Filter} (or the bare
-     * scan for {@code match_all}). Throws
+     * scan for {@code match_all}), with no score read
+     * ({@link QueryToRex.Scores#UNUSED}). Throws
      * {@link UnsupportedOperationException} naming the first
      * unsupported element, exactly as {@link #translate}.
      */
     public static RelNode translateQuery(QueryBuilder query, LanceSchemas.IndexModel model, LancePlannerFactory factory) {
-        return queryRoot(query, detectLanceShape(query), model, scanBuilder(model, factory));
+        return queryRoot(query, detectLanceShape(query), model, scanBuilder(model, factory), QueryToRex.Scores.UNUSED);
     }
 
     /**

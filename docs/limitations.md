@@ -12,6 +12,26 @@ Every `_search` over a Lance backed target runs on the fragment executors. A bod
 
 A request Lance refuses as invalid input (for example `lance_match_phrase` on an FTS index built without `with_position: true`) answers 400 `illegal_argument_exception` with Lance's message.
 
+## Query types the field types refuse
+
+The fragment leaves carry doc values, the Lance full text and vector indexes, and the parent join of nested columns, but no postings, positions, term statistics or points ([features.md](features.md#query-dsl-matrix) lists every query type and what evaluates it). The query types that read what the leaves do not carry are refused by the field types themselves, with 400 on both paths and the same message on OpenSearch's stock search action over the whole table reader:
+
+- `intervals`: `Can only use interval queries on text fields - not on [body] which is of type [lance_text]`.
+- `match_phrase_prefix`: `Can only use phrase prefix queries on text fields - not on [body] which is of type [lance_text]`.
+- `span_term`, `span_near`, `span_first` and the other `span_*` queries: `Cannot extract a term from a query of type class org.opensearch.lance.query.LanceFtsQuery: ...`; the span builders extract a Lucene term from the field type's term query, and the Lance full text query is not a term query.
+- `more_like_this`: `more_like_this only supports text/keyword fields: [body]`.
+- `has_child`, `has_parent`, `parent_id`: `[has_child] no join field has been configured`; no join field is derived from a Lance table.
+
+Lance's inverted index exposes neither positions nor term statistics through the Java SDK; span, interval and more like this queries wait on that API.
+
+## `ids` outside the translator
+
+`ids` translates to a predicate on the primary key column and is served by the Lance scan under every envelope. The `_id` field itself has no postings on the fragment leaves (the id is synthesised from the key column, or from the row address on a table without a primary key), so an `ids` clause inside a shape the translator refuses (a `bool` with `minimum_should_match`, a `function_score` with a `script_score` function, a `nested` query) is built by the Lucene composition as a terms query on `_id` and matches nothing. A table without a primary key has no `ids` translation at all, and the query matches nothing there. The same holds for OpenSearch's stock search action over the whole table reader.
+
+## Score shaping queries on a scored request
+
+`constant_score`, `dis_max`, `boosting` and `function_score`, and a `bool` whose optional `should` clauses would score its matches apart, translate to a predicate only where no score is read (a count, an aggregation request, a page ordered by stored columns). The predicate scores every row `1.0`, so on a page in score order, with `track_scores`, `min_score`, `rescore` or `collapse` those queries take the Lucene composition, which orders the page the way the query asks; the count and the aggregations of the same request are then Lucene's as well, not a Lance count scan or a pushed aggregate. `GET /<index>/_lance/explain` reports the choice under `unplanned` (`query type [dis_max] on a scored request`, `bool with optional should clauses on a scored request`). A `bool` whose every clause scores every match alike (`must` and `filter` clauses only, or a single `should`) translates under every envelope; its Lucene score would be the sum of its clauses' scores where the pushed page reports `1.0`, and `track_scores` over a pushed page reports `1.0` for every hit.
+
 ## Aggregation answers that differ from a single reader
 
 - `percentiles` with the default tdigest method and `cardinality` are computed on the fragment path as one sketch per executor and merged by the coordinator, the way OpenSearch merges them across shards. The merged value is within the sketch's error of the value a single reader over the whole table computes, not identical to it, and can move when the fragment to node assignment changes. Inside an executor the sketch is built per collection slice and the slices are merged as well, so the value also moves with `lance.fragment_path.slices` (set it to `1` for one sketch per executor). When the aggregation pushdown answers a tdigest `percentiles` / `percentile_ranks` ([features.md](features.md#aggregation-pushdown)), the executor's sketch is fed from what Lance aggregated rather than from every document: the tdigest receives each of `lance.aggregation.percentiles_bins` equal width bins over the field's `[min, max]` as one value at each bin edge and the rest at the centre, so the histogram is accurate to the bin width (`(max - min) / bins`, 0.025 % of the range at the default 4096) and the digest built from those few thousand weighted points interpolates less accurately than one built from every document (measured at 0.16 % of the range for a p95 over a long tailed field of 20M rows). `cardinality` is never answered by the pushdown: the planner routes any tree carrying one to the aggregators, because the pushed form measured slower than the aggregator while returning the same count. `hdr` percentiles, `stats`, `extended_stats`, `range`, `date_range`, `missing`, `filter`, `filters` and `composite` are exact at every node and slice count.

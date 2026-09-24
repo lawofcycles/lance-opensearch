@@ -1082,7 +1082,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             // collectors on the executor, so a request carrying either is
             // not planned as a pushed aggregate or a pushed page (see
             // ExecutionShape.collectorKnobs). The track_total_hits bound
-            // travels so the planner can demand an exact count.
+            // travels so the planner can demand an exact count, and
+            // track_scores so it knows the page reads scores.
             return new ExecutionShape(
                 query,
                 postFilter,
@@ -1093,7 +1094,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 aggregations,
                 minScore != null || terminateAfter > 0,
                 !rescores.isEmpty() || collapse != null,
-                trackTotalHitsUpTo
+                trackTotalHitsUpTo,
+                trackScores
             );
         }
     }

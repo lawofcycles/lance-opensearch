@@ -169,8 +169,8 @@ public class LanceTopKIT extends LanceRestTestCase {
             // The planner refuses the shape (the explain endpoint names
             // it) and the doc-values comparator answers it: the nearest
             // rows to the landmark come back in distance order either
-            // way, with or without a constant_score wrap forcing the
-            // Lucene composition.
+            // way, with or without a constant_score wrap (the geo column
+            // keeps both forms on the Lucene composition).
             String sort =
                 "\"sort\":[{\"_geo_distance\":{\"location\":{\"lat\":35.6812,\"lon\":139.7671},\"order\":\"asc\",\"unit\":\"m\"}}]";
             String direct = "{\"size\":4,\"query\":{\"exists\":{\"field\":\"location\"}}," + sort + "}";

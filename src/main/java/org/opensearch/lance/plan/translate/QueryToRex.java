@@ -21,6 +21,9 @@ import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateFormatters;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.BoostingQueryBuilder;
+import org.opensearch.index.query.ConstantScoreQueryBuilder;
+import org.opensearch.index.query.DisMaxQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
 import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
@@ -32,6 +35,12 @@ import org.opensearch.index.query.RegexpQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.index.query.WildcardQueryBuilder;
+import org.opensearch.index.query.functionscore.DecayFunctionBuilder;
+import org.opensearch.index.query.functionscore.FieldValueFactorFunctionBuilder;
+import org.opensearch.index.query.functionscore.FunctionScoreQueryBuilder;
+import org.opensearch.index.query.functionscore.RandomScoreFunctionBuilder;
+import org.opensearch.index.query.functionscore.ScoreFunctionBuilder;
+import org.opensearch.index.query.functionscore.ScriptScoreFunctionBuilder;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.search.DocValueFormat;
@@ -67,7 +76,26 @@ import static org.opensearch.lance.plan.translate.AggregationToRel.unsupported;
  * backslash escaped SQL pattern), {@code RLIKE} (with the pattern
  * anchored the way Lucene matches the whole term) and
  * {@code STARTS_WITH}; {@code ids} compares the index's primary key
- * column; {@code match_none} is the {@code false} literal. Every other
+ * column; {@code match_none} is the {@code false} literal. The compound
+ * queries that only shape scores reduce to the rows they match when
+ * the request reads no score ({@link Scores#UNUSED}): a
+ * {@code constant_score} is its filter, a {@code dis_max} is the
+ * disjunction of its clauses, a {@code boosting} is its positive clause
+ * (the negative clause must translate too, so a refusal the Lucene
+ * composition would answer is not lost, but it selects nothing), and a
+ * {@code function_score} is its query, provided it has no
+ * {@code min_score} (a score threshold has no predicate form) and no
+ * {@code script_score} function (a script runs on the Lucene side only,
+ * and its failures with it); the filters and the fields of its other
+ * functions must resolve for the same reason the negative clause must.
+ * On a request whose scores order or filter the hits
+ * ({@link Scores#USED}) the four compounds throw, because the predicate
+ * has no score and the page would come back in another order than the
+ * one the query asks for; a {@code bool} whose optional {@code should}
+ * clauses would score its matches apart (a {@code should} next to a
+ * {@code must} or {@code filter}, or several {@code should}) throws for
+ * the same reason, while one that scores every match alike translates.
+ * Every other
  * query type, a value the field's type does not accept, and an
  * unmapped field throw {@link UnsupportedOperationException} naming
  * the element.
@@ -88,16 +116,55 @@ public final class QueryToRex {
      */
     static final int MAX_TERMS_VALUES = IndexSettings.MAX_TERMS_COUNT_SETTING.getDefault(Settings.EMPTY);
 
+    /**
+     * What the request the predicate serves does with document scores.
+     * The predicate itself carries no score (every row it selects scores
+     * 1.0 on the Lucene side), so the compound queries whose only effect
+     * is on scores ({@code constant_score}, {@code dis_max},
+     * {@code boosting}, {@code function_score}) reduce to the rows they
+     * match only when nothing reads the score, and a {@code bool} whose
+     * optional clauses would score its matches apart translates only
+     * then as well.
+     */
+    public enum Scores {
+        /**
+         * No score is read: a count, an aggregation request, a page
+         * ordered by stored columns, the filter of a bucket, a knn
+         * prefilter or the scalar companion of a full text clause.
+         */
+        UNUSED,
+        /**
+         * Scores order or filter the hits: a page in score order, a sort
+         * naming {@code _score}, {@code track_scores}, {@code min_score},
+         * a {@code rescore} or a {@code collapse}.
+         */
+        USED
+    }
+
     private QueryToRex() {}
 
     /**
      * The predicate of a request's {@code query} clause over the scan
-     * the builder holds.
+     * the builder holds, for a request that reads no score
+     * ({@link Scores#UNUSED}).
      *
      * @throws UnsupportedOperationException naming the first element
      *     outside the supported set
      */
     public static RexNode translate(QueryBuilder query, LanceSchemas.IndexModel model, RelBuilder relBuilder) {
+        return translate(query, model, relBuilder, Scores.UNUSED);
+    }
+
+    /**
+     * The predicate of a request's {@code query} clause over the scan
+     * the builder holds.
+     *
+     * @param scores whether the request reads document scores, which
+     *     decides whether the score shaping compounds translate
+     * @throws UnsupportedOperationException naming the first element
+     *     outside the supported set
+     */
+    public static RexNode translate(QueryBuilder query, LanceSchemas.IndexModel model, RelBuilder relBuilder, Scores scores) {
         return predicate(
             query,
             new Context(
@@ -106,7 +173,8 @@ public final class QueryToRex {
                 model.multiFields(),
                 model.renamedFields(),
                 model.primaryKeyField(),
-                model.dateOverrideColumns()
+                model.dateOverrideColumns(),
+                scores
             ),
             relBuilder
         );
@@ -129,15 +197,27 @@ public final class QueryToRex {
     ) {
         return predicate(
             query,
-            new Context(" in filter of aggregation [" + aggregationName + "]", schema, multiFields, renamedFields, "", Set.of()),
+            new Context(
+                " in filter of aggregation [" + aggregationName + "]",
+                schema,
+                multiFields,
+                renamedFields,
+                "",
+                Set.of(),
+                Scores.UNUSED
+            ),
             relBuilder
         );
     }
 
-    /** Where a refusal happened ({@link #where} is empty for the request's query clause) and what fields resolve against. */
+    /**
+     * Where a refusal happened ({@link #where} is empty for the request's
+     * query clause), what fields resolve against, and whether the
+     * request reads scores.
+     */
     private record Context(String where, Schema schema, Map<String, LinkedHashMap<String, String>> multiFields, Map<
         String,
-        String> renamedFields, String primaryKey, Set<String> dateOverrides) {
+        String> renamedFields, String primaryKey, Set<String> dateOverrides, Scores scores) {
     }
 
     private static RexNode predicate(QueryBuilder query, Context context, RelBuilder relBuilder) {
@@ -245,7 +325,94 @@ public final class QueryToRex {
         if (query instanceof BoolQueryBuilder bool) {
             return boolOf(bool, context, relBuilder);
         }
+        if (query instanceof ConstantScoreQueryBuilder constantScore) {
+            requireScoresUnused("constant_score", context);
+            return predicate(constantScore.innerQuery(), context, relBuilder);
+        }
+        if (query instanceof DisMaxQueryBuilder disMax) {
+            requireScoresUnused("dis_max", context);
+            // DisjunctionMaxQuery matches the union of its clauses; an
+            // empty one matches nothing.
+            RexNode any = null;
+            for (QueryBuilder clause : disMax.innerQueries()) {
+                RexNode one = predicate(clause, context, relBuilder);
+                any = any == null ? one : relBuilder.call(SqlStdOperatorTable.OR, any, one);
+            }
+            return any == null ? relBuilder.literal(false) : any;
+        }
+        if (query instanceof BoostingQueryBuilder boosting) {
+            requireScoresUnused("boosting", context);
+            // The negative clause only lowers scores; it is translated so
+            // a clause the translator refuses keeps the whole query on the
+            // Lucene composition, which answers what the shard path would,
+            // and the predicate is dropped.
+            predicate(boosting.negativeQuery(), context, relBuilder);
+            return predicate(boosting.positiveQuery(), context, relBuilder);
+        }
+        if (query instanceof FunctionScoreQueryBuilder functionScore) {
+            return functionScoreOf(functionScore, context, relBuilder);
+        }
         throw unsupported("query type [" + query.getName() + "]" + context.where());
+    }
+
+    /**
+     * Refuses a score shaping compound on a request that reads scores:
+     * the predicate scores every row 1.0, so the page would come back in
+     * another order than the one the query asks for.
+     */
+    private static void requireScoresUnused(String queryName, Context context) {
+        if (context.scores() == Scores.USED) {
+            throw unsupported("query type [" + queryName + "] on a scored request" + context.where());
+        }
+    }
+
+    /**
+     * A {@code function_score} as the rows its query matches. Refused
+     * with a {@code min_score} (the threshold reads the scores the
+     * predicate does not have) and with a {@code script_score} function
+     * (the script runs on the Lucene side only, where a failing script
+     * answers 400). The filter of every function and the field a
+     * {@code field_value_factor}, a decay function or a
+     * {@code random_score} names are resolved and dropped, so a filter or
+     * a field the translator cannot place keeps the query on the Lucene
+     * composition and answers what the shard path answers.
+     */
+    private static RexNode functionScoreOf(FunctionScoreQueryBuilder functionScore, Context context, RelBuilder relBuilder) {
+        // The reasons that hold under every envelope are named first,
+        // so explain reports the same element for the same query.
+        if (functionScore.getMinScore() != null) {
+            throw unsupported("function_score with min_score" + context.where());
+        }
+        for (FunctionScoreQueryBuilder.FilterFunctionBuilder function : functionScore.filterFunctionBuilders()) {
+            if (function.getScoreFunction() instanceof ScriptScoreFunctionBuilder) {
+                throw unsupported("function_score with a script_score function" + context.where());
+            }
+        }
+        requireScoresUnused("function_score", context);
+        for (FunctionScoreQueryBuilder.FilterFunctionBuilder function : functionScore.filterFunctionBuilders()) {
+            if (function.getFilter() != null) {
+                predicate(function.getFilter(), context, relBuilder);
+            }
+            String field = functionField(function.getScoreFunction());
+            if (field != null) {
+                resolve(field, context, relBuilder);
+            }
+        }
+        return predicate(functionScore.query(), context, relBuilder);
+    }
+
+    /** The field a score function reads, or null when it reads none (a {@code weight}, a {@code random_score} without a field). */
+    private static String functionField(ScoreFunctionBuilder<?> function) {
+        if (function instanceof FieldValueFactorFunctionBuilder factor) {
+            return factor.fieldName();
+        }
+        if (function instanceof DecayFunctionBuilder<?> decay) {
+            return decay.getFieldName();
+        }
+        if (function instanceof RandomScoreFunctionBuilder random) {
+            return random.getField();
+        }
+        return null;
     }
 
     /** {@code target = v1 OR target = v2 OR ...} over two or more values, the shape the SQL printer collapses to {@code IN}. */
@@ -261,6 +428,16 @@ public final class QueryToRex {
     private static RexNode boolOf(BoolQueryBuilder bool, Context context, RelBuilder relBuilder) {
         if (bool.minimumShouldMatch() != null) {
             throw unsupported("minimum_should_match" + context.where());
+        }
+        if (context.scores() == Scores.USED
+            && !bool.should().isEmpty()
+            && bool.should().size() + bool.must().size() + bool.filter().size() > 1) {
+            // BooleanQuery scores a row by the optional clauses it matches
+            // on top of the required ones, so rows the predicate selects
+            // alike land in different places of a score ordered page; a
+            // single should clause alone is required and scores every
+            // match the same.
+            throw unsupported("bool with optional should clauses on a scored request" + context.where());
         }
         RexNode all = null;
         for (QueryBuilder clause : bool.must()) {
@@ -839,8 +1016,11 @@ public final class QueryToRex {
     /**
      * The fields the leaves of {@code query} name, as the request spells
      * them (a keyword sub field as {@code body.raw}, a struct child as
-     * {@code location.lat}), through every {@code bool} clause and the
-     * inner {@code filter} of a {@code lance_knn}. Only the leaf shapes
+     * {@code location.lat}), through every {@code bool} clause, the
+     * clauses of a {@code constant_score}, {@code dis_max},
+     * {@code boosting} or {@code function_score} (its function filters
+     * and the fields its functions read included) and the inner
+     * {@code filter} of a {@code lance_knn}. Only the leaf shapes
      * this translator supports contribute; a full text clause, a
      * {@code match} or any other query names nothing here. Empty for a
      * null query.
@@ -865,6 +1045,32 @@ public final class QueryToRex {
         }
         if (query instanceof LanceKnnQueryBuilder knn) {
             collectFields(knn.filter(), fields);
+            return;
+        }
+        if (query instanceof ConstantScoreQueryBuilder constantScore) {
+            collectFields(constantScore.innerQuery(), fields);
+            return;
+        }
+        if (query instanceof DisMaxQueryBuilder disMax) {
+            for (QueryBuilder clause : disMax.innerQueries()) {
+                collectFields(clause, fields);
+            }
+            return;
+        }
+        if (query instanceof BoostingQueryBuilder boosting) {
+            collectFields(boosting.positiveQuery(), fields);
+            collectFields(boosting.negativeQuery(), fields);
+            return;
+        }
+        if (query instanceof FunctionScoreQueryBuilder functionScore) {
+            collectFields(functionScore.query(), fields);
+            for (FunctionScoreQueryBuilder.FilterFunctionBuilder function : functionScore.filterFunctionBuilders()) {
+                collectFields(function.getFilter(), fields);
+                String field = functionField(function.getScoreFunction());
+                if (field != null) {
+                    fields.add(field);
+                }
+            }
             return;
         }
         String field = null;
