@@ -356,10 +356,10 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     public void testLanceMatchWithScalarFilterMatchesLuceneComposition() throws Exception {
         // bool { must: [lance_match], filter: [term] } is collapsed on
         // the executor into one Lance FTS scan with a SQL prefilter.
-        // The control query wraps the same filter in constant_score,
-        // which the SQL translator refuses, so it runs as the plain
-        // Lucene BooleanQuery over the unfiltered FTS scan. Both
-        // must agree on ids, order, scores and the total.
+        // The control query wraps the same filter in a bool with
+        // minimum_should_match, which the SQL translator refuses, so it
+        // runs as the plain Lucene BooleanQuery over the unfiltered FTS
+        // scan. Both must agree on ids, order, scores and the total.
         try (LanceTestCluster fixture = LanceTestCluster.setUpMultiFragment(12, 4, "lmatchprefilter")) {
             String indexName = fixture.indexName();
             String fts = "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}";
@@ -814,11 +814,12 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     /**
      * Runs {@code bool { must: [fts], filter: [filter], must_not: [mustNot] }}
      * twice: once as written (collapsed into a prefiltered Lance FTS
-     * scan on the executor) and once with the filter wrapped in
-     * {@code constant_score} so the SQL translator refuses it and the
-     * bool stays a Lucene BooleanQuery. Asserts the two agree on ids
-     * (in score order), scores, {@code hits.total.value} with and
-     * without {@code size:0}, and that the ids are {@code expectedIds}.
+     * scan on the executor) and once with the filter wrapped in a
+     * {@code bool} with {@code minimum_should_match}, which the SQL
+     * translator refuses, so the bool stays a Lucene BooleanQuery.
+     * Asserts the two agree on ids (in score order), scores,
+     * {@code hits.total.value} with and without {@code size:0}, and
+     * that the ids are {@code expectedIds}.
      */
     private static void assertPushdownMatchesControl(String indexName, String fts, String filter, String mustNot, List<String> expectedIds)
         throws IOException {
@@ -826,9 +827,9 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         String pushdownBool = "{\"bool\":{\"must\":[" + fts + "],\"filter\":[" + filter + "]" + mustNotClause + "}}";
         String controlBool = "{\"bool\":{\"must\":["
             + fts
-            + "],\"filter\":[{\"constant_score\":{\"filter\":"
+            + "],\"filter\":[{\"bool\":{\"should\":["
             + filter
-            + "}}]"
+            + "],\"minimum_should_match\":1}}]"
             + mustNotClause
             + "}}";
 
@@ -875,9 +876,10 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     public void testPlannerPushdownMatchesLuceneCompositionForEveryFtsShape() throws Exception {
         // Every FTS shape with a scalar filter runs twice: once as
         // written, which the planner folds into one prefiltered Lance
-        // FTS scan, and once with the filter wrapped in constant_score,
-        // which the planner's translator refuses, so the bool stays a
-        // Lucene BooleanQuery over the unfiltered FTS scan. The helper
+        // FTS scan, and once with the filter wrapped in a bool with
+        // minimum_should_match, which the planner's translator refuses,
+        // so the bool stays a Lucene BooleanQuery over the unfiltered
+        // FTS scan. The helper
         // asserts equal ids in score order, equal scores, and equal
         // totals with and without size:0. Rows: 12 rows in three
         // fragments of four; even rows carry body "hello lance i" and

@@ -168,11 +168,12 @@ public class LanceHitShapeIT extends LanceRestTestCase {
             String count = readAll(postJson("/" + indexName + "/_count", "{\"query\":" + query + "}"));
             assertEquals(expected.size(), extractIntPath(count, "count"));
 
-            // A page the top-k pushdown does not fold (a score sort next
-            // to a column sort) runs the same filter through Lucene's
-            // collector: the plan is a Lucene page whose scalar filter
-            // carries both encodings, and the hits are the expected rows.
-            String pageBody = "{\"size\":12,\"query\":" + query + ",\"sort\":[\"_score\",{\"id\":\"asc\"}]}";
+            // A page the top-k pushdown does not fold (a sort mode the
+            // Lance ordering does not spell) runs the same filter through
+            // Lucene's collector: the plan is a Lucene page whose scalar
+            // filter carries both encodings, and the hits are the
+            // expected rows.
+            String pageBody = "{\"size\":12,\"query\":" + query + ",\"sort\":[{\"id\":{\"order\":\"asc\",\"mode\":\"min\"}}]}";
             @SuppressWarnings("unchecked")
             Map<String, Object> pagePlan = (Map<String, Object>) parseJson(explainBody(indexName, pageBody)).get("fragment_plan");
             assertEquals("LUCENE_TOPK", pagePlan.get("kind"));
