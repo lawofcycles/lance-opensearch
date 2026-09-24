@@ -5,12 +5,16 @@
 
 package org.opensearch.lance.plan.metadata;
 
+import org.lance.Dataset;
+import org.lance.index.IndexType;
+
 import java.time.Instant;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * What the planner knows about one Lance table at one manifest version,
@@ -88,6 +92,46 @@ public final class TableStatistics {
     /** Statistics of {@code column}, empty when no index covers it. */
     public Optional<ColumnStatistics> column(String column) {
         return Optional.ofNullable(columns.get(column));
+    }
+
+    /**
+     * Reads the zone maps of every column that carries a zone map index
+     * and that {@code fields} names, directly or through a dotted child
+     * or sub field ({@code body.raw} reads the zone map of {@code body}),
+     * so a planner that runs after {@code dataset} is closed can prune
+     * fragments with them ({@link ColumnStatistics#zoneMapIfRead()}).
+     * Each zone map is read once per instance and memoised; a column
+     * without a zone map index or outside {@code fields} is left
+     * unread. A read that fails propagates its {@link RuntimeException};
+     * callers treat the zone maps as an input to plan quality and catch
+     * it rather than fail the request.
+     *
+     * @param dataset the open dataset at {@link #datasetVersion()}
+     * @param fields the request fields the query's leaves name
+     */
+    public void readZoneMaps(Dataset dataset, Set<String> fields) {
+        if (fields.isEmpty()) {
+            return;
+        }
+        for (ColumnStatistics column : columns.values()) {
+            if (column.hasIndex(IndexType.ZONEMAP) && namesColumn(fields, column.column())) {
+                column.zoneMap(dataset);
+            }
+        }
+    }
+
+    /** Whether some field is {@code column} or a dotted path below it. */
+    static boolean namesColumn(Set<String> fields, String column) {
+        if (fields.contains(column)) {
+            return true;
+        }
+        String prefix = column + ".";
+        for (String field : fields) {
+            if (field.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Manifest version the statistics describe. */

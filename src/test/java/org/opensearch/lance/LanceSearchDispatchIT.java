@@ -243,6 +243,105 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         }
     }
 
+    public void testZoneMapPruningSkipsFragmentsWithoutChangingTheAnswer() throws Exception {
+        // Four fragments of 100 rows with a zone map on id (ids
+        // contiguous per fragment): a range on id excludes whole
+        // fragments at the coordinator, the executors skip them, and
+        // every shape answers exactly what the unpruned scan answers.
+        String suffix = "prune-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeZoneMappedFixtureTable(scratchDir, tableName, 4, 100, 50);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // id >= 250 lives in fragments 2 and 3 only; 0 and 1 are pruned.
+            String range = "{\"range\":{\"id\":{\"gte\":250}}}";
+            long before = prunedFragments();
+
+            String hits = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":" + range + ",\"size\":200,\"track_total_hits\":true}")
+            );
+            assertEquals("the range matches ids 250..399: " + hits, 150, extractIntPath(hits, "hits", "total", "value"));
+            assertEquals(150, countOccurrences(hits, "\"_id\":"));
+            assertFalse("no pruned row is returned: " + hits, hits.contains("\"id\":249,") || hits.contains("\"id\":100,"));
+            assertTrue("a kept row is returned: " + hits, hits.contains("\"id\":250,") || hits.contains("\"id\":250}"));
+            assertEquals("two fragments skipped on the hits request", before + 2, prunedFragments());
+
+            String count = readAll(postJson("/" + indexName + "/_count", "{\"query\":" + range + "}"));
+            assertEquals("_count sees the same rows: " + count, 150, extractIntPath(count, "count"));
+            assertEquals("two fragments skipped on the count", before + 4, prunedFragments());
+
+            // The pushed aggregate over the pruned scan: sum(250..399).
+            String sum = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":" + range + ",\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}")
+            );
+            assertEquals(150, extractIntPath(sum, "hits", "total", "value"));
+            assertEquals((250 + 399) * 150 / 2, extractIntPath(sum, "aggregations", "s", "value"));
+            assertEquals("two fragments skipped on the aggregate", before + 6, prunedFragments());
+
+            // A sorted page over the pruned scan starts at the lowest kept id.
+            String page = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":" + range + ",\"size\":3,\"sort\":[{\"id\":\"asc\"}]}")
+            );
+            assertEquals(List.of(250, 251, 252), sortValuesOf(page));
+            assertEquals("two fragments skipped on the page", before + 8, prunedFragments());
+
+            // A full text clause with the range as its prefilter: every
+            // row carries the token, so the prefilter decides the count.
+            String fts = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"track_total_hits\":true,\"query\":{\"bool\":{\"must\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}],"
+                        + "\"filter\":["
+                        + range
+                        + "]}}}"
+                )
+            );
+            assertEquals("the prefilter decides the count: " + fts, 150, extractIntPath(fts, "hits", "total", "value"));
+            assertEquals("two fragments skipped on the full text request", before + 10, prunedFragments());
+
+            // Every fragment pruned: the answer is the empty one, with the
+            // aggregations block an empty table produces.
+            String none = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":1000}}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}"
+                )
+            );
+            assertEquals(0, extractIntPath(none, "hits", "total", "value"));
+            assertEquals(0, extractIntPath(none, "aggregations", "s", "value"));
+            assertEquals("four fragments skipped when nothing can match", before + 14, prunedFragments());
+
+            // A range inside every fragment prunes nothing.
+            String all = readAll(
+                postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"id\":{\"gte\":50}}},\"size\":0,\"track_total_hits\":true}")
+            );
+            assertEquals(350, extractIntPath(all, "hits", "total", "value"));
+            assertEquals("nothing skipped when every fragment may match", before + 14, prunedFragments());
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** The first sort value of every hit of {@code searchBody}, in hit order. */
+    @SuppressWarnings("unchecked")
+    private static List<Integer> sortValuesOf(String searchBody) {
+        Map<String, Object> map = parseJson(searchBody);
+        List<Object> hits = (List<Object>) ((Map<String, Object>) map.get("hits")).get("hits");
+        List<Integer> values = new java.util.ArrayList<>(hits.size());
+        for (Object hit : hits) {
+            List<Object> sort = (List<Object>) ((Map<String, Object>) hit).get("sort");
+            values.add(((Number) sort.get(0)).intValue());
+        }
+        return values;
+    }
+
     public void testFragmentDispatchModeAnswersQueriesAgainstUnmappedFieldsWithoutError() throws Exception {
         // A range against an unmapped field behaves as on the shard
         // path: RangeQueryBuilder.doRewrite folds it to match_none and

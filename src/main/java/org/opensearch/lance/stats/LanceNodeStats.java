@@ -45,7 +45,9 @@ import org.opensearch.lance.query.ScanAdmission;
  * {@code plan.refinements} how often the fragment executor moved a
  * pushed operation of a shipped plan to the Lucene side, per reason;
  * {@code plan.executed} how many fragment requests the Lance scan and
- * Lucene each answered;
+ * Lucene each answered; {@code plan.pruned} how many fragments the
+ * executor left out of its scans because the shipped plan's zone map
+ * pruning excluded them;
  * {@code freshness} the node's checks of the Lance backed shards it
  * holds against their tables ({@link FreshnessStats});
  * {@code indices} the shard reader of every Lance-backed shard the node
@@ -60,7 +62,7 @@ import org.opensearch.lance.query.ScanAdmission;
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
     /** The wire format's version, the first field written and the first read. */
-    public static final int WIRE_VERSION = 1;
+    public static final int WIRE_VERSION = 2;
 
     private final boolean cacheEnabled;
     private final int snapshotCount;
@@ -117,6 +119,12 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * ({@code lucene}); both keys always present.
      */
     private final Map<String, Long> planExecuted;
+    /**
+     * How many fragments this node's executor left out of its scans
+     * because the shipped plan's zone map pruning excluded them, summed
+     * over every request since the node started.
+     */
+    private final long planPrunedFragments;
 
     private final int planStatisticsTables;
     private final long planStatisticsCollectMillisTotal;
@@ -294,7 +302,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             0,
             0L,
             Map.of(),
-            Map.of()
+            Map.of(),
+            0L
         );
     }
 
@@ -332,7 +341,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         int planStatisticsTables,
         long planStatisticsCollectMillisTotal,
         Map<String, Long> planRefinements,
-        Map<String, Long> planExecuted
+        Map<String, Long> planExecuted,
+        long planPrunedFragments
     ) {
         this(
             cacheEnabled,
@@ -369,6 +379,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             planStatisticsCollectMillisTotal,
             planRefinements,
             planExecuted,
+            planPrunedFragments,
             FreshnessStats.NONE
         );
     }
@@ -408,6 +419,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         long planStatisticsCollectMillisTotal,
         Map<String, Long> planRefinements,
         Map<String, Long> planExecuted,
+        long planPrunedFragments,
         FreshnessStats freshness
     ) {
         this.cacheEnabled = cacheEnabled;
@@ -444,6 +456,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.planStatisticsCollectMillisTotal = planStatisticsCollectMillisTotal;
         this.planRefinements = Collections.unmodifiableMap(new LinkedHashMap<>(planRefinements));
         this.planExecuted = Collections.unmodifiableMap(new LinkedHashMap<>(planExecuted));
+        this.planPrunedFragments = planPrunedFragments;
         this.freshness = freshness == null ? FreshnessStats.NONE : freshness;
     }
 
@@ -506,6 +519,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.planStatisticsCollectMillisTotal = in.readVLong();
         this.planRefinements = Collections.unmodifiableMap(in.readOrderedMap(StreamInput::readString, StreamInput::readVLong));
         this.planExecuted = Collections.unmodifiableMap(in.readOrderedMap(StreamInput::readString, StreamInput::readVLong));
+        this.planPrunedFragments = in.readVLong();
         this.freshness = new FreshnessStats(in);
     }
 
@@ -549,6 +563,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         out.writeVLong(planStatisticsCollectMillisTotal);
         out.writeMap(planRefinements, StreamOutput::writeString, StreamOutput::writeVLong);
         out.writeMap(planExecuted, StreamOutput::writeString, StreamOutput::writeVLong);
+        out.writeVLong(planPrunedFragments);
         freshness.writeTo(out);
     }
 
@@ -626,6 +641,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             builder.field(executed.getKey(), executed.getValue());
         }
         builder.endObject();
+        builder.startObject("pruned");
+        builder.field("fragments", planPrunedFragments);
+        builder.endObject();
         builder.endObject();
 
         builder.startObject("freshness");
@@ -699,6 +717,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     /** Fragment requests this node's executor answered, keyed by {@code pushed_scan} and {@code lucene}. */
     public Map<String, Long> planExecuted() {
         return planExecuted;
+    }
+
+    /** Fragments this node's executor skipped under zone map pruning since the node started. */
+    public long planPrunedFragments() {
+        return planPrunedFragments;
     }
 
     /** This node's freshness checks of the Lance backed shards it holds. */
@@ -891,6 +914,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && planStatisticsCollectMillisTotal == other.planStatisticsCollectMillisTotal
             && planRefinements.equals(other.planRefinements)
             && planExecuted.equals(other.planExecuted)
+            && planPrunedFragments == other.planPrunedFragments
             && freshness.equals(other.freshness);
     }
 
@@ -931,6 +955,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             planStatisticsCollectMillisTotal,
             planRefinements,
             planExecuted,
+            planPrunedFragments,
             freshness
         );
     }

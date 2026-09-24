@@ -191,6 +191,21 @@ public final class LanceSchemas {
      * @param warmCache the node's snapshot cache
      */
     public static IndexModel build(IndexMetadata indexMetadata, LanceWarmCache warmCache) throws IOException {
+        return build(indexMetadata, warmCache, Set.of());
+    }
+
+    /**
+     * {@link #build(IndexMetadata, LanceWarmCache)}, reading as well the
+     * zone maps of the columns {@code queryFields} name while the lease
+     * is held ({@link TableStatistics#readZoneMaps}), so the plan built
+     * over the model can exclude the fragments the query predicate
+     * cannot match. A zone map that fails to read is logged and left
+     * unread: pruning is an input to plan quality, not to correctness.
+     *
+     * @param queryFields the fields the query's leaves name
+     *     ({@link org.opensearch.lance.plan.translate.QueryToRex#referencedFields})
+     */
+    public static IndexModel build(IndexMetadata indexMetadata, LanceWarmCache warmCache, Set<String> queryFields) throws IOException {
         String indexName = indexMetadata.getIndex().getName();
         Settings settings = indexMetadata.getSettings();
         String tableUri = settings.get(LanceEngineFactory.TABLE_SETTING);
@@ -226,6 +241,11 @@ public final class LanceSchemas {
             Schema arrowSchema = dataset.getSchema();
             try {
                 TableStatistics statistics = warmCache.tableStatistics().forVersion(dataset.uri(), lease.snapshot().version(), dataset);
+                try {
+                    statistics.readZoneMaps(dataset, queryFields);
+                } catch (RuntimeException e) {
+                    LOGGER.warn("zone maps of [{}] unavailable, planning without pruning", indexName, e);
+                }
                 return model(indexName, arrowSchema, multiFields, renamedFields, pkField, overrides.dateColumns().keySet(), statistics);
             } catch (RuntimeException e) {
                 // Statistics inform plan quality, not correctness: fall

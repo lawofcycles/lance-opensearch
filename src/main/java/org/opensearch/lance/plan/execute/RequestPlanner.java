@@ -20,6 +20,7 @@ import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.cost.CostInputs;
+import org.opensearch.lance.plan.prune.ZoneMapPruner;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
 import org.opensearch.lance.plan.traits.Accuracy;
 import org.opensearch.lance.plan.traits.PlanRequirement;
@@ -35,6 +36,7 @@ import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import java.io.IOException;
 import java.util.Objects;
 import java.util.Set;
+import java.util.SortedSet;
 
 /**
  * The coordinator's planning of one target: the request is translated
@@ -68,6 +70,13 @@ import java.util.Set;
  * demand; when no plan of the request does, the request is refused with
  * a 400 whose message names the trait, instead of an executor returning
  * an answer the request cannot rely on.
+ *
+ * <p>After the physical form is chosen, the query predicate is checked
+ * against the zone maps the caller read for the query's columns
+ * ({@link ZoneMapPruner}): a fragment none of whose zones can hold a
+ * matching row is listed in {@link FragmentPlan#excludedFragmentIds()},
+ * and the executors leave it out of their scans. The check reads the
+ * logical tree, so it applies to every physical form alike.
  */
 public final class RequestPlanner {
 
@@ -231,6 +240,15 @@ public final class RequestPlanner {
         FragmentPlan plan = FragmentPlan.of(physical, shape.hasAggregations(), shape.hits(), inputs);
         if (filteredKnn != null && (plan.lanceClause() == null || plan.filterSql() == null)) {
             throw knnFilterRefusal(filteredKnn, "the filter has no Lance SQL form");
+        }
+        // The fragments the query predicate cannot match, judged from
+        // the zone maps read for the query's columns; the executors
+        // leave them out of their scans. Read off the logical tree,
+        // whose Filter is the query predicate whatever physical form
+        // the planner chose for it.
+        SortedSet<Integer> excluded = ZoneMapPruner.prune(logical, model.table());
+        if (!excluded.isEmpty()) {
+            plan = plan.withExcludedFragments(ZoneMapPruner.toArray(excluded));
         }
         if (LOGGER.isDebugEnabled()) {
             LOGGER.debug("lance.plan: index [{}] planned [{}]\n{}", model.indexName(), plan, RelOptUtil.toString(physical));

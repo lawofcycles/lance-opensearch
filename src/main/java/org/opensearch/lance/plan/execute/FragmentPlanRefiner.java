@@ -144,6 +144,7 @@ public final class FragmentPlanRefiner {
 
     private static final LongAdder EXECUTED_PUSHED = new LongAdder();
     private static final LongAdder EXECUTED_ON_LUCENE = new LongAdder();
+    private static final LongAdder PRUNED_FRAGMENTS = new LongAdder();
 
     /** Applies the guards to {@code planned}, counting every reason that fired. */
     public Refined refine(FragmentPlan planned, Inputs in) {
@@ -280,6 +281,20 @@ public final class FragmentPlanRefiner {
         counts.put(EXECUTED_PUSHED_SCAN, EXECUTED_PUSHED.sum());
         counts.put(EXECUTED_LUCENE, EXECUTED_ON_LUCENE.sum());
         return counts;
+    }
+
+    /**
+     * Records that this node's executor left {@code fragments} fragments
+     * of one request out of its scans because the shipped plan's zone
+     * map pruning excluded them ({@link FragmentPlan#excludedFragmentIds()}).
+     */
+    public static void recordPruned(int fragments) {
+        PRUNED_FRAGMENTS.add(fragments);
+    }
+
+    /** Fragments this node's executor skipped under zone map pruning since the node started. */
+    public static long prunedFragments() {
+        return PRUNED_FRAGMENTS.sum();
     }
 
     /** Downgrades since the node started, keyed by {@link Reason#statsKey()}, every reason present. */

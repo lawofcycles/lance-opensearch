@@ -65,7 +65,12 @@ import java.util.Optional;
  * one of {@link #topK()} (an ordered, cut page the Lance scan returns)
  * or {@link #aggregate()} (a Substrait aggregate the Lance scan
  * computes), or neither when Lucene's collector and aggregators run.
- * {@link #kind()} names which physical root produced the plan.
+ * {@link #kind()} names which physical root produced the plan. A fourth
+ * part is optional: {@link #excludedFragmentIds()} lists the fragments
+ * the coordinator's zone map pruning proved empty of matching rows
+ * ({@link org.opensearch.lance.plan.prune.ZoneMapPruner}); the executor
+ * leaves them out of every scan of the request. Empty when nothing was
+ * pruned.
  *
  * <p>The wire format is internal to the plugin and assumes every node
  * runs the same plugin version. The stream opens with
@@ -84,7 +89,9 @@ import java.util.Optional;
 public final class FragmentPlan implements Writeable, ToXContentObject {
 
     /** The wire format's version, the first field written and the first read. */
-    public static final int WIRE_VERSION = 1;
+    public static final int WIRE_VERSION = 2;
+
+    private static final int[] NO_EXCLUDED_FRAGMENTS = new int[0];
 
     /** Which physical root the plan came from, and so how the envelope executes. */
     public enum Kind {
@@ -404,18 +411,36 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
     private final QueryBuilder lanceClause;
     private final TopK topK;
     private final Aggregate aggregate;
+    private final int[] excludedFragmentIds;
 
     public FragmentPlan(Kind kind, String filterSql, QueryBuilder lanceClause, TopK topK, Aggregate aggregate) {
+        this(kind, filterSql, lanceClause, topK, aggregate, NO_EXCLUDED_FRAGMENTS);
+    }
+
+    /**
+     * @param excludedFragmentIds the fragments the executor leaves out
+     *     of its scans, in ascending order without duplicates; the empty
+     *     array when nothing was pruned
+     */
+    public FragmentPlan(Kind kind, String filterSql, QueryBuilder lanceClause, TopK topK, Aggregate aggregate, int[] excludedFragmentIds) {
         this.kind = Objects.requireNonNull(kind, "kind");
         this.filterSql = filterSql;
         this.lanceClause = lanceClause;
         this.topK = topK;
         this.aggregate = aggregate;
+        this.excludedFragmentIds = Objects.requireNonNull(excludedFragmentIds, "excludedFragmentIds").clone();
         if (topK != null && aggregate != null) {
             throw new IllegalArgumentException("a plan carries a pushed page or a pushed aggregate, not both");
         }
         if (kind != Kind.PUSHED_SCAN && (topK != null || aggregate != null)) {
             throw new IllegalArgumentException("only a " + Kind.PUSHED_SCAN + " plan carries a pushed page or aggregate, got " + kind);
+        }
+        for (int i = 1; i < this.excludedFragmentIds.length; i++) {
+            if (this.excludedFragmentIds[i] <= this.excludedFragmentIds[i - 1]) {
+                throw new IllegalArgumentException(
+                    "excluded fragment ids must be ascending and distinct, got " + Arrays.toString(this.excludedFragmentIds)
+                );
+            }
         }
     }
 
@@ -425,7 +450,8 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
             in.readOptionalString(),
             in.readOptionalNamedWriteable(QueryBuilder.class),
             in.readOptionalWriteable(TopK::read),
-            in.readOptionalWriteable(Aggregate::read)
+            in.readOptionalWriteable(Aggregate::read),
+            in.readVIntArray()
         );
     }
 
@@ -443,6 +469,7 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         out.writeOptionalNamedWriteable(lanceClause);
         out.writeOptionalWriteable(topK);
         out.writeOptionalWriteable(aggregate);
+        out.writeVIntArray(excludedFragmentIds);
     }
 
     /**
@@ -626,12 +653,53 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         return aggregate;
     }
 
+    /**
+     * The fragments the executor leaves out of every scan of the
+     * request, in ascending order: the ones the coordinator's zone map
+     * pruning proved empty of rows matching the query predicate. Empty
+     * when nothing was pruned.
+     */
+    public int[] excludedFragmentIds() {
+        return excludedFragmentIds.clone();
+    }
+
+    /** Whether the plan excludes at least one fragment. */
+    public boolean excludesFragments() {
+        return excludedFragmentIds.length > 0;
+    }
+
+    /**
+     * {@code fragmentIds} without the excluded fragments, in the order
+     * given; the same list when the plan excludes nothing or none of
+     * them is listed.
+     */
+    public List<Integer> retainedFragments(List<Integer> fragmentIds) {
+        if (excludedFragmentIds.length == 0) {
+            return fragmentIds;
+        }
+        List<Integer> retained = new ArrayList<>(fragmentIds.size());
+        for (Integer id : fragmentIds) {
+            if (Arrays.binarySearch(excludedFragmentIds, id) < 0) {
+                retained.add(id);
+            }
+        }
+        return retained.size() == fragmentIds.size() ? fragmentIds : retained;
+    }
+
+    /** The same plan excluding {@code fragmentIds} (ascending, distinct); this plan when the array is empty and nothing was excluded. */
+    public FragmentPlan withExcludedFragments(int[] fragmentIds) {
+        if (Arrays.equals(fragmentIds, excludedFragmentIds)) {
+            return this;
+        }
+        return new FragmentPlan(kind, filterSql, lanceClause, topK, aggregate, fragmentIds);
+    }
+
     /** The same plan with the pushed aggregate dropped: the aggregators run over the same query. */
     public FragmentPlan withoutAggregate() {
         if (aggregate == null) {
             return this;
         }
-        return new FragmentPlan(Kind.LUCENE_AGGREGATE, filterSql, lanceClause, null, null);
+        return new FragmentPlan(Kind.LUCENE_AGGREGATE, filterSql, lanceClause, null, null, excludedFragmentIds);
     }
 
     /** The same plan with the pushed page dropped: the collector cuts the page over the same query. */
@@ -639,20 +707,22 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         if (topK == null) {
             return this;
         }
-        return new FragmentPlan(Kind.LUCENE_TOPK, filterSql, lanceClause, null, null);
+        return new FragmentPlan(Kind.LUCENE_TOPK, filterSql, lanceClause, null, null, excludedFragmentIds);
     }
 
     /**
      * The same plan with the Lance clause and its prefilter dropped:
      * the executor builds the Lucene composition of the request's own
      * query builder instead. The kind stays, the pushed page or
-     * aggregate must have been dropped before.
+     * aggregate must have been dropped before. The excluded fragments
+     * stay as well: the Lucene composition evaluates the same predicate
+     * the pruning judged.
      */
     public FragmentPlan withoutLanceClause() {
         if (lanceClause == null) {
             return this;
         }
-        return new FragmentPlan(kind, null, null, topK, aggregate);
+        return new FragmentPlan(kind, null, null, topK, aggregate, excludedFragmentIds);
     }
 
     @Override
@@ -667,12 +737,13 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
             && Objects.equals(filterSql, other.filterSql)
             && Objects.equals(lanceClause, other.lanceClause)
             && Objects.equals(topK, other.topK)
-            && Objects.equals(aggregate, other.aggregate);
+            && Objects.equals(aggregate, other.aggregate)
+            && Arrays.equals(excludedFragmentIds, other.excludedFragmentIds);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(kind, filterSql, lanceClause, topK, aggregate);
+        return Objects.hash(kind, filterSql, lanceClause, topK, aggregate, Arrays.hashCode(excludedFragmentIds));
     }
 
     /** Names the kind and every set part, for the executor's debug log. */
@@ -695,6 +766,9 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         if (aggregate != null) {
             sb.append(' ').append(aggregate);
         }
+        if (excludedFragmentIds.length > 0) {
+            sb.append(" excluded=").append(Arrays.toString(excludedFragmentIds));
+        }
         return sb.toString();
     }
 
@@ -703,10 +777,12 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
      * endpoint: {@code kind}, then {@code filter_sql}, {@code lance_clause}
      * (the clause's query name), {@code top_k} ({@code orderings} with
      * {@code column} / {@code ascending} / {@code nulls_first},
-     * {@code fetch}, {@code cursor_sql}) and {@code aggregate}
+     * {@code fetch}, {@code cursor_sql}), {@code aggregate}
      * ({@code group_count}, {@code metrics} with {@code name} /
-     * {@code kind}, {@code substrait_bytes}), each present only when set.
-     * The Substrait bytes themselves are not rendered, only their length.
+     * {@code kind}, {@code substrait_bytes}) and
+     * {@code excluded_fragment_ids} (the pruned fragments, ascending),
+     * each present only when set. The Substrait bytes themselves are
+     * not rendered, only their length.
      */
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
@@ -748,6 +824,9 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
             builder.endArray();
             builder.field("substrait_bytes", aggregate.substrait.length);
             builder.endObject();
+        }
+        if (excludedFragmentIds.length > 0) {
+            builder.array("excluded_fragment_ids", excludedFragmentIds);
         }
         return builder.endObject();
     }

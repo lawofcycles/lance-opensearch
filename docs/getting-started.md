@@ -773,7 +773,8 @@ curl -sS localhost:9200/_lance/stats?pretty
           "aggregate_resolution" : 0,
           "column_store_warm" : 0
         },
-        "executed" : { "pushed_scan" : 6, "lucene" : 51 }
+        "executed" : { "pushed_scan" : 6, "lucene" : 51 },
+        "pruned" : { "fragments" : 0 }
       }
     }
   }
@@ -863,9 +864,12 @@ A data node may still move a pushed aggregate (or a pushed page or full text cla
     "aggregate_resolution" : 0,
     "column_store_warm" : 0
   },
-  "executed" : { "pushed_scan" : 6, "lucene" : 51 }
+  "executed" : { "pushed_scan" : 6, "lucene" : 51 },
+  "pruned" : { "fragments" : 0 }
 }
 ```
+
+`plan.pruned.fragments` counts the fragments the node's executor left out of its scans because the coordinator's zone map pruning excluded them (a `range` or `term` on a column with a zone map index whose zones cannot hold the value; the explain answer lists them under `fragment_plan.excluded_fragment_ids`). It stays at zero on a table without a zone map index. See [features.md](features.md#fragment-pruning).
 
 Settings that steer the pushed scan, all dynamic cluster settings unless noted:
 

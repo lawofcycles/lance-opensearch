@@ -682,6 +682,56 @@ public class LanceExplainIT extends LanceRestTestCase {
         }
     }
 
+    public void testExplainListsTheFragmentsZoneMapPruningExcludes() throws Exception {
+        String suffix = "explain-prune-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        // Four fragments of 100 rows, ids contiguous per fragment, two
+        // zones of 50 rows per fragment on the id zone map.
+        LanceTableFactory.writeZoneMappedFixtureTable(scratchDir, tableName, 4, 100, 50);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            attach(tableUri);
+
+            // id >= 250 cannot hold in fragments 0 (ids 0..99) and 1
+            // (100..199); fragment 2 (200..299) and 3 (300..399) may.
+            String range = "{\"range\":{\"id\":{\"gte\":250}}}";
+            String aggregate = explainOk(
+                indexName,
+                "{\"size\":0,\"query\":" + range + ",\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}"
+            );
+            assertEquals("PUSHED_SCAN", fragmentPlanOf(aggregate).get("kind"));
+            assertEquals(List.of(0, 1), fragmentPlanOf(aggregate).get("excluded_fragment_ids"));
+
+            String count = explainOk(indexName, "{\"size\":0,\"query\":" + range + "}");
+            assertEquals(List.of(0, 1), fragmentPlanOf(count).get("excluded_fragment_ids"));
+
+            String page = explainOk(indexName, "{\"size\":5,\"query\":" + range + ",\"sort\":[{\"rating\":\"asc\"}]}");
+            assertEquals(List.of(0, 1), fragmentPlanOf(page).get("excluded_fragment_ids"));
+
+            // A term inside one zone keeps that fragment alone.
+            String term = explainOk(indexName, "{\"size\":0,\"query\":{\"term\":{\"id\":120}}}");
+            assertEquals(List.of(0, 2, 3), fragmentPlanOf(term).get("excluded_fragment_ids"));
+
+            // Nothing to prune: no predicate, a predicate every fragment
+            // may hold, or a column without a zone map.
+            assertFalse(fragmentPlanOf(explainOk(indexName, "{\"size\":0}")).containsKey("excluded_fragment_ids"));
+            assertFalse(
+                fragmentPlanOf(explainOk(indexName, "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":50}}}}")).containsKey(
+                    "excluded_fragment_ids"
+                )
+            );
+            assertFalse(
+                fragmentPlanOf(explainOk(indexName, "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":990}}}}")).containsKey(
+                    "excluded_fragment_ids"
+                )
+            );
+        } finally {
+            deleteQuietly(indexName);
+        }
+    }
+
     public void testExplainUnknownIndexIs404() {
         ResponseException failure = expectThrows(
             ResponseException.class,

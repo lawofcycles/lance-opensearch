@@ -1868,6 +1868,39 @@ public final class LanceTableFactory {
         });
     }
 
+    /**
+     * The {@link #writeHintFixtureTable} layout with a zone map index on
+     * {@code id} of {@code rowsPerZone} rows per zone. The ids of
+     * fragment {@code f} are the contiguous run
+     * {@code [f * rowsPerFragment, (f + 1) * rowsPerFragment)}, so every
+     * zone's bounds are disjoint from the other fragments' and a range
+     * on {@code id} excludes whole fragments; the body column's inverted
+     * index is present as in the hint fixture.
+     *
+     * @return absolute URI of the table.
+     */
+    public static String writeZoneMappedFixtureTable(Path parent, String name, int fragments, int rowsPerFragment, int rowsPerZone)
+        throws Exception {
+        return withLocaleRoot(() -> {
+            String uri = writeHintFixtureTableOnce(parent, name, fragments, rowsPerFragment);
+            try (
+                RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+                Dataset dataset = Dataset.open().allocator(allocator).uri(uri).build()
+            ) {
+                dataset.createIndex(
+                    IndexOptions.builder(
+                        Collections.singletonList("id"),
+                        IndexType.ZONEMAP,
+                        IndexParams.builder()
+                            .setScalarIndexParams(ScalarIndexParams.create("zonemap", "{\"rows_per_zone\":" + rowsPerZone + "}"))
+                            .build()
+                    ).withIndexName("id_zonemap").build()
+                );
+            }
+            return uri;
+        });
+    }
+
     private static String writeHintFixtureTableOnce(Path parent, String name, int fragments, int rowsPerFragment) throws Exception {
         Path tablePath = parent.resolve(name + ".lance");
         String uri = tablePath.toString();

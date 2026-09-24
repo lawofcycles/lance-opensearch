@@ -208,6 +208,7 @@ public final class LanceStatsCollector {
                 0L,
                 FragmentPlanRefiner.refinementCounts(),
                 FragmentPlanRefiner.executedCounts(),
+                FragmentPlanRefiner.prunedFragments(),
                 freshnessStats
             );
         }
@@ -247,6 +248,7 @@ public final class LanceStatsCollector {
             warmCache.tableStatistics().collectMillisTotal(),
             FragmentPlanRefiner.refinementCounts(),
             FragmentPlanRefiner.executedCounts(),
+            FragmentPlanRefiner.prunedFragments(),
             freshnessStats
         );
     }

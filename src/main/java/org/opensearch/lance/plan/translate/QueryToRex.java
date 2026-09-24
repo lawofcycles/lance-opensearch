@@ -33,6 +33,7 @@ import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.index.query.WildcardQueryBuilder;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
+import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.search.DocValueFormat;
 
 import java.math.BigDecimal;
@@ -40,6 +41,7 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -819,15 +821,51 @@ public final class QueryToRex {
         if (query == null || columns.isEmpty()) {
             return false;
         }
+        for (String field : referencedFields(query)) {
+            if (columns.contains(field)) {
+                return true;
+            }
+            int dot = field.indexOf('.');
+            while (dot > 0) {
+                if (columns.contains(field.substring(0, dot))) {
+                    return true;
+                }
+                dot = field.indexOf('.', dot + 1);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The fields the leaves of {@code query} name, as the request spells
+     * them (a keyword sub field as {@code body.raw}, a struct child as
+     * {@code location.lat}), through every {@code bool} clause and the
+     * inner {@code filter} of a {@code lance_knn}. Only the leaf shapes
+     * this translator supports contribute; a full text clause, a
+     * {@code match} or any other query names nothing here. Empty for a
+     * null query.
+     */
+    public static Set<String> referencedFields(QueryBuilder query) {
+        Set<String> fields = new LinkedHashSet<>();
+        collectFields(query, fields);
+        return fields;
+    }
+
+    private static void collectFields(QueryBuilder query, Set<String> fields) {
+        if (query == null) {
+            return;
+        }
         if (query instanceof BoolQueryBuilder bool) {
             for (List<QueryBuilder> clauses : List.of(bool.must(), bool.filter(), bool.mustNot(), bool.should())) {
                 for (QueryBuilder clause : clauses) {
-                    if (referencesAny(clause, columns)) {
-                        return true;
-                    }
+                    collectFields(clause, fields);
                 }
             }
-            return false;
+            return;
+        }
+        if (query instanceof LanceKnnQueryBuilder knn) {
+            collectFields(knn.filter(), fields);
+            return;
         }
         String field = null;
         if (query instanceof TermQueryBuilder term) {
@@ -845,19 +883,8 @@ public final class QueryToRex {
         } else if (query instanceof PrefixQueryBuilder prefix) {
             field = prefix.fieldName();
         }
-        if (field == null) {
-            return false;
+        if (field != null) {
+            fields.add(field);
         }
-        if (columns.contains(field)) {
-            return true;
-        }
-        int dot = field.indexOf('.');
-        while (dot > 0) {
-            if (columns.contains(field.substring(0, dot))) {
-                return true;
-            }
-            dot = field.indexOf('.', dot + 1);
-        }
-        return false;
     }
 }
