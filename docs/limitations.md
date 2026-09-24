@@ -47,16 +47,16 @@ The Substrait aggregation pushdown ([features.md](features.md#aggregation-pushdo
 - A `meta` object that is present but empty is not echoed by the pushdown (the builder exposes an empty map for both cases).
 - `sum` and `avg` on `float` / `double` columns add the values in the scan's order without the aggregators' compensated summation, so the last bits of a floating point sum can differ between the two paths.
 
-## FTS query behaviour on stock `match` / `match_phrase`
+## FTS query behaviour on stock `match` / `match_phrase` / `multi_match`
 
-OpenSearch's stock `match` and `match_phrase` queries against a `lance_text` field ignore `operator`, `minimum_should_match`, phrase order, and `slop`. Reason: `lance_text` uses a keyword-analyzer `TextSearchInfo` so the whole query string reaches Lance as a single token and Lance's own tokenizer runs on the query text — OpenSearch's combining layer never sees multiple tokens. Use the plugin's DSL queries for that control:
+OpenSearch's stock `match`, `match_phrase` and `multi_match` (type `best_fields`) on a `lance_text` field are rewritten by the coordinator into `lance_match`, `lance_match_phrase` and `lance_multi_match` with the same parameters, so `operator`, `fuzziness`, `prefix_length`, `max_expansions`, phrase order, `slop` and per field boosts reach Lance. What does not:
 
-- `lance_match` for AND / OR operator, fuzziness, prefix length, max expansions.
-- `lance_match_phrase` for phrase order and `slop`.
-- `lance_multi_match` for multi-field search with per-field boosts.
-- `lance_fts_boost` / `lance_fts_bool` to compose FTS clauses on Lance's side.
-
-`minimum_should_match` on stock `match` is still ignored because Lance's Java SDK does not expose the equivalent knob today.
+- `minimum_should_match`, `zero_terms_query`, `lenient`, `fuzzy_transpositions`, `fuzzy_rewrite`, `auto_generate_synonyms_phrase_query` are ignored: the whole query text is one Lance query and Lance's Java SDK exposes no equivalent knob.
+- `fuzziness: AUTO` resolves to one edit distance for the whole query text (0 under three characters, 1 under six, else 2), where Lucene would derive it per term.
+- `multi_match` of type `most_fields`, `cross_fields`, `phrase`, `phrase_prefix` or `bool_prefix`, with `fuzziness` or a non default `tie_breaker`, or naming a field pattern or a field that is not `lance_text`, keeps its stock form: one Lance match per field, combined by Lucene.
+- A clause with an explicit `analyzer` keeps its stock form: OpenSearch tokenises the text and Lucene combines one Lance match per token.
+- Inside a compound the rewrite does not descend into (`function_score`, `nested`, `constant_score`, `boosting`; it descends into `bool` and `dis_max`) the field type answers the stock clause itself: `match` runs the whole text as one Lance match and its `operator` is not applied, `match_phrase` of two or more words runs as a Lance phrase with its `slop`, a one word `match_phrase` runs as a Lance match.
+- `match_phrase_prefix`, `query_string`, `simple_query_string`, `intervals` and the `span_*` queries are not rewritten.
 
 ## regexp on `lance_text`
 
