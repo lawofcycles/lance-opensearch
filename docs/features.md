@@ -24,7 +24,7 @@ Distribution over the cluster is automatic: fragments are spread over every data
   {"type": "rest", "name": "catalog-a", "config": {"uri": "https://catalog.example.com", "header.Authorization": "Bearer ..."}}
   ```
 
-  A Glue namespace registers an AWS Glue Data Catalog. `config` carries the property names the Glue implementation reads: `region`, optional `endpoint`, `catalog_id`, `root`, and the static credential keys `access_key_id` / `secret_access_key` / `session_token` (absent, the SDK's default credential chain applies). Tables inside every Glue database whose `table_type` is `lance` surface under their table name:
+  A Glue namespace registers an AWS Glue Data Catalog. `config` carries the property names the Glue implementation reads: `region`, optional `endpoint`, `catalog_id`, `root`, and the static credential keys `access_key_id` / `secret_access_key` / `session_token`. Without the static keys the SDK's default credential chain applies, in its usual order: the `aws.*` system properties, the `AWS_*` environment variables, a web identity token file, the shared credentials and config files of the OpenSearch process user (`~/.aws/credentials` and `~/.aws/config`, or the files `AWS_SHARED_CREDENTIALS_FILE` / `AWS_CONFIG_FILE` name when they stay inside `~/.aws`; the plugin's security policy grants the read under that directory only, resolving `~` from the JVM's `user.home` while the SDK resolves it from the `HOME` variable, so the two must agree, as they do on a standard install), the container credentials endpoint and the EC2 instance metadata service. Tables inside every Glue database whose `table_type` is `lance` surface under their table name:
 
   ```json
   POST /_lance/namespace
