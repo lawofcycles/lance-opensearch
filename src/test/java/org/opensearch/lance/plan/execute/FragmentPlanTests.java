@@ -113,7 +113,7 @@ public class FragmentPlanTests extends OpenSearchTestCase {
                 assertEquals("the pruning block is optional", 0, in.readVInt());
                 assertArrayEquals(new int[0], StreamInput.wrap(in.readByteArray()).readVIntArray());
                 assertEquals("the Substrait block is optional while no filter is set", 0, in.readVInt());
-                assertFalse(StreamInput.wrap(in.readByteArray()).readBoolean());
+                assertEquals("and empty: the block itself is the flag", 0, in.readByteArray().length);
                 assertEquals("nothing follows", -1, in.read());
             }
         }

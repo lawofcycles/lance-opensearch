@@ -31,7 +31,10 @@ Every message that crosses nodes carries a `WIRE_VERSION` constant and is writte
 
 A reader opens with `WireVersion.read`, which returns the marker in a `Reader`, reads the base
 fields itself, then calls `Reader.block(version, parser, fallback)` once for every version above
-1 it knows, and `Reader.finish()` last. The three cases a mixed cluster produces fall out of
+1 it knows, and `Reader.finish()` last. `finish` throws an `IllegalStateException` when the walk
+skipped a version the reader knows, whatever the writer's marker, so a reader class that forgot to
+register one of its own blocks fails the first message it reads instead of taking the fallback
+silently against an older writer. The three cases a mixed cluster produces fall out of
 that walk.
 
 - Same version on both ends: every block is present and known; the reader decodes each.
@@ -105,7 +108,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 |---|---|---|
 | `FragmentPlan` | 1 | Base: kind, filter SQL, Lance clause (named writeable query builder), pushed page (orderings, fetch, cursor SQL), pushed aggregate (Substrait bytes, group count, metric slots, two cost predictions, column names) |
 | | 2 | Block, optional: excluded fragment ids (integer array; fallback empty) |
-| | 3 | Block, critical while a filter is set: Substrait filter bytes (optional byte array; fallback absent) |
+| | 3 | Block, critical while a filter is set: Substrait filter bytes (byte array; the block is empty when no filter is set, and the reader takes an empty block as absent) |
 | `LanceExplainResponse` | 1 | Retired layout: index, route (`fragment` or `shard_path`), shard path reasons, logical and physical text, optional fragment plan, optional unplanned message, refinements, traits. Read by the current version and never written |
 | | 2 | Base: index, route (`fragment` or `unsupported`), optional logical and physical text, optional fragment plan, optional unplanned message, refinements, optional traits |
 | `LanceFragmentQueryRequest` | 1 | Base: table URI, index name, storage options, pinned version, the fragment plan, optional query and post filter, sorts, search after, size, aggregations, fragment ids, track scores, track total hits up to, min score, terminate after, hit projection, rescores, collapse |

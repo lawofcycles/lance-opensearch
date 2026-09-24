@@ -7,6 +7,7 @@ package org.opensearch.lance.plan.execute;
 
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
@@ -62,6 +63,32 @@ public class FragmentPlanMixedVersionTests extends OpenSearchTestCase {
         out.writeOptionalWriteable(null);
         out.writeOptionalWriteable(null);
         WireVersion.writeBlock(out, false, o -> o.writeVIntArray(excludedFragmentIds));
+    }
+
+    /**
+     * The stream a version 3 node writes: version 2 plus the Substrait
+     * block, which holds the filter bytes alone and is empty (and
+     * optional) when no filter is set.
+     */
+    private static void writeVersion3(
+        StreamOutput out,
+        FragmentPlan.Kind kind,
+        String filterSql,
+        int[] excludedFragmentIds,
+        byte[] filterSubstrait
+    ) throws IOException {
+        WireVersion.write(out, 3);
+        out.writeEnum(kind);
+        out.writeOptionalString(filterSql);
+        out.writeOptionalNamedWriteable(null);
+        out.writeOptionalWriteable(null);
+        out.writeOptionalWriteable(null);
+        WireVersion.writeBlock(out, false, o -> o.writeVIntArray(excludedFragmentIds));
+        WireVersion.writeBlock(out, filterSubstrait != null, o -> {
+            if (filterSubstrait != null) {
+                o.writeByteArray(filterSubstrait);
+            }
+        });
     }
 
     private static FragmentPlan readAs(BytesStreamOutput out, int asVersion) throws IOException {
@@ -137,6 +164,35 @@ public class FragmentPlanMixedVersionTests extends OpenSearchTestCase {
             sqlOnly.writeTo(out);
             assertEquals("the Substrait block is optional when empty", sqlOnly, readAs(out, 1));
             assertEquals(sqlOnly, readAs(out, 2));
+        }
+    }
+
+    public void testVersion3StreamHoldsTheSubstraitBytesAloneInTheirBlock() throws IOException {
+        byte[] bytes = new byte[] { 1, 2, 3 };
+        FragmentPlan withFilter = new FragmentPlan(FragmentPlan.Kind.LUCENE_COUNT, "rating = 5", bytes, null, null, null, new int[] { 2 });
+        try (BytesStreamOutput written = new BytesStreamOutput(); BytesStreamOutput byHand = new BytesStreamOutput()) {
+            withFilter.writeTo(written);
+            writeVersion3(byHand, FragmentPlan.Kind.LUCENE_COUNT, "rating = 5", new int[] { 2 }, bytes);
+            assertArrayEquals(
+                "the writer lays the stream out as documented",
+                BytesReference.toBytes(byHand.bytes()),
+                BytesReference.toBytes(written.bytes())
+            );
+            FragmentPlan read = readAs(byHand, FragmentPlan.WIRE_VERSION);
+            assertEquals(withFilter, read);
+            assertArrayEquals(bytes, read.filterSubstrait());
+        }
+    }
+
+    public void testVersion3StreamWithoutASubstraitFilterHasAnEmptyBlock() throws IOException {
+        FragmentPlan sqlOnly = new FragmentPlan(FragmentPlan.Kind.LUCENE_COUNT, "rating = 5", null, null, null, new int[] { 2 });
+        try (BytesStreamOutput written = new BytesStreamOutput(); BytesStreamOutput byHand = new BytesStreamOutput()) {
+            sqlOnly.writeTo(written);
+            writeVersion3(byHand, FragmentPlan.Kind.LUCENE_COUNT, "rating = 5", new int[] { 2 }, null);
+            assertArrayEquals(BytesReference.toBytes(byHand.bytes()), BytesReference.toBytes(written.bytes()));
+            FragmentPlan read = readAs(byHand, FragmentPlan.WIRE_VERSION);
+            assertEquals(sqlOnly, read);
+            assertNull(read.filterSubstrait());
         }
     }
 }

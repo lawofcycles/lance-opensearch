@@ -155,6 +155,32 @@ public class WireVersionTests extends OpenSearchTestCase {
         }
     }
 
+    public void testForgottenBlockIsRefusedEvenWhenTheWriterNeverSentIt() throws IOException {
+        // A version 1 writer sent no block at all, so a reader that forgot
+        // to register block 3 would otherwise take the fallback silently
+        // and the coding bug would only show against a newer writer.
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            WireVersion.write(out, 1);
+            out.writeString("m");
+            try (StreamInput in = out.bytes().streamInput()) {
+                WireVersion.Reader reader = WireVersion.read(in, "Message", Message.WIRE_VERSION);
+                in.readString();
+                assertEquals(-1, (int) reader.block(2, StreamInput::readVInt, -1));
+                IllegalStateException forgotten = expectThrows(IllegalStateException.class, reader::finish);
+                assertEquals("Message did not read wire version block [3]", forgotten.getMessage());
+            }
+            try (StreamInput in = out.bytes().streamInput()) {
+                WireVersion.Reader reader = WireVersion.read(in, "Message", Message.WIRE_VERSION);
+                in.readString();
+                IllegalStateException forgotten = expectThrows(IllegalStateException.class, reader::finish);
+                assertEquals("the first forgotten block is named", "Message did not read wire version block [2]", forgotten.getMessage());
+            }
+            try (StreamInput in = out.bytes().streamInput()) {
+                assertEquals("the reader that registers every block is fine", new Message("m", -1, null), Message.read(in, 3));
+            }
+        }
+    }
+
     public void testBaseAfterVersionOneStartsTheBlocksThere() throws IOException {
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             // A message whose base fields took their layout at version
