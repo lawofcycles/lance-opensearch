@@ -12,20 +12,16 @@ import org.apache.calcite.rel.RelNode;
 import org.opensearch.lance.plan.calcite.LanceConvention;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LuceneConvention;
-import org.opensearch.lance.plan.calcite.ShardPathConvention;
 import org.opensearch.lance.plan.cost.CostInputs;
 import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.LanceHitShape;
-import org.opensearch.lance.plan.rel.LanceShardPathShape;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 import org.opensearch.lance.plan.rel.LanceTopK;
-import org.opensearch.lance.plan.rel.ShardPathReason;
 import org.opensearch.lance.plan.rel.physical.FanOutExec;
 import org.opensearch.lance.plan.rel.physical.HeapTopKExec;
 import org.opensearch.lance.plan.rel.physical.LuceneAggregateExec;
 import org.opensearch.lance.plan.rel.physical.LuceneHandoffExec;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
-import org.opensearch.lance.plan.rel.physical.ShardPathFallbackExec;
 import org.opensearch.lance.plan.substrait.LanceSubstraitProducer;
 import org.opensearch.lance.plan.translate.PlanTestFixtures;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
@@ -274,28 +270,6 @@ public class PlanTraitsTests extends OpenSearchTestCase {
         // copy re reads the new input
         MergeExec copy = (MergeExec) sketch.copy(sketch.getTraitSet(), List.of(fanOut));
         assertSame(Accuracy.EXACT, accuracyOf(copy));
-    }
-
-    public void testShardPathFallbackIsExactInRowAddressOrder() {
-        LanceTableScan scan = (LanceTableScan) PlanTestFixtures.factory()
-            .relBuilder(PlanTestFixtures.model().schema())
-            .scan(LancePlannerFactory.SCHEMA_NAME, "idx")
-            .build();
-        ShardPathFallbackExec exec = new ShardPathFallbackExec(
-            scan.getCluster(),
-            scan.getCluster().traitSetOf(ShardPathConvention.INSTANCE),
-            scan,
-            List.of(ShardPathReason.SUGGEST)
-        );
-        assertSame(Accuracy.EXACT, accuracyOf(exec));
-        assertSame(TieStability.STABLE_ROWADDR, tieStabilityOf(exec));
-        LanceShardPathShape shape = new LanceShardPathShape(
-            scan.getCluster(),
-            scan.getCluster().traitSetOf(Convention.NONE),
-            scan,
-            List.of(ShardPathReason.SUGGEST)
-        );
-        assertSame("the logical shape carries the defaults", Accuracy.APPROXIMATE, accuracyOf(shape));
     }
 
     public void testRequirementApplyAndSatisfy() {

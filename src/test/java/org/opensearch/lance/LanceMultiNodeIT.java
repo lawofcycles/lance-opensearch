@@ -772,7 +772,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * keeps one hit per collapse value across the nodes. The bucket
      * column ({@code id % 4}) puts every group's rows on different
      * nodes, so a merge that trusted one node's groups would return
-     * several hits per value. The expected answers are the shard path's
+     * several hits per value. The expected answers are the stock search path's
      * (one shard over the whole table): identical for collapse, and for
      * a rescore whose window covers every match; a window smaller than
      * the matches is rescored per executor, as per shard on a multi
@@ -794,13 +794,13 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
 
             // Rescore with a window that covers every match: the merged
-            // page is the shard path's.
-            assertFragmentPathMatchesShardPath(
+            // page is the stock search path's.
+            assertFragmentPathMatchesStockSearch(
                 indexName,
                 "\"size\":5,\"query\":{\"range\":{\"id\":{\"gte\":2}}},"
                     + "\"rescore\":{\"window_size\":12,\"query\":{\"rescore_query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}}}}"
             );
-            assertFragmentPathMatchesShardPath(
+            assertFragmentPathMatchesStockSearch(
                 indexName,
                 "\"size\":6,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}},"
                     + "\"rescore\":{\"window_size\":12,\"query\":{\"rescore_query\":{\"term\":{\"bucket\":1}},"
@@ -831,12 +831,12 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
             // Collapse on a value that spans the nodes, under a sort,
             // under score order and with inner hits.
-            assertFragmentPathMatchesShardPath(indexName, "\"size\":10,\"sort\":[{\"id\":\"desc\"}],\"collapse\":{\"field\":\"bucket\"}");
-            assertFragmentPathMatchesShardPath(
+            assertFragmentPathMatchesStockSearch(indexName, "\"size\":10,\"sort\":[{\"id\":\"desc\"}],\"collapse\":{\"field\":\"bucket\"}");
+            assertFragmentPathMatchesStockSearch(
                 indexName,
                 "\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}},\"collapse\":{\"field\":\"bucket\"}"
             );
-            assertFragmentPathMatchesShardPath(
+            assertFragmentPathMatchesStockSearch(
                 indexName,
                 "\"from\":1,\"size\":2,\"sort\":[{\"ts\":\"asc\"}],\"collapse\":{\"field\":\"bucket\"}"
             );
@@ -955,9 +955,9 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     /**
      * Every FTS shape answered by executors that hold a proper subset
      * of the fragments must equal the answer over the whole table. The
-     * oracle is the shard path: a highlighter routes the
-     * same request to the one shard, whose reader holds every fragment, so
-     * its Lance scan runs unrestricted on one node. Compared per shape:
+     * oracle is the stock search action over the one shard, whose reader
+     * holds every fragment, so its Lance scan runs unrestricted on one
+     * node. Compared per shape:
      * hit ids and order, scores, sort values, {@code hits.total},
      * and terms buckets. The interleaved fixture gives every row a
      * distinct score for {@code lance} and a unique token
@@ -1005,7 +1005,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
 
             for (String shape : shapes) {
-                assertFragmentPathMatchesShardPath(indexName, shape);
+                assertFragmentPathMatchesStockSearch(indexName, shape);
             }
             // Analytic check of the bare top 10, independent of the
             // oracle: the score grows with the id, row i is
@@ -1039,7 +1039,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // node's fragments and must still agree with the oracle.
             updateClusterSetting("lance.fts.subset_probe_limit", "50");
             for (String shape : shapes) {
-                assertFragmentPathMatchesShardPath(indexName, shape);
+                assertFragmentPathMatchesStockSearch(indexName, shape);
             }
 
             // The coordinator logs the fragments it hands to each node;
@@ -1071,8 +1071,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     /**
      * Hits with equal scores or equal sort values come back in the same
      * order from three executors as from one reader over the whole
-     * table. The oracle is again the shard path (a highlighter),
-     * whose Lucene collectors break ties by doc id, which on the
+     * table. The oracle is again the stock search action over the one
+     * shard, whose Lucene collectors break ties by doc id, which on the
      * whole-table reader is fragment order then offset. The doc value
      * fixture has ties everywhere: {@code lance} is repeated
      * {@code (i % 5) + 1} times so sixty rows over the six fragments
@@ -1088,7 +1088,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * <p>The score-ordered shapes carry an explicit {@code _score} sort.
      * Without one the executor clips the Lance FTS scan to the page
      * size, and which of the tied rows survive that clip is decided
-     * inside Lance, not by row address, so the shard path is not the
+     * inside Lance, not by row address, so the stock search path is not the
      * oracle for the bare shape; that shape is checked for the merge
      * order alone at the end.
      */
@@ -1127,10 +1127,10 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
 
             for (String shape : shapes) {
-                assertFragmentPathMatchesShardPath(indexName, shape);
+                assertFragmentPathMatchesStockSearch(indexName, shape);
             }
             for (String shape : mixedShapes) {
-                assertFragmentPathMatchesShardPath(indexName, shape);
+                assertFragmentPathMatchesStockSearch(indexName, shape);
             }
             // The top ten of the score sort are the first ten rows with
             // i % 5 == 4, all in fragment 0, and the page starting at
@@ -1144,12 +1144,12 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // A _doc sort orders by fragment then offset on the whole
             // table reader, and the fragment path has to agree on the
             // ids; its per-node doc ids in the sort array differ from
-            // the shard path's, so only the ids are compared.
+            // the stock search path's, so only the ids are compared.
             for (String order : List.of("asc", "desc")) {
                 String shape = "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"_score\":\"desc\"},{\"_doc\":\"" + order + "\"}]";
                 Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
                 Map<String, Object> shardPath = parse(
-                    readAll(postJson("/" + indexName + "/_search", LanceRestTestCase.onShardPath("{" + shape + "}")))
+                    readAll(postJson("/" + LanceRestTestCase.withStockOracle(indexName) + "/_search", "{" + shape + "}"))
                 );
                 assertEquals(shape, hitIdsOf(shardPath), hitIdsOf(fragmentPath));
             }
@@ -1159,7 +1159,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // lowest row addresses again: after flag 1 (even rows) come
             // the odd rows, fragment by fragment.
             String withCursor = "\"size\":10,\"query\":" + tied + ",\"sort\":[{\"flag\":\"desc\"}],\"search_after\":[1]";
-            assertFragmentPathMatchesShardPath(indexName, withCursor);
+            assertFragmentPathMatchesStockSearch(indexName, withCursor);
             Map<String, Object> secondPage = parse(readAll(postJson("/" + indexName + "/_search", "{" + withCursor + "}")));
             assertEquals(List.of(1, 3, 5, 7, 9, 11, 15, 17, 19, 21), sourceIds(secondPage));
 
@@ -1185,7 +1185,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // which rows Lance returns differs between executors. The
             // own shares can add up to fewer than 21, and the response
             // still has to state the bound itself as the value, as the
-            // shard path does whenever the relation is gte.
+            // stock search path does whenever the relation is gte.
             String boundedBare = "{\"size\":10,\"track_total_hits\":20,\"query\":" + tied + "}";
             for (int i = 0; i < 3; i++) {
                 Map<String, Object> bounded = parse(readAll(postJson("/" + indexName + "/_search", boundedBare)));
@@ -1205,7 +1205,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * hold two of the six fragments. The coordinator's SQL drives both
      * the count only scan and the per executor hits scan, so the
      * totals, the hits and the pages have to be those of the single
-     * shard path. Rows are {@code "hello tok<i> grp<i % 25> sp<i %
+     * stock search path. Rows are {@code "hello tok<i> grp<i % 25> sp<i %
      * 625> lance..."} for {@code i} in 0..599.
      */
     public void testWildcardRegexpPrefixAcrossThreeNodesMatchWholeTableAnswer() throws Exception {
@@ -1239,7 +1239,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
 
             for (String shape : shapes) {
-                assertFragmentPathMatchesShardPath(indexName, shape);
+                assertFragmentPathMatchesStockSearch(indexName, shape);
             }
 
             Map<String, Object> page = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(0) + "}")));
@@ -1350,19 +1350,15 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 String shape = shapes.get(i);
                 Map<String, Object> response = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
                 pushed.add(response);
-                assertFragmentPathMatchesShardPath(indexName, shape);
+                assertFragmentPathMatchesStockSearch(indexName, shape);
                 // Whole aggregations block against the single shard,
                 // except for the shapes whose three partials lose
                 // groups the single shard keeps.
                 if (!partialsLoseGroups.contains(i)) {
                     Map<String, Object> shardPath = parse(
-                        readAll(postJson("/" + indexName + "/_search", LanceRestTestCase.onShardPath("{" + shape + "}")))
+                        readAll(postJson("/" + LanceRestTestCase.withStockOracle(indexName) + "/_search", "{" + shape + "}"))
                     );
-                    assertEquals(
-                        shape,
-                        LanceRestTestCase.withoutShardPathOracle(shardPath.get("aggregations")),
-                        response.get("aggregations")
-                    );
+                    assertEquals(shape, shardPath.get("aggregations"), response.get("aggregations"));
                 }
             }
             // Analytic check of the size 2 terms, independent of the
@@ -1404,8 +1400,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * {@code f}, ts {@code 2024-01-01 + id days}, categories c0 to c2).
      * The exact shapes (stats, extended_stats, range, date_range,
      * missing, filter, filters, nested) have to answer the same as the
-     * aggregators and as the single shard path. The sketch shapes have
-     * to land within their tolerance of the shard path's single sketch:
+     * aggregators and as the single stock search path. The sketch shapes have
+     * to land within their tolerance of the stock search path's single sketch:
      * a relative 1 % for a cardinality count, and for the percentiles
      * 3 % of the value range, the tolerance the single node IT allows
      * two tdigests of the same data. The tdigest percentiles build
@@ -1449,22 +1445,17 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             try {
                 List<Map<String, Object>> pushed = new ArrayList<>();
                 for (String shape : exact) {
-                    pushed.add(assertAggregationsMatchShardPath(indexName, shape));
+                    pushed.add(assertAggregationsMatchStockSearch(indexName, shape));
                 }
                 List<Map<String, Object>> pushedSketches = new ArrayList<>();
                 for (String shape : sketches) {
                     Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
                     Map<String, Object> shardPath = parse(
                         readAll(
-                            postJson("/" + indexName + "/_search?request_cache=false", LanceRestTestCase.onShardPath("{" + shape + "}"))
+                            postJson("/" + LanceRestTestCase.withStockOracle(indexName) + "/_search?request_cache=false", "{" + shape + "}")
                         )
                     );
-                    assertSketchesClose(
-                        shape,
-                        LanceRestTestCase.withoutShardPathOracle(shardPath.get("aggregations")),
-                        fragmentPath.get("aggregations"),
-                        300d
-                    );
+                    assertSketchesClose(shape, shardPath.get("aggregations"), fragmentPath.get("aggregations"), 300d);
                     pushedSketches.add(fragmentPath);
                 }
                 // Exactly 300 distinct ids and 3 categories, both in the
@@ -1485,7 +1476,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                     updateClusterSetting("lance.aggregation.pushdown", null);
                 }
                 // The pushdown answered on every data node for the exact
-                // shapes and the percentiles shape (the shard path and
+                // shapes and the percentiles shape (the stock search path and
                 // the aggregator run leave no such line); the three
                 // sketch shapes carrying a cardinality ran through the
                 // aggregators and left none.
@@ -1577,7 +1568,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * The pushdown with parallel group scans on three executors: twelve
      * fragments of 25 rows, so every node holds several fragments and
      * cuts them into up to four scans per request. The responses have
-     * to equal the shard path and the aggregators, {@code terms} error
+     * to equal the stock search path and the aggregators, {@code terms} error
      * and other counts included, and the cluster log has to show
      * answers assembled from more than one scan.
      */
@@ -1614,18 +1605,14 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 String shape = shapes.get(i);
                 Map<String, Object> response = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
                 pushed.add(response);
-                assertFragmentPathMatchesShardPath(indexName, shape);
+                assertFragmentPathMatchesStockSearch(indexName, shape);
                 // The size 2 terms loses groups across three partials
                 // that a single shard keeps; every other block is equal.
                 if (i != 1) {
                     Map<String, Object> shardPath = parse(
-                        readAll(postJson("/" + indexName + "/_search", LanceRestTestCase.onShardPath("{" + shape + "}")))
+                        readAll(postJson("/" + LanceRestTestCase.withStockOracle(indexName) + "/_search", "{" + shape + "}"))
                     );
-                    assertEquals(
-                        shape,
-                        LanceRestTestCase.withoutShardPathOracle(shardPath.get("aggregations")),
-                        response.get("aggregations")
-                    );
+                    assertEquals(shape, shardPath.get("aggregations"), response.get("aggregations"));
                 }
             }
             // 300 one row groups: each node keeps shard_size 13 of its
@@ -1686,7 +1673,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
     /**
      * The wider allow list on three executors: every fragment path answer
-     * equals the shard path's for the exact aggregations (stats,
+     * equals the stock search path's for the exact aggregations (stats,
      * extended_stats, range, date_range, filters, missing, hdr
      * percentiles, composite with paging over a date_histogram or terms
      * sources), and the sketches (tdigest percentiles, cardinality) stay
@@ -1723,19 +1710,19 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
 
-            // Fragment path requests issued below; the shard path
+            // Fragment path requests issued below; the stock search path
             // requests (the highlighter oracle) leave no executor
             // line.
             int fragmentPathRequests = 0;
             for (String shape : exact) {
-                assertAggregationsMatchShardPath(indexName, shape);
+                assertAggregationsMatchStockSearch(indexName, shape);
                 fragmentPathRequests++;
             }
 
             // Composite paging: every page and its after_key equal the
-            // shard path's, and the pages cover the 300 (category, id)
+            // stock search path's, and the pages cover the 300 (category, id)
             // pairs without a repeat.
-            Map<String, Object> page = assertAggregationsMatchShardPath(indexName, firstPage);
+            Map<String, Object> page = assertAggregationsMatchStockSearch(indexName, firstPage);
             fragmentPathRequests++;
             Map<String, Object> afterKey = (Map<String, Object>) aggregationOf(page, "c").get("after_key");
             assertEquals("c0", afterKey.get("cat"));
@@ -1746,7 +1733,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             }
             for (int pages = 0; pages < 3; pages++) {
                 String after = "{\"cat\":\"" + afterKey.get("cat") + "\",\"i\":" + afterKey.get("i") + "}";
-                page = assertAggregationsMatchShardPath(
+                page = assertAggregationsMatchStockSearch(
                     indexName,
                     "\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":7,\"after\":"
                         + after
@@ -1770,7 +1757,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             Map<String, Object> viaFragments = parse(readAll(postJson("/" + indexName + "/_search", tdigest)));
             fragmentPathRequests++;
             Map<String, Object> viaShard = parse(
-                readAll(postJson("/" + indexName + "/_search?request_cache=false", LanceRestTestCase.onShardPath(tdigest)))
+                readAll(postJson("/" + LanceRestTestCase.withStockOracle(indexName) + "/_search?request_cache=false", tdigest))
             );
             Map<String, Object> fragmentValues = (Map<String, Object>) aggregationOf(viaFragments, "p").get("values");
             Map<String, Object> shardValues = (Map<String, Object>) aggregationOf(viaShard, "p").get("values");
@@ -1779,7 +1766,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 double expected = ((Number) shardValues.get(percentile)).doubleValue();
                 double actual = ((Number) fragmentValues.get(percentile)).doubleValue();
                 assertTrue(
-                    "percentile " + percentile + ": shard path " + expected + ", fragment path " + actual,
+                    "percentile " + percentile + ": stock search path " + expected + ", fragment path " + actual,
                     Math.abs(expected - actual) <= 0.03d * 299d
                 );
             }
@@ -1804,7 +1791,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // of these requests: the executor logs one line per request
             // with its fragment count and duration, so each node has as
             // many lines as requests were issued and a request that had
-            // fallen to the shard path would leave a gap.
+            // fallen to the stock search path would leave a gap.
             int expectedRequests = fragmentPathRequests;
             assertEquals(13, expectedRequests);
             assertBusy(() -> {
@@ -1840,7 +1827,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * category's rows and a week's rows sit on every node, so a parent
      * pipeline computed on any executor would read partial sums; the
      * coordinator computes it after the cross node reduce and the answer
-     * equals the shard path's single shard for every sibling and parent
+     * equals the stock search path's single shard for every sibling and parent
      * pipeline. A second table of the same shape pins the cross index
      * merge: two Lance backed indexes fan out once each per node and the
      * aggregations, pipelines included, reduce across the six answers.
@@ -1884,7 +1871,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             int dataNodes = dataNodeCount();
             long executedBefore = LanceRestTestCase.fragmentRequestsExecuted();
             for (String shape : shapes) {
-                assertAggregationsMatchShardPath(indexName, shape);
+                assertAggregationsMatchStockSearch(indexName, shape);
             }
             assertEquals(
                 "one executor per node per request",
@@ -1892,7 +1879,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 LanceRestTestCase.fragmentRequestsExecuted()
             );
             for (String shape : shapes) {
-                assertAggregationsMatchShardPath(indexName + "," + otherIndex, shape);
+                assertAggregationsMatchStockSearch(indexName + "," + otherIndex, shape);
             }
             assertEquals(
                 "one executor per node per index per request",
@@ -1908,10 +1895,10 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
     /**
      * The aggregation types the coordinator's former allow list sent to
-     * the shard path, on three executors: {@code multi_terms}, a
+     * the stock search path, on three executors: {@code multi_terms}, a
      * scripted metric, a {@code filter} over a Lance full text clause
      * and {@code weighted_avg} run through the aggregators on every node
-     * and their merged answer equals the shard path's; a {@code global}
+     * and their merged answer equals the stock search path's; a {@code global}
      * answers 400 at the coordinator and reaches no executor. Twelve
      * fragments of 25 rows, four per node, with a {@code bucket} column
      * ({@code id % 4}) so every multi terms key spans the nodes.
@@ -1943,7 +1930,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
             long before = LanceRestTestCase.fragmentRequestsExecuted();
             for (String shape : shapes) {
-                assertAggregationsMatchShardPath(indexName, shape);
+                assertAggregationsMatchStockSearch(indexName, shape);
             }
             assertEquals(
                 "every shape ran on all three executors",
@@ -1973,15 +1960,15 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
-     * Sliced collection on three executors answers like the shard path.
+     * Sliced collection on three executors answers like the stock search path.
      * Twelve fragments of 25 rows, four per node, collected in two slices
      * per executor with the pushdown off so every shape runs through the
-     * Lucene aggregators: the exact aggregations equal the shard path's
+     * Lucene aggregators: the exact aggregations equal the stock search path's
      * and the sketches stay within their error. Every executor's DEBUG
      * line reports its four leaves in two slices.
      */
     @SuppressWarnings("unchecked")
-    public void testSlicedCollectionAcrossThreeNodesAnswersLikeTheShardPath() throws Exception {
+    public void testSlicedCollectionAcrossThreeNodesAnswersLikeTheStockSearch() throws Exception {
         String suffix = "mn-slices-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -2009,7 +1996,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
             int fragmentPathRequests = 0;
             for (String shape : exact) {
-                assertAggregationsMatchShardPath(indexName, shape);
+                assertAggregationsMatchStockSearch(indexName, shape);
                 fragmentPathRequests++;
             }
 
@@ -2017,7 +2004,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             Map<String, Object> viaFragments = parse(readAll(postJson("/" + indexName + "/_search", tdigest)));
             fragmentPathRequests++;
             Map<String, Object> viaShard = parse(
-                readAll(postJson("/" + indexName + "/_search?request_cache=false", LanceRestTestCase.onShardPath(tdigest)))
+                readAll(postJson("/" + LanceRestTestCase.withStockOracle(indexName) + "/_search?request_cache=false", tdigest))
             );
             Map<String, Object> fragmentValues = (Map<String, Object>) aggregationOf(viaFragments, "p").get("values");
             Map<String, Object> shardValues = (Map<String, Object>) aggregationOf(viaShard, "p").get("values");
@@ -2026,7 +2013,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 double expected = ((Number) shardValues.get(percentile)).doubleValue();
                 double actual = ((Number) fragmentValues.get(percentile)).doubleValue();
                 assertTrue(
-                    "percentile " + percentile + ": shard path " + expected + ", fragment path " + actual,
+                    "percentile " + percentile + ": stock search path " + expected + ", fragment path " + actual,
                     Math.abs(expected - actual) <= 0.03d * 299d
                 );
             }
@@ -2070,24 +2057,24 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
-     * Run {@code shape} through the fragment path and, with the
-     * highlighter of {@code LanceRestTestCase.onShardPath},
-     * through the shard path, and assert the two responses carry the same
-     * {@code hits.total} and the same {@code aggregations} block (the
-     * oracle's own key aside). Returns the fragment path response.
+     * Run {@code shape} through the fragment path and, against the
+     * target of {@code LanceRestTestCase.withStockOracle}, through the
+     * stock search action, and assert the two responses carry the same
+     * {@code hits.total} and the same {@code aggregations} block.
+     * Returns the fragment path response.
      */
     @SuppressWarnings("unchecked")
-    private static Map<String, Object> assertAggregationsMatchShardPath(String indexName, String shape) throws IOException {
+    private static Map<String, Object> assertAggregationsMatchStockSearch(String indexName, String shape) throws IOException {
         Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
         Map<String, Object> shardPath = parse(
-            readAll(postJson("/" + indexName + "/_search?request_cache=false", LanceRestTestCase.onShardPath("{" + shape + "}")))
+            readAll(postJson("/" + LanceRestTestCase.withStockOracle(indexName) + "/_search?request_cache=false", "{" + shape + "}"))
         );
         assertEquals(
             shape,
             ((Map<String, Object>) shardPath.get("hits")).get("total"),
             ((Map<String, Object>) fragmentPath.get("hits")).get("total")
         );
-        assertEquals(shape, LanceRestTestCase.withoutShardPathOracle(shardPath.get("aggregations")), fragmentPath.get("aggregations"));
+        assertEquals(shape, shardPath.get("aggregations"), fragmentPath.get("aggregations"));
         return fragmentPath;
     }
 
@@ -2215,24 +2202,24 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
     /**
      * Run {@code shape} (the body of a {@code _search} request without
-     * its outer braces) through the fragment path and, with the
-     * highlighter of {@code LanceRestTestCase.onShardPath}
-     * added, through the shard path, and compare the parts of the two
-     * responses that describe the result.
+     * its outer braces) through the fragment path and, against the
+     * target of {@code LanceRestTestCase.withStockOracle}, through the
+     * stock search action, and compare the parts of the two responses
+     * that describe the result.
      */
-    private static void assertFragmentPathMatchesShardPath(String indexName, String shape) throws IOException {
-        assertFragmentPathMatchesShardPath(indexName, shape, true);
+    private static void assertFragmentPathMatchesStockSearch(String indexName, String shape) throws IOException {
+        assertFragmentPathMatchesStockSearch(indexName, shape, true);
     }
 
     /**
-     * As {@link #assertFragmentPathMatchesShardPath(String, String)};
+     * As {@link #assertFragmentPathMatchesStockSearch(String, String)};
      * {@code compareScores} false skips the per-hit {@code _score}
      * comparison.
      */
-    private static void assertFragmentPathMatchesShardPath(String indexName, String shape, boolean compareScores) throws IOException {
+    private static void assertFragmentPathMatchesStockSearch(String indexName, String shape, boolean compareScores) throws IOException {
         Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
         Map<String, Object> shardPath = parse(
-            readAll(postJson("/" + indexName + "/_search", LanceRestTestCase.onShardPath("{" + shape + "}")))
+            readAll(postJson("/" + LanceRestTestCase.withStockOracle(indexName) + "/_search", "{" + shape + "}"))
         );
         assertEquals(shape, hitIdsOf(shardPath), hitIdsOf(fragmentPath));
         assertEquals(shape, sortValues(shardPath), sortValues(fragmentPath));
@@ -2755,7 +2742,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         // and merges 6 responses; the answers must match the one request
         // per node the default bound gives, the shard comes up green with a
         // reader over the first fragment, GET reaches every row, and a
-        // shape only the shard path serves is refused.
+        // body no plan answers is refused.
         String suffix = "mn-bound-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -2838,7 +2825,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             });
 
             // GET through the Lance scan filter reaches rows outside the
-            // shard reader; the shard path is refused for the table.
+            // shard reader; a body no plan answers (a highlighter) is
+            // refused with 400 naming the element.
             updateClusterSetting("lance.test.max_docs_per_reader", "4");
             String pkAttach = readAll(postJson("/_lance/attach", "{\"table\":\"" + pkTableUri + "\"}"));
             assertTrue(pkAttach, pkAttach.contains("\"lucene_bound_exceeded\":true"));
@@ -2850,10 +2838,13 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             }
             ResponseException refused = expectThrows(
                 ResponseException.class,
-                () -> postJson("/" + pkTable + "/_search", LanceRestTestCase.onShardPath("{\"size\":1,\"query\":{\"match_all\":{}}}"))
+                () -> postJson(
+                    "/" + pkTable + "/_search",
+                    "{\"size\":1,\"query\":{\"match_all\":{}},\"highlight\":{\"fields\":{\"label\":{}}}}"
+                )
             );
             assertEquals(400, refused.getResponse().getStatusLine().getStatusCode());
-            assertTrue(readAll(refused.getResponse()).contains("above the Lucene bound"));
+            assertTrue(readAll(refused.getResponse()).contains("search body carries a `highlight` clause"));
 
             // The default bound gives one request per node and the same
             // answers.
