@@ -353,14 +353,39 @@ nobody: the data node logs it and executes it. `LanceExplainResponse` travels fr
 planned the explain body to the node that received the REST call when they differ.
 
 Both streams open with an integer `WIRE_VERSION` (`FragmentPlan.WIRE_VERSION`,
-`LanceExplainResponse.WIRE_VERSION`, each `1` today), written first and read first. A reader that
-finds another number refuses the stream with an `IOException` naming both numbers (`FragmentPlan
-wire version [2] does not match this node's [1]: every node must run the same plugin version`),
-so a mismatch fails at the first field with a message that says why, instead of misreading the
-fields that follow into a generic stream corruption error. The number is bumped whenever a field
-is added, removed or retyped. No reader decodes an older number: the marker detects a mismatch,
-it does not negotiate one, and the fragment request between two plugin versions fails rather than
-falling back to the shard path.
+`LanceExplainResponse.WIRE_VERSION`, each `1` today), written first and read first through the
+`WireVersion` helper. A reader that finds another number refuses the stream with an `IOException`
+naming both numbers (`FragmentPlan wire version [2] does not match this node's [1]: every node must
+run the same plugin version`), so a mismatch fails at the first field with a message that says why,
+instead of misreading the fields that follow into a generic stream corruption error. The number is
+bumped whenever a field is added, removed or retyped. No reader decodes an older number: the marker
+detects a mismatch, it does not negotiate one, and the fragment request between two plugin versions
+fails rather than falling back to the shard path.
+
+The same marker opens every other plugin internal message that crosses nodes, each with its own
+`WIRE_VERSION` constant and its own name in the message. The fragment request and response around
+the plan (`LanceFragmentQueryRequest`, `LanceFragmentQueryResponse`) carry one for the fields they
+add around it: the request's marker guards the table, storage options, pinned version and the
+Lucene side builders, the plan's marker guards the plan, so a change to either bumps its own
+number. The per node stats request and the stats a node returns (`LanceStatsNodeRequest`,
+`LanceNodeStats`, the whole payload of `LanceStatsNodeResponse`), the per node `node_local` build
+request and response (`LanceBuildIndexesNodeRequest`, `LanceBuildIndexesNodeResponse`), the sync
+request and response the shard's node answers (`LanceIndexSyncRequest`, `LanceIndexSyncResponse`),
+and the poll, namespace update and attach requests and responses the cluster manager answers
+(`LanceNamespacePollRequest`, `LanceNamespacePollResponse`, `LanceNamespaceUpdateRequest`,
+`LanceNamespaceUpdateResponse`, `LanceAttachRequest`, `LanceAttachResponse`) each open with theirs.
+The marker sits after the fields the OpenSearch base class writes (the parent task id of a request,
+the cluster manager timeout of a cluster manager request, the node of a per node response, the
+acknowledged bit of an acknowledged response), which OpenSearch versions itself, and before the
+first field the plugin owns. A `Writeable` nested in one of these messages without a marker of its
+own (`LanceBuildIndexesRequest` inside the node request, `KindResult` inside the node response, the
+records inside `LanceNodeStats`) is covered by the enclosing message's number, so a change to its
+fields bumps that number. Messages the plugin only executes on the node that received the REST
+call (`LanceExplainRequest`, `LanceRefsRequest`, `LanceNamespaceListRequest`,
+`LanceBuildIndexesRequest` at the top level, and their responses) carry no marker: a
+`HandledTransportAction` invoked through the node client never serialises them.
+`LanceNamespaceMetadata` carries none either: it is cluster state, versioned and published by
+OpenSearch's own mechanism, and its backwards-compatibility policy is written on the class.
 
 The contract that follows is the plugin's for now: every node in the cluster runs the same plugin
 version, and a rolling upgrade is not supported for the fragment path. The
