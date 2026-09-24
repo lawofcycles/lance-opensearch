@@ -16,8 +16,6 @@ None. (List any of TransportLanceFragmentQueryAction.java, LanceFragmentLeafRead
 
 Commands run and their results, with numbers (test counts, timings, before/after).
 
-Changelog: the fragment added under `changelog/unreleased/<section>/`, or the reason this PR carries the `skip-changelog` label instead.
-
 ### Not verified
 
 What could not be checked locally and why (for example DLS behaviour needs the security plugin).

@@ -206,13 +206,12 @@ All production code lives under `src/main/java/org/opensearch/lance/`, one subpa
 
 ## Submitting changes
 
-See [CONTRIBUTING](CONTRIBUTING.md): open an issue first, sign every commit with `git commit -s`, add a changelog fragment under `changelog/unreleased/`, and fill every section of the pull request template.
+See [CONTRIBUTING](CONTRIBUTING.md): open an issue first, sign every commit with `git commit -s`, and fill every section of the pull request template.
 
 ## Releasing
 
-Every change goes to `main` and a release is a tag on it. Four steps:
+Every change goes to `main` and a release is a tag on it. Three steps:
 
 1. Set the new version in `gradle.properties` (`version=X.Y.Z`) and open a pull request for it.
-2. In the same pull request, run `python3 scripts/assemble-changelog.py --version X.Y.Z --date YYYY-MM-DD`. It moves the fragments under `changelog/unreleased/` into a `## [X.Y.Z] - YYYY-MM-DD` block of `CHANGELOG.md` and deletes them; commit the result.
-3. Once that pull request is merged, tag the merge commit and push the tag: `git tag -s vX.Y.Z` then `git push origin vX.Y.Z`.
-4. The `release` workflow (`.github/workflows/release.yml`) runs on the tag: it checks that the tag matches `version=` in `gradle.properties`, runs `./gradlew build` with every test, and creates the GitHub Release `vX.Y.Z` with `build/distributions/opensearch-lance-X.Y.Z.zip` attached and the `## [X.Y.Z]` block of `CHANGELOG.md` as its notes. A tag whose version differs from `gradle.properties` fails the workflow before the build.
+2. Once that pull request is merged, tag the merge commit and push the tag: `git tag -s vX.Y.Z` then `git push origin vX.Y.Z`.
+3. The `release` workflow (`.github/workflows/release.yml`) runs on the tag: it checks that the tag matches `version=` in `gradle.properties`, runs `./gradlew build` with every test, and creates the GitHub Release `vX.Y.Z` with `build/distributions/opensearch-lance-X.Y.Z.zip` attached. GitHub generates the release notes from the titles of the pull requests merged since the previous release. A tag whose version differs from `gradle.properties` fails the workflow before the build.

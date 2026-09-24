@@ -37,12 +37,11 @@ Every node also needs two JVM options for Arrow; [docs/getting-started.md](docs/
 - [docs/query-plan.md](docs/query-plan.md), the explain endpoint, the physical operators and the cost model.
 - [docs/architecture.md](docs/architecture.md), how the plugin is put together.
 - [docs/dependencies.md](docs/dependencies.md), what the plugin zip bundles and why.
-- [CHANGELOG.md](CHANGELOG.md), release notes; unreleased entries are fragments under [changelog/unreleased/](changelog/unreleased/README.md).
 - [RFC #22643](https://github.com/opensearch-project/OpenSearch/issues/22643), the design discussion.
 
 ## Contributing
 
-Bug reports, feature requests, documentation fixes and code are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to open an issue, the pull request process and the changelog fragment every pull request adds; [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) covers the build, the precommit checks and the tests. Every commit must be signed off (`git commit -s`) under the Developer Certificate of Origin.
+Bug reports, feature requests, documentation fixes and code are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to open an issue and the pull request process; [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) covers the build, the precommit checks and the tests. Every commit must be signed off (`git commit -s`) under the Developer Certificate of Origin.
 
 ## License
 

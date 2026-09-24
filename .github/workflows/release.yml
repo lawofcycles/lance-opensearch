@@ -73,36 +73,8 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      # The release notes are the `## [<version>]` block of CHANGELOG.md
-      # (written by scripts/assemble-changelog.py before the tag), without
-      # its heading and up to the next `## ` heading. When CHANGELOG.md has
-      # no block for the version the notes point at the file instead. The
-      # version reaches awk through the environment, not through the shell
-      # quoted program text, so no character in it is interpreted.
-      - name: Extract the release notes from CHANGELOG.md
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          notes="$RUNNER_TEMP/release-notes.md"
-          awk '
-            BEGIN { heading = "## [" ENVIRON["VERSION"] "]" }
-            index($0, heading) == 1 { inside = 1; next }
-            inside && /^## / { exit }
-            inside && NF == 0 && count == 0 { next }
-            inside { lines[count++] = $0 }
-            END {
-              while (count > 0 && lines[count - 1] ~ /^[[:space:]]*$/) count--
-              for (i = 0; i < count; i++) print lines[i]
-            }
-          ' CHANGELOG.md > "$notes"
-          if [ ! -s "$notes" ]; then
-            echo "CHANGELOG.md has no block for $VERSION, the release notes point at the file"
-            echo "See CHANGELOG.md." > "$notes"
-          fi
-          echo "release notes:"
-          cat "$notes"
-
+      # GitHub writes the release notes from the titles and authors of the
+      # pull requests merged since the previous release.
       - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -113,4 +85,4 @@ jobs:
             "build/distributions/opensearch-lance-$VERSION.zip" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$VERSION" \
-            --notes-file "$RUNNER_TEMP/release-notes.md"
+            --generate-notes
