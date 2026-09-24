@@ -12,6 +12,7 @@ the other features. This page assumes you have a Lance backed index and a search
 - [Physical operators](#physical-operators)
 - [Cost](#cost)
 - [Refinements](#refinements)
+- [Fragment pruning](#fragment-pruning)
 - [Traits](#traits)
 - [Wire format](#wire-format)
 
@@ -33,8 +34,8 @@ Two vocabularies appear throughout. The Calcite one: a logical tree (what the tr
 a physical tree (what the planner chose), operators, traits and costs. The plugin one: the fragment
 route (the coordinator fans the request out to the data nodes) and the unsupported route (no
 plan answers the body, which holds `suggest` or `highlight`; a search refuses it), the pushed scan, the
-Lucene operators, the refinements and the two stats counters `plan.refinements` and
-`plan.executed` under `GET /_lance/stats`.
+Lucene operators, the refinements, the fragment pruning and the three stats counters
+`plan.refinements`, `plan.executed` and `plan.pruned` under `GET /_lance/stats`.
 
 ## The explain endpoint
 
@@ -119,9 +120,15 @@ the executor builds its Lance query from (`lance_knn`, `lance_match`, ...), abse
 shape. `top_k` describes a pushed page (`orderings` with `column`, `ascending`, `nulls_first`;
 `fetch`; `cursor_sql` for a `search_after` page) and `aggregate` a pushed aggregate
 (`group_count`, `metrics` with the aggregation `name` and metric `kind`, `substrait_bytes`).
-Compare it with the node's `lance.plan:` line or with `plan.refinements` and `plan.executed` in
-`GET /_lance/stats` to see whether a data node executed the shipped plan or downgraded it. The
-field is absent when the plan failed (below).
+`excluded_fragment_ids` lists, in ascending order, the fragments the coordinator's zone map
+pruning proved empty of rows matching the query predicate (see
+[Fragment pruning](#fragment-pruning)); the executors leave them out of every scan of the
+request. It is absent when nothing was pruned: no scalar predicate, no zone map on a predicate
+column, or every fragment may hold a match.
+Compare it with the node's `lance.plan:` line or with `plan.refinements`, `plan.executed` and
+`plan.pruned` in `GET /_lance/stats` to see whether a data node executed the shipped plan,
+downgraded it, and how many fragments it skipped. The field is absent when the plan failed
+(below).
 
 `unplanned` names the request element that kept the envelope, or the whole query, on the Lucene
 side: the translator's message for the first element it could not spell (`query type [match]`,
@@ -283,6 +290,54 @@ actually caused the downgrade. The explain endpoint predicts the first two reaso
 coordinating node can see (whether a reader wrapper is installed, whether the page orders by an
 `ip` override column) and lists them in the same order under `refinements_possible`.
 
+## Fragment pruning
+
+Before the plan ships, the coordinator checks the query predicate against the zone maps of the
+table (`ZoneMapPruner`) and lists the fragments no matching row can come from in
+`FragmentPlan.excludedFragmentIds` (`excluded_fragment_ids` in the explain answer). A zone map
+index (`"scalar": "zonemap"` in the attach's `indexes` clause, or a zone map built on the table
+by another writer) records per zone, a run of `rows_per_zone` rows inside one fragment, the
+column's minimum, maximum and null count. A fragment is excluded when every one of its zones is
+proven empty: for a comparison (`term`, `terms`, `range`, the bounds of a `date` term) the
+literal falls outside the zone's `[min, max]`, or the zone is all null; for `exists`
+(`IS NOT NULL`) the zone is all null; for an `IS NULL` the zone holds no null. A `bool`'s `must`
+and `filter` clauses exclude a fragment when any clause does, its `should` clauses only when
+every clause does, and a `must_not` clause is never read (it keeps rows without a value, and the
+pruner does not reason about negation). The predicate is the query's, read from the logical
+tree, so the exclusions apply whatever physical form the planner chose: a pushed page, a pushed
+aggregate, the prefilter of a full text or `lance_knn` clause, the Lucene collectors, and the
+count path all skip the same fragments. A `post_filter` is not read (it applies to the hits
+alone, not to the aggregations).
+
+Every judgement is conservative. A fragment the zone map does not cover (appended after the index
+was built, or rewritten by a compaction the index has not followed) is kept; so is a zone whose
+bounds are unknown (a null minimum or maximum next to non null rows), a floating point zone
+whose maximum is `NaN` (Lance ranks `NaN` above every finite value, so the finite maximum is
+hidden), a predicate shape the pruner does not read (`wildcard`, `regexp`, `prefix`, a negation,
+a column without a zone map), and every fragment when the statistics could not be collected.
+Zone bounds compare in the column's own representation: an integer, date or timestamp bound as
+Lance reports it (a day count for `date32`, the column's unit for a timestamp), widened to the
+enclosing milliseconds before it meets the epoch millis literal a date range translates to; a
+string bound by code point, the order Lance computed the bounds in. Excluding a fragment never
+changes an answer, only the fragments the executors open.
+
+The zone maps are read lazily, once per manifest version and per column, and only for the columns
+the query names: the coordinator reads them while it holds the table open to enumerate the
+fragments (`TableStatistics.readZoneMaps`), before the planner runs, and the entry in the
+statistics cache keeps them for the life of that version. A table without a zone map index
+costs nothing here; a request whose query names no zone mapped column reads nothing.
+
+Each data node's executor removes the excluded fragments from the list the coordinator sent it
+before it opens the fragment reader and issues any Lance scan, and counts the fragments it
+skipped under `plan.pruned.fragments` in `GET /_lance/stats`. A node whose every fragment is
+excluded still answers the request, over a reader with no leaves, so the aggregations block and
+the count the coordinator merges have the shape an empty table produces. The Lance side counts
+(`hits.total` of a scalar filter or a full text prefilter) read the same reduced list.
+
+Only the zone map's minimum, maximum and null count are consulted. A bloom filter index, which
+answers an equality probe on a high cardinality column, and the fragment coverage of a BTree
+are not read for pruning.
+
 ## Traits
 
 Two request demandable traits sit next to the convention in every operator's trait set
@@ -355,10 +410,10 @@ travels from the coordinator to every data node inside the per node fragment req
 nobody: the data node logs it and executes it. `LanceExplainResponse` travels from the node that
 planned the explain body to the node that received the REST call when they differ.
 
-Both streams open with an integer `WIRE_VERSION` (`FragmentPlan.WIRE_VERSION` is `1` today,
+Both streams open with an integer `WIRE_VERSION` (`FragmentPlan.WIRE_VERSION` is `2` today,
 `LanceExplainResponse.WIRE_VERSION` is `2`), written first and read first through the
 `WireVersion` helper. A reader that finds another number refuses the stream with an `IOException`
-naming both numbers (`FragmentPlan wire version [2] does not match this node's [1]: every node must
+naming both numbers (`FragmentPlan wire version [3] does not match this node's [2]: every node must
 run the same plugin version`), so a mismatch fails at the first field with a message that says why,
 instead of misreading the fields that follow into a generic stream corruption error. The number is
 bumped whenever a field is added, removed or retyped. No reader decodes an older number: the marker
@@ -398,8 +453,9 @@ marker to decode the previous format; the marker is where that branch goes.
 
 After the marker, `FragmentPlan` writes its kind, the optional filter SQL, the optional Lance
 clause as a named writeable query builder, the optional pushed page (orderings, fetch, cursor
-SQL) and the optional pushed aggregate (the Substrait bytes, the group count, the metric slots,
-the two shipped cost predictions and the column names the aggregators would read).
+SQL), the optional pushed aggregate (the Substrait bytes, the group count, the metric slots,
+the two shipped cost predictions and the column names the aggregators would read) and the
+excluded fragment ids as an integer array (empty when nothing was pruned).
 `LanceExplainResponse` writes the index, the route, the two optional plan texts, the optional
 fragment plan, the optional unplanned message, the predicted refinements and the optional traits
 object (the requested accuracy, whether a tie stability was demanded and which, the declared pair,
