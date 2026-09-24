@@ -1,0 +1,1 @@
+{"query":{"bool":{"should":[{"lance_match":{"field":"body","query":"hello"}},{"lance_match_phrase":{"field":"category","query":"c0 c1"}}],"must_not":[{"term":{"id":6}}]}}}

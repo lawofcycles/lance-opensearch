@@ -48,6 +48,168 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         }
     }
 
+    public void testStockMatchFamilyAnswersLikeTheLanceDsl() throws Exception {
+        // Every stock full text spelling on a lance_text field is
+        // rewritten to its lance_* form on the coordinator, so the two
+        // spellings return the same ids in the same score order, the
+        // same scores and the same totals. Rows: 12 in three fragments
+        // of four; even rows carry body "hello lance i" and title
+        // "sunny morning i", odd rows body "quick brown fox i" and title
+        // "cloudy morning i"; row i is _id (i / 4) + "-" + (i % 4).
+        try (LanceTestCluster fixture = LanceTestCluster.setUpMultiFragment(12, 4, "stockmatchfamily")) {
+            String indexName = fixture.indexName();
+            List<String> even = List.of("0-0", "0-2", "1-0", "1-2", "2-0", "2-2");
+            List<String> odd = List.of("0-1", "0-3", "1-1", "1-3", "2-1", "2-3");
+            List<String> all = new ArrayList<>(even);
+            all.addAll(odd);
+
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"match\":{\"body\":\"hello\"}}",
+                "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}",
+                even
+            );
+            // The operator reaches Lance: OR hits every row, AND none.
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"match\":{\"body\":\"hello quick\"}}",
+                "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello quick\"}}",
+                all
+            );
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"match\":{\"body\":{\"query\":\"hello quick\",\"operator\":\"and\"}}}",
+                "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello quick\",\"operator\":\"and\"}}",
+                List.of()
+            );
+            // Fuzziness reaches Lance as an edit distance ("helo" is one
+            // edit from "hello"); AUTO resolves to 1 on a four letter text.
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"match\":{\"body\":{\"query\":\"helo\",\"fuzziness\":1}}}",
+                "{\"lance_match\":{\"field\":\"body\",\"query\":\"helo\",\"fuzziness\":1}}",
+                even
+            );
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"match\":{\"body\":{\"query\":\"helo\",\"fuzziness\":\"AUTO\"}}}",
+                "{\"lance_match\":{\"field\":\"body\",\"query\":\"helo\",\"fuzziness\":1}}",
+                even
+            );
+            // A boost multiplies the stock match's scores like the explicit one's.
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"match\":{\"body\":{\"query\":\"hello\",\"boost\":2.0}}}",
+                "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\",\"boost\":2.0}}",
+                even
+            );
+            // Phrase order and slop reach Lance.
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"match_phrase\":{\"body\":\"hello lance\"}}",
+                "{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"hello lance\"}}",
+                even
+            );
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"match_phrase\":{\"body\":\"lance hello\"}}",
+                "{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"lance hello\"}}",
+                List.of()
+            );
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"match_phrase\":{\"body\":{\"query\":\"quick fox\",\"slop\":1}}}",
+                "{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"quick fox\",\"slop\":1}}",
+                odd
+            );
+            // multi_match best_fields with a field boost is Lance's multi match with per column boosts.
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"multi_match\":{\"query\":\"hello cloudy\",\"fields\":[\"body\",\"title^2\"]}}",
+                "{\"lance_multi_match\":{\"fields\":[\"body\",\"title\"],\"query\":\"hello cloudy\",\"boosts\":[1.0,2.0]}}",
+                all
+            );
+            // A bool of several stock clauses fuses into one lance_fts_bool.
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"bool\":{\"must\":[{\"match\":{\"body\":\"hello\"}},{\"match\":{\"title\":\"sunny\"}}]}}",
+                "{\"lance_fts_bool\":{\"must\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},"
+                    + "{\"lance_match\":{\"field\":\"title\",\"query\":\"sunny\"}}]}}",
+                even
+            );
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"bool\":{\"should\":[{\"match\":{\"body\":\"hello\"}},{\"match\":{\"title\":\"cloudy\"}}]}}",
+                "{\"lance_fts_bool\":{\"should\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},"
+                    + "{\"lance_match\":{\"field\":\"title\",\"query\":\"cloudy\"}}]}}",
+                all
+            );
+            // Row 6 (body "hello lance 6") carries the token 6 the must_not drops.
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"bool\":{\"must\":[{\"match\":{\"body\":\"hello\"}}],\"must_not\":[{\"match\":{\"body\":\"6\"}}]}}",
+                "{\"lance_fts_bool\":{\"must\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}],"
+                    + "\"must_not\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"6\"}}]}}",
+                List.of("0-0", "0-2", "1-0", "2-0", "2-2")
+            );
+            // A stock match with scalar companions takes the prefiltered
+            // scan the explicit clause takes; range keeps rows 4..11.
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"bool\":{\"must\":[{\"match\":{\"body\":\"hello\"}}],\"filter\":[{\"range\":{\"id\":{\"gte\":4}}}]}}",
+                "{\"bool\":{\"must\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}],\"filter\":[{\"range\":{\"id\":{\"gte\":4}}}]}}",
+                List.of("1-0", "1-2", "2-0", "2-2")
+            );
+            // A should next to a filter without a must stays optional as
+            // in Lucene: the filter alone selects rows 4..11, the match
+            // only scores. The bool stays on the Lucene side, and its
+            // answer is the Lucene composition of the explicit clause.
+            assertStockAnswersLikeLance(
+                indexName,
+                "{\"bool\":{\"should\":[{\"match\":{\"body\":\"hello\"}}],\"filter\":[{\"range\":{\"id\":{\"gte\":4}}}]}}",
+                "{\"bool\":{\"should\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}],\"filter\":[{\"range\":{\"id\":{\"gte\":4}}}]}}",
+                List.of("1-0", "1-1", "1-2", "1-3", "2-0", "2-1", "2-2", "2-3")
+            );
+
+            // The explain endpoint reports the rewritten clause: the
+            // stock bool plans as one fused lance_fts_bool.
+            Request explain = new Request("GET", "/" + indexName + "/_lance/explain");
+            explain.setJsonEntity(
+                "{\"size\":5,\"query\":{\"bool\":{\"must\":[{\"match\":{\"body\":\"hello\"}},{\"match\":{\"title\":\"sunny\"}}]}}}"
+            );
+            String explained = readAll(client().performRequest(explain));
+            assertEquals("fragment", stringPath(explained, "route"));
+            assertEquals("lance_fts_bool", stringPath(explained, "fragment_plan", "lance_clause"));
+            assertTrue(explained, stringPath(explained, "logical").contains("LanceFtsMatch(kind=[FTS_BOOL], columns=[[body, title]]"));
+        }
+    }
+
+    /**
+     * Runs {@code stock} and {@code lance} as the query of a size 20
+     * page and of a size 0 count, and asserts equal ids in score order,
+     * equal scores, equal totals, and that the ids are
+     * {@code expectedIds}.
+     */
+    private static void assertStockAnswersLikeLance(String indexName, String stock, String lance, List<String> expectedIds)
+        throws IOException {
+        String stockPage = readAll(postJson("/" + indexName + "/_search", "{\"size\":20,\"query\":" + stock + "}"));
+        String lancePage = readAll(postJson("/" + indexName + "/_search", "{\"size\":20,\"query\":" + lance + "}"));
+        List<String> stockIds = idsOf(hitsOf(stockPage));
+        assertEquals("ids in score order, stock vs lance_*: " + stockPage, idsOf(hitsOf(lancePage)), stockIds);
+        assertEquals("expected id set: " + stockPage, new HashSet<>(expectedIds), new HashSet<>(stockIds));
+        assertEquals(expectedIds.size(), extractIntPath(stockPage, "hits", "total", "value"));
+        List<Double> stockScores = scoresOf(stockPage);
+        List<Double> lanceScores = scoresOf(lancePage);
+        assertEquals(lanceScores.size(), stockScores.size());
+        for (int i = 0; i < stockScores.size(); i++) {
+            assertEquals("score at rank " + i + ": " + stockPage, lanceScores.get(i), stockScores.get(i), 1e-4);
+        }
+        String stockCount = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":" + stock + "}"));
+        String lanceCount = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":" + lance + "}"));
+        assertEquals(expectedIds.size(), extractIntPath(stockCount, "hits", "total", "value"));
+        assertEquals(extractIntPath(lanceCount, "hits", "total", "value"), extractIntPath(stockCount, "hits", "total", "value"));
+    }
+
     public void testLanceMatchAcrossSeveralFragmentsOnOneNode() throws Exception {
         // 12 rows written 4 per file give fragments 0, 1 and 2. On the
         // single-node cluster the executor holds all three, so both the

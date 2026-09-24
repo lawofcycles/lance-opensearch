@@ -37,11 +37,12 @@ import java.util.List;
  */
 public class LanceQueryShapeFixtureTests extends OpenSearchTestCase {
 
-    /** One fixture per FTS shape (bare and filtered) and per refusal. */
+    /** One fixture per FTS shape (bare, filtered, fused bool) and per refusal. */
     public static final List<String> FTS_FIXTURES = List.of(
         "match",
         "match_boosted",
         "match_bare_bool",
+        "match_should_alone",
         "match_filtered",
         "match_must_not_only",
         "match_phrase",
@@ -52,11 +53,16 @@ public class LanceQueryShapeFixtureTests extends OpenSearchTestCase {
         "fts_bool_filtered",
         "fts_boost",
         "fts_boost_filtered",
-        "refusal_fts_in_should",
+        "fused_bool_two_must",
+        "fused_bool_must_not",
+        "fused_bool_two_should_must_not_only",
+        "fused_bool_filtered",
         "refusal_fts_in_filter",
-        "refusal_fts_in_must_not",
-        "refusal_two_fts_in_must",
+        "refusal_fts_must_not_only",
+        "refusal_should_with_filter_only",
+        "refusal_boosted_phrase_in_fused_bool",
         "refusal_fts_with_scalar_must",
+        "refusal_fts_with_scalar_should",
         "refusal_fts_with_knn",
         "refusal_bool_boost",
         "refusal_minimum_should_match",

@@ -51,7 +51,8 @@ import java.util.SortedSet;
  * {@code ip} or {@code geo_point} override column has no Lance SQL
  * form (their Lucene form, encoded doc values, differs from what the
  * column stores), and a query outside the translator's vocabulary
- * ({@code match}, {@code query_string}, an unmapped field, ...) has no
+ * ({@code match} on a field that is not {@code lance_text},
+ * {@code query_string}, an unmapped field, ...) has no
  * relational form; both execute through the Lucene composition of the
  * request's own builder under a plan whose kind the envelope selects.
  * A filtered {@code lance_knn} is the exception: its filter is a

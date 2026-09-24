@@ -1,0 +1,1 @@
+{"query":{"bool":{"must":[{"lance_match":{"field":"body","query":"hello"}}],"should":[{"lance_match":{"field":"body","query":"sunny","boost":2.0}}],"must_not":[{"lance_match":{"field":"body","query":"stale"}},{"term":{"id":6}}],"filter":[{"term":{"category":"c0"}}]}}}

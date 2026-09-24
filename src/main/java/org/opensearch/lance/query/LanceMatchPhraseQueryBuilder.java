@@ -37,18 +37,16 @@ import org.opensearch.lance.mapper.LanceTextFieldMapper;
  * }
  * }</pre>
  *
- * <p>Why this exists as a separate DSL: OpenSearch's stock
- * {@code match_phrase} relies on the field's search analyzer to tokenise
- * the query text and then hands the resulting {@code TokenStream} to
- * {@link MappedFieldType#phraseQuery}. {@code lance_text} advertises
- * {@link org.opensearch.index.mapper.TextSearchInfo#SIMPLE_MATCH_ONLY},
- * whose keyword analyzer emits the whole query as a single token — so
- * Lucene's {@code QueryBuilder.createFieldQuery} sees one token, skips
- * {@code phraseQuery}, and falls back to {@code termQuery}. That path
- * ignores phrase order. Providing {@code lance_match_phrase} lets the
- * caller push a phrase (with slop) straight into
- * {@code FullTextQuery.phrase(text, column, slop)} on Lance, which does
- * its own tokenisation using the analyzer baked into the FTS index.
+ * <p>This is the explicit form of OpenSearch's stock {@code match_phrase}
+ * on a {@code lance_text} field: the coordinator rewrites such a
+ * {@code match_phrase} into this builder with the same text and slop
+ * before planning ({@code StockTextQueryRewriter}), so both spellings
+ * plan and score the same. Outside that path (a {@code match_phrase}
+ * inside a compound the rewrite does not descend into) the field type
+ * answers the stock query itself through
+ * {@code LanceTextFieldType.phraseQuery}, which hands the words of the
+ * quote analyzer's token stream to the same
+ * {@code FullTextQuery.phrase(text, column, slop)}.
  *
  * <p>{@code field} and {@code query} are required. {@code slop} defaults
  * to 0 (strict phrase order). Unknown properties are rejected so typos

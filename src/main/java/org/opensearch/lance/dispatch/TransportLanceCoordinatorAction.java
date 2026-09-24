@@ -62,6 +62,7 @@ import org.opensearch.lance.plan.metadata.TableStatisticsCache;
 import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
+import org.opensearch.lance.plan.translate.StockTextQueryRewriter;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
@@ -661,14 +662,20 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 target.dateOverrideColumns(),
                 () -> totalRows
             );
+        // Stock match / match_phrase / multi_match clauses on the
+        // target's lance_text fields become the plugin's Lance FTS
+        // clauses before planning, per target because the mapping
+        // decides which fields those are; the executors receive the
+        // rewritten query, so the plan and the query they run agree.
+        FragmentQuerySpec targetSpec = baseSpec.withQuery(StockTextQueryRewriter.rewrite(baseSpec.query(), target.lanceTextFields()));
         RequestPlanner.Planned planned = RequestPlanner.plan(
-            baseSpec.executionShape(),
+            targetSpec.executionShape(),
             model,
             target.sqlExcludedColumns(),
             plannerFactory,
             RequestPlanner.clusterInputs(nodeList.size(), target.tableUri(), clusterService.getClusterSettings())
         );
-        FragmentQuerySpec spec = baseSpec.withPlan(planned.plan());
+        FragmentQuerySpec spec = targetSpec.withPlan(planned.plan());
         if (allFragmentIds.isEmpty()) {
             if (spec.aggregations() == null) {
                 // Empty table with no aggregations requested: no
@@ -939,7 +946,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                     renamedFields,
                     primaryKeyField,
                     PlanExecutor.sqlExcludedColumns(overrides),
-                    overrides.dateColumns().keySet()
+                    overrides.dateColumns().keySet(),
+                    LanceMappingMeta.lanceTextFields(indexMetadata.mapping())
                 )
             );
         }
@@ -986,12 +994,14 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * {@code primaryKeyField}, {@code sqlExcludedColumns} and
      * {@code dateOverrideColumns} feed the planner model the per-target
      * filter SQL derivation builds once the target's Arrow schema is
-     * known.
+     * known. {@code lanceTextFields} are the fields the mapping types as
+     * {@code lance_text}, on which stock full text clauses rewrite to
+     * Lance FTS clauses ({@link StockTextQueryRewriter}).
      */
     private record IndexTarget(String indexName, String tableUri, StorageOptions storageOptions, long pinnedVersion, Map<
         String,
         LinkedHashMap<String, String>> multiFields, Map<String, String> renamedFields, String primaryKeyField, Set<
-            String> sqlExcludedColumns, Set<String> dateOverrideColumns) {
+            String> sqlExcludedColumns, Set<String> dateOverrideColumns, Set<String> lanceTextFields) {
 
         Optional<Long> pinnedVersionOrEmpty() {
             return pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();
@@ -1026,6 +1036,30 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             return new FragmentQuerySpec(
                 targetPlan,
                 query,
+                postFilter,
+                sorts,
+                searchAfter,
+                from,
+                effectiveSize,
+                aggregations,
+                trackScores,
+                trackTotalHitsUpTo,
+                minScore,
+                terminateAfter,
+                projection,
+                rescores,
+                collapse
+            );
+        }
+
+        /** The same spec carrying the query rewritten for one target's mapping. */
+        FragmentQuerySpec withQuery(QueryBuilder targetQuery) {
+            if (targetQuery == query) {
+                return this;
+            }
+            return new FragmentQuerySpec(
+                plan,
+                targetQuery,
                 postFilter,
                 sorts,
                 searchAfter,

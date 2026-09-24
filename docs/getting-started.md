@@ -275,7 +275,7 @@ Options are persisted as `index.lance.storage_options.<key>` on the created inde
 
 Each command below assumes the index name `demo` from step 4.
 
-Full text queries come in two forms. The stock OpenSearch syntax (`match`, `match_phrase`, `multi_match`, and `bool` around them) works on every `lance_text` field and is the form to start with: on a `lance_text` field the plugin's field type answers OpenSearch's `match` family with a Lance `MatchQuery` over the query text, so the hits and the BM25 scores come from the Lance inverted index, not from a Lucene index. The `lance_*` form (`lance_match`, `lance_match_phrase`, `lance_multi_match`, `lance_fts_bool`, `lance_fts_boost`) hands the same Lance queries every parameter the stock parsers do not pass through: AND / OR operator, fuzziness, phrase order and slop, per-field boosts inside one Lance query, and score composition on Lance's side. It is also the form the planner recognises, so a `lance_*` clause with scalar `filter` / `must_not` companions runs as one Lance scan with the filter as a prefilter, while the same `bool` around a stock `match` runs each clause as its own Lance scan and lets Lucene combine them. Use the stock syntax when it does what you need and reach for the `lance_*` form for the parameters and the single scan; each subsection below shows the stock form first and the explicit form under it. [limitations.md](limitations.md#fts-query-behaviour-on-stock-match--match_phrase) has the short list of what the stock form ignores.
+Full text queries come in two forms that answer the same. The stock OpenSearch syntax (`match`, `match_phrase`, `multi_match`, and `bool` around them) is the form to start with: on a `lance_text` field the coordinator rewrites each stock clause into the plugin's `lance_*` clause with the same parameters before it plans the request, so the hits and the BM25 scores come from the Lance inverted index, `operator`, `fuzziness`, phrase order, `slop` and field boosts reach Lance, and a `bool` of several clauses with scalar `filter` / `must_not` companions runs as one Lance scan with the filter as a prefilter. The `lance_*` form (`lance_match`, `lance_match_phrase`, `lance_multi_match`, `lance_fts_bool`, `lance_fts_boost`) is the explicit spelling of the same Lance queries; it is what the rewrite produces, what `GET /<index>/_lance/explain` prints under `lance_clause`, and the form to write when a parameter has no stock counterpart (`lance_fts_boost`'s negative clause). Each subsection below shows the stock form first and the explicit form under it. [limitations.md](limitations.md#fts-query-behaviour-on-stock-match--match_phrase--multi_match) has the short list of what the stock form drops.
 
 ### Full-text search (match)
 
@@ -289,11 +289,11 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
 
 Expected `hits.total.value`: 8 (every even row). `_score` is Lance's BM25 for the row.
 
-Lance's own tokenizer splits several words and Lance ORs the terms: `{"match":{"body":"hello lance"}}` returns 8 and `{"match":{"body":"hello quick"}}` returns 16, because every row contains one of the two words.
+Lance's own tokenizer splits several words and the default operator ORs the terms: `{"match":{"body":"hello lance"}}` returns 8 and `{"match":{"body":"hello quick"}}` returns 16, because every row contains one of the two words. `operator: and` requires both: `{"match":{"body":{"query":"hello quick","operator":"and"}}}` returns 0 and `{"match":{"body":{"query":"hello lance","operator":"and"}}}` returns 8.
 
-What the stock form does not carry: the whole query text reaches Lance as one string, so `operator: and` and `minimum_should_match` on `match` are ignored (`{"match":{"body":{"query":"hello quick","operator":"and"}}}` still returns 16), and `fuzziness` on `match` returns 400 (`Can only use fuzzy queries on keyword and text fields`). The explicit form below carries them.
+`fuzziness` is an edit distance: `{"match":{"body":{"query":"helo","fuzziness":1}}}` returns 8 (`helo` is one edit from `hello`; without `fuzziness` it returns 0). `AUTO` resolves on the length of the whole query text, 1 for `helo`. `prefix_length` and `max_expansions` reach Lance as well. `minimum_should_match` has no Lance counterpart and is ignored.
 
-#### Explicit form: lance_match (operator, fuzziness)
+#### Explicit form: lance_match
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
@@ -301,9 +301,7 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
   -d '{"query":{"lance_match":{"field":"body","query":"hello lance","operator":"and"}}}'
 ```
 
-Expected `hits.total.value`: 8 (every even row contains both `hello` and `lance`). Swapping the query text to `"hello quick"` returns 16 hits with the default operator (OR) and 0 hits with `operator: and`, because no row contains both words.
-
-`lance_match` also accepts `fuzziness` (non-negative integer edit distance), `prefix_length`, and `max_expansions`. OpenSearch's `AUTO` fuzziness is not supported because Lance takes an explicit integer.
+Expected `hits.total.value`: 8, the same hits and scores as the stock `match` with `operator: and`. `lance_match` takes `fuzziness` as a non negative integer only (`AUTO` is not accepted), `prefix_length` and `max_expansions`:
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
@@ -311,7 +309,7 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
   -d '{"query":{"lance_match":{"field":"body","query":"helo","fuzziness":1}}}'
 ```
 
-Expected `hits.total.value`: 8. `helo` is edit distance 1 from `hello`, so the eight even rows still match. Without `fuzziness` the same query returns 0.
+Expected `hits.total.value`: 8.
 
 ### Phrase (match_phrase)
 
@@ -321,9 +319,11 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
   -d '{"query":{"match_phrase":{"body":"hello lance"}}}'
 ```
 
-Expected `hits.total.value`: 8. The stock `match_phrase` reaches Lance the same way `match` does, as one string for a Lance `MatchQuery`, so word order and `slop` are not enforced: `{"match_phrase":{"body":"lance hello"}}` also returns 8. Use the explicit form when the order matters.
+Expected `hits.total.value`: 8. Word order is enforced: `{"match_phrase":{"body":"lance hello"}}` returns 0. Non zero `slop` lets tokens sit further apart: `{"match_phrase":{"body":{"query":"quick fox","slop":1}}}` matches every `quick brown fox <i>` because `brown` sits one position between `quick` and `fox`.
 
-#### Explicit form: lance_match_phrase (order, slop)
+A phrase needs an inverted index that stores token positions (the `with_position=True` argument in the step 3 scripts; `"with_position": true` on `POST /_lance/build_indexes/{index}` when the plugin builds the index). On an index built without positions Lance answers 400 with `position is not found but required for phrase queries`.
+
+#### Explicit form: lance_match_phrase
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
@@ -331,9 +331,7 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
   -d '{"query":{"lance_match_phrase":{"field":"body","query":"hello lance"}}}'
 ```
 
-Returns 8 hits. Reversing the phrase to `"lance hello"` returns 0. Non-zero slop lets tokens sit further apart: `{"field":"body","query":"quick fox","slop":1}` matches every `quick brown fox <i>` because `brown` sits one position between `quick` and `fox`.
-
-`lance_match_phrase` needs an inverted index that stores token positions (the `with_position=True` argument in the step 3 scripts; `"with_position": true` on `POST /_lance/build_indexes/{index}` when the plugin builds the index). On an index built without positions Lance answers 400 with `position is not found but required for phrase queries`.
+Returns the same 8 hits; `{"field":"body","query":"quick fox","slop":1}` is the explicit spelling of the slop example.
 
 ### Multi-field match (multi_match)
 
@@ -352,9 +350,9 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
       }'
 ```
 
-Expected `hits.total.value`: 16. `hello` hits every even row on `body`; `cloudy` hits every odd row on `title`; the two are unioned. The stock `multi_match` builds one Lance `MatchQuery` per field and Lucene combines the per-field scores (`best_fields`, the default, keeps the best field's score; `most_fields` sums them); the `^2` boost applies to the `title` clause's Lance score. `operator`, `minimum_should_match` and `type: phrase` are ignored for the same reason as on `match`.
+Expected `hits.total.value`: 16. `hello` hits every even row on `body`; `cloudy` hits every odd row on `title`; the two are unioned. The default type `best_fields` becomes one Lance `MultiMatchQuery` over both columns that keeps the best column's score, with the `^2` boost as that column's factor; `operator` applies inside each column. Restricting to `["body"]` drops the odd row matches; adding `"operator":"and"` returns 0 hits because no row contains both words in one field. The other `multi_match` types (`most_fields`, `cross_fields`, `phrase`, `phrase_prefix`, `bool_prefix`) keep their stock form: one Lance match per field, combined by Lucene.
 
-#### Explicit form: lance_multi_match (one Lance query, shared operator, boosts)
+#### Explicit form: lance_multi_match
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
@@ -370,11 +368,11 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
       }'
 ```
 
-Expected `hits.total.value`: 16, the same rows as above, scored by Lance's `MultiMatchQuery` in one scan. Restricting to `["body"]` drops the odd-row matches; adding `"operator":"and"` returns 0 hits because no row contains both words in one field.
+Expected `hits.total.value`: 16, the same rows and scores as the stock `multi_match` above.
 
 ### Composition with bool
 
-A `bool` composes full text clauses with each other and with scalar filters. With the stock `match` inside, every clause runs as its own Lance FTS scan and Lucene applies the `must` / `should` / `must_not` / `filter` logic over the per-fragment results, so the scores and counts are what OpenSearch gives the same `bool` over Lucene fields. `rating` is `(i % 5) + 1`, so the even rows carry the ratings 1, 3, 5, 2, 4, 1, 3, 5.
+A `bool` composes full text clauses with each other and with scalar filters. When its `must` and `should` lists hold full text clauses only and its `filter` holds scalar clauses (`term`, `terms`, `range`, `exists`, `match_all`, `wildcard`, `regexp`, `prefix`, or a `bool` of those), the planner translates the scalar clauses to Lance SQL and fuses the full text clauses into one Lance boolean query, so the whole `bool` runs as one Lance FTS scan with the SQL as a prefilter: Lance evaluates the predicate first (through the column's scalar index when it has one), looks the inverted index up only for the selected rows, and scores the clauses as Lucene's `BooleanQuery` would (`must` clauses intersect and add their scores, `should` clauses add theirs when they match, `must_not` clauses exclude). `rating` is `(i % 5) + 1`, so the even rows carry the ratings 1, 3, 5, 2, 4, 1, 3, 5.
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
@@ -391,32 +389,15 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
 
 Expected `hits.total.value`: 5 (rows 2, 4, 8, 12, 14: even, and rating 3 or above). Other compositions on the same table:
 
-- `must: [{"match":{"body":"hello"}}, {"match":{"title":"sunny"}}]` returns 8: both words sit on the even rows.
+- `must: [{"match":{"body":"hello"}}, {"match":{"title":"sunny"}}]` returns 8: both words sit on the even rows, each hit scored by the sum of the two clauses.
 - `must: [{"match":{"body":"hello"}}], must_not: [{"match":{"body":"lance"}}]` returns 0: every row with `hello` also has `lance`.
 - `should: [{"match":{"body":"hello"}}, {"match":{"title":"cloudy"}}]` returns 16, each row scored by the one clause it matches.
 
-#### Explicit form: a lance_* clause with scalar filters, one Lance scan
-
-When the `bool` holds exactly one `lance_*` clause in `must` and only scalar clauses (`term`, `terms`, `range`, `exists`, `match_all`, `wildcard`, `regexp`, `prefix`, or a `bool` of those) in `filter` / `must_not`, the planner translates the scalar clauses to Lance SQL and runs one Lance FTS scan with that SQL as a prefilter: Lance evaluates the predicate first (through the column's scalar index when it has one) and looks the inverted index up only for the selected rows.
-
-```
-curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
-  -H 'Content-Type: application/json' \
-  -d '{
-        "query": {
-          "bool": {
-            "must":   [{"lance_match": {"field": "body", "query": "hello"}}],
-            "filter": [{"range": {"rating": {"gte": 3}}}]
-          }
-        }
-      }'
-```
-
-Expected `hits.total.value`: 5, the same rows as the stock `bool` above. "Where a request runs" below shows how to see the difference between the two plans.
+Shapes the planner leaves to Lucene, with the same results: a `should` next to a `filter` without a `must` (the full text clause is optional in Lucene, the filter alone selects the rows), a scalar clause in `must` or `should`, a full text clause in `filter`, a `minimum_should_match`, or a `boost` on the `bool`. Every full text clause then runs as its own Lance scan and Lucene combines them. "Where a request runs" below shows how to tell the two plans apart.
 
 #### Explicit form: lance_fts_bool and lance_fts_boost, composition on Lance's side
 
-`lance_fts_bool` composes `must` / `should` / `must_not` lists of full text clauses inside one Lance query; `lance_fts_boost` defines the hits by a `positive` clause and multiplies the score of the hits that also match `negative` by `negative_boost`. Every clause must itself be a `lance_*` full text query (`lance_match`, `lance_match_phrase`, `lance_multi_match`, or a nested `lance_fts_bool` / `lance_fts_boost`); a stock `match` inside either returns 400.
+`lance_fts_bool` is what the fused stock `bool` becomes: `must` / `should` / `must_not` lists of full text clauses inside one Lance query. `lance_fts_boost` defines the hits by a `positive` clause and multiplies the score of the hits that also match `negative` by `negative_boost`; it has no stock counterpart (the stock `boosting` query is not rewritten to it). Every clause inside either must itself be a `lance_*` full text query (`lance_match`, `lance_match_phrase`, `lance_multi_match`, or a nested `lance_fts_bool` / `lance_fts_boost`); a stock `match` inside either returns 400.
 
 ```
 curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
@@ -550,34 +531,13 @@ For OpenSearch's dedicated `hybrid` query (per-sub-query top-K with a score-norm
 
 `GET /{index}/_lance/explain` takes a search body and answers what the coordinator would execute for it, without running the search. The plugin plans every `_search` once, on the coordinating node, through a Calcite planner: the body is translated to a logical tree over the table, the planner picks the cheapest physical form that declares the traits the request demands, and the per node part of that form ships to the data nodes with each fragment request. The explain endpoint runs the same planning entry and prints the result, so what it shows is what a search with the same body executes. [query-plan.md](query-plan.md) is the reference for every field, the operators, the cost model, the refinements and the traits; this section shows the two answers the examples above produce.
 
-A stock `match` is outside the translator's vocabulary, so the plan carries no query part and the executors run Lucene's collector over the query the field type built (`LUCENE_TOPK`); `unplanned` names the element that kept the request on the Lucene side:
+The `bool` from "Composition with bool" is a shape the translator spells. The stock `match` was rewritten to `lance_match` before planning (the `logical` text and `lance_clause` show the rewritten clause), the `range` becomes the Lance SQL `rating >= 3` and rides on the pushed full text operation as its prefilter, the page is pushed too (`PUSHED_SCAN`), and nothing is `unplanned`. The physical lines carry three terms per operator (`accuracy`, `tie_stability`, `cost`), cut here for width:
 
 ```
 curl -s -X GET 'http://localhost:9200/demo/_lance/explain?pretty' \
   -H 'Content-Type: application/json' \
   -d '{"size":3,"query":{"bool":{"must":[{"match":{"body":"hello"}}],"filter":[{"range":{"rating":{"gte":3}}}]}}}'
 ```
-
-```json
-{
-  "index" : "demo",
-  "route" : "fragment",
-  "logical" : "LanceTableScan(table=[[lance, demo]])\n",
-  "physical" : "MergeExec(reduce=[HITS_TOP_K], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms=1, native_bytes=1, heap_bytes=0}], total_cost=[{ms=18, native_bytes=2, heap_bytes=0}])\n  FanOutExec(fanOut=[1], partitioning=[EQUAL_FRAGMENT_GROUPS], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms=1, native_bytes=1, heap_bytes=0}])\n    LanceTableScan(table=[[lance, demo]], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms=16, native_bytes=0, heap_bytes=0}])\n",
-  "fragment_plan" : {
-    "kind" : "LUCENE_TOPK"
-  },
-  "unplanned" : "query type [match]",
-  "refinements_possible" : [ ],
-  "traits" : {
-    "requested" : { "accuracy" : "APPROXIMATE", "tie_stability" : "NONE" },
-    "declared" : { "accuracy" : "EXACT", "tie_stability" : "STABLE_ROWADDR" },
-    "enforcer" : "none"
-  }
-}
-```
-
-The same `bool` with `lance_match` in `must` is a shape the translator spells: the `range` becomes the Lance SQL `rating >= 3` and rides on the pushed full text operation as its prefilter, the page is pushed too (`PUSHED_SCAN`), and nothing is `unplanned`. The physical lines carry the same three terms as above (`accuracy`, `tie_stability`, `cost`), cut here for width:
 
 ```json
 {
@@ -603,12 +563,39 @@ The same `bool` with `lance_match` in `must` is a shape the translator spells: t
 }
 ```
 
+A shape the planner leaves to Lucene carries no query part: the executors run Lucene's collector over the query the field type built (`LUCENE_TOPK`) and `unplanned` names the element that kept the request on the Lucene side. Here the `match` sits in `should` next to a `filter` without a `must`, so it is optional in Lucene and the filter alone selects the rows, which Lance's boolean cannot express:
+
+```
+curl -s -X GET 'http://localhost:9200/demo/_lance/explain?pretty' \
+  -H 'Content-Type: application/json' \
+  -d '{"size":3,"query":{"bool":{"should":[{"match":{"body":"hello"}}],"filter":[{"range":{"rating":{"gte":3}}}]}}}'
+```
+
+```json
+{
+  "index" : "demo",
+  "route" : "fragment",
+  "logical" : "LanceTableScan(table=[[lance, demo]])\n",
+  "physical" : "MergeExec(reduce=[HITS_TOP_K], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms=1, native_bytes=1, heap_bytes=0}], total_cost=[{ms=18, native_bytes=2, heap_bytes=0}])\n  FanOutExec(fanOut=[1], partitioning=[EQUAL_FRAGMENT_GROUPS], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms=1, native_bytes=1, heap_bytes=0}])\n    LanceTableScan(table=[[lance, demo]], accuracy=[EXACT], tie_stability=[STABLE_ROWADDR], cost=[{ms=16, native_bytes=0, heap_bytes=0}])\n",
+  "fragment_plan" : {
+    "kind" : "LUCENE_TOPK"
+  },
+  "unplanned" : "full text clause in [should] next to [filter] without a [must] clause",
+  "refinements_possible" : [ ],
+  "traits" : {
+    "requested" : { "accuracy" : "APPROXIMATE", "tie_stability" : "NONE" },
+    "declared" : { "accuracy" : "EXACT", "tie_stability" : "STABLE_ROWADDR" },
+    "enforcer" : "none"
+  }
+}
+```
+
 How to read the fields:
 
 - `route` is `fragment` for everything the coordinator fans out to the data nodes, which is every body except one holding `suggest` or `highlight`; those answer `route: unsupported` with the refusal message under `unplanned` (a `_search` with the same body answers that message as 400), and nothing else is planned.
 - `logical` is the tree the translator built and `physical` the tree the planner chose: `MergeExec` (how the per node answers combine) over `FanOutExec` (how many data nodes the request fans out to) over the per node plan, a `LanceTableScan` carrying its pushed operations (`filter{sql=...}`, `fts{...}`, `knn{...}`, `topk{...}`, `aggregate{...}`), or a `HeapTopKExec` / `LuceneAggregateExec` operator over the bare scan when Lucene's collector or aggregators run the request. Every physical line ends with the `accuracy` and `tie_stability` the operator declares and the `cost` the planner charged it; the root adds `total_cost`, the figure the candidates were compared by. Below a million rows the milliseconds are placeholders (a bare scan charges one per row, which is where the `16` above comes from); at a million rows and above an aggregation is priced by the fitted model described in [query-plan.md](query-plan.md#cost).
 - `fragment_plan` is what every data node receives: `kind` (`PUSHED_SCAN`, `LUCENE_TOPK`, `LUCENE_COUNT`, `LUCENE_AGGREGATE`), the `filter_sql` of the scalar predicate when there is one, the `lance_clause` the executor builds its Lance query from, and the pushed `top_k` page or `aggregate`.
-- `unplanned` is present only when some element kept the request, or the whole query, on the Lucene side, and names it (`query type [match]`, `sort type [_geo_distance]`, `aggregation type [multi_terms]`, `size [5] (only 0 with aggregations)`, `pipeline aggregation`). It is absent when the planner's cost model chose the Lucene operator for a tree that did translate; the physical plan shows that choice.
+- `unplanned` is present only when some element kept the request, or the whole query, on the Lucene side, and names it (`query type [match]` for a `match` on a field that is not `lance_text`, `full text clause in [should] next to [filter] without a [must] clause`, `sort type [_geo_distance]`, `aggregation type [multi_terms]`, `size [5] (only 0 with aggregations)`, `pipeline aggregation`). It is absent when the planner's cost model chose the Lucene operator for a tree that did translate; the physical plan shows that choice.
 - `refinements_possible` lists the downgrades a data node could still apply to the shipped plan for what only it knows (`security_wrapper` when a DLS / FLS reader wrapper is installed, `sort_field_type` for a page sorted by an `ip` column). `GET /_lance/stats` counts what the nodes did under `plan.refinements` and `plan.executed`, see step 6.
 - `traits` is what the body demanded of the plan (`requested`: an explicit `track_total_hits` demands `EXACT` accuracy, a `search_after` cursor demands a reproducible tie order; `APPROXIMATE` and `NONE` mean no demand) against what the chosen plan declares (`declared`). The bare scan above returns rows in Lance row address order (`STABLE_ROWADDR`); a page cut in score order out of a full text or knn scan is `UNSTABLE`, which is why `search_after` over a `lance_match` page sorted by `_score` alone is refused. `enforcer` says whether the planner had to replace the cheapest plan with one meeting the demand.
 
@@ -924,7 +911,7 @@ Alternatively, keep the surviving indices and reattach each one explicitly with 
 
 **A query on a mapped column returns zero hits when Python `dataset.to_table()` shows data.** Inspect the OpenSearch mapping (`curl -s http://localhost:9200/<index>/_mapping`). If the column is missing there, its Arrow type is not yet covered by the mapping derivation; open an issue with the schema.
 
-**`match` returns hits `operator: and` should have excluded, or `match_phrase` ignores word order.** Expected: on a `lance_text` field the stock queries hand the whole text to a Lance `MatchQuery` and the operator, `minimum_should_match`, phrase order and `slop` do not reach Lance. Use `lance_match` / `lance_match_phrase` (step 5).
+**`match` returns hits `operator: and` should have excluded, or `match_phrase` ignores word order.** On a `lance_text` field at the top of the query or inside a `bool` / `dis_max`, both reach Lance (step 5); check the field's mapping type with `GET /<index>/_mapping` (a `keyword` override answers `match` as an exact term) and `GET /<index>/_lance/explain` (`lance_clause` names the rewritten clause). Inside another compound (`function_score`, `nested`, `constant_score`) the `operator` of `match` is not applied; write `lance_match` there.
 
 **`lance_match_phrase` answers 400 `position is not found but required for phrase queries`.** The inverted index was built without token positions. Rebuild it with `with_position=True` (pylance) or `"with_position": true` on `POST /_lance/build_indexes/{index}`; positions are fixed when the index is created.
 

@@ -259,7 +259,9 @@ public class LanceFtsBoolQueryBuilder extends AbstractQueryBuilder<LanceFtsBoolQ
                 );
             }
             FullTextQuery ftq = lanceClause.toLanceFullTextQuery(context);
-            out.add(new FullTextQuery.BooleanClause(occur, ftq));
+            // The clause's own boost has no Lucene BoostQuery to ride on
+            // inside a Lance tree; fold it into the Lance factor.
+            out.add(new FullTextQuery.BooleanClause(occur, LanceFtsQueryBuilder.boosted(ftq, clause.boost(), NAME)));
         }
     }
 

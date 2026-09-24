@@ -8,8 +8,10 @@ package org.opensearch.lance;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.core.common.io.stream.StreamInput;
@@ -114,6 +116,35 @@ public final class LanceMappingMeta {
     public static boolean isDropped(Map<String, Object> fieldEntry) {
         Object meta = fieldEntry.get("meta");
         return meta instanceof Map<?, ?> metaMap && "true".equals(metaMap.get("lance_dropped"));
+    }
+
+    /**
+     * The top-level fields the mapping types as {@code lance_text}, in
+     * mapping order, dropped ones included (a query on a dropped field
+     * is refused by the field type either way). The coordinator reads
+     * this to decide which stock {@code match} family clauses address a
+     * Lance inverted index.
+     *
+     * @param mapping the index's mapping metadata, nullable
+     */
+    public static Set<String> lanceTextFields(MappingMetadata mapping) {
+        if (mapping == null) {
+            return Set.of();
+        }
+        Map<String, Object> source = mapping.sourceAsMap();
+        Object properties = source == null ? null : source.get("properties");
+        if (!(properties instanceof Map<?, ?> propsMap)) {
+            return Set.of();
+        }
+        Set<String> fields = new LinkedHashSet<>();
+        for (Map.Entry<?, ?> entry : propsMap.entrySet()) {
+            if (entry.getKey() instanceof String name
+                && entry.getValue() instanceof Map<?, ?> field
+                && "lance_text".equals(field.get("type"))) {
+                fields.add(name);
+            }
+        }
+        return fields;
     }
 
     private static Integer parseFieldId(Object raw) {

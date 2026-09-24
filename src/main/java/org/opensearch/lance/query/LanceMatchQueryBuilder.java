@@ -44,17 +44,20 @@ import org.lance.ipc.FullTextQuery;
  * }
  * }</pre>
  *
- * <p>Why this exists as a separate DSL: OpenSearch's stock {@code match}
- * query analyses the query text on the OpenSearch side, splits it into
- * tokens, and applies the {@code operator} clause to a Lucene
- * {@link org.apache.lucene.search.BooleanQuery} that combines one
- * {@code termQuery} per token. For a field advertising
- * {@link org.opensearch.index.mapper.TextSearchInfo#SIMPLE_MATCH_ONLY} the
- * analyzer only lowercases, so all tokens end up in one term and Lance
- * — which tokenises internally with the FTS index's analyzer — never sees
- * the operator or the fuzziness. {@code lance_match} bypasses that layer
- * by handing the raw text and every FTS parameter to
- * {@link FullTextQuery#match} on Lance directly.
+ * <p>This is the explicit form of OpenSearch's stock {@code match} on a
+ * {@code lance_text} field: the coordinator rewrites such a
+ * {@code match} into this builder with the same text, operator,
+ * fuzziness, prefix length and expansion bound before planning
+ * ({@code StockTextQueryRewriter}), so both spellings plan and score
+ * the same. Written directly it carries the parameters the stock
+ * parser has no place for outside the planner's path, and it is what a
+ * {@code lance_fts_bool} or {@code lance_fts_boost} composes. The stock
+ * {@code match} analyses nothing on the OpenSearch side for this field
+ * type (the field advertises a keyword search analyzer), so the whole
+ * text reaches Lance as one query and Lance tokenises it with the FTS
+ * index's analyzer; the operator, applied by OpenSearch's
+ * {@code MatchQuery} only across several tokens, would be lost without
+ * the rewrite.
  *
  * <p>{@code field} and {@code query} are required. Optional parameters:
  * <ul>

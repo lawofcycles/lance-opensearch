@@ -6,7 +6,9 @@
 package org.opensearch.lance.query;
 
 import java.util.List;
+import java.util.Optional;
 
+import org.lance.ipc.FullTextQuery;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.json.JsonXContent;
@@ -36,6 +38,49 @@ public class LanceFtsBoolQueryBuilderTests extends OpenSearchTestCase {
         XContentParser parser = JsonXContent.jsonXContent.createParser(namedXContentRegistry(), null, json);
         parser.nextToken();
         return parser;
+    }
+
+    public void testClauseBoostFoldsIntoTheLanceMatchFactor() {
+        // A clause boost inside the Lance tree has no Lucene BoostQuery
+        // to ride on: a match clause's boost multiplies Lance's factor,
+        // a multi match's per column boosts are scaled, a phrase (no
+        // factor in Lance) refuses rather than dropping the boost.
+        FullTextQuery match = FullTextQuery.match("hello", "body", 1.5f, Optional.of(1), 20, FullTextQuery.Operator.AND, 2);
+        assertEquals(
+            FullTextQuery.match("hello", "body", 3f, Optional.of(1), 20, FullTextQuery.Operator.AND, 2),
+            LanceFtsQueryBuilder.boosted(match, 2f, LanceFtsBoolQueryBuilder.NAME)
+        );
+        assertSame(match, LanceFtsQueryBuilder.boosted(match, 1f, LanceFtsBoolQueryBuilder.NAME));
+
+        FullTextQuery multi = FullTextQuery.multiMatch("hello", List.of("body", "title"), null, FullTextQuery.Operator.OR);
+        assertEquals(
+            FullTextQuery.multiMatch("hello", List.of("body", "title"), List.of(2f, 2f), FullTextQuery.Operator.OR),
+            LanceFtsQueryBuilder.boosted(multi, 2f, LanceFtsBoolQueryBuilder.NAME)
+        );
+        FullTextQuery weighted = FullTextQuery.multiMatch("hello", List.of("body", "title"), List.of(1f, 3f), FullTextQuery.Operator.OR);
+        assertEquals(
+            FullTextQuery.multiMatch("hello", List.of("body", "title"), List.of(2f, 6f), FullTextQuery.Operator.OR),
+            LanceFtsQueryBuilder.boosted(weighted, 2f, LanceFtsBoolQueryBuilder.NAME)
+        );
+
+        FullTextQuery phrase = FullTextQuery.phrase("hello lance", "body", 0);
+        Exception e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceFtsQueryBuilder.boosted(phrase, 2f, LanceFtsBoolQueryBuilder.NAME)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("[lance_fts_bool] boost [2.0]"));
+    }
+
+    public void testBoostRepresentableOnlyForMatchAndMultiMatchOrUnitBoost() {
+        assertTrue(LanceFtsQueryBuilder.boostRepresentable(new LanceMatchQueryBuilder("body", "hello").boost(2f)));
+        assertTrue(LanceFtsQueryBuilder.boostRepresentable(new LanceMultiMatchQueryBuilder(List.of("body"), "hello").boost(2f)));
+        assertTrue(LanceFtsQueryBuilder.boostRepresentable(new LanceMatchPhraseQueryBuilder("body", "hello lance")));
+        assertFalse(LanceFtsQueryBuilder.boostRepresentable(new LanceMatchPhraseQueryBuilder("body", "hello lance").boost(2f)));
+        assertFalse(
+            LanceFtsQueryBuilder.boostRepresentable(
+                new LanceFtsBoolQueryBuilder().must(new LanceMatchQueryBuilder("body", "hello")).boost(2f)
+            )
+        );
     }
 
     public void testStreamRoundTrip() throws Exception {

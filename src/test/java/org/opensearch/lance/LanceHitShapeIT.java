@@ -387,14 +387,28 @@ public class LanceHitShapeIT extends LanceRestTestCase {
             assertEquals(List.of("0-0", "0-2"), idsOf(hitsOf(ascendingBody)));
 
             // A lone descending _score builds no Lucene sort, and neither
-            // does an absent sort; both refuse the cursor.
+            // does an absent sort; both refuse the cursor. The absent
+            // sort is refused before planning with the stock message on
+            // both paths. The lone _score is a page in score order whose
+            // ties have no reproducible order, which the planner refuses
+            // for the rewritten match as it does for lance_match; the
+            // stock oracle keeps its own message.
             String reason = "Sort must contain at least one field.";
-            assertSameRefusalAsStockSearch(
-                indexName,
-                "{\"size\":2," + query + ",\"sort\":[\"_score\"],\"search_after\":[1.0]}",
-                400,
-                reason
+            String scoreCursor = "{\"size\":2," + query + ",\"sort\":[\"_score\"],\"search_after\":[1.0]}";
+            ConcurrentResult scoreCursorFragment = postForStatus("/" + indexName + "/_search", scoreCursor);
+            assertEquals(scoreCursorFragment.body(), 400, scoreCursorFragment.status());
+            assertTrue(
+                scoreCursorFragment.body(),
+                stringPath(scoreCursorFragment.body(), "error", "root_cause", "0", "reason").contains(
+                    "search_after requires TieStability [stable_key]"
+                )
             );
+            ConcurrentResult scoreCursorStock = postForStatus(
+                "/" + withStockOracle(indexName) + "/_search?allow_partial_search_results=false",
+                scoreCursor
+            );
+            assertEquals(scoreCursorStock.body(), 400, scoreCursorStock.status());
+            assertEquals(reason, stringPath(scoreCursorStock.body(), "error", "root_cause", "0", "reason"));
             assertSameRefusalAsStockSearch(indexName, "{\"size\":2," + query + ",\"search_after\":[1.0]}", 400, reason);
 
             // A cursor of the wrong length is refused with the shard

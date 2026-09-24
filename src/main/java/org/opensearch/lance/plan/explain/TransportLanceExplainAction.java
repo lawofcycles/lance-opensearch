@@ -19,6 +19,7 @@ import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.NativeMemoryLimit;
@@ -33,6 +34,7 @@ import org.opensearch.lance.plan.traits.UnmetPlanRequirementException;
 import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
+import org.opensearch.lance.plan.translate.StockTextQueryRewriter;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
@@ -57,7 +59,9 @@ import java.io.IOException;
  * answers 200 because it reports rather than executes. Every other body
  * takes the fragment route: the
  * query is rewritten with the shard free {@link QueryRewriteContext}
- * the coordinator applies ({@link RequestPlanner#rewriteAtCoordinator}),
+ * the coordinator applies ({@link RequestPlanner#rewriteAtCoordinator})
+ * and its stock full text clauses on {@code lance_text} fields become
+ * Lance FTS clauses as on the coordinator ({@link StockTextQueryRewriter}),
  * the {@link ExecutionShape} is built the way
  * the coordinator builds it, and {@link RequestPlanner#plan} runs with
  * the same {@link CostInputs} the coordinator would plan with (the
@@ -158,10 +162,9 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
             return LanceExplainResponse.unsupported(indexName, unsupported);
         }
         LanceOverrides overrides = LanceOverrides.of(metadata.getSettings());
-        QueryBuilder query = RequestPlanner.rewriteAtCoordinator(
-            indicesService,
-            source == null ? null : source.query(),
-            System.currentTimeMillis()
+        QueryBuilder query = StockTextQueryRewriter.rewrite(
+            RequestPlanner.rewriteAtCoordinator(indicesService, source == null ? null : source.query(), System.currentTimeMillis()),
+            LanceMappingMeta.lanceTextFields(metadata.mapping())
         );
         // The model reads the zone maps of the query's columns while it
         // holds the table, so the plan below prunes the same fragments

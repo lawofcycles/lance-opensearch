@@ -44,14 +44,14 @@ import org.opensearch.lance.mapper.LanceTextFieldMapper;
  * }
  * }</pre>
  *
- * <p>Why this exists as a separate DSL: OpenSearch's stock
- * {@code multi_match} query rewrites into a Lucene bool of per-field
- * term queries after analysing on the OpenSearch side, so — as with
- * {@code match} on {@code lance_text} — every token collapses to a
- * single term before Lance sees it. {@code lance_multi_match} hands
- * the raw text and column list straight to
- * {@link FullTextQuery#multiMatch}, which tokenises internally using
- * each column's FTS-index analyzer and scores across fields together.
+ * <p>This is the explicit form of OpenSearch's stock {@code multi_match}
+ * of type {@code best_fields} on {@code lance_text} fields: the
+ * coordinator rewrites such a {@code multi_match} into this builder with
+ * the same fields, per field boosts and operator before planning
+ * ({@code StockTextQueryRewriter}), so both spellings plan and score the
+ * same. Lance's {@link FullTextQuery#multiMatch} takes the best column's
+ * score, as {@code best_fields} does; the other stock types keep their
+ * stock form and Lucene composes one Lance match per field.
  *
  * <p>{@code fields} and {@code query} are required. {@code fields}
  * must reference {@code lance_text} columns whose Lance FTS index

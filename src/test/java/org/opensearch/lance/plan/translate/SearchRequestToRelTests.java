@@ -185,10 +185,53 @@ public class SearchRequestToRelTests extends OpenSearchTestCase {
     }
 
     public void testUnsupportedQueryTypeThrows() {
+        // A stock match the coordinator did not rewrite (the field is
+        // not lance_text) has no relational form.
         SearchSourceBuilder source = new SearchSourceBuilder().size(0)
             .query(QueryBuilders.matchQuery("body", "hello"))
             .aggregation(AggregationBuilders.sum("s").field("price"));
         assertEquals("query type [match]", messageOf(source));
+    }
+
+    public void testStockBoolOfMatchesRewritesAndFusesIntoOneFtsNode() {
+        // The coordinator's rewrite turns the stock clauses into the
+        // lance_* builders; the translator then fuses the several FTS
+        // clauses of the bool into one lance_fts_bool over the scalar
+        // filter, the plan one lance_fts_bool written by hand gets.
+        SearchSourceBuilder source = new SearchSourceBuilder().size(5)
+            .query(
+                StockTextQueryRewriter.rewrite(
+                    QueryBuilders.boolQuery()
+                        .must(QueryBuilders.matchQuery("body", "hello"))
+                        .must(QueryBuilders.matchPhraseQuery("body", "hello lance").slop(1))
+                        .should(QueryBuilders.matchQuery("body", "sunny").boost(2f))
+                        .mustNot(QueryBuilders.matchQuery("body", "stale"))
+                        .filter(QueryBuilders.rangeQuery("id").gte(4)),
+                    java.util.Set.of("body")
+                )
+            );
+        String plan = translate(source);
+        assertTrue(plan, plan.contains("LanceFtsMatch(kind=[FTS_BOOL], columns=[[body]], query=[{\"lance_fts_bool\":{"));
+        assertTrue(
+            plan,
+            plan.contains(
+                "\"must\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\",\"boost\":1.0}},"
+                    + "{\"lance_match_phrase\":{\"field\":\"body\",\"query\":\"hello lance\",\"slop\":1,\"boost\":1.0}}]"
+            )
+        );
+        assertTrue(plan, plan.contains("\"should\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"sunny\",\"boost\":2.0}}]"));
+        assertTrue(plan, plan.contains("\"must_not\":[{\"lance_match\":{\"field\":\"body\",\"query\":\"stale\",\"boost\":1.0}}]"));
+        assertTrue(plan, plan.contains("LogicalFilter(condition=[>=(CAST($0):BIGINT NOT NULL, 4)])"));
+    }
+
+    public void testStockMatchWithScoreSortTranslatesAfterTheRewrite() {
+        // A score sort is refused on a scalar query and accepted on a
+        // full text root; the rewritten stock match is such a root.
+        SearchSourceBuilder source = new SearchSourceBuilder().size(5)
+            .query(StockTextQueryRewriter.rewrite(QueryBuilders.matchQuery("body", "hello"), java.util.Set.of("body")))
+            .sort(new org.opensearch.search.sort.ScoreSortBuilder());
+        String plan = translate(source);
+        assertTrue(plan, plan.contains("LanceFtsMatch(kind=[MATCH], columns=[[body]]"));
     }
 
     public void testNonZeroSizeWithAggregationsThrows() {

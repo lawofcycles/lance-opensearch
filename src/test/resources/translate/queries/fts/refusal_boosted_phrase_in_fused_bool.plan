@@ -1,0 +1,1 @@
+error: boost on a [lance_match_phrase] clause inside a bool of several full text clauses

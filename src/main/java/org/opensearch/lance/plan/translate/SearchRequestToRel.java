@@ -60,10 +60,11 @@ import java.util.List;
  * {@link LanceKnnSearch} node for a Lance FTS clause
  * ({@code lance_match}, {@code lance_match_phrase},
  * {@code lance_multi_match}, {@code lance_fts_bool},
- * {@code lance_fts_boost}), a {@code bool} whose {@code must} is
- * exactly one such clause with scalar {@code filter} /
- * {@code must_not} companions, or a {@code lance_knn} (optionally with
- * its inner {@code filter}); over the root sit a
+ * {@code lance_fts_boost}), a {@code bool} whose {@code must} and
+ * {@code should} hold such clauses (fused into one
+ * {@code lance_fts_bool} when there are several) with scalar
+ * {@code filter} / {@code must_not} companions, or a {@code lance_knn}
+ * (optionally with its inner {@code filter}); over the root sit a
  * {@link org.opensearch.lance.plan.rel.LanceTopK} carrying the sort
  * collations, the page size and the {@code search_after} cursor, and a
  * {@link org.opensearch.lance.plan.rel.LanceHitShape} naming the hit
@@ -587,10 +588,11 @@ public final class SearchRequestToRel {
 
     /**
      * A top-level query clause the planner represents as its own node:
-     * one Lance FTS clause with the scalar clauses of its enclosing
-     * {@code bool} (null when the clause stands alone), or a
-     * {@code lance_knn} whose inner filter travels as the {@code Filter}
-     * input.
+     * one Lance FTS clause (a single DSL clause, or the
+     * {@code lance_fts_bool} the FTS clauses of a stock {@code bool}
+     * fuse into) with the scalar clauses of its enclosing {@code bool}
+     * (null when the clause stands alone), or a {@code lance_knn} whose
+     * inner filter travels as the {@code Filter} input.
      */
     private sealed interface LanceShape permits FtsShape, KnnShape {}
 
@@ -604,13 +606,31 @@ public final class SearchRequestToRel {
      * Detects the supported full text and knn shapes at the top of the
      * query clause: a bare Lance FTS clause, {@code lance_knn}
      * (optionally with its inner {@code filter}), or a {@code bool}
-     * whose {@code must} is exactly one FTS clause and whose
-     * {@code filter} / {@code must_not} hold no further FTS or knn
-     * clause. Returns null for a query without any Lance FTS or knn
-     * clause (the scalar path translates it); every other combination
-     * (an FTS as a {@code should} clause, an FTS next to other
-     * {@code must} clauses, an FTS or knn below {@code filter} /
-     * {@code must_not}, a knn inside a {@code bool}) throws
+     * holding Lance FTS clauses. Returns null for a query without any
+     * Lance FTS or knn clause (the scalar path translates it).
+     *
+     * <p>A {@code bool} is accepted when its {@code must} and
+     * {@code should} lists hold FTS clauses only, its {@code filter}
+     * holds scalar clauses only, and its {@code must_not} holds any mix
+     * of the two; it needs at least one {@code must} or {@code should}
+     * clause, no {@code minimum_should_match} and a boost of 1. The FTS
+     * clauses fuse into one {@link LanceFtsBoolQueryBuilder} with the
+     * same occurrences, which Lance scores as Lucene's
+     * {@code BooleanQuery} would: required clauses intersect and add
+     * their scores, optional clauses add theirs when they match,
+     * prohibited clauses exclude. Two Lucene rules bound the fuse. A
+     * {@code should} next to a {@code filter} without a {@code must} is
+     * optional in Lucene (the filter alone selects the rows) but
+     * required in Lance's boolean, so that shape is refused. A clause
+     * boost travels inside the Lance tree only on a match or multi
+     * match ({@link LanceFtsQueryBuilder#boostRepresentable}), so a
+     * boosted phrase or nested boolean refuses the fuse. A single FTS
+     * clause in {@code must}, or alone in {@code should} without a
+     * filter, stays that clause. The scalar {@code filter} and
+     * {@code must_not} clauses become the shape's filter. Every other
+     * combination (a scalar clause in {@code must} or {@code should}, an
+     * FTS clause below {@code filter}, a knn inside a {@code bool}, an
+     * FTS clause nested below the top level of a list) throws
      * {@link UnsupportedOperationException} naming the shape, keeping
      * the contract that those combinations do not push into the Lance
      * scan.
@@ -631,37 +651,35 @@ public final class SearchRequestToRel {
         if (!containsLanceClause(bool)) {
             return null;
         }
-        for (QueryBuilder clause : bool.should()) {
-            if (containsLanceClause(clause)) {
-                throw unsupported("full text or knn clause in [should]");
-            }
-        }
         for (QueryBuilder clause : bool.filter()) {
             if (containsLanceClause(clause)) {
                 throw unsupported("full text or knn clause in [filter]");
             }
         }
+        List<QueryBuilder> ftsMust = ftsClausesOf(bool.must(), "must");
+        List<QueryBuilder> ftsShould = ftsClausesOf(bool.should(), "should");
+        List<QueryBuilder> ftsMustNot = new ArrayList<>();
+        List<QueryBuilder> scalarMustNot = new ArrayList<>();
         for (QueryBuilder clause : bool.mustNot()) {
-            if (containsLanceClause(clause)) {
-                throw unsupported("full text or knn clause in [must_not]");
-            }
-        }
-        List<QueryBuilder> ftsMust = new ArrayList<>();
-        for (QueryBuilder clause : bool.must()) {
             if (clause instanceof LanceKnnQueryBuilder) {
                 throw unsupported("knn clause inside [bool]");
             }
             if (clause instanceof LanceFtsQueryBuilder) {
-                ftsMust.add(clause);
+                ftsMustNot.add(clause);
             } else if (containsLanceClause(clause)) {
-                throw unsupported("full text or knn clause below the top level of [must]");
+                throw unsupported("full text or knn clause below the top level of [must_not]");
+            } else {
+                scalarMustNot.add(clause);
             }
         }
-        if (ftsMust.size() > 1) {
-            throw unsupported("[must] with more than one full text clause");
+        if (ftsMust.isEmpty() && ftsShould.isEmpty()) {
+            throw unsupported("full text clause in [must_not] without a [must] or [should] full text clause");
         }
-        if (ftsMust.size() != 1 || bool.must().size() != 1) {
-            throw unsupported("[must] mixing a full text clause with other clauses");
+        if (ftsMust.isEmpty() && !bool.filter().isEmpty()) {
+            // Lucene requires one should clause only when no must or
+            // filter clause is present; the filter would make the FTS
+            // clauses optional, which Lance's boolean cannot express.
+            throw unsupported("full text clause in [should] next to [filter] without a [must] clause");
         }
         if (bool.minimumShouldMatch() != null) {
             throw unsupported("minimum_should_match on a bool holding a full text clause");
@@ -669,17 +687,77 @@ public final class SearchRequestToRel {
         if (bool.boost() != 1.0f) {
             throw unsupported("boost on a bool holding a full text clause");
         }
+        QueryBuilder ftsClause;
+        if (ftsMust.size() == 1 && ftsShould.isEmpty() && ftsMustNot.isEmpty()) {
+            ftsClause = ftsMust.get(0);
+        } else if (ftsMust.isEmpty() && ftsShould.size() == 1 && ftsMustNot.isEmpty()) {
+            ftsClause = ftsShould.get(0);
+        } else {
+            ftsClause = fuse(ftsMust, ftsShould, ftsMustNot);
+        }
         BoolQueryBuilder scalar = null;
-        if (!bool.filter().isEmpty() || !bool.mustNot().isEmpty()) {
+        if (!bool.filter().isEmpty() || !scalarMustNot.isEmpty()) {
             scalar = new BoolQueryBuilder();
             for (QueryBuilder clause : bool.filter()) {
                 scalar.filter(clause);
             }
-            for (QueryBuilder clause : bool.mustNot()) {
+            for (QueryBuilder clause : scalarMustNot) {
                 scalar.mustNot(clause);
             }
         }
-        return new FtsShape(ftsMust.get(0), scalar);
+        return new FtsShape(ftsClause, scalar);
+    }
+
+    /**
+     * The clauses of a {@code must} or {@code should} list, which must
+     * all be Lance FTS clauses: a knn, a nested FTS or a scalar clause
+     * next to an FTS clause refuses the shape.
+     */
+    private static List<QueryBuilder> ftsClausesOf(List<QueryBuilder> clauses, String occur) {
+        List<QueryBuilder> fts = new ArrayList<>();
+        List<QueryBuilder> other = new ArrayList<>();
+        for (QueryBuilder clause : clauses) {
+            if (clause instanceof LanceKnnQueryBuilder) {
+                throw unsupported("knn clause inside [bool]");
+            }
+            if (clause instanceof LanceFtsQueryBuilder) {
+                fts.add(clause);
+            } else if (containsLanceClause(clause)) {
+                throw unsupported("full text or knn clause below the top level of [" + occur + "]");
+            } else {
+                other.add(clause);
+            }
+        }
+        if (!fts.isEmpty() && !other.isEmpty()) {
+            throw unsupported("[" + occur + "] mixing a full text clause with other clauses");
+        }
+        return fts;
+    }
+
+    /**
+     * One {@code lance_fts_bool} holding the FTS clauses of a stock
+     * {@code bool} under their occurrences. A clause whose boost Lance
+     * cannot carry refuses the fuse.
+     */
+    private static LanceFtsBoolQueryBuilder fuse(List<QueryBuilder> must, List<QueryBuilder> should, List<QueryBuilder> mustNot) {
+        LanceFtsBoolQueryBuilder fused = new LanceFtsBoolQueryBuilder();
+        for (QueryBuilder clause : must) {
+            fused.must(fusable(clause));
+        }
+        for (QueryBuilder clause : should) {
+            fused.should(fusable(clause));
+        }
+        for (QueryBuilder clause : mustNot) {
+            fused.mustNot(fusable(clause));
+        }
+        return fused;
+    }
+
+    private static QueryBuilder fusable(QueryBuilder clause) {
+        if (!LanceFtsQueryBuilder.boostRepresentable(clause)) {
+            throw unsupported("boost on a [" + clause.getWriteableName() + "] clause inside a bool of several full text clauses");
+        }
+        return clause;
     }
 
     /** Whether {@code query} is, or (through {@code bool} nesting) contains, a Lance FTS or knn clause. */

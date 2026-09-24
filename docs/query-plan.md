@@ -104,8 +104,11 @@ only. In the `physical` text a logical operator the planner kept (a tree it coul
 prints the same way, without the three terms. The request's `query` clause plans as a filter over the scan; a query filter under an aggregation the
 pushdown computes folds into one pushed aggregate whose `filter=` names the Lance SQL the scan
 evaluates; a top level Lance FTS clause (`lance_match`, `lance_match_phrase`, `lance_multi_match`,
-`lance_fts_bool`, `lance_fts_boost`, alone or as the single `must` of a `bool` with scalar
-`filter` / `must_not` companions) and a top level `lance_knn` (optionally with its inner `filter`)
+`lance_fts_bool`, `lance_fts_boost`, or a stock `match` / `match_phrase` / `multi_match` on a
+`lance_text` field, which the coordinator rewrites to the matching `lance_*` clause before planning;
+alone, or inside a `bool` whose `must` and `should` hold full text clauses only, fused into one
+`lance_fts_bool` when there are several, with scalar `filter` / `must_not` companions) and a top level
+`lance_knn` (optionally with its inner `filter`)
 plan as their own logical nodes and show on the scan as pushed `fts` / `knn` operations carrying
 every parameter and the filter's SQL. Do not parse the text; its shape will keep changing as the
 planner grows.
@@ -131,9 +134,10 @@ downgraded it, and how many fragments it skipped. The field is absent when the p
 (below).
 
 `unplanned` names the request element that kept the envelope, or the whole query, on the Lucene
-side: the translator's message for the first element it could not spell (`query type [match]`,
-`sort type [_geo_distance]`, `aggregation type [top_hits]`, `column [body] behind aggregation
-field [body] is not numeric`), or the structural reason (`size [5] (only 0 with aggregations)`,
+side: the translator's message for the first element it could not spell (`query type [match]` for
+a `match` on a field that is not `lance_text`, `full text clause in [should] next to [filter]
+without a [must] clause`, `sort type [_geo_distance]`, `aggregation type [top_hits]`, `column
+[body] behind aggregation field [body] is not numeric`), or the structural reason (`size [5] (only 0 with aggregations)`,
 `aggregations with a post_filter`, `pipeline aggregation`, `min_score or terminate_after (applied
 by the Lucene collectors)`). It is absent when everything translated, including when the cost
 model chose the Lucene operator for a tree that did translate. When no plan meets the request's

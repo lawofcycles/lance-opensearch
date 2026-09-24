@@ -6,13 +6,20 @@
 package org.opensearch.lance.mapper;
 
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
+import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.tests.analysis.CannedTokenStream;
+import org.apache.lucene.tests.analysis.Token;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.RegExp;
 import org.lance.ipc.FullTextQuery;
+import org.opensearch.common.lucene.Lucene;
+import org.opensearch.common.unit.Fuzziness;
+import org.opensearch.index.mapper.TextSearchInfo;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.test.OpenSearchTestCase;
@@ -57,6 +64,80 @@ public class LanceTextFieldMapperTests extends OpenSearchTestCase {
         // type has to decode it before passing the string on to Lance.
         Query query = fieldType(null).termQuery(new BytesRef("phone"), null);
         assertEquals(new LanceFtsQuery("body", "phone"), query);
+    }
+
+    public void testSearchAnalyzerIsKeywordAndQuoteAnalyzerSplitsOnWhitespace() {
+        // A stock match hands the whole text to termQuery (core short
+        // circuits on the keyword analyzer); a stock match_phrase of
+        // several words goes through the quote analyzer's tokens and
+        // reaches phraseQuery, which core only calls on a field that
+        // declares positions.
+        TextSearchInfo info = fieldType(null).getTextSearchInfo();
+        assertSame(Lucene.KEYWORD_ANALYZER, info.getSearchAnalyzer());
+        assertSame(Lucene.WHITESPACE_ANALYZER, info.getSearchQuoteAnalyzer());
+        assertTrue("phrase parsing needs positions", info.hasPositions());
+    }
+
+    public void testPhraseQueryJoinsTheStreamTermsIntoOneLancePhrase() throws Exception {
+        try (TokenStream stream = Lucene.WHITESPACE_ANALYZER.tokenStream("body", "hello  lance")) {
+            Query query = fieldType(null).phraseQuery(stream, 1, true, null);
+            assertEquals(new LanceFtsQuery(FullTextQuery.phrase("hello lance", "body", 1), Set.of("body")), query);
+        }
+    }
+
+    public void testPhraseQueryTargetsTheTokensColumn() throws Exception {
+        try (TokenStream stream = Lucene.WHITESPACE_ANALYZER.tokenStream("body", "hello lance")) {
+            Query query = fieldType("body_tokens").phraseQuery(stream, 0, true, null);
+            assertEquals(new LanceFtsQuery(FullTextQuery.phrase("hello lance", "body_tokens", 0), Set.of("body")), query);
+        }
+    }
+
+    public void testMultiPhraseQueryWithOneTermPerPositionIsAPlainPhrase() throws Exception {
+        try (TokenStream stream = Lucene.WHITESPACE_ANALYZER.tokenStream("body", "quick fox")) {
+            Query query = fieldType(null).multiPhraseQuery(stream, 2, true, null);
+            assertEquals(new LanceFtsQuery(FullTextQuery.phrase("quick fox", "body", 2), Set.of("body")), query);
+        }
+    }
+
+    public void testMultiPhraseQueryRejectsStackedTerms() throws Exception {
+        // Two terms at one position (a synonym graph): Lance's phrase
+        // query takes one term per position, so the field refuses.
+        try (
+            TokenStream stream = new CannedTokenStream(new Token("quick", 1, 0, 5), new Token("fast", 0, 0, 5), new Token("fox", 1, 6, 9))
+        ) {
+            Exception e = expectThrows(IllegalArgumentException.class, () -> fieldType(null).multiPhraseQuery(stream, 0, true, null));
+            assertTrue(e.getMessage(), e.getMessage().contains("one term per position"));
+        }
+    }
+
+    public void testFuzzyQueryBecomesALanceMatchWithTheEditDistance() {
+        Query query = fieldType(null).fuzzyQuery("helo", Fuzziness.ONE, 2, 30, true, null, null);
+        FullTextQuery expected = FullTextQuery.match("helo", "body", 1f, Optional.of(1), 30, FullTextQuery.Operator.OR, 2);
+        assertEquals(new LanceFtsQuery(expected, Set.of("body")), query);
+    }
+
+    public void testFuzzyDistanceResolvesAutoOnTheWholeText() {
+        assertEquals(0, LanceTextFieldMapper.LanceTextFieldType.fuzzyDistance(Fuzziness.AUTO, "ab"));
+        assertEquals(1, LanceTextFieldMapper.LanceTextFieldType.fuzzyDistance(Fuzziness.AUTO, "helo"));
+        assertEquals(2, LanceTextFieldMapper.LanceTextFieldType.fuzzyDistance(Fuzziness.AUTO, "hello lance"));
+        assertEquals(2, LanceTextFieldMapper.LanceTextFieldType.fuzzyDistance(Fuzziness.TWO, "ab"));
+    }
+
+    public void testPhraseAndFuzzyQueriesRejectDroppedField() throws Exception {
+        LanceTextFieldMapper.LanceTextFieldType dropped = new LanceTextFieldMapper.LanceTextFieldType(
+            "body",
+            null,
+            Map.of("lance_dropped", "true")
+        );
+        try (TokenStream stream = Lucene.WHITESPACE_ANALYZER.tokenStream("body", "hello lance")) {
+            Exception phrase = expectThrows(IllegalArgumentException.class, () -> dropped.phraseQuery(stream, 0, true, null));
+            assertTrue(phrase.getMessage(), phrase.getMessage().contains("no longer exists"));
+        }
+        Exception fuzzy = expectThrows(
+            IllegalArgumentException.class,
+            () -> dropped.fuzzyQuery("helo", Fuzziness.ONE, 0, 50, true, null, null)
+        );
+        assertTrue(fuzzy.getMessage(), fuzzy.getMessage().contains("no longer exists"));
     }
 
     public void testExistsQueryMatchesAllDocs() {

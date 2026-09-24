@@ -7,11 +7,18 @@ package org.opensearch.lance.query;
 
 import org.lance.ipc.FullTextQuery;
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.common.unit.Fuzziness;
 import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.query.Operator;
+import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryBuilders;
+import org.opensearch.lance.plan.translate.StockTextQueryRewriter;
 import org.opensearch.test.OpenSearchTestCase;
+
+import java.util.Set;
 
 public class LanceMatchQueryBuilderTests extends OpenSearchTestCase {
 
@@ -30,6 +37,27 @@ public class LanceMatchQueryBuilderTests extends OpenSearchTestCase {
                 assertEquals(20, copy.maxExpansions());
             }
         }
+    }
+
+    public void testStockMatchOnALanceTextFieldRewritesToTheSameBuilder() {
+        // The coordinator rewrites a stock match on a lance_text field
+        // into this builder before planning, so the two spellings plan
+        // the same FTS node and the executor builds the same Lance query.
+        LanceMatchQueryBuilder explicit = new LanceMatchQueryBuilder("body", "hello quick").operator(FullTextQuery.Operator.AND)
+            .fuzziness(1)
+            .prefixLength(1)
+            .maxExpansions(10);
+        explicit.boost(2f).queryName("stock");
+        QueryBuilder stock = QueryBuilders.matchQuery("body", "hello quick")
+            .operator(Operator.AND)
+            .fuzziness(Fuzziness.ONE)
+            .prefixLength(1)
+            .maxExpansions(10)
+            .boost(2f)
+            .queryName("stock");
+        QueryBuilder rewritten = StockTextQueryRewriter.rewrite(stock, Set.of("body"));
+        assertEquals(explicit, rewritten);
+        assertEquals(explicit.hashCode(), rewritten.hashCode());
     }
 
     public void testStreamRoundTripWithoutFuzziness() throws Exception {
