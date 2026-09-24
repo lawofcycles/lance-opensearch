@@ -12,6 +12,7 @@ import java.util.List;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.lance.WireVersion;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.aggregations.InternalAggregations;
 
@@ -64,8 +65,15 @@ import org.opensearch.search.aggregations.InternalAggregations;
  * Writeable} — the transport layer serialises the whole list in
  * one call and the coordinator rebuilds hits without any per-hit
  * conversion.
+ *
+ * <p>The response opens with {@link #WIRE_VERSION} (see
+ * {@link WireVersion}), so a coordinator of another plugin version
+ * refuses it by name before reading a field.
  */
 public final class LanceFragmentQueryResponse extends ActionResponse {
+
+    /** The wire format's version, the first field the response writes. */
+    public static final int WIRE_VERSION = 1;
 
     private final long matched;
     private final boolean matchedIsLowerBound;
@@ -117,6 +125,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
 
     public LanceFragmentQueryResponse(StreamInput in) throws IOException {
         super(in);
+        WireVersion.read(in, "LanceFragmentQueryResponse", WIRE_VERSION);
         this.matched = in.readVLong();
         this.matchedIsLowerBound = in.readBoolean();
         this.fragmentCount = in.readVInt();
@@ -136,6 +145,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
+        WireVersion.write(out, WIRE_VERSION);
         out.writeVLong(matched);
         out.writeBoolean(matchedIsLowerBound);
         out.writeVInt(fragmentCount);

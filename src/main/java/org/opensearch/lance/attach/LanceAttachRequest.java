@@ -16,6 +16,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.WireVersion;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.Task;
 
@@ -26,9 +27,13 @@ import org.opensearch.tasks.Task;
  * <p>A {@link ClusterManagerNodeRequest} so the transport action can
  * forward it to the elected cluster manager; the inherited
  * {@code clusterManagerNodeTimeout} bounds how long the node that
- * received the REST call waits for a manager to be known.
+ * received the REST call waits for a manager to be known. Opens with
+ * {@link #WIRE_VERSION} (see {@link WireVersion}).
  */
 public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAttachRequest> {
+
+    /** The wire format's version, the first field the request writes after its base class. */
+    public static final int WIRE_VERSION = 1;
 
     private final String table;
     private final String indexName;
@@ -106,6 +111,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
 
     public LanceAttachRequest(StreamInput in) throws IOException {
         super(in);
+        WireVersion.read(in, "LanceAttachRequest", WIRE_VERSION);
         this.table = in.readString();
         this.indexName = in.readOptionalString();
         this.pinnedVersion = in.readOptionalLong();
@@ -123,6 +129,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
+        WireVersion.write(out, WIRE_VERSION);
         out.writeString(table);
         out.writeOptionalString(indexName);
         out.writeOptionalLong(pinnedVersion);

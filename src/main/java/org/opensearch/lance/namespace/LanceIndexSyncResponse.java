@@ -12,6 +12,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.xcontent.ToXContentObject;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.lance.WireVersion;
 
 /**
  * Response for {@link LanceIndexSyncAction}: the
@@ -19,9 +20,12 @@ import org.opensearch.core.xcontent.XContentBuilder;
  * {@code {"index", "checked", "reason"?, "moved", "served_version",
  * "target_version", "mapping_changed", "rebuilt"}}; {@code reason} is
  * present only when the index was not checked (it is pinned to a
- * version).
+ * version). Opens with {@link #WIRE_VERSION} (see {@link WireVersion}).
  */
 public final class LanceIndexSyncResponse extends ActionResponse implements ToXContentObject {
+
+    /** The wire format's version, the first field the response writes. */
+    public static final int WIRE_VERSION = 1;
 
     private final LanceIndexFreshnessService.Outcome outcome;
 
@@ -31,6 +35,7 @@ public final class LanceIndexSyncResponse extends ActionResponse implements ToXC
 
     public LanceIndexSyncResponse(StreamInput in) throws IOException {
         super(in);
+        WireVersion.read(in, "LanceIndexSyncResponse", WIRE_VERSION);
         this.outcome = new LanceIndexFreshnessService.Outcome(
             in.readString(),
             in.readBoolean(),
@@ -45,6 +50,7 @@ public final class LanceIndexSyncResponse extends ActionResponse implements ToXC
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
+        WireVersion.write(out, WIRE_VERSION);
         out.writeString(outcome.index());
         out.writeBoolean(outcome.checked());
         out.writeOptionalString(outcome.reason());

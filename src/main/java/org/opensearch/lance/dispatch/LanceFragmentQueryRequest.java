@@ -20,6 +20,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.WireVersion;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.collapse.CollapseBuilder;
@@ -74,9 +75,14 @@ import org.opensearch.tasks.Task;
  * Lucene side (aggregator construction, collectors, the fetch phase)
  * needs them whatever the plan says. The wire format is internal to the
  * plugin: every node runs the same plugin version, a mixed version
- * cluster is not supported.
+ * cluster is not supported. The request opens with {@link #WIRE_VERSION}
+ * (see {@link WireVersion}), so an executor of another plugin version
+ * refuses it by name before reading a field.
  */
 public final class LanceFragmentQueryRequest extends ActionRequest {
+
+    /** The wire format's version, the first field the request writes after its base class. */
+    public static final int WIRE_VERSION = 1;
 
     private final String tableUri;
     private final String indexName;
@@ -292,6 +298,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
 
     public LanceFragmentQueryRequest(StreamInput in) throws IOException {
         super(in);
+        WireVersion.read(in, "LanceFragmentQueryRequest", WIRE_VERSION);
         this.tableUri = in.readString();
         this.indexName = in.readString();
         this.storageOptions = StorageOptions.readFromStream(in);
@@ -343,6 +350,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
+        WireVersion.write(out, WIRE_VERSION);
         out.writeString(tableUri);
         out.writeString(indexName);
         storageOptions.writeTo(out);

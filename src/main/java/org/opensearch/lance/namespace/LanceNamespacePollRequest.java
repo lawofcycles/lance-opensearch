@@ -12,14 +12,19 @@ import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.lance.WireVersion;
 
 /**
  * Request for {@link LanceNamespacePollAction}: run one catalog listing
  * cycle on the cluster manager, over every registration or over the one
  * {@link #name()} identifies (a registration name, or a directory
- * registration's path).
+ * registration's path). Opens with {@link #WIRE_VERSION} (see
+ * {@link WireVersion}).
  */
 public final class LanceNamespacePollRequest extends ClusterManagerNodeRequest<LanceNamespacePollRequest> {
+
+    /** The wire format's version, the first field the request writes after its base class. */
+    public static final int WIRE_VERSION = 1;
 
     private final String name;
 
@@ -33,12 +38,14 @@ public final class LanceNamespacePollRequest extends ClusterManagerNodeRequest<L
 
     public LanceNamespacePollRequest(StreamInput in) throws IOException {
         super(in);
+        WireVersion.read(in, "LanceNamespacePollRequest", WIRE_VERSION);
         this.name = in.readOptionalString();
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
+        WireVersion.write(out, WIRE_VERSION);
         out.writeOptionalString(name);
     }
 

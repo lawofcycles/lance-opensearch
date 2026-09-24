@@ -15,14 +15,19 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.xcontent.ToXContentObject;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.lance.WireVersion;
 
 /**
  * Response for {@link LanceNamespacePollAction}: the cycle's
  * {@link LanceNamespaceService.PollReport}. Rendered as
  * {@code {"surfaced": [index, ...], "skipped": [{"namespace", "table",
  * "index", "reason"}, ...], "unavailable": {"name": "error", ...}}}.
+ * Opens with {@link #WIRE_VERSION} (see {@link WireVersion}).
  */
 public final class LanceNamespacePollResponse extends ActionResponse implements ToXContentObject {
+
+    /** The wire format's version, the first field the response writes. */
+    public static final int WIRE_VERSION = 1;
 
     private final LanceNamespaceService.PollReport report;
 
@@ -32,6 +37,7 @@ public final class LanceNamespacePollResponse extends ActionResponse implements 
 
     public LanceNamespacePollResponse(StreamInput in) throws IOException {
         super(in);
+        WireVersion.read(in, "LanceNamespacePollResponse", WIRE_VERSION);
         List<String> surfaced = in.readStringList();
         int skippedCount = in.readVInt();
         List<LanceNamespaceService.PollReport.SkippedTable> skipped = new ArrayList<>(skippedCount);
@@ -51,6 +57,7 @@ public final class LanceNamespacePollResponse extends ActionResponse implements 
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
+        WireVersion.write(out, WIRE_VERSION);
         out.writeStringCollection(report.surfaced());
         out.writeVInt(report.skipped().size());
         for (LanceNamespaceService.PollReport.SkippedTable skipped : report.skipped()) {

@@ -10,6 +10,7 @@ import java.io.IOException;
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.lance.WireVersion;
 
 /**
  * Transport response for
@@ -21,9 +22,14 @@ import org.opensearch.core.common.io.stream.StreamOutput;
  * surface a 404 for {@code DELETE} on an unknown namespace without
  * hitting the local cluster-state cache — the cache on a follower may
  * lag a recent register from another node, so a decision made from
- * local state alone would be racy.
+ * local state alone would be racy. Opens, after the acknowledged bit
+ * the base class writes, with {@link #WIRE_VERSION} (see
+ * {@link WireVersion}).
  */
 public final class LanceNamespaceUpdateResponse extends AcknowledgedResponse {
+
+    /** The wire format's version, the first field the response writes after its base class. */
+    public static final int WIRE_VERSION = 1;
 
     private final boolean changed;
 
@@ -34,12 +40,14 @@ public final class LanceNamespaceUpdateResponse extends AcknowledgedResponse {
 
     public LanceNamespaceUpdateResponse(StreamInput in) throws IOException {
         super(in);
+        WireVersion.read(in, "LanceNamespaceUpdateResponse", WIRE_VERSION);
         this.changed = in.readBoolean();
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
+        WireVersion.write(out, WIRE_VERSION);
         out.writeBoolean(changed);
     }
 
