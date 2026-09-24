@@ -1267,14 +1267,31 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"prefix\":{\"category\":\"c\"}}}}",
                 "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"script\":{\"script\":{\"source\":\"doc['id'].value % 2 == 0\"}}}}}",
                 "\"size\":0,\"aggs\":{\"w\":{\"weighted_avg\":{\"value\":{\"field\":\"rating\"},\"weight\":{\"field\":\"id\"}}}}",
-                "\"size\":0,\"aggs\":{\"m\":{\"median_absolute_deviation\":{\"field\":\"rating\"}}}",
                 "\"size\":0,\"aggs\":{\"a\":{\"adjacency_matrix\":{\"filters\":{\"x\":{\"term\":{\"flag\":true}},\"y\":{\"term\":{\"category\":\"c0\"}}}}}}",
                 "\"size\":2,\"query\":{\"term\":{\"category\":\"c1\"}},\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"category\"},{\"field\":\"flag\"}]}}}" };
             long before = fragmentRequestsExecuted();
             for (String shape : shapes) {
                 assertStockSearchAgrees(index, shape);
             }
-            assertEquals("every shape ran on the fragment path", before + shapes.length, fragmentRequestsExecuted());
+            // median_absolute_deviation is a TDigest sketch, and the
+            // oracle target reduces one more (empty) shard's digest, which
+            // moves the interpolated quantile within the sketch's error;
+            // it is compared with a tolerance instead of byte for byte.
+            String mad = "\"size\":0,\"aggs\":{\"m\":{\"median_absolute_deviation\":{\"field\":\"rating\"}}}";
+            double madFragment = extractDoublePath(
+                readAll(postJson("/" + index + "/_search", "{" + mad + "}")),
+                "aggregations",
+                "m",
+                "value"
+            );
+            double madOracle = extractDoublePath(
+                readAll(postJson("/" + withStockOracle(index) + "/_search?request_cache=false", "{" + mad + "}")),
+                "aggregations",
+                "m",
+                "value"
+            );
+            assertEquals("median_absolute_deviation within the sketch tolerance", madOracle, madFragment, 0.01 * Math.abs(madOracle));
+            assertEquals("every shape ran on the fragment path", before + shapes.length + 1, fragmentRequestsExecuted());
 
             // Checks independent of the oracle: the multi terms buckets
             // (three categories by two flags) cover every row that has
@@ -1749,7 +1766,10 @@ public class LanceAggregationIT extends LanceRestTestCase {
      */
     private static void assertSameRefusalAsStockSearch(String index, String body, int status, String reason) throws IOException {
         ConcurrentResult fragmentPath = postForStatus("/" + index + "/_search", body);
-        ConcurrentResult shardPath = postForStatus("/" + withStockOracle(index) + "/_search", body);
+        // No partial results on the two shard oracle target: a refusal
+        // raised on the data bearing shard alone would otherwise leave
+        // the response at 200 next to the empty oracle shard.
+        ConcurrentResult shardPath = postForStatus("/" + withStockOracle(index) + "/_search?allow_partial_search_results=false", body);
         assertEquals(fragmentPath.body(), status, fragmentPath.status());
         assertEquals(shardPath.body(), status, shardPath.status());
         assertTrue(fragmentPath.body(), fragmentPath.body().contains(reason));

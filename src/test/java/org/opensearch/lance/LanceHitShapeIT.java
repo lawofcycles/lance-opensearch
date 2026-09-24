@@ -143,10 +143,18 @@ public class LanceHitShapeIT extends LanceRestTestCase {
         return (Map<String, Object>) parseJson(searchBody).get("hits");
     }
 
-    /** Assert that {@code body} is refused with {@code status} and a root cause reason of {@code reason} on both paths. */
+    /**
+     * Assert that {@code body} is refused with {@code status} and a root
+     * cause reason of {@code reason} on both paths. The oracle target
+     * carries an empty second shard whose fetch phase never runs, so a
+     * refusal raised per hit would leave that shard green and the
+     * response at 200 with a partial failure; asking for no partial
+     * results makes the one shard's refusal the request's answer, as it
+     * is on a single shard.
+     */
     private static void assertSameRefusalAsStockSearch(String indexName, String body, int status, String reason) throws IOException {
         ConcurrentResult fragmentPath = postForStatus("/" + indexName + "/_search", body);
-        ConcurrentResult shardPath = postForStatus("/" + withStockOracle(indexName) + "/_search", body);
+        ConcurrentResult shardPath = postForStatus("/" + withStockOracle(indexName) + "/_search?allow_partial_search_results=false", body);
         assertEquals(fragmentPath.body(), status, fragmentPath.status());
         assertEquals(shardPath.body(), status, shardPath.status());
         assertEquals(reason, stringPath(fragmentPath.body(), "error", "root_cause", "0", "reason"));
