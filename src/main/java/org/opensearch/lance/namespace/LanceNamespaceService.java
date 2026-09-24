@@ -280,7 +280,11 @@ public final class LanceNamespaceService {
      * PolarisNamespace and UnityNamespace only construct their HTTP
      * client without sending a request; GlueNamespace only builds the
      * AWS SDK client, whose credential providers resolve lazily on the
-     * first call.
+     * first call. Both the build (in {@link LanceNamespaceFactory#create})
+     * and every later call (in {@link LanceNamespaceHandle#call}) run
+     * inside {@code doPrivileged}, so the SDK's reads of the process
+     * user's {@code ~/.aws} files are judged against the plugin's own
+     * policy and not the server frames on this thread's stack.
      */
     private LanceNamespaceHandle ensureHandle(LanceNamespaceMetadata.Entry entry) {
         LanceNamespaceHandle cached = namespaceCache.get(entry.name());

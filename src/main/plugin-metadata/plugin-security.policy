@@ -29,6 +29,23 @@ grant {
   // own domain is consulted.
   permission java.io.FilePermission "/proc/meminfo", "read";
 
+  // The AWS SDK's default credential and region chain, which the Glue
+  // catalog client of a `glue` namespace registration falls back to when
+  // the registration's config carries no static keys, reads the shared
+  // credentials and config files of the OpenSearch process user
+  // (~/.aws/credentials, ~/.aws/config, and the files the
+  // AWS_SHARED_CREDENTIALS_FILE / AWS_CONFIG_FILE variables point at when
+  // they stay inside that directory) through Files.newInputStream. The
+  // core policy has no grant under the user's home. Read only; the
+  // reads happen inside the doPrivileged blocks of LanceNamespaceFactory
+  // (client construction) and LanceNamespaceHandle (every catalog call),
+  // so only the plugin's own jars are consulted. The Iceberg REST,
+  // Polaris and Unity clients read no local file.
+  // Written with a literal slash after ${user.home}: the agent's policy
+  // parser (org.opensearch.secure_sm.policy.PolicyFile) expands
+  // "${user.home}/" in a permission name and leaves "${/}" as is there.
+  permission java.io.FilePermission "${user.home}/.aws/-", "read";
+
   // Reflection. TransportLanceFragmentQueryAction and TransportLanceStatsAction
   // call the package private IndexService.getReaderWrapper through
   // getDeclaredMethod plus setAccessible; CoreAggregationResults opens a
