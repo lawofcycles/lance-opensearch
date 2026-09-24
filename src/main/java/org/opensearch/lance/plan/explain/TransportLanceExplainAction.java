@@ -38,7 +38,6 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
-import java.util.List;
 
 /**
  * Serves {@link LanceExplainAction} on the coordinating node: resolves

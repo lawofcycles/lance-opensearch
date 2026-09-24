@@ -260,7 +260,11 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
             try (StreamInput in = out.bytes().streamInput()) {
                 IOException refused = expectThrows(IOException.class, () -> new LanceExplainResponse(in));
                 assertEquals(
-                    "LanceExplainResponse wire version [2] does not match this node's [1]: every node must run the same plugin version",
+                    "LanceExplainResponse wire version ["
+                        + (LanceExplainResponse.WIRE_VERSION + 1)
+                        + "] does not match this node's ["
+                        + LanceExplainResponse.WIRE_VERSION
+                        + "]: every node must run the same plugin version",
                     refused.getMessage()
                 );
             }

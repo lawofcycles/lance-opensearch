@@ -77,8 +77,13 @@ import java.util.Objects;
  */
 public final class LanceExplainResponse extends ActionResponse implements ToXContentObject {
 
-    /** The wire format's version, the first field written and the first read. */
-    public static final int WIRE_VERSION = 1;
+    /**
+     * The wire format's version, the first field written and the first
+     * read. Bumped when a field is added, removed or retyped; 2 dropped
+     * the shard path reasons list and made the plan texts and the
+     * traits optional for the unsupported route.
+     */
+    public static final int WIRE_VERSION = 2;
 
     /** What happens to the request. */
     public enum Route {

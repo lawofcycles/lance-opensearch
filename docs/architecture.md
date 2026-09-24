@@ -55,7 +55,7 @@ flowchart TD
     end
     subgraph coord ["Coordinating node"]
         RE["REST layer"]
-        DF["Dispatch filter<br/>(fragment path vs shard path)"]
+        DF["Dispatch filter<br/>(Lance backed target, or not)"]
         PL["Calcite planner<br/>(push into Lance scan, or not)"]
         CO["Fragment coordinator<br/>(plan-driven fan-out and merge)"]
     end
@@ -101,11 +101,13 @@ between checks. `POST /_lance/namespace/_poll` and `POST /{index}/_lance/sync` r
 jobs on demand. [docs/design/namespace-freshness.md](design/namespace-freshness.md) records why
 the split is drawn there.
 
-The dispatch layer decides, per request, which of two routes answers a `_search`. The fragment
-path intercepts the request before OpenSearch's shard fan-out, distributes the table's fragments
-across the data nodes, and merges the per-node answers. The shard path is stock OpenSearch over a
-Lance-backed reader, kept as the correctness fallback for request shapes the fragment path does
-not serve.
+The dispatch layer intercepts every `_search` whose targets are all Lance backed before
+OpenSearch's shard fan-out and hands it to the fragment path, which distributes the table's
+fragments across the data nodes and merges the per-node answers. Every body over such a target
+takes that path; a body no plan answers (`suggest`, `highlight`) is refused at the coordinator
+with 400 naming the element. Only a target that mixes a Lance backed index with an ordinary one
+stays on OpenSearch's stock search action, which reads the Lance index through the shard engine's
+whole table reader.
 
 The query planner, built on Apache Calcite, decides once per request, on the coordinating node,
 how the work executes on every data node: folded into the Lance native scan, or run through
@@ -161,9 +163,9 @@ caches are node-scoped rather than per-shard), `LanceOverrides` and `StorageOpti
 forms of the attach body's mapping and credential clauses), and `LanceCircuitBreaker` (a breaker
 over the native memory Lance holds, which JVM heap accounting cannot see).
 
-`dispatch/` and `plan/` together are the search brain: dispatch decides fragment path versus
-shard path, the planner decides native versus Lucene execution. `engine/` is the muscle both
-routes share: one Lucene leaf reader per fragment, serving doc values, stored fields, terms and
+`dispatch/` and `plan/` together are the search brain: dispatch intercepts the search and drives
+the fan-out, the planner decides native versus Lucene execution and refuses what has no plan.
+`engine/` is the muscle the fragment path and the shard engine share: one Lucene leaf reader per fragment, serving doc values, stored fields, terms and
 points for every mapped column kind, plus the version-keyed snapshot cache that gives concurrent
 requests stable reads. `namespace/` keeps the index set and the mappings in step with the
 catalogs and tables behind them. `query/` is the DSL surface (`lance_match` and friends,
@@ -248,8 +250,8 @@ on the shard's node.
 ### Search: an aggregation
 
 Take `POST /demo/_search` with `size: 0` and a `terms` aggregation. Two decisions route it: the
-dispatch filter picks fragment path or shard path per request, and the planner picks native or
-Lucene execution per node.
+dispatch filter checks that every target is Lance backed, and the planner picks native or Lucene
+execution per node.
 
 ```mermaid
 sequenceDiagram
@@ -260,7 +262,7 @@ sequenceDiagram
     participant EX as Fragment executor (per data node)
     participant L as Lance
     C->>F: _search (size 0, terms agg)
-    F->>CO: dispatchable: fragment path
+    F->>CO: every target Lance backed: fragment path
     CO->>P: rewrite, translate, plan once per target
     alt aggregate folds into the scan
         P-->>CO: scan carrying the pushed aggregate
@@ -280,14 +282,12 @@ sequenceDiagram
     CO-->>C: SearchResponse (stock reduce)
 ```
 
-The dispatch filter checks that every target index is Lance-backed and the request shape is one
-the fragment executor answers correctly. That shape decision is itself a plan: the translator
-marks a body holding an element only the shard path serves (suggesters, highlighters, and the
-rest of the list in
-[limitations.md](limitations.md)) with a shard-path shape node naming each element as a reason,
-the planner lowers it to the shard-path convention's fallback operator, and a plan with that
-operator at its root proceeds unchanged onto the shard path. The coordinator never
-touches shards: fan-out and merge are plan operators, and a plan executor walks that plan to send
+The dispatch filter checks that every target index is Lance-backed; nothing about the body takes
+part in that decision. Whether a body has an answer is decided at plan time on the coordinator:
+the translator refuses a body carrying an element no plan answers (`suggest`, `highlight`, the
+list in [limitations.md](limitations.md)) with 400 naming the element, before the body is
+translated, and the explain endpoint reports the same body as `route: unsupported` with the same
+message. The coordinator never touches shards: fan-out and merge are plan operators, and a plan executor walks that plan to send
 one request per data node and reduce the answers with OpenSearch's stock reduction. A node needs
 no shard copy to take a share of the work — it builds its context from cluster state — which is
 what makes the fragment distribution independent of the shard allocation.
@@ -304,9 +304,11 @@ readers, so anything wrapper-sensitive must stay on the Lucene route) or a mappi
 aggregate does not resolve against move the aggregate to the aggregators there. The response is
 identical either way; only where the grouping happened differs.
 
-The shard path remains the third route: stock OpenSearch, one node reading the whole table
-through a Lance-backed directory reader. It exists for correctness on shapes the fragment path
-does not serve, never as a load-shedding target.
+There is no third route. Until every request shape ran on the fragment executors, a body they
+did not serve proceeded onto stock OpenSearch, one node reading the whole table through the Lance
+backed directory reader; that fallback is gone, and the executor decides at plan time whether a
+body has an answer. The directory reader itself stays for `GET /_doc/{id}`, `_stats` and a
+`_search` over a target that mixes a Lance backed index with an ordinary one.
 
 ### Search: hits
 
@@ -335,7 +337,7 @@ would have re-implemented a subset of Apache Calcite, so the plugin embeds Calci
 planner core, the relational algebra and the cost machinery — not its SQL parser, JDBC stack or
 code generation.
 
-Execution placement is modelled with three Calcite conventions. A convention marks where an
+Execution placement is modelled with two Calcite conventions. A convention marks where an
 operator runs, and converting between them is an explicit, costed step:
 
 - The Lance convention: work the native scan computes (pushed aggregates, filters, full text,
@@ -351,18 +353,15 @@ operator runs, and converting between them is an explicit, costed step:
   so callers see the scan itself), `FanOutExec` (one per node request per fragment group, run by
   the coordinator's plan executor as the transport fan-out) and `MergeExec` (the reduce of the per
   node answers, run by the plan executor as the merge reducer).
-- The shard-path convention: work answered by OpenSearch's regular shard search. Its single
-  operator, `ShardPathFallbackExec`, is produced by `PlanToShardPathRule` for a request whose body
-  holds an element only the shard path serves; the operator carries the reasons and its presence
-  at the plan root is what routes the request there, so the shard fallback is a plan the planner
-  produces rather than a shape checklist in the dispatch filter. The dispatch filter runs it by
-  forwarding the whole request to the stock `TransportSearchAction`.
+
+A body with no plan under either convention (`suggest`, `highlight`) is not a third convention:
+the translator refuses it before the Volcano run (`SearchRequestToRel.checkEnvelopeSupported`),
+the search endpoint answers 400 and the explain endpoint `route: unsupported`.
 
 ```mermaid
 flowchart LR
     subgraph logical ["Logical plan (from the request body)"]
         LT["query / aggregate / top-k /<br/>FTS / knn nodes over a table scan"]
-        SS["shard-path shape<br/>(reasons) over a table scan"]
     end
     subgraph lance ["Lance convention"]
         PS["scan carrying pushed operations"]
@@ -370,11 +369,9 @@ flowchart LR
     subgraph lucene ["Lucene convention"]
         LE["aggregate / top-k executed by<br/>Lucene machinery; fan-out and merge"]
     end
-    SP["shard-path convention:<br/>fallback operator"]
     LT -- "pushdown and fuse rules" --> PS
     LT -- "converter rules" --> LE
     PS -- "zero-cost handoff" --> LE
-    SS -- "shard-path rule" --> SP
 ```
 
 Translators turn the search body into a logical tree; pushdown rules fold what Lance can compute
@@ -401,8 +398,8 @@ extremes, value counts, stats or bucket counts; `APPROXIMATE` for an aggregate c
 pushed Lance scan and the Lucene aggregators compute as the same sketches, so both physical forms
 of such a tree declare the same value (`LanceAggregate.accuracy()`). `TieStability` says whether
 the order of rows that compare equal under the request's sort is reproducible between two calls:
-`STABLE_ROWADDR` for a bare scan, a page without a sort over a scalar query and the shard path
-fallback (Lance row address order, which is Lucene doc order over the whole table reader);
+`STABLE_ROWADDR` for a bare scan and a page without a sort over a scalar query (Lance row address
+order, which is Lucene doc order over the whole table reader);
 `STABLE_KEY` for a page ordered by a stored column, with or without a further tie breaker, on the
 pushed scan and on `HeapTopKExec` alike (`LanceTopK.tieStability()`); `UNSTABLE` for a page cut in
 score order out of a full text or knn scan, whose equal scores land in whatever order the
@@ -493,7 +490,7 @@ reads the statistics through `LanceTable.getStatistic()` (row count) and through
 defaults.
 
 Planning happens in two stages. Stage one runs on the coordinating node: the request's query is
-rewritten with the same shard-free rewrite the shard path applies, the whole body is translated
+rewritten with the same shard-free rewrite `TransportSearchAction` applies, the whole body is translated
 once through the same entry the explain endpoint uses, the Volcano run chooses the per node
 physical form, and that form is written down as a `FragmentPlan` (the Lance SQL of the scalar
 predicate, the full text or knn clause the executor builds its Lance query from, and the pushed
@@ -521,8 +518,8 @@ downgrade under `plan.refinements` by reason and, under `plan.executed`, how man
 node answered through the Lance scan and through Lucene. The per node plan is a wire format internal to the
 plugin: every node is assumed to run the same plugin version, the stream opens with a version
 marker a reader of another version refuses by name, nothing decodes an older marker, and a
-fragment request between nodes of different plugin versions fails rather than falling back to the
-shard path, so a rolling upgrade is not supported for the fragment path. The same marker opens
+fragment request between nodes of different plugin versions fails, so a rolling upgrade is not
+supported for the fragment path. The same marker opens
 every other plugin internal message that crosses nodes (the fragment request and response around
 the plan, the per node stats and build messages, the sync, poll, namespace update and attach
 messages), each with a `WIRE_VERSION` of its own written and checked through `WireVersion`;
@@ -531,8 +528,8 @@ messages), each with a `WIRE_VERSION` of its own written and checked through `Wi
 The planner was delivered in phases, and the later ones are still in flight: first the
 foundations (dependencies, schema, conventions, cost, the explain endpoint), then the aggregation
 route through the planner, then hits, full text and vector translation, then the Lucene
-convention operators with fan-out and merge as plan operators, then the shard-path fallback as a
-plan operator, then the cost model fitted to the measured aggregation shapes, then the two stage
+convention operators with fan-out and merge as plan operators, then the cost model fitted to the
+measured aggregation shapes, then the two stage
 planning that ships the per node plan from the coordinator and the node local refinement of the
 plan on column store warmth, then accuracy and tie-stability as planner traits a request can
 demand, then the traits and costs printed by the explain endpoint. The CHANGELOG tracks what has
@@ -635,7 +632,7 @@ node-visible surface (setting, endpoint, response field) without its line in `do
 In this repository:
 
 - [features.md](features.md) — what each surface does, by concern.
-- [limitations.md](limitations.md) — known gaps and shard-path fall-throughs.
+- [limitations.md](limitations.md) — known gaps and refused shapes.
 - [getting-started.md](getting-started.md) — end-to-end walkthrough.
 - [CHANGELOG.md](../CHANGELOG.md) — what has landed, release by release.
 - [design/namespace-freshness.md](design/namespace-freshness.md) — why freshness runs on the
