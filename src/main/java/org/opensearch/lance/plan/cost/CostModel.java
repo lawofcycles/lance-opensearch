@@ -5,6 +5,8 @@
 
 package org.opensearch.lance.plan.cost;
 
+import static org.opensearch.lance.plan.cost.CostCoefficients.FILTER_SQL_TIE_BREAK_MS;
+import static org.opensearch.lance.plan.cost.CostCoefficients.FILTER_WIRE_MS_PER_KB_PER_NODE;
 import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_CARDINALITY_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_COLUMN_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_COMPOSITE_SOURCE_MS_PER_MROW_THREAD;
@@ -35,6 +37,8 @@ import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_NUMERIC_KEY
 import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_PERCENTILES_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_RANGE_KEY_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_STRING_KEY_MS_PER_MROW_THREAD;
+
+import org.opensearch.lance.plan.rel.PushedOperation.PushedFilter;
 
 /**
  * Predicted latency in milliseconds of the two physical forms of an
@@ -135,6 +139,36 @@ public final class CostModel {
         millis += LUCENE_CARDINALITY_MS_PER_MROW_THREAD * aggregated * (shape.cardinality() ? 1 : 0);
         millis += LUCENE_LARGE_GROUPS_MS_PER_MROW_THREAD * aggregated * (shape.largeGroups() ? 1 : 0);
         millis += LUCENE_FILTER_EVAL_MS_PER_MROW_THREAD * mrowThread * (shape.filtered() ? 1 : 0);
+        return millis;
+    }
+
+    /**
+     * Predicted milliseconds a pushed filter's encoding adds to the scan
+     * that carries it, in both cost regimes: shipping the encoding to
+     * every data node inside the fragment request (a Substrait filter
+     * that also carries its SQL ships both), plus, on the SQL encoding,
+     * {@link CostCoefficients#FILTER_SQL_TIE_BREAK_MS}. Turning the
+     * encoding into the expression Lance plans is not a term: both
+     * encodings decode to the same DataFusion expression inside Lance
+     * and run through the same coercion, simplification and scalar index
+     * passes, and the measurements behind the tie break constant put
+     * the decode of either inside the noise of that planning. The
+     * evaluation of the predicate is likewise the same on either form.
+     *
+     * <p>The term is microseconds against the milliseconds of the rows
+     * terms, so it never decides between a pushed filter and a Lucene
+     * operator; it orders the two encodings of one predicate, which
+     * otherwise cost the same: the Substrait form wins until its extra
+     * bytes times the fan out outweigh the tie break, from where the
+     * shorter SQL ships instead.
+     */
+    public static double filterEncodingMillis(CostInputs inputs, PushedFilter filter) {
+        double sqlKb = filter.sql() == null ? 0.0 : filter.sql().length() / 1024.0;
+        double substraitKb = filter.substraitLength() / 1024.0;
+        double millis = FILTER_WIRE_MS_PER_KB_PER_NODE * (sqlKb + substraitKb) * inputs.nodes();
+        if (!filter.usesSubstrait()) {
+            millis += FILTER_SQL_TIE_BREAK_MS;
+        }
         return millis;
     }
 }

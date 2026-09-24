@@ -122,6 +122,36 @@ public final class CostCoefficients {
     /** Share of the rows Calcite assumes a group key of unknown cardinality has, its default aggregate estimate. */
     public static final double UNKNOWN_KEY_DISTINCT_SHARE = 0.1;
 
+    // ---- pushed filter encodings (see CostModel#filterEncodingMillis) ------
+
+    /**
+     * Shipping one KB of a plan's filter encoding to one data node
+     * inside the fragment request: a structural assumption of 1 GB/s
+     * transport throughput, not a measurement. The request's fixed
+     * transport cost is inside the fixed terms above; only the
+     * encoding's size varies between the two forms of a pushed filter,
+     * and a Substrait message runs three to twenty times the length of
+     * the SQL of the same predicate.
+     */
+    public static final double FILTER_WIRE_MS_PER_KB_PER_NODE = 0.001;
+    /**
+     * Charged to the SQL encoding of a pushed filter so that the
+     * Substrait encoding wins when the two otherwise cost the same,
+     * which the measurements say they do: on the build farm a count
+     * only scan of a small table planned a filter of 7 to 650
+     * characters in 0.6 to 2.4 ms over the unfiltered scan in either
+     * encoding, with the Substrait form 30 to 70 microseconds slower
+     * on the smallest predicates and inside the run to run noise on
+     * the larger ones, because Lance turns both into the same
+     * DataFusion expression and the planning of that expression is
+     * what costs. The constant is a preference for the encoding whose
+     * field references are positional and whose message is typed, not
+     * a measured difference; the wire term overtakes it once the
+     * Substrait bytes' excess over the SQL, times the fan out, passes
+     * 50 KB, so a very long term list on a wide cluster ships as SQL.
+     */
+    public static final double FILTER_SQL_TIE_BREAK_MS = 0.05;
+
     /** The fitted coefficients by name, for the tests that check them against the fit report. */
     public static Map<String, Double> fitted() {
         Map<String, Double> named = new LinkedHashMap<>();

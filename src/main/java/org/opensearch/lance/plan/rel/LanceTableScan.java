@@ -225,6 +225,22 @@ public class LanceTableScan extends TableScan implements LanceRel {
      * already pushed query kind or top-k.
      */
     public LanceTableScan withPushedFilter(RexNode condition, String sql) {
+        return withPushedFilter(condition, sql, null);
+    }
+
+    /**
+     * The same scan with {@code condition} pushed as its filter in the
+     * encoding the executor evaluates: the Substrait {@code bytes} for
+     * {@code ScanOptions.substraitFilter} when non null (with
+     * {@code sql}, when non null, travelling next to them for the
+     * column loads that take SQL only), the {@code sql} for
+     * {@code ScanOptions.filter} otherwise. Two scans over the same
+     * predicate in the two encodings have different digests and
+     * compete on cost in the same equivalence set. Refuses when the
+     * scan already carries any pushed operation, as
+     * {@link #withPushedFilter(RexNode, String)} does.
+     */
+    public LanceTableScan withPushedFilter(RexNode condition, String sql, ByteBuffer bytes) {
         if (pushedFilter().isPresent()) {
             throw new IllegalStateException("the scan already carries a pushed filter");
         }
@@ -234,7 +250,7 @@ public class LanceTableScan extends TableScan implements LanceRel {
         if (!pushedOperations.isEmpty()) {
             throw new IllegalStateException("the scan already carries a pushed operation: " + pushedOperations);
         }
-        return new LanceTableScan(getCluster(), getTraitSet(), table, ImmutableList.of(new PushedFilter(condition, sql)));
+        return new LanceTableScan(getCluster(), getTraitSet(), table, ImmutableList.of(new PushedFilter(condition, sql, bytes)));
     }
 
     /**
@@ -410,7 +426,10 @@ public class LanceTableScan extends TableScan implements LanceRel {
      * operator's constant) at every table size and keeps the small
      * table choice in line with the large table one. The hits shapes
      * (a pushed top-k, FTS or knn) have no measured alternative, so the
-     * placeholder is their model in both regimes.
+     * placeholder is their model in both regimes. A pushed filter adds
+     * {@link CostModel#filterEncodingMillis} to its rows placeholder,
+     * the term that orders the SQL and the Substrait encodings of one
+     * predicate, which the pushdown rules register side by side.
      */
     @Override
     public RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
@@ -432,6 +451,13 @@ public class LanceTableScan extends TableScan implements LanceRel {
             }
         } else if (pushedOperations.isEmpty() && CostModel.usesFittedModel(table.getRowCount())) {
             return planner.getCostFactory().makeZeroCost();
+        }
+        Optional<PushedFilter> filter = pushedFilter();
+        if (filter.isPresent()) {
+            // The two encodings of one predicate share the rows term;
+            // the encoding term orders them.
+            double millis = rows + CostModel.filterEncodingMillis(CostInputsHolder.inputsOf(planner), filter.get());
+            return planner.getCostFactory().makeCost(millis, pushedOperations.size(), 0);
         }
         return planner.getCostFactory().makeCost(rows, pushedOperations.size(), 0);
     }
