@@ -168,6 +168,13 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         assertEquals(original.hashCode(), restored.hashCode());
     }
 
+    public void testFreshnessStatsTakeANullMapAsNoRefusedUpdates() {
+        LanceNodeStats.FreshnessStats stats = new LanceNodeStats.FreshnessStats(1, 2L, 3L, 4L, 5L, 6L, 7L, 8L, null);
+        assertEquals(Map.of(), stats.mappingErrors());
+        assertEquals(stats, new LanceNodeStats.FreshnessStats(1, 2L, 3L, 4L, 5L, 6L, 7L, 8L));
+        assertEquals(Map.of(), stats.withMappingErrors(null).mappingErrors());
+    }
+
     public void testNodeStatsXContentShape() throws Exception {
         ScanAdmission.setEnabled(true);
         ScanAdmission.setHeadroom(ScanAdmission.DEFAULT_HEADROOM);

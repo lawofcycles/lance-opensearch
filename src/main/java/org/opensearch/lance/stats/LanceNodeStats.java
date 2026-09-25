@@ -180,7 +180,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         }
 
         public FreshnessStats {
-            mappingErrors = Collections.unmodifiableMap(new LinkedHashMap<>(mappingErrors));
+            mappingErrors = mappingErrors == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(mappingErrors));
         }
 
         /** The counters alone, as the base fields of {@link LanceNodeStats} carry them. */
