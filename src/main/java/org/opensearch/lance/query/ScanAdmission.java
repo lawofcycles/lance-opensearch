@@ -603,9 +603,11 @@ public final class ScanAdmission {
 
     /**
      * The planner statistics of {@code dataset} at its open version from
-     * the installed cache, collected on a miss (metadata calls only);
-     * empty when no cache is installed or the collection fails, in
-     * which case the estimators fall back to their per row constants.
+     * the installed cache; empty when no cache is installed or the cache
+     * does not hold that version yet (its collection runs in the
+     * background, started by the coordinator's plan or by the freshness
+     * check of the shard), in which case the estimators fall back to
+     * their per row constants. Never collects on the calling thread.
      */
     public static Optional<TableStatistics> statisticsOf(Dataset dataset) {
         TableStatisticsCache cache = tableStatistics;
@@ -613,7 +615,7 @@ public final class ScanAdmission {
             return Optional.empty();
         }
         try {
-            return Optional.ofNullable(cache.forVersion(dataset.uri(), dataset.version(), dataset));
+            return Optional.ofNullable(cache.peek(dataset.uri(), dataset.version()));
         } catch (RuntimeException e) {
             return Optional.empty();
         }

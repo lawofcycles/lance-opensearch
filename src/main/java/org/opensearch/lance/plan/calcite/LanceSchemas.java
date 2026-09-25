@@ -17,6 +17,7 @@ import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
+import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.metadata.TableStatistics;
 
@@ -43,9 +44,9 @@ import java.util.function.Supplier;
  * {@code Dataset} when the node has one and shares the node's Lance
  * {@code Session} when it does not. The Arrow schema is read while the
  * lease is held and the {@link TableStatistics} come from the node's
- * statistics cache under the snapshot's version (collected from the open
- * dataset on the first request of that version); the model keeps no
- * reference to the dataset.
+ * statistics cache under the snapshot's version (collected in the
+ * background on the first request of that version, which plans
+ * without them); the model keeps no reference to the dataset.
  */
 public final class LanceSchemas {
 
@@ -239,19 +240,31 @@ public final class LanceSchemas {
         ) {
             Dataset dataset = lease.snapshot().dataset();
             Schema arrowSchema = dataset.getSchema();
-            try {
-                TableStatistics statistics = warmCache.tableStatistics().forVersion(dataset.uri(), lease.snapshot().version(), dataset);
+            long snapshotVersion = lease.snapshot().version();
+            // The collection the cache starts on a miss opens the table
+            // on its own: the snapshot's dataset closes with the
+            // snapshot, and a node_local index reads a clone whose URI
+            // and version the snapshot's dataset carries.
+            boolean clone = LanceLocalClones.isNodeLocal(settings);
+            String openUri = clone ? dataset.uri() : tableUri;
+            StorageOptions openOptions = clone ? StorageOptions.empty() : storageOptions;
+            TableStatistics statistics = warmCache.tableStatistics()
+                .lookup(
+                    dataset.uri(),
+                    snapshotVersion,
+                    () -> LanceRegistry.openDataset(openUri, openOptions, Optional.of(snapshotVersion))
+                );
+            if (statistics != null) {
                 try {
                     statistics.readZoneMaps(dataset, queryFields);
                 } catch (RuntimeException e) {
                     LOGGER.warn("zone maps of [{}] unavailable, planning without pruning", indexName, e);
                 }
                 return model(indexName, arrowSchema, multiFields, renamedFields, pkField, overrides.dateColumns().keySet(), statistics);
-            } catch (RuntimeException e) {
-                // Statistics inform plan quality, not correctness: fall
-                // back to the fragment row counts rather than failing.
-                LOGGER.warn("table statistics of [{}] unavailable, planning without them", indexName, e);
             }
+            // The statistics are being collected in the background:
+            // this plan reads the fragment row counts instead.
+            LOGGER.debug("table statistics of [{}] at version {} not collected yet, planning without them", indexName, snapshotVersion);
             long rows = 0L;
             for (long fragmentRows : dataset.getFragmentStatistics().getRowCounts()) {
                 rows += fragmentRows;

@@ -15,7 +15,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 /**
  * Node scoped cache of {@link TableStatistics}, one entry per
@@ -27,6 +30,22 @@ import java.util.concurrent.atomic.AtomicLong;
  * node, which looks them up under the version of the warm cache snapshot
  * it holds. The two run on the same node when a data node coordinates,
  * and then share the entry.
+ *
+ * <p>A lookup never collects on the calling thread. {@link #lookup}
+ * answers the entry when it is held and {@code null} when it is not,
+ * and on a miss starts one collection of the key on the executor the
+ * cache was given (the node's generic pool), which opens the table
+ * through the caller's opener, reads the statistics and stores them.
+ * The caller plans without statistics this once; the next lookup of the
+ * same version finds the entry. On a table of ten billion rows the
+ * collection takes minutes (Lance assembles the index statistics from
+ * the index files), which is why it must not sit on the request's
+ * thread. {@link #prefetch} starts the same collection without a
+ * lookup, so a node that holds the table's shard can have the entry
+ * ready before the first request (the freshness check calls it when the
+ * shard starts and when the manifest advances). A key is collected once
+ * at a time: a second lookup or prefetch of a key whose collection is
+ * running starts nothing.
  *
  * <p>Bounds: {@link #release} drops the entry of a version whose warm
  * cache snapshot closed; inserting a version of a table keeps at most
@@ -52,61 +71,110 @@ public final class TableStatisticsCache {
     }
 
     private final int maxEntries;
+    private final Executor executor;
     /** Access ordered, guarded by {@code this}. */
     private final LinkedHashMap<Key, TableStatistics> entries = new LinkedHashMap<>(16, 0.75f, true);
-    /** Serialises the collection of one key so concurrent first lookups collect once. */
-    private final Map<Key, Object> collectLocks = new ConcurrentHashMap<>();
+    /** The keys whose collection is queued or running; one collection per key at a time. */
+    private final Map<Key, Boolean> pending = new ConcurrentHashMap<>();
     private final AtomicLong collects = new AtomicLong();
     private final AtomicLong hits = new AtomicLong();
+    private final AtomicLong misses = new AtomicLong();
     private final AtomicLong collectMillisTotal = new AtomicLong();
+    /** Milliseconds a collection waits before it reads the table; a test hook, zero on a real node. */
+    private volatile long collectDelayMillis;
 
+    /**
+     * A cache whose collections run on the calling thread of
+     * {@link #lookup} or {@link #prefetch}. For tests without a thread
+     * pool: {@code lookup} still answers {@code null} on the miss that
+     * started the collection, and the next lookup hits.
+     */
     public TableStatisticsCache() {
-        this(DEFAULT_MAX_ENTRIES);
+        this(DEFAULT_MAX_ENTRIES, Runnable::run);
     }
 
-    /** @param maxEntries entries kept before the least recently used one is evicted */
-    public TableStatisticsCache(int maxEntries) {
+    /**
+     * @param maxEntries entries kept before the least recently used one is evicted
+     * @param executor runs the collections; the node's generic pool in production
+     */
+    public TableStatisticsCache(int maxEntries, Executor executor) {
         this.maxEntries = Math.max(1, maxEntries);
+        this.executor = executor;
     }
 
     /**
-     * The statistics of {@code dataset} at its current version, keyed on
-     * {@code dataset.uri()} and {@code dataset.version()}, collected
-     * from it on a miss.
+     * The statistics under {@code (tableUri, version)} when the cache
+     * holds them, else {@code null}. A miss is counted as a plan made
+     * without statistics and starts one collection of the key in the
+     * background unless one is already queued or running: the
+     * collection opens the table through {@code opener} (which must open
+     * it at {@code version}), reads the statistics and closes it.
      */
-    public TableStatistics forDataset(Dataset dataset) {
-        return forVersion(dataset.uri(), dataset.version(), dataset);
-    }
-
-    /**
-     * The statistics under {@code (tableUri, version)}, collected from
-     * {@code dataset} on a miss. {@code dataset} must be open at
-     * {@code version}; it is only read when the entry is missing.
-     */
-    public TableStatistics forVersion(String tableUri, long version, Dataset dataset) {
+    public TableStatistics lookup(String tableUri, long version, Supplier<Dataset> opener) {
         Key key = new Key(tableUri, version);
         TableStatistics cached = lookup(key);
         if (cached != null) {
             hits.incrementAndGet();
             return cached;
         }
-        Object lock = collectLocks.computeIfAbsent(key, k -> new Object());
+        misses.incrementAndGet();
+        start(key, opener);
+        return null;
+    }
+
+    /**
+     * Start collecting the statistics under {@code (tableUri, version)}
+     * in the background when the cache neither holds them nor is
+     * collecting them; {@code opener} opens the table at
+     * {@code version} for the collection. Returns whether a collection
+     * was started.
+     */
+    public boolean prefetch(String tableUri, long version, Supplier<Dataset> opener) {
+        Key key = new Key(tableUri, version);
+        if (lookup(key) != null) {
+            return false;
+        }
+        return start(key, opener);
+    }
+
+    private boolean start(Key key, Supplier<Dataset> opener) {
+        if (pending.putIfAbsent(key, Boolean.TRUE) != null) {
+            return false;
+        }
         try {
-            synchronized (lock) {
-                cached = lookup(key);
-                if (cached != null) {
-                    hits.incrementAndGet();
-                    return cached;
-                }
-                long startNanos = System.nanoTime();
-                TableStatistics collected = TableStatisticsCollector.collect(dataset);
-                collectMillisTotal.addAndGet(wholeMillis(System.nanoTime() - startNanos));
-                collects.incrementAndGet();
-                put(key, collected);
-                return collected;
+            executor.execute(() -> collect(key, opener));
+        } catch (RejectedExecutionException e) {
+            pending.remove(key);
+            LOGGER.warn("table statistics of {} not collected: {}", key, e.getMessage());
+            return false;
+        }
+        return true;
+    }
+
+    private void collect(Key key, Supplier<Dataset> opener) {
+        try {
+            long delay = collectDelayMillis;
+            if (delay > 0L) {
+                Thread.sleep(delay);
             }
+            long startNanos = System.nanoTime();
+            TableStatistics collected;
+            try (Dataset dataset = opener.get()) {
+                collected = TableStatisticsCollector.collect(dataset);
+            }
+            collectMillisTotal.addAndGet(wholeMillis(System.nanoTime() - startNanos));
+            collects.incrementAndGet();
+            put(key, collected);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOGGER.debug("table statistics collection of {} interrupted", key);
+        } catch (RuntimeException e) {
+            // Statistics are an input to plan quality, not to
+            // correctness: the requests keep planning without them and
+            // the next lookup tries again.
+            LOGGER.warn("table statistics of {} could not be collected; requests plan without them", key, e);
         } finally {
-            collectLocks.remove(key, lock);
+            pending.remove(key);
         }
     }
 
@@ -119,7 +187,7 @@ public final class TableStatisticsCache {
         return Math.max(1L, (nanos + 999_999L) / 1_000_000L);
     }
 
-    /** The cached entry for {@code (tableUri, version)}, or {@code null}; does not collect. */
+    /** The cached entry for {@code (tableUri, version)}, or {@code null}; neither collects nor counts. */
     public synchronized TableStatistics peek(String tableUri, long version) {
         return entries.get(new Key(tableUri, version));
     }
@@ -176,7 +244,12 @@ public final class TableStatisticsCache {
         return entries.size();
     }
 
-    /** Collections performed (misses). */
+    /** Keys whose collection is queued or running. */
+    public int pendingCount() {
+        return pending.size();
+    }
+
+    /** Collections completed. */
     public long collectCount() {
         return collects.get();
     }
@@ -186,9 +259,24 @@ public final class TableStatisticsCache {
         return hits.get();
     }
 
+    /** Lookups that found no entry: plans made without statistics. */
+    public long missCount() {
+        return misses.get();
+    }
+
     /** Milliseconds spent collecting, summed over every collection; each collection counts at least one. */
     public long collectMillisTotal() {
         return collectMillisTotal.get();
+    }
+
+    /**
+     * Make every collection started from now on wait {@code millis}
+     * before it reads the table; zero clears the wait. A test hook
+     * ({@code lance.test.statistics_collect_delay}) that lets a request
+     * against a small table observe the plan made without statistics.
+     */
+    public void setCollectDelayMillis(long millis) {
+        this.collectDelayMillis = Math.max(0L, millis);
     }
 
     /** Drop every entry. */
