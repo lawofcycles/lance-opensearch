@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
@@ -71,12 +72,22 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
     private final String tokensColumn;
 
     public static class Builder extends ParametrizedFieldMapper.Builder {
+        /**
+         * A mapping update may set {@code tokens_column} on a field that
+         * had none: an analyzer mode attach with {@code derive: async}
+         * maps a column that already carries a Lance inverted index as
+         * plain {@code lance_text} until the backfill commits, and the
+         * re-derivation after that commit adds the derived column's
+         * name. Once set, the name cannot change or be removed: the
+         * derived column is what the queries target, so renaming it is
+         * a re-attach.
+         */
         private final Parameter<String> tokensColumn = Parameter.stringParam(
             "tokens_column",
             false,
             m -> ((LanceTextFieldMapper) m).tokensColumn,
             null
-        ).acceptsNull();
+        ).acceptsNull().setMergeValidator((previous, updated) -> previous == null || Objects.equals(previous, updated));
         private final Parameter<Map<String, String>> meta = Parameter.metaParam();
 
         public Builder(String name) {
