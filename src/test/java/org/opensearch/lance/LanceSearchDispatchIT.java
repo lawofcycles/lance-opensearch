@@ -257,6 +257,9 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         try {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            // Pruning reads the zone maps out of the table statistics,
+            // which the first request of a version plans without.
+            warmTableStatistics(indexName);
 
             // id >= 250 lives in fragments 2 and 3 only; 0 and 1 are pruned.
             String range = "{\"range\":{\"id\":{\"gte\":250}}}";
@@ -323,6 +326,78 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals(350, extractIntPath(all, "hits", "total", "value"));
             assertEquals("nothing skipped when every fragment may match", before + 14, prunedFragments());
         } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void testFirstSearchPlansWithoutStatisticsAndTheNextOneReadsThem() throws Exception {
+        // The coordinator plans a version's first request without the
+        // table statistics and does not wait for their collection, which
+        // runs in the background; the requests after it read the entry.
+        // On a table this small the collection would be done within
+        // milliseconds of the attach, so it is held back for the test.
+        String suffix = "stats-async-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeZoneMappedFixtureTable(scratchDir, tableName, 4, 100, 50);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String body = "{\"query\":{\"range\":{\"id\":{\"gte\":250}}},\"size\":0,\"track_total_hits\":true,"
+            + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+        try {
+            updateClusterSetting("lance.test.statistics_collect_delay", "8s");
+            awaitTableStatistics();
+            Map<String, Long> before = planStatistics();
+            long prunedBefore = prunedFragments();
+
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // The first search answers at once and correctly; without
+            // the statistics there are no zone maps to prune with, so
+            // every fragment is scanned.
+            long startMillis = System.currentTimeMillis();
+            String first = readAll(postJson("/" + indexName + "/_search", body));
+            long searchMillis = System.currentTimeMillis() - startMillis;
+            assertTrue("the search did not wait for the delayed collection: " + searchMillis + " ms", searchMillis < 8_000L);
+            assertEquals(150, extractIntPath(first, "hits", "total", "value"));
+            assertEquals("sum(250..399): " + first, 48675, extractIntPath(first, "aggregations", "s", "value"));
+            assertEquals("no fragment pruned without statistics", prunedBefore, prunedFragments());
+            Map<String, Long> afterFirst = planStatistics();
+            assertEquals(
+                "the first plan of the version ran without statistics: " + afterFirst,
+                before.get("planned_without") + 1,
+                afterFirst.get("planned_without").longValue()
+            );
+
+            // The collection finishes in the background.
+            assertBusy(() -> {
+                Map<String, Long> now = planStatistics();
+                assertEquals("nothing pending: " + now, 0L, now.get("pending").longValue());
+                assertTrue("the collection counted its time: " + now, now.get("collect_millis_total") > before.get("collect_millis_total"));
+            }, 60, TimeUnit.SECONDS);
+            Map<String, Long> collected = planStatistics();
+
+            // The next search reads the entry: the same answer, planned
+            // with statistics (the zone maps now prune fragments 0 and 1)
+            // and no further plan without them.
+            String second = readAll(postJson("/" + indexName + "/_search", body));
+            assertEquals(150, extractIntPath(second, "hits", "total", "value"));
+            assertEquals(48675, extractIntPath(second, "aggregations", "s", "value"));
+            assertEquals("two fragments pruned with the statistics", prunedBefore + 2, prunedFragments());
+            Map<String, Long> afterSecond = planStatistics();
+            assertEquals(
+                "the second plan read the statistics: " + afterSecond,
+                collected.get("planned_without"),
+                afterSecond.get("planned_without")
+            );
+            assertEquals(collected.get("collect_millis_total"), afterSecond.get("collect_millis_total"));
+        } finally {
+            try {
+                updateClusterSetting("lance.test.statistics_collect_delay", null);
+            } catch (Exception ignored) {}
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}

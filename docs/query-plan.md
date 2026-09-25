@@ -254,7 +254,16 @@ carries the whole charge.
 The quantities come from the tree and from the table statistics the planner collects once per
 manifest version from Lance metadata (rows, deleted rows, the bitmap distinct count of a terms
 key, the Arrow type widths of the columns read; `GET /_lance/stats` reports the cache under
-`plan.statistics`). The run's inputs come from the caller as `plan/cost/CostInputs`: the number of
+`plan.statistics`). The collection runs in the background, not on the request: the first request
+that plans against a version the node has not collected yet plans without statistics (the row
+count from the fragment metadata, the model's defaults for every other figure, no zone map
+pruning) and starts the collection; the requests after it read the entry. A node holding the
+table's shard starts the collection when the shard opens the version, so it is usually ready
+there before the first request; a node that only coordinates starts it on that request. On a
+small table the difference is invisible; on a table of billions of rows it is the difference
+between a first request that answers in seconds and one that waits minutes for the index
+statistics ([architecture.md](architecture.md) has the details and the `pending` and
+`planned_without` counters). The run's inputs come from the caller as `plan/cost/CostInputs`: the number of
 data nodes the request fans out to, the storage kind of the table URI, this node's CPUs, and four
 settings read at their current values, `lance.aggregation.pushdown_parallelism` (the scan's
 parallelism), `lance.fragment_path.slices` (the aggregator path's parallelism),
@@ -363,7 +372,9 @@ The zone maps are read lazily, once per manifest version and per column, and onl
 the query names: the coordinator reads them while it holds the table open to enumerate the
 fragments (`TableStatistics.readZoneMaps`), before the planner runs, and the entry in the
 statistics cache keeps them for the life of that version. A table without a zone map index
-costs nothing here; a request whose query names no zone mapped column reads nothing.
+costs nothing here; a request whose query names no zone mapped column reads nothing. A request
+that plans before the version's statistics are collected (see "Cost" above) has no zone maps to
+read and prunes nothing.
 
 Each data node's executor removes the excluded fragments from the list the coordinator sent it
 before it opens the fragment reader and issues any Lance scan, and counts the fragments it

@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -627,7 +628,7 @@ public class LanceExplainIT extends LanceRestTestCase {
         }
     }
 
-    public void testExplainFillsThePlannerStatisticsCache() throws Exception {
+    public void testFirstExplainPlansWithoutStatisticsAndTheNextOneReadsThem() throws Exception {
         String suffix = "explain-stats-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -635,47 +636,63 @@ public class LanceExplainIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            // The collector logs its duration at debug; raise the
-            // level for the run so the node log carries the line.
-            Request debug = new Request("PUT", "/_cluster/settings");
-            debug.setJsonEntity("{\"transient\":{\"logger.org.opensearch.lance.plan.metadata\":\"DEBUG\"}}");
-            client().performRequest(debug);
+            // On a table this small the background collection finishes
+            // within milliseconds of the attach; hold it back so the
+            // first explain is observed planning without statistics.
+            Request delay = new Request("PUT", "/_cluster/settings");
+            delay.setJsonEntity("{\"transient\":{\"lance.test.statistics_collect_delay\":\"8s\"}}");
+            client().performRequest(delay);
 
+            // Nothing of the earlier tests is still collecting, so the
+            // counters below move for this table alone.
+            awaitTableStatistics();
+            Map<String, Long> before = planStatistics();
             attach(tableUri);
 
-            // Nothing has planned against this table yet: the entry
-            // count and the collect time are what other tests left
-            // behind (zero on a fresh node).
-            String before = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
-            @SuppressWarnings("unchecked")
-            Map<String, Object> nodes = (Map<String, Object>) parseJson(before).get("nodes");
-            String nodeId = nodes.keySet().iterator().next();
-            int tablesBefore = extractIntPath(before, "nodes", nodeId, "plan", "statistics", "tables");
-            int millisBefore = extractIntPath(before, "nodes", nodeId, "plan", "statistics", "collect_millis_total");
-            assertTrue("the baseline is a counter: " + before, tablesBefore >= 0 && millisBefore >= 0);
+            // The first explain does not wait for the collection: it
+            // answers at once, planned without statistics, and the
+            // stats record that plan.
+            long startMillis = System.currentTimeMillis();
+            String body = explainOk(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
+            long explainMillis = System.currentTimeMillis() - startMillis;
+            assertTrue("the explain did not wait for the delayed collection: " + explainMillis + " ms", explainMillis < 8_000L);
+            assertEquals("PUSHED_SCAN", fragmentPlanOf(body).get("kind"));
+            Map<String, Long> first = planStatistics();
+            assertEquals(
+                "the first plan of the version ran without statistics: " + first,
+                before.get("planned_without") + 1,
+                first.get("planned_without").longValue()
+            );
+            assertTrue(
+                "the collection is pending or done: " + first,
+                first.get("pending") > 0L || first.get("tables") > before.get("tables")
+            );
 
-            explainOk(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
+            // The collection finishes in the background: the collect
+            // time grew (a collection counts at least one millisecond
+            // however fast it ran), the entry is held, nothing pending.
+            assertBusy(() -> {
+                Map<String, Long> now = planStatistics();
+                assertEquals("nothing pending: " + now, 0L, now.get("pending").longValue());
+                assertTrue("the collection counted its time: " + now, now.get("collect_millis_total") > before.get("collect_millis_total"));
+                assertTrue("the explained table is cached: " + now, now.get("tables") >= 1L);
+            }, 60, TimeUnit.SECONDS);
+            Map<String, Long> collected = planStatistics();
 
-            // The plan construction collected the table's statistics
-            // under the snapshot's version: one more entry, and the
-            // collect time grew (a collection counts at least one
-            // millisecond however fast it ran).
-            String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
-            int tables = extractIntPath(stats, "nodes", nodeId, "plan", "statistics", "tables");
-            int millis = extractIntPath(stats, "nodes", nodeId, "plan", "statistics", "collect_millis_total");
-            assertEquals("the explained table is cached: " + stats, tablesBefore + 1, tables);
-            assertTrue("the first explain collected: " + millisBefore + " -> " + millis, millis > millisBefore);
-
-            // A second explain of the same version reads the cached
-            // entry: neither the entry count nor the collect time moves.
-            explainOk(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
-            String again = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
-            assertEquals(tables, extractIntPath(again, "nodes", nodeId, "plan", "statistics", "tables"));
-            assertEquals(millis, extractIntPath(again, "nodes", nodeId, "plan", "statistics", "collect_millis_total"));
+            // The next explain of the same version reads the entry:
+            // neither the plans without statistics, the entry count nor
+            // the collect time move.
+            String again = explainOk(indexName, "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
+            assertEquals("PUSHED_SCAN", fragmentPlanOf(again).get("kind"));
+            Map<String, Long> second = planStatistics();
+            assertEquals("the second plan read the statistics: " + second, collected.get("planned_without"), second.get("planned_without"));
+            assertEquals(collected.get("tables"), second.get("tables"));
+            assertEquals(collected.get("collect_millis_total"), second.get("collect_millis_total"));
+            assertEquals(0L, second.get("pending").longValue());
         } finally {
             try {
                 Request reset = new Request("PUT", "/_cluster/settings");
-                reset.setJsonEntity("{\"transient\":{\"logger.org.opensearch.lance.plan.metadata\":null}}");
+                reset.setJsonEntity("{\"transient\":{\"lance.test.statistics_collect_delay\":null}}");
                 client().performRequest(reset);
             } catch (Exception ignored) {}
             deleteQuietly(indexName);
@@ -693,6 +710,9 @@ public class LanceExplainIT extends LanceRestTestCase {
         String indexName = tableName;
         try {
             attach(tableUri);
+            // Pruning reads the zone maps out of the table statistics,
+            // which the first request of a version plans without.
+            warmTableStatistics(indexName);
 
             // id >= 250 cannot hold in fragments 0 (ids 0..99) and 1
             // (100..199); fragment 2 (200..299) and 3 (300..399) may.

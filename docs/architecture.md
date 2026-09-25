@@ -472,20 +472,32 @@ model's choice. The hits shapes
 same placeholder ordering at every size.
 
 The statistics the planner reads come from Lance table metadata, not from scanning rows. Once per
-manifest version a node collects, from the open dataset, the fragment list with each fragment's
-live row count and data file count (`getFragmentStatistics`), the physical rows behind them (the
-difference is the deleted row count), the indexes on the table with their type, fragment coverage
-and size (`getIndexes`), and per index the figures Lance's `getIndexStatistics` reports (indexed
-and unindexed rows; for a bitmap index the number of bitmaps, which is the column's distinct
-value estimate). Zone maps (`getZonemapStats`) are read lazily on the first request for a column
-and memoised with the version. The result is cached per `(table URI, manifest version)`, so a
-version pays the collection on its first request and every later request reads the entry; the
-entry goes when the snapshot cache closes that version, and a table that follows its manifest
-keeps at most the current and the previous version. The cache is per node and is filled by the coordinator role from the dataset it opens to
-enumerate fragments (and by the explain endpoint from the warm cache snapshot it plans against);
-the data nodes run no planner. `GET /_lance/stats` reports
-the entry count and the accumulated collection time under `plan.statistics`. The Calcite side
-reads the statistics through `LanceTable.getStatistic()` (row count) and through Lance's own
+manifest version a node collects, from a dataset it opens for the purpose, the fragment list with
+each fragment's live row count and data file count (`getFragmentStatistics`), the physical rows
+behind them (the difference is the deleted row count), the indexes on the table with their type,
+fragment coverage and size (`getIndexes`), and for each bitmap index the figures Lance's
+`getIndexStatistics` reports (indexed and unindexed rows, and the number of bitmaps, which is the
+column's distinct value estimate). `getIndexStatistics` is not called for the other index types:
+nothing the planner or the admission gate reads is in their answer, and Lance assembles it from
+the index files, which on a table of ten billion rows takes minutes for an inverted or a vector
+index. Zone maps (`getZonemapStats`) are read lazily on the first request for a column and
+memoised with the version. The result is cached per `(table URI, manifest version)`; the entry
+goes when the snapshot cache closes that version, and a table that follows its manifest keeps at
+most the current and the previous version.
+
+The collection never runs on a request's thread. A plan that finds no entry for its version
+(`TableStatisticsCache.lookup`) starts the collection on the node's generic pool and goes on
+without statistics: the row count comes from the fragment metadata, the cost model uses its
+defaults where a figure is missing, no fragment is pruned, and the admission gate's estimators use
+their per row constants. The plans that follow read the entry. A node that holds the table's shard
+starts the collection earlier, when it builds the snapshot of a version (at attach, when the
+namespace poll surfaces the table, and when the freshness check follows the manifest to a new
+version), so on that node the statistics are usually ready before the first request; a node that
+only coordinates collects on its first request of the version. Statistics are not shipped between
+nodes. The cache is per node and `GET /_lance/stats` reports it under `plan.statistics`: `tables`
+(entries held), `collect_millis_total` (time spent collecting), `pending` (collections queued or
+running) and `planned_without` (plans made without statistics since the node started). The Calcite
+side reads the statistics through `LanceTable.getStatistic()` (row count) and through Lance's own
 `RowCount` and `DistinctRowCount` metadata handlers for the scan, chained in front of Calcite's
 defaults.
 
