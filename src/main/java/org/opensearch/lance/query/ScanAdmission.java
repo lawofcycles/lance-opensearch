@@ -1360,21 +1360,20 @@ public final class ScanAdmission {
      * table and holds each result until it has combined them
      * ({@code ScalarIndexExpr::evaluate} joins the two sides of an
      * {@code AND} or {@code OR} and only then intersects or unions
-     * them), so the peak is the sum over the referenced indexed columns
-     * of the rows each predicate selects: one over the distinct count
-     * for an equality on a column whose index reports one, else
-     * {@link #FILTER_MATCH_RATIO_UNKNOWN}, capped at the whole table.
-     * A filter that references no indexed column is
-     * {@link #FILTER_MATCH_RATIO_UNKNOWN}, as {@link #filterSelectivity}
-     * assumes.
+     * them), so the peak is the sum over the referenced columns with a
+     * scalar index of the rows each predicate selects: one over the
+     * distinct count for an equality on a column whose index reports
+     * one, else {@link #FILTER_MATCH_RATIO_UNKNOWN}, capped at the
+     * whole table. Zero when no referenced column carries a scalar
+     * index: Lance then evaluates the filter on the scanned batches
+     * without a {@code MaterializeIndexExec} and materialises nothing.
      */
     static double filterMaterialisedRatio(String filterSql, TableStatistics statistics) {
-        List<ColumnStatistics> referenced = referencedIndexedColumns(filterSql, statistics);
-        if (referenced.isEmpty()) {
-            return FILTER_MATCH_RATIO_UNKNOWN;
-        }
         double sum = 0d;
-        for (ColumnStatistics column : referenced) {
+        for (ColumnStatistics column : referencedIndexedColumns(filterSql, statistics)) {
+            if (!hasScalarIndex(column)) {
+                continue;
+            }
             OptionalLong distinct = column.distinctCount();
             if (distinct.isPresent() && distinct.getAsLong() > 0L && isEquality(filterSql, column.column())) {
                 sum += 1d / distinct.getAsLong();
@@ -1383,6 +1382,16 @@ public final class ScanAdmission {
             }
         }
         return Math.min(1d, sum);
+    }
+
+    /** Whether {@code column} carries an index the filter path loads (see {@link #isScalarIndex}). */
+    private static boolean hasScalarIndex(ColumnStatistics column) {
+        for (ColumnStatistics.IndexSummary index : column.indexes()) {
+            if (index.type().isPresent() && isScalarIndex(index.type().get())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -1868,9 +1877,13 @@ public final class ScanAdmission {
             rows = (long) (scannedRows * selectivity);
             // The index result is evaluated over the whole table before
             // the scan's fragments are kept; the table's rows when the
-            // statistics know them, else the rows the scans cover.
-            double materialisedRatio = statistics.map(s -> filterMaterialisedRatio(filterSql, s)).orElse(FILTER_MATCH_RATIO_UNKNOWN);
-            materialised = (long) (Math.max(tableRows, scannedRows) * materialisedRatio);
+            // statistics know them, else the rows the scans cover. A
+            // filter no scalar index answers runs on the scanned batches
+            // and materialises nothing.
+            if (index.isPresent()) {
+                double materialisedRatio = filterMaterialisedRatio(filterSql, statistics.get());
+                materialised = (long) (Math.max(tableRows, scannedRows) * materialisedRatio);
+            }
         }
         long estimate = aggregateScanEstimateBytes(scans, rows, materialised, rowWidthBytes, batchReadahead, shardShare);
         long heap = aggregateScanHeapBytes(groups, metrics, scans);

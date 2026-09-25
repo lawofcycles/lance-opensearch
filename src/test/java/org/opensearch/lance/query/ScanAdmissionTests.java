@@ -954,7 +954,8 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
     /**
      * perf1b's indexes as the statistics report them: a bitmap over the
      * 200 value {@code category}, BTrees over {@code price} and
-     * {@code rating} without a manifest size or a distinct count.
+     * {@code rating} without a manifest size or a distinct count, an
+     * inverted index over {@code body}; {@code brand} carries none.
      */
     private static Optional<TableStatistics> perf1bStatistics() {
         ColumnStatistics.IndexSummary category = new ColumnStatistics.IndexSummary(
@@ -990,10 +991,22 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             OptionalLong.empty(),
             true
         );
+        ColumnStatistics.IndexSummary body = new ColumnStatistics.IndexSummary(
+            "inverted_body",
+            Optional.of(IndexType.INVERTED),
+            250,
+            250,
+            OptionalLong.empty(),
+            OptionalLong.of(PERF1B_ROWS),
+            OptionalLong.of(0L),
+            OptionalLong.empty(),
+            true
+        );
         Map<String, ColumnStatistics> columns = new LinkedHashMap<>();
         columns.put("category", new ColumnStatistics("category", List.of(category)));
         columns.put("price", new ColumnStatistics("price", List.of(price)));
         columns.put("rating", new ColumnStatistics("rating", List.of(rating)));
+        columns.put("body", new ColumnStatistics("body", List.of(body)));
         List<TableStatistics.FragmentStats> fragments = new ArrayList<>();
         for (int i = 0; i < 250; i++) {
             fragments.add(new TableStatistics.FragmentStats(i, PERF1B_ROWS / 250, 1));
@@ -1141,6 +1154,55 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             ScanAdmission.aggregateScanEstimateBytes(PERF1B_SCANS, PERF1B_NODE_ROWS, 0L, width, PERF1B_READAHEAD, 8 * GB),
             ScanAdmission.lastEstimateBytes()
         );
+    }
+
+    public void testAggregateFilteredOnAnUnindexedColumnMaterialisesNothing() {
+        // filter on brand (no index) + terms(category): Lance evaluates
+        // the predicate on the scanned batches without a
+        // MaterializeIndexExec, so only the read queues and batches of
+        // the scans are charged, at one row in five streamed. The body
+        // column carries an inverted index only, which the filter path
+        // does not load either.
+        TableStatistics statistics = perf1bStatistics().get();
+        assertEquals(0d, ScanAdmission.filterMaterialisedRatio("brand = 'b1'", statistics), 0d);
+        assertEquals(0d, ScanAdmission.filterMaterialisedRatio("body = 'x'", statistics), 0d);
+        assertTrue(ScanAdmission.scalarIndexFor("brand = 'b1'", statistics).isEmpty());
+        assertTrue(ScanAdmission.scalarIndexFor("body = 'x'", statistics).isEmpty());
+        // A predicate on an indexed column next to one on an unindexed
+        // column charges the indexed one alone.
+        assertEquals(0.2d, ScanAdmission.filterMaterialisedRatio("(brand = 'b1') AND (price >= 50.0)", statistics), 1e-9);
+        long width = ScanAdmission.UTF8_COLUMN_BYTES_PER_ROW + 8L;
+        perf1bNode(PERF1B_AVAILABLE_BEFORE_KILL);
+        ScanAdmission.admitAggregateScan(
+            "perf1b",
+            perf1bStatistics(),
+            "brand = 'b1'",
+            PERF1B_SCANS,
+            PERF1B_NODE_ROWS,
+            width,
+            10L,
+            0,
+            PERF1B_READAHEAD,
+            Long.MAX_VALUE
+        );
+        assertEquals(perf1bAggregateEstimate(50_000_000L, 0L, width), ScanAdmission.lastEstimateBytes());
+        assertEquals(0L, ScanAdmission.rejections());
+        // Without statistics no index is known to answer the filter and
+        // nothing is materialised either.
+        ScanAdmission.requestEnded();
+        ScanAdmission.admitAggregateScan(
+            "perf1b",
+            Optional.empty(),
+            "price >= 50.0",
+            PERF1B_SCANS,
+            PERF1B_NODE_ROWS,
+            width,
+            10L,
+            0,
+            PERF1B_READAHEAD,
+            Long.MAX_VALUE
+        );
+        assertEquals(perf1bAggregateEstimate(50_000_000L, 0L, width), ScanAdmission.lastEstimateBytes());
     }
 
     public void testBoundedMatchPageOverPerf1bIsAdmittedOnAFreshNode() {
