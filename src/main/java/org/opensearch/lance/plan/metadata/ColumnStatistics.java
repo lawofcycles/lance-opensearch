@@ -54,12 +54,46 @@ public final class ColumnStatistics {
      *     {@code num_bitmaps} over its deltas (a null bitmap counts as
      *     one value); empty for every other type, including BTree whose
      *     statistics report pages and bounds but no cardinality
+     * @param partitions the IVF partition count of a vector index, the
+     *     smallest {@code num_partitions} over its deltas (a nearest
+     *     scan probes {@code nprobes} partitions of every delta, so the
+     *     share of the index it loads is at most {@code nprobes} over
+     *     the smallest count); empty for a scalar index and when the
+     *     statistics report no count
      * @param statisticsAvailable whether {@code getIndexStatistics}
-     *     answered for this index; false leaves the row and distinct
-     *     figures empty
+     *     answered for this index; false leaves the row, distinct and
+     *     partition figures empty
      */
     public record IndexSummary(String name, Optional<IndexType> type, int coveredFragments, int totalFragments, OptionalLong sizeBytes,
-        OptionalLong indexedRows, OptionalLong unindexedRows, OptionalLong distinctCount, boolean statisticsAvailable) {
+        OptionalLong indexedRows, OptionalLong unindexedRows, OptionalLong distinctCount, OptionalLong partitions,
+        boolean statisticsAvailable) {
+
+        /** A summary whose statistics report no partition count (every scalar index, a vector index without one). */
+        public IndexSummary(
+            String name,
+            Optional<IndexType> type,
+            int coveredFragments,
+            int totalFragments,
+            OptionalLong sizeBytes,
+            OptionalLong indexedRows,
+            OptionalLong unindexedRows,
+            OptionalLong distinctCount,
+            boolean statisticsAvailable
+        ) {
+            this(
+                name,
+                type,
+                coveredFragments,
+                totalFragments,
+                sizeBytes,
+                indexedRows,
+                unindexedRows,
+                distinctCount,
+                OptionalLong.empty(),
+                statisticsAvailable
+            );
+        }
+
         /** Whether every fragment of the table is covered by this index. */
         public boolean coversAllFragments() {
             return coveredFragments >= totalFragments;

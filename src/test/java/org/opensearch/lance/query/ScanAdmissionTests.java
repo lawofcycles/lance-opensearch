@@ -5,6 +5,7 @@
 
 package org.opensearch.lance.query;
 
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -22,15 +23,22 @@ import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.util.Constants;
+import org.lance.Dataset;
 import org.lance.index.IndexType;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
+import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.NativeMemoryLimit;
+import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.plan.metadata.ColumnStatistics;
 import org.opensearch.lance.plan.metadata.TableStatistics;
+import org.opensearch.lance.plan.metadata.TableStatisticsCache;
 import org.opensearch.test.OpenSearchTestCase;
+
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 /**
  * The admission decision, the estimator of every gated kind against
@@ -38,6 +46,7 @@ import org.opensearch.test.OpenSearchTestCase;
  * fragment executor gates on, the retained pool, the per kind counters
  * and the 429 the gate answers with.
  */
+@ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class ScanAdmissionTests extends OpenSearchTestCase {
 
     private static final long GB = 1L << 30;
@@ -785,6 +794,116 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         assertEquals(0L, ScanAdmission.vectorIndexEstimateBytes(OptionalLong.of(240 * GB), TEN_BILLION, 200, 65_536L, 10, 0, 128, 8 * GB));
     }
 
+    /** perf1b's IVF_PQ index as the statistics summarise it, with or without its partition count. */
+    private static TableStatistics perf1bVectorStatistics(long rows, long indexSizeBytes, OptionalLong partitions) {
+        ColumnStatistics.IndexSummary index = new ColumnStatistics.IndexSummary(
+            "embedding_idx",
+            Optional.of(IndexType.IVF_PQ),
+            1,
+            1,
+            OptionalLong.of(indexSizeBytes),
+            OptionalLong.of(rows),
+            OptionalLong.of(0L),
+            OptionalLong.empty(),
+            partitions,
+            true
+        );
+        return new TableStatistics(
+            rows,
+            0L,
+            List.of(new TableStatistics.FragmentStats(0, rows, 1)),
+            Map.of("embedding", new ColumnStatistics("embedding", List.of(index))),
+            1L,
+            Instant.EPOCH
+        );
+    }
+
+    public void testVectorIndexEstimateScalesTheIndexByTheProbedShareOfTheStatisticsPartitionCount() {
+        // perf1b: a 1B row IVF_PQ index of 19.5 GB in the manifest, on
+        // a 128 GB node with 34 GB available after earlier scans. The
+        // statistics report 1024 partitions; a lance_knn with nprobes
+        // 200 probes one fifth of them, so the load is a fifth of the
+        // index, doubled: 7.6 GB, within the 26 GB left after the
+        // headroom (and within the 8 GiB shard share, where it is zero).
+        long rows = 1_000_000_000L;
+        long size = 19_500_000_000L;
+        TableStatistics statistics = perf1bVectorStatistics(rows, size, OptionalLong.of(1024L));
+        ColumnStatistics.IndexSummary index = ScanAdmission.vectorIndexFor("embedding", statistics).get();
+        assertEquals(OptionalLong.of(1024L), index.partitions());
+        // Judged against a 1 GiB shard share so the figure shows.
+        long estimate = ScanAdmission.vectorIndexEstimateBytes(
+            index.sizeBytes(),
+            rows,
+            200,
+            index.partitions().orElse(0L),
+            1000,
+            0,
+            128,
+            GB
+        );
+        long expected = (long) (size * (200 / 1024d)) * ScanAdmission.IVF_PARTITION_LOAD_FACTOR;
+        assertEquals(expected, estimate);
+        assertEquals("about a fifth of the index, loaded twice", 0.39d, estimate / (double) size, 0.001d);
+        assertTrue(ScanAdmission.decide(estimate, 0L, 34 * GB, Long.MAX_VALUE, true, 8 * GB, 0L).admitted());
+        // Against the 8 GiB shard share of a 16 CPU node the probed
+        // partitions fit the cache and the estimate is zero.
+        assertEquals(
+            0L,
+            ScanAdmission.vectorIndexEstimateBytes(index.sizeBytes(), rows, 200, index.partitions().orElse(0L), 1000, 0, 128, 8 * GB)
+        );
+    }
+
+    public void testVectorIndexEstimateIsTheWholeIndexTwiceWhenTheStatisticsReportNoPartitionCount() {
+        // The same index summarised without a partition count (the
+        // statistics could not be read, or name none): the whole 19.5
+        // GB doubled, 39 GB, refused at 34 GB available.
+        long rows = 1_000_000_000L;
+        long size = 19_500_000_000L;
+        TableStatistics statistics = perf1bVectorStatistics(rows, size, OptionalLong.empty());
+        ColumnStatistics.IndexSummary index = ScanAdmission.vectorIndexFor("embedding", statistics).get();
+        assertEquals(OptionalLong.empty(), index.partitions());
+        long estimate = ScanAdmission.vectorIndexEstimateBytes(
+            index.sizeBytes(),
+            rows,
+            200,
+            index.partitions().orElse(0L),
+            1000,
+            0,
+            128,
+            8 * GB
+        );
+        assertEquals(size * ScanAdmission.IVF_PARTITION_LOAD_FACTOR, estimate);
+        assertFalse(ScanAdmission.decide(estimate, 0L, 34 * GB, Long.MAX_VALUE, true, 8 * GB, 0L).admitted());
+    }
+
+    public void testAdmitVectorSearchReadsThePartitionCountOfTheTableStatistics() throws Exception {
+        // The indexed fixture trains one IVF partition, so with the
+        // statistics installed the nearest scan is judged over one
+        // partition and named as such, and the estimate is the index's
+        // manifest size loaded twice under a one byte shard share.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeIndexedFixtureTable(scratchDir, "admission-" + getTestName(), 2, 150);
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setHeadroom(new ByteSizeValue(Long.MAX_VALUE / 2, ByteSizeUnit.BYTES));
+        TableStatisticsCache cache = new TableStatisticsCache();
+        ScanAdmission.setTableStatistics(cache);
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            TableStatistics statistics = cache.forDataset(dataset);
+            ColumnStatistics.IndexSummary index = ScanAdmission.vectorIndexFor("embedding", statistics).get();
+            assertEquals(OptionalLong.of(1L), index.partitions());
+            assertTrue(index.sizeBytes().isPresent());
+            CircuitBreakingException refused = expectThrows(
+                CircuitBreakingException.class,
+                () -> ScanAdmission.admitVectorSearch("demo", dataset, "embedding", 3, 1, 0, 8, null)
+            );
+            String message = refused.getMessage();
+            assertTrue(message, message.contains("ivf_pq index [embedding_ivf]"));
+            assertTrue(message, message.contains("probed with nprobes 1 over 1 partitions"));
+            assertEquals(index.sizeBytes().getAsLong() * ScanAdmission.IVF_PARTITION_LOAD_FACTOR, ScanAdmission.lastEstimateBytes());
+            assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.VECTOR_INDEX));
+        }
+    }
+
     public void testAggregateScanEstimateIsTheReadQueueAndBatchesOfEveryParallelScan() {
         // terms(category) over 3.3B rows in 8 parallel scans on a 16
         // vCPU node: each scan reads 412M rows of 40 bytes (a 32 byte
@@ -937,5 +1056,78 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
 
     public void testBreakerRoomOfAnUnlimitedAccountingNeverRefusesHeap() {
         assertEquals(Long.MAX_VALUE, LanceHitsAccounting.unlimited().breakerRoomBytes());
+    }
+
+    // ---- the warm up probe ----
+
+    public void testWarmUpProbeIsJudgedAsAOneRowPageAndRecordedUnderItsSource() {
+        long rows = 1_000_000_000L;
+        long estimate = NativeMemoryLimit.invertedIndexEntryEstimateBytes(rows) + ScanAdmission.scanBufferEstimateBytes(
+            rows,
+            ScanAdmission.WARM_UP_PROBE_SHAPE
+        );
+        assertEquals(
+            "the probe's page is one row: 12 bytes doubled",
+            NativeMemoryLimit.invertedIndexEntryEstimateBytes(rows) + 24L,
+            estimate
+        );
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setHeadroom(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setResidentSetProbeForTests(() -> -1L);
+        assertEquals("none", ScanAdmission.lastSource());
+
+        // Too little available: not admitted, nothing thrown, the
+        // decision carries the figures the WARN names, the refusal is
+        // counted under fts and the source is the warm up.
+        ScanAdmission.setMemoryProbeForTests(() -> 16 * GB);
+        ScanAdmission.Decision skipped = ScanAdmission.admitWarmUpProbe(rows);
+        assertFalse(skipped.admitted());
+        assertEquals(estimate, skipped.estimateBytes());
+        assertEquals(8 * GB, skipped.availableBytes());
+        assertEquals(0L, skipped.retainedCreditBytes());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FTS));
+        assertEquals("fts", ScanAdmission.lastKind());
+        assertEquals("warm_up", ScanAdmission.lastSource());
+        assertEquals(estimate, ScanAdmission.lastEstimateBytes());
+        assertEquals("a skipped probe is not in flight", 0, ScanAdmission.inFlightForTests());
+
+        // Enough available: admitted and counted in flight on this
+        // thread until the probe's request end, and the pool records
+        // what the scan left behind.
+        long[] available = { estimate + 8 * GB + 2 * GB };
+        ScanAdmission.setMemoryProbeForTests(() -> available[0]);
+        ScanAdmission.Decision admitted = ScanAdmission.admitWarmUpProbe(rows);
+        assertTrue(admitted.admitted());
+        assertEquals(estimate, admitted.estimateBytes());
+        assertEquals(1, ScanAdmission.inFlightForTests());
+        ScanAdmission.scanStarted();
+        available[0] -= 7 * GB;
+        ScanAdmission.scanFinished();
+        ScanAdmission.requestEnded();
+        assertEquals(0, ScanAdmission.inFlightForTests());
+        assertEquals(7 * GB, ScanAdmission.retainedCreditBytes());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FTS));
+
+        // A request's decision afterwards flips the source back (the
+        // same one row page, admitted on the credit).
+        ScanAdmission.admit("demo", rows, ScanAdmission.WARM_UP_PROBE_SHAPE);
+        assertEquals("request", ScanAdmission.lastSource());
+        ScanAdmission.requestEnded();
+
+        // A fitting document set is estimate zero: admitted, recorded,
+        // not in flight.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.Decision fits = ScanAdmission.admitWarmUpProbe(16L);
+        assertTrue(fits.admitted());
+        assertEquals(0L, fits.estimateBytes());
+        assertEquals("warm_up", ScanAdmission.lastSource());
+        assertEquals(0, ScanAdmission.inFlightForTests());
+
+        // A disabled gate admits the probe whatever the estimate.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setMemoryProbeForTests(() -> 0L);
+        ScanAdmission.setEnabled(false);
+        assertTrue(ScanAdmission.admitWarmUpProbe(rows).admitted());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FTS));
     }
 }

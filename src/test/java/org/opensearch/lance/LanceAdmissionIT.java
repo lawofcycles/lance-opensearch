@@ -8,9 +8,11 @@ package org.opensearch.lance;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -35,7 +37,9 @@ import org.opensearch.core.rest.RestStatus;
  * kinds (a scalar index load, a filter scan, a nearest scan, a pushed
  * aggregate, a sorted page) are each refused under the same overrides
  * with their kind in the message and their counter incremented, and
- * admitted without them.
+ * admitted without them. The metadata warm up's full text probe is
+ * judged by the same gate, and the stats report its decision under the
+ * {@code warm_up} source.
  */
 public class LanceAdmissionIT extends LanceRestTestCase {
 
@@ -337,8 +341,8 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 assertTrue(btree, btree.contains("btree index [rating_btree]"));
                 assertTrue(btree, btree.contains("selectivity 0.2000"));
 
-                // The nearest scan: the IVF_PQ partitions, the whole
-                // index twice since the partition count is not known.
+                // The nearest scan: the IVF_PQ partitions, the fixture's
+                // one partition probed whole and loaded twice.
                 String knn = expectAdmissionRefusal(tableName, KNN, "vector_index");
                 assertTrue(knn, knn.contains("nearest scan on [embedding]"));
                 assertTrue(knn, knn.contains("index [embedding_ivf]"));
@@ -451,5 +455,86 @@ public class LanceAdmissionIT extends LanceRestTestCase {
         assertTrue("expected circuit_breaking_exception: " + response, response.contains("circuit_breaking_exception"));
         assertTrue("expected the admission label and kind: " + response, response.contains("[lance_admission] " + kind + " estimate"));
         return response;
+    }
+
+    // ---- the warm up's full text probe ----
+
+    public void testWarmUpProbeDecisionIsReportedUnderTheWarmUpSource() throws Exception {
+        // Attaching a table with an inverted index runs the metadata
+        // warm up, whose full text probe is judged by the gate before it
+        // runs. With the defaults the 300 row document set fits the
+        // shard share, so the probe is admitted at estimate zero, and
+        // the stats report the decision as the warm up's, not a
+        // request's. No request touches the index before the check, so
+        // the last decision is the probe's.
+        String suffix = "admissionwarmup-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeIndexedFixtureTable(scratchDir, tableName, 2, 150);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(readAll(attach), 200, attach.getStatusLine().getStatusCode());
+            ensureGreen(tableName);
+            assertBusy(() -> {
+                Map<String, Object> warmUp;
+                try {
+                    warmUp = warmUpStatus(tableName);
+                } catch (ResponseException e) {
+                    throw new AssertionError("stats temporarily unavailable: " + e.getMessage(), e);
+                }
+                assertNotNull("the node has seen the attach", warmUp);
+                assertEquals(warmUp.toString(), "done", warmUp.get("state"));
+            }, 30, TimeUnit.SECONDS);
+            Map<String, Object> warmUp = warmUpStatus(tableName);
+            Map<String, Object> probe = indexEntry(warmUp, "body_fts");
+            assertEquals(probe.toString(), "done", probe.get("state"));
+            Map<String, Object> admission = admissionStats();
+            assertEquals(admission.toString(), "fts", admission.get("last_kind"));
+            assertEquals(admission.toString(), "warm_up", admission.get("last_source"));
+            assertEquals(admission.toString(), 0L, ((Number) admission.get("last_estimate_bytes")).longValue());
+            // A request's decision afterwards is reported as such.
+            Response page = postJson("/" + tableName + "/_search", BOUNDED);
+            assertEquals(readAll(page), RestStatus.OK.getStatus(), page.getStatusLine().getStatusCode());
+            Map<String, Object> afterRequest = admissionStats();
+            assertEquals(afterRequest.toString(), "fts", afterRequest.get("last_kind"));
+            assertEquals(afterRequest.toString(), "request", afterRequest.get("last_source"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + tableName));
+            } catch (Exception ignored) {
+                // best-effort cleanup; the base class wipes indices too
+            }
+            deleteRecursively(scratchDir);
+        }
+    }
+
+    /** The single node's {@code warm_up.tables} entry of {@code indexName}, or {@code null} when the node has not seen it. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> warmUpStatus(String indexName) throws IOException {
+        String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+        Map<String, Object> nodes = (Map<String, Object>) parseJson(stats).get("nodes");
+        assertEquals("single node cluster: " + stats, 1, nodes.size());
+        Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();
+        Map<String, Object> warmUp = (Map<String, Object>) node.get("warm_up");
+        for (Object table : (List<Object>) warmUp.get("tables")) {
+            Map<String, Object> entry = (Map<String, Object>) table;
+            if (indexName.equals(entry.get("index"))) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    /** The {@code indexes} entry named {@code name} of one warm up table entry. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> indexEntry(Map<String, Object> warmUp, String name) {
+        for (Object index : (List<Object>) warmUp.get("indexes")) {
+            Map<String, Object> entry = (Map<String, Object>) index;
+            if (name.equals(entry.get("name"))) {
+                return entry;
+            }
+        }
+        throw new AssertionError("no index " + name + " in " + warmUp);
     }
 }

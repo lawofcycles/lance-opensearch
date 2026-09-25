@@ -18,6 +18,8 @@ import java.util.concurrent.Executors;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
 import org.lance.Dataset;
 import org.lance.index.IndexDescription;
 import org.lance.ipc.ScanOptions;
@@ -25,19 +27,26 @@ import org.lance.schema.LanceField;
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.unit.ByteSizeUnit;
+import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
+import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceIndexWarmer.Mode;
 import org.opensearch.lance.engine.LanceIndexWarmer.State;
 import org.opensearch.lance.engine.LanceIndexWarmer.TableStatus;
+import org.opensearch.lance.query.ScanAdmission;
+import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
  * {@link LanceIndexWarmer} against a local table carrying one index of
  * every kind it knows: the scans it issues load without error under both
- * modes, the status it publishes names every index, and {@code none}
- * records a skipped table without touching it.
+ * modes, the status it publishes names every index, {@code none}
+ * records a skipped table without touching it, and the full text probe
+ * is skipped with a WARN when the admission gate does not admit it and
+ * credited to the gate's retained pool when it is.
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class LanceIndexWarmerTests extends OpenSearchTestCase {
@@ -55,10 +64,19 @@ public class LanceIndexWarmerTests extends OpenSearchTestCase {
         allocator = new RootAllocator(Long.MAX_VALUE);
         cache = new LanceWarmCache(allocator, 64L * 1024 * 1024, 64, true);
         executor = Executors.newSingleThreadExecutor();
+        // No Session is installed here, so the gate would read a shard
+        // share of zero and judge the full text probe on the host's
+        // memory; a share the fixture's document set fits makes the
+        // probe estimate zero and the warm up deterministic. The two
+        // admission tests below narrow it.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(64, ByteSizeUnit.MB));
     }
 
     @Override
     public void tearDown() throws Exception {
+        ScanAdmission.setIndexCacheShardShareOverride(ByteSizeValue.ZERO);
+        ScanAdmission.setAvailableMemoryOverride(List.of());
+        ScanAdmission.setHeadroom(ScanAdmission.DEFAULT_HEADROOM);
         if (executor != null) {
             executor.shutdownNow();
             executor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS);
@@ -170,6 +188,81 @@ public class LanceIndexWarmerTests extends OpenSearchTestCase {
         assertEquals(1, status.indexes().size());
         assertEquals(State.FAILED, status.indexes().get(0).state());
         assertTrue(status.indexes().get(0).detail(), status.indexes().get(0).detail().startsWith("could not open the table"));
+        warmer.close();
+    }
+
+    /** The fixture's full text probe estimate under a one byte shard share: 300 rows of document set plus a one row page, doubled. */
+    private static final long PROBE_ESTIMATE = 300L * 52L + 24L;
+
+    public void testInvertedProbeWhoseEstimateDoesNotFitIsSkippedWithAWarning() throws Exception {
+        // A one byte shard share makes the 300 row document set count in
+        // full, and a scripted reading of zero leaves nothing after the
+        // headroom: the gate does not admit the probe, the warm up skips
+        // it, warns once, and the other indexes still warm.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setAvailableMemoryOverride(List.of("0b"));
+        long rejectedBefore = ScanAdmission.rejections(ScanAdmission.Kind.FTS);
+        LanceIndexWarmer warmer = new LanceIndexWarmer(cache, executor, Mode.METADATA);
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(LanceIndexWarmer.class))) {
+            appender.addExpectation(
+                new MockLogAppender.SeenEventExpectation(
+                    "the skip is warned once with the figures",
+                    LanceIndexWarmer.class.getName(),
+                    Level.WARN,
+                    "skipped the inverted index warm up of [warm-skip] [body]: estimate ["
+                        + NativeMemoryLimit.humanReadable(PROBE_ESTIMATE)
+                        + "] exceeds available [0b] minus headroom [8gb] plus [*] retained by earlier admitted scans"
+                )
+            );
+            warmer.schedule(indexMetadata("warm-skip"));
+            TableStatus status = awaitFinished(warmer, "warm-skip");
+            assertEquals(status.toString(), State.DONE, status.state());
+            Map<String, LanceIndexWarmer.IndexStatus> byName = new HashMap<>();
+            for (LanceIndexWarmer.IndexStatus index : status.indexes()) {
+                byName.put(index.name(), index);
+            }
+            assertEquals(byName.toString(), 4, byName.size());
+            LanceIndexWarmer.IndexStatus fts = byName.get("body_fts");
+            assertEquals(fts.toString(), State.SKIPPED, fts.state());
+            assertTrue(
+                fts.detail(),
+                fts.detail().startsWith("estimate [" + NativeMemoryLimit.humanReadable(PROBE_ESTIMATE) + "] exceeds available")
+            );
+            assertEquals(State.DONE, byName.get("rating_btree").state());
+            assertEquals(State.DONE, byName.get("category_bitmap").state());
+            assertEquals(State.DONE, byName.get("embedding_ivf").state());
+            appender.assertAllExpectationsMatched();
+        }
+        // The decision is recorded as the warm up's, under fts.
+        assertEquals("fts", ScanAdmission.lastKind());
+        assertEquals("warm_up", ScanAdmission.lastSource());
+        assertEquals(PROBE_ESTIMATE, ScanAdmission.lastEstimateBytes());
+        assertEquals(rejectedBefore + 1, ScanAdmission.rejections(ScanAdmission.Kind.FTS));
+        warmer.close();
+    }
+
+    public void testAdmittedInvertedProbeRunsAndIsCreditedToTheRetainedPool() throws Exception {
+        // The same estimate against a reading of 100 GiB is admitted;
+        // the probe's scan completes at a scripted 90 GiB, so the pool
+        // records the drop clamped to the estimate, and the next
+        // decision would be credited that much.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setAvailableMemoryOverride(List.of("100gb", "90gb"));
+        long rejectedBefore = ScanAdmission.rejections(ScanAdmission.Kind.FTS);
+        LanceIndexWarmer warmer = new LanceIndexWarmer(cache, executor, Mode.METADATA);
+        warmer.schedule(indexMetadata("warm-admit"));
+        TableStatus status = awaitFinished(warmer, "warm-admit");
+        assertEquals(status.toString(), State.DONE, status.state());
+        for (LanceIndexWarmer.IndexStatus index : status.indexes()) {
+            assertEquals(index.toString(), State.DONE, index.state());
+        }
+        assertEquals("fts", ScanAdmission.lastKind());
+        assertEquals("warm_up", ScanAdmission.lastSource());
+        assertEquals(PROBE_ESTIMATE, ScanAdmission.lastEstimateBytes());
+        assertEquals(rejectedBefore, ScanAdmission.rejections(ScanAdmission.Kind.FTS));
+        // The probe's request ended on the warm up thread, so the pool
+        // is credited: 10 GiB dropped, clamped to what was admitted.
+        assertEquals(PROBE_ESTIMATE, ScanAdmission.retainedCreditBytes());
         warmer.close();
     }
 

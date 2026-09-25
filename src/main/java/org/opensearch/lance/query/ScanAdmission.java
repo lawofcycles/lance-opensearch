@@ -69,7 +69,11 @@ import org.opensearch.secure_sm.AccessController;
  * memory plus the memory earlier admitted scans retained, minus a
  * headroom, must hold it, else the request is refused with
  * {@link CircuitBreakingException} (HTTP 429) under the label
- * {@link #LABEL}. An estimate that fits the index cache shard share is
+ * {@link #LABEL}. The metadata warm up's full text probe is judged by
+ * the same decision through {@link #admitWarmUpProbe}, and skipped
+ * instead of refused because no request waits for it ({@link Source}
+ * tells the two apart in the stats). An estimate that fits the index
+ * cache shard share is
  * zero: for the cached kinds because a fitting entry is loaded once and
  * kept, for the scan kinds because buffers smaller than one shard of the
  * cache the node already dedicates to Lance are within its sizing. Heap
@@ -163,6 +167,36 @@ public final class ScanAdmission {
             return description;
         }
     }
+
+    /**
+     * Where a decision came from. The key is the one the stats block
+     * ({@code admission.last_source}) uses.
+     */
+    public enum Source {
+        /** A gated path of a search request; a refusal answers 429. */
+        REQUEST("request"),
+        /** The metadata warm up's full text probe; a refusal skips the probe. */
+        WARM_UP("warm_up");
+
+        private final String key;
+
+        Source(String key) {
+            this.key = key;
+        }
+
+        /** The stats key: {@code request} or {@code warm_up}. */
+        public String key() {
+            return key;
+        }
+    }
+
+    /**
+     * The shape the metadata warm up's full text probe is judged as: a
+     * bounded page of one row ({@code match(<token>) limit 1}). The
+     * probe rebuilds the same document set a query does, so its
+     * estimate is the {@link Kind#FTS} one for that page.
+     */
+    public static final Shape WARM_UP_PROBE_SHAPE = new Shape(true, false, 1L);
 
     /**
      * Native bytes one returned row of the hits scan occupies in its
@@ -346,6 +380,9 @@ public final class ScanAdmission {
 
     /** Kind of the last decision, admitted or not; {@code null} before the first. */
     private static final AtomicReference<Kind> LAST_KIND = new AtomicReference<>();
+
+    /** Source of the last decision, admitted or not; {@code null} before the first. */
+    private static final AtomicReference<Source> LAST_SOURCE = new AtomicReference<>();
 
     /** Guards {@link #POOL}, {@link #inFlight} and {@link #activeScans}. */
     private static final Object LOCK = new Object();
@@ -647,6 +684,16 @@ public final class ScanAdmission {
     public static String lastKind() {
         Kind kind = LAST_KIND.get();
         return kind == null ? "none" : kind.key();
+    }
+
+    /**
+     * Source key of the last decision on this node ({@code request} or
+     * {@code warm_up}), {@code "none"} before the first, for
+     * {@code GET /_lance/stats}.
+     */
+    public static String lastSource() {
+        Source source = LAST_SOURCE.get();
+        return source == null ? "none" : source.key();
     }
 
     /**
@@ -1012,15 +1059,16 @@ public final class ScanAdmission {
 
     /**
      * The {@link Kind#VECTOR_INDEX} estimate of a nearest scan that
-     * probes {@code nprobes} of the index's {@code partitions}
-     * (0 when the partition count is not known) with {@code k ×
-     * refineFactor} candidates over {@code dimension} components:
+     * probes {@code nprobes} of the index's {@code partitions} (the
+     * table statistics' {@code num_partitions}, 0 when they report
+     * none) with {@code k × refineFactor} candidates over
+     * {@code dimension} components:
      *
      * <ul>
      *   <li>the probed partitions: the index's bytes scaled by
      *       {@code nprobes / partitions} (the whole index when the count
-     *       is unknown, since the plugin cannot tell how much of it the
-     *       probes touch), times {@link #IVF_PARTITION_LOAD_FACTOR} for
+     *       is unknown, since the plugin cannot then tell how much of it
+     *       the probes touch), times {@link #IVF_PARTITION_LOAD_FACTOR} for
      *       the read then concatenated copy of each partition;</li>
      *   <li>the refine step: {@code k × refineFactor × dimension × 4}
      *       bytes of full vectors read back when {@code refineFactor} is
@@ -1545,7 +1593,10 @@ public final class ScanAdmission {
      * Gate the nearest scan of {@code column} over {@code dataset}: the
      * {@link Kind#VECTOR_INDEX} load of the partitions it probes.
      * {@code nprobes} and {@code refineFactor} are the query's (0 for
-     * Lance's defaults), {@code dimension} the vector column's.
+     * Lance's defaults), {@code dimension} the vector column's. The
+     * partition count comes from the table statistics
+     * ({@link ColumnStatistics.IndexSummary#partitions}); when they
+     * report none the whole index is taken as probed.
      */
     public static void admitVectorSearch(
         String indexName,
@@ -1565,8 +1616,9 @@ public final class ScanAdmission {
         Optional<ColumnStatistics.IndexSummary> index = statistics.flatMap(s -> vectorIndexFor(column, s));
         long tableRows = tableRows(statistics);
         OptionalLong size = index.isPresent() ? index.get().sizeBytes() : OptionalLong.empty();
+        long partitions = index.isPresent() ? index.get().partitions().orElse(0L) : 0L;
         int probes = nprobes > 0 ? nprobes : 1;
-        long estimate = vectorIndexEstimateBytes(size, tableRows, probes, 0L, k, refineFactor, dimension, shardShare);
+        long estimate = vectorIndexEstimateBytes(size, tableRows, probes, partitions, k, refineFactor, dimension, shardShare);
         String what = "nearest scan on ["
             + column
             + "] over ["
@@ -1577,7 +1629,8 @@ public final class ScanAdmission {
             + NativeMemoryLimit.humanReadable(size.orElse(tableRows * VECTOR_INDEX_BYTES_PER_ROW))
             + "] probed with nprobes "
             + probes
-            + " over an unknown partition count, loaded twice while its partitions are concatenated, against an index cache shard of ["
+            + (partitions > 0L ? " over " + partitions + " partitions" : " over an unknown partition count")
+            + ", loaded twice while its partitions are concatenated, against an index cache shard of ["
             + NativeMemoryLimit.humanReadable(shardShare)
             + "]";
         String remedy = "Lower nprobes, attach the table to a node with a larger index cache, or relax lance.admission.headroom / "
@@ -1665,14 +1718,36 @@ public final class ScanAdmission {
     public static void recordColumnLoad(long bytes, boolean refused) {
         LAST_ESTIMATE_BYTES.set(Math.max(0L, bytes));
         LAST_KIND.set(Kind.COLUMN_LOAD);
+        LAST_SOURCE.set(Source.REQUEST);
         if (refused) {
             REJECTIONS.get(Kind.COLUMN_LOAD).incrementAndGet();
         }
     }
 
     /**
-     * Judge one path: read the available memory and the credit, decide,
-     * record, and either throw the 429 or count the admission in flight.
+     * Judge the metadata warm up's full text probe over a table of
+     * {@code rows} physical rows: the {@link Kind#FTS} estimate of
+     * {@link #WARM_UP_PROBE_SHAPE}, the same formula a request's
+     * bounded page is judged on, recorded under {@link Source#WARM_UP}.
+     * Nothing is thrown: the warm up has no caller to answer 429 to, so
+     * a refusal is returned as a {@link Decision} that is not admitted
+     * (and counted as an {@code fts} rejection) and the caller skips the
+     * probe. An admitted non zero estimate is counted in flight on the
+     * calling thread like a ticketless request: the caller brackets the
+     * probe's scan with {@link #scanStarted} and {@link #scanFinished}
+     * and ends it with {@link #requestEnded()}, so what the probe leaves
+     * behind is credited to the retained pool.
+     */
+    public static Decision admitWarmUpProbe(long rows) {
+        long shardShare = shardShareBytes();
+        long estimate = ftsEstimateBytes(rows, scanBufferEstimateBytes(rows, WARM_UP_PROBE_SHAPE), shardShare);
+        return judge(Kind.FTS, Source.WARM_UP, estimate, 0L, Long.MAX_VALUE, null);
+    }
+
+    /**
+     * Judge one path of a request: read the available memory and the
+     * credit, decide, record, and either throw the 429 or count the
+     * admission in flight.
      */
     private static void judge(
         Kind kind,
@@ -1683,18 +1758,41 @@ public final class ScanAdmission {
         String remedy,
         LanceHitsAccounting ticket
     ) {
+        Decision decision = judge(kind, Source.REQUEST, estimateBytes, heapEstimateBytes, heapAvailableBytes, ticket);
+        if (!decision.admitted()) {
+            throw rejection(kind, decision, heapAvailableBytes, headroomBytes, what, remedy);
+        }
+    }
+
+    /**
+     * Judge one path from {@code source}: read the available memory and
+     * the credit, decide, record the estimate, kind and source, count a
+     * refusal under the kind, and count an admitted non zero estimate in
+     * flight. Returns the decision; the caller answers a refusal as its
+     * source requires.
+     */
+    private static Decision judge(
+        Kind kind,
+        Source source,
+        long estimateBytes,
+        long heapEstimateBytes,
+        long heapAvailableBytes,
+        LanceHitsAccounting ticket
+    ) {
         long availableNow = readAvailableMemoryNow();
         long credit = retainedCreditBytes(availableNow);
         Decision decision = decide(estimateBytes, heapEstimateBytes, availableNow, heapAvailableBytes, enabled, headroomBytes, credit);
         LAST_ESTIMATE_BYTES.set(decision.estimateBytes());
         LAST_KIND.set(kind);
+        LAST_SOURCE.set(source);
         if (!decision.admitted()) {
             REJECTIONS.get(kind).incrementAndGet();
-            throw rejection(kind, decision, heapAvailableBytes, headroomBytes, what, remedy);
+            return decision;
         }
         if (decision.estimateBytes() > 0L) {
             countInFlight(availableNow, decision.estimateBytes(), ticket);
         }
+        return decision;
     }
 
     /**
@@ -1892,6 +1990,7 @@ public final class ScanAdmission {
         }
         LAST_ESTIMATE_BYTES.set(0L);
         LAST_KIND.set(null);
+        LAST_SOURCE.set(null);
         ADMITTED_ON_THREAD.remove();
         synchronized (LOCK) {
             POOL.reset();

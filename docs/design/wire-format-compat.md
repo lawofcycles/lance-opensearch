@@ -53,7 +53,8 @@ the fallback is merely slower or less informative. `FragmentPlan` marks its Subs
 critical only while a filter is set, because an older data node that ignored the filter would scan
 without the predicate and answer wrongly, and marks its pruning block optional, because an older
 node that scans the pruned fragments too still answers correctly. `LanceNodeStats` marks its
-pruned fragment counter optional, because an older coordinator merely shows the stats without it.
+pruned fragment counter and its admission source optional, because an older coordinator merely
+shows the stats without them.
 
 A block is decoded from a stream of its own bytes, so a parser that leaves bytes of the block
 unread fails the message with `<Message> wire version block [n] left k bytes unread` rather than
@@ -113,8 +114,9 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 2 | Base: index, route (`fragment` or `unsupported`), optional logical and physical text, optional fragment plan, optional unplanned message, refinements, optional traits |
 | `LanceFragmentQueryRequest` | 1 | Base: table URI, index name, storage options, pinned version, the fragment plan, optional query and post filter, sorts, search after, size, aggregations, fragment ids, track scores, track total hits up to, min score, terminate after, hit projection, rescores, collapse |
 | `LanceFragmentQueryResponse` | 1 | Base: matched, matched is lower bound, fragment count, hits, row addresses, aggregations, terminated early |
-| `LanceNodeStats` | 1 | Base: every figure of the node stats but the pruned fragment counter, then the freshness stats |
+| `LanceNodeStats` | 1 | Base: every figure of the node stats but the pruned fragment counter and the admission source, then the freshness stats |
 | | 2 | Block, optional: pruned fragment counter (fallback zero) |
+| | 3 | Block, optional: source of the last admission decision (`request` or `warm_up`; fallback `none`) |
 | `LanceStatsNodeRequest` | 1 | Base: nothing after the marker |
 | `LanceBuildIndexesNodeRequest` | 1 | Base: the build request, the source version |
 | `LanceBuildIndexesNodeResponse` | 1 | Base: the three kind results, the status, the optional mapping JSON |

@@ -49,9 +49,10 @@ import java.util.Set;
  * BTree reports {@code num_pages}, {@code min} and {@code max}; a
  * bitmap {@code num_bitmaps}; an inverted index {@code num_tokens},
  * {@code num_docs} and {@code params}; a zone map {@code num_zones} and
- * {@code rows_per_zone}; an IVF vector index its partition sizes,
- * sub index and quantizer metadata. Only the row figures and the
- * bitmap's {@code num_bitmaps} are read here. An index whose statistics
+ * {@code rows_per_zone}; an IVF vector index {@code num_partitions},
+ * its partition sizes, sub index and quantizer metadata. Only the row
+ * figures, the bitmap's {@code num_bitmaps} and the IVF index's
+ * {@code num_partitions} are read here. An index whose statistics
  * Lance cannot produce is recorded with the figures empty and
  * {@code statisticsAvailable} false; the collection as a whole still
  * succeeds.
@@ -194,33 +195,41 @@ public final class TableStatisticsCollector {
             parsed.indexedRows(),
             parsed.unindexedRows(),
             parsed.distinctCount(),
+            parsed.partitions(),
             true
         );
     }
 
     /** The figures read out of one {@code getIndexStatistics} answer, and the index type it names. */
-    record ParsedStatistics(Optional<IndexType> type, OptionalLong indexedRows, OptionalLong unindexedRows, OptionalLong distinctCount) {
+    record ParsedStatistics(Optional<IndexType> type, OptionalLong indexedRows, OptionalLong unindexedRows, OptionalLong distinctCount,
+        OptionalLong partitions) {
     }
 
     /**
-     * Read the index type, the row figures and, for a bitmap index, the
-     * distinct value estimate out of the map {@code getIndexStatistics}
-     * returned. The map's {@code index_type} names the concrete type
+     * Read the index type, the row figures, for a bitmap index the
+     * distinct value estimate and for an IVF vector index the partition
+     * count out of the map {@code getIndexStatistics} returned. The
+     * map's {@code index_type} names the concrete type
      * ({@code IVF_PQ}, {@code BTree}, {@code ZoneMap}, ...) where the
      * manifest entry behind {@code Dataset.getIndexes()} only says
      * {@code VECTOR} for every vector index, so it replaces
-     * {@code declared} when it maps to an {@link IndexType}. A missing
-     * or non numeric entry leaves its figure empty; a {@code null} map
-     * leaves all of them empty and the type as declared.
+     * {@code declared} when it maps to an {@link IndexType}. The
+     * partition count is the smallest {@code num_partitions} of the
+     * deltas under {@code indices}: a nearest scan probes the same
+     * number of partitions in every delta, so the smallest count bounds
+     * the share of the index the probes load. A missing or non numeric
+     * entry leaves its figure empty; a {@code null} map leaves all of
+     * them empty and the type as declared.
      */
     static ParsedStatistics readStatistics(Map<String, Object> raw, Optional<IndexType> declared) {
         if (raw == null) {
-            return new ParsedStatistics(declared, OptionalLong.empty(), OptionalLong.empty(), OptionalLong.empty());
+            return new ParsedStatistics(declared, OptionalLong.empty(), OptionalLong.empty(), OptionalLong.empty(), OptionalLong.empty());
         }
         Optional<IndexType> type = indexType(raw.get("index_type")).or(() -> declared);
         OptionalLong indexedRows = longValue(raw.get("num_indexed_rows"));
         OptionalLong unindexedRows = longValue(raw.get("num_unindexed_rows"));
         OptionalLong distinct = OptionalLong.empty();
+        OptionalLong partitions = OptionalLong.empty();
         if (type.isPresent() && type.get() == IndexType.BITMAP && raw.get("indices") instanceof List<?> deltas) {
             long bitmaps = 0L;
             boolean any = false;
@@ -237,7 +246,24 @@ public final class TableStatisticsCollector {
                 distinct = OptionalLong.of(bitmaps);
             }
         }
-        return new ParsedStatistics(type, indexedRows, unindexedRows, distinct);
+        if (type.isPresent() && isVectorIndex(type.get()) && raw.get("indices") instanceof List<?> deltas) {
+            for (Object delta : deltas) {
+                if (delta instanceof Map<?, ?> deltaMap) {
+                    OptionalLong count = longValue(deltaMap.get("num_partitions"));
+                    if (count.isPresent()
+                        && count.getAsLong() > 0L
+                        && (partitions.isEmpty() || count.getAsLong() < partitions.getAsLong())) {
+                        partitions = count;
+                    }
+                }
+            }
+        }
+        return new ParsedStatistics(type, indexedRows, unindexedRows, distinct, partitions);
+    }
+
+    /** Whether {@code type} is a vector index ({@code VECTOR} or any {@code IVF_*}), whose statistics carry a partition count. */
+    private static boolean isVectorIndex(IndexType type) {
+        return type == IndexType.VECTOR || type.name().startsWith("IVF");
     }
 
     /**

@@ -44,6 +44,7 @@ import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
+import org.opensearch.lance.query.ScanAdmission;
 
 /**
  * Reads the indexes of a Lance table into this node's shared Lance
@@ -78,7 +79,12 @@ import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
  * snapshot's dataset. Requests never wait for a warm-up: they run their
  * own lazy load and Lance's cache reconciles the two. A failing index
  * is logged at WARN and the task moves to the next index; nothing here
- * can fail a request.
+ * can fail a request. The full-text probe is the one warm-up scan that
+ * can allocate what the node cannot hold (it rebuilds the index's
+ * document set), so it is judged by {@link ScanAdmission} first and
+ * skipped with a WARN when its estimate does not fit; an admitted probe
+ * is bracketed like a request's scan so the gate's retained pool
+ * accounts for what it leaves behind.
  */
 public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
 
@@ -90,7 +96,12 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
     /**
      * Token the full-text probe searches for. It should match nothing:
      * Lance loads the token dictionaries to look it up (the index open)
-     * and reads no posting list.
+     * and reads no posting list. A legacy single file index still loads
+     * its whole document set on the open, and a partitioned index
+     * written without per partition corpus statistics reads every
+     * partition's document lengths before the lookup, so the probe is
+     * judged by the admission gate before it runs (see
+     * {@link ScanAdmission#admitWarmUpProbe}).
      */
     static final String FTS_PROBE_TOKEN = "lancewarmupprobe";
 
@@ -148,7 +159,11 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
         RUNNING,
         DONE,
         FAILED,
-        /** The mode was {@code none}, or the index type has no warm-up scan. */
+        /**
+         * The mode was {@code none}, the index type has no warm-up scan,
+         * or the admission gate found the full-text probe's estimate
+         * does not fit the node's available memory.
+         */
         SKIPPED,
         /** The index was deleted before the warm-up finished. */
         CANCELLED;
@@ -400,12 +415,16 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
                 }
             }
             boolean anyFailed = false;
+            long tableRows = 0L;
+            for (LanceWarmCache.FragmentMeta fragment : lease.snapshot().fragments()) {
+                tableRows += fragment.physicalRows();
+            }
             for (IndexDescription description : descriptions) {
                 if (task.cancelled.get() || closed) {
                     task.finish(State.CANCELLED);
                     return;
                 }
-                IndexStatus status = warmIndex(dataset, description, fieldsById, task, effective, detail);
+                IndexStatus status = warmIndex(dataset, description, fieldsById, task, effective, detail, tableRows);
                 task.record(status);
                 anyFailed |= status.state() == State.FAILED;
             }
@@ -435,7 +454,8 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
         Map<Integer, LanceField> fieldsById,
         Task task,
         Mode effective,
-        String detail
+        String detail,
+        long tableRows
     ) {
         String name = description.getName();
         String type = description.getIndexType();
@@ -452,7 +472,41 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
             if (options == null) {
                 return new IndexStatus(name, type, column, State.SKIPPED, 0d, "no warm-up scan for index type " + type);
             }
-            drain(dataset, options);
+            if (isInverted(type)) {
+                // The probe makes Lance rebuild the index's document
+                // set whole, the allocation the admission gate exists
+                // to keep off a node that cannot hold it, so it is
+                // judged like a request's full text page. Refused, the
+                // probe is skipped: no request waits for it, and the
+                // first real full text query is gated on its own.
+                ScanAdmission.Decision decision = ScanAdmission.admitWarmUpProbe(tableRows);
+                if (!decision.admitted()) {
+                    String reason = "estimate ["
+                        + NativeMemoryLimit.humanReadable(decision.estimateBytes())
+                        + "] exceeds available ["
+                        + NativeMemoryLimit.humanReadable(Math.max(0L, decision.availableBytes()))
+                        + "] minus headroom ["
+                        + NativeMemoryLimit.humanReadable(ScanAdmission.headroomBytes())
+                        + "] plus ["
+                        + NativeMemoryLimit.humanReadable(decision.retainedCreditBytes())
+                        + "] retained by earlier admitted scans";
+                    LOGGER.warn("skipped the inverted index warm up of [{}] [{}]: {}", task.indexName, column, reason);
+                    return new IndexStatus(name, type, column, State.SKIPPED, 0d, reason);
+                }
+                // Admitted: bracket the scan as every gated scan does
+                // so the pool samples what the probe leaves behind, and
+                // release the in flight count the admission took on
+                // this thread.
+                ScanAdmission.scanStarted();
+                try {
+                    drain(dataset, options);
+                } finally {
+                    ScanAdmission.scanFinished();
+                    ScanAdmission.requestEnded();
+                }
+            } else {
+                drain(dataset, options);
+            }
             double seconds = (System.nanoTime() - startNanos) / 1e9;
             LOGGER.info(
                 "warmed index [{}] ({} on {}) of [{}] in {} s, mode {}{}",
@@ -516,6 +570,11 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
                 }
                 return null;
         }
+    }
+
+    /** Whether {@code indexType} names an inverted (full-text) index, whichever way Lance spells it. */
+    static boolean isInverted(String indexType) {
+        return indexType != null && indexType.replace("_", "").toUpperCase(Locale.ROOT).equals("INVERTED");
     }
 
     /** Dimension of a {@code FixedSizeList<float32>} column, or 0 for any other type. */
