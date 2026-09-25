@@ -225,6 +225,20 @@ public class CostModelTests extends OpenSearchTestCase {
         CostInputs local = CostInputs.local(16);
         assertTrue(CostModel.luceneAggregateMillis(local, bare) < CostModel.pushedAggregateMillis(local, bare));
         assertTrue(CostModel.pushedAggregateMillis(local, withAvg) < CostModel.luceneAggregateMillis(local, withAvg));
+        // The metric under the key is charged per bucket on top of the
+        // metric itself and its column: the Lucene side moves by at
+        // least the bucket metric term over the rows one slice collects.
+        double mrowThread = 2e7 / local.slices() / 1e6;
+        double added = CostModel.luceneAggregateMillis(local, withAvg) - CostModel.luceneAggregateMillis(local, bare);
+        assertTrue(
+            "the avg under the terms adds " + added + " ms on the Lucene side",
+            added >= CostCoefficients.LUCENE_BUCKET_METRIC_MS_PER_MROW_THREAD * mrowThread
+        );
+        // The same metric with no bucket key above it pays the metric term alone.
+        AggregateProfile avgAlone = new AggregateProfile(2e7, 1, 1, true, 1, 4, 1, 0, 0, 0, 0, 0, 0, false, 1, false, false, false, 0, 1.0);
+        AggregateProfile nothing = new AggregateProfile(2e7, 1, 1, true, 1, 4, 1, 0, 0, 0, 0, 0, 0, false, 0, false, false, false, 0, 1.0);
+        double alone = CostModel.luceneAggregateMillis(local, avgAlone) - CostModel.luceneAggregateMillis(local, nothing);
+        assertEquals(CostCoefficients.LUCENE_SIMPLE_METRIC_MS_PER_MROW_THREAD * mrowThread, alone, 1e-9);
     }
 
     public void testTenMillionDistinctTermsStayPushedOverS3WithSlices() {
@@ -287,6 +301,53 @@ public class CostModelTests extends OpenSearchTestCase {
             CostInputs s3 = new CostInputs(nodes, StorageKind.OBJECT_STORE, 16, 8, 8);
             assertTrue(nodes + " nodes", CostModel.pushedAggregateMillis(s3, filtered) < CostModel.luceneAggregateMillis(s3, filtered));
         }
+        // The row address set of the filter is charged per matching row
+        // of the whole table, so raising the selectivity from 5 % to
+        // 100 % on one node adds at least that term over the 950
+        // million rows that join the match, on top of the per thread
+        // string key the same rows pay.
+        CostInputs oneNode = new CostInputs(1, StorageKind.OBJECT_STORE, 16, 8, 8);
+        AggregateProfile sparse = withSelectivity(filtered, 0.05);
+        AggregateProfile dense = withSelectivity(filtered, 0.999);
+        double added = CostModel.pushedAggregateMillis(oneNode, dense) - CostModel.pushedAggregateMillis(oneNode, sparse);
+        double matchingMrows = 1e9 * (0.999 - 0.05) / 1e6;
+        double keyPerThread = CostCoefficients.PUSHED_STRING_KEY_MS_PER_MROW_THREAD * matchingMrows / oneNode.pushdownParallelism();
+        assertEquals(
+            "the matching rows add " + added + " ms to the pushed scan",
+            CostCoefficients.PUSHED_FILTER_MATCH_MS_PER_MROW * matchingMrows,
+            added - keyPerThread,
+            1e-6
+        );
+        // Six nodes hold a sixth of the rows each but the same match set:
+        // the term does not shrink with the node count.
+        CostInputs sixNodes = new CostInputs(6, StorageKind.OBJECT_STORE, 16, 8, 8);
+        double addedOnSix = CostModel.pushedAggregateMillis(sixNodes, dense) - CostModel.pushedAggregateMillis(sixNodes, sparse);
+        assertTrue(addedOnSix >= CostCoefficients.PUSHED_FILTER_MATCH_MS_PER_MROW * matchingMrows);
+    }
+
+    private static AggregateProfile withSelectivity(AggregateProfile p, double selectivity) {
+        return new AggregateProfile(
+            p.tableRows(),
+            p.groups(),
+            p.mergedGroups(),
+            p.groupsKnown(),
+            p.columnsRead(),
+            p.bytesPerRow(),
+            p.scanPasses(),
+            p.stringKeys(),
+            p.numericKeys(),
+            p.dateKeys(),
+            p.rangeKeys(),
+            p.filterKeys(),
+            p.compositeDateKeys(),
+            p.composite(),
+            p.simpleMetrics(),
+            p.extendedStats(),
+            p.percentiles(),
+            p.cardinality(),
+            p.cardinalityDistinct(),
+            selectivity
+        );
     }
 
     public void testCardinalityStaysOnTheAggregators() {
