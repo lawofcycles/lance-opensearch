@@ -229,20 +229,27 @@ or more (`CostCoefficients.FITTED_MODEL_MIN_ROWS`), the pushed scan and the Luce
 operator are each priced by `plan/cost/CostModel` as a sum of coefficient times quantity terms: a
 fixed cost per request, an object store open latency when the table URI is `s3://`, `gs://`,
 `az://` or the like, the per row work of every thread (the table's rows divided by the fan out
-node count and by the path's parallelism) with one coefficient per kind of group key and metric,
-the object store transfer of the columns the scan reads (per node, not per thread), a hash table
-penalty above a million groups, and the executor's merge of its parallel scans' group rows. The
-coefficients live in `plan/cost/CostCoefficients.java`; they were fitted by non negative least
-squares to the warm latencies measured on the 20M, 100M and 1B row benchmark tables across one to
-six node clusters, `scripts/fit-cost-coefficients.py` reproduces the fit from
-`src/test/resources/cost/measurements.csv`, and `CostModelTests` holds the model to the measured
-choices. Below a million rows, and for every hits tree at every size (sorted pages, full text,
-vector), the operators keep placeholder costs: the scan charges its estimated rows (or its groups
-for a pushed aggregate) as milliseconds, the Lucene operators a constant pinned above the pushed
-form so the pushed form wins whenever a rule folds the tree, and a tree with a `cardinality`
-metric carries a placeholder penalty on the pushed side so the small table choice matches the
-fitted model's choice on the large ones. A `LanceTableScan` with no pushed operation over a table
-in the fitted range costs zero, because the Lucene operator above it carries the whole charge.
+node count and by the path's parallelism) with one coefficient per kind of group key and metric
+(a metric under a bucket key costs more than the same metric alone, since the aggregator
+addresses its arrays per bucket ordinal), the object store transfer of the columns the scan reads
+(per node, not per thread), a hash table penalty above a million groups (per thread on the pushed
+scan, per node on the aggregators, whose slices compete for the node's memory), the row address
+set a pushed filter materialises from its scalar index (per matching row of the whole table, since
+the index covers the table on every node), and the executor's merge of its parallel scans' group
+rows. The coefficients live in `plan/cost/CostCoefficients.java`; they were fitted by non negative
+least squares to the warm latencies measured on the 20M, 100M and 1B row benchmark tables across
+one to six node clusters, including both paths of `terms` over a ten million value key, of a
+filtered `terms`, of `terms` with a metric under it and of `cardinality` over a low cardinality
+key on four and six nodes at 1B rows and on one node at 20M rows. `scripts/fit-cost-coefficients.py`
+reproduces the fit from `src/test/resources/cost/measurements.csv`, and `CostModelTests` holds the
+model to the measured choices. Below a million rows, and for every hits tree at every size (sorted
+pages, full text, vector), the operators keep placeholder costs: the scan charges its estimated
+rows (or its groups for a pushed aggregate) as milliseconds, the Lucene operators a constant
+pinned above the pushed form so the pushed form wins whenever a rule folds the tree, and a tree
+with a `cardinality` metric carries a placeholder penalty on the pushed side so the small table
+choice matches the fitted model's choice on the large ones. A `LanceTableScan` with no pushed
+operation over a table in the fitted range costs zero, because the Lucene operator above it
+carries the whole charge.
 
 The quantities come from the tree and from the table statistics the planner collects once per
 manifest version from Lance metadata (rows, deleted rows, the bitmap distinct count of a terms
