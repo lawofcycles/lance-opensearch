@@ -55,6 +55,11 @@ public class CostCoefficientsTests extends OpenSearchTestCase {
     public void testStructuralConstants() {
         assertEquals(1_000_000L, CostCoefficients.FITTED_MODEL_MIN_ROWS);
         assertEquals(1_000_000L, CostCoefficients.LARGE_GROUPS);
+        assertEquals(
+            "one bit per ordinal under a quarter of a precision 14 sketch",
+            (1L << 14) / 4 * 8,
+            CostCoefficients.LUCENE_CARDINALITY_ORDINALS_MAX_DISTINCT
+        );
         assertTrue(CostCoefficients.DICTIONARY_STRING_BYTES_PER_ROW < CostCoefficients.STRING_BYTES_PER_ROW);
         assertTrue(CostCoefficients.TERMS_TOP_K_RETENTION_FACTOR >= 1);
     }

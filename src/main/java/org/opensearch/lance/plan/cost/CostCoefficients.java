@@ -18,7 +18,8 @@ import java.util.Map;
  * unit. "Per Mrow thread" means per million rows one thread processes:
  * the per node row share divided by the path's parallelism (the pushed
  * scan's {@code pushdown_parallelism}, the aggregator path's
- * {@code slices}).
+ * {@code slices}); "per Mrow node" per million rows one node holds,
+ * and "per Mrow" per million rows of the whole table.
  *
  * <p>The structural constants at the end are not fitted: they are the
  * assumptions the model makes where the statistics carry no figure, and
@@ -61,8 +62,19 @@ public final class CostCoefficients {
     public static final double PUSHED_LARGE_GROUPS_MS_PER_MROW_THREAD = 140;
     /** Evaluating a query filter inside the scan, over every row. */
     public static final double PUSHED_FILTER_EVAL_MS_PER_MROW_THREAD = 65;
+    /**
+     * Materialising the row address set the filter's scalar index
+     * answers with, per million matching rows of the whole table: the
+     * index covers the table, so every node reads the full set whatever
+     * its share of the rows, and the parallel scans of a node share it.
+     * The 1B filtered aggregate measured 7.0 s on one node, 4.3 s on
+     * four and 3.8 s on six, a floor the per thread terms cannot reach.
+     */
+    public static final double PUSHED_FILTER_MATCH_MS_PER_MROW = 17;
     /** Merging the group rows the parallel scans of one node return, per million rows merged. */
     public static final double PUSHED_MERGE_MS_PER_MGROUP = 460;
+    /** Hashing every row's value into the HyperLogLog++ sketch, the same work as a string group key. */
+    public static final double PUSHED_CARDINALITY_HASH_MS_PER_MROW_THREAD = 19;
     /** Feeding distinct values into the HyperLogLog++ sketch on one thread, per million values. */
     public static final double PUSHED_CARDINALITY_MS_PER_MVALUE = 310;
 
@@ -86,14 +98,29 @@ public final class CostCoefficients {
     public static final double LUCENE_NESTED_LEVEL_MS_PER_MROW_THREAD = 35;
     /** One sum / avg / min / max / value_count / stats metric. */
     public static final double LUCENE_SIMPLE_METRIC_MS_PER_MROW_THREAD = 3.7;
+    /**
+     * One simple metric collected under a bucket key, on top of the
+     * metric's own cost: the bucket aggregator hands every row to the
+     * metric with its bucket ordinal, so the metric's arrays are
+     * addressed per bucket rather than accumulated in place. On the 20M
+     * table a terms(category) alone collected in 38 ms and with an
+     * avg or sum under it in 146 to 201 ms.
+     */
+    public static final double LUCENE_BUCKET_METRIC_MS_PER_MROW_THREAD = 32;
     /** One extended_stats metric. */
     public static final double LUCENE_EXTENDED_STATS_MS_PER_MROW_THREAD = 18;
     /** One percentiles / percentile_ranks TDigest. */
     public static final double LUCENE_PERCENTILES_MS_PER_MROW_THREAD = 97;
-    /** One cardinality HyperLogLog++. */
+    /** One cardinality HyperLogLog++ hashing every row's value; see {@link #LUCENE_CARDINALITY_ORDINALS_MAX_DISTINCT}. */
     public static final double LUCENE_CARDINALITY_MS_PER_MROW_THREAD = 130;
-    /** Hash table misses once the groups exceed {@link #LARGE_GROUPS}. */
-    public static final double LUCENE_LARGE_GROUPS_MS_PER_MROW_THREAD = 150;
+    /**
+     * Hash table misses once the groups exceed {@link #LARGE_GROUPS},
+     * per million rows one node holds rather than one thread: the
+     * slices' tables compete for the node's memory, and the measured
+     * terms over ten million distinct values ran only twice as fast
+     * with eight slices as with one, not eight times.
+     */
+    public static final double LUCENE_LARGE_GROUPS_MS_PER_MROW_NODE = 95;
     /** Evaluating a query filter on the Lucene side, over every row. */
     public static final double LUCENE_FILTER_EVAL_MS_PER_MROW_THREAD = 500;
 
@@ -109,6 +136,15 @@ public final class CostCoefficients {
     public static final long FITTED_MODEL_MIN_ROWS = 1_000_000L;
     /** Group count above which the per row hash table misses apply on both paths. */
     public static final long LARGE_GROUPS = 1_000_000L;
+    /**
+     * Distinct values above which the Lucene cardinality aggregator
+     * hashes every row's bytes instead of collecting ordinals. The
+     * aggregator takes the ordinals path when one bit per ordinal stays
+     * under a quarter of its precision 14 sketch (2^14 bytes), that is
+     * 2^14 / 4 bytes of bits, 32,768 ordinals; a numeric column always
+     * hashes, and cheaply, which the model does not tell apart.
+     */
+    public static final long LUCENE_CARDINALITY_ORDINALS_MAX_DISTINCT = 32_768L;
     /** Bytes per row assumed for a string column with a bitmap index (dictionary encoded). */
     public static final double DICTIONARY_STRING_BYTES_PER_ROW = 2;
     /** Bytes per row assumed for a string or binary column without one. */
@@ -177,7 +213,9 @@ public final class CostCoefficients {
         named.put("PUSHED_PERCENTILES_MS_PER_MROW_THREAD", PUSHED_PERCENTILES_MS_PER_MROW_THREAD);
         named.put("PUSHED_LARGE_GROUPS_MS_PER_MROW_THREAD", PUSHED_LARGE_GROUPS_MS_PER_MROW_THREAD);
         named.put("PUSHED_FILTER_EVAL_MS_PER_MROW_THREAD", PUSHED_FILTER_EVAL_MS_PER_MROW_THREAD);
+        named.put("PUSHED_FILTER_MATCH_MS_PER_MROW", PUSHED_FILTER_MATCH_MS_PER_MROW);
         named.put("PUSHED_MERGE_MS_PER_MGROUP", PUSHED_MERGE_MS_PER_MGROUP);
+        named.put("PUSHED_CARDINALITY_HASH_MS_PER_MROW_THREAD", PUSHED_CARDINALITY_HASH_MS_PER_MROW_THREAD);
         named.put("PUSHED_CARDINALITY_MS_PER_MVALUE", PUSHED_CARDINALITY_MS_PER_MVALUE);
         named.put("LUCENE_FIXED_MS", LUCENE_FIXED_MS);
         named.put("LUCENE_COLUMN_MS_PER_MROW_THREAD", LUCENE_COLUMN_MS_PER_MROW_THREAD);
@@ -188,10 +226,11 @@ public final class CostCoefficients {
         named.put("LUCENE_COMPOSITE_SOURCE_MS_PER_MROW_THREAD", LUCENE_COMPOSITE_SOURCE_MS_PER_MROW_THREAD);
         named.put("LUCENE_NESTED_LEVEL_MS_PER_MROW_THREAD", LUCENE_NESTED_LEVEL_MS_PER_MROW_THREAD);
         named.put("LUCENE_SIMPLE_METRIC_MS_PER_MROW_THREAD", LUCENE_SIMPLE_METRIC_MS_PER_MROW_THREAD);
+        named.put("LUCENE_BUCKET_METRIC_MS_PER_MROW_THREAD", LUCENE_BUCKET_METRIC_MS_PER_MROW_THREAD);
         named.put("LUCENE_EXTENDED_STATS_MS_PER_MROW_THREAD", LUCENE_EXTENDED_STATS_MS_PER_MROW_THREAD);
         named.put("LUCENE_PERCENTILES_MS_PER_MROW_THREAD", LUCENE_PERCENTILES_MS_PER_MROW_THREAD);
         named.put("LUCENE_CARDINALITY_MS_PER_MROW_THREAD", LUCENE_CARDINALITY_MS_PER_MROW_THREAD);
-        named.put("LUCENE_LARGE_GROUPS_MS_PER_MROW_THREAD", LUCENE_LARGE_GROUPS_MS_PER_MROW_THREAD);
+        named.put("LUCENE_LARGE_GROUPS_MS_PER_MROW_NODE", LUCENE_LARGE_GROUPS_MS_PER_MROW_NODE);
         named.put("LUCENE_FILTER_EVAL_MS_PER_MROW_THREAD", LUCENE_FILTER_EVAL_MS_PER_MROW_THREAD);
         return named;
     }

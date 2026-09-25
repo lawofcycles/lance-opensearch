@@ -99,6 +99,27 @@ public record AggregateProfile(double tableRows, double groups, double mergedGro
         return groups > CostCoefficients.LARGE_GROUPS;
     }
 
+    /** Whether any bucket key groups the rows: a metric under one is collected per bucket ordinal rather than in place. */
+    public boolean bucketed() {
+        return stringKeys + numericKeys + dateKeys + rangeKeys + filterKeys + compositeDateKeys > 0;
+    }
+
+    /** Simple metrics collected under a bucket key; zero for a metric only tree. */
+    public int bucketedMetrics() {
+        return bucketed() ? simpleMetrics : 0;
+    }
+
+    /**
+     * Whether the Lucene cardinality aggregator hashes every row's
+     * value: it does once the column's distinct values exceed
+     * {@link CostCoefficients#LUCENE_CARDINALITY_ORDINALS_MAX_DISTINCT},
+     * below that it collects ordinals into a bitset and hashes each
+     * distinct term once.
+     */
+    public boolean cardinalityHashesEveryRow() {
+        return cardinality && cardinalityDistinct > CostCoefficients.LUCENE_CARDINALITY_ORDINALS_MAX_DISTINCT;
+    }
+
     /** Terms, range, filter and date keys that are not composite sources: one aggregator level each on the Lucene side. */
     public int nestedLevels() {
         if (composite) {
