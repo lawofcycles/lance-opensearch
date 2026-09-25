@@ -50,7 +50,9 @@ import org.opensearch.lance.query.ScanAdmission;
  * executor left out of its scans because the shipped plan's zone map
  * pruning excluded them;
  * {@code freshness} the node's checks of the Lance backed shards it
- * holds against their tables ({@link FreshnessStats});
+ * holds against their tables ({@link FreshnessStats}), with the mapping
+ * updates the cluster manager refused per index under
+ * {@code mapping_errors};
  * {@code indices} the shard reader of every Lance-backed shard the node
  * hosts.
  *
@@ -62,16 +64,19 @@ import org.opensearch.lance.query.ScanAdmission;
  * previous plugin version steps over, so a mixed version cluster
  * answers {@code GET /_lance/stats} without that counter instead of
  * failing; version 3 added the source of the last admission decision
- * the same way, and an older coordinator shows it as {@code none}.
+ * the same way, and an older coordinator shows it as {@code none};
+ * version 4 added the freshness service's refused mapping updates per
+ * index as another such block, shown as empty by an older coordinator.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
     /**
      * The wire format's version, the first field written and the first
      * read; 2 added the pruned fragment counter, 3 the source of the
-     * last admission decision.
+     * last admission decision, 4 the refused mapping updates of the
+     * freshness checks.
      */
-    public static final int WIRE_VERSION = 3;
+    public static final int WIRE_VERSION = 4;
 
     private final boolean cacheEnabled;
     private final int snapshotCount;
@@ -148,14 +153,37 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * how many mapping updates were sent and how many were skipped
      * because the derived mapping equalled the current one, how many
      * indexes were rebuilt for a keyword to lance_text flip, how many
-     * checks failed, and when the last check ran (epoch millis, 0 when
-     * none ran).
+     * checks failed, when the last check ran (epoch millis, 0 when
+     * none ran), and per index the message of the last mapping update
+     * the cluster manager refused (empty once a later check applied a
+     * mapping or found nothing to apply). The counters are base fields
+     * of {@link LanceNodeStats}; the refused updates travel in its
+     * version 4 block, so {@link #FreshnessStats(StreamInput)} reads
+     * the counters alone and {@link #withMappingErrors} adds the map.
      */
     public record FreshnessStats(int tracked, long checks, long moves, long mappingUpdates, long mappingUnchanged, long rebuilds,
-        long failures, long lastCheckMillis) implements Writeable {
+        long failures, long lastCheckMillis, Map<String, String> mappingErrors) implements Writeable {
 
         public static final FreshnessStats NONE = new FreshnessStats(0, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
 
+        public FreshnessStats(
+            int tracked,
+            long checks,
+            long moves,
+            long mappingUpdates,
+            long mappingUnchanged,
+            long rebuilds,
+            long failures,
+            long lastCheckMillis
+        ) {
+            this(tracked, checks, moves, mappingUpdates, mappingUnchanged, rebuilds, failures, lastCheckMillis, Map.of());
+        }
+
+        public FreshnessStats {
+            mappingErrors = mappingErrors == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(mappingErrors));
+        }
+
+        /** The counters alone, as the base fields of {@link LanceNodeStats} carry them. */
         public FreshnessStats(StreamInput in) throws IOException {
             this(
                 in.readVInt(),
@@ -169,6 +197,22 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             );
         }
 
+        /** These counters with {@code mappingErrors} as the refused updates. */
+        public FreshnessStats withMappingErrors(Map<String, String> mappingErrors) {
+            return new FreshnessStats(
+                tracked,
+                checks,
+                moves,
+                mappingUpdates,
+                mappingUnchanged,
+                rebuilds,
+                failures,
+                lastCheckMillis,
+                mappingErrors
+            );
+        }
+
+        /** The counters alone; the refused updates are written by {@link LanceNodeStats} as its version 4 block. */
         @Override
         public void writeTo(StreamOutput out) throws IOException {
             out.writeVInt(tracked);
@@ -550,9 +594,12 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.planStatisticsCollectMillisTotal = in.readVLong();
         this.planRefinements = Collections.unmodifiableMap(in.readOrderedMap(StreamInput::readString, StreamInput::readVLong));
         this.planExecuted = Collections.unmodifiableMap(in.readOrderedMap(StreamInput::readString, StreamInput::readVLong));
-        this.freshness = new FreshnessStats(in);
+        FreshnessStats counters = new FreshnessStats(in);
         this.planPrunedFragments = reader.block(2, StreamInput::readVLong, 0L);
         this.admissionLastSource = reader.block(3, StreamInput::readString, "none");
+        this.freshness = counters.withMappingErrors(
+            reader.block(4, block -> block.readOrderedMap(StreamInput::readString, StreamInput::readString), Map.of())
+        );
         reader.finish();
     }
 
@@ -603,6 +650,13 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         // A coordinator that ignores the source shows the decision
         // without it, so the block is never critical.
         WireVersion.writeBlock(out, false, o -> o.writeString(admissionLastSource));
+        // Likewise for the refused mapping updates: an older coordinator
+        // shows the freshness counters without them.
+        WireVersion.writeBlock(
+            out,
+            false,
+            o -> o.writeMap(freshness.mappingErrors(), StreamOutput::writeString, StreamOutput::writeString)
+        );
     }
 
     @Override
@@ -694,6 +748,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.field("rebuilds", freshness.rebuilds());
         builder.field("failures", freshness.failures());
         builder.field("last_check_millis", freshness.lastCheckMillis());
+        builder.startObject("mapping_errors");
+        for (Map.Entry<String, String> refused : freshness.mappingErrors().entrySet()) {
+            builder.field(refused.getKey(), refused.getValue());
+        }
+        builder.endObject();
         builder.endObject();
 
         builder.startObject("indices");

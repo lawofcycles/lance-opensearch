@@ -5,6 +5,7 @@
 
 package org.opensearch.lance.mapper;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -18,7 +19,10 @@ import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.RegExp;
 import org.lance.ipc.FullTextQuery;
 import org.opensearch.common.lucene.Lucene;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.Fuzziness;
+import org.opensearch.index.mapper.ContentPath;
+import org.opensearch.index.mapper.Mapper;
 import org.opensearch.index.mapper.TextSearchInfo;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
@@ -27,11 +31,10 @@ import org.opensearch.test.OpenSearchTestCase;
 /**
  * Unit tests for {@link LanceTextFieldMapper} focused on the contract the
  * plugin relies on: the {@code lance_text} type name, the shape of the
- * query the field type hands back to Lucene, and the read-only guarantee on
- * the mapper itself. Instantiation of the parametrized mapper requires a
- * {@code Mapper.BuilderContext}, so those code paths are covered from
- * {@link LancePluginTests} through {@code PARSER}; here we work with the
- * field type directly, which is enough to lock in the observable behaviour.
+ * query the field type hands back to Lucene, the read-only guarantee on
+ * the mapper itself, and which changes of {@code tokens_column} a
+ * mapping update may make. The query tests work with the field type
+ * directly; the merge tests parse mappers through {@code PARSER}.
  */
 public class LanceTextFieldMapperTests extends OpenSearchTestCase {
 
@@ -41,6 +44,64 @@ public class LanceTextFieldMapperTests extends OpenSearchTestCase {
 
     public void testTypeNameIsLanceText() {
         assertEquals(LanceTextFieldMapper.CONTENT_TYPE, fieldType(null).typeName());
+    }
+
+    /**
+     * A {@code lance_text} mapper parsed from {@code node}, the way a
+     * mapping update reaches the mapper through {@code PARSER}. The
+     * parser context is not consulted for the two parameters the mapper
+     * declares.
+     */
+    private static LanceTextFieldMapper mapperOf(Map<String, Object> node) {
+        Mapper.BuilderContext context = new Mapper.BuilderContext(Settings.EMPTY, new ContentPath(0));
+        return (LanceTextFieldMapper) LanceTextFieldMapper.PARSER.parse("body", new HashMap<>(node), null).build(context);
+    }
+
+    public void testMergeSetsTokensColumnOnAFieldThatHadNone() {
+        // The interim mapping of an analyzer mode attach over a column
+        // that already carries a Lance inverted index: lance_text with
+        // no tokens column. The re-derivation after the backfill adds
+        // the derived column and the analyzer name; both must merge.
+        LanceTextFieldMapper interim = mapperOf(Map.of("type", "lance_text", "meta", Map.of("lance_field_id", "1")));
+        LanceTextFieldMapper analyzerMode = mapperOf(
+            Map.of(
+                "type",
+                "lance_text",
+                "tokens_column",
+                "body__lance_tokens",
+                "meta",
+                Map.of("lance_field_id", "1", "lance_analyzer", "english")
+            )
+        );
+        LanceTextFieldMapper.LanceTextFieldType merged = (LanceTextFieldMapper.LanceTextFieldType) interim.merge(analyzerMode).fieldType();
+        assertEquals("body__lance_tokens", merged.tokensColumn());
+        assertEquals("body__lance_tokens", merged.lanceColumn());
+        assertEquals("english", merged.analyzerName());
+    }
+
+    public void testMergeKeepsAnUnchangedTokensColumn() {
+        LanceTextFieldMapper analyzerMode = mapperOf(Map.of("type", "lance_text", "tokens_column", "body__lance_tokens"));
+        LanceTextFieldMapper same = mapperOf(Map.of("type", "lance_text", "tokens_column", "body__lance_tokens"));
+        assertEquals("body__lance_tokens", ((LanceTextFieldMapper.LanceTextFieldType) analyzerMode.merge(same).fieldType()).tokensColumn());
+    }
+
+    public void testMergeRefusesToChangeOrDropASetTokensColumn() {
+        // Renaming the derived column, or a derivation that no longer
+        // sees it, is not a mapping update: the queries would target a
+        // column the operator did not choose. Re-attaching is the way.
+        LanceTextFieldMapper analyzerMode = mapperOf(Map.of("type", "lance_text", "tokens_column", "body__lance_tokens"));
+        LanceTextFieldMapper renamed = mapperOf(Map.of("type", "lance_text", "tokens_column", "body_other"));
+        Exception rename = expectThrows(IllegalArgumentException.class, () -> analyzerMode.merge(renamed));
+        assertTrue(
+            rename.getMessage(),
+            rename.getMessage().contains("Cannot update parameter [tokens_column] from [body__lance_tokens] to [body_other]")
+        );
+        LanceTextFieldMapper plain = mapperOf(Map.of("type", "lance_text"));
+        Exception drop = expectThrows(IllegalArgumentException.class, () -> analyzerMode.merge(plain));
+        assertTrue(
+            drop.getMessage(),
+            drop.getMessage().contains("Cannot update parameter [tokens_column] from [body__lance_tokens] to [null]")
+        );
     }
 
     public void testTermQueryUsesFieldNameWhenNoTokensColumn() {

@@ -20,6 +20,8 @@ import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.core.xcontent.ToXContent;
@@ -30,6 +32,7 @@ import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.NativeMemoryLimit.IndexCacheSizing;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.WireVersion;
 import org.opensearch.lance.WireVersionTestSupport;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceWarmCache;
@@ -109,7 +112,17 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             planRefinements(2L, 0L, 1L),
             planExecuted(7L, 4L),
             9L,
-            new LanceNodeStats.FreshnessStats(2, 40L, 3L, 1L, 2L, 1L, 0L, 1_700_000_000_000L)
+            new LanceNodeStats.FreshnessStats(
+                2,
+                40L,
+                3L,
+                1L,
+                2L,
+                1L,
+                0L,
+                1_700_000_000_000L,
+                Map.of("perf", "Mapper for [body] conflicts with existing mapper")
+            )
         );
     }
 
@@ -155,6 +168,13 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         assertEquals(original.hashCode(), restored.hashCode());
     }
 
+    public void testFreshnessStatsTakeANullMapAsNoRefusedUpdates() {
+        LanceNodeStats.FreshnessStats stats = new LanceNodeStats.FreshnessStats(1, 2L, 3L, 4L, 5L, 6L, 7L, 8L, null);
+        assertEquals(Map.of(), stats.mappingErrors());
+        assertEquals(stats, new LanceNodeStats.FreshnessStats(1, 2L, 3L, 4L, 5L, 6L, 7L, 8L));
+        assertEquals(Map.of(), stats.withMappingErrors(null).mappingErrors());
+    }
+
     public void testNodeStatsXContentShape() throws Exception {
         ScanAdmission.setEnabled(true);
         ScanAdmission.setHeadroom(ScanAdmission.DEFAULT_HEADROOM);
@@ -183,7 +203,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"refinements\":{\"security_wrapper\":2,\"sort_field_type\":0,\"aggregate_resolution\":1},"
                     + "\"executed\":{\"pushed_scan\":7,\"lucene\":4},\"pruned\":{\"fragments\":9}},"
                     + "\"freshness\":{\"tracked\":2,\"checks\":40,\"moves\":3,\"mapping_updates\":1,\"mapping_unchanged\":2,"
-                    + "\"rebuilds\":1,\"failures\":0,\"last_check_millis\":1700000000000},"
+                    + "\"rebuilds\":1,\"failures\":0,\"last_check_millis\":1700000000000,"
+                    + "\"mapping_errors\":{\"perf\":\"Mapper for [body] conflicts with existing mapper\"}},"
                     + "\"indices\":{\"big\":{\"rows\":3000000000,\"shard_reader_rows\":2000000000,\"nested_docs\":0,"
                     + "\"lucene_bound_exceeded\":true,\"index_types\":{},"
                     + "\"renamed_fields\":[{\"from\":\"ts\",\"to\":\"event_ts\",\"lance_field_id\":1}]},"
@@ -260,7 +281,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceNodeStats.WIRE_VERSION, in.readVInt());
             }
         }
-        // The stream a version 4 data node would return: today's fields
+        // The stream a version 5 data node would return: today's fields
         // and one optional block this coordinator steps over.
         BytesReference newer = WireVersionTestSupport.asNextVersion(
             sample(),
@@ -285,13 +306,17 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals("the counter the older coordinator does not know falls back to zero", 0L, asVersion1.planPrunedFragments());
                 assertEquals("the source the older coordinator does not know falls back to none", "none", asVersion1.admissionLastSource());
                 assertEquals(sample().planExecuted(), asVersion1.planExecuted());
-                assertEquals(sample().freshness(), asVersion1.freshness());
+                assertEquals(
+                    "the freshness counters are base fields; the refused updates are not",
+                    sample().freshness().withMappingErrors(Map.of()),
+                    asVersion1.freshness()
+                );
                 assertEquals("the reader consumed the blocks", -1, in.read());
             }
         }
     }
 
-    public void testMixedPluginVersionAVersion2CoordinatorReadsTodaysStatsWithoutTheSource() throws Exception {
+    public void testMixedPluginVersionAVersion2CoordinatorReadsTodaysStatsWithoutTheSourceAndTheMappingErrors() throws Exception {
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             sample().writeTo(out);
             try (StreamInput in = out.bytes().streamInput()) {
@@ -299,37 +324,109 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals("the block version 2 knows is read", 9L, asVersion2.planPrunedFragments());
                 assertEquals("the block it does not know falls back", "none", asVersion2.admissionLastSource());
                 assertEquals("fts", asVersion2.admissionLastKind());
+                assertEquals(sample().freshness().withMappingErrors(Map.of()), asVersion2.freshness());
                 assertEquals("the reader consumed the blocks", -1, in.read());
             }
         }
     }
 
+    public void testMixedPluginVersionAVersion3CoordinatorReadsTodaysStatsWithoutTheMappingErrors() throws Exception {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            sample().writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceNodeStats asVersion3 = LanceNodeStats.read(in, 3);
+                assertEquals(9L, asVersion3.planPrunedFragments());
+                assertEquals("the block version 3 knows is read", "warm_up", asVersion3.admissionLastSource());
+                assertEquals(
+                    "the block it does not know is stepped over",
+                    sample().freshness().withMappingErrors(Map.of()),
+                    asVersion3.freshness()
+                );
+                assertTrue(asVersion3.freshness().mappingErrors().isEmpty());
+                assertEquals("the reader consumed the blocks", -1, in.read());
+            }
+        }
+    }
+
+    /**
+     * The bytes of today's stream as a data node at wire version
+     * {@code marker} writes them: the base fields and the blocks up to
+     * that version, the later blocks cut off.
+     */
+    private static BytesReference asWrittenByVersion(LanceNodeStats stats, int marker) throws Exception {
+        try (BytesStreamOutput out = new BytesStreamOutput(); BytesStreamOutput today = new BytesStreamOutput()) {
+            stats.writeTo(today);
+            // The blocks are the last thing written, each a flag, a
+            // length prefix and the bytes of that length; their sizes are
+            // measured by writing them again on their own. Version 2 is
+            // the pruned counter, 3 the admission source, 4 the mapping
+            // errors, in that order.
+            int trailing = 0;
+            if (marker < 4) {
+                trailing += blockSize(
+                    o -> o.writeMap(stats.freshness().mappingErrors(), StreamOutput::writeString, StreamOutput::writeString)
+                );
+            }
+            if (marker < 3) {
+                trailing += blockSize(o -> o.writeString(stats.admissionLastSource()));
+            }
+            if (marker < 2) {
+                trailing += blockSize(o -> o.writeVLong(stats.planPrunedFragments()));
+            }
+            try (StreamInput in = today.bytes().streamInput()) {
+                assertEquals(LanceNodeStats.WIRE_VERSION, in.readVInt());
+                byte[] rest = in.readAllBytes();
+                assertTrue(rest.length > trailing);
+                out.writeVInt(marker);
+                out.writeBytes(rest, 0, rest.length - trailing);
+            }
+            return out.bytes();
+        }
+    }
+
+    private static int blockSize(Writeable fields) throws Exception {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            WireVersion.writeBlock(out, false, fields);
+            return out.bytes().length();
+        }
+    }
+
     public void testMixedPluginVersionTodaysCoordinatorReadsAVersion1NodesStats() throws Exception {
         // The stream a version 1 data node writes: today's base fields
-        // without the pruned counter and source blocks, and no block at
-        // all.
-        BytesReference version1;
-        try (BytesStreamOutput out = new BytesStreamOutput(); BytesStreamOutput today = new BytesStreamOutput()) {
-            sample().writeTo(today);
-            try (StreamInput in = today.bytes().streamInput()) {
-                assertEquals(3, in.readVInt());
-                byte[] rest = in.readAllBytes();
-                // The blocks are the last things written: each a flag,
-                // a length and its field (the counter in one byte, the
-                // source as a length prefixed string).
-                int prunedBlockLength = 1 + 1 + 1;
-                int sourceBlockLength = 1 + 1 + (1 + "warm_up".length());
-                out.writeVInt(1);
-                out.writeBytes(rest, 0, rest.length - prunedBlockLength - sourceBlockLength);
-            }
-            version1 = out.bytes();
-        }
+        // and no block at all.
+        BytesReference version1 = asWrittenByVersion(sample(), 1);
         try (StreamInput in = version1.streamInput()) {
             LanceNodeStats restored = new LanceNodeStats(in);
             assertEquals(0L, restored.planPrunedFragments());
             assertEquals("none", restored.admissionLastSource());
             assertEquals(sample().planExecuted(), restored.planExecuted());
-            assertEquals(sample().freshness(), restored.freshness());
+            assertEquals(sample().freshness().withMappingErrors(Map.of()), restored.freshness());
+            assertEquals(-1, in.read());
+        }
+    }
+
+    public void testMixedPluginVersionTodaysCoordinatorReadsAVersion2NodesStats() throws Exception {
+        // The stream a version 2 data node writes: the pruned counter
+        // block only.
+        BytesReference version2 = asWrittenByVersion(sample(), 2);
+        try (StreamInput in = version2.streamInput()) {
+            LanceNodeStats restored = new LanceNodeStats(in);
+            assertEquals(9L, restored.planPrunedFragments());
+            assertEquals("none", restored.admissionLastSource());
+            assertEquals(sample().freshness().withMappingErrors(Map.of()), restored.freshness());
+            assertEquals(-1, in.read());
+        }
+    }
+
+    public void testMixedPluginVersionTodaysCoordinatorReadsAVersion3NodesStats() throws Exception {
+        // The stream a version 3 data node writes: the pruned counter and
+        // the admission source blocks, no mapping error block.
+        BytesReference version3 = asWrittenByVersion(sample(), 3);
+        try (StreamInput in = version3.streamInput()) {
+            LanceNodeStats restored = new LanceNodeStats(in);
+            assertEquals(9L, restored.planPrunedFragments());
+            assertEquals("warm_up", restored.admissionLastSource());
+            assertEquals("the mapping errors fall back to empty", sample().freshness().withMappingErrors(Map.of()), restored.freshness());
             assertEquals(-1, in.read());
         }
     }

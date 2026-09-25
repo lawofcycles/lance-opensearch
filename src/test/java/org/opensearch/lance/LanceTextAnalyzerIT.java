@@ -27,7 +27,9 @@ import org.opensearch.core.rest.RestStatus;
  * {@code running} to {@code runs}), while {@code _source} never shows
  * the derived column. Also the {@code whitespace} analyzer's case
  * boundary, the {@code derive: async} attach path (mapping flips after
- * the background backfill), and the 400s of the clause.
+ * the background backfill, both from an interim {@code keyword} mapping
+ * and from an interim {@code lance_text} one over a column that already
+ * carries a Lance inverted index), and the 400s of the clause.
  */
 public class LanceTextAnalyzerIT extends LanceRestTestCase {
 
@@ -200,6 +202,71 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
                     extractIntPath(matchBody, "hits", "total", "value")
                 );
             }, 60, TimeUnit.SECONDS);
+        } finally {
+            deleteIndexQuietly(indexName);
+        }
+    }
+
+    public void testAsyncDeriveOnAColumnWithAnInvertedIndexSwitchesTheMapping() throws Exception {
+        // The usual shape of an existing table: the text column already
+        // carries a Lance inverted index, so the interim mapping is
+        // lance_text without a tokens column (no rebuild is involved)
+        // and the re-derivation after the backfill has to update the
+        // field in place: tokens_column from absent to the derived
+        // column, meta.lance_analyzer added.
+        String suffix = "indexed-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableUri = LanceTableFactory.writeEnglishTextTableWithInvertedIndex(scratchDir, "demo-" + suffix);
+        String indexName = indexNameOf(tableUri);
+        try {
+            Response attach = postJson(
+                "/_lance/attach",
+                "{\"table\":\""
+                    + tableUri
+                    + "\",\"derive\":\"async\",\"overrides\":{\"body\":{\"type\":\"text_analyzer\",\"analyzer\":\"english\"}}}"
+            );
+            String attachBody = readAll(attach);
+            assertEquals("attach failed: " + attachBody, RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertTrue("the async attach reports its backfill: " + attachBody, attachBody.contains("\"backfill\""));
+
+            // The interim mapping: lance_text over Lance's own tokenizer.
+            String interim = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+            assertTrue(
+                "body must map as lance_text before the backfill: " + interim,
+                interim.contains("\"body\":{\"type\":\"lance_text\"")
+            );
+            assertFalse("no tokens column before the backfill: " + interim, interim.contains("tokens_column"));
+            assertFalse("no analyzer before the backfill: " + interim, interim.contains("lance_analyzer"));
+
+            // After the backfill commit the freshness check re-derives the
+            // mapping and PutMapping sets tokens_column and the analyzer
+            // on the existing field. Stemmed matches follow.
+            assertBusy(() -> {
+                String mapping = readAll(performRetrying(new Request("GET", "/" + indexName + "/_mapping")));
+                assertTrue("mapping must gain the tokens column: " + mapping, mapping.contains("\"tokens_column\":\"body__lance_tokens\""));
+                assertTrue("mapping must record the analyzer: " + mapping, mapping.contains("\"lance_analyzer\":\"english\""));
+                Request search = new Request("POST", "/" + indexName + "/_search");
+                search.setJsonEntity("{\"size\":10,\"query\":{\"match\":{\"body\":\"running\"}}}");
+                String matchBody = readAll(performRetrying(search));
+                assertEquals(
+                    "running must hit the three run-stem rows: " + matchBody,
+                    3,
+                    extractIntPath(matchBody, "hits", "total", "value")
+                );
+            }, 60, TimeUnit.SECONDS);
+
+            // No refused mapping update is left behind on any node, and
+            // the manual check answers without one.
+            Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+            @SuppressWarnings("unchecked")
+            Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
+            for (Object node : nodes.values()) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> freshness = (Map<String, Object>) ((Map<String, Object>) node).get("freshness");
+                assertEquals("no refused mapping update in the stats: " + freshness, Map.of(), freshness.get("mapping_errors"));
+            }
+            String sync = readAll(client().performRequest(new Request("POST", "/" + indexName + "/_lance/sync")));
+            assertFalse("the manual check reports no refusal: " + sync, sync.contains("mapping_error"));
         } finally {
             deleteIndexQuietly(indexName);
         }
