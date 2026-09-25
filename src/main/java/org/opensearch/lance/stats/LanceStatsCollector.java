@@ -147,6 +147,7 @@ public final class LanceStatsCollector {
         Map<String, Long> admissionRejections = ScanAdmission.rejectionsByKind();
         long admissionLastEstimate = ScanAdmission.lastEstimateBytes();
         String admissionLastKind = ScanAdmission.lastKind();
+        String admissionLastSource = ScanAdmission.lastSource();
         // One reading serves both figures, so the reported credit is the
         // one a decision made at the reported available memory would use.
         long admissionAvailableReading = ScanAdmission.availablePhysicalMemoryBytes();
@@ -198,6 +199,7 @@ public final class LanceStatsCollector {
                 admissionRejections,
                 admissionLastEstimate,
                 admissionLastKind,
+                admissionLastSource,
                 admissionAvailable,
                 admissionRetained,
                 warmUpMode,
@@ -238,6 +240,7 @@ public final class LanceStatsCollector {
             admissionRejections,
             admissionLastEstimate,
             admissionLastKind,
+            admissionLastSource,
             admissionAvailable,
             admissionRetained,
             warmUpMode,

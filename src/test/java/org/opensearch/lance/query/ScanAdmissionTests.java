@@ -1050,4 +1050,77 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
     public void testBreakerRoomOfAnUnlimitedAccountingNeverRefusesHeap() {
         assertEquals(Long.MAX_VALUE, LanceHitsAccounting.unlimited().breakerRoomBytes());
     }
+
+    // ---- the warm up probe ----
+
+    public void testWarmUpProbeIsJudgedAsAOneRowPageAndRecordedUnderItsSource() {
+        long rows = 1_000_000_000L;
+        long estimate = NativeMemoryLimit.invertedIndexEntryEstimateBytes(rows) + ScanAdmission.scanBufferEstimateBytes(
+            rows,
+            ScanAdmission.WARM_UP_PROBE_SHAPE
+        );
+        assertEquals(
+            "the probe's page is one row: 12 bytes doubled",
+            NativeMemoryLimit.invertedIndexEntryEstimateBytes(rows) + 24L,
+            estimate
+        );
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setHeadroom(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setResidentSetProbeForTests(() -> -1L);
+        assertEquals("none", ScanAdmission.lastSource());
+
+        // Too little available: not admitted, nothing thrown, the
+        // decision carries the figures the WARN names, the refusal is
+        // counted under fts and the source is the warm up.
+        ScanAdmission.setMemoryProbeForTests(() -> 16 * GB);
+        ScanAdmission.Decision skipped = ScanAdmission.admitWarmUpProbe(rows);
+        assertFalse(skipped.admitted());
+        assertEquals(estimate, skipped.estimateBytes());
+        assertEquals(8 * GB, skipped.availableBytes());
+        assertEquals(0L, skipped.retainedCreditBytes());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FTS));
+        assertEquals("fts", ScanAdmission.lastKind());
+        assertEquals("warm_up", ScanAdmission.lastSource());
+        assertEquals(estimate, ScanAdmission.lastEstimateBytes());
+        assertEquals("a skipped probe is not in flight", 0, ScanAdmission.inFlightForTests());
+
+        // Enough available: admitted and counted in flight on this
+        // thread until the probe's request end, and the pool records
+        // what the scan left behind.
+        long[] available = { estimate + 8 * GB + 2 * GB };
+        ScanAdmission.setMemoryProbeForTests(() -> available[0]);
+        ScanAdmission.Decision admitted = ScanAdmission.admitWarmUpProbe(rows);
+        assertTrue(admitted.admitted());
+        assertEquals(estimate, admitted.estimateBytes());
+        assertEquals(1, ScanAdmission.inFlightForTests());
+        ScanAdmission.scanStarted();
+        available[0] -= 7 * GB;
+        ScanAdmission.scanFinished();
+        ScanAdmission.requestEnded();
+        assertEquals(0, ScanAdmission.inFlightForTests());
+        assertEquals(7 * GB, ScanAdmission.retainedCreditBytes());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FTS));
+
+        // A request's decision afterwards flips the source back (the
+        // same one row page, admitted on the credit).
+        ScanAdmission.admit("demo", rows, ScanAdmission.WARM_UP_PROBE_SHAPE);
+        assertEquals("request", ScanAdmission.lastSource());
+        ScanAdmission.requestEnded();
+
+        // A fitting document set is estimate zero: admitted, recorded,
+        // not in flight.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.Decision fits = ScanAdmission.admitWarmUpProbe(16L);
+        assertTrue(fits.admitted());
+        assertEquals(0L, fits.estimateBytes());
+        assertEquals("warm_up", ScanAdmission.lastSource());
+        assertEquals(0, ScanAdmission.inFlightForTests());
+
+        // A disabled gate admits the probe whatever the estimate.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setMemoryProbeForTests(() -> 0L);
+        ScanAdmission.setEnabled(false);
+        assertTrue(ScanAdmission.admitWarmUpProbe(rows).admitted());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FTS));
+    }
 }

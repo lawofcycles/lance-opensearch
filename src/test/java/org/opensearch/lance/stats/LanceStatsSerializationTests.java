@@ -72,6 +72,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             admissionRejections(7L, 1L),
             832L,
             "fts",
+            "warm_up",
             6_442_450_944L,
             268_435_456L,
             "metadata",
@@ -170,7 +171,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"index_cache_capacity\":17179869183,\"index_cache_shards\":2,\"index_cache_shard_share\":8589934591},"
                     + "\"fts\":{\"subset_probe_limit\":1000000},"
                     + "\"admission\":{\"enabled\":true,\"headroom_bytes\":8589934592,\"available_bytes\":6442450944,"
-                    + "\"retained_bytes\":268435456,\"last_estimate_bytes\":832,\"last_kind\":\"fts\","
+                    + "\"retained_bytes\":268435456,\"last_estimate_bytes\":832,\"last_kind\":\"fts\",\"last_source\":\"warm_up\","
                     + "\"rejections\":{\"fts\":7,\"scalar_index\":0,\"vector_index\":0,\"filter_scan\":1,\"aggregate_scan\":0,"
                     + "\"column_load\":0}},"
                     + "\"warm_up\":{\"mode\":\"metadata\",\"tables\":[{\"index\":\"perf\",\"table\":\"s3://bucket/perf.lance\","
@@ -252,14 +253,14 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         assertNull(restored.validate());
     }
 
-    public void testNodeStatsStreamOpensWithTheWireVersionAndCarriesThePrunedCounterAsABlock() throws Exception {
+    public void testNodeStatsStreamOpensWithTheWireVersionAndCarriesTheLaterFieldsAsBlocks() throws Exception {
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             sample().writeTo(out);
             try (StreamInput in = out.bytes().streamInput()) {
                 assertEquals(LanceNodeStats.WIRE_VERSION, in.readVInt());
             }
         }
-        // The stream a version 3 data node would return: today's fields
+        // The stream a version 4 data node would return: today's fields
         // and one optional block this coordinator steps over.
         BytesReference newer = WireVersionTestSupport.asNextVersion(
             sample(),
@@ -270,43 +271,63 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         try (StreamInput in = newer.streamInput()) {
             LanceNodeStats restored = new LanceNodeStats(in);
             assertEquals(9L, restored.planPrunedFragments());
+            assertEquals("warm_up", restored.admissionLastSource());
             assertEquals(sample().freshness(), restored.freshness());
             assertEquals("the reader consumed the block", -1, in.read());
         }
     }
 
-    public void testMixedPluginVersionAVersion1CoordinatorReadsTodaysStatsWithoutThePrunedCounter() throws Exception {
+    public void testMixedPluginVersionAVersion1CoordinatorReadsTodaysStatsWithoutTheLaterFields() throws Exception {
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             sample().writeTo(out);
             try (StreamInput in = out.bytes().streamInput()) {
                 LanceNodeStats asVersion1 = LanceNodeStats.read(in, 1);
                 assertEquals("the counter the older coordinator does not know falls back to zero", 0L, asVersion1.planPrunedFragments());
+                assertEquals("the source the older coordinator does not know falls back to none", "none", asVersion1.admissionLastSource());
                 assertEquals(sample().planExecuted(), asVersion1.planExecuted());
                 assertEquals(sample().freshness(), asVersion1.freshness());
-                assertEquals("the reader consumed the block", -1, in.read());
+                assertEquals("the reader consumed the blocks", -1, in.read());
+            }
+        }
+    }
+
+    public void testMixedPluginVersionAVersion2CoordinatorReadsTodaysStatsWithoutTheSource() throws Exception {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            sample().writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceNodeStats asVersion2 = LanceNodeStats.read(in, 2);
+                assertEquals("the block version 2 knows is read", 9L, asVersion2.planPrunedFragments());
+                assertEquals("the block it does not know falls back", "none", asVersion2.admissionLastSource());
+                assertEquals("fts", asVersion2.admissionLastKind());
+                assertEquals("the reader consumed the blocks", -1, in.read());
             }
         }
     }
 
     public void testMixedPluginVersionTodaysCoordinatorReadsAVersion1NodesStats() throws Exception {
-        // The stream a version 1 data node writes: today's fields without
-        // the pruned block, and no block at all.
+        // The stream a version 1 data node writes: today's base fields
+        // without the pruned counter and source blocks, and no block at
+        // all.
         BytesReference version1;
         try (BytesStreamOutput out = new BytesStreamOutput(); BytesStreamOutput today = new BytesStreamOutput()) {
             sample().writeTo(today);
             try (StreamInput in = today.bytes().streamInput()) {
-                assertEquals(2, in.readVInt());
+                assertEquals(3, in.readVInt());
                 byte[] rest = in.readAllBytes();
-                // The block is the last thing written: flag, length and the counter.
-                int blockLength = 1 + 1 + 1;
+                // The blocks are the last things written: each a flag,
+                // a length and its field (the counter in one byte, the
+                // source as a length prefixed string).
+                int prunedBlockLength = 1 + 1 + 1;
+                int sourceBlockLength = 1 + 1 + (1 + "warm_up".length());
                 out.writeVInt(1);
-                out.writeBytes(rest, 0, rest.length - blockLength);
+                out.writeBytes(rest, 0, rest.length - prunedBlockLength - sourceBlockLength);
             }
             version1 = out.bytes();
         }
         try (StreamInput in = version1.streamInput()) {
             LanceNodeStats restored = new LanceNodeStats(in);
             assertEquals(0L, restored.planPrunedFragments());
+            assertEquals("none", restored.admissionLastSource());
             assertEquals(sample().planExecuted(), restored.planExecuted());
             assertEquals(sample().freshness(), restored.freshness());
             assertEquals(-1, in.read());

@@ -35,9 +35,10 @@ import org.opensearch.lance.query.ScanAdmission;
  * {@code native_memory}, {@code fts}, {@code admission}, {@code warm_up},
  * {@code plan} and {@code indices} objects of one node in
  * {@code GET /_lance/stats}. {@code admission} carries the admission
- * gate's settings in force, its rejections per kind, the estimate and
- * kind of its last decision, the node's available memory and the memory
- * earlier admitted scans retained;
+ * gate's settings in force, its rejections per kind, the estimate,
+ * kind and source (a request or the warm up) of its last decision, the
+ * node's available memory and the memory earlier admitted scans
+ * retained;
  * {@code warm_up} carries the mode in force and one
  * {@link LanceWarmUpStatus} per Lance-backed index the node has seen
  * since it started; {@code plan.statistics} the planner's table
@@ -60,12 +61,17 @@ import org.opensearch.lance.query.ScanAdmission;
  * counter, which version 2 added as a block a coordinator of the
  * previous plugin version steps over, so a mixed version cluster
  * answers {@code GET /_lance/stats} without that counter instead of
- * failing.
+ * failing; version 3 added the source of the last admission decision
+ * the same way, and an older coordinator shows it as {@code none}.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
-    /** The wire format's version, the first field written and the first read; 2 added the pruned fragment counter. */
-    public static final int WIRE_VERSION = 2;
+    /**
+     * The wire format's version, the first field written and the first
+     * read; 2 added the pruned fragment counter, 3 the source of the
+     * last admission decision.
+     */
+    public static final int WIRE_VERSION = 3;
 
     private final boolean cacheEnabled;
     private final int snapshotCount;
@@ -100,6 +106,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     private final Map<String, Long> admissionRejections;
     private final long admissionLastEstimateBytes;
     private final String admissionLastKind;
+    /** {@code request}, {@code warm_up}, or {@code none} before the first decision and from a node that does not report it. */
+    private final String admissionLastSource;
     private final long admissionAvailableBytes;
     private final long admissionRetainedBytes;
 
@@ -296,6 +304,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             ScanAdmission.rejectionsByKind(),
             0L,
             "none",
+            "none",
             0L,
             0L,
             "none",
@@ -335,6 +344,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         Map<String, Long> admissionRejections,
         long admissionLastEstimateBytes,
         String admissionLastKind,
+        String admissionLastSource,
         long admissionAvailableBytes,
         long admissionRetainedBytes,
         String warmUpMode,
@@ -372,6 +382,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             admissionRejections,
             admissionLastEstimateBytes,
             admissionLastKind,
+            admissionLastSource,
             admissionAvailableBytes,
             admissionRetainedBytes,
             warmUpMode,
@@ -412,6 +423,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         Map<String, Long> admissionRejections,
         long admissionLastEstimateBytes,
         String admissionLastKind,
+        String admissionLastSource,
         long admissionAvailableBytes,
         long admissionRetainedBytes,
         String warmUpMode,
@@ -449,6 +461,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.admissionRejections = Collections.unmodifiableMap(new LinkedHashMap<>(admissionRejections));
         this.admissionLastEstimateBytes = admissionLastEstimateBytes;
         this.admissionLastKind = admissionLastKind;
+        this.admissionLastSource = admissionLastSource;
         this.admissionAvailableBytes = admissionAvailableBytes;
         this.admissionRetainedBytes = admissionRetainedBytes;
         this.warmUpMode = warmUpMode;
@@ -539,6 +552,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.planExecuted = Collections.unmodifiableMap(in.readOrderedMap(StreamInput::readString, StreamInput::readVLong));
         this.freshness = new FreshnessStats(in);
         this.planPrunedFragments = reader.block(2, StreamInput::readVLong, 0L);
+        this.admissionLastSource = reader.block(3, StreamInput::readString, "none");
         reader.finish();
     }
 
@@ -586,6 +600,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         // A coordinator that ignores the counter shows the stats
         // without it, so the block is never critical.
         WireVersion.writeBlock(out, false, o -> o.writeVLong(planPrunedFragments));
+        // A coordinator that ignores the source shows the decision
+        // without it, so the block is never critical.
+        WireVersion.writeBlock(out, false, o -> o.writeString(admissionLastSource));
     }
 
     @Override
@@ -631,6 +648,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.field("retained_bytes", admissionRetainedBytes);
         builder.field("last_estimate_bytes", admissionLastEstimateBytes);
         builder.field("last_kind", admissionLastKind);
+        builder.field("last_source", admissionLastSource);
         builder.startObject("rejections");
         for (Map.Entry<String, Long> rejection : admissionRejections.entrySet()) {
             builder.field(rejection.getKey(), rejection.getValue());
@@ -861,6 +879,16 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     }
 
     /**
+     * Source of the node's last admission decision: {@code request} for
+     * a search request's gated path, {@code warm_up} for the metadata
+     * warm up's full text probe, {@code none} before the first and from
+     * a node whose plugin version does not report it.
+     */
+    public String admissionLastSource() {
+        return admissionLastSource;
+    }
+
+    /**
      * The node's available physical memory when the stats were collected
      * ({@code MemAvailable} on Linux, the free physical memory elsewhere),
      * before the headroom is subtracted.
@@ -925,6 +953,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && admissionRejections.equals(other.admissionRejections)
             && admissionLastEstimateBytes == other.admissionLastEstimateBytes
             && admissionLastKind.equals(other.admissionLastKind)
+            && admissionLastSource.equals(other.admissionLastSource)
             && admissionAvailableBytes == other.admissionAvailableBytes
             && admissionRetainedBytes == other.admissionRetainedBytes
             && warmUpMode.equals(other.warmUpMode)
@@ -966,6 +995,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             admissionRejections,
             admissionLastEstimateBytes,
             admissionLastKind,
+            admissionLastSource,
             admissionAvailableBytes,
             admissionRetainedBytes,
             warmUpMode,
