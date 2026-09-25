@@ -7,10 +7,13 @@ package org.opensearch.lance.query;
 
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 
 import org.apache.arrow.vector.types.FloatingPointPrecision;
@@ -25,6 +28,7 @@ import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.util.Constants;
 import org.lance.Dataset;
 import org.lance.index.IndexType;
+import org.lance.ipc.FullTextQuery;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.core.common.unit.ByteSizeUnit;
@@ -908,10 +912,11 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         // terms(category) over 3.3B rows in 8 parallel scans on a 16
         // vCPU node: each scan reads 412M rows of 40 bytes (a 32 byte
         // key and the 8 byte count), capped at the 2 GiB read queue,
-        // plus 16 batches of 8192 rows in flight, doubled.
+        // plus 16 batches of 8192 rows in flight, doubled. No filter, so
+        // nothing is materialised.
         long rows = 3_300_000_000L;
         long width = ScanAdmission.UTF8_COLUMN_BYTES_PER_ROW + 8L;
-        long estimate = ScanAdmission.aggregateScanEstimateBytes(8, rows, width, 16, 8 * GB);
+        long estimate = ScanAdmission.aggregateScanEstimateBytes(8, rows, 0L, width, 16, 8 * GB);
         long perScan = ScanAdmission.IO_BUFFER_BYTES_PER_SCAN + (long) (16 * ScanAdmission.SCAN_BATCH_ROWS * width
             * ScanAdmission.SCAN_BUFFER_FACTOR);
         assertEquals(perScan * 8, estimate);
@@ -919,13 +924,446 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         assertEquals(
             (ScanAdmission.IO_BUFFER_BYTES_PER_SCAN + (long) (64 * ScanAdmission.SCAN_BATCH_ROWS * width
                 * ScanAdmission.SCAN_BUFFER_FACTOR)) * 16,
-            ScanAdmission.aggregateScanEstimateBytes(16, TEN_BILLION, width, 64, 8 * GB)
+            ScanAdmission.aggregateScanEstimateBytes(16, TEN_BILLION, 0L, width, 64, 8 * GB)
         );
         // A 16 row fixture reads 640 bytes per scan: within the shard.
-        assertEquals(0L, ScanAdmission.aggregateScanEstimateBytes(8, 16L, width, 16, 8 * GB));
-        assertTrue(ScanAdmission.aggregateScanEstimateBytes(8, 16L, width, 16, 1L) > 0L);
+        assertEquals(0L, ScanAdmission.aggregateScanEstimateBytes(8, 16L, 3L, width, 16, 8 * GB));
+        assertTrue(ScanAdmission.aggregateScanEstimateBytes(8, 16L, 3L, width, 16, 1L) > 0L);
+        // A filtered aggregate adds the materialised row addresses at the
+        // filter scan's per row constant.
+        assertEquals(
+            estimate + 200_000_000L * ScanAdmission.FILTER_SCAN_BYTES_PER_MATCHING_ROW,
+            ScanAdmission.aggregateScanEstimateBytes(8, rows, 200_000_000L, width, 16, 8 * GB)
+        );
         // The group state is heap: groups x (64 + 24 per metric) per scan.
         assertEquals(1_000_000L * (64L + 24L * 2) * 8, ScanAdmission.aggregateScanHeapBytes(1_000_000L, 2, 8));
+    }
+
+    // ---- the shapes that killed the 4 node perf1b cluster, judged with its figures ----
+
+    /** perf1b: 1B rows over 4 r7gd.4xlarge nodes (16 vCPU, 128 GB), 250M rows per node, 8 parallel aggregate scans. */
+    private static final long PERF1B_ROWS = 1_000_000_000L;
+    private static final long PERF1B_NODE_ROWS = 250_000_000L;
+    private static final int PERF1B_SCANS = 8;
+    private static final int PERF1B_READAHEAD = 16;
+
+    /** The node's MemAvailable before the filtered aggregate that killed it on its warm run, and after a fresh start. */
+    private static final String PERF1B_AVAILABLE_BEFORE_KILL = "59941011456b";
+    private static final String PERF1B_AVAILABLE_FRESH_NODE = "96560082944b";
+
+    /**
+     * perf1b's indexes as the statistics report them: a bitmap over the
+     * 200 value {@code category}, BTrees over {@code price} and
+     * {@code rating} without a manifest size or a distinct count, an
+     * inverted index over {@code body}; {@code brand} carries none.
+     */
+    private static Optional<TableStatistics> perf1bStatistics() {
+        ColumnStatistics.IndexSummary category = new ColumnStatistics.IndexSummary(
+            "bitmap_category",
+            Optional.of(IndexType.BITMAP),
+            250,
+            250,
+            OptionalLong.of(PERF1B_ROWS),
+            OptionalLong.of(PERF1B_ROWS),
+            OptionalLong.of(0L),
+            OptionalLong.of(200L),
+            true
+        );
+        ColumnStatistics.IndexSummary price = new ColumnStatistics.IndexSummary(
+            "btree_price",
+            Optional.of(IndexType.BTREE),
+            250,
+            250,
+            OptionalLong.empty(),
+            OptionalLong.of(PERF1B_ROWS),
+            OptionalLong.of(0L),
+            OptionalLong.empty(),
+            true
+        );
+        ColumnStatistics.IndexSummary rating = new ColumnStatistics.IndexSummary(
+            "btree_rating",
+            Optional.of(IndexType.BTREE),
+            250,
+            250,
+            OptionalLong.empty(),
+            OptionalLong.of(PERF1B_ROWS),
+            OptionalLong.of(0L),
+            OptionalLong.empty(),
+            true
+        );
+        ColumnStatistics.IndexSummary body = new ColumnStatistics.IndexSummary(
+            "inverted_body",
+            Optional.of(IndexType.INVERTED),
+            250,
+            250,
+            OptionalLong.empty(),
+            OptionalLong.of(PERF1B_ROWS),
+            OptionalLong.of(0L),
+            OptionalLong.empty(),
+            true
+        );
+        Map<String, ColumnStatistics> columns = new LinkedHashMap<>();
+        columns.put("category", new ColumnStatistics("category", List.of(category)));
+        columns.put("price", new ColumnStatistics("price", List.of(price)));
+        columns.put("rating", new ColumnStatistics("rating", List.of(rating)));
+        columns.put("body", new ColumnStatistics("body", List.of(body)));
+        List<TableStatistics.FragmentStats> fragments = new ArrayList<>();
+        for (int i = 0; i < 250; i++) {
+            fragments.add(new TableStatistics.FragmentStats(i, PERF1B_ROWS / 250, 1));
+        }
+        return Optional.of(new TableStatistics(PERF1B_ROWS, 0L, fragments, columns, 1L, Instant.EPOCH));
+    }
+
+    /** The 4xlarge's index cache shard share and the default headroom, with {@code available} scripted as the node's reading. */
+    private static void perf1bNode(String available) {
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setHeadroom(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setAvailableMemoryOverride(List.of(available));
+    }
+
+    /** The aggregate estimate of a filtered pushed aggregate over perf1b on one of the 4 nodes. */
+    private static long perf1bAggregateEstimate(long streamedRows, long materialisedRows, long width) {
+        return ScanAdmission.aggregateScanEstimateBytes(PERF1B_SCANS, streamedRows, materialisedRows, width, PERF1B_READAHEAD, 8 * GB);
+    }
+
+    public void testRangeFilteredTermsAggregateOverPerf1bIsRefusedOnTheNodeItKilled() {
+        // range price [100,200) + terms(category): the BTree on price
+        // reports no distinct count, so one row in five is assumed to
+        // match; the index result is materialised over the whole table
+        // (200M row addresses at 256 bytes, 51.2 GB) on top of the 8
+        // scans' read queues and batches. The node had 59.9 GB available
+        // when the warm run killed it: 51.4 GB after the headroom, below
+        // the estimate.
+        perf1bNode(PERF1B_AVAILABLE_BEFORE_KILL);
+        long width = ScanAdmission.UTF8_COLUMN_BYTES_PER_ROW + 8L;
+        long expected = perf1bAggregateEstimate(50_000_000L, 200_000_000L, width);
+        assertEquals(200_000_000L * ScanAdmission.FILTER_SCAN_BYTES_PER_MATCHING_ROW + 8 * 260_485_760L, expected);
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admitAggregateScan(
+                "perf1b",
+                perf1bStatistics(),
+                "(price >= 100.0) AND (price < 200.0)",
+                PERF1B_SCANS,
+                PERF1B_NODE_ROWS,
+                width,
+                10L,
+                0,
+                PERF1B_READAHEAD,
+                Long.MAX_VALUE
+            )
+        );
+        assertTrue(rejection.getMessage(), rejection.getMessage().startsWith("[" + ScanAdmission.LABEL + "] aggregate_scan estimate"));
+        assertTrue(rejection.getMessage(), rejection.getMessage().contains("materialising 200000000 row addresses"));
+        assertEquals(expected, ScanAdmission.lastEstimateBytes());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.AGGREGATE_SCAN));
+    }
+
+    public void testBoolFilteredTermsAggregateOverPerf1bChargesEveryIndexedPredicate() {
+        // bool(term category=cat010, range price>=50) + terms(rating):
+        // the combined selectivity is the bitmap's one in 200 (1.25M rows
+        // streamed per node), but Lance evaluates both predicates on
+        // their indexes over the whole table and holds both results
+        // until it intersects them, so the materialised rows are the
+        // sum: 5M for the equality plus 200M for the range.
+        perf1bNode(PERF1B_AVAILABLE_BEFORE_KILL);
+        long width = 4L + 8L;
+        long expected = perf1bAggregateEstimate(1_250_000L, 205_000_000L, width);
+        assertEquals(205_000_000L * ScanAdmission.FILTER_SCAN_BYTES_PER_MATCHING_ROW + 8 * 5_020_728L, expected);
+        String filter = "(category = 'cat010') AND (price >= 50.0)";
+        assertEquals(0.005d, ScanAdmission.filterSelectivity(filter, perf1bStatistics().get()), 1e-9);
+        assertEquals(0.205d, ScanAdmission.filterMaterialisedRatio(filter, perf1bStatistics().get()), 1e-9);
+        expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admitAggregateScan(
+                "perf1b",
+                perf1bStatistics(),
+                filter,
+                PERF1B_SCANS,
+                PERF1B_NODE_ROWS,
+                width,
+                5L,
+                0,
+                PERF1B_READAHEAD,
+                Long.MAX_VALUE
+            )
+        );
+        assertEquals("aggregate_scan", ScanAdmission.lastKind());
+        assertEquals(expected, ScanAdmission.lastEstimateBytes());
+    }
+
+    public void testEqualityFilteredTermsAggregateOverPerf1bIsAdmittedOnAFreshNode() {
+        // filter rating=5 + terms(category): the BTree on rating reports
+        // no distinct count either, so the model's inputs are those of
+        // the range shape and the estimate is the same 53.3 GB. A fresh
+        // 128 GB node reads 96.6 GB available, 88 GB after the headroom,
+        // and admits it; the node that had 59.9 GB left refuses it.
+        long width = ScanAdmission.UTF8_COLUMN_BYTES_PER_ROW + 8L;
+        long expected = perf1bAggregateEstimate(50_000_000L, 200_000_000L, width);
+        perf1bNode(PERF1B_AVAILABLE_FRESH_NODE);
+        ScanAdmission.admitAggregateScan(
+            "perf1b",
+            perf1bStatistics(),
+            "rating = 5",
+            PERF1B_SCANS,
+            PERF1B_NODE_ROWS,
+            width,
+            10L,
+            0,
+            PERF1B_READAHEAD,
+            Long.MAX_VALUE
+        );
+        assertEquals(expected, ScanAdmission.lastEstimateBytes());
+        assertEquals(0L, ScanAdmission.rejections());
+        ScanAdmission.requestEnded();
+        perf1bNode(PERF1B_AVAILABLE_BEFORE_KILL);
+        expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admitAggregateScan(
+                "perf1b",
+                perf1bStatistics(),
+                "rating = 5",
+                PERF1B_SCANS,
+                PERF1B_NODE_ROWS,
+                width,
+                10L,
+                0,
+                PERF1B_READAHEAD,
+                Long.MAX_VALUE
+            )
+        );
+        // An unfiltered aggregate materialises nothing and stays within
+        // the shard share: 250M rows of 40 bytes in 8 scans is 8 read
+        // queues of 1.25 GB, which is above 8 GiB, so it is the read
+        // queue alone that is judged.
+        ScanAdmission.requestEnded();
+        perf1bNode(PERF1B_AVAILABLE_BEFORE_KILL);
+        ScanAdmission.admitAggregateScan(
+            "perf1b",
+            perf1bStatistics(),
+            null,
+            PERF1B_SCANS,
+            PERF1B_NODE_ROWS,
+            width,
+            10L,
+            0,
+            PERF1B_READAHEAD,
+            Long.MAX_VALUE
+        );
+        assertEquals(
+            ScanAdmission.aggregateScanEstimateBytes(PERF1B_SCANS, PERF1B_NODE_ROWS, 0L, width, PERF1B_READAHEAD, 8 * GB),
+            ScanAdmission.lastEstimateBytes()
+        );
+    }
+
+    public void testAggregateFilteredOnAnUnindexedColumnMaterialisesNothing() {
+        // filter on brand (no index) + terms(category): Lance evaluates
+        // the predicate on the scanned batches without a
+        // MaterializeIndexExec, so only the read queues and batches of
+        // the scans are charged, at one row in five streamed. The body
+        // column carries an inverted index only, which the filter path
+        // does not load either.
+        TableStatistics statistics = perf1bStatistics().get();
+        assertEquals(0d, ScanAdmission.filterMaterialisedRatio("brand = 'b1'", statistics), 0d);
+        assertEquals(0d, ScanAdmission.filterMaterialisedRatio("body = 'x'", statistics), 0d);
+        assertTrue(ScanAdmission.scalarIndexFor("brand = 'b1'", statistics).isEmpty());
+        assertTrue(ScanAdmission.scalarIndexFor("body = 'x'", statistics).isEmpty());
+        // A predicate on an indexed column next to one on an unindexed
+        // column charges the indexed one alone.
+        assertEquals(0.2d, ScanAdmission.filterMaterialisedRatio("(brand = 'b1') AND (price >= 50.0)", statistics), 1e-9);
+        long width = ScanAdmission.UTF8_COLUMN_BYTES_PER_ROW + 8L;
+        perf1bNode(PERF1B_AVAILABLE_BEFORE_KILL);
+        ScanAdmission.admitAggregateScan(
+            "perf1b",
+            perf1bStatistics(),
+            "brand = 'b1'",
+            PERF1B_SCANS,
+            PERF1B_NODE_ROWS,
+            width,
+            10L,
+            0,
+            PERF1B_READAHEAD,
+            Long.MAX_VALUE
+        );
+        assertEquals(perf1bAggregateEstimate(50_000_000L, 0L, width), ScanAdmission.lastEstimateBytes());
+        assertEquals(0L, ScanAdmission.rejections());
+        // Without statistics no index is known to answer the filter and
+        // nothing is materialised either.
+        ScanAdmission.requestEnded();
+        ScanAdmission.admitAggregateScan(
+            "perf1b",
+            Optional.empty(),
+            "price >= 50.0",
+            PERF1B_SCANS,
+            PERF1B_NODE_ROWS,
+            width,
+            10L,
+            0,
+            PERF1B_READAHEAD,
+            Long.MAX_VALUE
+        );
+        assertEquals(perf1bAggregateEstimate(50_000_000L, 0L, width), ScanAdmission.lastEstimateBytes());
+    }
+
+    public void testBoundedMatchPageOverPerf1bIsAdmittedOnAFreshNode() {
+        // match body 'w000100 w000200' size 10: one clause, no phrase;
+        // the document set of 52 GB plus the 10 row page buffer against
+        // 88 GB after the headroom. Completed twice in the round.
+        perf1bNode(PERF1B_AVAILABLE_FRESH_NODE);
+        ScanAdmission.Shape shape = ScanAdmission.classify(new LanceFtsQuery("body", "w000100 w000200").withScanLimit(10), false);
+        assertEquals(1, shape.clauses());
+        assertFalse(shape.phrase());
+        ScanAdmission.admit("perf1b", PERF1B_ROWS, shape);
+        assertEquals(NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS) + 10L * 12L * 2L, ScanAdmission.lastEstimateBytes());
+        assertEquals(0L, ScanAdmission.rejections());
+    }
+
+    public void testBoundedPhrasePageOverPerf1bIsRefusedOnAFreshNode() {
+        // match_phrase body 'w000000 w000001' size 10: the document set
+        // plus the positions of the phrase's tokens, 48 bytes per row,
+        // 100 GB over 1B rows; a fresh 128 GB node has 88 GB after the
+        // headroom and every node of the 4 node cluster was killed.
+        perf1bNode(PERF1B_AVAILABLE_FRESH_NODE);
+        ScanAdmission.Shape shape = ScanAdmission.classify(new LanceFtsQuery("body", "w000000 w000001", true, 0).withScanLimit(10), false);
+        assertEquals(1, shape.clauses());
+        assertEquals(1, shape.phraseClauses());
+        long expected = NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS) + PERF1B_ROWS
+            * ScanAdmission.PHRASE_POSITION_BYTES_PER_ROW + 10L * 12L * 2L;
+        assertEquals(100_000_000_240L, expected);
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("perf1b", PERF1B_ROWS, shape)
+        );
+        assertTrue(rejection.getMessage(), rejection.getMessage().startsWith("[" + ScanAdmission.LABEL + "] fts estimate [93.1gb]"));
+        assertTrue(rejection.getMessage(), rejection.getMessage().contains("positions of the phrase's tokens"));
+        assertEquals(expected, ScanAdmission.lastEstimateBytes());
+    }
+
+    public void testBoundedBoolOfTwoMatchesOverPerf1bIsRefusedOnAFreshNode() {
+        // bool(must [match w000100, match w000200], filter range price
+        // >= 50) size 10, fused into one Lance boolean query with a
+        // prefilter: two clauses, each searched over the whole index,
+        // 104 GB of document sets against 88 GB after the headroom.
+        perf1bNode(PERF1B_AVAILABLE_FRESH_NODE);
+        FullTextQuery fused = FullTextQuery.booleanQuery(
+            List.of(
+                new FullTextQuery.BooleanClause(FullTextQuery.Occur.MUST, FullTextQuery.match("w000100", "body")),
+                new FullTextQuery.BooleanClause(FullTextQuery.Occur.MUST, FullTextQuery.match("w000200", "body"))
+            )
+        );
+        LanceFtsQuery query = new LanceFtsQuery(fused, Set.of("body"), 10, "price >= 50.0");
+        ScanAdmission.Shape shape = ScanAdmission.classify(query, false);
+        assertEquals(2, shape.clauses());
+        assertEquals(0, shape.phraseClauses());
+        assertFalse(shape.unbounded());
+        assertEquals(10L, shape.boundedScanRows());
+        long expected = 2L * NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS) + 10L * 12L * 2L;
+        assertEquals(104_000_000_240L, expected);
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("perf1b", PERF1B_ROWS, shape)
+        );
+        assertTrue(rejection.getMessage(), rejection.getMessage().contains("rebuilt for each of 2 full text clauses"));
+        assertEquals(expected, ScanAdmission.lastEstimateBytes());
+        // The same two clauses spelled as two Lucene clauses (the shape
+        // the resolver leaves under dis_max or a nested bool) count the
+        // same, unbounded there.
+        BooleanQuery lucene = new BooleanQuery.Builder().add(new LanceFtsQuery("body", "w000100"), BooleanClause.Occur.MUST)
+            .add(new LanceFtsQuery("body", "w000200"), BooleanClause.Occur.MUST)
+            .build();
+        ScanAdmission.Shape nested = ScanAdmission.classify(lucene, false);
+        assertEquals(2, nested.clauses());
+        assertTrue(nested.unbounded());
+    }
+
+    public void testBoolOfTwoPhrasesChargesThePositionsOfEachPhrase() {
+        // lance_fts_bool(must [match_phrase, match_phrase]) size 10: two
+        // document sets and two phrases' positions, 200 GB over 1B rows.
+        perf1bNode(PERF1B_AVAILABLE_FRESH_NODE);
+        FullTextQuery fused = FullTextQuery.booleanQuery(
+            List.of(
+                new FullTextQuery.BooleanClause(FullTextQuery.Occur.MUST, FullTextQuery.phrase("w000000 w000001", "body", 0)),
+                new FullTextQuery.BooleanClause(FullTextQuery.Occur.MUST, FullTextQuery.phrase("w000100 w000200", "body", 0))
+            )
+        );
+        ScanAdmission.Shape shape = ScanAdmission.classify(new LanceFtsQuery(fused, Set.of("body")).withScanLimit(10), false);
+        assertEquals(2, shape.clauses());
+        assertEquals(2, shape.phraseClauses());
+        assertTrue(shape.phrase());
+        long entry = NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS);
+        long positions = PERF1B_ROWS * ScanAdmission.PHRASE_POSITION_BYTES_PER_ROW;
+        long expected = 2L * entry + 2L * positions + 10L * 12L * 2L;
+        assertEquals(200_000_000_240L, expected);
+        // Twice what one phrase's positions add to the same two clauses.
+        assertEquals(
+            positions,
+            ScanAdmission.ftsEstimateBytes(PERF1B_ROWS, 2, 2, 240L, 8 * GB) - ScanAdmission.ftsEstimateBytes(
+                PERF1B_ROWS,
+                2,
+                1,
+                240L,
+                8 * GB
+            )
+        );
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("perf1b", PERF1B_ROWS, shape)
+        );
+        assertTrue(rejection.getMessage(), rejection.getMessage().contains("for each of 2 phrase clauses"));
+        assertEquals(expected, ScanAdmission.lastEstimateBytes());
+        // Two phrases as two LanceFtsQuery leaves under a Lucene bool
+        // count the same.
+        BooleanQuery lucene = new BooleanQuery.Builder().add(
+            new LanceFtsQuery("body", "w000000 w000001", true, 0),
+            BooleanClause.Occur.MUST
+        ).add(new LanceFtsQuery("body", "w000100 w000200", true, 0), BooleanClause.Occur.SHOULD).build();
+        assertEquals(2, ScanAdmission.classify(lucene, false).phraseClauses());
+    }
+
+    public void testClauseCountFollowsTheLanceQueryTree() {
+        // A multi_match searches one index per column; a boost searches
+        // both sides; a boolean sums its clauses; every phrase in the
+        // tree is counted.
+        FullTextQuery multi = FullTextQuery.multiMatch("w000100", List.of("title", "body"));
+        assertEquals(2, ScanAdmission.leafClauses(multi));
+        assertEquals(0, ScanAdmission.phraseClauses(multi));
+        FullTextQuery boost = FullTextQuery.boost(FullTextQuery.match("a", "body"), FullTextQuery.phrase("b c", "body", 0), 0.5f);
+        assertEquals(2, ScanAdmission.leafClauses(boost));
+        assertEquals(1, ScanAdmission.phraseClauses(boost));
+        assertEquals(
+            2,
+            ScanAdmission.phraseClauses(FullTextQuery.boost(FullTextQuery.phrase("a b", "body", 0), FullTextQuery.phrase("b c", "body", 0)))
+        );
+        FullTextQuery bool = FullTextQuery.booleanQuery(
+            List.of(
+                new FullTextQuery.BooleanClause(FullTextQuery.Occur.SHOULD, multi),
+                new FullTextQuery.BooleanClause(FullTextQuery.Occur.MUST_NOT, FullTextQuery.match("d", "body"))
+            )
+        );
+        assertEquals(3, ScanAdmission.leafClauses(bool));
+        assertEquals(0, ScanAdmission.phraseClauses(bool));
+        ScanAdmission.Shape shape = ScanAdmission.classify(new LanceFtsQuery(bool, Set.of("title", "body")).withScanLimit(5), false);
+        assertEquals(3, shape.clauses());
+        assertEquals(5L, shape.boundedScanRows());
+        // The three argument shape is one non phrase clause.
+        assertEquals(1, UNBOUNDED.clauses());
+        assertEquals(0, UNBOUNDED.phraseClauses());
+        assertFalse(UNBOUNDED.phrase());
+        assertEquals(0, ScanAdmission.Shape.NONE.clauses());
+        // The estimator: two clauses double the document set, each
+        // phrase adds its positions, a fitting document set is zero
+        // whatever the clauses.
+        long entry = NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS);
+        assertEquals(2 * entry + 240L, ScanAdmission.ftsEstimateBytes(PERF1B_ROWS, 2, 0, 240L, 8 * GB));
+        assertEquals(
+            entry + PERF1B_ROWS * ScanAdmission.PHRASE_POSITION_BYTES_PER_ROW,
+            ScanAdmission.ftsEstimateBytes(PERF1B_ROWS, 1, 1, 0L, 8 * GB)
+        );
+        assertEquals(
+            3 * entry + 3 * PERF1B_ROWS * ScanAdmission.PHRASE_POSITION_BYTES_PER_ROW,
+            ScanAdmission.ftsEstimateBytes(PERF1B_ROWS, 3, 3, 0L, 8 * GB)
+        );
+        assertEquals(0L, ScanAdmission.ftsEstimateBytes(1_000_000L, 3, 3, 240L, 8 * GB));
     }
 
     public void testHeapTermIsJudgedAgainstTheBreakerRoomNotPhysicalMemory() {

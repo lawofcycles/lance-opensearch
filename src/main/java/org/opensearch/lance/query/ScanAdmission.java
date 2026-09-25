@@ -33,6 +33,7 @@ import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryVisitor;
 import org.lance.Dataset;
 import org.lance.index.IndexType;
+import org.lance.ipc.FullTextQuery;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.core.common.unit.ByteSizeUnit;
@@ -206,6 +207,24 @@ public final class ScanAdmission {
      * physical row width of the scan is these two columns.
      */
     static final long HITS_SCAN_ROW_BYTES = 12L;
+
+    /**
+     * Native bytes per table row one phrase clause holds on top of the
+     * document set. A phrase reads the positions of every query token's
+     * posting list next to the postings ({@code posting_list} in Lance's
+     * {@code PostingListReader} reads the positions column when the query
+     * is a phrase), one {@code u32} per occurrence, for the whole
+     * index whichever fragments the scan keeps; a query with several
+     * phrase clauses reads them once per clause. The phrase
+     * {@code w000000 w000001 size 10} over 1B rows killed every node of
+     * a 4 node 128 GB cluster after being admitted at 52 GB (the
+     * document set alone) with 97 GB available, and on one 128 GB node
+     * the same phrase peaked at 103 GB of resident set. 48 bytes per
+     * row puts the phrase estimate over 1B rows at 100 GB, which
+     * explains the single node peak and refuses the shape on a node
+     * whose available memory is below it.
+     */
+    static final long PHRASE_POSITION_BYTES_PER_ROW = 48L;
 
     /**
      * Allowance over the modelled scan rows for the batches Lance and
@@ -846,14 +865,30 @@ public final class ScanAdmission {
      * limit unbounded for sort, aggregations, {@code post_filter},
      * {@code size 0}, for every clause nested under another scoring
      * query and under a security reader wrapper; an exact match count
-     * also runs the unbounded count-only scan), and the largest
-     * bounded scan limit otherwise, which is the rows the top-k page's
-     * scan returns at most.
+     * also runs the unbounded count-only scan), the largest bounded
+     * scan limit otherwise, which is the rows the top-k page's scan
+     * returns at most, how many full text clauses the tree searches
+     * (every {@code match}, {@code match_phrase} and column of a
+     * {@code multi_match} across every {@link LanceFtsQuery} and every
+     * clause of a Lance boolean or boost query: Lance runs one search
+     * per clause, each over the whole index, and joins their results)
+     * and how many of those clauses are phrases, each of which reads
+     * the positions of its tokens' postings.
      */
-    public record Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows) {
+    public record Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows, int clauses, int phraseClauses) {
 
         /** A query tree without a full-text clause; never gated. */
-        public static final Shape NONE = new Shape(false, false, 0L);
+        public static final Shape NONE = new Shape(false, false, 0L, 0, 0);
+
+        /** A shape of one non phrase clause (a single {@code match}). */
+        public Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows) {
+            this(hasFtsClause, unbounded, boundedScanRows, hasFtsClause ? 1 : 0, 0);
+        }
+
+        /** Whether any clause is a phrase. */
+        public boolean phrase() {
+            return phraseClauses > 0;
+        }
     }
 
     /**
@@ -863,6 +898,8 @@ public final class ScanAdmission {
      * count ({@code track_total_hits: true}) would run the unbounded
      * count-only scan, is unbounded. Everything else is a bounded
      * top-k page whose scan returns at most the largest clause limit.
+     * The clause and phrase clause counts are read off every
+     * {@link LanceFtsQuery}'s Lance query tree whatever the bound.
      */
     public static Shape classify(Query query, boolean trackTotalHitsAccurate) {
         List<LanceFtsQuery> found = new ArrayList<>();
@@ -885,17 +922,72 @@ public final class ScanAdmission {
         if (found.isEmpty()) {
             return Shape.NONE;
         }
+        int clauses = 0;
+        int phraseClauses = 0;
+        boolean unbounded = trackTotalHitsAccurate;
         long boundedScanRows = 0L;
         for (LanceFtsQuery fts : found) {
+            clauses += leafClauses(fts.fullTextQuery());
+            phraseClauses += phraseClauses(fts.fullTextQuery());
             if (fts.scanLimit() == LanceFtsQuery.SCAN_LIMIT_UNBOUNDED) {
-                return new Shape(true, true, 0L);
+                unbounded = true;
+            } else {
+                boundedScanRows = Math.max(boundedScanRows, fts.scanLimit());
             }
-            boundedScanRows = Math.max(boundedScanRows, fts.scanLimit());
         }
-        if (trackTotalHitsAccurate) {
-            return new Shape(true, true, 0L);
+        return new Shape(true, unbounded, unbounded ? 0L : boundedScanRows, Math.max(1, clauses), phraseClauses);
+    }
+
+    /**
+     * The searches Lance runs for {@code query}: one per {@code match}
+     * or phrase, one per column of a {@code multi_match} (each column
+     * has its own inverted index), the sum over the clauses of a
+     * boolean query and over both sides of a boost query.
+     */
+    static int leafClauses(FullTextQuery query) {
+        switch (query.getType()) {
+            case MULTI_MATCH:
+                return Math.max(1, ((FullTextQuery.MultiMatchQuery) query).getColumns().size());
+            case BOOST: {
+                FullTextQuery.BoostQuery boost = (FullTextQuery.BoostQuery) query;
+                return leafClauses(boost.getPositive()) + leafClauses(boost.getNegative());
+            }
+            case BOOLEAN: {
+                int sum = 0;
+                for (FullTextQuery.BooleanClause clause : ((FullTextQuery.BooleanQuery) query).getClauses()) {
+                    sum += leafClauses(clause.getQuery());
+                }
+                return Math.max(1, sum);
+            }
+            default:
+                return 1;
         }
-        return new Shape(true, false, boundedScanRows);
+    }
+
+    /**
+     * The phrases in {@code query}: one for a {@code match_phrase},
+     * the sum over the clauses of a boolean query and over both sides
+     * of a boost query. Each phrase reads the positions of its tokens'
+     * postings on its own.
+     */
+    static int phraseClauses(FullTextQuery query) {
+        switch (query.getType()) {
+            case MATCH_PHRASE:
+                return 1;
+            case BOOST: {
+                FullTextQuery.BoostQuery boost = (FullTextQuery.BoostQuery) query;
+                return phraseClauses(boost.getPositive()) + phraseClauses(boost.getNegative());
+            }
+            case BOOLEAN: {
+                int sum = 0;
+                for (FullTextQuery.BooleanClause clause : ((FullTextQuery.BooleanQuery) query).getClauses()) {
+                    sum += phraseClauses(clause.getQuery());
+                }
+                return sum;
+            }
+            default:
+                return 0;
+        }
     }
 
     /**
@@ -936,14 +1028,24 @@ public final class ScanAdmission {
     /**
      * The {@link Kind#FTS} estimate: the document set rebuild
      * ({@link NativeMemoryLimit#invertedIndexEntryEstimateBytes}, which
-     * Lance performs whole whichever fragments the scan keeps) plus
-     * {@code scanBufferBytes}; zero when the document set fits
-     * {@code shardShareBytes}, because a document set the cache holds
-     * is not rebuilt per scan.
+     * Lance performs whole whichever fragments the scan keeps) once per
+     * full text clause (Lance searches each clause of a boolean query on
+     * its own and holds every clause's result while it joins them, so a
+     * {@code bool} of two {@code match} clauses rebuilds and holds two
+     * document sets' worth), plus {@code phraseClauses × rows ×
+     * PHRASE_POSITION_BYTES_PER_ROW} (each phrase clause reads the
+     * positions of its own tokens' postings for the whole index), plus
+     * {@code scanBufferBytes}; zero when
+     * one document set fits {@code shardShareBytes}, because a document
+     * set the cache holds is not rebuilt per scan.
      */
-    static long ftsEstimateBytes(long rows, long scanBufferBytes, long shardShareBytes) {
+    static long ftsEstimateBytes(long rows, int clauses, int phraseClauses, long scanBufferBytes, long shardShareBytes) {
         long entry = NativeMemoryLimit.invertedIndexEntryEstimateBytes(rows);
-        return entry <= shardShareBytes ? 0L : entry + Math.max(0L, scanBufferBytes);
+        if (entry <= shardShareBytes) {
+            return 0L;
+        }
+        long positions = Math.max(0, phraseClauses) * Math.max(0L, rows) * PHRASE_POSITION_BYTES_PER_ROW;
+        return entry * Math.max(1, clauses) + positions + Math.max(0L, scanBufferBytes);
     }
 
     /**
@@ -1106,18 +1208,32 @@ public final class ScanAdmission {
      * per scan the queued reads, {@code min(IO_BUFFER_BYTES_PER_SCAN,
      * groupRows × rowWidthBytes)}, plus the decoded batches in flight,
      * {@code batchReadahead × SCAN_BATCH_ROWS × rowWidthBytes ×
-     * SCAN_BUFFER_FACTOR}. Zero when the sum fits
+     * SCAN_BUFFER_FACTOR}; plus, for a filtered aggregate, the row
+     * addresses the filter's scalar indexes materialise,
+     * {@code materialisedRows × FILTER_SCAN_BYTES_PER_MATCHING_ROW}
+     * (Lance's {@code MaterializeIndexExec} evaluates the filter's index
+     * expression over the whole table before it keeps the scan's
+     * fragments, the same term the filter scan estimate charges; 0 for
+     * an unfiltered aggregate). Zero when the sum fits
      * {@code shardShareBytes}, as for a filter scan. The hash aggregate
      * state DataFusion keeps per group is not in this term; the group
      * state on the plugin's heap is {@link #aggregateScanHeapBytes}.
      */
-    static long aggregateScanEstimateBytes(int scans, long scannedRows, long rowWidthBytes, int batchReadahead, long shardShareBytes) {
+    static long aggregateScanEstimateBytes(
+        int scans,
+        long scannedRows,
+        long materialisedRows,
+        long rowWidthBytes,
+        int batchReadahead,
+        long shardShareBytes
+    ) {
         int count = Math.max(1, scans);
         long width = Math.max(1L, rowWidthBytes);
         long groupRows = (Math.max(0L, scannedRows) + count - 1) / count;
         long perScan = Math.min(IO_BUFFER_BYTES_PER_SCAN, groupRows * width) + (long) (Math.max(1, batchReadahead) * SCAN_BATCH_ROWS * width
             * SCAN_BUFFER_FACTOR);
-        long total = perScan * count;
+        long materialised = Math.max(0L, materialisedRows) * FILTER_SCAN_BYTES_PER_MATCHING_ROW;
+        long total = perScan * count + materialised;
         return total <= shardShareBytes ? 0L : total;
     }
 
@@ -1251,6 +1367,47 @@ public final class ScanAdmission {
     }
 
     /**
+     * The share of the table's rows the scalar indexes answering
+     * {@code filterSql} materialise between them: Lance evaluates every
+     * indexed predicate of the filter on its own index over the whole
+     * table and holds each result until it has combined them
+     * ({@code ScalarIndexExpr::evaluate} joins the two sides of an
+     * {@code AND} or {@code OR} and only then intersects or unions
+     * them), so the peak is the sum over the referenced columns with a
+     * scalar index of the rows each predicate selects: one over the
+     * distinct count for an equality on a column whose index reports
+     * one, else {@link #FILTER_MATCH_RATIO_UNKNOWN}, capped at the
+     * whole table. Zero when no referenced column carries a scalar
+     * index: Lance then evaluates the filter on the scanned batches
+     * without a {@code MaterializeIndexExec} and materialises nothing.
+     */
+    static double filterMaterialisedRatio(String filterSql, TableStatistics statistics) {
+        double sum = 0d;
+        for (ColumnStatistics column : referencedIndexedColumns(filterSql, statistics)) {
+            if (!hasScalarIndex(column)) {
+                continue;
+            }
+            OptionalLong distinct = column.distinctCount();
+            if (distinct.isPresent() && distinct.getAsLong() > 0L && isEquality(filterSql, column.column())) {
+                sum += 1d / distinct.getAsLong();
+            } else {
+                sum += FILTER_MATCH_RATIO_UNKNOWN;
+            }
+        }
+        return Math.min(1d, sum);
+    }
+
+    /** Whether {@code column} carries an index the filter path loads (see {@link #isScalarIndex}). */
+    private static boolean hasScalarIndex(ColumnStatistics column) {
+        for (ColumnStatistics.IndexSummary index : column.indexes()) {
+            if (index.type().isPresent() && isScalarIndex(index.type().get())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * The scalar index Lance would answer {@code filterSql} from: the
      * first referenced column's first non full text, non vector index
      * (a column with several such indexes is answered by whichever
@@ -1380,9 +1537,9 @@ public final class ScanAdmission {
 
     /**
      * The full text decision as the executor's tests exercise it: the
-     * document set rebuild plus {@code scanBufferBytes}, zero when the
-     * document set fits {@code shardShareBytes}, judged with no heap
-     * term.
+     * document set rebuild of one non phrase clause plus
+     * {@code scanBufferBytes}, zero when the document set fits
+     * {@code shardShareBytes}, judged with no heap term.
      */
     public static Decision decideFts(
         long rows,
@@ -1394,7 +1551,7 @@ public final class ScanAdmission {
         long retainedCreditBytes
     ) {
         return decide(
-            ftsEstimateBytes(rows, scanBufferBytes, shardShareBytes),
+            ftsEstimateBytes(rows, 1, 0, scanBufferBytes, shardShareBytes),
             0L,
             availableMemoryBytes,
             Long.MAX_VALUE,
@@ -1431,13 +1588,22 @@ public final class ScanAdmission {
      */
     public static void admit(String indexName, long rows, Shape shape, LanceHitsAccounting ticket) {
         long shardShare = shardShareBytes();
-        long estimate = ftsEstimateBytes(rows, scanBufferEstimateBytes(rows, shape), shardShare);
+        long estimate = ftsEstimateBytes(rows, shape.clauses(), shape.phraseClauses(), scanBufferEstimateBytes(rows, shape), shardShare);
+        int clauses = Math.max(1, shape.clauses());
         String what = (shape.unbounded() ? "unbounded full text scan" : "bounded full text page")
             + " over ["
             + indexName
             + "]: inverted index document set of ["
             + NativeMemoryLimit.humanReadable(NativeMemoryLimit.invertedIndexEntryEstimateBytes(rows))
-            + "] against an index cache shard of ["
+            + "]"
+            + (clauses > 1 ? " rebuilt for each of " + clauses + " full text clauses" : "")
+            + (shape.phrase()
+                ? " plus the positions of the phrase's tokens ["
+                    + NativeMemoryLimit.humanReadable(Math.max(0L, rows) * PHRASE_POSITION_BYTES_PER_ROW)
+                    + "]"
+                    + (shape.phraseClauses() > 1 ? " for each of " + shape.phraseClauses() + " phrase clauses" : "")
+                : "")
+            + " against an index cache shard of ["
             + NativeMemoryLimit.humanReadable(shardShare)
             + "] plus the hits scan buffers";
         String remedy = shape.unbounded()
@@ -1643,9 +1809,11 @@ public final class ScanAdmission {
      * {@code dataset}: the {@link Kind#SCALAR_INDEX} load of
      * {@code filterSql}'s index when the aggregate is filtered and the
      * statistics name one, then the {@link Kind#AGGREGATE_SCAN} of
-     * {@code scannedRows} rows of {@code rowWidthBytes} with a group
-     * state of {@code groups} groups and {@code metrics} metrics on the
-     * heap, compared with {@code heapAvailableBytes}. Without a request
+     * {@code scannedRows} rows of {@code rowWidthBytes} (the rows the
+     * filter keeps, plus the row addresses the filter's indexes
+     * materialise over the whole table) with a group state of
+     * {@code groups} groups and {@code metrics} metrics on the heap,
+     * compared with {@code heapAvailableBytes}. Without a request
      * ticket (the runner has none) the admission is counted on the
      * calling thread and released by its next admission or
      * {@link #requestEnded()}.
@@ -1664,14 +1832,49 @@ public final class ScanAdmission {
         if (!enabled) {
             return;
         }
+        admitAggregateScan(
+            indexName,
+            statisticsOf(dataset),
+            filterSql,
+            scans,
+            scannedRows,
+            rowWidthBytes,
+            groups,
+            metrics,
+            batchReadahead(),
+            heapAvailableBytes
+        );
+    }
+
+    /**
+     * {@link #admitAggregateScan(String, Dataset, String, int, long, long, long, int, long)}
+     * with the table's {@code statistics} and the scans'
+     * {@code batchReadahead} given, so a test can judge a shape against
+     * hand built statistics on any host.
+     */
+    static void admitAggregateScan(
+        String indexName,
+        Optional<TableStatistics> statistics,
+        String filterSql,
+        int scans,
+        long scannedRows,
+        long rowWidthBytes,
+        long groups,
+        int metrics,
+        int batchReadahead,
+        long heapAvailableBytes
+    ) {
+        if (!enabled) {
+            return;
+        }
         long shardShare = shardShareBytes();
-        Optional<TableStatistics> statistics = statisticsOf(dataset);
         long rows = scannedRows;
+        long materialised = 0L;
         if (filterSql != null && !filterSql.isEmpty()) {
             double selectivity = statistics.map(s -> filterSelectivity(filterSql, s)).orElse(FILTER_MATCH_RATIO_UNKNOWN);
             Optional<ColumnStatistics.IndexSummary> index = statistics.flatMap(s -> scalarIndexFor(filterSql, s));
+            long tableRows = tableRows(statistics);
             if (index.isPresent()) {
-                long tableRows = tableRows(statistics);
                 IndexType type = index.get().type().orElse(IndexType.BTREE);
                 long estimate = scalarIndexEstimateBytes(type, index.get().sizeBytes(), tableRows, selectivity, shardShare);
                 String what = type.name().toLowerCase(Locale.ROOT)
@@ -1686,8 +1889,17 @@ public final class ScanAdmission {
                 judge(Kind.SCALAR_INDEX, estimate, 0L, heapAvailableBytes, what, filterRemedy(), null);
             }
             rows = (long) (scannedRows * selectivity);
+            // The index result is evaluated over the whole table before
+            // the scan's fragments are kept; the table's rows when the
+            // statistics know them, else the rows the scans cover. A
+            // filter no scalar index answers runs on the scanned batches
+            // and materialises nothing.
+            if (index.isPresent()) {
+                double materialisedRatio = filterMaterialisedRatio(filterSql, statistics.get());
+                materialised = (long) (Math.max(tableRows, scannedRows) * materialisedRatio);
+            }
         }
-        long estimate = aggregateScanEstimateBytes(scans, rows, rowWidthBytes, batchReadahead(), shardShare);
+        long estimate = aggregateScanEstimateBytes(scans, rows, materialised, rowWidthBytes, batchReadahead, shardShare);
         long heap = aggregateScanHeapBytes(groups, metrics, scans);
         String what = "pushed aggregate over ["
             + indexName
@@ -1697,7 +1909,15 @@ public final class ScanAdmission {
             + rows
             + " rows of ["
             + NativeMemoryLimit.humanReadable(rowWidthBytes)
-            + "] each (read queue and batches in flight per scan); the group state of "
+            + "] each (read queue and batches in flight per scan)"
+            + (materialised > 0L
+                ? ", the filter's indexes materialising "
+                    + materialised
+                    + " row addresses over the whole table at ["
+                    + NativeMemoryLimit.humanReadable(FILTER_SCAN_BYTES_PER_MATCHING_ROW)
+                    + "] each"
+                : "")
+            + "; the group state of "
             + groups
             + " groups takes ["
             + NativeMemoryLimit.humanReadable(heap)
@@ -1740,7 +1960,13 @@ public final class ScanAdmission {
      */
     public static Decision admitWarmUpProbe(long rows) {
         long shardShare = shardShareBytes();
-        long estimate = ftsEstimateBytes(rows, scanBufferEstimateBytes(rows, WARM_UP_PROBE_SHAPE), shardShare);
+        long estimate = ftsEstimateBytes(
+            rows,
+            WARM_UP_PROBE_SHAPE.clauses(),
+            WARM_UP_PROBE_SHAPE.phraseClauses(),
+            scanBufferEstimateBytes(rows, WARM_UP_PROBE_SHAPE),
+            shardShare
+        );
         return judge(Kind.FTS, Source.WARM_UP, estimate, 0L, Long.MAX_VALUE, null);
     }
 
