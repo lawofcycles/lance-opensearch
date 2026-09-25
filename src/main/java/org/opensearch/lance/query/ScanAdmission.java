@@ -1012,15 +1012,16 @@ public final class ScanAdmission {
 
     /**
      * The {@link Kind#VECTOR_INDEX} estimate of a nearest scan that
-     * probes {@code nprobes} of the index's {@code partitions}
-     * (0 when the partition count is not known) with {@code k ×
-     * refineFactor} candidates over {@code dimension} components:
+     * probes {@code nprobes} of the index's {@code partitions} (the
+     * table statistics' {@code num_partitions}, 0 when they report
+     * none) with {@code k × refineFactor} candidates over
+     * {@code dimension} components:
      *
      * <ul>
      *   <li>the probed partitions: the index's bytes scaled by
      *       {@code nprobes / partitions} (the whole index when the count
-     *       is unknown, since the plugin cannot tell how much of it the
-     *       probes touch), times {@link #IVF_PARTITION_LOAD_FACTOR} for
+     *       is unknown, since the plugin cannot then tell how much of it
+     *       the probes touch), times {@link #IVF_PARTITION_LOAD_FACTOR} for
      *       the read then concatenated copy of each partition;</li>
      *   <li>the refine step: {@code k × refineFactor × dimension × 4}
      *       bytes of full vectors read back when {@code refineFactor} is
@@ -1545,7 +1546,10 @@ public final class ScanAdmission {
      * Gate the nearest scan of {@code column} over {@code dataset}: the
      * {@link Kind#VECTOR_INDEX} load of the partitions it probes.
      * {@code nprobes} and {@code refineFactor} are the query's (0 for
-     * Lance's defaults), {@code dimension} the vector column's.
+     * Lance's defaults), {@code dimension} the vector column's. The
+     * partition count comes from the table statistics
+     * ({@link ColumnStatistics.IndexSummary#partitions}); when they
+     * report none the whole index is taken as probed.
      */
     public static void admitVectorSearch(
         String indexName,
@@ -1565,8 +1569,9 @@ public final class ScanAdmission {
         Optional<ColumnStatistics.IndexSummary> index = statistics.flatMap(s -> vectorIndexFor(column, s));
         long tableRows = tableRows(statistics);
         OptionalLong size = index.isPresent() ? index.get().sizeBytes() : OptionalLong.empty();
+        long partitions = index.isPresent() ? index.get().partitions().orElse(0L) : 0L;
         int probes = nprobes > 0 ? nprobes : 1;
-        long estimate = vectorIndexEstimateBytes(size, tableRows, probes, 0L, k, refineFactor, dimension, shardShare);
+        long estimate = vectorIndexEstimateBytes(size, tableRows, probes, partitions, k, refineFactor, dimension, shardShare);
         String what = "nearest scan on ["
             + column
             + "] over ["
@@ -1577,7 +1582,8 @@ public final class ScanAdmission {
             + NativeMemoryLimit.humanReadable(size.orElse(tableRows * VECTOR_INDEX_BYTES_PER_ROW))
             + "] probed with nprobes "
             + probes
-            + " over an unknown partition count, loaded twice while its partitions are concatenated, against an index cache shard of ["
+            + (partitions > 0L ? " over " + partitions + " partitions" : " over an unknown partition count")
+            + ", loaded twice while its partitions are concatenated, against an index cache shard of ["
             + NativeMemoryLimit.humanReadable(shardShare)
             + "]";
         String remedy = "Lower nprobes, attach the table to a node with a larger index cache, or relax lance.admission.headroom / "

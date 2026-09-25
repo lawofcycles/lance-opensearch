@@ -129,6 +129,9 @@ public class TableStatisticsCollectorTests extends OpenSearchTestCase {
         assertTrue(vector.statisticsAvailable());
         assertEquals(OptionalLong.of(FRAGMENTS * ROWS_PER_FRAGMENT), vector.indexedRows());
         assertEquals(OptionalLong.empty(), vector.distinctCount());
+        assertEquals("the fixture trains one IVF partition", OptionalLong.of(1L), vector.partitions());
+        assertEquals("a scalar index has no partitions", OptionalLong.empty(), btree.partitions());
+        assertEquals(OptionalLong.empty(), inverted.partitions());
 
         IndexSummary zoneMap = onlyIndex(statistics, "id");
         assertEquals("id_zonemap", zoneMap.name());
@@ -280,6 +283,51 @@ public class TableStatisticsCollectorTests extends OpenSearchTestCase {
                 Map.of("index_type", "Bitmap", "indices", List.of(Map.of("num_bitmaps", 2))),
                 Optional.empty()
             ).distinctCount()
+        );
+    }
+
+    public void testPartitionCountIsTheSmallestNumPartitionsOfAVectorIndexsDeltas() {
+        // One delta: its count.
+        ParsedStatistics one = TableStatisticsCollector.readStatistics(
+            Map.of("index_type", "IVF_PQ", "indices", List.of(Map.of("num_partitions", 1024, "partitions", List.of()))),
+            Optional.of(IndexType.VECTOR)
+        );
+        assertEquals(Optional.of(IndexType.IVF_PQ), one.type());
+        assertEquals(OptionalLong.of(1024L), one.partitions());
+        // Several deltas: a nearest scan probes nprobes partitions of
+        // each, so the smallest count bounds the probed share.
+        ParsedStatistics deltas = TableStatisticsCollector.readStatistics(
+            Map.of("index_type", "IVF_HNSW_SQ", "indices", List.of(Map.of("num_partitions", 4096), Map.of("num_partitions", 256))),
+            Optional.of(IndexType.VECTOR)
+        );
+        assertEquals(OptionalLong.of(256L), deltas.partitions());
+        // No count, a non numeric one, or a zero: empty.
+        assertEquals(
+            OptionalLong.empty(),
+            TableStatisticsCollector.readStatistics(Map.of("index_type", "IVF_PQ", "indices", List.of(Map.of())), Optional.empty())
+                .partitions()
+        );
+        assertEquals(
+            OptionalLong.empty(),
+            TableStatisticsCollector.readStatistics(
+                Map.of("index_type", "IVF_PQ", "indices", List.of(Map.of("num_partitions", "many"))),
+                Optional.empty()
+            ).partitions()
+        );
+        assertEquals(
+            OptionalLong.empty(),
+            TableStatisticsCollector.readStatistics(
+                Map.of("index_type", "IVF_PQ", "indices", List.of(Map.of("num_partitions", 0))),
+                Optional.empty()
+            ).partitions()
+        );
+        // A scalar index's deltas are not read for a partition count.
+        assertEquals(
+            OptionalLong.empty(),
+            TableStatisticsCollector.readStatistics(
+                Map.of("index_type", "BTree", "indices", List.of(Map.of("num_partitions", 8))),
+                Optional.empty()
+            ).partitions()
         );
     }
 }
