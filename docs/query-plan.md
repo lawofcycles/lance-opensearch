@@ -111,8 +111,13 @@ next to it because the executor's column loads take SQL only (the `sql=` is abse
 printer has no spelling for the predicate, which today is arithmetic in a comparison). Both
 encodings decode to the same DataFusion expression inside Lance and run through the same
 planning, so the cost that orders them is the encoding's size on the wire and a tie break in
-favour of the Substrait form (`CostCoefficients.FILTER_SQL_TIE_BREAK_MS`): a short predicate
-ships as Substrait, a long `terms` list on a wide cluster as SQL. A predicate on a struct child
+favour of the Substrait form (`CostCoefficients.FILTER_SQL_TIE_BREAK_MS`, 0.05 ms, against
+`FILTER_WIRE_MS_PER_KB_PER_NODE`, 0.001 ms per KB per data node). The Substrait form ships its
+SQL as well, so the two differ by the Substrait bytes alone, and Substrait is the default: the
+SQL form is chosen only when the Substrait bytes multiplied by the number of data nodes exceed
+50 KB. For a `terms` list of short keyword values (about 13 bytes of Substrait each) that is
+about 4,000 values on one data node and about 1,000 on four; a 200 value list is under 3 KB of
+Substrait and ships as Substrait on any cluster of up to 18 data nodes. A predicate on a struct child
 (`meta.region`) has a SQL spelling only, a predicate the SQL printer refuses a Substrait spelling
 only, and the planner takes whichever exists. A query filter under an aggregation the
 pushdown computes folds into one pushed aggregate whose `filter=` names the Lance SQL the scan
