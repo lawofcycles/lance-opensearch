@@ -1195,18 +1195,32 @@ public final class ScanAdmission {
      * per scan the queued reads, {@code min(IO_BUFFER_BYTES_PER_SCAN,
      * groupRows × rowWidthBytes)}, plus the decoded batches in flight,
      * {@code batchReadahead × SCAN_BATCH_ROWS × rowWidthBytes ×
-     * SCAN_BUFFER_FACTOR}. Zero when the sum fits
+     * SCAN_BUFFER_FACTOR}; plus, for a filtered aggregate, the row
+     * addresses the filter's scalar indexes materialise,
+     * {@code materialisedRows × FILTER_SCAN_BYTES_PER_MATCHING_ROW}
+     * (Lance's {@code MaterializeIndexExec} evaluates the filter's index
+     * expression over the whole table before it keeps the scan's
+     * fragments, the same term the filter scan estimate charges; 0 for
+     * an unfiltered aggregate). Zero when the sum fits
      * {@code shardShareBytes}, as for a filter scan. The hash aggregate
      * state DataFusion keeps per group is not in this term; the group
      * state on the plugin's heap is {@link #aggregateScanHeapBytes}.
      */
-    static long aggregateScanEstimateBytes(int scans, long scannedRows, long rowWidthBytes, int batchReadahead, long shardShareBytes) {
+    static long aggregateScanEstimateBytes(
+        int scans,
+        long scannedRows,
+        long materialisedRows,
+        long rowWidthBytes,
+        int batchReadahead,
+        long shardShareBytes
+    ) {
         int count = Math.max(1, scans);
         long width = Math.max(1L, rowWidthBytes);
         long groupRows = (Math.max(0L, scannedRows) + count - 1) / count;
         long perScan = Math.min(IO_BUFFER_BYTES_PER_SCAN, groupRows * width) + (long) (Math.max(1, batchReadahead) * SCAN_BATCH_ROWS * width
             * SCAN_BUFFER_FACTOR);
-        long total = perScan * count;
+        long materialised = Math.max(0L, materialisedRows) * FILTER_SCAN_BYTES_PER_MATCHING_ROW;
+        long total = perScan * count + materialised;
         return total <= shardShareBytes ? 0L : total;
     }
 
@@ -1337,6 +1351,38 @@ public final class ScanAdmission {
             }
         }
         return best < 0d ? FILTER_MATCH_RATIO_UNKNOWN : Math.min(1d, best);
+    }
+
+    /**
+     * The share of the table's rows the scalar indexes answering
+     * {@code filterSql} materialise between them: Lance evaluates every
+     * indexed predicate of the filter on its own index over the whole
+     * table and holds each result until it has combined them
+     * ({@code ScalarIndexExpr::evaluate} joins the two sides of an
+     * {@code AND} or {@code OR} and only then intersects or unions
+     * them), so the peak is the sum over the referenced indexed columns
+     * of the rows each predicate selects: one over the distinct count
+     * for an equality on a column whose index reports one, else
+     * {@link #FILTER_MATCH_RATIO_UNKNOWN}, capped at the whole table.
+     * A filter that references no indexed column is
+     * {@link #FILTER_MATCH_RATIO_UNKNOWN}, as {@link #filterSelectivity}
+     * assumes.
+     */
+    static double filterMaterialisedRatio(String filterSql, TableStatistics statistics) {
+        List<ColumnStatistics> referenced = referencedIndexedColumns(filterSql, statistics);
+        if (referenced.isEmpty()) {
+            return FILTER_MATCH_RATIO_UNKNOWN;
+        }
+        double sum = 0d;
+        for (ColumnStatistics column : referenced) {
+            OptionalLong distinct = column.distinctCount();
+            if (distinct.isPresent() && distinct.getAsLong() > 0L && isEquality(filterSql, column.column())) {
+                sum += 1d / distinct.getAsLong();
+            } else {
+                sum += FILTER_MATCH_RATIO_UNKNOWN;
+            }
+        }
+        return Math.min(1d, sum);
     }
 
     /**
@@ -1740,9 +1786,11 @@ public final class ScanAdmission {
      * {@code dataset}: the {@link Kind#SCALAR_INDEX} load of
      * {@code filterSql}'s index when the aggregate is filtered and the
      * statistics name one, then the {@link Kind#AGGREGATE_SCAN} of
-     * {@code scannedRows} rows of {@code rowWidthBytes} with a group
-     * state of {@code groups} groups and {@code metrics} metrics on the
-     * heap, compared with {@code heapAvailableBytes}. Without a request
+     * {@code scannedRows} rows of {@code rowWidthBytes} (the rows the
+     * filter keeps, plus the row addresses the filter's indexes
+     * materialise over the whole table) with a group state of
+     * {@code groups} groups and {@code metrics} metrics on the heap,
+     * compared with {@code heapAvailableBytes}. Without a request
      * ticket (the runner has none) the admission is counted on the
      * calling thread and released by its next admission or
      * {@link #requestEnded()}.
@@ -1761,14 +1809,49 @@ public final class ScanAdmission {
         if (!enabled) {
             return;
         }
+        admitAggregateScan(
+            indexName,
+            statisticsOf(dataset),
+            filterSql,
+            scans,
+            scannedRows,
+            rowWidthBytes,
+            groups,
+            metrics,
+            batchReadahead(),
+            heapAvailableBytes
+        );
+    }
+
+    /**
+     * {@link #admitAggregateScan(String, Dataset, String, int, long, long, long, int, long)}
+     * with the table's {@code statistics} and the scans'
+     * {@code batchReadahead} given, so a test can judge a shape against
+     * hand built statistics on any host.
+     */
+    static void admitAggregateScan(
+        String indexName,
+        Optional<TableStatistics> statistics,
+        String filterSql,
+        int scans,
+        long scannedRows,
+        long rowWidthBytes,
+        long groups,
+        int metrics,
+        int batchReadahead,
+        long heapAvailableBytes
+    ) {
+        if (!enabled) {
+            return;
+        }
         long shardShare = shardShareBytes();
-        Optional<TableStatistics> statistics = statisticsOf(dataset);
         long rows = scannedRows;
+        long materialised = 0L;
         if (filterSql != null && !filterSql.isEmpty()) {
             double selectivity = statistics.map(s -> filterSelectivity(filterSql, s)).orElse(FILTER_MATCH_RATIO_UNKNOWN);
             Optional<ColumnStatistics.IndexSummary> index = statistics.flatMap(s -> scalarIndexFor(filterSql, s));
+            long tableRows = tableRows(statistics);
             if (index.isPresent()) {
-                long tableRows = tableRows(statistics);
                 IndexType type = index.get().type().orElse(IndexType.BTREE);
                 long estimate = scalarIndexEstimateBytes(type, index.get().sizeBytes(), tableRows, selectivity, shardShare);
                 String what = type.name().toLowerCase(Locale.ROOT)
@@ -1783,8 +1866,13 @@ public final class ScanAdmission {
                 judge(Kind.SCALAR_INDEX, estimate, 0L, heapAvailableBytes, what, filterRemedy(), null);
             }
             rows = (long) (scannedRows * selectivity);
+            // The index result is evaluated over the whole table before
+            // the scan's fragments are kept; the table's rows when the
+            // statistics know them, else the rows the scans cover.
+            double materialisedRatio = statistics.map(s -> filterMaterialisedRatio(filterSql, s)).orElse(FILTER_MATCH_RATIO_UNKNOWN);
+            materialised = (long) (Math.max(tableRows, scannedRows) * materialisedRatio);
         }
-        long estimate = aggregateScanEstimateBytes(scans, rows, rowWidthBytes, batchReadahead(), shardShare);
+        long estimate = aggregateScanEstimateBytes(scans, rows, materialised, rowWidthBytes, batchReadahead, shardShare);
         long heap = aggregateScanHeapBytes(groups, metrics, scans);
         String what = "pushed aggregate over ["
             + indexName
@@ -1794,7 +1882,15 @@ public final class ScanAdmission {
             + rows
             + " rows of ["
             + NativeMemoryLimit.humanReadable(rowWidthBytes)
-            + "] each (read queue and batches in flight per scan); the group state of "
+            + "] each (read queue and batches in flight per scan)"
+            + (materialised > 0L
+                ? ", the filter's indexes materialising "
+                    + materialised
+                    + " row addresses over the whole table at ["
+                    + NativeMemoryLimit.humanReadable(FILTER_SCAN_BYTES_PER_MATCHING_ROW)
+                    + "] each"
+                : "")
+            + "; the group state of "
             + groups
             + " groups takes ["
             + NativeMemoryLimit.humanReadable(heap)
