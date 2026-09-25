@@ -33,6 +33,7 @@ import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryVisitor;
 import org.lance.Dataset;
 import org.lance.index.IndexType;
+import org.lance.ipc.FullTextQuery;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.core.common.unit.ByteSizeUnit;
@@ -206,6 +207,23 @@ public final class ScanAdmission {
      * physical row width of the scan is these two columns.
      */
     static final long HITS_SCAN_ROW_BYTES = 12L;
+
+    /**
+     * Native bytes per table row a phrase query holds on top of the
+     * document set. A phrase reads the positions of every query token's
+     * posting list next to the postings ({@code posting_list} in Lance's
+     * {@code PostingListReader} reads the positions column when the query
+     * is a phrase), one {@code u32} per occurrence, for the whole
+     * index whichever fragments the scan keeps. The phrase
+     * {@code w000000 w000001 size 10} over 1B rows killed every node of
+     * a 4 node 128 GB cluster after being admitted at 52 GB (the
+     * document set alone) with 97 GB available, and on one 128 GB node
+     * the same phrase peaked at 103 GB of resident set. 48 bytes per
+     * row puts the phrase estimate over 1B rows at 100 GB, which
+     * explains the single node peak and refuses the shape on a node
+     * whose available memory is below it.
+     */
+    static final long PHRASE_POSITION_BYTES_PER_ROW = 48L;
 
     /**
      * Allowance over the modelled scan rows for the batches Lance and
@@ -846,14 +864,24 @@ public final class ScanAdmission {
      * limit unbounded for sort, aggregations, {@code post_filter},
      * {@code size 0}, for every clause nested under another scoring
      * query and under a security reader wrapper; an exact match count
-     * also runs the unbounded count-only scan), and the largest
-     * bounded scan limit otherwise, which is the rows the top-k page's
-     * scan returns at most.
+     * also runs the unbounded count-only scan), the largest bounded
+     * scan limit otherwise, which is the rows the top-k page's scan
+     * returns at most, how many full text clauses the tree searches
+     * (every {@code match}, {@code match_phrase} and column of a
+     * {@code multi_match} across every {@link LanceFtsQuery} and every
+     * clause of a Lance boolean or boost query: Lance runs one search
+     * per clause, each over the whole index, and joins their results)
+     * and whether any of them is a phrase, which reads positions.
      */
-    public record Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows) {
+    public record Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows, int clauses, boolean phrase) {
 
         /** A query tree without a full-text clause; never gated. */
-        public static final Shape NONE = new Shape(false, false, 0L);
+        public static final Shape NONE = new Shape(false, false, 0L, 0, false);
+
+        /** A shape of one non phrase clause (a single {@code match}). */
+        public Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows) {
+            this(hasFtsClause, unbounded, boundedScanRows, hasFtsClause ? 1 : 0, false);
+        }
     }
 
     /**
@@ -863,6 +891,8 @@ public final class ScanAdmission {
      * count ({@code track_total_hits: true}) would run the unbounded
      * count-only scan, is unbounded. Everything else is a bounded
      * top-k page whose scan returns at most the largest clause limit.
+     * The clause count and the phrase flag are read off every
+     * {@link LanceFtsQuery}'s Lance query tree whatever the bound.
      */
     public static Shape classify(Query query, boolean trackTotalHitsAccurate) {
         List<LanceFtsQuery> found = new ArrayList<>();
@@ -885,17 +915,67 @@ public final class ScanAdmission {
         if (found.isEmpty()) {
             return Shape.NONE;
         }
+        int clauses = 0;
+        boolean phrase = false;
+        boolean unbounded = trackTotalHitsAccurate;
         long boundedScanRows = 0L;
         for (LanceFtsQuery fts : found) {
+            clauses += leafClauses(fts.fullTextQuery());
+            phrase |= hasPhrase(fts.fullTextQuery());
             if (fts.scanLimit() == LanceFtsQuery.SCAN_LIMIT_UNBOUNDED) {
-                return new Shape(true, true, 0L);
+                unbounded = true;
+            } else {
+                boundedScanRows = Math.max(boundedScanRows, fts.scanLimit());
             }
-            boundedScanRows = Math.max(boundedScanRows, fts.scanLimit());
         }
-        if (trackTotalHitsAccurate) {
-            return new Shape(true, true, 0L);
+        return new Shape(true, unbounded, unbounded ? 0L : boundedScanRows, Math.max(1, clauses), phrase);
+    }
+
+    /**
+     * The searches Lance runs for {@code query}: one per {@code match}
+     * or phrase, one per column of a {@code multi_match} (each column
+     * has its own inverted index), the sum over the clauses of a
+     * boolean query and over both sides of a boost query.
+     */
+    static int leafClauses(FullTextQuery query) {
+        switch (query.getType()) {
+            case MULTI_MATCH:
+                return Math.max(1, ((FullTextQuery.MultiMatchQuery) query).getColumns().size());
+            case BOOST: {
+                FullTextQuery.BoostQuery boost = (FullTextQuery.BoostQuery) query;
+                return leafClauses(boost.getPositive()) + leafClauses(boost.getNegative());
+            }
+            case BOOLEAN: {
+                int sum = 0;
+                for (FullTextQuery.BooleanClause clause : ((FullTextQuery.BooleanQuery) query).getClauses()) {
+                    sum += leafClauses(clause.getQuery());
+                }
+                return Math.max(1, sum);
+            }
+            default:
+                return 1;
         }
-        return new Shape(true, false, boundedScanRows);
+    }
+
+    /** Whether {@code query} is, or contains, a phrase, which reads the positions of its tokens' postings. */
+    static boolean hasPhrase(FullTextQuery query) {
+        switch (query.getType()) {
+            case MATCH_PHRASE:
+                return true;
+            case BOOST: {
+                FullTextQuery.BoostQuery boost = (FullTextQuery.BoostQuery) query;
+                return hasPhrase(boost.getPositive()) || hasPhrase(boost.getNegative());
+            }
+            case BOOLEAN:
+                for (FullTextQuery.BooleanClause clause : ((FullTextQuery.BooleanQuery) query).getClauses()) {
+                    if (hasPhrase(clause.getQuery())) {
+                        return true;
+                    }
+                }
+                return false;
+            default:
+                return false;
+        }
     }
 
     /**
@@ -936,14 +1016,23 @@ public final class ScanAdmission {
     /**
      * The {@link Kind#FTS} estimate: the document set rebuild
      * ({@link NativeMemoryLimit#invertedIndexEntryEstimateBytes}, which
-     * Lance performs whole whichever fragments the scan keeps) plus
-     * {@code scanBufferBytes}; zero when the document set fits
-     * {@code shardShareBytes}, because a document set the cache holds
-     * is not rebuilt per scan.
+     * Lance performs whole whichever fragments the scan keeps) once per
+     * full text clause (Lance searches each clause of a boolean query on
+     * its own and holds every clause's result while it joins them, so a
+     * {@code bool} of two {@code match} clauses rebuilds and holds two
+     * document sets' worth), plus {@code rows × PHRASE_POSITION_BYTES_PER_ROW}
+     * when a clause is a phrase (the positions of its tokens' postings,
+     * read for the whole index), plus {@code scanBufferBytes}; zero when
+     * one document set fits {@code shardShareBytes}, because a document
+     * set the cache holds is not rebuilt per scan.
      */
-    static long ftsEstimateBytes(long rows, long scanBufferBytes, long shardShareBytes) {
+    static long ftsEstimateBytes(long rows, int clauses, boolean phrase, long scanBufferBytes, long shardShareBytes) {
         long entry = NativeMemoryLimit.invertedIndexEntryEstimateBytes(rows);
-        return entry <= shardShareBytes ? 0L : entry + Math.max(0L, scanBufferBytes);
+        if (entry <= shardShareBytes) {
+            return 0L;
+        }
+        long positions = phrase ? Math.max(0L, rows) * PHRASE_POSITION_BYTES_PER_ROW : 0L;
+        return entry * Math.max(1, clauses) + positions + Math.max(0L, scanBufferBytes);
     }
 
     /**
@@ -1380,9 +1469,9 @@ public final class ScanAdmission {
 
     /**
      * The full text decision as the executor's tests exercise it: the
-     * document set rebuild plus {@code scanBufferBytes}, zero when the
-     * document set fits {@code shardShareBytes}, judged with no heap
-     * term.
+     * document set rebuild of one non phrase clause plus
+     * {@code scanBufferBytes}, zero when the document set fits
+     * {@code shardShareBytes}, judged with no heap term.
      */
     public static Decision decideFts(
         long rows,
@@ -1394,7 +1483,7 @@ public final class ScanAdmission {
         long retainedCreditBytes
     ) {
         return decide(
-            ftsEstimateBytes(rows, scanBufferBytes, shardShareBytes),
+            ftsEstimateBytes(rows, 1, false, scanBufferBytes, shardShareBytes),
             0L,
             availableMemoryBytes,
             Long.MAX_VALUE,
@@ -1431,13 +1520,21 @@ public final class ScanAdmission {
      */
     public static void admit(String indexName, long rows, Shape shape, LanceHitsAccounting ticket) {
         long shardShare = shardShareBytes();
-        long estimate = ftsEstimateBytes(rows, scanBufferEstimateBytes(rows, shape), shardShare);
+        long estimate = ftsEstimateBytes(rows, shape.clauses(), shape.phrase(), scanBufferEstimateBytes(rows, shape), shardShare);
+        int clauses = Math.max(1, shape.clauses());
         String what = (shape.unbounded() ? "unbounded full text scan" : "bounded full text page")
             + " over ["
             + indexName
             + "]: inverted index document set of ["
             + NativeMemoryLimit.humanReadable(NativeMemoryLimit.invertedIndexEntryEstimateBytes(rows))
-            + "] against an index cache shard of ["
+            + "]"
+            + (clauses > 1 ? " rebuilt for each of " + clauses + " full text clauses" : "")
+            + (shape.phrase()
+                ? " plus the positions of the phrase's tokens ["
+                    + NativeMemoryLimit.humanReadable(Math.max(0L, rows) * PHRASE_POSITION_BYTES_PER_ROW)
+                    + "]"
+                : "")
+            + " against an index cache shard of ["
             + NativeMemoryLimit.humanReadable(shardShare)
             + "] plus the hits scan buffers";
         String remedy = shape.unbounded()
@@ -1740,7 +1837,13 @@ public final class ScanAdmission {
      */
     public static Decision admitWarmUpProbe(long rows) {
         long shardShare = shardShareBytes();
-        long estimate = ftsEstimateBytes(rows, scanBufferEstimateBytes(rows, WARM_UP_PROBE_SHAPE), shardShare);
+        long estimate = ftsEstimateBytes(
+            rows,
+            WARM_UP_PROBE_SHAPE.clauses(),
+            WARM_UP_PROBE_SHAPE.phrase(),
+            scanBufferEstimateBytes(rows, WARM_UP_PROBE_SHAPE),
+            shardShare
+        );
         return judge(Kind.FTS, Source.WARM_UP, estimate, 0L, Long.MAX_VALUE, null);
     }
 
