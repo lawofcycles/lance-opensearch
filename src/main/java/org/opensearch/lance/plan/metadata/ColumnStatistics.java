@@ -34,11 +34,12 @@ public final class ColumnStatistics {
      * summary.
      *
      * @param name index name
-     * @param type Lance index type: the concrete type the index
-     *     statistics name ({@code IVF_PQ}, {@code BTree}, ...) when
-     *     they were read, since the manifest entry says {@code VECTOR}
-     *     for every vector index; otherwise the manifest entry's type;
-     *     empty when neither names a type this Lance build maps
+     * @param type Lance index type as the manifest entry records it
+     *     ({@code BTREE}, {@code BITMAP}, {@code INVERTED},
+     *     {@code ZONEMAP}, and {@code VECTOR} for every vector index);
+     *     the concrete type the index statistics name replaces it when
+     *     they were read; empty when the manifest names no type this
+     *     Lance build maps
      * @param coveredFragments fragments the index covers (the union of
      *     the deltas' fragment bitmaps); equals {@code totalFragments}
      *     when no fragment is unindexed
@@ -47,7 +48,7 @@ public final class ColumnStatistics {
      *     manifest does not record them
      * @param indexedRows {@code num_indexed_rows} of
      *     {@code Dataset.getIndexStatistics}, empty when the statistics
-     *     could not be read
+     *     were not read or could not be read
      * @param unindexedRows {@code num_unindexed_rows}, likewise
      * @param distinctCount an estimate of the column's distinct values
      *     when the index type exposes one: for a bitmap index the sum of
@@ -60,9 +61,11 @@ public final class ColumnStatistics {
      *     share of the index it loads is at most {@code nprobes} over
      *     the smallest count); empty for a scalar index and when the
      *     statistics report no count
-     * @param statisticsAvailable whether {@code getIndexStatistics}
-     *     answered for this index; false leaves the row, distinct and
-     *     partition figures empty
+     * @param statisticsAvailable whether {@code getIndexStatistics} was
+     *     read and answered for this index; the collector reads it for
+     *     bitmap and vector indexes only, so this is false for every
+     *     other type and leaves the row, distinct and partition figures
+     *     empty
      */
     public record IndexSummary(String name, Optional<IndexType> type, int coveredFragments, int totalFragments, OptionalLong sizeBytes,
         OptionalLong indexedRows, OptionalLong unindexedRows, OptionalLong distinctCount, OptionalLong partitions,
