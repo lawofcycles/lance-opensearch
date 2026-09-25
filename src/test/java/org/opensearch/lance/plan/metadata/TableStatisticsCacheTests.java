@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.Optional;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -76,7 +77,7 @@ public class TableStatisticsCacheTests extends OpenSearchTestCase {
     }
 
     /** An executor that holds its tasks until the test runs them, so the collection's timing is the test's. */
-    private static final class DeferredExecutor implements java.util.concurrent.Executor {
+    private static final class DeferredExecutor implements Executor {
         final Deque<Runnable> queued = new ArrayDeque<>();
 
         @Override

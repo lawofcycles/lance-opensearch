@@ -605,8 +605,8 @@ public final class ScanAdmission {
      * The planner statistics of {@code dataset} at its open version from
      * the installed cache; empty when no cache is installed or the cache
      * does not hold that version yet (its collection runs in the
-     * background, started by the coordinator's plan or by the freshness
-     * check of the shard), in which case the estimators fall back to
+     * background, started by the coordinator's plan or by the snapshot
+     * build on the shard's node), in which case the estimators fall back to
      * their per row constants. Never collects on the calling thread.
      */
     public static Optional<TableStatistics> statisticsOf(Dataset dataset) {
