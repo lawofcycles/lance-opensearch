@@ -16,6 +16,15 @@ least squares would fit the 1B rows alone, and a fit on the log of the
 latency would not be linear in the coefficients. Non negativity is a
 physical constraint (no term of the model makes a request faster).
 
+Most quantities are rows per thread (the node's row share divided by the
+path's parallelism). Three are not: the object store transfer and the
+Lucene hash table misses above LARGE_GROUPS are per node (bandwidth bound,
+the parallel threads share the node's memory and network), and the row
+address set a pushed filter materialises from a scalar index covers the
+whole table on every node, so it is per table row. The structural
+constants (LARGE_GROUPS, LUCENE_CARDINALITY_ORDINALS_MAX_DISTINCT) mirror
+CostCoefficients.java and are not fitted.
+
 Standard library only. Usage:
 
     python3 scripts/fit-cost-coefficients.py [--csv PATH] [--report PATH]
@@ -31,6 +40,7 @@ import sys
 from collections import defaultdict
 
 LARGE_GROUPS = 1_000_000
+LUCENE_CARDINALITY_ORDINALS_MAX_DISTINCT = 32_768
 CHOICE_MARGIN = 1.3
 
 PUSHED_NAMES = [
@@ -48,7 +58,9 @@ PUSHED_NAMES = [
     "PUSHED_PERCENTILES_MS_PER_MROW_THREAD",
     "PUSHED_LARGE_GROUPS_MS_PER_MROW_THREAD",
     "PUSHED_FILTER_EVAL_MS_PER_MROW_THREAD",
+    "PUSHED_FILTER_MATCH_MS_PER_MROW",
     "PUSHED_MERGE_MS_PER_MGROUP",
+    "PUSHED_CARDINALITY_HASH_MS_PER_MROW_THREAD",
     "PUSHED_CARDINALITY_MS_PER_MVALUE",
 ]
 LUCENE_NAMES = [
@@ -62,10 +74,11 @@ LUCENE_NAMES = [
     "LUCENE_COMPOSITE_SOURCE_MS_PER_MROW_THREAD",
     "LUCENE_NESTED_LEVEL_MS_PER_MROW_THREAD",
     "LUCENE_SIMPLE_METRIC_MS_PER_MROW_THREAD",
+    "LUCENE_BUCKET_METRIC_MS_PER_MROW_THREAD",
     "LUCENE_EXTENDED_STATS_MS_PER_MROW_THREAD",
     "LUCENE_PERCENTILES_MS_PER_MROW_THREAD",
     "LUCENE_CARDINALITY_MS_PER_MROW_THREAD",
-    "LUCENE_LARGE_GROUPS_MS_PER_MROW_THREAD",
+    "LUCENE_LARGE_GROUPS_MS_PER_MROW_NODE",
     "LUCENE_FILTER_EVAL_MS_PER_MROW_THREAD",
 ]
 ALL_NAMES = PUSHED_NAMES + [n for n in LUCENE_NAMES if n not in PUSHED_NAMES]
@@ -75,6 +88,8 @@ UNITS = {
     "MS_PER_GB_PER_NODE": "ms per GB of column bytes one node reads from the object store",
     "MS_PER_MROW_THREAD_PER_8_BYTES": "ms per million rows per thread per 8 bytes of row width",
     "MS_PER_MROW_THREAD": "ms per million rows one thread processes",
+    "MS_PER_MROW_NODE": "ms per million rows one node holds",
+    "MS_PER_MROW": "ms per million rows of the whole table",
     "MS_PER_MGROUP": "ms per million group rows merged",
     "MS_PER_MVALUE": "ms per million distinct values fed to the sketch",
 }
@@ -119,14 +134,19 @@ def features(row):
     filtered = 1.0 if sel < 1.0 else 0.0
 
     rows_per_node = rows / nodes
+    mrow_node = rows_per_node / 1e6
     mrow_thread_p = rows_per_node / par / 1e6
     mrow_thread_l = rows_per_node / slices / 1e6
+    mrow_table = rows / 1e6
     gb_per_node = rows * bytes_per_row * passes / nodes / 1e9
     large = 1.0 if groups > LARGE_GROUPS else 0.0
     merged_mgroups = min(num(row, "merged_groups"), rows_per_node) / 1e6
     non_composite_keys = (string_keys + numeric_keys + date_keys + range_keys + filter_keys) * (1.0 - composite)
     composite_sources = (string_keys + numeric_keys + composite_date_keys) * composite
     nested_levels = max(0.0, non_composite_keys - 1.0)
+    any_key = 1.0 if string_keys + numeric_keys + date_keys + range_keys + filter_keys + composite_date_keys > 0 else 0.0
+    bucket_metrics = simple_metrics * any_key
+    cardinality_hashed = cardinality if distinct > LUCENE_CARDINALITY_ORDINALS_MAX_DISTINCT else 0.0
 
     if row["path"] == "pushed":
         values = [
@@ -144,7 +164,9 @@ def features(row):
             mrow_thread_p * percentiles * sel,
             mrow_thread_p * large * sel,
             mrow_thread_p * filtered,
+            mrow_table * sel * filtered,
             merged_mgroups * par,
+            mrow_thread_p * cardinality * sel,
             min(distinct, mrow_thread_p * 1e6) * par / 1e6 * cardinality,
         ]
         return dict(zip(PUSHED_NAMES, values))
@@ -159,10 +181,11 @@ def features(row):
         mrow_thread_l * composite_sources * sel,
         mrow_thread_l * nested_levels * sel,
         mrow_thread_l * simple_metrics * sel,
+        mrow_thread_l * bucket_metrics * sel,
         mrow_thread_l * extended_stats * sel,
         mrow_thread_l * percentiles * sel,
-        mrow_thread_l * cardinality * sel,
-        mrow_thread_l * large * sel,
+        mrow_thread_l * cardinality_hashed * sel,
+        mrow_node * large * sel,
         mrow_thread_l * filtered,
     ]
     return dict(zip(LUCENE_NAMES, values))
@@ -333,7 +356,8 @@ def main():
     out.append("## Choices")
     out.append("")
     out.append(
-        f"Every (shape, table, cluster) with both a pushed and a Lucene measurement. Pairs whose measured latencies "
+        f"Every (shape, table, cluster) with both a pushed and a Lucene measurement (excluded rows on either side "
+        f"stay out). Pairs whose measured latencies "
         f"differ by more than {CHOICE_MARGIN}x are asserted by CostModelTests; pairs inside that band are reported only. "
         "A pair is listed once per Lucene slices value measured."
     )
@@ -342,12 +366,10 @@ def main():
     out.append("|---|---|---|---|---|---|---|---|---|---|---|")
     pairs = defaultdict(dict)
     for row in rows:
+        if row["excluded"] != "0":
+            continue
         key = (row["table"], row["cluster"], row["shape"])
-        if row["path"] == "pushed":
-            if row["excluded"] == "0":
-                pairs[key].setdefault("pushed", []).append(row)
-        else:
-            pairs[key].setdefault("lucene", []).append(row)
+        pairs[key].setdefault(row["path"], []).append(row)
     disagreements = []
     agreed = 0
     reported = 0

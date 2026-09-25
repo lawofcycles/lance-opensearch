@@ -82,6 +82,8 @@ public class AggregateProfileTests extends OpenSearchTestCase {
         assertEquals(8.0, p.bytesPerRow(), 0.0);
         assertEquals(1, p.simpleMetrics());
         assertEquals(0, p.nestedLevels());
+        assertFalse(p.bucketed());
+        assertEquals("a metric with no bucket key above it accumulates in place", 0, p.bucketedMetrics());
     }
 
     public void testDateHistogramWithMetricReadsTwoColumns() throws IOException {
@@ -94,6 +96,8 @@ public class AggregateProfileTests extends OpenSearchTestCase {
         assertEquals("ten assumed years of months", 120.0, p.groups(), 0.0);
         assertTrue("an interval bounds the buckets whatever the row count", p.groupsKnown());
         assertEquals(1, p.simpleMetrics());
+        assertTrue(p.bucketed());
+        assertEquals("the sum under the histogram is collected per bucket", 1, p.bucketedMetrics());
     }
 
     public void testFixedDateHistogramBucketsFollowTheInterval() throws IOException {
@@ -156,8 +160,10 @@ public class AggregateProfileTests extends OpenSearchTestCase {
         AggregateProfile p = profile("{\"size\":0,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"user_id\"}}}}");
         assertTrue(p.cardinality());
         assertEquals(1e9, p.cardinalityDistinct(), 0.0);
+        assertTrue("a billion distinct values are hashed row by row", p.cardinalityHashesEveryRow());
         AggregateProfile indexed = profile("{\"size\":0,\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"category\"}}}}");
         assertEquals(200.0, indexed.cardinalityDistinct(), 0.0);
+        assertFalse("two hundred distinct values are collected through the ordinals", indexed.cardinalityHashesEveryRow());
     }
 
     public void testQueryFilterLowersTheSelectivityAndAddsItsColumn() throws IOException {

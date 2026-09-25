@@ -7,6 +7,7 @@ package org.opensearch.lance.plan.cost;
 
 import static org.opensearch.lance.plan.cost.CostCoefficients.FILTER_SQL_TIE_BREAK_MS;
 import static org.opensearch.lance.plan.cost.CostCoefficients.FILTER_WIRE_MS_PER_KB_PER_NODE;
+import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_BUCKET_METRIC_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_CARDINALITY_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_COLUMN_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_COMPOSITE_SOURCE_MS_PER_MROW_THREAD;
@@ -15,7 +16,7 @@ import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_EXTENDED_ST
 import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_FILTERS_KEY_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_FILTER_EVAL_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_FIXED_MS;
-import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_LARGE_GROUPS_MS_PER_MROW_THREAD;
+import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_LARGE_GROUPS_MS_PER_MROW_NODE;
 import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_NESTED_LEVEL_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_NUMERIC_KEY_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_PERCENTILES_MS_PER_MROW_THREAD;
@@ -23,6 +24,7 @@ import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_RANGE_KEY_M
 import static org.opensearch.lance.plan.cost.CostCoefficients.LUCENE_SIMPLE_METRIC_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.OBJECT_STORE_OPEN_MS;
 import static org.opensearch.lance.plan.cost.CostCoefficients.OBJECT_STORE_READ_MS_PER_GB_PER_NODE;
+import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_CARDINALITY_HASH_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_CARDINALITY_MS_PER_MVALUE;
 import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_COMPOSITE_DATE_KEY_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_DATE_KEY_MS_PER_MROW_THREAD;
@@ -30,6 +32,7 @@ import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_DECODE_MS_P
 import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_EXTENDED_STATS_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_FILTERS_KEY_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_FILTER_EVAL_MS_PER_MROW_THREAD;
+import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_FILTER_MATCH_MS_PER_MROW;
 import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_FIXED_MS;
 import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_LARGE_GROUPS_MS_PER_MROW_THREAD;
 import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_MERGE_MS_PER_MGROUP;
@@ -52,12 +55,19 @@ import org.opensearch.lance.plan.rel.PushedOperation.PushedFilter;
  * <p>Both formulas share the fixed costs of a request and, over an
  * object store table, the store's open latency. Rows are charged per
  * thread: the table's rows divided by the nodes and by the path's
- * parallelism. The pushed scan additionally pays the object store
- * transfer of the columns it reads, once per node and not divided by
- * the parallelism, because the transfer is bandwidth bound rather than
- * CPU bound (the parallelism sweep at 1B rows moved it by a fifth where
- * the local decode moved fourfold); the aggregator path reads the
- * warmed columns from the node's column store and has no storage term.
+ * parallelism. Three quantities are not per thread. The pushed scan
+ * pays the object store transfer of the columns it reads once per node
+ * and not divided by the parallelism, because the transfer is
+ * bandwidth bound rather than CPU bound (the parallelism sweep at 1B
+ * rows moved it by a fifth where the local decode moved fourfold); the
+ * aggregator path reads the warmed columns from the node's column store
+ * and has no storage term. The aggregator path's hash table misses
+ * above {@link CostCoefficients#LARGE_GROUPS} groups are per node too:
+ * the slices' tables compete for the node's memory, and eight slices
+ * measured twice as fast as one, not eight times. A pushed filter
+ * materialises the row address set its scalar index answers with, and
+ * that set covers the whole table on every node whatever the node's
+ * share of the rows, so it is charged per matching row of the table.
  * The fan out floor the design named turned out not to be per node in
  * the measurements (its coefficient fitted to zero), so it lives in the
  * fixed terms; the merge of the per node answers on the coordinator is
@@ -88,6 +98,7 @@ public final class CostModel {
         double objectStore = inputs.storage() == StorageKind.OBJECT_STORE ? 1.0 : 0.0;
         double rowsPerNode = shape.tableRows() / inputs.nodes();
         double mrowThread = rowsPerNode / inputs.pushdownParallelism() / 1e6;
+        double mrowTable = shape.tableRows() / 1e6;
         double gigabytesPerNode = shape.tableRows() * shape.bytesPerRow() * shape.scanPasses() / inputs.nodes() / 1e9;
         double selectivity = shape.filterSelectivity();
         double aggregated = mrowThread * selectivity;
@@ -110,7 +121,9 @@ public final class CostModel {
         millis += PUSHED_PERCENTILES_MS_PER_MROW_THREAD * aggregated * (shape.percentiles() ? 1 : 0);
         millis += PUSHED_LARGE_GROUPS_MS_PER_MROW_THREAD * aggregated * (shape.largeGroups() ? 1 : 0);
         millis += PUSHED_FILTER_EVAL_MS_PER_MROW_THREAD * mrowThread * (shape.filtered() ? 1 : 0);
+        millis += PUSHED_FILTER_MATCH_MS_PER_MROW * mrowTable * selectivity * (shape.filtered() ? 1 : 0);
         millis += PUSHED_MERGE_MS_PER_MGROUP * mergedMgroups * inputs.pushdownParallelism();
+        millis += PUSHED_CARDINALITY_HASH_MS_PER_MROW_THREAD * aggregated * (shape.cardinality() ? 1 : 0);
         millis += PUSHED_CARDINALITY_MS_PER_MVALUE * sketchMvalues;
         return millis;
     }
@@ -119,6 +132,7 @@ public final class CostModel {
     public static double luceneAggregateMillis(CostInputs inputs, AggregateProfile shape) {
         double objectStore = inputs.storage() == StorageKind.OBJECT_STORE ? 1.0 : 0.0;
         double rowsPerNode = shape.tableRows() / inputs.nodes();
+        double mrowNode = rowsPerNode / 1e6;
         double mrowThread = rowsPerNode / inputs.slices() / 1e6;
         double selectivity = shape.filterSelectivity();
         double aggregated = mrowThread * selectivity;
@@ -134,10 +148,11 @@ public final class CostModel {
         millis += LUCENE_COMPOSITE_SOURCE_MS_PER_MROW_THREAD * aggregated * shape.compositeSources();
         millis += LUCENE_NESTED_LEVEL_MS_PER_MROW_THREAD * aggregated * shape.nestedLevels();
         millis += LUCENE_SIMPLE_METRIC_MS_PER_MROW_THREAD * aggregated * shape.simpleMetrics();
+        millis += LUCENE_BUCKET_METRIC_MS_PER_MROW_THREAD * aggregated * shape.bucketedMetrics();
         millis += LUCENE_EXTENDED_STATS_MS_PER_MROW_THREAD * aggregated * (shape.extendedStats() ? 1 : 0);
         millis += LUCENE_PERCENTILES_MS_PER_MROW_THREAD * aggregated * (shape.percentiles() ? 1 : 0);
-        millis += LUCENE_CARDINALITY_MS_PER_MROW_THREAD * aggregated * (shape.cardinality() ? 1 : 0);
-        millis += LUCENE_LARGE_GROUPS_MS_PER_MROW_THREAD * aggregated * (shape.largeGroups() ? 1 : 0);
+        millis += LUCENE_CARDINALITY_MS_PER_MROW_THREAD * aggregated * (shape.cardinalityHashesEveryRow() ? 1 : 0);
+        millis += LUCENE_LARGE_GROUPS_MS_PER_MROW_NODE * mrowNode * selectivity * (shape.largeGroups() ? 1 : 0);
         millis += LUCENE_FILTER_EVAL_MS_PER_MROW_THREAD * mrowThread * (shape.filtered() ? 1 : 0);
         return millis;
     }
