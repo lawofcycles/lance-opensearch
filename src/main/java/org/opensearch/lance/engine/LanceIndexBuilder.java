@@ -241,7 +241,7 @@ public final class LanceIndexBuilder {
                 boolean hasFts = !dataset.describeIndices(new IndexCriteria.Builder().forColumn(column).mustSupportFts(true).build())
                     .isEmpty();
                 if (hasFts) {
-                    result.addSkipped(column, existingIndexReason("FTS", fragmentIds));
+                    result.addSkipped(column, existingIndexReason("FTS", column, fragmentIds));
                     continue;
                 }
                 ScalarIndexParams fts = ScalarIndexParams.create("inverted", ftsParamsJson);
@@ -313,13 +313,16 @@ public final class LanceIndexBuilder {
 
     /**
      * Builds scalar indexes for numeric / date / boolean / keyword columns.
-     * Columns already carrying a scalar index are skipped. The index type
-     * per column comes from {@code preferences} (the {@code indexes}
-     * clause of the attach or namespace body, or the one-shot
-     * {@code build_indexes} body): a preference of {@code none} skips the
-     * column, an absent preference builds the default BTree. The
+     * The index type per column comes from {@code preferences} (the
+     * {@code indexes} clause of the attach or namespace body, or the
+     * one-shot {@code build_indexes} body): a preference of {@code none}
+     * skips the column, an absent preference builds the default BTree. The
      * preference's {@code params} serialise into the type's Lance option
-     * JSON.
+     * JSON. A column that already carries a scalar index of the requested
+     * type is skipped (extending it over new fragments is the optimize
+     * path); Lance allows several scalar index types on one column, so a
+     * request for a type the column does not carry yet builds it next to
+     * the existing ones (a zone map next to a writer's BTree).
      */
     public static BuildResult ensureScalarIndexes(
         Dataset dataset,
@@ -348,8 +351,8 @@ public final class LanceIndexBuilder {
             }
             IndexType indexType = scalarIndexType(typeName);
             try {
-                if (hasScalarIndex(dataset, column)) {
-                    result.addSkipped(column, existingIndexReason("scalar", fragmentIds));
+                if (hasIndexOfType(dataset, column, indexType)) {
+                    result.addSkipped(column, existingIndexReason(indexType.name(), column, fragmentIds));
                     continue;
                 }
                 String paramsJson = scalarParamsJson(preference);
@@ -483,7 +486,7 @@ public final class LanceIndexBuilder {
             }
             try {
                 if (hasVectorIndex(dataset, column)) {
-                    result.addSkipped(column, existingIndexReason("vector", fragmentIds));
+                    result.addSkipped(column, existingIndexReason("vector", column, fragmentIds));
                     continue;
                 }
                 // Initial build only in this method. train=true because we only
@@ -645,15 +648,17 @@ public final class LanceIndexBuilder {
     }
 
     /**
-     * Reason string for a column whose index already exists. A partial
-     * build ({@code fragment_ids}) is not applied to an existing index
-     * either, so both shapes point the caller at {@code optimize=true}.
+     * Reason string for a column that already carries the index
+     * {@code kind} names ({@code FTS}, {@code vector}, or the scalar
+     * {@link IndexType} that was requested). A partial build
+     * ({@code fragment_ids}) is not applied to an existing index either,
+     * so both shapes point the caller at {@code optimize=true}.
      */
-    private static String existingIndexReason(String kind, Optional<List<Integer>> fragmentIds) {
+    private static String existingIndexReason(String kind, String column, Optional<List<Integer>> fragmentIds) {
         if (fragmentIds.isPresent()) {
-            return kind + " index already exists; fragment_ids does not extend an existing index, use optimize=true";
+            return kind + " index already exists on [" + column + "]; fragment_ids does not extend an existing index, use optimize=true";
         }
-        return kind + " index already exists; use optimize=true to extend it over new fragments";
+        return kind + " index already exists on [" + column + "]; use optimize=true to extend it over new fragments";
     }
 
     /**
@@ -800,11 +805,11 @@ public final class LanceIndexBuilder {
         return result;
     }
 
-    // Returns true if the column already carries any Lance scalar index type
-    // (BTree, Bitmap, LabelList, ZoneMap, NGram, BloomFilter, Scalar). INVERTED
-    // (FTS) is not counted here because {@link RestAttachAction}#derive routes
+    // The Lance scalar index types the optimize path extends (BTree, Bitmap,
+    // LabelList, ZoneMap, NGram, BloomFilter, Scalar). INVERTED (FTS) is not
+    // counted here because {@link RestAttachAction}#derive routes
     // Utf8-with-FTS through ftsColumns and Utf8-without-FTS through scalarColumns,
-    // so the scalar builder only sees keyword columns that never carry FTS.
+    // so the scalar optimize only sees keyword columns that never carry FTS.
     //
     // Lance's IndexDescription#getIndexType returns the Rust-side Display form
     // (e.g. "BTree", "LabelList"). Compare in a normalised form so we tolerate
@@ -834,9 +839,20 @@ public final class LanceIndexBuilder {
         return normalised.startsWith("IVF") || "VECTOR".equals(normalised);
     }
 
-    private static boolean hasScalarIndex(Dataset dataset, String column) {
+    /**
+     * Whether {@code column} already carries an index of exactly
+     * {@code indexType}. Lance's {@code describeIndices} reports the
+     * type in its Display form ({@code BTree}, {@code ZoneMap},
+     * {@code BloomFilter}) while {@link IndexType#name()} is shouty snake
+     * ({@code BTREE}, {@code ZONEMAP}, {@code BLOOM_FILTER}); both sides
+     * are normalised before the comparison. Another type on the same
+     * column does not count: Lance keeps several scalar index types on
+     * one column, and the builder adds the requested one next to them.
+     */
+    private static boolean hasIndexOfType(Dataset dataset, String column, IndexType indexType) {
+        String wanted = normaliseIndexType(indexType.name());
         for (IndexDescription desc : dataset.describeIndices(new IndexCriteria.Builder().forColumn(column).build())) {
-            if (isScalarIndexType(desc.getIndexType())) {
+            if (wanted.equals(normaliseIndexType(desc.getIndexType()))) {
                 return true;
             }
         }

@@ -1807,7 +1807,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
                 "expected id skipped with the reason: " + body,
                 body.contains(
                     "\"skipped\":{\"fts\":[],\"scalar\":[{\"column\":\"id\",\"reason\":\""
-                        + "scalar index already exists; use optimize=true to extend it over new fragments\"}],\"vector\":[]}"
+                        + "BTREE index already exists on [id]; use optimize=true to extend it over new fragments\"}],\"vector\":[]}"
                 )
             );
             assertTrue("expected nothing failed: " + body, body.contains("\"failed\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
