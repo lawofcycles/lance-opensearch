@@ -824,12 +824,13 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         // statistics report 1024 partitions; a lance_knn with nprobes
         // 200 probes one fifth of them, so the load is a fifth of the
         // index, doubled: 7.6 GB, within the 26 GB left after the
-        // headroom.
+        // headroom (and within the 8 GiB shard share, where it is zero).
         long rows = 1_000_000_000L;
         long size = 19_500_000_000L;
         TableStatistics statistics = perf1bVectorStatistics(rows, size, OptionalLong.of(1024L));
         ColumnStatistics.IndexSummary index = ScanAdmission.vectorIndexFor("embedding", statistics).get();
         assertEquals(OptionalLong.of(1024L), index.partitions());
+        // Judged against a 1 GiB shard share so the figure shows.
         long estimate = ScanAdmission.vectorIndexEstimateBytes(
             index.sizeBytes(),
             rows,
@@ -838,12 +839,18 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             1000,
             0,
             128,
-            8 * GB
+            GB
         );
         long expected = (long) (size * (200 / 1024d)) * ScanAdmission.IVF_PARTITION_LOAD_FACTOR;
         assertEquals(expected, estimate);
         assertEquals("about a fifth of the index, loaded twice", 0.39d, estimate / (double) size, 0.001d);
         assertTrue(ScanAdmission.decide(estimate, 0L, 34 * GB, Long.MAX_VALUE, true, 8 * GB, 0L).admitted());
+        // Against the 8 GiB shard share of a 16 CPU node the probed
+        // partitions fit the cache and the estimate is zero.
+        assertEquals(
+            0L,
+            ScanAdmission.vectorIndexEstimateBytes(index.sizeBytes(), rows, 200, index.partitions().orElse(0L), 1000, 0, 128, 8 * GB)
+        );
     }
 
     public void testVectorIndexEstimateIsTheWholeIndexTwiceWhenTheStatisticsReportNoPartitionCount() {
