@@ -534,6 +534,23 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
 
     /**
+     * Test override that makes every background collection of the
+     * planner's table statistics wait this long before it reads the
+     * table. Zero (the default) collects at once. It exists so the
+     * integration tests can observe, on a small table whose statistics
+     * would otherwise be ready within milliseconds, the request that
+     * plans without them and the {@code GET /_lance/stats} counters that
+     * record it; do not set it on a real node. Dynamic.
+     */
+    public static final Setting<TimeValue> TEST_STATISTICS_COLLECT_DELAY_SETTING = Setting.timeSetting(
+        "lance.test.statistics_collect_delay",
+        TimeValue.ZERO,
+        TimeValue.ZERO,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * Whether a {@code size: 0} aggregation request whose shape the
      * scan can compute (metrics including stats, cardinality and tdigest
      * percentiles; {@code terms} / {@code histogram} / {@code date_histogram}
@@ -793,6 +810,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             ADMISSION_BOUNDED_SHAPES_GATED_SETTING,
             TEST_INDEX_CACHE_SHARD_SHARE_SETTING,
             TEST_ADMISSION_AVAILABLE_MEMORY_SETTING,
+            TEST_STATISTICS_COLLECT_DELAY_SETTING,
             AGGREGATION_PUSHDOWN_SETTING,
             AGGREGATION_PUSHDOWN_PARALLELISM_SETTING,
             AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING,
@@ -1072,9 +1090,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             LanceRegistry.allocator(),
             columnCacheBytes,
             CACHE_MAX_SNAPSHOTS_SETTING.get(environment.settings()),
-            CACHE_ENABLED_SETTING.get(environment.settings())
+            CACHE_ENABLED_SETTING.get(environment.settings()),
+            threadPool.executor(ThreadPool.Names.GENERIC)
         );
         clusterService.getClusterSettings().addSettingsUpdateConsumer(CACHE_ENABLED_SETTING, warmCache::setEnabled);
+        warmCache.tableStatistics().setCollectDelayMillis(TEST_STATISTICS_COLLECT_DELAY_SETTING.get(environment.settings()).millis());
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(
+                TEST_STATISTICS_COLLECT_DELAY_SETTING,
+                delay -> warmCache.tableStatistics().setCollectDelayMillis(delay.millis())
+            );
         // Node-local shallow clones for indexes attached with
         // index.lance.index_placement = node_local. The service owns the
         // clone directories under the node's first data path, resolves

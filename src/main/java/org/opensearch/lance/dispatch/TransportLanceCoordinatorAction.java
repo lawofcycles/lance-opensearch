@@ -604,8 +604,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // The Arrow schema and the table statistics the planner model
         // reads for the plan below, captured while the dataset is open.
         // The statistics come from this node's cache under the observed
-        // version and are collected from the open dataset only on the
-        // first request of that version.
+        // version; a version the cache does not hold yet is collected in
+        // the background from a dataset of its own, and this request
+        // plans without statistics rather than wait for them (a large
+        // table's collection takes minutes).
         Schema arrowSchema;
         TableStatistics statistics = null;
         long tableRows = 0L;
@@ -621,15 +623,19 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             for (Long rows : allFragmentRows) {
                 tableRows += rows;
             }
-            try {
-                statistics = tableStatistics.forDataset(dataset);
-            } catch (RuntimeException e) {
-                // Statistics are an input to plan quality, not to
-                // correctness: the model falls back to the physical
-                // row count rather than failing the search.
-                LOGGER.warn("lance.dispatch: table statistics of [{}] unavailable, planning without them", target.indexName(), e);
-            }
-            if (statistics != null) {
+            final long version = observedVersion;
+            statistics = tableStatistics.lookup(
+                dataset.uri(),
+                version,
+                () -> LanceRegistry.openDataset(target.tableUri(), target.storageOptions(), Optional.of(version))
+            );
+            if (statistics == null) {
+                LOGGER.debug(
+                    "lance.dispatch: table statistics of [{}] at version {} not collected yet, planning without them",
+                    target.indexName(),
+                    version
+                );
+            } else {
                 // The zone maps of the columns the query names, read
                 // while the dataset is open so the planner can exclude
                 // the fragments the predicate cannot match. Memoised

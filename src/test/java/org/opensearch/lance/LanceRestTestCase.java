@@ -375,6 +375,59 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
     }
 
     /**
+     * The planner's table statistics counters of {@code GET /_lance/stats}
+     * summed over the nodes: {@code tables} (entries held),
+     * {@code pending} (collections queued or running),
+     * {@code planned_without} (plans made without statistics) and
+     * {@code collect_millis_total}.
+     */
+    @SuppressWarnings("unchecked")
+    static Map<String, Long> planStatistics() throws IOException {
+        Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
+        Map<String, Long> totals = new LinkedHashMap<>();
+        for (Object node : nodes.values()) {
+            Map<String, Object> plan = (Map<String, Object>) ((Map<String, Object>) node).get("plan");
+            Map<String, Object> statistics = (Map<String, Object>) plan.get("statistics");
+            for (Map.Entry<String, Object> counter : statistics.entrySet()) {
+                totals.merge(counter.getKey(), ((Number) counter.getValue()).longValue(), Long::sum);
+            }
+        }
+        return totals;
+    }
+
+    /**
+     * Wait until no node is collecting planner table statistics
+     * ({@code plan.statistics.pending} is zero on every node). A request
+     * that misses the statistics of its version, and the shard start that
+     * builds the version's snapshot, start the collection before they
+     * return, so a wait placed after them leaves the statistics in the
+     * cache for the requests that follow.
+     */
+    static void awaitTableStatistics() throws Exception {
+        assertBusy(() -> {
+            Map<String, Long> statistics = planStatistics();
+            assertEquals("statistics collections still pending: " + statistics, 0L, statistics.getOrDefault("pending", 0L).longValue());
+        }, 60, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Leave the planner's table statistics of {@code indexName}'s current
+     * version in the cache of the node the client talks to: one explain
+     * of the empty body starts their collection when nothing has yet,
+     * then {@link #awaitTableStatistics()}. The first request that plans
+     * against a version otherwise runs without statistics, so a test
+     * whose assertions read them (zone map pruning, the admission gate's
+     * index estimates) calls this after attaching.
+     */
+    static void warmTableStatistics(String indexName) throws Exception {
+        Request explain = new Request("GET", "/" + indexName + "/_lance/explain");
+        explain.setJsonEntity("{\"size\":0}");
+        client().performRequest(explain);
+        awaitTableStatistics();
+    }
+
+    /**
      * The hits of {@code searchBody} with every rendered key ({@code _score}
      * included) except {@code _shard} and {@code _node}, which
      * {@code explain: true} adds and which name the node that rendered

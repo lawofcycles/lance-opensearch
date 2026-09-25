@@ -33,9 +33,10 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 /**
  * {@link TableStatisticsCollector} against a small table carrying one
  * index of each kind (BTree, bitmap, inverted, IVF_PQ, zone map): the
- * fragment figures, the per column index summaries, the figures read
- * from Lance's index statistics, the lazily read zone map, and the
- * deleted and unindexed rows after a delete and an append.
+ * fragment figures, the per column index summaries from the manifest,
+ * the figures read from Lance's index statistics for the bitmap and the
+ * vector index alone, the lazily read zone map, and the deleted rows and the index
+ * coverage after a delete and a partial index build.
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class TableStatisticsCollectorTests extends OpenSearchTestCase {
@@ -99,17 +100,18 @@ public class TableStatisticsCollectorTests extends OpenSearchTestCase {
         assertEquals(FRAGMENTS, btree.coveredFragments());
         assertEquals(FRAGMENTS, btree.totalFragments());
         assertTrue(btree.coversAllFragments());
-        assertTrue(btree.statisticsAvailable());
-        assertEquals(OptionalLong.of(FRAGMENTS * ROWS_PER_FRAGMENT), btree.indexedRows());
-        assertEquals(OptionalLong.of(0L), btree.unindexedRows());
+        assertFalse("the planner reads nothing from a BTree's statistics, so they are not read", btree.statisticsAvailable());
+        assertEquals(OptionalLong.empty(), btree.indexedRows());
+        assertEquals(OptionalLong.empty(), btree.unindexedRows());
         assertEquals("a BTree reports no cardinality", OptionalLong.empty(), btree.distinctCount());
         assertTrue("the manifest records the index size", btree.sizeBytes().isPresent() && btree.sizeBytes().getAsLong() > 0L);
 
         IndexSummary bitmap = onlyIndex(statistics, "category");
         assertEquals("category_bitmap", bitmap.name());
         assertEquals(Optional.of(IndexType.BITMAP), bitmap.type());
-        assertTrue(bitmap.statisticsAvailable());
+        assertTrue("the bitmap's statistics carry the distinct count, so they are read", bitmap.statisticsAvailable());
         assertEquals(OptionalLong.of(FRAGMENTS * ROWS_PER_FRAGMENT), bitmap.indexedRows());
+        assertEquals(OptionalLong.of(0L), bitmap.unindexedRows());
         // c0, c1, c2 plus the null bitmap (every fourth row is null).
         assertEquals(OptionalLong.of(4L), bitmap.distinctCount());
         assertEquals(OptionalLong.of(4L), statistics.column("category").get().distinctCount());
@@ -119,24 +121,27 @@ public class TableStatisticsCollectorTests extends OpenSearchTestCase {
         IndexSummary inverted = onlyIndex(statistics, "body");
         assertEquals("body_fts", inverted.name());
         assertEquals(Optional.of(IndexType.INVERTED), inverted.type());
-        assertTrue(inverted.statisticsAvailable());
-        assertEquals(OptionalLong.of(FRAGMENTS * ROWS_PER_FRAGMENT), inverted.indexedRows());
+        assertFalse("an inverted index's statistics are not read", inverted.statisticsAvailable());
+        assertEquals(OptionalLong.empty(), inverted.indexedRows());
         assertEquals(OptionalLong.empty(), inverted.distinctCount());
+        assertTrue(inverted.coversAllFragments());
+        assertTrue(inverted.sizeBytes().isPresent() && inverted.sizeBytes().getAsLong() > 0L);
 
         IndexSummary vector = onlyIndex(statistics, "embedding");
         assertEquals("embedding_ivf", vector.name());
-        assertEquals(Optional.of(IndexType.IVF_PQ), vector.type());
-        assertTrue(vector.statisticsAvailable());
+        assertEquals("the statistics name the concrete vector type", Optional.of(IndexType.IVF_PQ), vector.type());
+        assertTrue("a vector index's statistics carry the partition count, so they are read", vector.statisticsAvailable());
         assertEquals(OptionalLong.of(FRAGMENTS * ROWS_PER_FRAGMENT), vector.indexedRows());
         assertEquals(OptionalLong.empty(), vector.distinctCount());
         assertEquals("the fixture trains one IVF partition", OptionalLong.of(1L), vector.partitions());
         assertEquals("a scalar index has no partitions", OptionalLong.empty(), btree.partitions());
         assertEquals(OptionalLong.empty(), inverted.partitions());
+        assertTrue(vector.sizeBytes().isPresent() && vector.sizeBytes().getAsLong() > 0L);
 
         IndexSummary zoneMap = onlyIndex(statistics, "id");
         assertEquals("id_zonemap", zoneMap.name());
         assertEquals(Optional.of(IndexType.ZONEMAP), zoneMap.type());
-        assertTrue(zoneMap.statisticsAvailable());
+        assertFalse("a zone map's statistics are not read; its zones are read lazily", zoneMap.statisticsAvailable());
         assertEquals(OptionalLong.empty(), zoneMap.distinctCount());
     }
 
@@ -219,12 +224,12 @@ public class TableStatisticsCollectorTests extends OpenSearchTestCase {
         assertEquals(2, btree.coveredFragments());
         assertEquals(3, btree.totalFragments());
         assertFalse(btree.coversAllFragments());
-        assertEquals(OptionalLong.of(2 * ROWS_PER_FRAGMENT - 10), btree.indexedRows());
-        assertEquals(OptionalLong.of(ROWS_PER_FRAGMENT), btree.unindexedRows());
+        assertEquals("coverage comes from the manifest, not from the unread statistics", OptionalLong.empty(), btree.indexedRows());
+        assertEquals(OptionalLong.empty(), btree.unindexedRows());
 
         IndexSummary inverted = onlyIndex(statistics, "body");
         assertTrue(inverted.coversAllFragments());
-        assertEquals(OptionalLong.of(0L), inverted.unindexedRows());
+        assertEquals(3, inverted.coveredFragments());
     }
 
     public void testStatisticsWithoutTheExpectedKeysLeaveTheFiguresEmpty() {

@@ -318,6 +318,11 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             assertEquals(3, extractIntPath(readAll(postJson("/" + tableName + "/_search", KNN)), "hits", "total", "value"));
             assertEquals(300, extractIntPath(readAll(postJson("/" + tableName + "/_search", TERMS_AGG)), "hits", "total", "value"));
             assertEquals(300, extractIntPath(readAll(postJson("/" + tableName + "/_search", SORTED_PAGE)), "hits", "total", "value"));
+            // The estimates below name the indexes and their selectivity
+            // out of the table statistics, which are collected in the
+            // background once the shard starts and the first request
+            // plans; wait for them before the gated shapes run.
+            awaitTableStatistics();
 
             updateClusterSetting("lance.test.index_cache_shard_share", "\"1b\"");
             updateClusterSetting("lance.admission.headroom", "\"1pb\"");

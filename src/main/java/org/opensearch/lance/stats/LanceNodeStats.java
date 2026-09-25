@@ -42,7 +42,9 @@ import org.opensearch.lance.query.ScanAdmission;
  * {@code warm_up} carries the mode in force and one
  * {@link LanceWarmUpStatus} per Lance-backed index the node has seen
  * since it started; {@code plan.statistics} the planner's table
- * statistics cache (entries held and milliseconds spent collecting);
+ * statistics cache (entries held, milliseconds spent collecting, the
+ * collections queued or running, and how many plans were made without
+ * statistics because their version was not collected yet);
  * {@code plan.refinements} how often the fragment executor moved a
  * pushed operation of a shipped plan to the Lucene side, per reason;
  * {@code plan.executed} how many fragment requests the Lance scan and
@@ -66,7 +68,9 @@ import org.opensearch.lance.query.ScanAdmission;
  * failing; version 3 added the source of the last admission decision
  * the same way, and an older coordinator shows it as {@code none};
  * version 4 added the freshness service's refused mapping updates per
- * index as another such block, shown as empty by an older coordinator.
+ * index as another such block, shown as empty by an older coordinator;
+ * version 5 added the statistics collections pending and the plans
+ * made without statistics, shown as zero by an older coordinator.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
@@ -74,9 +78,10 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * The wire format's version, the first field written and the first
      * read; 2 added the pruned fragment counter, 3 the source of the
      * last admission decision, 4 the refused mapping updates of the
-     * freshness checks.
+     * freshness checks, 5 the pending statistics collections and the
+     * plans made without statistics.
      */
-    public static final int WIRE_VERSION = 4;
+    public static final int WIRE_VERSION = 5;
 
     private final boolean cacheEnabled;
     private final int snapshotCount;
@@ -144,6 +149,10 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
     private final int planStatisticsTables;
     private final long planStatisticsCollectMillisTotal;
+    /** Statistics collections queued or running on this node. */
+    private final int planStatisticsPending;
+    /** Plans this node made without table statistics because their version was not collected yet. */
+    private final long planStatisticsPlannedWithout;
     private final FreshnessStats freshness;
 
     /**
@@ -435,6 +444,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             localClones,
             planStatisticsTables,
             planStatisticsCollectMillisTotal,
+            0,
+            0L,
             planRefinements,
             planExecuted,
             planPrunedFragments,
@@ -476,6 +487,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         List<LocalCloneStats> localClones,
         int planStatisticsTables,
         long planStatisticsCollectMillisTotal,
+        int planStatisticsPending,
+        long planStatisticsPlannedWithout,
         Map<String, Long> planRefinements,
         Map<String, Long> planExecuted,
         long planPrunedFragments,
@@ -514,6 +527,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.localClones = List.copyOf(localClones);
         this.planStatisticsTables = planStatisticsTables;
         this.planStatisticsCollectMillisTotal = planStatisticsCollectMillisTotal;
+        this.planStatisticsPending = planStatisticsPending;
+        this.planStatisticsPlannedWithout = planStatisticsPlannedWithout;
         this.planRefinements = Collections.unmodifiableMap(new LinkedHashMap<>(planRefinements));
         this.planExecuted = Collections.unmodifiableMap(new LinkedHashMap<>(planExecuted));
         this.planPrunedFragments = planPrunedFragments;
@@ -600,7 +615,29 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.freshness = counters.withMappingErrors(
             reader.block(4, block -> block.readOrderedMap(StreamInput::readString, StreamInput::readString), Map.of())
         );
+        StatisticsProgress progress = reader.block(5, StatisticsProgress::new, StatisticsProgress.NONE);
+        this.planStatisticsPending = progress.pending();
+        this.planStatisticsPlannedWithout = progress.plannedWithout();
         reader.finish();
+    }
+
+    /**
+     * The version 5 block: the statistics collections queued or running
+     * and the plans made without statistics. A record so the block is
+     * read from its own stream in one step.
+     */
+    private record StatisticsProgress(int pending, long plannedWithout) implements Writeable {
+        static final StatisticsProgress NONE = new StatisticsProgress(0, 0L);
+
+        StatisticsProgress(StreamInput in) throws IOException {
+            this(in.readVInt(), in.readVLong());
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeVInt(pending);
+            out.writeVLong(plannedWithout);
+        }
     }
 
     @Override
@@ -657,6 +694,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             false,
             o -> o.writeMap(freshness.mappingErrors(), StreamOutput::writeString, StreamOutput::writeString)
         );
+        // Likewise for the collection progress counters.
+        WireVersion.writeBlock(out, false, new StatisticsProgress(planStatisticsPending, planStatisticsPlannedWithout));
     }
 
     @Override
@@ -723,6 +762,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.startObject("statistics");
         builder.field("tables", planStatisticsTables);
         builder.field("collect_millis_total", planStatisticsCollectMillisTotal);
+        builder.field("pending", planStatisticsPending);
+        builder.field("planned_without", planStatisticsPlannedWithout);
         builder.endObject();
         builder.startObject("refinements");
         for (Map.Entry<String, Long> refinement : planRefinements.entrySet()) {
@@ -805,6 +846,16 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     /** Milliseconds this node has spent collecting planner table statistics, summed over every collection. */
     public long planStatisticsCollectMillisTotal() {
         return planStatisticsCollectMillisTotal;
+    }
+
+    /** Planner table statistics collections queued or running on this node. */
+    public int planStatisticsPending() {
+        return planStatisticsPending;
+    }
+
+    /** Plans this node made without table statistics because their version was not collected yet. */
+    public long planStatisticsPlannedWithout() {
+        return planStatisticsPlannedWithout;
     }
 
     /** Plan refinements this node's executor applied since it started, keyed by reason; every reason present. */
@@ -1021,6 +1072,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && localClones.equals(other.localClones)
             && planStatisticsTables == other.planStatisticsTables
             && planStatisticsCollectMillisTotal == other.planStatisticsCollectMillisTotal
+            && planStatisticsPending == other.planStatisticsPending
+            && planStatisticsPlannedWithout == other.planStatisticsPlannedWithout
             && planRefinements.equals(other.planRefinements)
             && planExecuted.equals(other.planExecuted)
             && planPrunedFragments == other.planPrunedFragments
@@ -1063,6 +1116,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             localClones,
             planStatisticsTables,
             planStatisticsCollectMillisTotal,
+            planStatisticsPending,
+            planStatisticsPlannedWithout,
             planRefinements,
             planExecuted,
             planPrunedFragments,

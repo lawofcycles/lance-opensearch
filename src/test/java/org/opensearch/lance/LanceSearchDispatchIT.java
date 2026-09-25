@@ -10,6 +10,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -33,7 +34,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // match_all and scalar filters (term / range / bool / match)
         // through the fragment dispatch path: hits.total.value and the
         // hits themselves are derived from the same Lance filter.
-        String suffix = "dispatch-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "dispatch-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -105,7 +106,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // ISO-8601 string literals in a range on a Lance Timestamp
         // column translate to `timestamp '...'` SQL, so the same range
         // DSL that works on a stock search path date field works here.
-        String suffix = "date-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "date-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeDatedTable(scratchDir, tableName);
@@ -188,7 +189,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // column translate to to_timestamp_millis(...) SQL; the
         // translator decides from the field mapping, not the literal
         // shape.
-        String suffix = "dateml-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "dateml-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeDatedTable(scratchDir, tableName);
@@ -248,7 +249,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // contiguous per fragment): a range on id excludes whole
         // fragments at the coordinator, the executors skip them, and
         // every shape answers exactly what the unpruned scan answers.
-        String suffix = "prune-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "prune-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeZoneMappedFixtureTable(scratchDir, tableName, 4, 100, 50);
@@ -257,6 +258,9 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         try {
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            // Pruning reads the zone maps out of the table statistics,
+            // which the first request of a version plans without.
+            warmTableStatistics(indexName);
 
             // id >= 250 lives in fragments 2 and 3 only; 0 and 1 are pruned.
             String range = "{\"range\":{\"id\":{\"gte\":250}}}";
@@ -329,6 +333,78 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         }
     }
 
+    public void testFirstSearchPlansWithoutStatisticsAndTheNextOneReadsThem() throws Exception {
+        // The coordinator plans a version's first request without the
+        // table statistics and does not wait for their collection, which
+        // runs in the background; the requests after it read the entry.
+        // On a table this small the collection would be done within
+        // milliseconds of the attach, so it is held back for the test.
+        String suffix = "stats-async-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeZoneMappedFixtureTable(scratchDir, tableName, 4, 100, 50);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String body = "{\"query\":{\"range\":{\"id\":{\"gte\":250}}},\"size\":0,\"track_total_hits\":true,"
+            + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+        try {
+            updateClusterSetting("lance.test.statistics_collect_delay", "8s");
+            awaitTableStatistics();
+            Map<String, Long> before = planStatistics();
+            long prunedBefore = prunedFragments();
+
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // The first search answers at once and correctly; without
+            // the statistics there are no zone maps to prune with, so
+            // every fragment is scanned.
+            long startMillis = System.currentTimeMillis();
+            String first = readAll(postJson("/" + indexName + "/_search", body));
+            long searchMillis = System.currentTimeMillis() - startMillis;
+            assertTrue("the search did not wait for the delayed collection: " + searchMillis + " ms", searchMillis < 8_000L);
+            assertEquals(150, extractIntPath(first, "hits", "total", "value"));
+            assertEquals("sum(250..399): " + first, 48675, extractIntPath(first, "aggregations", "s", "value"));
+            assertEquals("no fragment pruned without statistics", prunedBefore, prunedFragments());
+            Map<String, Long> afterFirst = planStatistics();
+            assertEquals(
+                "the first plan of the version ran without statistics: " + afterFirst,
+                before.get("planned_without") + 1,
+                afterFirst.get("planned_without").longValue()
+            );
+
+            // The collection finishes in the background.
+            assertBusy(() -> {
+                Map<String, Long> now = planStatistics();
+                assertEquals("nothing pending: " + now, 0L, now.get("pending").longValue());
+                assertTrue("the collection counted its time: " + now, now.get("collect_millis_total") > before.get("collect_millis_total"));
+            }, 60, TimeUnit.SECONDS);
+            Map<String, Long> collected = planStatistics();
+
+            // The next search reads the entry: the same answer, planned
+            // with statistics (the zone maps now prune fragments 0 and 1)
+            // and no further plan without them.
+            String second = readAll(postJson("/" + indexName + "/_search", body));
+            assertEquals(150, extractIntPath(second, "hits", "total", "value"));
+            assertEquals(48675, extractIntPath(second, "aggregations", "s", "value"));
+            assertEquals("two fragments pruned with the statistics", prunedBefore + 2, prunedFragments());
+            Map<String, Long> afterSecond = planStatistics();
+            assertEquals(
+                "the second plan read the statistics: " + afterSecond,
+                collected.get("planned_without"),
+                afterSecond.get("planned_without")
+            );
+            assertEquals(collected.get("collect_millis_total"), afterSecond.get("collect_millis_total"));
+        } finally {
+            try {
+                updateClusterSetting("lance.test.statistics_collect_delay", null);
+            } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     /** The first sort value of every hit of {@code searchBody}, in hit order. */
     @SuppressWarnings("unchecked")
     private static List<Integer> sortValuesOf(String searchBody) {
@@ -347,7 +423,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // path: RangeQueryBuilder.doRewrite folds it to match_none and
         // the response is 200 with zero hits, also when the clause is
         // nested inside a bool.
-        String suffix = "unmapped-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "unmapped-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 4);
@@ -400,7 +476,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // projects no columns; the count must be exact for match and
         // phrase, and a post_filter must route the count through Lucene
         // because it narrows below what Lance would report.
-        String suffix = "ftscount-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "ftscount-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         // Even ids carry "hello lance N", odd ids "quick brown fox N".
@@ -453,7 +529,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // pushes size into the Lance scan as limit. The clip must not
         // leak into hits.total, and shapes that need the full match set
         // (sort by a field, aggregations) must not be clipped.
-        String suffix = "ftstop-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "ftstop-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         // Even ids carry "hello lance N", odd ids "quick brown fox N".
@@ -524,7 +600,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // pushes size into the Lance scan as limit. The clip must not
         // leak into hits.total, and shapes that need the full match set
         // must not be clipped.
-        String suffix = "topk-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "topk-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 20);
@@ -589,7 +665,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // answer (the same body with a highlighter, which routes
         // there) and the executed counter proves the fragment path
         // served the plain body.
-        String suffix = "min-score-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "min-score-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -671,7 +747,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // the count Lucene's TotalHitCountCollector answers, which for
         // match_all is the leaf's document count before termination,
         // exactly as on the stock search path.
-        String suffix = "terminate-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "terminate-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -747,7 +823,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // every shape is compared with the stock search path's answer to the
         // same body. Twelve rows over three fragments: body scores are
         // distinct (BM25 grows with id), category is c<id % 3>.
-        String suffix = "rescore-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "rescore-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeBucketedInterleavedTable(scratchDir, tableName, 3, 4);
@@ -838,7 +914,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // group; every shape is compared with the stock search path's answer.
         // Twelve rows: category c<id % 3>, bucket id % 4, body scores
         // grow with id.
-        String suffix = "collapse-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "collapse-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeBucketedInterleavedTable(scratchDir, tableName, 3, 4);
@@ -1007,7 +1083,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // applies the bound, so an integer bound below the total
         // yields the capped value with relation gte, `true` and the
         // default yield the exact value, and `false` drops hits.total.
-        String suffix = "s3-track-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "s3-track-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 12, 4);
@@ -1160,7 +1236,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // _primary_term appear only when the request opts in. The
         // fragment path has no per-doc versions, so the constants match
         // what the stock search path reports for a freshly indexed doc.
-        String suffix = "s3-env-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "s3-env-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 4);
@@ -1210,7 +1286,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
      */
     @SuppressWarnings("unchecked")
     public void testCrossIndexSearchRoutesByTheTargetsBacking() throws Exception {
-        String suffix = "cross-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "cross-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String small = "small-" + suffix;
         String large = "large-" + suffix;
@@ -1320,7 +1396,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     public void testFragmentDispatchModeAnswersFromPagination() throws Exception {
         // The coordinator asks each node for from + size hits and drops
         // the leading from after the merge.
-        String suffix = "s3-from-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "s3-from-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -1349,7 +1425,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
 
     public void testFragmentDispatchModeAnswersPostFilter() throws Exception {
         // post_filter narrows hits and hits.total but not aggregations.
-        String suffix = "s3-pf-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "s3-pf-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -1377,7 +1453,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testFragmentDispatchModeAnswersSearchAfter() throws Exception {
-        String suffix = "s3-sa-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "s3-sa-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -1415,7 +1491,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // Script queries and script sorts read doc values through the
         // standard DocValues API, so they work on the fragment path
         // without dedicated plumbing.
-        String suffix = "s3-scq-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "s3-scq-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -1649,7 +1725,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // every row, a body no plan answers must be refused, and attach
         // and _lance/stats must say what happened.
         updateClusterSetting("lance.test.max_docs_per_reader", "20");
-        String suffix = "bound-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "bound-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 120, 20);

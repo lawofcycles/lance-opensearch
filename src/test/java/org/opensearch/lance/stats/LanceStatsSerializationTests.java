@@ -28,6 +28,7 @@ import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LanceOverrides;
+import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.NativeMemoryLimit.IndexCacheSizing;
@@ -109,6 +110,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             List.of(new LanceNodeStats.LocalCloneStats("cloned", 4321L, 9L)),
             5,
             123L,
+            2,
+            4L,
             planRefinements(2L, 0L, 1L),
             planExecuted(7L, 4L),
             9L,
@@ -199,7 +202,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"indexes\":[{\"name\":\"rating_idx\",\"type\":\"BTree\",\"column\":\"rating\",\"state\":\"done\",\"seconds\":0.4},"
                     + "{\"name\":\"body_idx\",\"type\":\"Inverted\",\"column\":\"body\",\"state\":\"failed\",\"seconds\":1.25,"
                     + "\"detail\":\"boom\"}]}]},"
-                    + "\"plan\":{\"statistics\":{\"tables\":5,\"collect_millis_total\":123},"
+                    + "\"plan\":{\"statistics\":{\"tables\":5,\"collect_millis_total\":123,\"pending\":2,\"planned_without\":4},"
                     + "\"refinements\":{\"security_wrapper\":2,\"sort_field_type\":0,\"aggregate_resolution\":1},"
                     + "\"executed\":{\"pushed_scan\":7,\"lucene\":4},\"pruned\":{\"fragments\":9}},"
                     + "\"freshness\":{\"tracked\":2,\"checks\":40,\"moves\":3,\"mapping_updates\":1,\"mapping_unchanged\":2,"
@@ -281,7 +284,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceNodeStats.WIRE_VERSION, in.readVInt());
             }
         }
-        // The stream a version 5 data node would return: today's fields
+        // The stream a version 6 data node would return: today's fields
         // and one optional block this coordinator steps over.
         BytesReference newer = WireVersionTestSupport.asNextVersion(
             sample(),
@@ -293,6 +296,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             LanceNodeStats restored = new LanceNodeStats(in);
             assertEquals(9L, restored.planPrunedFragments());
             assertEquals("warm_up", restored.admissionLastSource());
+            assertEquals(2, restored.planStatisticsPending());
+            assertEquals(4L, restored.planStatisticsPlannedWithout());
             assertEquals(sample().freshness(), restored.freshness());
             assertEquals("the reader consumed the block", -1, in.read());
         }
@@ -305,6 +310,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 LanceNodeStats asVersion1 = LanceNodeStats.read(in, 1);
                 assertEquals("the counter the older coordinator does not know falls back to zero", 0L, asVersion1.planPrunedFragments());
                 assertEquals("the source the older coordinator does not know falls back to none", "none", asVersion1.admissionLastSource());
+                assertEquals("the progress counters it does not know fall back to zero", 0, asVersion1.planStatisticsPending());
+                assertEquals(0L, asVersion1.planStatisticsPlannedWithout());
                 assertEquals(sample().planExecuted(), asVersion1.planExecuted());
                 assertEquals(
                     "the freshness counters are base fields; the refused updates are not",
@@ -325,6 +332,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals("the block it does not know falls back", "none", asVersion2.admissionLastSource());
                 assertEquals("fts", asVersion2.admissionLastKind());
                 assertEquals(sample().freshness().withMappingErrors(Map.of()), asVersion2.freshness());
+                assertEquals(0, asVersion2.planStatisticsPending());
+                assertEquals(0L, asVersion2.planStatisticsPlannedWithout());
                 assertEquals("the reader consumed the blocks", -1, in.read());
             }
         }
@@ -343,6 +352,23 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     asVersion3.freshness()
                 );
                 assertTrue(asVersion3.freshness().mappingErrors().isEmpty());
+                assertEquals(0, asVersion3.planStatisticsPending());
+                assertEquals(0L, asVersion3.planStatisticsPlannedWithout());
+                assertEquals("the reader consumed the blocks", -1, in.read());
+            }
+        }
+    }
+
+    public void testMixedPluginVersionAVersion4CoordinatorReadsTodaysStatsWithoutTheProgressCounters() throws Exception {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            sample().writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceNodeStats asVersion4 = LanceNodeStats.read(in, 4);
+                assertEquals(9L, asVersion4.planPrunedFragments());
+                assertEquals("warm_up", asVersion4.admissionLastSource());
+                assertEquals("the blocks version 4 knows are read", sample().freshness(), asVersion4.freshness());
+                assertEquals("the block it does not know is stepped over", 0, asVersion4.planStatisticsPending());
+                assertEquals(0L, asVersion4.planStatisticsPlannedWithout());
                 assertEquals("the reader consumed the blocks", -1, in.read());
             }
         }
@@ -360,8 +386,14 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             // length prefix and the bytes of that length; their sizes are
             // measured by writing them again on their own. Version 2 is
             // the pruned counter, 3 the admission source, 4 the mapping
-            // errors, in that order.
+            // errors, 5 the statistics progress counters, in that order.
             int trailing = 0;
+            if (marker < 5) {
+                trailing += blockSize(o -> {
+                    o.writeVInt(stats.planStatisticsPending());
+                    o.writeVLong(stats.planStatisticsPlannedWithout());
+                });
+            }
             if (marker < 4) {
                 trailing += blockSize(
                     o -> o.writeMap(stats.freshness().mappingErrors(), StreamOutput::writeString, StreamOutput::writeString)
@@ -399,6 +431,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             LanceNodeStats restored = new LanceNodeStats(in);
             assertEquals(0L, restored.planPrunedFragments());
             assertEquals("none", restored.admissionLastSource());
+            assertEquals(0, restored.planStatisticsPending());
+            assertEquals(0L, restored.planStatisticsPlannedWithout());
             assertEquals(sample().planExecuted(), restored.planExecuted());
             assertEquals(sample().freshness().withMappingErrors(Map.of()), restored.freshness());
             assertEquals(-1, in.read());
@@ -414,6 +448,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             assertEquals(9L, restored.planPrunedFragments());
             assertEquals("none", restored.admissionLastSource());
             assertEquals(sample().freshness().withMappingErrors(Map.of()), restored.freshness());
+            assertEquals(0, restored.planStatisticsPending());
+            assertEquals(0L, restored.planStatisticsPlannedWithout());
             assertEquals(-1, in.read());
         }
     }
@@ -427,6 +463,23 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             assertEquals(9L, restored.planPrunedFragments());
             assertEquals("warm_up", restored.admissionLastSource());
             assertEquals("the mapping errors fall back to empty", sample().freshness().withMappingErrors(Map.of()), restored.freshness());
+            assertEquals(0, restored.planStatisticsPending());
+            assertEquals(0L, restored.planStatisticsPlannedWithout());
+            assertEquals(-1, in.read());
+        }
+    }
+
+    public void testMixedPluginVersionTodaysCoordinatorReadsAVersion4NodesStats() throws Exception {
+        // The stream a version 4 data node writes: the pruned counter, the
+        // admission source and the mapping error blocks, no progress block.
+        BytesReference version4 = asWrittenByVersion(sample(), 4);
+        try (StreamInput in = version4.streamInput()) {
+            LanceNodeStats restored = new LanceNodeStats(in);
+            assertEquals(9L, restored.planPrunedFragments());
+            assertEquals("warm_up", restored.admissionLastSource());
+            assertEquals(sample().freshness(), restored.freshness());
+            assertEquals("the progress counters fall back to zero", 0, restored.planStatisticsPending());
+            assertEquals(0L, restored.planStatisticsPlannedWithout());
             assertEquals(-1, in.read());
         }
     }
@@ -538,6 +591,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             LanceNodeStats empty = collector.collect();
             assertEquals(0, empty.planStatisticsTables());
             assertEquals(0L, empty.planStatisticsCollectMillisTotal());
+            assertEquals(0, empty.planStatisticsPending());
+            assertEquals(0L, empty.planStatisticsPlannedWithout());
             try (
                 LanceWarmCache.Lease lease = cache.acquire(
                     "uuid",
@@ -549,20 +604,36 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     LanceOverrides.EMPTY
                 )
             ) {
-                cache.tableStatistics().forDataset(lease.snapshot().dataset());
+                // Building the snapshot collected the statistics of its
+                // version (on this thread: the test cache has no pool).
                 LanceNodeStats held = collector.collect();
                 assertEquals(1, held.planStatisticsTables());
                 assertTrue(
                     "one collection counts at least one millisecond: " + held.planStatisticsCollectMillisTotal(),
                     held.planStatisticsCollectMillisTotal() >= 1L
                 );
-                cache.tableStatistics().forDataset(lease.snapshot().dataset());
+                assertEquals("nothing is pending once the collection ran", 0, held.planStatisticsPending());
+                assertEquals("a prefetch is not a plan without statistics", 0L, held.planStatisticsPlannedWithout());
+                String tableUri = lease.snapshot().dataset().uri();
+                long version = lease.snapshot().version();
+                assertNotNull(
+                    cache.tableStatistics()
+                        .lookup(tableUri, version, () -> LanceRegistry.openDataset(uri, StorageOptions.empty(), Optional.of(version)))
+                );
                 assertEquals(
                     "a cache hit collects nothing",
                     held.planStatisticsCollectMillisTotal(),
                     collector.collect().planStatisticsCollectMillisTotal()
                 );
-                cache.retire("uuid", lease.snapshot().version() + 1);
+                // A lookup of a version the cache does not hold is a plan
+                // without statistics, counted as such (the collection it
+                // starts fails here: there is no such version to open).
+                assertNull(
+                    cache.tableStatistics().lookup(tableUri, version + 1, () -> { throw new IllegalStateException("no such version"); })
+                );
+                assertEquals(1L, collector.collect().planStatisticsPlannedWithout());
+                assertEquals(0, collector.collect().planStatisticsPending());
+                cache.retire("uuid", version + 1);
             }
             assertEquals("the entry went with its snapshot", 0, collector.collect().planStatisticsTables());
         }

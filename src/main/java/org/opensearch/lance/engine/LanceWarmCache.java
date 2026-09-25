@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -380,7 +381,7 @@ public final class LanceWarmCache implements Closeable {
     }
 
     private final ColumnStore columnStore;
-    private final TableStatisticsCache tableStatistics = new TableStatisticsCache();
+    private final TableStatisticsCache tableStatistics;
     private final int maxSnapshots;
     private volatile boolean enabled;
     /** Guarded by {@code this}. */
@@ -393,14 +394,33 @@ public final class LanceWarmCache implements Closeable {
     private final AtomicLong snapshotCloses = new AtomicLong();
 
     /**
-     * @param allocator        parent of the column store's child allocator
-     * @param columnLimitBytes off-heap budget of the column store
-     * @param maxSnapshots     how many snapshots to keep before evicting
-     *                         the least recently used unreferenced one
-     * @param enabled          initial value of {@code lance.cache.enabled}
+     * A cache whose table statistics are collected on the thread that
+     * misses them, for tests without a thread pool; see
+     * {@link #LanceWarmCache(BufferAllocator, long, int, boolean, Executor)}.
      */
     public LanceWarmCache(BufferAllocator allocator, long columnLimitBytes, int maxSnapshots, boolean enabled) {
+        this(allocator, columnLimitBytes, maxSnapshots, enabled, Runnable::run);
+    }
+
+    /**
+     * @param allocator          parent of the column store's child allocator
+     * @param columnLimitBytes   off-heap budget of the column store
+     * @param maxSnapshots       how many snapshots to keep before evicting
+     *                           the least recently used unreferenced one
+     * @param enabled            initial value of {@code lance.cache.enabled}
+     * @param statisticsExecutor runs the planner statistics collections
+     *                           the {@link #tableStatistics()} cache
+     *                           starts on a miss (the node's generic pool)
+     */
+    public LanceWarmCache(
+        BufferAllocator allocator,
+        long columnLimitBytes,
+        int maxSnapshots,
+        boolean enabled,
+        Executor statisticsExecutor
+    ) {
         this.columnStore = new ColumnStore(allocator, columnLimitBytes);
+        this.tableStatistics = new TableStatisticsCache(TableStatisticsCache.DEFAULT_MAX_ENTRIES, statisticsExecutor);
         this.maxSnapshots = Math.max(1, maxSnapshots);
         this.enabled = enabled;
     }
@@ -530,7 +550,31 @@ public final class LanceWarmCache implements Closeable {
                 evicted = evictOverflow();
             }
             closeAll(evicted);
+            prefetchTableStatistics(dataset, tableUri, storageOptions);
             return new Lease(built);
+        }
+    }
+
+    /**
+     * Start collecting the planner's table statistics of the version
+     * {@code dataset} reads, in the background, unless this node holds
+     * or is collecting them. A snapshot is built when a shard of the
+     * index starts on this node and when the shard follows its table to
+     * a new version, so the statistics of the version the node serves
+     * are ready, or on their way, before the first request that plans
+     * against it; the collection opens the table on its own because the
+     * snapshot's dataset closes with the snapshot.
+     */
+    private void prefetchTableStatistics(Dataset dataset, String tableUri, StorageOptions storageOptions) {
+        try {
+            long version = dataset.version();
+            tableStatistics.prefetch(
+                dataset.uri(),
+                version,
+                () -> LanceRegistry.openDataset(tableUri, storageOptions, Optional.of(version))
+            );
+        } catch (RuntimeException e) {
+            LOGGER.debug("could not start the table statistics collection for {}", tableUri, e);
         }
     }
 
@@ -738,10 +782,11 @@ public final class LanceWarmCache implements Closeable {
 
     /**
      * The node's cache of planner table statistics, keyed on (table URI,
-     * manifest version). Filled by the plan construction from the
-     * dataset of the snapshot it holds, and by the coordinator from the
-     * dataset it opens to enumerate fragments; an entry is dropped when
-     * the snapshot of its version closes.
+     * manifest version). Filled in the background: by the build of a
+     * snapshot (the version a shard on this node starts to serve), and
+     * by the first plan of a version the cache does not hold, on the
+     * coordinator or the explain endpoint; an entry is dropped when the
+     * snapshot of its version closes.
      */
     public TableStatisticsCache tableStatistics() {
         return tableStatistics;

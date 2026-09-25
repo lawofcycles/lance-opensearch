@@ -35,8 +35,8 @@ import java.util.Set;
  * {@code getFragments} once (physical rows, for the deleted row count),
  * {@code getLanceSchema} once (field id to column name),
  * {@code getIndexes} once, and {@code getIndexStatistics} once per
- * distinct index name. No row is scanned and {@code countRows} is not
- * called.
+ * distinct bitmap or vector index name. No row is scanned and
+ * {@code countRows} is not called.
  *
  * <p>{@code getIndexStatistics} answers a JSON object (as a
  * {@code Map}) whose top level, assembled by Lance for every scalar
@@ -50,12 +50,18 @@ import java.util.Set;
  * bitmap {@code num_bitmaps}; an inverted index {@code num_tokens},
  * {@code num_docs} and {@code params}; a zone map {@code num_zones} and
  * {@code rows_per_zone}; an IVF vector index {@code num_partitions},
- * its partition sizes, sub index and quantizer metadata. Only the row
- * figures, the bitmap's {@code num_bitmaps} and the IVF index's
- * {@code num_partitions} are read here. An index whose statistics
- * Lance cannot produce is recorded with the figures empty and
- * {@code statisticsAvailable} false; the collection as a whole still
- * succeeds.
+ * its partition sizes, sub index and quantizer metadata. The figures
+ * the planner and the admission gate read out of it are the bitmap's
+ * {@code num_bitmaps} (the column's distinct value estimate) and the
+ * IVF index's {@code num_partitions} (the share of the index a nearest
+ * scan probes), so the call is made for bitmap and vector indexes only:
+ * Lance assembles the answer from the index files, and on a table of
+ * ten billion rows an inverted index takes minutes to answer. Every
+ * other index is summarised from the manifest alone (type, fragment
+ * coverage, size), with the row figures empty and
+ * {@code statisticsAvailable} false. A bitmap or vector index whose
+ * statistics Lance cannot produce is recorded the same way; the
+ * collection as a whole still succeeds.
  */
 public final class TableStatisticsCollector {
 
@@ -108,7 +114,7 @@ public final class TableStatisticsCollector {
             }
             indexCount++;
             IndexSummary summary = summarise(dataset, name, deltas, fragments.size());
-            if (!summary.statisticsAvailable()) {
+            if (readsStatistics(summary.type()) && !summary.statisticsAvailable()) {
                 statisticsMissing++;
             }
             summariesByColumn.computeIfAbsent(column, k -> new ArrayList<>()).add(summary);
@@ -120,7 +126,7 @@ public final class TableStatisticsCollector {
         TableStatistics statistics = new TableStatistics(rowCount, deletedRows, fragments, columns, version, Instant.now());
         long millis = (System.nanoTime() - startNanos) / 1_000_000L;
         LOGGER.debug(
-            "collected table statistics of {} at version {} in {} ms: {} rows, {} deleted, {} fragments, {} indexes ({} without statistics)",
+            "collected table statistics of {} at version {} in {} ms: {} rows, {} deleted, {} fragments, {} indexes ({} bitmap or vector indexes without statistics)",
             dataset.uri(),
             version,
             millis,
@@ -168,22 +174,29 @@ public final class TableStatisticsCollector {
         // every fragment that existed when it was built; treat it as
         // covering the whole table rather than none of it.
         int coveredFragments = coverageKnown ? covered.size() : totalFragments;
+        IndexSummary fromManifest = new IndexSummary(
+            name,
+            type,
+            coveredFragments,
+            totalFragments,
+            sizeKnown ? OptionalLong.of(sizeBytes) : OptionalLong.empty(),
+            OptionalLong.empty(),
+            OptionalLong.empty(),
+            OptionalLong.empty(),
+            false
+        );
+        if (!readsStatistics(type)) {
+            // Nothing the planner reads is in the statistics of the
+            // other index types, and Lance assembles them from the
+            // index files, so the call is not made.
+            return fromManifest;
+        }
         Map<String, Object> raw;
         try {
             raw = dataset.getIndexStatistics(name);
         } catch (RuntimeException e) {
             LOGGER.debug("index statistics of {} ({}) unavailable: {}", name, type.map(Enum::name).orElse("unknown type"), e.toString());
-            return new IndexSummary(
-                name,
-                type,
-                coveredFragments,
-                totalFragments,
-                sizeKnown ? OptionalLong.of(sizeBytes) : OptionalLong.empty(),
-                OptionalLong.empty(),
-                OptionalLong.empty(),
-                OptionalLong.empty(),
-                false
-            );
+            return fromManifest;
         }
         ParsedStatistics parsed = readStatistics(raw, type);
         return new IndexSummary(
@@ -264,6 +277,16 @@ public final class TableStatisticsCollector {
     /** Whether {@code type} is a vector index ({@code VECTOR} or any {@code IVF_*}), whose statistics carry a partition count. */
     private static boolean isVectorIndex(IndexType type) {
         return type == IndexType.VECTOR || type.name().startsWith("IVF");
+    }
+
+    /**
+     * Whether the collector asks Lance for the statistics of an index of
+     * {@code type}: a bitmap (its {@code num_bitmaps}) or a vector index
+     * (its {@code num_partitions}); no other type's answer carries a
+     * figure the planner or the admission gate reads.
+     */
+    static boolean readsStatistics(Optional<IndexType> type) {
+        return type.isPresent() && (type.get() == IndexType.BITMAP || isVectorIndex(type.get()));
     }
 
     /**
