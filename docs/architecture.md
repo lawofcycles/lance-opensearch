@@ -475,12 +475,13 @@ The statistics the planner reads come from Lance table metadata, not from scanni
 manifest version a node collects, from a dataset it opens for the purpose, the fragment list with
 each fragment's live row count and data file count (`getFragmentStatistics`), the physical rows
 behind them (the difference is the deleted row count), the indexes on the table with their type,
-fragment coverage and size (`getIndexes`), and for each bitmap index the figures Lance's
-`getIndexStatistics` reports (indexed and unindexed rows, and the number of bitmaps, which is the
-column's distinct value estimate). `getIndexStatistics` is not called for the other index types:
-nothing the planner or the admission gate reads is in their answer, and Lance assembles it from
-the index files, which on a table of ten billion rows takes minutes for an inverted or a vector
-index. Zone maps (`getZonemapStats`) are read lazily on the first request for a column and
+fragment coverage and size (`getIndexes`), and for each bitmap and vector index the figures Lance's
+`getIndexStatistics` reports (indexed and unindexed rows; for a bitmap the number of bitmaps, which
+is the column's distinct value estimate; for an IVF index the partition count the admission gate
+scales its estimate with). `getIndexStatistics` is not called for the other index types (BTree,
+inverted, zone map, and the rest): nothing the planner or the admission gate reads is in their
+answer, and Lance assembles it from the index files, which on a table of ten billion rows takes
+minutes for an inverted index. Zone maps (`getZonemapStats`) are read lazily on the first request for a column and
 memoised with the version. The result is cached per `(table URI, manifest version)`; the entry
 goes when the snapshot cache closes that version, and a table that follows its manifest keeps at
 most the current and the previous version.
