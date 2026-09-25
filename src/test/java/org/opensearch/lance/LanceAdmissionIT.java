@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -484,7 +485,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 }
                 assertNotNull("the node has seen the attach", warmUp);
                 assertEquals(warmUp.toString(), "done", warmUp.get("state"));
-            }, 30, java.util.concurrent.TimeUnit.SECONDS);
+            }, 30, TimeUnit.SECONDS);
             Map<String, Object> warmUp = warmUpStatus(tableName);
             Map<String, Object> probe = indexEntry(warmUp, "body_fts");
             assertEquals(probe.toString(), "done", probe.get("state"));
