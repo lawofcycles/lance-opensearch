@@ -892,7 +892,14 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         TableStatisticsCache cache = new TableStatisticsCache();
         ScanAdmission.setTableStatistics(cache);
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
-            TableStatistics statistics = cache.forDataset(dataset);
+            // The cache collects on the miss (the test cache runs its
+            // collections on the calling thread); the second lookup hits.
+            long version = dataset.version();
+            assertNull(
+                cache.lookup(dataset.uri(), version, () -> LanceRegistry.openDataset(uri, StorageOptions.empty(), Optional.of(version)))
+            );
+            TableStatistics statistics = cache.lookup(dataset.uri(), version, () -> { throw new AssertionError("already collected"); });
+            assertNotNull(statistics);
             ColumnStatistics.IndexSummary index = ScanAdmission.vectorIndexFor("embedding", statistics).get();
             assertEquals(OptionalLong.of(1L), index.partitions());
             assertTrue(index.sizeBytes().isPresent());
