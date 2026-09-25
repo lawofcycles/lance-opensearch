@@ -282,7 +282,7 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         assertEquals("and so is the failure", 1, service.stats().failures());
     }
 
-    public void testRefusedMappingUpdateIsReportedUntilALaterCheckApplies() throws Exception {
+    public void testRefusedMappingUpdateLeavesMappingUnchangedAndReportsTheError() throws Exception {
         String tableUri = writeTable("refused");
         FakeShard shard = FakeShard.overTable("refused", tableUri, Settings.EMPTY);
         LanceIndexFreshnessService.Tracked entry = service.track(shard);
@@ -291,21 +291,24 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
 
         // The cluster manager refuses the PutMapping for a reason other
         // than a type change: no rebuild, the index keeps its mapping,
-        // and the refusal is what the outcome and the stats show.
+        // so the outcome reports no mapping change and carries the
+        // refusal, which the stats show too.
         client.failing = PutMappingAction.NAME;
         try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
             dataset.addColumns(List.of(new Field("score", FieldType.nullable(new ArrowType.Int(64, true)), null)));
         }
         LanceIndexFreshnessService.Outcome refused = service.check(entry);
         assertTrue(refused.moved());
-        assertTrue(refused.mappingChanged());
+        assertFalse("a refused update did not change the mapping", refused.mappingChanged());
         assertFalse(refused.rebuilt());
         assertNotNull("the outcome carries the refusal", refused.mappingError());
         assertTrue(refused.mappingError(), refused.mappingError().contains("refused"));
+        assertEquals(1, client.count(PutMappingAction.NAME));
         assertEquals(0, client.count(DeleteIndexAction.NAME));
         assertEquals("the reader still advances", 1, shard.refreshes.get());
         assertEquals(Map.of("refused", refused.mappingError()), service.stats().mappingErrors());
         assertEquals(1, service.stats().failures());
+        assertEquals("a refused update is not counted as applied", 0, service.stats().mappingUpdates());
 
         // The next move derives again and finds the mapping it derived
         // already in place (nothing to send): the refusal is cleared.
@@ -317,14 +320,48 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         assertNull(cleared.mappingError());
         assertTrue(service.stats().mappingErrors().isEmpty());
 
+        // An acknowledged update reports the change and no error.
+        try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
+            dataset.addColumns(List.of(new Field("rank", FieldType.nullable(new ArrowType.Int(64, true)), null)));
+        }
+        LanceIndexFreshnessService.Outcome applied = service.check(entry);
+        assertTrue(applied.mappingChanged());
+        assertNull(applied.mappingError());
+        assertEquals(1, service.stats().mappingUpdates());
+
         // Untracking the index (its shard left this node) drops the entry too.
         client.failing = PutMappingAction.NAME;
         try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
-            dataset.addColumns(List.of(new Field("rank", FieldType.nullable(new ArrowType.Int(64, true)), null)));
+            dataset.addColumns(List.of(new Field("grade", FieldType.nullable(new ArrowType.Int(64, true)), null)));
         }
         assertNotNull(service.check(entry).mappingError());
         assertEquals(1, service.stats().mappingErrors().size());
         service.untrack("refused");
+        assertTrue(service.stats().mappingErrors().isEmpty());
+    }
+
+    public void testACheckWithNothingToApplyClearsTheRefusedMappingUpdate() throws Exception {
+        String tableUri = writeTable("nothingtoapply");
+        FakeShard shard = FakeShard.overTable("nothingtoapply", tableUri, Settings.EMPTY);
+        LanceIndexFreshnessService.Tracked entry = service.track(shard);
+        service.check(entry);
+
+        client.failing = PutMappingAction.NAME;
+        try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
+            dataset.addColumns(List.of(new Field("score", FieldType.nullable(new ArrowType.Int(64, true)), null)));
+        }
+        LanceIndexFreshnessService.Outcome refused = service.check(entry);
+        assertNotNull(refused.mappingError());
+        assertEquals(1, service.stats().mappingErrors().size());
+
+        // The table stands still, so the next check derives nothing
+        // (the mapping was derived once already) and has nothing to
+        // apply: the refusal recorded before no longer stands.
+        LanceIndexFreshnessService.Outcome idle = service.check(entry);
+        assertFalse(idle.moved());
+        assertFalse(idle.mappingChanged());
+        assertNull(idle.mappingError());
+        assertEquals("no second PutMapping was sent", 1, client.count(PutMappingAction.NAME));
         assertTrue(service.stats().mappingErrors().isEmpty());
     }
 

@@ -93,9 +93,12 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
 
     /**
      * What one check found and did; the answer of {@code POST /{index}/_lance/sync}.
+     * {@code mappingChanged} is true once the cluster manager acknowledged
+     * the mapping update the check sent (or the index was rebuilt);
      * {@code mappingError} is the message of the {@code PutMapping} the
      * check sent and the cluster manager refused, {@code null} when the
-     * mapping was not touched or the update was applied.
+     * mapping was not touched or the update was applied. The two are
+     * never both set.
      */
     public record Outcome(String index, boolean checked, String reason, boolean moved, long servedVersion, long targetVersion,
         boolean mappingChanged, boolean rebuilt, String mappingError) {
@@ -396,7 +399,12 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         }
         boolean mappingChanged = false;
         String mappingError = null;
-        if (derivation != null) {
+        if (derivation == null) {
+            // Nothing to derive this check: the version did not move and
+            // the mapping was derived once already, so there is nothing
+            // to apply and a refusal recorded earlier no longer stands.
+            mappingErrors.remove(indexName);
+        } else {
             if ("wait".equals(settings.get(UNCOVERED_FRAGMENT_POLICY_SETTING, "immediate"))) {
                 // `wait` is accepted but converges with the immediate
                 // branch: the plugin never writes to a user table, so
@@ -418,7 +426,6 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                     return new Outcome(indexName, true, null, moved, served, target, true, true, null);
                 }
                 case CHANGED -> {
-                    mappingChanged = true;
                     try {
                         client.admin()
                             .indices()
@@ -426,6 +433,9 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                             .setSource(derivation.mappingJson(), MediaTypeRegistry.JSON)
                             .execute()
                             .actionGet();
+                        // The mapping changed only once the cluster
+                        // manager acknowledged the update.
+                        mappingChanged = true;
                         mappingUpdates.increment();
                         mappingErrors.remove(indexName);
                     } catch (Exception e) {
