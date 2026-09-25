@@ -1035,6 +1035,39 @@ public final class LanceTableFactory {
         });
     }
 
+    /**
+     * {@link #writeEnglishTextTable} plus a Lance inverted index over
+     * {@code body} built by the table writer (Lance's own English
+     * tokenizer, with positions), so the attach derivation maps
+     * {@code body} as {@code lance_text} before any {@code text_analyzer}
+     * override applies. This is the shape of an existing table whose
+     * text column a {@code text_analyzer} override is put on.
+     *
+     * @return absolute URI of the table, usable as-is for
+     *         {@code /_lance/attach} or namespace register.
+     */
+    public static String writeEnglishTextTableWithInvertedIndex(Path parent, String name) throws Exception {
+        String uri = writeEnglishTextTable(parent, name);
+        return withLocaleRoot(() -> {
+            try (
+                RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+                Dataset dataset = Dataset.open().allocator(allocator).uri(uri).build()
+            ) {
+                ScalarIndexParams scalarParams = ScalarIndexParams.create(
+                    "inverted",
+                    "{\"base_tokenizer\":\"simple\",\"language\":\"English\",\"with_position\":true}"
+                );
+                IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+                dataset.createIndex(
+                    IndexOptions.builder(Collections.singletonList(BODY_COLUMN), IndexType.INVERTED, indexParams)
+                        .withIndexName(BODY_COLUMN + "_fts")
+                        .build()
+                );
+            }
+            return uri;
+        });
+    }
+
     private static String writeJapaneseTableOnce(Path parent, String name) throws Exception {
         Path tablePath = parent.resolve(name + ".lance");
         String uri = tablePath.toString();
