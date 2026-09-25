@@ -732,6 +732,70 @@ public class LanceExplainIT extends LanceRestTestCase {
         }
     }
 
+    public void testExplainShipsATermsFilterAsSubstraitUntilItsBytesPassTheTieBreak() throws Exception {
+        String suffix = "explain-encoding-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        String tableUri = LanceTableFactory.writeHintFixtureTable(scratchDir, tableName, 2, 10);
+        String indexName = tableName;
+        try {
+            attach(tableUri);
+            int expected = extractIntPath(
+                readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"term\":{\"category\":\"c1\"}}}")),
+                "hits",
+                "total",
+                "value"
+            );
+            assertTrue("the fixture holds c1 rows", expected > 0);
+
+            // 200 short values: the Substrait message is a few KB, far
+            // under the 50 KB of Substrait bytes times data nodes at
+            // which the SQL form's tie break is paid back, so the list
+            // ships as Substrait with the SQL next to it.
+            StringBuilder shortList = new StringBuilder("\"c1\"");
+            for (int i = 1; i < 200; i++) {
+                shortList.append(",\"cat").append(String.format(Locale.ROOT, "%03d", i)).append('"');
+            }
+            String shortBody = "{\"size\":0,\"query\":{\"terms\":{\"category\":[" + shortList + "]}}}";
+            String shortExplained = explainOk(indexName, shortBody);
+            Map<String, Object> shortPlan = fragmentPlanOf(shortExplained);
+            assertEquals("LUCENE_COUNT", shortPlan.get("kind"));
+            assertTrue(
+                "the SQL travels next to the bytes: " + shortExplained,
+                ((String) shortPlan.get("filter_sql")).startsWith("category IN (")
+            );
+            Object shortBytes = shortPlan.get("filter_substrait_bytes");
+            assertTrue("200 values ship as Substrait: " + shortExplained, shortBytes instanceof Number);
+            int substraitBytes = ((Number) shortBytes).intValue();
+            assertTrue("the bytes stay under the tie break: " + substraitBytes, substraitBytes > 0 && substraitBytes < 50 * 1024);
+            assertTrue(stringPath(shortExplained, "physical").contains("substrait_bytes="));
+            assertEquals(expected, extractIntPath(readAll(postJson("/" + indexName + "/_search", shortBody)), "hits", "total", "value"));
+
+            // 320 values of 200 characters: the Substrait message alone
+            // is over 60 KB on this one data node, so the wire term
+            // passes the tie break and the shorter SQL ships alone.
+            StringBuilder longList = new StringBuilder("\"c1\"");
+            String padding = "x".repeat(200);
+            for (int i = 1; i < 320; i++) {
+                longList.append(",\"v").append(i).append('-').append(padding).append('"');
+            }
+            String longBody = "{\"size\":0,\"query\":{\"terms\":{\"category\":[" + longList + "]}}}";
+            String longExplained = explainOk(indexName, longBody);
+            Map<String, Object> longPlan = fragmentPlanOf(longExplained);
+            assertEquals("LUCENE_COUNT", longPlan.get("kind"));
+            String longSql = (String) longPlan.get("filter_sql");
+            assertTrue(
+                "the SQL ships: " + longExplained.substring(0, Math.min(400, longExplained.length())),
+                longSql != null && longSql.startsWith("category IN (")
+            );
+            assertTrue("over 50 KB of Substrait ships as SQL: " + longPlan.keySet(), !longPlan.containsKey("filter_substrait_bytes"));
+            assertFalse(stringPath(longExplained, "physical").contains("substrait_bytes="));
+            assertEquals(expected, extractIntPath(readAll(postJson("/" + indexName + "/_search", longBody)), "hits", "total", "value"));
+        } finally {
+            deleteQuietly(indexName);
+        }
+    }
+
     public void testExplainUnknownIndexIs404() {
         ResponseException failure = expectThrows(
             ResponseException.class,

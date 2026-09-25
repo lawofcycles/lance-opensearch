@@ -136,7 +136,9 @@ public class LanceBuildIndexesSerializationTests extends OpenSearchTestCase {
             new KindResult(List.of(new BuiltResult("body", "INVERTED")), List.of(), List.of()),
             new KindResult(
                 List.of(new BuiltResult("id", "BTREE"), new BuiltResult("category", "BITMAP")),
-                List.of(new ColumnResult("rating", "scalar index already exists; use optimize=true to extend it over new fragments")),
+                List.of(
+                    new ColumnResult("rating", "BTREE index already exists on [rating]; use optimize=true to extend it over new fragments")
+                ),
                 List.of(new ColumnResult("price", "LanceError(IO): Permission denied (os error 13)"))
             ),
             new KindResult(

@@ -6,6 +6,7 @@
 package org.opensearch.lance.engine;
 
 import java.nio.file.Path;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -81,6 +82,78 @@ public class LanceIndexBuilderTests extends OpenSearchTestCase {
             assertEquals("failures: " + result.failed(), 0, result.failed().size());
             assertEquals(List.of(new LanceIndexBuilder.Built("rating", "BTREE")), result.built());
             assertEquals("BTREE", describedType(dataset, "rating"));
+        }
+    }
+
+    public void testRequestedTypeIsBuiltNextToAnotherTypeAndSkippedWhenPresent() throws Exception {
+        Path scratch = createTempDir();
+        String uri = LanceTableFactory.writeHintFixtureTable(scratch, "scalar-coexist", 2, 10);
+        Map<String, LanceOverrides.IndexPreference> zonemap = LanceOverrides.parseIndexesClause(
+            Map.of("id", Map.of("scalar", "zonemap", "params", Map.of("rows_per_zone", 5)))
+        );
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE); Dataset dataset = open(allocator, uri)) {
+            // The default BTree first, as a table writer would have left it.
+            LanceIndexBuilder.BuildResult btree = LanceIndexBuilder.ensureScalarIndexes(
+                dataset,
+                Set.of("id"),
+                Long.MAX_VALUE,
+                Optional.empty(),
+                Map.of()
+            );
+            assertEquals(List.of(new LanceIndexBuilder.Built("id", "BTREE")), btree.built());
+
+            // The same type again is the existing skip, naming the type.
+            LanceIndexBuilder.BuildResult again = LanceIndexBuilder.ensureScalarIndexes(
+                dataset,
+                Set.of("id"),
+                Long.MAX_VALUE,
+                Optional.empty(),
+                Map.of()
+            );
+            assertEquals(List.of(), again.built());
+            assertEquals(
+                List.of(
+                    new LanceIndexBuilder.Skipped(
+                        "id",
+                        "BTREE index already exists on [id]; use optimize=true to extend it over new fragments"
+                    )
+                ),
+                again.skipped()
+            );
+
+            // A different type is built next to the BTree.
+            LanceIndexBuilder.BuildResult zone = LanceIndexBuilder.ensureScalarIndexes(
+                dataset,
+                Set.of("id"),
+                Long.MAX_VALUE,
+                Optional.empty(),
+                zonemap
+            );
+            assertEquals("failures: " + zone.failed(), 0, zone.failed().size());
+            assertEquals(List.of(new LanceIndexBuilder.Built("id", "ZONEMAP")), zone.built());
+            assertEquals(List.of(), zone.skipped());
+            assertEquals(Set.of("BTREE", "ZONEMAP"), describedTypes(dataset, "id"));
+
+            // And is itself skipped once present, with a partial build
+            // pointed at optimize as well.
+            LanceIndexBuilder.BuildResult zoneAgain = LanceIndexBuilder.ensureScalarIndexes(
+                dataset,
+                Set.of("id"),
+                Long.MAX_VALUE,
+                Optional.of(List.of(1)),
+                zonemap
+            );
+            assertEquals(List.of(), zoneAgain.built());
+            assertEquals(
+                List.of(
+                    new LanceIndexBuilder.Skipped(
+                        "id",
+                        "ZONEMAP index already exists on [id]; fragment_ids does not extend an existing index, use optimize=true"
+                    )
+                ),
+                zoneAgain.skipped()
+            );
+            assertEquals(Set.of("BTREE", "ZONEMAP"), describedTypes(dataset, "id"));
         }
     }
 
@@ -175,5 +248,14 @@ public class LanceIndexBuilderTests extends OpenSearchTestCase {
         List<IndexDescription> descriptions = dataset.describeIndices(forColumn(column));
         assertEquals("expected exactly one index on " + column + ": " + descriptions, 1, descriptions.size());
         return descriptions.get(0).getIndexType().replace("_", "").toUpperCase(Locale.ROOT);
+    }
+
+    /** Every index type Lance reports for {@code column}, normalised like {@link #describedType}. */
+    private static Set<String> describedTypes(Dataset dataset, String column) {
+        Set<String> types = new HashSet<>();
+        for (IndexDescription description : dataset.describeIndices(forColumn(column))) {
+            types.add(description.getIndexType().replace("_", "").toUpperCase(Locale.ROOT));
+        }
+        return types;
     }
 }

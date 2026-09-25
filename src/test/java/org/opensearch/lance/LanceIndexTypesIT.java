@@ -7,9 +7,11 @@ package org.opensearch.lance;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -131,6 +133,85 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
                     client().performRequest(new Request("DELETE", "/" + index));
                 } catch (Exception ignored) {}
             }
+            deleteRecursively(scratchDir);
+        }
+    }
+
+    public void testBuildIndexesAddsAZoneMapNextToAnExistingBTree() throws Exception {
+        String suffix = "idxcoexist-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        // Four fragments of 100 rows with the ids of fragment f in
+        // [f * 100, (f + 1) * 100), so a zone map on id excludes whole
+        // fragments from a range.
+        String tableUri = LanceTableFactory.writeHintFixtureTable(scratchDir, tableName, 4, 100);
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + indexName + "\"}");
+            assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            ensureGreen(indexName);
+
+            // The default BTree on id, as a table writer would have left it.
+            String btree = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}"));
+            assertTrue("expected the BTree on id: " + btree, btree.contains("\"scalar\":[{\"column\":\"id\",\"type\":\"BTREE\"}]"));
+
+            // The same type again is skipped, and the reason names it.
+            String sameType = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}"));
+            assertTrue("expected nothing built: " + sameType, sameType.contains("\"built\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
+            assertTrue(
+                "expected id skipped as an existing BTree: " + sameType,
+                sameType.contains(
+                    "\"scalar\":[{\"column\":\"id\",\"reason\":\"BTREE index already exists on [id]; "
+                        + "use optimize=true to extend it over new fragments\"}]"
+                )
+            );
+
+            // A zone map requested on the same column is built next to
+            // the BTree instead of being skipped.
+            String zonemap = readAll(
+                postJson(
+                    "/_lance/build_indexes/" + indexName,
+                    "{\"columns\":[\"id\"],\"indexes\":{\"id\":{\"scalar\":\"zonemap\",\"params\":{\"rows_per_zone\":50}}}}"
+                )
+            );
+            assertTrue(
+                "expected the zone map on id: " + zonemap,
+                zonemap.contains("\"scalar\":[{\"column\":\"id\",\"type\":\"ZONEMAP\"}]")
+            );
+            assertTrue("expected nothing skipped: " + zonemap, zonemap.contains("\"skipped\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
+            assertTrue("expected nothing failed: " + zonemap, zonemap.contains("\"failed\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
+
+            // The stats surface reports both types on the column.
+            assertBusy(() -> {
+                String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+                Map<String, Object> indexTypes = statsIndexTypes(stats, indexName);
+                assertNotNull("stats must report index_types for " + indexName + ": " + stats, indexTypes);
+                assertEquals(Set.of("BTREE", "ZONEMAP"), normalisedTypes(indexTypes, "id"));
+            });
+
+            // The planner reads the new zone map: id >= 250 cannot hold in
+            // fragments 0 (ids 0..99) and 1 (100..199).
+            assertBusy(() -> {
+                Request explain = new Request("GET", "/" + indexName + "/_lance/explain");
+                explain.setJsonEntity("{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":250}}}}");
+                String body;
+                try {
+                    body = readAll(client().performRequest(explain));
+                } catch (ResponseException e) {
+                    throw new AssertionError("index temporarily unavailable: " + e.getMessage(), e);
+                }
+                Object fragmentPlan = parseJson(body).get("fragment_plan");
+                assertTrue("the fragment route carries a plan: " + body, fragmentPlan instanceof Map<?, ?>);
+                assertEquals("pruned fragments: " + body, List.of(0, 1), ((Map<?, ?>) fragmentPlan).get("excluded_fragment_ids"));
+            });
+
+            // The pruned count agrees with the rows.
+            String counted = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":250}}}}"));
+            assertEquals(150, extractIntPath(counted, "hits", "total", "value"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
             deleteRecursively(scratchDir);
         }
     }
@@ -264,5 +345,16 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
         Object types = indexTypes.get(column);
         assertTrue("expected one index type for " + column + ": " + indexTypes, types instanceof List<?> list && list.size() == 1);
         return ((List<?>) types).get(0).toString().replace("_", "").toUpperCase(Locale.ROOT);
+    }
+
+    /** Every index type reported for {@code column}, normalised like {@link #normalisedType}. */
+    private static Set<String> normalisedTypes(Map<String, Object> indexTypes, String column) {
+        Object types = indexTypes.get(column);
+        assertTrue("expected index types for " + column + ": " + indexTypes, types instanceof List<?>);
+        Set<String> normalised = new HashSet<>();
+        for (Object type : (List<?>) types) {
+            normalised.add(type.toString().replace("_", "").toUpperCase(Locale.ROOT));
+        }
+        return normalised;
     }
 }

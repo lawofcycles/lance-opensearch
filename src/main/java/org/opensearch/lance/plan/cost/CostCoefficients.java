@@ -129,9 +129,15 @@ public final class CostCoefficients {
      * inside the fragment request: a structural assumption of 1 GB/s
      * transport throughput, not a measurement. The request's fixed
      * transport cost is inside the fixed terms above; only the
-     * encoding's size varies between the two forms of a pushed filter,
-     * and a Substrait message runs three to twenty times the length of
-     * the SQL of the same predicate.
+     * encoding's size varies between the two forms of a pushed filter.
+     * The Substrait form ships its SQL as well (the executor's column
+     * loads take SQL only), so the two forms differ by the Substrait
+     * bytes alone, and the SQL form is chosen once those bytes times the
+     * data node count exceed {@link #FILTER_SQL_TIE_BREAK_MS} divided by
+     * this constant, 50 KB: about 4,000 short {@code terms} values on
+     * one node, about 1,000 on four. A 200 value {@code terms} list
+     * (under 3 KB of Substrait) ships as Substrait on any cluster of
+     * fewer than about 18 data nodes.
      */
     public static final double FILTER_WIRE_MS_PER_KB_PER_NODE = 0.001;
     /**
@@ -147,8 +153,10 @@ public final class CostCoefficients {
      * what costs. The constant is a preference for the encoding whose
      * field references are positional and whose message is typed, not
      * a measured difference; the wire term overtakes it once the
-     * Substrait bytes' excess over the SQL, times the fan out, passes
-     * 50 KB, so a very long term list on a wide cluster ships as SQL.
+     * Substrait bytes times the data node count pass 50 KB
+     * ({@code 0.05 / 0.001} KB), so only a {@code terms} list in the
+     * thousands of values on one node, or in the high hundreds on a
+     * wide cluster, ships as SQL.
      */
     public static final double FILTER_SQL_TIE_BREAK_MS = 0.05;
 
