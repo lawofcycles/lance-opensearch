@@ -1226,7 +1226,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         perf1bNode(PERF1B_AVAILABLE_FRESH_NODE);
         ScanAdmission.Shape shape = ScanAdmission.classify(new LanceFtsQuery("body", "w000000 w000001", true, 0).withScanLimit(10), false);
         assertEquals(1, shape.clauses());
-        assertTrue(shape.phrase());
+        assertEquals(1, shape.phraseClauses());
         long expected = NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS) + PERF1B_ROWS
             * ScanAdmission.PHRASE_POSITION_BYTES_PER_ROW + 10L * 12L * 2L;
         assertEquals(100_000_000_240L, expected);
@@ -1254,7 +1254,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         LanceFtsQuery query = new LanceFtsQuery(fused, Set.of("body"), 10, "price >= 50.0");
         ScanAdmission.Shape shape = ScanAdmission.classify(query, false);
         assertEquals(2, shape.clauses());
-        assertFalse(shape.phrase());
+        assertEquals(0, shape.phraseClauses());
         assertFalse(shape.unbounded());
         assertEquals(10L, shape.boundedScanRows());
         long expected = 2L * NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS) + 10L * 12L * 2L;
@@ -1276,16 +1276,64 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         assertTrue(nested.unbounded());
     }
 
+    public void testBoolOfTwoPhrasesChargesThePositionsOfEachPhrase() {
+        // lance_fts_bool(must [match_phrase, match_phrase]) size 10: two
+        // document sets and two phrases' positions, 200 GB over 1B rows.
+        perf1bNode(PERF1B_AVAILABLE_FRESH_NODE);
+        FullTextQuery fused = FullTextQuery.booleanQuery(
+            List.of(
+                new FullTextQuery.BooleanClause(FullTextQuery.Occur.MUST, FullTextQuery.phrase("w000000 w000001", "body", 0)),
+                new FullTextQuery.BooleanClause(FullTextQuery.Occur.MUST, FullTextQuery.phrase("w000100 w000200", "body", 0))
+            )
+        );
+        ScanAdmission.Shape shape = ScanAdmission.classify(new LanceFtsQuery(fused, Set.of("body")).withScanLimit(10), false);
+        assertEquals(2, shape.clauses());
+        assertEquals(2, shape.phraseClauses());
+        assertTrue(shape.phrase());
+        long entry = NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS);
+        long positions = PERF1B_ROWS * ScanAdmission.PHRASE_POSITION_BYTES_PER_ROW;
+        long expected = 2L * entry + 2L * positions + 10L * 12L * 2L;
+        assertEquals(200_000_000_240L, expected);
+        // Twice what one phrase's positions add to the same two clauses.
+        assertEquals(
+            positions,
+            ScanAdmission.ftsEstimateBytes(PERF1B_ROWS, 2, 2, 240L, 8 * GB) - ScanAdmission.ftsEstimateBytes(
+                PERF1B_ROWS,
+                2,
+                1,
+                240L,
+                8 * GB
+            )
+        );
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("perf1b", PERF1B_ROWS, shape)
+        );
+        assertTrue(rejection.getMessage(), rejection.getMessage().contains("for each of 2 phrase clauses"));
+        assertEquals(expected, ScanAdmission.lastEstimateBytes());
+        // Two phrases as two LanceFtsQuery leaves under a Lucene bool
+        // count the same.
+        BooleanQuery lucene = new BooleanQuery.Builder().add(
+            new LanceFtsQuery("body", "w000000 w000001", true, 0),
+            BooleanClause.Occur.MUST
+        ).add(new LanceFtsQuery("body", "w000100 w000200", true, 0), BooleanClause.Occur.SHOULD).build();
+        assertEquals(2, ScanAdmission.classify(lucene, false).phraseClauses());
+    }
+
     public void testClauseCountFollowsTheLanceQueryTree() {
         // A multi_match searches one index per column; a boost searches
-        // both sides; a boolean sums its clauses; a phrase anywhere in
-        // the tree flags the shape.
+        // both sides; a boolean sums its clauses; every phrase in the
+        // tree is counted.
         FullTextQuery multi = FullTextQuery.multiMatch("w000100", List.of("title", "body"));
         assertEquals(2, ScanAdmission.leafClauses(multi));
-        assertFalse(ScanAdmission.hasPhrase(multi));
+        assertEquals(0, ScanAdmission.phraseClauses(multi));
         FullTextQuery boost = FullTextQuery.boost(FullTextQuery.match("a", "body"), FullTextQuery.phrase("b c", "body", 0), 0.5f);
         assertEquals(2, ScanAdmission.leafClauses(boost));
-        assertTrue(ScanAdmission.hasPhrase(boost));
+        assertEquals(1, ScanAdmission.phraseClauses(boost));
+        assertEquals(
+            2,
+            ScanAdmission.phraseClauses(FullTextQuery.boost(FullTextQuery.phrase("a b", "body", 0), FullTextQuery.phrase("b c", "body", 0)))
+        );
         FullTextQuery bool = FullTextQuery.booleanQuery(
             List.of(
                 new FullTextQuery.BooleanClause(FullTextQuery.Occur.SHOULD, multi),
@@ -1293,24 +1341,29 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             )
         );
         assertEquals(3, ScanAdmission.leafClauses(bool));
-        assertFalse(ScanAdmission.hasPhrase(bool));
+        assertEquals(0, ScanAdmission.phraseClauses(bool));
         ScanAdmission.Shape shape = ScanAdmission.classify(new LanceFtsQuery(bool, Set.of("title", "body")).withScanLimit(5), false);
         assertEquals(3, shape.clauses());
         assertEquals(5L, shape.boundedScanRows());
         // The three argument shape is one non phrase clause.
         assertEquals(1, UNBOUNDED.clauses());
+        assertEquals(0, UNBOUNDED.phraseClauses());
         assertFalse(UNBOUNDED.phrase());
         assertEquals(0, ScanAdmission.Shape.NONE.clauses());
-        // The estimator: two clauses double the document set, a phrase
-        // adds the positions, a fitting document set is zero whatever
-        // the clauses.
+        // The estimator: two clauses double the document set, each
+        // phrase adds its positions, a fitting document set is zero
+        // whatever the clauses.
         long entry = NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS);
-        assertEquals(2 * entry + 240L, ScanAdmission.ftsEstimateBytes(PERF1B_ROWS, 2, false, 240L, 8 * GB));
+        assertEquals(2 * entry + 240L, ScanAdmission.ftsEstimateBytes(PERF1B_ROWS, 2, 0, 240L, 8 * GB));
         assertEquals(
             entry + PERF1B_ROWS * ScanAdmission.PHRASE_POSITION_BYTES_PER_ROW,
-            ScanAdmission.ftsEstimateBytes(PERF1B_ROWS, 1, true, 0L, 8 * GB)
+            ScanAdmission.ftsEstimateBytes(PERF1B_ROWS, 1, 1, 0L, 8 * GB)
         );
-        assertEquals(0L, ScanAdmission.ftsEstimateBytes(1_000_000L, 3, true, 240L, 8 * GB));
+        assertEquals(
+            3 * entry + 3 * PERF1B_ROWS * ScanAdmission.PHRASE_POSITION_BYTES_PER_ROW,
+            ScanAdmission.ftsEstimateBytes(PERF1B_ROWS, 3, 3, 0L, 8 * GB)
+        );
+        assertEquals(0L, ScanAdmission.ftsEstimateBytes(1_000_000L, 3, 3, 240L, 8 * GB));
     }
 
     public void testHeapTermIsJudgedAgainstTheBreakerRoomNotPhysicalMemory() {
