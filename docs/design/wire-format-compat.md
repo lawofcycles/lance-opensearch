@@ -53,8 +53,8 @@ the fallback is merely slower or less informative. `FragmentPlan` marks its Subs
 critical only while a filter is set, because an older data node that ignored the filter would scan
 without the predicate and answer wrongly, and marks its pruning block optional, because an older
 node that scans the pruned fragments too still answers correctly. `LanceNodeStats` marks its
-pruned fragment counter and its admission source optional, because an older coordinator merely
-shows the stats without them.
+pruned fragment counter, its admission source and its refused mapping updates optional, because an
+older coordinator merely shows the stats without them.
 
 A block is decoded from a stream of its own bytes, so a parser that leaves bytes of the block
 unread fails the message with `<Message> wire version block [n] left k bytes unread` rather than
@@ -117,11 +117,13 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | `LanceNodeStats` | 1 | Base: every figure of the node stats but the pruned fragment counter and the admission source, then the freshness stats |
 | | 2 | Block, optional: pruned fragment counter (fallback zero) |
 | | 3 | Block, optional: source of the last admission decision (`request` or `warm_up`; fallback `none`) |
+| | 4 | Block, optional: the freshness checks' refused mapping updates, index name to message (fallback empty) |
 | `LanceStatsNodeRequest` | 1 | Base: nothing after the marker |
 | `LanceBuildIndexesNodeRequest` | 1 | Base: the build request, the source version |
 | `LanceBuildIndexesNodeResponse` | 1 | Base: the three kind results, the status, the optional mapping JSON |
 | `LanceIndexSyncRequest` | 1 | Base: nothing after the marker (the index travels in the OpenSearch base class) |
 | `LanceIndexSyncResponse` | 1 | Base: the freshness outcome (index, checked, reason, moved, served and target version, mapping changed, rebuilt) |
+| | 2 | Block, optional: the message of the mapping update the check sent and the cluster manager refused (optional string; fallback absent) |
 | `LanceNamespacePollRequest` | 1 | Base: optional namespace name |
 | `LanceNamespacePollResponse` | 1 | Base: surfaced indexes, skipped tables, unavailable namespaces |
 | `LanceNamespaceUpdateRequest` | 1 | Base: operation, name, optional type, optional root URI, storage options, config, overrides JSON |

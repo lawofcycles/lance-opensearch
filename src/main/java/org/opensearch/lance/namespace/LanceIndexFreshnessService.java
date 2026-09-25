@@ -9,6 +9,7 @@ import java.io.Closeable;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -78,6 +79,10 @@ import org.opensearch.transport.client.Client;
  * with the same table, storage options, overrides and tag and the new
  * mapping. The service outlives its own index's deletion; the closing
  * shard unregisters itself and the new shard registers when it starts.
+ * Any other refusal of the {@code PutMapping} leaves the index on the
+ * mapping it has; the message is kept per index and reported by
+ * {@link #stats()} and by the outcome of the check, until a later check
+ * applies a mapping or finds the mapping unchanged.
  */
 public final class LanceIndexFreshnessService implements IndexEventListener, Closeable {
 
@@ -86,11 +91,30 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
     static final String REFRESH_SOURCE = "lance freshness";
     private static final String UNCOVERED_FRAGMENT_POLICY_SETTING = "index.lance.uncovered_fragment_policy";
 
-    /** What one check found and did; the answer of {@code POST /{index}/_lance/sync}. */
+    /**
+     * What one check found and did; the answer of {@code POST /{index}/_lance/sync}.
+     * {@code mappingError} is the message of the {@code PutMapping} the
+     * check sent and the cluster manager refused, {@code null} when the
+     * mapping was not touched or the update was applied.
+     */
     public record Outcome(String index, boolean checked, String reason, boolean moved, long servedVersion, long targetVersion,
-        boolean mappingChanged, boolean rebuilt) {
+        boolean mappingChanged, boolean rebuilt, String mappingError) {
+
+        public Outcome(
+            String index,
+            boolean checked,
+            String reason,
+            boolean moved,
+            long servedVersion,
+            long targetVersion,
+            boolean mappingChanged,
+            boolean rebuilt
+        ) {
+            this(index, checked, reason, moved, servedVersion, targetVersion, mappingChanged, rebuilt, null);
+        }
+
         static Outcome notChecked(String index, String reason) {
-            return new Outcome(index, false, reason, false, -1L, -1L, false, false);
+            return new Outcome(index, false, reason, false, -1L, -1L, false, false, null);
         }
     }
 
@@ -160,6 +184,15 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
     private final Map<String, Tracked> tracked = new ConcurrentHashMap<>();
     /** Indexes whose `wait` uncovered fragment policy has been explained once. */
     private final Set<String> warnedWaitPolicy = ConcurrentHashMap.newKeySet();
+    /**
+     * The message of the last mapping update the cluster manager refused,
+     * per index, kept until a later check applies a mapping or finds
+     * nothing to apply, or until the shard leaves this node. Reported
+     * under {@code freshness.mapping_errors} of {@code GET /_lance/stats},
+     * because a refused update otherwise leaves the index serving the
+     * stale mapping with nothing but a WARN line to say so.
+     */
+    private final Map<String, String> mappingErrors = new ConcurrentHashMap<>();
 
     private final LongAdder checks = new LongAdder();
     private final LongAdder moves = new LongAdder();
@@ -227,6 +260,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         }
         driftDetector.forgetIndex(indexName);
         warnedWaitPolicy.remove(indexName);
+        mappingErrors.remove(indexName);
     }
 
     /** Whether this node checks {@code indexName}. */
@@ -361,6 +395,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             }
         }
         boolean mappingChanged = false;
+        String mappingError = null;
         if (derivation != null) {
             if ("wait".equals(settings.get(UNCOVERED_FRAGMENT_POLICY_SETTING, "immediate"))) {
                 // `wait` is accepted but converges with the immediate
@@ -373,10 +408,14 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             entry.derivedOnce = true;
             MappingComparison comparison = shard.compareMapping(derivation.mappingJson());
             switch (comparison) {
-                case UNCHANGED -> mappingUnchanged.increment();
+                case UNCHANGED -> {
+                    mappingUnchanged.increment();
+                    mappingErrors.remove(indexName);
+                }
                 case TYPE_CONFLICT -> {
+                    mappingErrors.remove(indexName);
                     rebuild(indexName, table, storageOptions, derivation, settings, target, "preflight merge refused the type change");
-                    return new Outcome(indexName, true, null, moved, served, target, true, true);
+                    return new Outcome(indexName, true, null, moved, served, target, true, true, null);
                 }
                 case CHANGED -> {
                     mappingChanged = true;
@@ -388,13 +427,20 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                             .execute()
                             .actionGet();
                         mappingUpdates.increment();
+                        mappingErrors.remove(indexName);
                     } catch (Exception e) {
                         String message = e.getMessage() == null ? "" : e.getMessage();
                         if (message.contains("cannot be changed from type")) {
+                            mappingErrors.remove(indexName);
                             rebuild(indexName, table, storageOptions, derivation, settings, target, message);
-                            return new Outcome(indexName, true, null, moved, served, target, true, true);
+                            return new Outcome(indexName, true, null, moved, served, target, true, true, null);
                         }
                         failures.increment();
+                        // The index keeps serving the mapping it has; the
+                        // refusal stays visible in the stats until a later
+                        // check applies a mapping.
+                        mappingError = message;
+                        mappingErrors.put(indexName, message);
                         LOG.warn("mapping re-derivation failed for {} at version {}: {}", indexName, target, message);
                     }
                 }
@@ -413,7 +459,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                 warmCache.retire(shard.indexUuid(), target);
             }
         }
-        return new Outcome(indexName, true, null, moved, served, target, mappingChanged, false);
+        return new Outcome(indexName, true, null, moved, served, target, mappingChanged, false, mappingError);
     }
 
     /**
@@ -490,7 +536,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         }
     }
 
-    /** This node's counters for {@code GET /_lance/stats}. */
+    /** This node's counters for {@code GET /_lance/stats}, with the mapping updates still refused per index. */
     public LanceNodeStats.FreshnessStats stats() {
         return new LanceNodeStats.FreshnessStats(
             tracked.size(),
@@ -500,7 +546,8 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             mappingUnchanged.sum(),
             rebuilds.sum(),
             failures.sum(),
-            lastCheckMillis
+            lastCheckMillis,
+            new TreeMap<>(mappingErrors)
         );
     }
 

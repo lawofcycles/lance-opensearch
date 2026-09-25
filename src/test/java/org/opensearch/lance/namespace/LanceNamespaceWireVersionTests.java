@@ -64,7 +64,17 @@ public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
     }
 
     public void testSyncResponse() throws Exception {
-        LanceIndexFreshnessService.Outcome outcome = new LanceIndexFreshnessService.Outcome("demo", true, null, true, 3L, 4L, false, false);
+        LanceIndexFreshnessService.Outcome outcome = new LanceIndexFreshnessService.Outcome(
+            "demo",
+            true,
+            null,
+            true,
+            3L,
+            4L,
+            true,
+            false,
+            "Mapper for [body] conflicts with existing mapper"
+        );
         LanceIndexSyncResponse original = new LanceIndexSyncResponse(outcome);
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             original.writeTo(out);
@@ -77,7 +87,36 @@ public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
         }
         Writeable prelude = WireVersionTestSupport.NO_PRELUDE;
         assertEquals(outcome, ((LanceIndexSyncResponse) readNextVersion(original, prelude, LanceIndexSyncResponse::new)).outcome());
-        assertRefusesCritical("LanceIndexSyncResponse", original, prelude, LanceIndexSyncResponse::new);
+        assertRefusesCritical(
+            "LanceIndexSyncResponse",
+            LanceIndexSyncResponse.WIRE_VERSION,
+            original,
+            prelude,
+            LanceIndexSyncResponse::new
+        );
+    }
+
+    public void testSyncResponseOfAVersion1NodeCarriesNoMappingError() throws Exception {
+        // The stream a node of the previous plugin version writes: the
+        // base fields with marker 1 and no block.
+        LanceIndexFreshnessService.Outcome outcome = new LanceIndexFreshnessService.Outcome("demo", true, null, true, 3L, 4L, true, false);
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            WireVersion.write(out, 1);
+            out.writeString(outcome.index());
+            out.writeBoolean(outcome.checked());
+            out.writeOptionalString(outcome.reason());
+            out.writeBoolean(outcome.moved());
+            out.writeLong(outcome.servedVersion());
+            out.writeLong(outcome.targetVersion());
+            out.writeBoolean(outcome.mappingChanged());
+            out.writeBoolean(outcome.rebuilt());
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceIndexSyncResponse restored = new LanceIndexSyncResponse(in);
+                assertEquals(outcome, restored.outcome());
+                assertNull(restored.outcome().mappingError());
+                assertEquals(-1, in.read());
+            }
+        }
     }
 
     public void testPollRequest() throws Exception {
@@ -187,13 +226,30 @@ public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
 
     /** Reads the stream of the next version with one critical block appended and asserts the refusal names {@code format}. */
     private static void assertRefusesCritical(String format, Writeable original, Writeable prelude, Reader reader) throws IOException {
+        assertRefusesCritical(format, 1, original, prelude, reader);
+    }
+
+    /**
+     * Reads the stream of the next version after {@code current} with one
+     * critical block appended and asserts the refusal names
+     * {@code format} and both versions.
+     */
+    private static void assertRefusesCritical(String format, int current, Writeable original, Writeable prelude, Reader reader)
+        throws IOException {
         BytesReference newer = WireVersionTestSupport.asNextVersion(original, prelude, true, out -> out.writeString("a later constraint"));
+        int next = current + 1;
         try (StreamInput in = newer.streamInput()) {
             IOException refused = expectThrows(IOException.class, () -> reader.read(in));
-            assertEquals(WireVersion.criticalBlockMessage(format, 2, 2, 1), refused.getMessage());
+            assertEquals(WireVersion.criticalBlockMessage(format, next, next, current), refused.getMessage());
             assertEquals(
                 format
-                    + " wire version [2] adds fields in version [2] that this node's [1] cannot ignore: "
+                    + " wire version ["
+                    + next
+                    + "] adds fields in version ["
+                    + next
+                    + "] that this node's ["
+                    + current
+                    + "] cannot ignore: "
                     + "upgrade this node before sending it this message",
                 refused.getMessage()
             );

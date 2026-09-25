@@ -18,14 +18,18 @@ import org.opensearch.lance.WireVersion;
  * Response for {@link LanceIndexSyncAction}: the
  * {@link LanceIndexFreshnessService.Outcome} of the check. Rendered as
  * {@code {"index", "checked", "reason"?, "moved", "served_version",
- * "target_version", "mapping_changed", "rebuilt"}}; {@code reason} is
- * present only when the index was not checked (it is pinned to a
- * version). Opens with {@link #WIRE_VERSION} (see {@link WireVersion}).
+ * "target_version", "mapping_changed", "rebuilt", "mapping_error"?}};
+ * {@code reason} is present only when the index was not checked (it is
+ * pinned to a version), {@code mapping_error} only when the check sent
+ * a mapping update the cluster manager refused. Opens with
+ * {@link #WIRE_VERSION} (see {@link WireVersion}); version 2 added the
+ * refused update's message as an optional block, so a node of the
+ * previous plugin version answers without it.
  */
 public final class LanceIndexSyncResponse extends ActionResponse implements ToXContentObject {
 
-    /** The wire format's version, the first field the response writes. */
-    public static final int WIRE_VERSION = 1;
+    /** The wire format's version, the first field the response writes; 2 added the mapping error. */
+    public static final int WIRE_VERSION = 2;
 
     private final LanceIndexFreshnessService.Outcome outcome;
 
@@ -36,17 +40,27 @@ public final class LanceIndexSyncResponse extends ActionResponse implements ToXC
     public LanceIndexSyncResponse(StreamInput in) throws IOException {
         super(in);
         WireVersion.Reader reader = WireVersion.read(in, "LanceIndexSyncResponse", WIRE_VERSION);
-        this.outcome = new LanceIndexFreshnessService.Outcome(
-            in.readString(),
-            in.readBoolean(),
-            in.readOptionalString(),
-            in.readBoolean(),
-            in.readLong(),
-            in.readLong(),
-            in.readBoolean(),
-            in.readBoolean()
-        );
+        String index = in.readString();
+        boolean checked = in.readBoolean();
+        String reason = in.readOptionalString();
+        boolean moved = in.readBoolean();
+        long servedVersion = in.readLong();
+        long targetVersion = in.readLong();
+        boolean mappingChanged = in.readBoolean();
+        boolean rebuilt = in.readBoolean();
+        String mappingError = reader.block(2, StreamInput::readOptionalString, null);
         reader.finish();
+        this.outcome = new LanceIndexFreshnessService.Outcome(
+            index,
+            checked,
+            reason,
+            moved,
+            servedVersion,
+            targetVersion,
+            mappingChanged,
+            rebuilt,
+            mappingError
+        );
     }
 
     @Override
@@ -60,6 +74,10 @@ public final class LanceIndexSyncResponse extends ActionResponse implements ToXC
         out.writeLong(outcome.targetVersion());
         out.writeBoolean(outcome.mappingChanged());
         out.writeBoolean(outcome.rebuilt());
+        // A caller of the previous version reads the outcome without the
+        // message; the check itself ran the same, so the block is
+        // never critical.
+        WireVersion.writeBlock(out, false, o -> o.writeOptionalString(outcome.mappingError()));
     }
 
     public LanceIndexFreshnessService.Outcome outcome() {
@@ -79,6 +97,9 @@ public final class LanceIndexSyncResponse extends ActionResponse implements ToXC
         builder.field("target_version", outcome.targetVersion());
         builder.field("mapping_changed", outcome.mappingChanged());
         builder.field("rebuilt", outcome.rebuilt());
+        if (outcome.mappingError() != null) {
+            builder.field("mapping_error", outcome.mappingError());
+        }
         return builder.endObject();
     }
 }
