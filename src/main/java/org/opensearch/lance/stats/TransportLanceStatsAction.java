@@ -57,8 +57,9 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
      * same accessor the fragment query action resolves, held separately
      * so this action does not depend on the dispatch package's
      * internals. A DLS/FLS reader wrapper hides columns from the
-     * request; Lance's {@code describeIndices} metadata does not pass
-     * through the wrapper, so the per-column index type report is
+     * request; Lance's {@code describeIndices} metadata and the
+     * mapping's rename entries do not pass through the wrapper, so the
+     * per-column index type report and the renamed field list are
      * skipped whenever a wrapper is installed. Unlike the query path,
      * stats must not refuse to load when the accessor is missing:
      * {@code null} here just means "cannot tell", which is treated as
@@ -205,9 +206,16 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
                     // wrapper hides. A describeIndices failure likewise
                     // leaves the map empty rather than dropping the
                     // reader's row figures.
+                    //
+                    // The mapping's rename entries are skipped for the
+                    // same reason: each one names the Lance source
+                    // column of a field the wrapper may hide.
+                    boolean wrapped = hasReaderWrapper(indexService);
                     Map<String, List<String>> indexTypes;
-                    if (hasReaderWrapper(indexService)) {
+                    List<LanceMappingMeta.RenamedField> renamedFields;
+                    if (wrapped) {
                         indexTypes = Map.of();
+                        renamedFields = List.of();
                     } else {
                         try {
                             indexTypes = reader.columnIndexTypes();
@@ -215,6 +223,7 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
                             LOGGER.debug("lance.stats: describeIndices failed for {}: {}", shard.shardId(), e.toString());
                             indexTypes = Map.of();
                         }
+                        renamedFields = LanceMappingMeta.renamedFields(indexService.getMetadata().mapping());
                     }
                     stats.add(
                         new LanceNodeStats.IndexReaderStats(
@@ -224,7 +233,7 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
                             nestedDocs,
                             reader.luceneBoundExceeded(),
                             indexTypes,
-                            LanceMappingMeta.renamedFields(indexService.getMetadata().mapping())
+                            renamedFields
                         )
                     );
                 } catch (Exception e) {
