@@ -90,6 +90,7 @@ public class LancePluginTests extends OpenSearchTestCase {
         assertTrue(names.toString(), names.contains("cluster:admin/lance/namespace/update"));
         assertTrue(names.toString(), names.contains("cluster:admin/lance/namespace/poll"));
         assertTrue(names.toString(), names.contains("indices:admin/lance/sync"));
+        assertTrue(names.toString(), names.contains("cluster:admin/lance/statistics/prefetch"));
     }
 
     public void testRegistersLanceTextMapper() {
