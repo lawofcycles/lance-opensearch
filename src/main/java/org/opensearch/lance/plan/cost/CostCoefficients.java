@@ -41,7 +41,7 @@ public final class CostCoefficients {
     /** Transfer of the columns the scan reads, per GB one node pulls from the object store; not divided by the parallelism. */
     public static final double OBJECT_STORE_READ_MS_PER_GB_PER_NODE = 170;
     /** Decoding the scanned columns, per 8 bytes of row width. */
-    public static final double PUSHED_DECODE_MS_PER_MROW_THREAD_PER_8_BYTES = 8.9;
+    public static final double PUSHED_DECODE_MS_PER_MROW_THREAD_PER_8_BYTES = 9;
     /** Hashing a string group key. */
     public static final double PUSHED_STRING_KEY_MS_PER_MROW_THREAD = 17;
     /** Hashing a numeric group key. */
@@ -55,7 +55,7 @@ public final class CostCoefficients {
     /** A composite date histogram source. */
     public static final double PUSHED_COMPOSITE_DATE_KEY_MS_PER_MROW_THREAD = 100;
     /** The sums of squares an extended_stats adds over a stats. */
-    public static final double PUSHED_EXTENDED_STATS_MS_PER_MROW_THREAD = 0.9;
+    public static final double PUSHED_EXTENDED_STATS_MS_PER_MROW_THREAD = 0.89;
     /** The bin counts of a percentiles, on top of its second scan pass. */
     public static final double PUSHED_PERCENTILES_MS_PER_MROW_THREAD = 17;
     /** Hash table misses once the groups exceed {@link #LARGE_GROUPS}. */
