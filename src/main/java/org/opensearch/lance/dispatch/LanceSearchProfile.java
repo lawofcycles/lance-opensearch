@@ -29,7 +29,7 @@ import org.opensearch.transport.TransportResponseHandler;
  *   "lance": {
  *     "nodes": {
  *       "&lt;node id&gt;": {
- *         "query": {"millis": 12},
+ *         "query": {"millis": 12, "fts_scans": 1},
  *         "fetch": {"millis": 3, "take_count": 4, "take_rows": 47, "take_columns": 8, "take_millis": 9}
  *       }
  *     }
@@ -38,7 +38,10 @@ import org.opensearch.transport.TransportResponseHandler;
  * </pre>
  *
  * {@code query.millis} is the executor's query phase (the page collected,
- * the count and the aggregations included), {@code fetch.millis} its
+ * the count and the aggregations included), {@code query.fts_scans} the
+ * Lance full text scans the request ran on that node (the hits scans of
+ * its full text Weights and the count-only scans behind
+ * {@code hits.total}), {@code fetch.millis} its
  * fetch phase (the rows behind the hits materialised), and the
  * {@code take_*} figures the {@code _rowaddr IN (...)} take scans the
  * request issued on that node, whichever phase issued them: how many,
@@ -153,6 +156,7 @@ final class LanceSearchProfile {
                     builder.startObject(node.getKey());
                     builder.startObject("query");
                     builder.field("millis", figures.queryMillis());
+                    builder.field("fts_scans", figures.ftsScans());
                     builder.endObject();
                     builder.startObject("fetch");
                     builder.field("millis", figures.fetchMillis());
