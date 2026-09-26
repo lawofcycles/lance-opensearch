@@ -64,6 +64,14 @@ public final class LanceHitsAccounting implements Releasable {
      * request ends, so a request counts once however many paths it runs.
      */
     private final AtomicBoolean admitted = new AtomicBoolean();
+    /**
+     * Lance full text scans issued under this request: every scan a
+     * {@link LanceFtsQuery} Weight created against the request's
+     * searcher ran, and every count only scan the executor ran for
+     * {@code hits.total}. Reported per node under {@code profile.lance}
+     * as {@code query.fts_scans}.
+     */
+    private final AtomicLong ftsScans = new AtomicLong();
 
     public LanceHitsAccounting(CircuitBreaker breaker) {
         this.breaker = Objects.requireNonNull(breaker, "breaker must not be null");
@@ -116,6 +124,16 @@ public final class LanceHitsAccounting implements Releasable {
     /** Bytes currently reserved through this instance and not yet released. */
     public long reservedBytes() {
         return reserved.get();
+    }
+
+    /** Record one Lance full text scan of this request (a hits scan or a count only scan). */
+    public void ftsScanIssued() {
+        ftsScans.incrementAndGet();
+    }
+
+    /** Lance full text scans issued under this request so far. */
+    public long ftsScans() {
+        return ftsScans.get();
     }
 
     /**
