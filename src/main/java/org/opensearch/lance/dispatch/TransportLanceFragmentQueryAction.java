@@ -663,6 +663,16 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper = resolveReaderWrapper(indexService);
         boolean hasSecurityWrapper = readerWrapper != null;
 
+        // The scans of this request that run per fragment or per leaf
+        // (the column loads of the reader, the row takes behind the
+        // page) run in up to lance.fragment_path.parallelism groups on
+        // the index_searcher pool under the request's cancellation.
+        FragmentGroupScan groupScan = new FragmentGroupScan(
+            intraRequestExecutor,
+            clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_PARALLELISM_SETTING),
+            cancellation
+        );
+
         // The reader's leaves are views over the snapshot: no dataset
         // open, no schema pass. Numeric and boolean columns come from
         // the node's off-heap column store when the snapshot is cached;
@@ -695,7 +705,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // the scalar filter.
                 planned.scalarFilterSql(),
                 readerWrapper,
-                cancellation,
+                groupScan,
                 takes,
                 // The row take behind the page reads only the columns
                 // the body renders: the _source filter's, the fields'
@@ -1071,7 +1081,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     fetchPhase,
                     searcher.getIndexReader(),
                     page.scoreDocs(),
-                    sortAndFormats
+                    sortAndFormats,
+                    groupScan
                 );
                 long fetchEnd = System.nanoTime();
                 LanceFragmentQueryResponse.Profile profile = new LanceFragmentQueryResponse.Profile(
@@ -1829,22 +1840,16 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         List<Integer> effectiveFragmentIds,
         String filterSql,
         CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper,
-        LanceCancellation cancellation,
+        FragmentGroupScan groupScan,
         FetchTakeStats.Accumulator takes,
         LanceFragmentSchema.TakeProjection takeProjection
     ) throws IOException {
         // Column loads of this reader (the store's and the heap
-        // fallback's) scan the node's fragments in up to
-        // lance.fragment_path.parallelism groups on the index_searcher
-        // pool, so a column is read into its arrays on several cores.
-        // The scan carries the request's cancellation so every group,
-        // on whichever thread it runs, stops at its next batch once
-        // the task is cancelled.
-        FragmentGroupScan groupScan = new FragmentGroupScan(
-            intraRequestExecutor,
-            clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_PARALLELISM_SETTING),
-            cancellation
-        );
+        // fallback's) scan the node's fragments in the groups of
+        // groupScan, so a column is read into its arrays on several
+        // cores. The scan carries the request's cancellation so every
+        // group, on whichever thread it runs, stops at its next batch
+        // once the task is cancelled.
         DirectoryReader lanceReader = LanceDirectoryReader.openForSnapshot(
             new ByteBuffersDirectory(),
             snapshot,
