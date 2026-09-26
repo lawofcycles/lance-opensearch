@@ -124,6 +124,9 @@ wire types a stock shard would, so the coordinator's reduce cannot tell which ro
 
 Storage stays entirely on the Lance side: the table lives in an object store or on a filesystem,
 and per-table credentials travel with the registration so one cluster addresses many buckets.
+The caches the plugin holds are all in memory (the table snapshots, the column store, the Lance
+Session cache); there is no disk tier, so a table in an object store is read from it on every
+request that misses those caches.
 
 ## Directory layout
 
