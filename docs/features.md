@@ -590,6 +590,7 @@ Test settings, all node scope and dynamic; do not change them on a real node:
   ```
 
 - Keys follow Lance's Rust `object_store` naming. Values ride into `index.lance.storage_options.<key>` settings so the same JVM can address multiple buckets with different credentials concurrently.
+- The credential keys are withheld from the settings and cluster state APIs, and a snapshot of the index still carries them; see [limitations.md](limitations.md#storage-and-credentials) before writing keys into the map.
 - Empty map falls back to Lance's env-var lookup (`AWS_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `AWS_ALLOW_HTTP`).
 
 ## Mapping type coverage
