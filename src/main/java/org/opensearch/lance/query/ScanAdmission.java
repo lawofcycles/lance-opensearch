@@ -141,7 +141,7 @@ public final class ScanAdmission {
     /**
      * The gated paths. The key is the one the 429 message, the stats
      * block ({@code admission.rejections.<key>}, {@code admission.last_kind})
-     * and the changelog use.
+     * and {@code docs/admission.md} use.
      */
     public enum Kind {
         /** A full text scan over an inverted index (the document set rebuild, the row addresses of its SQL prefilter, plus the hits scan buffers). */
