@@ -5,15 +5,29 @@
 package org.opensearch.lance.query;
 
 import java.io.IOException;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.lance.Dataset;
+import org.lance.ipc.FullTextQuery;
+import org.lance.ipc.LanceScanner;
+import org.lance.ipc.ScanOptions;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.OpenSearchException;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.lance.LanceTableFactory;
+import org.opensearch.lance.engine.LanceIndexBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.transport.RemoteTransportException;
 
+@ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class LanceInvalidInputTests extends OpenSearchTestCase {
 
     private static final String LANCE_MESSAGE =
@@ -89,6 +103,81 @@ public class LanceInvalidInputTests extends OpenSearchTestCase {
 
     public void testUnwrapRejectsNull() {
         expectThrows(NullPointerException.class, () -> LanceInvalidInput.unwrap(null));
+    }
+
+    /**
+     * The criterion depends on two conventions of the bundled Lance SDK:
+     * the display prefix of {@code Error::InvalidInput} and the package
+     * its native methods live in. Both are checked here against
+     * exceptions the SDK really raises, so an SDK upgrade that renames
+     * either fails this test instead of turning the client's 400 into a
+     * 500. The two samples are the invalid inputs the documentation
+     * names: a phrase query on an inverted index built without
+     * positions, and an index build with a tokenizer Lance does not know.
+     */
+    public void testBundledSdkRaisesInvalidInputTheCriterionRecognises() throws Exception {
+        Path dir = createTempDir();
+        String uri = LanceTableFactory.writeEnglishTextTable(dir, "invalid-input-pin");
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            Dataset dataset = Dataset.open().allocator(allocator).uri(uri).build()
+        ) {
+            LanceIndexBuilder.BuildResult unknownTokenizer = LanceIndexBuilder.ensureFtsIndexes(
+                dataset,
+                Set.of("body"),
+                Long.MAX_VALUE,
+                Optional.empty(),
+                "no-such-tokenizer",
+                false
+            );
+            assertEquals("the unknown tokenizer fails the build: " + unknownTokenizer.built(), 1, unknownTokenizer.failed().size());
+            LanceIndexBuilder.Failed failed = unknownTokenizer.failed().get(0);
+            assertTrue("Lance's refusal of the tokenizer is invalid input: " + failed, failed.invalidInput());
+            assertTrue("Lance's message names the tokenizer: " + failed.reason(), failed.reason().contains("no-such-tokenizer"));
+
+            LanceIndexBuilder.BuildResult built = LanceIndexBuilder.ensureFtsIndexes(
+                dataset,
+                Set.of("body"),
+                Long.MAX_VALUE,
+                Optional.empty(),
+                LanceIndexBuilder.DEFAULT_FTS_TOKENIZER,
+                /* withPosition */ false
+            );
+            assertEquals("fts build failures: " + built.failed(), 0, built.failed().size());
+
+            ScanOptions phrase = new ScanOptions.Builder().fullTextQuery(FullTextQuery.phrase("the quick", "body", 0))
+                .columns(List.of("_score"))
+                .withRowAddress(true)
+                .build();
+            Exception raised = expectThrows(Exception.class, () -> {
+                try (LanceScanner scanner = dataset.newScan(phrase); ArrowReader reader = scanner.scanBatches()) {
+                    while (reader.loadNextBatch()) {
+                        // Drain: the refusal may surface on the first batch.
+                    }
+                }
+            });
+            assertTrue(
+                "Lance refuses the phrase query as IllegalArgumentException, saw " + raised,
+                raised instanceof IllegalArgumentException
+            );
+            assertTrue("the criterion accepts the SDK's exception: " + raised, LanceInvalidInput.isInvalidInput(raised));
+            assertTrue(
+                "the message opens with the InvalidInput display prefix ["
+                    + LanceInvalidInput.INVALID_INPUT_PREFIX
+                    + "]: "
+                    + raised.getMessage(),
+                raised.getMessage().startsWith(LanceInvalidInput.INVALID_INPUT_PREFIX)
+            );
+            assertTrue(
+                "the message is the positions refusal: " + raised.getMessage(),
+                raised.getMessage().contains("position is not found but required for phrase queries")
+            );
+            StackTraceElement top = raised.getStackTrace()[0];
+            assertTrue(
+                "the frame that threw is a method of the SDK package [" + LanceInvalidInput.LANCE_PACKAGE + "]: " + top,
+                top.getClassName().startsWith(LanceInvalidInput.LANCE_PACKAGE)
+            );
+        }
     }
 
     /**

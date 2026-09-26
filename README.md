@@ -52,6 +52,7 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' -H 'Content-Type: ap
 - How the plugin is put together: [docs/architecture.md](docs/architecture.md).
 - What the plugin zip bundles and why: [docs/dependencies.md](docs/dependencies.md).
 - Wire format and rolling upgrades: [docs/design/wire-format-compat.md](docs/design/wire-format-compat.md).
+- How Lance's errors become HTTP statuses: [docs/design/lance-error-mapping.md](docs/design/lance-error-mapping.md).
 - How tables surfaced from a namespace stay fresh: [docs/design/namespace-freshness.md](docs/design/namespace-freshness.md).
 
 ## Contributing
