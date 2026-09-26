@@ -21,6 +21,7 @@ import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceTextAnalyzerBackfill;
+import org.opensearch.lance.engine.LanceIndexBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -495,6 +496,50 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
                 derivation.notes().stream().anyMatch(note -> note.contains("text_analyzer override pending"))
             );
             assertTrue("overrides JSON must persist: " + derivation.overridesJson(), derivation.overridesJson().contains("text_analyzer"));
+        }
+    }
+
+    public void testTextAnalyzerStaysPendingUntilTheDerivedColumnIsIndexed() throws Exception {
+        // The backfill commits the derived column first and its
+        // inverted index second. Between the two commits the column
+        // exists but a match on it would be a flat scan, so the
+        // derivation keeps the base column on its default mapping and
+        // says why; the index commit flips it.
+        String uri = englishTextTable();
+        LanceOverrides overrides = overrides(Map.of("body", Map.of("type", "text_analyzer", "analyzer", "english")));
+        LanceTableFactory.addColumnFromSql(uri, "body__lance_tokens", "lower(body)");
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            RestAttachAction.Derivation pending = RestAttachAction.derive(dataset, overrides);
+            String mapping = pending.mappingJson();
+            assertTrue("body must stay on its default mapping: " + mapping, mapping.contains("\"body\":{\"type\":\"keyword\""));
+            assertFalse("no tokens_column before the index commit: " + mapping, mapping.contains("tokens_column"));
+            assertFalse("derived column must not surface: " + mapping, mapping.contains("\"body__lance_tokens\":{"));
+            assertTrue(
+                "expected a pending note naming the missing index, saw: " + pending.notes(),
+                pending.notes()
+                    .stream()
+                    .anyMatch(note -> note.contains("text_analyzer override pending") && note.contains("no inverted index"))
+            );
+            assertTrue(
+                "derived column stays an FTS build target: " + pending.ftsColumns(),
+                pending.ftsColumns().contains("body__lance_tokens")
+            );
+
+            LanceIndexBuilder.BuildResult build = LanceIndexBuilder.ensureVerbatimWhitespaceFtsIndexes(
+                dataset,
+                Set.of("body__lance_tokens")
+            );
+            assertTrue("index build must succeed: " + build.failed(), build.failed().isEmpty());
+            RestAttachAction.Derivation flipped = RestAttachAction.derive(dataset, overrides);
+            String flippedMapping = flipped.mappingJson();
+            assertTrue(
+                "body must map as lance_text with tokens_column once the index exists: " + flippedMapping,
+                flippedMapping.contains("\"body\":{\"type\":\"lance_text\",\"tokens_column\":\"body__lance_tokens\"")
+            );
+            assertFalse(
+                "no pending note once the index exists: " + flipped.notes(),
+                flipped.notes().stream().anyMatch(note -> note.contains("text_analyzer override pending"))
+            );
         }
     }
 
