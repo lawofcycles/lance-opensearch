@@ -7,8 +7,11 @@ package org.opensearch.lance;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -36,6 +39,7 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.StructVector;
+import org.apache.arrow.vector.ipc.ArrowFileWriter;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
@@ -45,13 +49,19 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.lance.Dataset;
+import org.lance.Fragment;
+import org.lance.FragmentMetadata;
+import org.lance.SourcedTransaction;
 import org.lance.WriteParams;
+import org.lance.fragment.DeletionFile;
+import org.lance.fragment.DeletionFileType;
 import org.lance.index.DistanceType;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.index.vector.VectorIndexParams;
+import org.lance.operation.Delete;
 import org.lance.schema.ColumnAlteration;
 import org.lance.schema.SqlExpressions;
 
@@ -207,6 +217,145 @@ public final class LanceTableFactory {
             }
         }
         return uri;
+    }
+
+    /**
+     * Attempts to write the table of {@link #writeMultiFragmentTable} plus
+     * a trailing fragment that holds no live row. {@code rowCount} must be
+     * a multiple of {@code maxRowsPerFile}; a {@code rowCount} of 12 with
+     * {@code maxRowsPerFile} 4 writes fragments 0, 1 and 2 holding rows
+     * 0..3, 4..7 and 8..11 exactly as {@link #writeMultiFragmentTable}
+     * does, and fragment 3 with {@code maxRowsPerFile} physical rows, then
+     * deletes every row of fragment 3 while keeping it in the manifest.
+     *
+     * <p>Lance 12.0.0 does not let a manifest hold such a fragment, so
+     * this fixture throws {@link IllegalStateException} after the commit.
+     * A fragment of {@code physicalRows == 0} cannot be written: the
+     * fragment writer answers a zero row batch with "Input data was
+     * empty.", and a fragment with no data file cannot be scanned. A
+     * fragment whose deletion file covers every row cannot be committed
+     * either: {@code Dataset.delete} and {@code Fragment.deleteRows} drop
+     * a fragment whose last live row goes instead of writing a full
+     * deletion file, and the commit step of every transaction
+     * ({@code migrate_manifest} in {@code rust/lance/src/io/commit.rs})
+     * removes any fragment whose live row count is zero from the manifest
+     * it writes, Lance's June 2025 fix "prevent and handle empty
+     * fragments". This
+     * fixture takes the second route by hand, writing the Arrow deletion
+     * file Lance reads under {@code _deletions/} and committing a
+     * {@code Delete} transaction whose updated fragment metadata names it;
+     * the manifest Lance writes for that transaction has three fragments,
+     * not four.
+     *
+     * <p>Kept as the record of what was tried; a caller that needs the
+     * state has to wait for a Lance release that keeps empty fragments, or
+     * a table written by a Lance older than June 2025.
+     */
+    public static String writeMultiFragmentTableWithEmptyFragment(Path parent, String name, int rowCount, int maxRowsPerFile)
+        throws Exception {
+        if (maxRowsPerFile <= 0) {
+            throw new IllegalArgumentException("maxRowsPerFile must be positive, was " + maxRowsPerFile);
+        }
+        if (rowCount % maxRowsPerFile != 0) {
+            throw new IllegalArgumentException("rowCount " + rowCount + " must be a multiple of maxRowsPerFile " + maxRowsPerFile);
+        }
+        return withLocaleRoot(() -> {
+            // One more fragment's worth of rows, written in the same
+            // CREATE so the FTS indexes cover the fragment about to be
+            // emptied, as they would a fragment emptied after indexing.
+            String uri = writeTableOnce(parent, name, rowCount + maxRowsPerFile, maxRowsPerFile);
+            emptyLastFragment(parent.resolve(name + ".lance"), uri);
+            return uri;
+        });
+    }
+
+    /**
+     * Delete every row of the table's last fragment while keeping the
+     * fragment in the manifest: write an Arrow deletion file listing all of
+     * its row offsets and commit a {@code Delete} transaction that attaches
+     * the file to the fragment's metadata.
+     */
+    private static void emptyLastFragment(Path tablePath, String uri) throws Exception {
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            Dataset dataset = Dataset.open().allocator(allocator).uri(uri).build()
+        ) {
+            List<Fragment> fragments = dataset.getFragments();
+            FragmentMetadata last = fragments.get(fragments.size() - 1).metadata();
+            int physicalRows = Math.toIntExact(last.getPhysicalRows());
+            long readVersion = dataset.version();
+            // Lance draws the file id at random; any value distinct per
+            // fragment and version works, and the fixture writes one file.
+            DeletionFile deletionFile = new DeletionFile(1L, readVersion, (long) physicalRows, DeletionFileType.ARRAY, null);
+            Path deletionPath = tablePath.resolve(deletionFile.getRelativePath(last.getId()));
+            Files.createDirectories(deletionPath.getParent());
+            writeArrowDeletionFile(allocator, deletionPath, physicalRows);
+
+            FragmentMetadata emptied = new FragmentMetadata(
+                last.getId(),
+                last.getFiles(),
+                last.getPhysicalRows(),
+                deletionFile,
+                last.getRowIdMeta(),
+                last.getCreatedAtVersionMeta(),
+                last.getLastUpdatedAtVersionMeta()
+            );
+            Delete delete = Delete.builder()
+                .updatedFragments(Collections.singletonList(emptied))
+                .deletedFragmentIds(Collections.emptyList())
+                .predicate(PRIMARY_KEY + " >= " + (rowCount(fragments) - physicalRows))
+                .build();
+            try (
+                SourcedTransaction transaction = dataset.newTransactionBuilder().readVersion(readVersion).operation(delete).build();
+                Dataset committed = transaction.commit()
+            ) {
+                List<Fragment> after = committed.getFragments();
+                Fragment trailing = after.get(after.size() - 1);
+                if (after.size() != fragments.size() || trailing.getId() != last.getId() || trailing.countRows() != 0) {
+                    throw new IllegalStateException(
+                        "expected fragment " + last.getId() + " to stay in the manifest with no live row, got " + after
+                    );
+                }
+            }
+        }
+    }
+
+    /** Physical rows over {@code fragments}, which before any deletion is the table's row count. */
+    private static long rowCount(List<Fragment> fragments) {
+        long rows = 0L;
+        for (Fragment fragment : fragments) {
+            rows += fragment.metadata().getPhysicalRows();
+        }
+        return rows;
+    }
+
+    /**
+     * The deletion file format Lance reads for
+     * {@code DeletionFileType.ARRAY}: an Arrow IPC file holding one batch
+     * of a single non nullable {@code row_id: uint32} column, one value per
+     * deleted row offset. Written here for offsets {@code 0..rows-1}.
+     */
+    private static void writeArrowDeletionFile(RootAllocator allocator, Path path, int rows) throws Exception {
+        Schema schema = new Schema(
+            Collections.singletonList(new Field("row_id", FieldType.notNullable(new ArrowType.Int(32, false)), null))
+        );
+        try (
+            VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+            WritableByteChannel channel = Files.newByteChannel(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+        ) {
+            UInt4Vector rowIds = (UInt4Vector) root.getVector("row_id");
+            rowIds.allocateNew(rows);
+            for (int offset = 0; offset < rows; offset++) {
+                rowIds.set(offset, offset);
+            }
+            rowIds.setValueCount(rows);
+            root.setRowCount(rows);
+            try (ArrowFileWriter writer = new ArrowFileWriter(root, null, channel)) {
+                writer.start();
+                writer.writeBatch();
+                writer.end();
+            }
+        }
     }
 
     /**
