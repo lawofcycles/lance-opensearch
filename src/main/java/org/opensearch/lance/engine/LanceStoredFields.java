@@ -48,6 +48,7 @@ import org.opensearch.index.mapper.Uid;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceFragmentSchema.ColumnKind;
 import org.opensearch.lance.engine.LanceFragmentSchema.NumericPrecision;
+import org.opensearch.lance.engine.LanceFragmentSchema.TakeProjection;
 
 /**
  * The stored fields path of one {@link LanceFragmentLeafReader}:
@@ -59,9 +60,12 @@ import org.opensearch.lance.engine.LanceFragmentSchema.NumericPrecision;
  * {@link #materialiseStoredFields}: {@code _id} from the declared
  * primary key column or a synthesised {@code "<fragment>-<offset>"},
  * {@code _source} as JSON in schema order through
- * {@link XContentBuilder}. The take projects only the surfaced columns
- * plus the primary key, so the cost of a page is proportional to
- * {@code size}, not to the fragment's row count. Every take scan is
+ * {@link XContentBuilder}. The take projects only the columns the
+ * request renders ({@link LanceFragmentSchema.TakeProjection}: the
+ * surfaced columns its {@code _source} filter and {@code fields} keep,
+ * plus the primary key for {@code _id}), so the cost of a page is
+ * proportional to {@code size} and to the columns asked for, not to
+ * the fragment's row count or the table's width. Every take scan is
  * counted and timed in {@link FetchTakeStats}.
  *
  * <p>Owns the request scoped rows taken so far and the decoding of
@@ -108,7 +112,7 @@ final class LanceStoredFields extends StoredFields {
     /**
      * Rows fetched by {@link #prefetchRows} keyed by doc id (physical
      * row offset within the fragment). Each entry holds the decoded
-     * values of {@link #takeColumns} in that order; {@link #MISSING_ROW}
+     * values of the {@link #projection}'s columns in that order; {@link #MISSING_ROW}
      * marks a doc id the take scan did not return (deleted between the
      * scan that produced the doc id and the fetch, which should not
      * happen because the reader pins one Dataset version, but is
@@ -133,20 +137,15 @@ final class LanceStoredFields extends StoredFields {
      */
     static final int TAKE_CHUNK = 4096;
     /**
-     * Column names the row take projects, in {@code _source} emission
-     * order. The first {@link #sourceColumnCount} entries are the
-     * surfaced columns from {@link #columnKind} (schema order); when
-     * the primary key column is not itself surfaced (its Arrow type is
-     * one {@link #classify} declines) it is appended after them so
-     * {@code _id} can still be rendered.
+     * Columns the row take projects for the request this leaf serves,
+     * in {@code _source} emission order; see
+     * {@link LanceFragmentSchema.TakeProjection}. Starts as the schema's
+     * full take (every surfaced column plus the primary key) and is
+     * narrowed by {@link #setTakeProjection} to what the request
+     * renders. Volatile because the executor sets it on the request
+     * thread and the takes run on the search pool.
      */
-    private final List<String> takeColumns;
-    private final int sourceColumnCount;
-    /**
-     * Index of the primary key column inside {@link #takeColumns}, or
-     * {@code -1} when {@link #pkType} is {@code NONE}.
-     */
-    private final int pkTakeIndex;
+    private volatile TakeProjection projection;
     /**
      * Top-level Struct column names with at least one surfaced child.
      * The row take projects the whole struct under the parent name;
@@ -179,9 +178,25 @@ final class LanceStoredFields extends StoredFields {
         this.columnKind = schema.columnKind();
         this.numericPrecision = schema.numericPrecision();
         this.geoPointColumns = schema.geoPointColumns();
-        this.sourceColumnCount = schema.sourceColumnCount();
-        this.pkTakeIndex = schema.pkTakeIndex();
-        this.takeColumns = schema.takeColumns();
+        this.projection = schema.takeProjection();
+    }
+
+    /**
+     * Narrow the row take to the columns the request renders; see
+     * {@link LanceFragmentSchema#takeProjection(boolean, List, List, List)}.
+     * Called by the fragment executor on the leaves it opens for one
+     * request before any row is taken; rows taken under an earlier
+     * projection are dropped, because their cells follow that
+     * projection's column order.
+     */
+    void setTakeProjection(TakeProjection projection) {
+        this.projection = projection;
+        takenRows.clear();
+    }
+
+    /** The columns the next row take projects; for tests. */
+    TakeProjection takeProjection() {
+        return projection;
     }
 
     @Override
@@ -233,11 +248,17 @@ final class LanceStoredFields extends StoredFields {
         if (addresses.isEmpty()) {
             return;
         }
+        // One projection per take: the executor sets it before the
+        // request's first take, so every row of this request follows
+        // the same column order as the rendering reads it back with.
+        TakeProjection projection = this.projection;
+        List<String> takeColumns = projection.columns();
         if (takeColumns.isEmpty()) {
-            // Nothing to project (PK-less table whose columns are all
-            // unsurfaced): every row renders as a synthesised _id and
-            // an empty _source, so there is no reason to call into
-            // Lance.
+            // Nothing to project (a PK-less table whose columns are all
+            // unsurfaced, or a request that renders neither _id from a
+            // key column nor any _source column): every row renders as
+            // a synthesised _id and an empty _source, so there is no
+            // reason to call into Lance.
             for (int docId : requested) {
                 takenRows.putIfAbsent(docId, new Object[0]);
             }
@@ -455,6 +476,8 @@ final class LanceStoredFields extends StoredFields {
             prefetchRows(new int[] { docID });
             row = takenRows.getOrDefault(docID, MISSING_ROW);
         }
+        TakeProjection projection = this.projection;
+        List<String> takeColumns = projection.columns();
         if (needsId) {
             // Materialise _id from whichever column the declared primary key
             // lives on, or synthesise "<fragment>-<offset>" when no PK is
@@ -468,6 +491,7 @@ final class LanceStoredFields extends StoredFields {
             // a row the take did not return also fall through to the
             // synthesised form so the row still gets a unique id rather
             // than repeating an empty string.
+            int pkTakeIndex = projection.pkTakeIndex();
             Object pk = pkTakeIndex >= 0 && pkTakeIndex < row.length ? row[pkTakeIndex] : null;
             int rowOffset = leaf.rowOf(docID);
             String idString = switch (pkType) {
@@ -494,13 +518,14 @@ final class LanceStoredFields extends StoredFields {
             // Dashboards) rejected it.
             //
             // Column iteration follows the schema pass order captured in
-            // takeColumns (the leading sourceColumnCount entries mirror
-            // columnKind), so _source keys land in the same order every
-            // time. Values come from the per-hit take; no whole-column
-            // load happens here.
+            // the projection's columns (the leading sourceColumnCount
+            // entries are the surfaced columns the request renders), so
+            // _source keys land in the same order every time. Values
+            // come from the per-hit take; no whole-column load happens
+            // here.
             try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
                 builder.startObject();
-                int limit = Math.min(sourceColumnCount, row.length);
+                int limit = Math.min(projection.sourceColumnCount(), row.length);
                 for (int c = 0; c < limit; c++) {
                     Object value = row[c];
                     if (value == null) {

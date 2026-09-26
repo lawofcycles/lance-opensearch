@@ -75,6 +75,7 @@ import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
+import org.opensearch.lance.engine.LanceFragmentSchema;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
@@ -695,7 +696,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 planned.scalarFilterSql(),
                 readerWrapper,
                 cancellation,
-                takes
+                takes,
+                // The row take behind the page reads only the columns
+                // the body renders: the _source filter's, the fields'
+                // and the primary key.
+                request.projection().takeProjection(snapshot.schema())
             )
         ) {
             MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
@@ -1825,7 +1830,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         String filterSql,
         CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper,
         LanceCancellation cancellation,
-        FetchTakeStats.Accumulator takes
+        FetchTakeStats.Accumulator takes,
+        LanceFragmentSchema.TakeProjection takeProjection
     ) throws IOException {
         // Column loads of this reader (the store's and the heap
         // fallback's) scan the node's fragments in up to
@@ -1852,11 +1858,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         try {
             // The leaves are this request's own, so the take scans they
             // issue are this request's takes, attached before any
-            // wrapper hides the Lance leaf.
+            // wrapper hides the Lance leaf; the same leaves take only
+            // the columns this request renders.
             for (LeafReaderContext leaf : lanceReader.leaves()) {
                 LanceFragmentLeafReader lanceLeaf = LanceFragmentLeafReader.unwrap(leaf.reader());
                 if (lanceLeaf != null) {
                     lanceLeaf.setTakeAccumulator(takes);
+                    lanceLeaf.setTakeProjection(takeProjection);
                 }
             }
             wrapped = OpenSearchDirectoryReader.wrap(lanceReader, shardId);

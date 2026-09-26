@@ -6,6 +6,7 @@
 package org.opensearch.lance.engine;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Map;
 
 import org.apache.arrow.vector.FieldVector;
@@ -421,6 +422,23 @@ public final class LanceFragmentLeafReader extends LeafReader {
     /** The take accumulator of the request this leaf serves, or {@code null}. */
     FetchTakeStats.Accumulator takeAccumulator() {
         return takeAccumulator;
+    }
+
+    /**
+     * Narrow the row take behind this leaf's stored fields to the
+     * columns the request renders; see
+     * {@link LanceFragmentSchema#takeProjection(boolean, List, List, List)}.
+     * The fragment executor calls this on the leaves it opens for one
+     * request, before the request takes any row; a leaf of the shard
+     * engine keeps the schema's full take.
+     */
+    public void setTakeProjection(LanceFragmentSchema.TakeProjection projection) {
+        storedFields.setTakeProjection(projection);
+    }
+
+    /** The columns this leaf's next row take projects; for tests. */
+    LanceFragmentSchema.TakeProjection takeProjection() {
+        return storedFields.takeProjection();
     }
 
     /** Publish sink for {@link LanceShardColumnCache#loadBooleanColumn}; see {@link LanceColumnLoader#publishBooleanColumn}. */

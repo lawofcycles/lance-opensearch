@@ -27,6 +27,7 @@ import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.lance.Dataset;
 import org.lance.index.IndexCriteria;
+import org.opensearch.common.regex.Regex;
 import org.opensearch.index.mapper.NestedPathFieldMapper;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.lance.LanceOverrides;
@@ -818,6 +819,116 @@ public final class LanceFragmentSchema {
     /** Index of the primary key inside {@link #takeColumns()}, or -1 when there is no PK. */
     int pkTakeIndex() {
         return pkTakeIndex;
+    }
+
+    /**
+     * The columns the row take behind a page of hits projects for one
+     * request, in {@code _source} emission order: the first
+     * {@code sourceColumnCount} entries are the surfaced columns the
+     * request renders in {@code _source} (schema order), then the
+     * primary key when {@code _id} is rendered and the key is not
+     * already among them. {@code pkTakeIndex} is the key's position, or
+     * {@code -1} when no key is taken.
+     */
+    public record TakeProjection(List<String> columns, int sourceColumnCount, int pkTakeIndex) {
+        public TakeProjection {
+            columns = List.copyOf(columns);
+        }
+    }
+
+    /** The take of a request that renders {@code _id} and the whole {@code _source}: every surfaced column plus the primary key. */
+    public TakeProjection takeProjection() {
+        return new TakeProjection(takeColumns, sourceColumnCount, pkTakeIndex);
+    }
+
+    /**
+     * The take of a request that renders only part of a hit, so the
+     * take reads from storage only the columns the fetch phase turns
+     * into the response.
+     *
+     * <p>A surfaced column is taken when the {@code _source} filter
+     * keeps it or a {@code fields} pattern names it. {@code includes}
+     * {@code null} stands for a request without a {@code _source}
+     * filter (every surfaced column is kept); an empty list stands for a
+     * request whose {@code _source} is not rendered (no column is kept
+     * by the filter, only {@code fields} can add one). A pattern keeps a
+     * column when it matches the column's name, or the dotted path of a
+     * struct or nested child under it (the take projects the whole
+     * parent, the fetch phase filters the children), or a keyword
+     * sub-field of it; patterns use the {@code *} wildcard of
+     * {@code _source} and {@code fields}. An {@code excludes} pattern
+     * drops a column only when it matches the column's name itself: a
+     * child exclusion leaves the parent taken and is applied by the
+     * fetch phase. A column a {@code fields} pattern names is taken
+     * whatever the {@code _source} filter says, because the
+     * {@code fields} phase reads the unfiltered source.
+     *
+     * @param renderId  whether {@code _id} is rendered, so the primary
+     *                  key column joins the take
+     * @param includes  the {@code _source} includes, {@code null} for no
+     *                  filter, empty for no {@code _source}
+     * @param excludes  the {@code _source} excludes
+     * @param fields    the {@code fields} patterns
+     */
+    public TakeProjection takeProjection(boolean renderId, List<String> includes, List<String> excludes, List<String> fields) {
+        List<String> columns = new ArrayList<>(takeColumns.size());
+        for (int i = 0; i < sourceColumnCount; i++) {
+            String column = takeColumns.get(i);
+            boolean kept = (includes == null || matchesAny(includes, column)) && !matchesName(excludes, column);
+            if (kept || matchesAny(fields, column)) {
+                columns.add(column);
+            }
+        }
+        int sourceCount = columns.size();
+        int pkIndex = -1;
+        if (renderId && pkType != LancePrimaryKeyType.NONE) {
+            pkIndex = columns.indexOf(fieldName);
+            if (pkIndex < 0) {
+                columns.add(fieldName);
+                pkIndex = columns.size() - 1;
+            }
+        }
+        return new TakeProjection(columns, sourceCount, pkIndex);
+    }
+
+    /** Whether any pattern matches {@code column} itself, a surfaced dotted path under it, or a keyword sub-field of it. */
+    private boolean matchesAny(List<String> patterns, String column) {
+        if (patterns == null || patterns.isEmpty()) {
+            return false;
+        }
+        String prefix = column + ".";
+        for (String pattern : patterns) {
+            if (Regex.simpleMatch(pattern, column) || pattern.startsWith(prefix)) {
+                return true;
+            }
+            if (!Regex.isSimpleMatchPattern(pattern)) {
+                continue;
+            }
+            for (String path : columnKind.keySet()) {
+                if (path.startsWith(prefix) && Regex.simpleMatch(pattern, path)) {
+                    return true;
+                }
+            }
+            for (Map.Entry<String, String> sub : keywordSubFields.entrySet()) {
+                if (sub.getValue().equals(column) && Regex.simpleMatch(pattern, sub.getKey())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Whether any pattern matches the column's own name. */
+    private static boolean matchesName(List<String> patterns, String column) {
+        if (patterns == null) {
+            return false;
+        }
+        for (String pattern : patterns) {
+            if (Regex.simpleMatch(pattern, column)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Lucene field infos of every leaf over this schema. */
