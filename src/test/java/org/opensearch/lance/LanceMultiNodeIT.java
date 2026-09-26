@@ -2823,6 +2823,131 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    /**
+     * Every data node collects the planner's table statistics of an
+     * attached table, not only the node that holds its shard, so a
+     * request coordinated by any of the other nodes is planned with them
+     * from the first one. The index warm-up is switched off for the
+     * test: the snapshot it builds on every node would start the same
+     * collection and hide the trigger under test, and it is off in the
+     * deployments where the first request on the other nodes was seen
+     * planning without statistics.
+     */
+    public void testEveryDataNodeCollectsTheStatisticsAfterAttach() throws Exception {
+        String suffix = "mn-stats-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            updateClusterSetting("lance.attach.warm_indexes", "none");
+            assertEquals("fixture assumes every node coordinates and executes", 3, dataNodeCount());
+            // Nothing of the earlier tests is still collecting, so the
+            // counters below move for this table alone.
+            assertBusy(() -> {
+                for (Map.Entry<String, Map<String, Long>> node : planStatisticsByNode().entrySet()) {
+                    assertEquals("nothing pending on " + node.getKey(), 0L, node.getValue().get("pending").longValue());
+                }
+            }, 60, TimeUnit.SECONDS);
+            Map<String, Map<String, Long>> before = planStatisticsByNode();
+
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=30s"));
+            String holder = readAll(client().performRequest(new Request("GET", "/_cat/shards/" + indexName + "?h=node"))).trim();
+            assertFalse("_cat/shards names the node holding the shard", holder.isEmpty());
+
+            // Every node collected once, the holder included: the collect
+            // time is a counter that grows with every collection.
+            assertBusy(() -> {
+                Map<String, Map<String, Long>> now = planStatisticsByNode();
+                for (Map.Entry<String, Map<String, Long>> node : now.entrySet()) {
+                    Map<String, Long> was = before.get(node.getKey());
+                    assertNotNull("node " + node.getKey() + " was there before the attach: " + before, was);
+                    assertTrue(
+                        "node " + node.getKey() + " collected the statistics: before " + was + ", now " + node.getValue(),
+                        node.getValue().get("collect_millis_total") > was.get("collect_millis_total")
+                    );
+                    assertEquals("nothing pending on " + node.getKey() + ": " + now, 0L, node.getValue().get("pending").longValue());
+                }
+            }, 60, TimeUnit.SECONDS);
+            Map<String, Map<String, Long>> collected = planStatisticsByNode();
+            for (Map.Entry<String, Map<String, Long>> node : collected.entrySet()) {
+                assertEquals(
+                    "no plan was made without statistics on " + node.getKey() + ": " + collected,
+                    before.get(node.getKey()).get("planned_without"),
+                    node.getValue().get("planned_without")
+                );
+            }
+
+            // A request coordinated by a node that does not hold the
+            // shard is planned with the statistics: its counter of plans
+            // made without them stands still.
+            HttpHost otherHost = null;
+            String otherName = null;
+            for (HttpHost candidate : getClusterHosts()) {
+                try (RestClient probe = buildClient(restClientSettings(), new HttpHost[] { candidate })) {
+                    String name = localNodeName(probe);
+                    if (!name.equals(holder)) {
+                        otherHost = candidate;
+                        otherName = name;
+                        break;
+                    }
+                }
+            }
+            assertNotNull("a node other than the holder [" + holder + "] among " + getClusterHosts(), otherHost);
+            String body = "{\"size\":0,\"track_total_hits\":true,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+            try (RestClient other = buildClient(restClientSettings(), new HttpHost[] { otherHost })) {
+                String response = readAll(post(other, "/" + indexName + "/_search?request_cache=false", body));
+                assertEquals(6, extractIntPath(response, "hits", "total", "value"));
+                assertEquals("sum(0..5): " + response, 15, extractIntPath(response, "aggregations", "s", "value"));
+            }
+            Map<String, Map<String, Long>> after = planStatisticsByNode();
+            assertEquals(
+                "the coordinator [" + otherName + "] planned with the statistics: " + after,
+                collected.get(otherName).get("planned_without"),
+                after.get(otherName).get("planned_without")
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+            try {
+                updateClusterSetting("lance.attach.warm_indexes", null);
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** The {@code plan.statistics} counters of every node in {@code GET /_lance/stats}, keyed by node name. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Map<String, Long>> planStatisticsByNode() throws IOException {
+        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
+        Map<String, Map<String, Long>> byNode = new HashMap<>();
+        for (Object value : nodes.values()) {
+            Map<String, Object> node = (Map<String, Object>) value;
+            Map<String, Object> plan = (Map<String, Object>) node.get("plan");
+            Map<String, Object> statistics = (Map<String, Object>) plan.get("statistics");
+            Map<String, Long> counters = new HashMap<>();
+            for (Map.Entry<String, Object> counter : statistics.entrySet()) {
+                counters.put(counter.getKey(), ((Number) counter.getValue()).longValue());
+            }
+            byNode.put((String) node.get("name"), counters);
+        }
+        return byNode;
+    }
+
+    /** The name of the node {@code client} talks to. */
+    @SuppressWarnings("unchecked")
+    private static String localNodeName(RestClient client) throws IOException {
+        Map<String, Object> parsed = parse(readAll(client.performRequest(new Request("GET", "/_nodes/_local/http"))));
+        Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
+        assertEquals(1, nodes.size());
+        Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();
+        return (String) node.get("name");
+    }
+
     /** The {@code fetch_cache} object of every node in {@code GET /_lance/stats}, keyed by node id. */
     @SuppressWarnings("unchecked")
     private static Map<String, Map<String, Object>> fetchCacheByNode() throws IOException {
