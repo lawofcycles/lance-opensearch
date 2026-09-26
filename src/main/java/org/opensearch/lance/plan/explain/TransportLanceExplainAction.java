@@ -23,6 +23,7 @@ import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.NativeMemoryLimit;
+import org.opensearch.lance.dispatch.LanceRequestCache;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
@@ -115,6 +116,7 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
     private final IndicesService indicesService;
     private final LanceWarmCache warmCache;
     private final LancePlannerFactory plannerFactory;
+    private final LanceRequestCache requestCache;
 
     @Inject
     public TransportLanceExplainAction(
@@ -124,13 +126,15 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
         ClusterService clusterService,
         IndicesService indicesService,
         LanceWarmCache warmCache,
-        Settings settings
+        Settings settings,
+        LanceRequestCache requestCache
     ) {
         super(LanceExplainAction.NAME, transportService, actionFilters, LanceExplainRequest::new, ThreadPool.Names.SAME);
         this.threadPool = threadPool;
         this.clusterService = clusterService;
         this.indicesService = indicesService;
         this.warmCache = warmCache;
+        this.requestCache = requestCache;
         long nativeBudgetBytes = NativeMemoryLimit.parse(
             LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.get(settings),
             LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.getKey()
@@ -192,6 +196,11 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
         String logicalText = RelOptUtil.toString(planned.logical());
         RelNode coordinatorPlan = planned.coordinatorPlan(shape, inputs.nodes());
         boolean readerWrapper = ReaderWrapperProbe.installed(indicesService, metadata.getIndex());
+        // Whether the result cache would serve a search with this body:
+        // the cache setting, the body's shape and the wrapper prediction
+        // above; the search's own request_cache flag and a multi index
+        // target are not visible here.
+        LanceRequestCache.Skip cacheSkip = requestCache.explainSkip(source, readerWrapper);
         return LanceExplainResponse.fragment(
             indexName,
             logicalText,
@@ -199,7 +208,8 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
             planned.plan(),
             planned.unplanned(),
             ExplainRefinements.predict(planned.plan(), readerWrapper, overrides.ipColumns()),
-            LanceExplainResponse.Traits.of(planned.enforcement(), coordinatorPlan.getTraitSet())
+            LanceExplainResponse.Traits.of(planned.enforcement(), coordinatorPlan.getTraitSet()),
+            cacheSkip == null ? LanceExplainResponse.Cacheability.YES : LanceExplainResponse.Cacheability.no(cacheSkip.reason())
         );
     }
 

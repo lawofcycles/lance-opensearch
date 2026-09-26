@@ -52,6 +52,15 @@ public class LanceStatsIT extends LanceRestTestCase {
             long limitBytes = ((Number) columnStore(afterSurface).get("limit_bytes")).longValue();
             assertTrue("column store limit must be positive, saw " + limitBytes, limitBytes > 0L);
             assertEquals(1_000_000, fts(afterSurface).get("subset_probe_limit"));
+            Map<String, Object> requestCache = requestCache(afterSurface);
+            assertEquals(true, requestCache.get("enabled"));
+            assertTrue(
+                "result cache limit must be positive, saw " + requestCache,
+                ((Number) requestCache.get("limit_bytes")).longValue() > 0L
+            );
+            for (String counter : List.of("size_bytes", "entries", "hits", "misses", "evictions", "invalidations", "skipped")) {
+                assertTrue("request_cache." + counter + ": " + requestCache, requestCache.containsKey(counter));
+            }
             Map<String, Object> nativeMemory = nativeMemory(afterSurface);
             assertTrue(nativeMemory.containsKey("estimated_bytes"));
             assertTrue(nativeMemory.containsKey("session_bytes"));
@@ -75,9 +84,10 @@ public class LanceStatsIT extends LanceRestTestCase {
 
             // Fragment path: a sum over rating loads the column into the
             // store; the request finds the engine's snapshot instead of
-            // building its own.
+            // building its own. The result cache is opted out of so the
+            // second request below reads the store instead of the cache.
             String sum = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}";
-            String first = readAll(postJson("/" + index + "/_search", sum));
+            String first = readAll(postJson("/" + index + "/_search?request_cache=false", sum));
             assertEquals(200, extractIntPath(first, "hits", "total", "value"));
             Map<String, Object> afterFirst = nodeStats();
             assertEquals("GET, _stats and _search share the engine's snapshot", 1, snapshots(afterFirst).get("count"));
@@ -94,7 +104,7 @@ public class LanceStatsIT extends LanceRestTestCase {
             assertTrue("bytes " + bytesAfterFirst + " within limit " + limitBytes, bytesAfterFirst > 0L && bytesAfterFirst <= limitBytes);
 
             // The same request again reads rating from the store.
-            String second = readAll(postJson("/" + index + "/_search", sum));
+            String second = readAll(postJson("/" + index + "/_search?request_cache=false", sum));
             assertEquals(
                 extractDoublePath(first, "aggregations", "s", "value"),
                 extractDoublePath(second, "aggregations", "s", "value"),
@@ -332,6 +342,11 @@ public class LanceStatsIT extends LanceRestTestCase {
     @SuppressWarnings("unchecked")
     private static Map<String, Object> columnStore(Map<String, Object> node) {
         return (Map<String, Object>) node.get("column_store");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> requestCache(Map<String, Object> node) {
+        return (Map<String, Object>) node.get("request_cache");
     }
 
     @SuppressWarnings("unchecked")

@@ -71,10 +71,21 @@ import java.util.Objects;
  * {@link WireVersion}). Version 1 carried the retired shard path route
  * with a reasons list, and plan texts and traits that were always
  * present; version 2 dropped the list and made those optional for the
- * unsupported route. A reader of this version decodes a version 1
- * stream by mapping a shard path answer to an unsupported one whose
+ * unsupported route; version 3 added {@code cacheable} as a block an
+ * older reader steps over. A reader of this version decodes a version
+ * 1 stream by mapping a shard path answer to an unsupported one whose
  * message is {@link #SHARD_PATH_RETIRED}, and reads a fragment answer
- * field by field. The response travels from the node that planned the
+ * field by field.
+ *
+ * <p>{@code cacheable} says whether a {@code _search} with the body
+ * would be answered from the coordinator result cache on a repeat
+ * while the table stays at its version: {@code true}, or
+ * {@code false} with {@code cacheable_reason} naming why
+ * ({@code size > 0}, {@code from > 0}, {@code dls}, {@code disabled}).
+ * A search's {@code request_cache=false} and a target of several
+ * indexes are not visible to explain, which has one index and no
+ * request. Absent on the unsupported route and when the plan failed,
+ * where nothing runs. The response travels from the node that planned the
  * explain body to the node that received the REST call when they
  * differ.
  */
@@ -85,9 +96,9 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
      * read. Bumped when a field is added; 2 dropped the reasons list of
      * the retired fallback route and made the plan texts and the traits
      * optional for the unsupported route, the last change to the base
-     * fields the format allows.
+     * fields the format allows; 3 added the cacheability block.
      */
-    public static final int WIRE_VERSION = 2;
+    public static final int WIRE_VERSION = 3;
 
     /** The {@code unplanned} message of a shard path answer read from a version 1 stream. */
     public static final String SHARD_PATH_RETIRED =
@@ -189,6 +200,41 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         }
     }
 
+    /**
+     * Whether a search with the explained body would be served from the
+     * coordinator result cache on a repeat, and why not when it would
+     * not ({@code reason} is null when {@code cacheable} is true).
+     */
+    public record Cacheability(boolean cacheable, String reason) implements Writeable {
+
+        public Cacheability {
+            if (cacheable && reason != null) {
+                throw new IllegalArgumentException("a cacheable body has no reason");
+            }
+            if (!cacheable) {
+                Objects.requireNonNull(reason, "reason");
+            }
+        }
+
+        /** A body the cache would serve. */
+        public static final Cacheability YES = new Cacheability(true, null);
+
+        /** A body the cache would not serve, for {@code reason}. */
+        public static Cacheability no(String reason) {
+            return new Cacheability(false, reason);
+        }
+
+        public Cacheability(StreamInput in) throws IOException {
+            this(in.readBoolean(), in.readOptionalString());
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeBoolean(cacheable);
+            out.writeOptionalString(reason);
+        }
+    }
+
     private final String index;
     private final Route route;
     private final String logical;
@@ -197,6 +243,7 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
     private final String unplanned;
     private final List<FragmentPlanRefiner.Reason> refinementsPossible;
     private final Traits traits;
+    private final Cacheability cacheability;
 
     /**
      * A fragment route answer.
@@ -204,6 +251,7 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
      * @param unplanned the element the translator refused, or null
      * @param refinementsPossible the predicted node local downgrades, empty when none apply
      * @param traits the trait side of the plan
+     * @param cacheability whether the result cache would serve the body on a repeat
      */
     public static LanceExplainResponse fragment(
         String index,
@@ -212,7 +260,8 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         FragmentPlan fragmentPlan,
         String unplanned,
         List<FragmentPlanRefiner.Reason> refinementsPossible,
-        Traits traits
+        Traits traits,
+        Cacheability cacheability
     ) {
         return new LanceExplainResponse(
             index,
@@ -222,7 +271,8 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
             Objects.requireNonNull(fragmentPlan, "fragmentPlan"),
             unplanned,
             refinementsPossible,
-            Objects.requireNonNull(traits, "traits")
+            Objects.requireNonNull(traits, "traits"),
+            Objects.requireNonNull(cacheability, "cacheability")
         );
     }
 
@@ -243,7 +293,8 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
             null,
             Objects.requireNonNull(planFailed, "planFailed"),
             List.of(),
-            Objects.requireNonNull(traits, "traits")
+            Objects.requireNonNull(traits, "traits"),
+            null
         );
     }
 
@@ -261,6 +312,7 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
             null,
             Objects.requireNonNull(unplanned, "unplanned"),
             List.of(),
+            null,
             null
         );
     }
@@ -273,7 +325,8 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         FragmentPlan fragmentPlan,
         String unplanned,
         List<FragmentPlanRefiner.Reason> refinementsPossible,
-        Traits traits
+        Traits traits,
+        Cacheability cacheability
     ) {
         this.index = Objects.requireNonNull(index, "index");
         this.route = Objects.requireNonNull(route, "route");
@@ -283,6 +336,7 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         this.unplanned = unplanned;
         this.refinementsPossible = inReasonOrder(refinementsPossible);
         this.traits = traits;
+        this.cacheability = cacheability;
     }
 
     /** {@code reasons} sorted in {@link FragmentPlanRefiner.Reason} order, so the array reads the same for every caller. */
@@ -341,6 +395,9 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
             this.refinementsPossible = inReasonOrder(in.readList(input -> input.readEnum(FragmentPlanRefiner.Reason.class)));
             this.traits = in.readBoolean() ? Traits.read(in) : null;
         }
+        // Version 3: the cacheability, absent from an older writer's
+        // answer, which had no result cache to report on.
+        this.cacheability = reader.block(3, block -> block.readOptionalWriteable(Cacheability::new), null);
         reader.finish();
     }
 
@@ -358,6 +415,9 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         if (traits != null) {
             traits.writeTo(out);
         }
+        // An older reader that ignores the cacheability shows the plan
+        // without it, so the block is never critical.
+        WireVersion.writeBlock(out, false, o -> o.writeOptionalWriteable(cacheability));
     }
 
     public String index() {
@@ -402,6 +462,11 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         return traits;
     }
 
+    /** Whether the result cache would serve the body; null on the unsupported route and when the plan failed. */
+    public Cacheability cacheability() {
+        return cacheability;
+    }
+
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
         builder.startObject();
@@ -431,6 +496,12 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
             builder.field("traits");
             traits.toXContent(builder);
         }
+        if (cacheability != null) {
+            builder.field("cacheable", cacheability.cacheable());
+            if (cacheability.reason() != null) {
+                builder.field("cacheable_reason", cacheability.reason());
+            }
+        }
         return builder.endObject();
     }
 
@@ -449,11 +520,12 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
             && Objects.equals(fragmentPlan, other.fragmentPlan)
             && Objects.equals(unplanned, other.unplanned)
             && refinementsPossible.equals(other.refinementsPossible)
-            && Objects.equals(traits, other.traits);
+            && Objects.equals(traits, other.traits)
+            && Objects.equals(cacheability, other.cacheability);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(index, route, logical, physical, fragmentPlan, unplanned, refinementsPossible, traits);
+        return Objects.hash(index, route, logical, physical, fragmentPlan, unplanned, refinementsPossible, traits, cacheability);
     }
 }

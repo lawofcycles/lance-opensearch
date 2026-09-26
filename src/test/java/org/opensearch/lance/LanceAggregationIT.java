@@ -418,6 +418,8 @@ public class LanceAggregationIT extends LanceRestTestCase {
     }
 
     public void testKeywordTermsLoadsTheDictionaryOnceAndAgreesWithTheDisabledCache() throws Exception {
+        // Every search opts out of the result cache: the test reads the
+        // store's loads and hits, which a cached answer never touches.
         // terms(category) size 0 through the Lucene aggregator: the first
         // request scans the keyword column once and its dictionary enters
         // the store (loads + 1, no budget miss), the second reads the
@@ -435,14 +437,14 @@ public class LanceAggregationIT extends LanceRestTestCase {
             String terms = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"size\":10}}}}";
             Map<String, Object> before = columnStoreStats();
 
-            String first = withoutTook(readAll(postJson("/" + index + "/_search", terms)));
+            String first = withoutTook(readAll(postJson("/" + index + "/_search?request_cache=false", terms)));
             assertEquals(600, extractIntPath(first, "hits", "total", "value"));
             assertEquals(List.of("c0=150", "c1=150", "c2=150"), bucketsOf(first, "c"));
             Map<String, Object> afterFirst = columnStoreStats();
             assertEquals("one scan filled the store", number(before.get("loads")) + 1, number(afterFirst.get("loads")));
             assertEquals("the dictionary fit the budget", before.get("budget_misses"), afterFirst.get("budget_misses"));
 
-            String second = withoutTook(readAll(postJson("/" + index + "/_search", terms)));
+            String second = withoutTook(readAll(postJson("/" + index + "/_search?request_cache=false", terms)));
             assertEquals("second request differs", first, second);
             Map<String, Object> afterSecond = columnStoreStats();
             assertEquals("no load on the second request", afterFirst.get("loads"), afterSecond.get("loads"));
@@ -453,7 +455,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             disable.setJsonEntity("{\"transient\":{\"lance.cache.enabled\":false}}");
             client().performRequest(disable);
             try {
-                String uncached = withoutTook(readAll(postJson("/" + index + "/_search", terms)));
+                String uncached = withoutTook(readAll(postJson("/" + index + "/_search?request_cache=false", terms)));
                 assertEquals("uncached request differs", first, uncached);
                 Map<String, Object> afterUncached = columnStoreStats();
                 assertEquals("the per request path never touches the store", afterSecond.get("loads"), afterUncached.get("loads"));
@@ -550,6 +552,8 @@ public class LanceAggregationIT extends LanceRestTestCase {
     }
 
     public void testHeapColumnLoadIsChargedToTheRequestBreakerAndRefusedAt429() throws Exception {
+        // Every search opts out of the result cache: the test reads the
+        // breaker charge and the store, which a cached answer never touches.
         // With lance.cache.enabled false every column a request reads is
         // materialised in heap for that request, the path a column store
         // budget miss takes (lance.cache.column_share is a startup
@@ -572,7 +576,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             Map<String, Object> before = columnStoreStats();
             long rejectionsBefore = longNumber(before.get("heap_fallback_rejections"));
 
-            String first = withoutTook(readAll(postJson("/" + index + "/_search", sum)));
+            String first = withoutTook(readAll(postJson("/" + index + "/_search?request_cache=false", sum)));
             assertEquals(600, extractIntPath(first, "hits", "total", "value"));
             // 480 rows have a rating of (i * 37) % 1000.
             double expectedSum = 0d;
@@ -592,7 +596,10 @@ public class LanceAggregationIT extends LanceRestTestCase {
 
             putTransientSetting("indices.breaker.request.limit", "8kb");
             try {
-                ResponseException refused = expectThrows(ResponseException.class, () -> postJson("/" + index + "/_search", sum));
+                ResponseException refused = expectThrows(
+                    ResponseException.class,
+                    () -> postJson("/" + index + "/_search?request_cache=false", sum)
+                );
                 String body = readAll(refused.getResponse());
                 assertEquals(body, RestStatus.TOO_MANY_REQUESTS.getStatus(), refused.getResponse().getStatusLine().getStatusCode());
                 assertTrue(body, body.contains("circuit_breaking_exception"));
@@ -607,7 +614,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             }
 
             // Back at the default limit the same request answers as before.
-            String again = withoutTook(readAll(postJson("/" + index + "/_search", sum)));
+            String again = withoutTook(readAll(postJson("/" + index + "/_search?request_cache=false", sum)));
             assertEquals(first, again);
             assertEquals(rejectionsBefore + 1, longNumber(columnStoreStats().get("heap_fallback_rejections")));
 
@@ -1627,6 +1634,8 @@ public class LanceAggregationIT extends LanceRestTestCase {
      */
     @SuppressWarnings("unchecked")
     public void testPipelineAggregationsAnswerLikeTheStockSearch() throws Exception {
+        // Every search opts out of the result cache: the test counts the
+        // fan out log lines, and a cached answer fans nothing out.
         String suffix = "pipeline-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -1709,14 +1718,14 @@ public class LanceAggregationIT extends LanceRestTestCase {
             Map<String, Object> sibling = parse(
                 readAll(
                     postJson(
-                        "/" + index + "/_search",
+                        "/" + index + "/_search?request_cache=false",
                         "{\"size\":0,\"aggs\":{" + byCategory + ",\"ab\":{\"avg_bucket\":{\"buckets_path\":\"t>s\"}}}}"
                     )
                 )
             );
             requests++;
             assertEquals(92d, ((Number) aggregation(sibling, "ab").get("value")).doubleValue(), 0d);
-            Map<String, Object> selected = parse(readAll(postJson("/" + index + "/_search", "{" + shapes[7] + "}")));
+            Map<String, Object> selected = parse(readAll(postJson("/" + index + "/_search?request_cache=false", "{" + shapes[7] + "}")));
             requests++;
             List<Map<String, Object>> kept = (List<Map<String, Object>>) aggregation(selected, "t").get("buckets");
             assertEquals(2, kept.size());
@@ -1765,7 +1774,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
      * body against the target of {@link #withStockOracle}).
      */
     private static void assertSameRefusalAsStockSearch(String index, String body, int status, String reason) throws IOException {
-        ConcurrentResult fragmentPath = postForStatus("/" + index + "/_search", body);
+        ConcurrentResult fragmentPath = postForStatus("/" + index + "/_search?request_cache=false", body);
         // No partial results on the two shard oracle target: a refusal
         // raised on the data bearing shard alone would otherwise leave
         // the response at 200 next to the empty oracle shard.
@@ -1794,6 +1803,9 @@ public class LanceAggregationIT extends LanceRestTestCase {
      */
     @SuppressWarnings("unchecked")
     public void testSliceCountDoesNotChangeTheCollectorAnswers() throws Exception {
+        // Every search opts out of the result cache: the slice setting is
+        // not part of the cache key, and the test needs the executors to
+        // run the same bodies again under the other slice count.
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 400, "slices")) {
             String index = fixture.indexName();
             String[] exact = {
@@ -1833,12 +1845,15 @@ public class LanceAggregationIT extends LanceRestTestCase {
                     long before = sliceLogLines(index, detail);
                     List<String> answers = new ArrayList<>();
                     for (String shape : exact) {
-                        answers.add(withoutTook(readAll(postJson("/" + index + "/_search", shape))));
+                        answers.add(withoutTook(readAll(postJson("/" + index + "/_search?request_cache=false", shape))));
                     }
                     exactBySlices.put(slices, answers);
-                    tdigestBySlices.put(slices, parse(readAll(postJson("/" + index + "/_search", tdigest))));
-                    cardinalityBySlices.put(slices, parse(readAll(postJson("/" + index + "/_search", cardinality))));
-                    clippedBySlices.put(slices, aggregation(parse(readAll(postJson("/" + index + "/_search", clipped))), "t"));
+                    tdigestBySlices.put(slices, parse(readAll(postJson("/" + index + "/_search?request_cache=false", tdigest))));
+                    cardinalityBySlices.put(slices, parse(readAll(postJson("/" + index + "/_search?request_cache=false", cardinality))));
+                    clippedBySlices.put(
+                        slices,
+                        aggregation(parse(readAll(postJson("/" + index + "/_search?request_cache=false", clipped))), "t")
+                    );
                     int requests = exact.length + 3;
                     assertBusy(() -> assertEquals("executor lines reporting " + detail, before + requests, sliceLogLines(index, detail)));
                 }

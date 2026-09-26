@@ -334,6 +334,8 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testFirstSearchPlansWithoutStatisticsAndTheNextOneReadsThem() throws Exception {
+        // Every search opts out of the result cache: the second search
+        // must be planned again to read the statistics.
         // The coordinator plans a version's first request without the
         // table statistics and does not wait for their collection, which
         // runs in the background; the requests after it read the entry.
@@ -360,7 +362,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             // the statistics there are no zone maps to prune with, so
             // every fragment is scanned.
             long startMillis = System.currentTimeMillis();
-            String first = readAll(postJson("/" + indexName + "/_search", body));
+            String first = readAll(postJson("/" + indexName + "/_search?request_cache=false", body));
             long searchMillis = System.currentTimeMillis() - startMillis;
             assertTrue("the search did not wait for the delayed collection: " + searchMillis + " ms", searchMillis < 8_000L);
             assertEquals(150, extractIntPath(first, "hits", "total", "value"));
@@ -384,7 +386,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             // The next search reads the entry: the same answer, planned
             // with statistics (the zone maps now prune fragments 0 and 1)
             // and no further plan without them.
-            String second = readAll(postJson("/" + indexName + "/_search", body));
+            String second = readAll(postJson("/" + indexName + "/_search?request_cache=false", body));
             assertEquals(150, extractIntPath(second, "hits", "total", "value"));
             assertEquals(48675, extractIntPath(second, "aggregations", "s", "value"));
             assertEquals("two fragments pruned with the statistics", prunedBefore + 2, prunedFragments());
@@ -1076,6 +1078,9 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     public void testTrackTotalHitsAndCountRunOnFragmentPath() throws Exception {
+        // Every _search opts out of the result cache: a _count shares the
+        // entry of a size 0 search with track_total_hits true and has no
+        // opt out of its own, and the test counts the _count fan outs.
         // track_total_hits in every form, and therefore _count (which
         // sends track_total_hits: true with size 0), are answered by
         // the fragment path. The match_all count comes from Lance
@@ -1094,7 +1099,10 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String trackBoundBody = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":3}")
+                postJson(
+                    "/" + indexName + "/_search?request_cache=false",
+                    "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":3}"
+                )
             );
             assertEquals(
                 "track_total_hits:3 caps the value: " + trackBoundBody,
@@ -1104,13 +1112,19 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertTrue("track_total_hits:3 should return relation=gte: " + trackBoundBody, trackBoundBody.contains("\"relation\":\"gte\""));
 
             String trackTrueBody = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":true}")
+                postJson(
+                    "/" + indexName + "/_search?request_cache=false",
+                    "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":true}"
+                )
             );
             assertEquals(12, extractIntPath(trackTrueBody, "hits", "total", "value"));
             assertTrue("track_total_hits:true is exact: " + trackTrueBody, trackTrueBody.contains("\"relation\":\"eq\""));
 
             String trackFalseBody = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":false}")
+                postJson(
+                    "/" + indexName + "/_search?request_cache=false",
+                    "{\"size\":0,\"query\":{\"match_all\":{}},\"track_total_hits\":false}"
+                )
             );
             assertFalse("track_total_hits:false should omit hits.total: " + trackFalseBody, trackFalseBody.contains("\"total\":{"));
 
@@ -1123,35 +1137,51 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             // matches eight of the twelve rows, all in fragments 1
             // and 2.
             String filterBound = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":5}")
+                postJson(
+                    "/" + indexName + "/_search?request_cache=false",
+                    "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":5}"
+                )
             );
             assertEquals(5, extractIntPath(filterBound, "hits", "total", "value"));
             assertTrue(filterBound.contains("\"relation\":\"gte\""));
             // Bound one below the match count: the limit of eight
             // fills exactly, which still means more than seven.
             String filterEdge = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":7}")
+                postJson(
+                    "/" + indexName + "/_search?request_cache=false",
+                    "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":7}"
+                )
             );
             assertEquals(7, extractIntPath(filterEdge, "hits", "total", "value"));
             assertTrue(filterEdge.contains("\"relation\":\"gte\""));
             // Bound equal to the match count: the scan of nine rows
             // comes back with eight, so the count is exact.
             String filterAtBound = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":8}")
+                postJson(
+                    "/" + indexName + "/_search?request_cache=false",
+                    "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":8}"
+                )
             );
             assertEquals(8, extractIntPath(filterAtBound, "hits", "total", "value"));
             assertTrue(filterAtBound.contains("\"relation\":\"eq\""));
             // Default bound (10,000) with hits: exact because the
             // table has fewer matches than the bound.
-            String filterDefault = readAll(postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"term\":{\"id\":5}}}"));
+            String filterDefault = readAll(
+                postJson("/" + indexName + "/_search?request_cache=false", "{\"size\":10,\"query\":{\"term\":{\"id\":5}}}")
+            );
             assertEquals(1, extractIntPath(filterDefault, "hits", "total", "value"));
             assertTrue(filterDefault.contains("\"relation\":\"eq\""));
             assertTrue("hit for id 5 sits at fragment 1 offset 1: " + filterDefault, filterDefault.contains("\"_id\":\"1-1\""));
-            String filterExact = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}}}"));
+            String filterExact = readAll(
+                postJson("/" + indexName + "/_search?request_cache=false", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}}}")
+            );
             assertEquals(8, extractIntPath(filterExact, "hits", "total", "value"));
             assertTrue(filterExact.contains("\"relation\":\"eq\""));
             String filterTrue = readAll(
-                postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":true}")
+                postJson(
+                    "/" + indexName + "/_search?request_cache=false",
+                    "{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":4}}},\"track_total_hits\":true}"
+                )
             );
             assertEquals(8, extractIntPath(filterTrue, "hits", "total", "value"));
             assertTrue(filterTrue.contains("\"relation\":\"eq\""));
@@ -1168,7 +1198,9 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
                 "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}" };
             int[] expected = new int[queries.length];
             for (int i = 0; i < queries.length; i++) {
-                String search = readAll(postJson("/" + indexName + "/_search", "{\"size\":0,\"query\":" + queries[i] + "}"));
+                String search = readAll(
+                    postJson("/" + indexName + "/_search?request_cache=false", "{\"size\":0,\"query\":" + queries[i] + "}")
+                );
                 expected[i] = extractIntPath(search, "hits", "total", "value");
             }
             assertEquals(12, expected[0]);
