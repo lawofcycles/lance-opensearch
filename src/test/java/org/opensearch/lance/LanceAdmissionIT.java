@@ -145,16 +145,38 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 assertEquals(admission.toString(), 16L * 52L + 10_001L * 24L, ((Number) admission.get("last_estimate_bytes")).longValue());
 
                 // Opting bounded shapes out restores the pass-through
-                // for the page while the unbounded shape stays gated.
+                // for the page's full text scan while the unbounded
+                // shape stays gated. Under the one byte share the page's
+                // fetch take is then the path refused: its five rows at
+                // the projected columns' widths plus the row address,
+                // doubled, do not fit a share of one byte and the headroom
+                // leaves nothing, so the 429 names fetch_take, not fts.
                 updateClusterSetting("lance.admission.bounded_shapes_gated", "false");
-                Response bounded = postJson("/" + indexName + "/_search?request_cache=false", BOUNDED);
-                assertEquals(RestStatus.OK.getStatus(), bounded.getStatusLine().getStatusCode());
-                assertEquals(8, extractIntPath(readAll(bounded), "hits", "total", "value"));
+                long ftsRejected = rejections(admission, "fts");
+                long takeRejected = rejections(admission, "fetch_take");
+                String take = expectAdmissionRefusal(indexName, BOUNDED, "fetch_take");
+                assertTrue(take, take.contains("fetch take over"));
+                assertTrue(take, take.contains("taking 5 rows of"));
+                assertTrue(take, take.contains("Narrow _source or fields, or lower size"));
+                Map<String, Object> afterTake = admissionStats();
+                assertEquals(afterTake.toString(), ftsRejected, rejections(afterTake, "fts"));
+                assertEquals(afterTake.toString(), takeRejected + 1, rejections(afterTake, "fetch_take"));
+                assertEquals(afterTake.toString(), "fetch_take", afterTake.get("last_kind"));
                 ResponseException stillGated = expectThrows(
                     ResponseException.class,
                     () -> postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED)
                 );
                 assertEquals(RestStatus.TOO_MANY_REQUESTS.getStatus(), stillGated.getResponse().getStatusLine().getStatusCode());
+                assertTrue(readAll(stillGated.getResponse()).contains("fts estimate"));
+                // With the share back at the node's the page's take fits
+                // it and the page answers.
+                updateClusterSetting("lance.test.index_cache_shard_share", null);
+                Response bounded = postJson("/" + indexName + "/_search?request_cache=false", BOUNDED);
+                assertEquals(RestStatus.OK.getStatus(), bounded.getStatusLine().getStatusCode());
+                assertEquals(8, extractIntPath(readAll(bounded), "hits", "total", "value"));
+                Map<String, Object> afterPage = admissionStats();
+                assertEquals(afterPage.toString(), "fetch_take", afterPage.get("last_kind"));
+                assertEquals(afterPage.toString(), 0L, ((Number) afterPage.get("last_estimate_bytes")).longValue());
             } finally {
                 updateClusterSetting("lance.admission.bounded_shapes_gated", null);
                 updateClusterSetting("lance.admission.headroom", null);
@@ -311,7 +333,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
         Map<String, Object> rejections = (Map<String, Object>) admission.get("rejections");
         assertEquals(
             admission.toString(),
-            Set.of("fts", "scalar_index", "vector_index", "filter_scan", "aggregate_scan", "column_load"),
+            Set.of("fts", "scalar_index", "vector_index", "filter_scan", "aggregate_scan", "column_load", "fetch_take"),
             rejections.keySet()
         );
         return ((Number) rejections.get(kind)).longValue();
@@ -540,6 +562,51 @@ public class LanceAdmissionIT extends LanceRestTestCase {
         }
     }
 
+    public void testFetchTakeOfAPageIsJudgedAfterItsHits() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "admissionfetch")) {
+            String indexName = fixture.indexName();
+            // A match_all page runs no gated scan for its hits; the take
+            // of its rows is the one path the gate judges. Under the one
+            // byte share the ten rows at the projected columns' widths,
+            // doubled, count in full and the headroom leaves nothing, so
+            // the page is refused naming the take. The overrides come
+            // first so no earlier take of this fixture has filled the
+            // fetch cache with the rows the page renders.
+            String page = "{\"size\":10,\"query\":{\"match_all\":{}}}";
+            updateClusterSetting("lance.test.index_cache_shard_share", "\"1b\"");
+            updateClusterSetting("lance.admission.headroom", "\"1pb\"");
+            try {
+                Map<String, Object> before = admissionStats();
+                String body = expectAdmissionRefusal(indexName, page, "fetch_take");
+                assertTrue(body, body.contains("fetch take over"));
+                assertTrue(body, body.contains("taking 10 rows of"));
+                assertTrue(body, body.contains("per row (the columns' Arrow widths plus the row address)"));
+                assertTrue(body, body.contains("Narrow _source or fields, or lower size"));
+                Map<String, Object> after = admissionStats();
+                assertEquals(after.toString(), rejections(before, "fetch_take") + 1, rejections(after, "fetch_take"));
+                assertEquals(after.toString(), rejections(before, "fts"), rejections(after, "fts"));
+                assertEquals(after.toString(), rejections(before, "filter_scan"), rejections(after, "filter_scan"));
+                assertEquals(after.toString(), "fetch_take", after.get("last_kind"));
+                assertEquals(after.toString(), "request", after.get("last_source"));
+                assertTrue(after.toString(), ((Number) after.get("last_estimate_bytes")).longValue() > 0L);
+            } finally {
+                updateClusterSetting("lance.admission.headroom", null);
+                updateClusterSetting("lance.test.index_cache_shard_share", null);
+            }
+            // At the defaults the ten rows fit the node's shard share: the
+            // take is admitted at estimate zero, recorded under its kind,
+            // and the page answers.
+            long rejected = rejections(admissionStats(), "fetch_take");
+            String response = readAll(postJson("/" + indexName + "/_search?request_cache=false", page));
+            assertEquals(16, extractIntPath(response, "hits", "total", "value"));
+            Map<String, Object> admitted = admissionStats();
+            assertEquals(admitted.toString(), "fetch_take", admitted.get("last_kind"));
+            assertEquals(admitted.toString(), "request", admitted.get("last_source"));
+            assertEquals(admitted.toString(), 0L, ((Number) admitted.get("last_estimate_bytes")).longValue());
+            assertEquals(admitted.toString(), rejected, rejections(admitted, "fetch_take"));
+        }
+    }
+
     /** POST {@code body} to the index and assert the 429 of the gate names {@code kind}; the response body. */
     private static String expectAdmissionRefusal(String indexName, String body, String kind) {
         ResponseException failure = expectThrows(
@@ -595,11 +662,12 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             assertEquals(admission.toString(), "fts", admission.get("last_kind"));
             assertEquals(admission.toString(), "warm_up", admission.get("last_source"));
             assertEquals(admission.toString(), 0L, ((Number) admission.get("last_estimate_bytes")).longValue());
-            // A request's decision afterwards is reported as such.
+            // A request's decision afterwards is reported as such: the
+            // last path a page runs is the take of its hits.
             Response page = postJson("/" + tableName + "/_search?request_cache=false", BOUNDED);
             assertEquals(readAll(page), RestStatus.OK.getStatus(), page.getStatusLine().getStatusCode());
             Map<String, Object> afterRequest = admissionStats();
-            assertEquals(afterRequest.toString(), "fts", afterRequest.get("last_kind"));
+            assertEquals(afterRequest.toString(), "fetch_take", afterRequest.get("last_kind"));
             assertEquals(afterRequest.toString(), "request", afterRequest.get("last_source"));
         } finally {
             try {
