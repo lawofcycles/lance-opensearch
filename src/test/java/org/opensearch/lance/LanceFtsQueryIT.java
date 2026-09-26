@@ -270,12 +270,13 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // stops counting past the bound and the coordinator reports
         // the capped value with relation gte. Every size is covered
         // because the executor takes a different count path for each:
-        // size 10 (the bounded hits scan returns all 6, short of its
-        // limit, so its own count is exact), size 2 (the hits scan is
-        // clipped, so a count scan limited to bound + 1 runs), size 0
-        // (no hits scan; the same limited count scan runs) and
-        // size 0 with an aggregation (the count comes from the
-        // aggregation's scan).
+        // size 10 (the hits scan keeps its limit of 10, already above
+        // bound + 1 = 4, returns all 6, short of its limit, so its own
+        // count is exact), size 2 (the hits scan is
+        // widened to 4 rows and fills, so its rows are the lower bound
+        // and no count scan runs), size 0 (no hits scan; a count scan
+        // limited to bound + 1 runs) and size 0 with an aggregation
+        // (the count comes from the aggregation's scan).
         try (LanceTestCluster fixture = LanceTestCluster.setUpMultiFragment(12, 4, "lmatchtrackhits")) {
             String indexName = fixture.indexName();
             String hello = "{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}";
