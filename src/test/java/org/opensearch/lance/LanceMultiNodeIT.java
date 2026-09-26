@@ -2512,6 +2512,16 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * {@code title}; the vector column is not surfaced and the table
      * declares no primary key); with {@code _source: false} it projects
      * nothing and issues no take.
+     *
+     * <p>The take counts come out the same whether an executor takes its
+     * leaves one after the other or side by side, so the side by side
+     * part is pinned through the cluster log: a debug logger on
+     * {@code LanceStoredFields} names the thread of every take, and with
+     * {@code lance.fragment_path.parallelism} raised to 4 (the default is
+     * half the processors, 1 on a small CI runner) the takes of this
+     * table run on more threads than there are data nodes. An executor
+     * that takes its leaves one after the other uses exactly one thread,
+     * the request's own, so the count would be the node count.
      */
     public void testPageTakesOnePerLeafAndProjectsTheRenderedColumnsAcrossThreeNodes() throws Exception {
         String suffix = "mn-take-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
@@ -2522,6 +2532,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, rows, rows / fragments);
         String indexName = tableName;
         try {
+            updateClusterSetting("logger.org.opensearch.lance.engine.LanceStoredFields", "DEBUG");
+            updateClusterSetting("lance.fragment_path.parallelism", "4");
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
@@ -2558,6 +2570,35 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals("the takes addressed every row: " + sorted, rows, takeRows);
             assertEquals("every take projected id, body and title: " + sorted, 3L * fragments, takeColumns);
 
+            // The log names the thread of each take; a thread name
+            // carries its node, so the distinct names over the cluster
+            // count one per node for executors that take their leaves one
+            // after the other, and more once any executor took side by
+            // side. The log is flushed asynchronously, hence assertBusy.
+            String tableMarker = tableName + ".lance";
+            assertBusy(() -> {
+                Set<String> takeThreads = new HashSet<>();
+                Set<String> takeNodes = new HashSet<>();
+                for (String line : clusterLogLines()) {
+                    if (!line.contains("lance.fetch: take of") || !line.contains(tableMarker)) {
+                        continue;
+                    }
+                    int at = line.indexOf(" on thread [");
+                    // A thread name has brackets of its own
+                    // (opensearch[node][pool][T#n]), so the name ends at
+                    // the bracket the elapsed time follows.
+                    int close = at < 0 ? -1 : line.indexOf("] in ", at);
+                    assertTrue("unexpected take log line shape: " + line, at >= 0 && close > at);
+                    takeThreads.add(line.substring(at + " on thread [".length(), close));
+                    takeNodes.add(loggingNodeName(line));
+                }
+                assertEquals("every data node logged its takes: " + takeNodes, 3, takeNodes.size());
+                assertTrue(
+                    "an executor took its leaves side by side, so the takes ran on more threads than nodes: " + takeThreads,
+                    takeThreads.size() > 3
+                );
+            });
+
             String noSource = readAll(
                 postJson(
                     "/" + indexName + "/_search",
@@ -2574,6 +2615,12 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 assertEquals(0L, ((Number) fetch.get("take_columns")).longValue());
             }
         } finally {
+            try {
+                updateClusterSetting("logger.org.opensearch.lance.engine.LanceStoredFields", null);
+            } catch (Exception ignored) {}
+            try {
+                updateClusterSetting("lance.fragment_path.parallelism", null);
+            } catch (Exception ignored) {}
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}

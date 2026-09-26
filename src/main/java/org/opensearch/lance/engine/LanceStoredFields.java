@@ -28,6 +28,8 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DocValuesSkipIndexType;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.FieldInfo;
@@ -78,6 +80,8 @@ import org.opensearch.lance.engine.LanceFragmentSchema.TakeProjection;
  * {@link #materialiseStoredFields} on the leaf, which delegates here.
  */
 final class LanceStoredFields extends StoredFields {
+
+    private static final Logger LOGGER = LogManager.getLogger(LanceStoredFields.class);
 
     /** Leaf whose rows this renders; maps doc ids to physical rows and back. */
     private final LanceFragmentLeafReader leaf;
@@ -305,13 +309,23 @@ final class LanceStoredFields extends StoredFields {
             } catch (Exception e) {
                 throw new IOException(e);
             } finally {
-                FetchTakeStats.record(
-                    FetchTakeStats.Kind.STORED_FIELDS,
-                    chunk.size(),
-                    takeColumns.size(),
-                    System.nanoTime() - start,
-                    leaf.takeAccumulator()
-                );
+                long elapsed = System.nanoTime() - start;
+                FetchTakeStats.record(FetchTakeStats.Kind.STORED_FIELDS, chunk.size(), takeColumns.size(), elapsed, leaf.takeAccumulator());
+                // Off by default; a debug logger on this class names the
+                // thread of every take, which is how the leaves taken side
+                // by side within one request can be told apart from the
+                // leaves taken one after the other on the request's thread.
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug(
+                        "lance.fetch: take of {} rows and {} columns from fragment {} of [{}] on thread [{}] in {} ms",
+                        chunk.size(),
+                        takeColumns.size(),
+                        fragmentId,
+                        dataset.uri(),
+                        Thread.currentThread().getName(),
+                        elapsed / 1_000_000L
+                    );
+                }
             }
         }
         for (int docId : requested) {

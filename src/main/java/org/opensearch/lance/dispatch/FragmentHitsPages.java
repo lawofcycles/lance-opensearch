@@ -558,6 +558,11 @@ final class FragmentHitsPages {
             });
         } catch (IOException | RuntimeException e) {
             throw e;
+        } catch (InterruptedException e) {
+            // The wait for a started group was interrupted: keep the
+            // interrupt bit for the search thread's own checks.
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted while taking the rows behind the page", e);
         } catch (Exception e) {
             throw new IOException(e);
         }
