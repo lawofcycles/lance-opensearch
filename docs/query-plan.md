@@ -73,7 +73,8 @@ model's range is charged one millisecond, and the coordinator layer adds its two
     "requested": {"accuracy": "APPROXIMATE", "tie_stability": "NONE"},
     "declared": {"accuracy": "EXACT", "tie_stability": "UNSTABLE"},
     "enforcer": "none"
-  }
+  },
+  "cacheable": true
 }
 ```
 
@@ -85,8 +86,8 @@ The fields, in the order they appear.
 when the body carries an element no plan answers (`suggest` or `highlight`, see
 [limitations.md](limitations.md#search-body-elements-the-plugin-refuses)). On the unsupported
 route `unplanned` carries the message a `_search` with the same body is refused with (400), and
-`logical`, `physical`, `fragment_plan`, `refinements_possible` and `traits` are absent, since
-nothing was planned; the endpoint answers 200 because it reports rather than executes. The
+`logical`, `physical`, `fragment_plan`, `refinements_possible`, `traits` and `cacheable` are
+absent, since nothing was planned; the endpoint answers 200 because it reports rather than executes. The
 dispatch filter's mixed target check (a target that is not Lance backed sends the whole request to
 the stock search action) is applied outside the plan and is not reflected in `route`.
 
@@ -182,9 +183,17 @@ route.
 body demanded of the plan root, `declared` what the root declares, `enforcer` whether the second
 planning pass fired.
 
+`cacheable` says whether a `_search` with the body would be answered from the coordinator's
+[result cache](features.md#result-cache) on a repeat while the table stays at its version:
+`true`, or `false` with `cacheable_reason` naming why (`size > 0`, `from > 0`, `dls` when a
+reader wrapper is installed, `disabled` when `lance.request_cache.enabled` is false on the node
+that answered). A search's own `request_cache=false` and a target of several indexes are not
+visible to explain, which takes one index and a body. Absent when the plan failed, since nothing
+runs.
+
 When no plan of the body declares the traits it demands, the answer keeps `route: fragment` but
-nothing ships: `fragment_plan` is absent, `refinements_possible` is empty, `unplanned` carries
-the `plan_failed` message, `physical` shows the cheapest plan the demand refused (so the reader
+nothing ships: `fragment_plan` and `cacheable` are absent, `refinements_possible` is empty,
+`unplanned` carries the `plan_failed` message, `physical` shows the cheapest plan the demand refused (so the reader
 sees which trait it declares), and `traits.enforcer` names the demand and what the cheapest plan
 offered. A `_search` with the same body answers 400 with the same message.
 
