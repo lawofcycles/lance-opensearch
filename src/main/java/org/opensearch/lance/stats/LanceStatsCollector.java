@@ -46,6 +46,7 @@ import org.opensearch.lance.query.LanceFtsQuery;
  * reason, and the requests the Lance scan and Lucene each answered.
  * {@code freshness} reads the node's {@code LanceIndexFreshnessService}
  * counters: the checks of the Lance backed shards this node holds.
+ * {@code request_cache} reads the coordinator result cache's figures.
  */
 public final class LanceStatsCollector {
 
@@ -55,6 +56,7 @@ public final class LanceStatsCollector {
     private final LanceIndexWarmer indexWarmer;
     private final Supplier<Map<String, LanceLocalClones.CloneStat>> localClones;
     private final Supplier<LanceNodeStats.FreshnessStats> freshness;
+    private final Supplier<LanceNodeStats.RequestCacheStats> requestCache;
 
     /**
      * @param warmCache        the node's snapshot cache, or {@code null}
@@ -117,12 +119,31 @@ public final class LanceStatsCollector {
         Supplier<Map<String, LanceLocalClones.CloneStat>> localClones,
         Supplier<LanceNodeStats.FreshnessStats> freshness
     ) {
+        this(warmCache, sessionBytes, indexCacheSizing, indexWarmer, localClones, freshness, null);
+    }
+
+    /**
+     * @param requestCache reads this node's coordinator result cache
+     *                     figures, or {@code null} when the plugin created
+     *                     no cache (the {@code request_cache} block then
+     *                     reads disabled with zero counters)
+     */
+    public LanceStatsCollector(
+        LanceWarmCache warmCache,
+        LongSupplier sessionBytes,
+        Supplier<IndexCacheSizing> indexCacheSizing,
+        LanceIndexWarmer indexWarmer,
+        Supplier<Map<String, LanceLocalClones.CloneStat>> localClones,
+        Supplier<LanceNodeStats.FreshnessStats> freshness,
+        Supplier<LanceNodeStats.RequestCacheStats> requestCache
+    ) {
         this.warmCache = warmCache;
         this.sessionBytes = sessionBytes;
         this.indexCacheSizing = indexCacheSizing;
         this.indexWarmer = indexWarmer;
         this.localClones = localClones;
         this.freshness = freshness;
+        this.requestCache = requestCache;
     }
 
     /** The node's cache figures with no index block; {@link #collect(List)} adds the shard readers. */
@@ -174,6 +195,9 @@ public final class LanceStatsCollector {
             cloneStats.sort((a, b) -> a.index().compareTo(b.index()));
         }
         LanceNodeStats.FreshnessStats freshnessStats = freshness == null ? LanceNodeStats.FreshnessStats.NONE : freshness.get();
+        LanceNodeStats.RequestCacheStats requestCacheStats = requestCache == null
+            ? LanceNodeStats.RequestCacheStats.NONE
+            : requestCache.get();
         if (warmCache == null) {
             return new LanceNodeStats(
                 false,
@@ -216,7 +240,7 @@ public final class LanceStatsCollector {
                 FragmentPlanRefiner.executedCounts(),
                 FragmentPlanRefiner.prunedFragments(),
                 freshnessStats
-            );
+            ).withRequestCache(requestCacheStats);
         }
         ColumnStore store = warmCache.columnStore();
         return new LanceNodeStats(
@@ -260,6 +284,6 @@ public final class LanceStatsCollector {
             FragmentPlanRefiner.executedCounts(),
             FragmentPlanRefiner.prunedFragments(),
             freshnessStats
-        );
+        ).withRequestCache(requestCacheStats);
     }
 }

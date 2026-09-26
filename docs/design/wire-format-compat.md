@@ -54,8 +54,8 @@ critical only while a filter is set, because an older data node that ignored the
 without the predicate and answer wrongly, and marks its pruning block optional, because an older
 node that scans the pruned fragments too still answers correctly. `LanceNodeStats` marks its
 pruned fragment counter, its admission source, its refused mapping updates, its statistics
-progress counters and its retained pool identity optional, because an older coordinator merely
-shows the stats without them.
+progress counters, its retained pool identity and its result cache figures optional, because an
+older coordinator merely shows the stats without them.
 
 A block is decoded from a stream of its own bytes, so a parser that leaves bytes of the block
 unread fails the message with `<Message> wire version block [n] left k bytes unread` rather than
@@ -113,6 +113,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 3 | Block, critical while a filter is set: Substrait filter bytes (byte array; the block is empty when no filter is set, and the reader takes an empty block as absent) |
 | `LanceExplainResponse` | 1 | Retired layout: index, route (`fragment` or `shard_path`), shard path reasons, logical and physical text, optional fragment plan, optional unplanned message, refinements, traits. Read by the current version and never written |
 | | 2 | Base: index, route (`fragment` or `unsupported`), optional logical and physical text, optional fragment plan, optional unplanned message, refinements, optional traits |
+| | 3 | Block, optional: whether the result cache would serve the body and the reason when not (optional `cacheable`, `reason`; fallback absent) |
 | `LanceFragmentQueryRequest` | 1 | Base: table URI, index name, storage options, pinned version, the fragment plan, optional query and post filter, sorts, search after, size, aggregations, fragment ids, track scores, track total hits up to, min score, terminate after, hit projection, rescores, collapse |
 | `LanceFragmentQueryResponse` | 1 | Base: matched, matched is lower bound, fragment count, hits, row addresses, aggregations, terminated early |
 | `LanceNodeStats` | 1 | Base: every figure of the node stats but the pruned fragment counter and the admission source, then the freshness stats |
@@ -121,7 +122,10 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 4 | Block, optional: the freshness checks' refused mapping updates, index name to message (fallback empty) |
 | | 5 | Block, optional: statistics collections pending and plans made without statistics (two counters; fallback zero) |
 | | 6 | Block, optional: identity of the scans the admission gate's retained pool was filled by (`kind:table:columns`; fallback `none`) |
+| | 7 | Block, optional: the coordinator result cache's figures (enabled, size, limit, entries, hits, misses, evictions, invalidations, skipped; fallback disabled and zero) |
 | `LanceStatsNodeRequest` | 1 | Base: nothing after the marker |
+| `LanceRequestCacheClearNodeRequest` | 1 | Base: the index uuids whose result cache entries the node drops |
+| `LanceRequestCacheClearNodeResponse` | 1 | Base: how many entries the node dropped |
 | `LanceBuildIndexesNodeRequest` | 1 | Base: the build request, the source version |
 | `LanceBuildIndexesNodeResponse` | 1 | Base: the three kind results, the status, the optional mapping JSON |
 | `LanceIndexSyncRequest` | 1 | Base: nothing after the marker (the index travels in the OpenSearch base class) |
@@ -137,7 +141,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 `LanceExplainResponse` version 1 predates the block layout and changed the base fields, which the
 rules above no longer allow; it is decoded by a branch on the marker that maps a shard path answer
 to an unsupported answer with the message `LanceExplainResponse.SHARD_PATH_RETIRED`, and a
-fragment answer field by field. Its blocks, when it gains one, start at version 3.
+fragment answer field by field. Its blocks start at version 3, the cacheability block.
 
 ## Compatibility matrix
 
