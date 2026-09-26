@@ -505,10 +505,12 @@ defaults where a figure is missing, no fragment is pruned, and the admission gat
 their per row constants. The plans that follow read the entry. Every data node starts the
 collection of an attached table's current version when the index appears in the cluster state
 (attach, the namespace poll surfacing the table, the node's first cluster state after a restart),
-so the statistics are usually ready on every node before its first request. The node that holds
-the table's shard starts it again when the freshness check follows the manifest to a new version,
-and every node when it builds the snapshot of a version; a node that only coordinates collects a
-new version on its first request of that version. Statistics are not shipped between
+so the statistics are usually ready on every node before its first request. When the freshness
+check follows the manifest to a new version, the node that holds the table's shard starts the
+collection of that version and broadcasts a prefetch of it to every data node
+(`LanceStatisticsPrefetchAction`), since the served version is not in the cluster state and no
+other node observes the move; a node also collects a version when it builds its snapshot.
+Statistics are not shipped between
 nodes. The cache is per node and `GET /_lance/stats` reports it under `plan.statistics`: `tables`
 (entries held), `collect_millis_total` (time spent collecting), `pending` (collections started and
 not finished; zero also on a node that has started none) and `planned_without` (plans made without
