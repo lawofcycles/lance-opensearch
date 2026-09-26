@@ -641,6 +641,37 @@ When Lance advances to a new version, the plugin exposes it as soon as the next 
 
 The `index.lance.uncovered_fragment_policy` setting still accepts `wait` alongside the default `immediate`. Both values currently expose the new version immediately; `wait` is reserved for a future async-optimize implementation, and setting it today logs an informational message so operators are aware that the plugin does not run auto-optimize.
 
+### Serving an object store table from local NVMe
+
+Lance's object store layer has no read-through cache on local disk, and the plugin adds none: every byte a request needs that is not already in memory is read from the store the table was attached from. On S3 that puts the store's latency on the first request that touches an index or a column: the pages a `term` filter reads from a BTree, the token dictionaries and posting lists of a full text query, the first load of a column into the column store, the partitions a nearest scan probes, and the `_rowaddr` take behind every page of hits. On the project's 1B row benchmark table, read from S3 by four r7gd.4xlarge data nodes, `filter rating=5 + terms(category)` took 164 s the first time (the rating BTree was being read from S3) and 4.3 s once its pages were in the Lance Session cache; the same table and plugin build on one r7gd.16xlarge with the table on the instance's NVMe took 14 s cold and 4.8 s warm. A `lance_knn` (k=10, nprobes=200) on the same table went from 17.9 s cold to 0.3 s warm when read from S3 by three such nodes, and from 1.0 s to 0.2 s on the NVMe node. A full text query whose inverted index does not fit one shard of the index cache (about 52 bytes per row, so about 48 GiB at 1B rows) rebuilds its document set from the index files on every query, and that read comes from the store every time. Everything the node holds in memory (the Lance Session cache, the plugin's column store and snapshots) is gone after a restart, so a restarted node pays every cold read again. Local disk does not shorten a shape that is bound by Lance's CPU work rather than by reads: a one hit `lance_match` on the 1B row table took 30 s on S3 and on NVMe alike.
+
+Two operational answers exist today. Neither needs a plugin setting, and the plugin has no setting for a local mirror or cache.
+
+**Copy the table to every data node.** Run `aws s3 sync s3://<bucket>/tables/t.lance /nvme/tables/t.lance` on every data node and attach the local path:
+
+```
+curl -X POST http://localhost:9200/_lance/attach \
+  -H 'Content-Type: application/json' \
+  -d '{"table":"/nvme/tables/t.lance"}'
+```
+
+The project's 1B row table (750 GB) syncs to one r7gd.16xlarge in about 24 minutes (1,413 s and 1,434 s in two runs). Every data node needs the whole table, not only the fragments it happens to execute: the fragment share of a node changes with cluster membership, and index files are read on every node. Lance never rewrites a data file, an index file, a deletion file or a manifest under `_versions/`, so rerunning `aws s3 sync` after the writer commits fetches only the files the new version added, and the freshness check picks the new version up on its next cadence from the local path exactly as it would from S3; files a Lance cleanup removed from the bucket stay on disk unless the sync runs with `--delete`. What matters is that every data node holds the same versions at the same path. The coordinator plans each request against the latest manifest at the path it sees, and a data node whose copy is behind cannot open that manifest, so every request that reaches it fails with 400 naming the `_versions/<N>.manifest` it could not open until its sync catches up. Run the sync from a cron on every node or from the writer's commit hook, and keep the window in which nodes disagree short: sync everything except `_versions/` on every node first (`aws s3 sync --exclude '_versions/*' ...`), then sync `_versions/` on every node.
+
+**Mount the bucket with a local cache.** [Mountpoint for Amazon S3](https://github.com/awslabs/mountpoint-s3) can keep a local cache of the object content it has read, so the first read of a piece of an object comes from S3 and later reads of the same piece from disk:
+
+```
+mount-s3 <bucket> /mnt/tables --cache /nvme/mp-cache --max-cache-size <MiB> --metadata-ttl minimal
+curl -X POST http://localhost:9200/_lance/attach \
+  -H 'Content-Type: application/json' \
+  -d '{"table":"/mnt/tables/tables/t.lance"}'
+```
+
+`--cache <dir>` is the cache directory (Mountpoint creates a subdirectory in it and empties that subdirectory at mount time and at exit, so a remount starts cold), `--max-cache-size <MiB>` bounds it (the default keeps 5 percent of the file system free), and `--metadata-ttl` is how long Mountpoint trusts the file metadata it cached, which with `--cache` defaults to 60 seconds; a new manifest can stay invisible to the freshness check for that long, so set the TTL to `minimal` or to a few seconds when a writer commits to the table. The options are documented in Mountpoint's [CONFIGURATION.md](https://github.com/awslabs/mountpoint-s3/blob/main/doc/CONFIGURATION.md). This path needs no copy step and no cron, but the project has not measured it. Mountpoint documents itself as optimised for sequential reads of large objects, while the reads that dominate a cold request here are small ranges at scattered offsets (BTree pages, `_rowaddr` takes), so how much of the 164 s above the cache removes on the second request, and what the first request costs through the mount compared with reading S3 directly, is not known.
+
+Should Lance's object store layer gain a read-through disk cache of its own (the project intends to propose one upstream), both answers reduce to one `storage_options` entry on the attach body.
+
+`index_placement: node_local` is not a read cache: it makes every data node build indexes into a shallow clone of the table under its data path so that the source stays read only, and every data read of the source still goes to the store. See "Attach and namespace surface" in [features.md](features.md#attach-and-namespace-surface).
+
 ### Cap Lance's native memory footprint
 
 Lance keeps its inverted-index and metadata caches in native memory, outside the JVM heap. The plugin installs a single Lance `Session` at startup so every table on a node shares the same caches. The upper bound is set by `lance.native_memory.limit`, a node-level setting that accepts either a byte value or a percentage of the memory left after the JVM heap is subtracted from physical memory. The default is `40%`, which scales with instance size and leaves room for the k-NN plugin's own memory budget on nodes that host both plugins.
