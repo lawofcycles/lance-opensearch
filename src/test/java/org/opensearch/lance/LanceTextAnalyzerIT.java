@@ -272,6 +272,92 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
         }
     }
 
+    public void testMappingFlipsAtTheIndexCommitNotAtTheColumnCommit() throws Exception {
+        // The backfill commits the derived column first and its
+        // inverted index second. A match on the derived column between
+        // the two commits would be a flat scan of the whole column, so
+        // the mapping must stay on the base column's own index until the
+        // index commit. The state between the commits is reproduced
+        // deterministically: the derived column is put in place by the
+        // test, a tag pins the index on that version, and the test
+        // builds the index and moves the tag when it wants the flip.
+        String suffix = "flip-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableUri = LanceTableFactory.writeEnglishTextTableWithInvertedIndex(scratchDir, "demo-" + suffix);
+        String indexName = indexNameOf(tableUri);
+        LanceTableFactory.addColumnFromSql(tableUri, "body__lance_tokens", "lower(body)");
+        long columnCommit = LanceTableFactory.currentVersion(tableUri);
+        LanceTableFactory.createTag(tableUri, "flip", columnCommit);
+        try {
+            // The tagged snapshot is read only, so the attach neither
+            // backfills nor builds; the derived column exists, which is
+            // what the tagged attach requires.
+            Response attach = postJson(
+                "/_lance/attach",
+                "{\"table\":\""
+                    + tableUri
+                    + "\",\"tag\":\"flip\",\"overrides\":{\"body\":{\"type\":\"text_analyzer\",\"analyzer\":\"whitespace\"}}}"
+            );
+            String attachBody = readAll(attach);
+            assertEquals("attach failed: " + attachBody, RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals((int) columnCommit, extractIntPath(attachBody, "version"));
+
+            // Column commit, no index: the base keeps its own index.
+            String interim = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
+            assertTrue("body must map as lance_text: " + interim, interim.contains("\"body\":{\"type\":\"lance_text\""));
+            assertFalse("no tokens column before the index commit: " + interim, interim.contains("tokens_column"));
+            assertFalse("no analyzer before the index commit: " + interim, interim.contains("lance_analyzer"));
+            assertFalse("derived column must not surface: " + interim, interim.contains("\"body__lance_tokens\":{\"type\""));
+            String interimExplain = readAll(explain(indexName, "{\"query\":{\"match\":{\"body\":\"sleep\"}}}"));
+            assertTrue(
+                "the pushed full text scan reads the base column: " + interimExplain,
+                stringPath(interimExplain, "physical").contains("columns=[body]")
+            );
+            String interimMatch = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":10,\"query\":{\"match\":{\"body\":\"sleep\"}}}")
+            );
+            assertEquals(
+                "sleep must hit row 2 through the base index: " + interimMatch,
+                1,
+                extractIntPath(interimMatch, "hits", "total", "value")
+            );
+
+            // The index commit, then the tag follows it: the freshness
+            // check derives at the new version and flips the field in
+            // place. The scan now reads the derived column.
+            LanceTableFactory.createWhitespaceFtsIndex(tableUri, "body__lance_tokens");
+            long indexCommit = LanceTableFactory.currentVersion(tableUri);
+            assertTrue("the index build is its own commit", indexCommit > columnCommit);
+            LanceTableFactory.updateTag(tableUri, "flip", indexCommit);
+            assertBusy(() -> {
+                String mapping = readAll(performRetrying(new Request("GET", "/" + indexName + "/_mapping")));
+                assertTrue("mapping must gain the tokens column: " + mapping, mapping.contains("\"tokens_column\":\"body__lance_tokens\""));
+                assertTrue("mapping must record the analyzer: " + mapping, mapping.contains("\"lance_analyzer\":\"whitespace\""));
+                Request search = new Request("POST", "/" + indexName + "/_search");
+                search.setJsonEntity("{\"size\":10,\"query\":{\"match\":{\"body\":\"sleep\"}}}");
+                String matchBody = readAll(performRetrying(search));
+                assertEquals(
+                    "sleep must hit row 2 through the derived column: " + matchBody,
+                    1,
+                    extractIntPath(matchBody, "hits", "total", "value")
+                );
+            }, 60, TimeUnit.SECONDS);
+            String flippedExplain = readAll(explain(indexName, "{\"query\":{\"match\":{\"body\":\"sleep\"}}}"));
+            assertTrue(
+                "the pushed full text scan reads the derived column: " + flippedExplain,
+                stringPath(flippedExplain, "physical").contains("columns=[body__lance_tokens]")
+            );
+        } finally {
+            deleteIndexQuietly(indexName);
+        }
+    }
+
+    private static Response explain(String indexName, String body) throws IOException {
+        Request request = new Request("GET", "/" + indexName + "/_lance/explain");
+        request.setJsonEntity(body);
+        return client().performRequest(request);
+    }
+
     public void testUnknownAnalyzerRefused() throws Exception {
         String tableUri = writeTable("unknown");
         ResponseException e = expectThrows(

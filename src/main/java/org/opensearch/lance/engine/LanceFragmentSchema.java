@@ -280,9 +280,11 @@ public final class LanceFragmentSchema {
             // from the reader (no FieldInfo, no _source entry: queries
             // reach it through Lance directly) and serves the base
             // column like any other lance_text column (FieldInfo only)
-            // once the derived column exists. While the backfill is
-            // pending the base keeps its default classification,
-            // matching the mapping derivation's fallback.
+            // once the derived column exists and carries its inverted
+            // index. The backfill commits the column and the index
+            // separately; until the index commit the base keeps its
+            // default classification, matching the mapping derivation's
+            // fallback, so no query runs against the unindexed column.
             Set<String> derivedTokensColumns = new HashSet<>();
             Set<String> analyzerModeBases = new HashSet<>();
             if (overrides != null && !overrides.textAnalyzerColumns().isEmpty()) {
@@ -296,7 +298,7 @@ public final class LanceFragmentSchema {
                     String derived = LanceOverrides.derivedColumnName(entry.getKey(), entry.getValue());
                     if (utf8Columns.contains(derived)) {
                         derivedTokensColumns.add(derived);
-                        if (utf8Columns.contains(entry.getKey())) {
+                        if (utf8Columns.contains(entry.getKey()) && ftsColumns.contains(derived)) {
                             analyzerModeBases.add(entry.getKey());
                         }
                     }

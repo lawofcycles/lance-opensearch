@@ -484,24 +484,41 @@ public class RestAttachAction extends BaseRestHandler {
                     String derived = LanceOverrides.derivedColumnName(name, override);
                     LanceField derivedField = fieldsByName.get(derived);
                     if (derivedField != null && derivedField.getType() instanceof ArrowType.Utf8) {
-                        // The analyzer mode: the field surfaces under its own
-                        // name as lance_text, term and FTS queries run against
-                        // the derived tokens column (tokens_column), and the
-                        // query text goes through the same OpenSearch analyzer
-                        // (meta.lance_analyzer) before it reaches Lance, so
-                        // the index-time and query-time tokenisation agree.
-                        mapping.startObject(name).field("type", "lance_text");
-                        mapping.field("tokens_column", derived);
-                        mapping.startObject("meta");
-                        mapping.field("lance_field_id", Integer.toString(fieldId));
-                        mapping.field("lance_arrow_type", arrowTypeIdentity(type));
-                        mapping.field("lance_analyzer", override.analyzer());
-                        mapping.endObject();
-                        writeMultiFieldsBlock(mapping, name, multiFields);
-                        mapping.endObject();
-                        continue;
-                    }
-                    if (derivedField != null) {
+                        // The backfill commits the derived column first and
+                        // its inverted index in a second commit. Only the
+                        // second one makes the analyzer mode servable: a
+                        // match on the derived column without its index is
+                        // a flat scan of the whole column, so the field
+                        // stays on its default mapping (the base column's
+                        // own index, or keyword) until the index exists.
+                        boolean derivedIndexed = !dataset.describeIndices(
+                            new IndexCriteria.Builder().forColumn(derived).mustSupportFts(true).build()
+                        ).isEmpty();
+                        if (derivedIndexed) {
+                            // The analyzer mode: the field surfaces under its own
+                            // name as lance_text, term and FTS queries run against
+                            // the derived tokens column (tokens_column), and the
+                            // query text goes through the same OpenSearch analyzer
+                            // (meta.lance_analyzer) before it reaches Lance, so
+                            // the index-time and query-time tokenisation agree.
+                            mapping.startObject(name).field("type", "lance_text");
+                            mapping.field("tokens_column", derived);
+                            mapping.startObject("meta");
+                            mapping.field("lance_field_id", Integer.toString(fieldId));
+                            mapping.field("lance_arrow_type", arrowTypeIdentity(type));
+                            mapping.field("lance_analyzer", override.analyzer());
+                            mapping.endObject();
+                            writeMultiFieldsBlock(mapping, name, multiFields);
+                            mapping.endObject();
+                            continue;
+                        }
+                        notes.add(
+                            name
+                                + ": text_analyzer override pending; derived column ["
+                                + derived
+                                + "] has no inverted index in this version"
+                        );
+                    } else if (derivedField != null) {
                         String message = "[overrides."
                             + name
                             + "] derived column ["
@@ -517,8 +534,8 @@ public class RestAttachAction extends BaseRestHandler {
                         // The backfill has not created the tokens column yet
                         // (attach with derive: async, or a namespace poll
                         // before the attach-side backfill lands). The column
-                        // derives by the default rules this cycle; the next
-                        // re-derivation after the backfill commit flips it to
+                        // derives by the default rules this cycle; the
+                        // re-derivation after the index commit flips it to
                         // the analyzer mode.
                         notes.add(
                             name + ": text_analyzer override pending; derived column [" + derived + "] does not exist in this version"

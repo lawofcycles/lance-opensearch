@@ -816,6 +816,33 @@ public class LanceExplainIT extends LanceRestTestCase {
         }
     }
 
+    public void testExplainNamesTheColumnAnAnalyzerModeScanReads() throws Exception {
+        // A field in the analyzer mode is asked for by its own name but
+        // the scan reads the derived tokens column; the pushed full text
+        // operation prints that column so the mode is visible.
+        String suffix = "explain-analyzer-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableUri = LanceTableFactory.writeEnglishTextTable(scratchDir, "demo-" + suffix);
+        String indexName = "demo-" + suffix;
+        try {
+            Response attach = postJson(
+                "/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"type\":\"text_analyzer\",\"analyzer\":\"english\"}}}"
+            );
+            assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            String body = explainOk(indexName, "{\"size\":5,\"query\":{\"match\":{\"body\":\"running\"}}}");
+            String physical = stringPath(body, "physical");
+            assertTrue("the pushed scan reads the derived column: " + physical, physical.contains("columns=[body__lance_tokens]"));
+            assertFalse("the field name is not the column read: " + physical, physical.contains("columns=[body]"));
+            String logical = stringPath(body, "logical");
+            assertTrue("the logical node names the same column: " + logical, logical.contains("columns=[[body__lance_tokens]]"));
+            assertEquals("lance_match", fragmentPlanOf(body).get("lance_clause"));
+        } finally {
+            deleteQuietly(indexName);
+        }
+    }
+
     public void testExplainUnknownIndexIs404() {
         ResponseException failure = expectThrows(
             ResponseException.class,

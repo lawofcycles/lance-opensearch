@@ -16,6 +16,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -52,6 +53,7 @@ import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.schema.ColumnAlteration;
+import org.lance.schema.SqlExpressions;
 
 /**
  * Test-only helper that writes a small Lance table onto the local
@@ -734,6 +736,23 @@ public final class LanceTableFactory {
     }
 
     /**
+     * Add a column computed by a SQL expression over the existing
+     * columns through {@code Dataset.addColumns(SqlExpressions)}, one
+     * commit. Used by the text_analyzer tests to put the derived tokens
+     * column in place with real values ({@code lower(body)}) without
+     * running the backfill, so the state between the backfill's column
+     * commit and its index commit can be reproduced deterministically.
+     */
+    public static void addColumnFromSql(String tableUri, String column, String sql) throws Exception {
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
+        ) {
+            dataset.addColumns(new SqlExpressions.Builder().withExpression(column, sql).build(), Optional.empty());
+        }
+    }
+
+    /**
      * Drop columns from an existing Lance table. Simulates
      * {@code dataset.drop_columns([...])} from Python / Rust; used by
      * integration tests that exercise mapping-drift detection when the
@@ -1065,6 +1084,37 @@ public final class LanceTableFactory {
                 );
             }
             return uri;
+        });
+    }
+
+    /**
+     * Build over {@code column} the inverted index the text_analyzer
+     * backfill builds over a derived tokens column: whitespace
+     * tokenizer, positions, and every default transformation of Lance's
+     * inverted index turned off, so the stored tokens are indexed
+     * verbatim. One commit. Used by the tests that reproduce the
+     * backfill's index commit on a table whose derived column was put
+     * in place by {@link #addColumnFromSql}.
+     */
+    public static void createWhitespaceFtsIndex(String tableUri, String column) throws Exception {
+        withLocaleRoot(() -> {
+            try (
+                RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+                Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
+            ) {
+                ScalarIndexParams scalarParams = ScalarIndexParams.create(
+                    "inverted",
+                    "{\"base_tokenizer\":\"whitespace\",\"with_position\":true,\"lower_case\":false,\"stem\":false,"
+                        + "\"remove_stop_words\":false,\"ascii_folding\":false,\"max_token_length\":null}"
+                );
+                IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+                dataset.createIndex(
+                    IndexOptions.builder(Collections.singletonList(column), IndexType.INVERTED, indexParams)
+                        .withIndexName(column + "_fts")
+                        .build()
+                );
+            }
+            return tableUri;
         });
     }
 

@@ -268,8 +268,9 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
      * {@code derive: async} the backfill runs on the generic pool after
      * this method returns and the derivation maps the base column by
      * the default rules for now; the freshness check on the shard's node
-     * re-derives the mapping when the backfill commit advances the
-     * manifest, which is when the column flips to the analyzer mode. A snapshot pinned by
+     * re-derives the mapping as the backfill commits advance the
+     * manifest, and the column flips to the analyzer mode at the commit
+     * that carries the derived column's inverted index. A snapshot pinned by
      * {@code version} or {@code tag} cannot be written, so every
      * derived column must already exist there.
      *
