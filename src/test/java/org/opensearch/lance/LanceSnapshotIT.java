@@ -17,6 +17,7 @@ import java.util.concurrent.TimeUnit;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
@@ -96,10 +97,18 @@ public class LanceSnapshotIT extends LanceRestTestCase {
                 assertEquals(3, extractIntPath(search, "hits", "total", "value"));
                 assertEquals(3, engineDocCount(indexName));
 
-                // Three poll cycles (cadence 1s) must not recreate or
-                // duplicate the restored index: the poll sees the name
-                // taken and skips the table.
-                Thread.sleep(3_500);
+                // Three poll cycles must not recreate or duplicate the
+                // restored index: the poll sees the name taken by an index
+                // backed by the same table and skips the table without
+                // reporting it. POST /_lance/namespace/_poll runs the same
+                // cycle the cadence runs.
+                for (int cycle = 0; cycle < 3; cycle++) {
+                    String polled = readAll(postJson("/_lance/namespace/_poll", ""));
+                    assertFalse(
+                        "poll cycle " + cycle + " must neither surface nor skip the restored index: " + polled,
+                        polled.contains("\"" + indexName + "\"")
+                    );
+                }
                 String cat = readAll(client().performRequest(new Request("GET", "/_cat/indices?format=json")));
                 assertEquals("restored index must appear exactly once: " + cat, 1, countOccurrences(cat, "\"" + indexName + "\""));
                 String settingsAfter = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
@@ -117,16 +126,22 @@ public class LanceSnapshotIT extends LanceRestTestCase {
                 // on the next poll cycle, not only _search and _count
                 // (whose fragment path opens the latest version per query).
                 LanceTableFactory.deleteRows(f.tableUri(), "id >= 2");
-                Thread.sleep(3_500);
-                String searchAfter = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
-                assertEquals(2, extractIntPath(searchAfter, "hits", "total", "value"));
-                assertBusy(() -> {
-                    int count = extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count");
-                    int statsCount = engineDocCount(indexName);
-                    String observed = "_count=" + count + " _stats=" + statsCount;
-                    assertEquals("engine reader of a restored index must follow the table: " + observed, 2, statsCount);
-                    assertEquals(observed, 2, count);
-                }, 10, TimeUnit.SECONDS);
+                assertBusyWithFixedSleepTime(() -> {
+                    try {
+                        String searchAfter = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
+                        assertEquals(2, extractIntPath(searchAfter, "hits", "total", "value"));
+                        int count = extractIntPath(
+                            readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))),
+                            "count"
+                        );
+                        int statsCount = engineDocCount(indexName);
+                        String observed = "_count=" + count + " _stats=" + statsCount;
+                        assertEquals("engine reader of a restored index must follow the table: " + observed, 2, statsCount);
+                        assertEquals(observed, 2, count);
+                    } catch (ResponseException e) {
+                        throw new AssertionError("index temporarily unavailable: " + e.getMessage(), e);
+                    }
+                }, TimeValue.timeValueSeconds(10), TimeValue.timeValueMillis(250));
                 String settingsFollowed = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
                 assertEquals(
                     "adoption must refresh the restored index in place: " + settingsFollowed,

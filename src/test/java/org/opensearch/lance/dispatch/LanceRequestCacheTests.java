@@ -6,13 +6,18 @@
 package org.opensearch.lance.dispatch;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.Version;
@@ -215,6 +220,66 @@ public class LanceRequestCacheTests extends OpenSearchTestCase {
         assertEquals(LanceRequestCache.Skip.SIZE, cache.explainSkip(body("{\"size\":3}"), false));
     }
 
+    public void testIndexWithAReaderWrapperIsNeverCached() throws IOException {
+        // The security plugin's document and field level security is a
+        // reader wrapper on the index service: the probe's temporary
+        // service reports one, and the answer differs per user, so no
+        // request over the index opens a lookup.
+        LanceRequestCache cache = cache();
+        IndexMetadata wrapped = indexMetadata("secured", "uuid-dls");
+        IndexMetadata plain = indexMetadata("open", "uuid-open");
+        IndicesService indicesService = mock(IndicesService.class);
+        when(indicesService.withTempIndexService(any(), any())).thenAnswer(
+            invocation -> ((IndexMetadata) invocation.getArgument(0)).getIndexUUID().equals("uuid-dls")
+        );
+        SearchRequest request = new SearchRequest("secured").source(body("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}"));
+        Index[] concrete = new Index[] { wrapped.getIndex() };
+
+        assertNull("a wrapped index opens no lookup", cache.begin(request, concrete, wrapped, List.of(node("n1")), indicesService, 0L));
+        assertEquals(1L, cache.stats().skipped());
+        assertEquals(0, cache.count());
+        assertNull("the answer is remembered per index", cache.begin(request, concrete, wrapped, List.of(node("n1")), indicesService, 0L));
+        assertEquals(2L, cache.stats().skipped());
+        verify(indicesService, times(1)).withTempIndexService(eq(wrapped), any());
+
+        LanceRequestCache.Lookup lookup = cache.begin(
+            new SearchRequest("open").source(request.source()),
+            new Index[] { plain.getIndex() },
+            plain,
+            List.of(node("n1")),
+            indicesService,
+            0L
+        );
+        assertNotNull("an index without a wrapper is cached as before", lookup);
+        assertNull(lookup.find(1L));
+        lookup.complete(took -> response(1.0d, 1L, false));
+        assertEquals(1, cache.count());
+        assertEquals(2L, cache.stats().skipped());
+
+        assertEquals("the remembered answer leaves with the index", 0, cache.invalidateIndexes(List.of("uuid-dls")));
+        assertNull(cache.begin(request, concrete, wrapped, List.of(node("n1")), indicesService, 0L));
+        verify(indicesService, times(2)).withTempIndexService(eq(wrapped), any());
+    }
+
+    public void testAnAnswerThatFailsToBuildStoresNothing() throws IOException {
+        // The coordinator completes a lookup only with the merge of a fan
+        // out that succeeded; a merge that throws leaves the cache as it
+        // was and the failure reaches the caller.
+        LanceRequestCache cache = cache();
+        IndexMetadata metadata = indexMetadata("demo", "uuid-1");
+        SearchRequest request = new SearchRequest("demo").source(body("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}"));
+        LanceRequestCache.Lookup lookup = begin(cache, request, metadata, node("n1"));
+        assertNull(lookup.find(1L));
+        IllegalStateException failure = expectThrows(IllegalStateException.class, () -> lookup.complete(took -> {
+            throw new IllegalStateException("fan out failed");
+        }));
+        assertEquals("fan out failed", failure.getMessage());
+        assertEquals(0, cache.count());
+        assertEquals(1L, cache.stats().misses());
+        assertEquals("a failed answer is no skip: nothing was offered to the store", 0L, cache.stats().skipped());
+        assertNull(begin(cache, request, metadata, node("n1")).find(1L));
+    }
+
     public void testHitRendersTheStoredAnswerWithAFreshTook() throws IOException {
         LanceRequestCache cache = cache();
         IndexMetadata metadata = indexMetadata("demo", "uuid-1");
@@ -299,14 +364,16 @@ public class LanceRequestCacheTests extends OpenSearchTestCase {
     }
 
     public void testExpiredEntriesAreMissesAndCountAsEvictions() throws Exception {
-        LanceRequestCache cache = new LanceRequestCache(1L << 20, 1L << 16, true, TimeValue.timeValueMillis(50));
+        AtomicLong now = new AtomicLong(1_000L);
+        LanceRequestCache cache = new LanceRequestCache(1L << 20, 1L << 16, true, TimeValue.timeValueMillis(50), now::get);
         IndexMetadata metadata = indexMetadata("demo", "uuid-1");
         SearchRequest request = new SearchRequest("demo").source(body("{\"size\":0}"));
         LanceRequestCache.Lookup first = begin(cache, request, metadata, node("n1"));
         assertNull(first.find(1L));
         first.complete(took -> response(1.0d, 1L, false));
-        assertNotNull(begin(cache, request, metadata, node("n1")).find(1L));
-        Thread.sleep(80L);
+        now.addAndGet(50L);
+        assertNotNull("an entry exactly at the expiry is still served", begin(cache, request, metadata, node("n1")).find(1L));
+        now.addAndGet(1L);
         assertNull("expired", begin(cache, request, metadata, node("n1")).find(1L));
         assertEquals(0, cache.count());
         assertEquals(1L, cache.stats().evictions());
@@ -314,7 +381,7 @@ public class LanceRequestCacheTests extends OpenSearchTestCase {
         LanceRequestCache.Lookup again = begin(cache, request, metadata, node("n1"));
         assertNull(again.find(1L));
         again.complete(took -> response(1.0d, 1L, false));
-        Thread.sleep(80L);
+        now.addAndGet(TimeUnit.DAYS.toMillis(1));
         assertNotNull("no expiry keeps the entry", begin(cache, request, metadata, node("n1")).find(1L));
     }
 

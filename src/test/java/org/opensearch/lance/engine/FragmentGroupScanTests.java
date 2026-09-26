@@ -17,6 +17,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.opensearch.test.OpenSearchTestCase;
@@ -58,13 +59,18 @@ public class FragmentGroupScanTests extends OpenSearchTestCase {
             for (int i = 0; i < 16; i++) {
                 fragments.add(i);
             }
+            // Every group holds its thread until all four groups are
+            // running, so no thread can take a second group: the caller
+            // and three pool threads each scan exactly one.
+            CountDownLatch allRunning = new CountDownLatch(4);
             List<Integer> firstOfGroup = scan.run(fragments, group -> {
                 threads.add(Thread.currentThread().getName());
-                Thread.sleep(20);
+                allRunning.countDown();
+                assertTrue("every group is running at once", allRunning.await(10, TimeUnit.SECONDS));
                 return group.get(0);
             });
             assertEquals(List.of(0, 4, 8, 12), firstOfGroup);
-            assertTrue("the pool ran some of the groups: " + threads, threads.size() > 1);
+            assertEquals("one thread per group: " + threads, 4, threads.size());
         } finally {
             pool.shutdownNow();
         }
@@ -110,27 +116,39 @@ public class FragmentGroupScanTests extends OpenSearchTestCase {
     public void testFirstFailureIsThrownAndStopsFurtherGroups() throws Exception {
         ExecutorService pool = Executors.newFixedThreadPool(2);
         try {
-            CountDownLatch failed = new CountDownLatch(1);
+            // The first pool thread to pick up a group fails it. Its task
+            // returns from the drain only after the failure is recorded,
+            // and that return releases the latch the other running groups
+            // wait on: when they return, the drain loop sees the failure
+            // and starts nothing further.
+            CountDownLatch failureRecorded = new CountDownLatch(1);
+            Executor observed = task -> pool.execute(() -> {
+                try {
+                    task.run();
+                } finally {
+                    failureRecorded.countDown();
+                }
+            });
+            Thread caller = Thread.currentThread();
+            AtomicBoolean failed = new AtomicBoolean();
             AtomicInteger started = new AtomicInteger();
-            FragmentGroupScan scan = new FragmentGroupScan(pool, 8);
+            FragmentGroupScan scan = new FragmentGroupScan(observed, 8);
             List<Integer> fragments = new ArrayList<>();
             for (int i = 0; i < 8; i++) {
                 fragments.add(i);
             }
             IOException thrown = expectThrows(IOException.class, () -> scan.run(fragments, group -> {
                 started.incrementAndGet();
-                if (group.get(0) == 0) {
-                    failed.countDown();
+                if (Thread.currentThread() != caller && failed.compareAndSet(false, true)) {
                     throw new IOException("group " + group + " failed");
                 }
                 // Groups picked up before the failure finish; the ones
                 // not started by then are never started.
-                assertTrue(failed.await(5, TimeUnit.SECONDS));
-                Thread.sleep(50);
+                assertTrue(failureRecorded.await(10, TimeUnit.SECONDS));
                 return group.size();
             }));
-            assertEquals("group [0] failed", thrown.getMessage());
-            assertTrue("not every group ran after the failure: " + started.get(), started.get() < 8);
+            assertTrue(thrown.getMessage(), thrown.getMessage().startsWith("group [") && thrown.getMessage().endsWith("] failed"));
+            assertTrue("at most one group per thread ran, none after the failure: " + started.get(), started.get() <= 3);
         } finally {
             pool.shutdownNow();
         }
