@@ -14,7 +14,9 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Stream;
 
 import org.apache.logging.log4j.LogManager;
@@ -144,6 +146,9 @@ public final class LanceLocalClones implements ClusterStateListener {
     /** Runs clone-directory deletion off the cluster applier thread; {@code null} runs it inline (unit tests). */
     private final ThreadPool threadPool;
     private final ConcurrentHashMap<String, Object> locks = new ConcurrentHashMap<>();
+    /** Reads of a {@code node_local} index that failed in {@link #locateForRead} since the node started, and the same per index name. */
+    private final LongAdder resolutionFailures = new LongAdder();
+    private final ConcurrentHashMap<String, LongAdder> resolutionFailuresByIndex = new ConcurrentHashMap<>();
     private volatile boolean orphanSweepDone;
 
     /**
@@ -254,18 +259,30 @@ public final class LanceLocalClones implements ClusterStateListener {
      * was handed. Otherwise the clone is ensured at {@code requestedVersion}
      * (the source version the coordinator resolved) or, when none was
      * shipped, at the recorded clone's version, falling back to the
-     * source's latest version for a first contact on this node.
+     * source's latest version for a first contact on this node. A node
+     * that has no clone yet gets one here (metadata only, without the
+     * search indexes a build later adds), which is the state a data node
+     * that joined after the build is in.
      *
-     * <p>A failure to clone logs and returns empty so the read falls back
-     * to the source: data reads on the source always work, only the
-     * clone-built indexes are missing there.
+     * <p>A failure to resolve the clone (an unreadable clone directory, a
+     * marker that cannot be rewritten, a source that cannot be opened for
+     * the shallow clone) is counted under {@link #resolutionFailures()}
+     * and thrown as an {@link IOException}, so the request fails instead
+     * of reading the source: the clone can carry full text and vector
+     * indexes the source does not have, and a read of the source would
+     * answer differently (a 400 for the missing index, or hits over
+     * another index coverage) without anything in the response saying so.
+     *
+     * @throws IOException when the clone exists on paper but cannot be
+     *     resolved; the message names the index, the clone directory and
+     *     the cause
      */
     public Optional<CloneLocation> locateForRead(
         String indexUuid,
         String tableUri,
         StorageOptions storageOptions,
         Optional<Long> requestedVersion
-    ) {
+    ) throws IOException {
         if (clusterService == null) {
             return Optional.empty();
         }
@@ -289,9 +306,33 @@ public final class LanceLocalClones implements ClusterStateListener {
             }
             return Optional.of(ensure(indexName, tableUri, storageOptions, target, false));
         } catch (Exception e) {
-            LOG.warn("lance.index_placement: could not resolve the node-local clone of [{}]; reading the source", tableUri, e);
-            return Optional.empty();
+            resolutionFailures.increment();
+            resolutionFailuresByIndex.computeIfAbsent(indexName, k -> new LongAdder()).increment();
+            String message = "lance.index_placement: could not resolve the node-local clone of index ["
+                + indexName
+                + "] under ["
+                + indexDir(indexName)
+                + "] for table ["
+                + tableUri
+                + "]: "
+                + e;
+            LOG.warn(message, e);
+            throw new IOException(message, e);
         }
+    }
+
+    /** Reads of a {@code node_local} index whose clone could not be resolved since the node started, over every index. */
+    public long resolutionFailures() {
+        return resolutionFailures.sum();
+    }
+
+    /** {@link #resolutionFailures()} per index name, in index name order; an index that never failed is absent. */
+    public Map<String, Long> resolutionFailuresByIndex() {
+        Map<String, Long> counts = new TreeMap<>();
+        for (Map.Entry<String, LongAdder> entry : resolutionFailuresByIndex.entrySet()) {
+            counts.put(entry.getKey(), entry.getValue().sum());
+        }
+        return counts;
     }
 
     /** Remove the clone directory of {@code indexName}, if any. */

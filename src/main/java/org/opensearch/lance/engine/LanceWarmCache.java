@@ -509,7 +509,9 @@ public final class LanceWarmCache implements Closeable {
         // indexes live) and the snapshot is keyed on that. A re-clone
         // (source version advance) retires every older snapshot of the
         // index so no request can be handed a snapshot whose dataset reads
-        // a deleted clone directory.
+        // a deleted clone directory. A clone that cannot be resolved fails
+        // the acquire (locateForRead throws); the source is read only for
+        // an index that is not node_local.
         LanceLocalClones clones = LanceLocalClones.instance();
         if (clones != null) {
             Optional<LanceLocalClones.CloneLocation> clone = clones.locateForRead(indexUuid, tableUri, storageOptions, version);
