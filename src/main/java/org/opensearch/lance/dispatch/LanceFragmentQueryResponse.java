@@ -79,36 +79,43 @@ import org.opensearch.search.aggregations.InternalAggregations;
  * optional block: an older coordinator steps over it and shows no
  * timings for the node. Version 3 added the columns the take scans
  * projected as a second optional block, read as zero by a coordinator
- * of version 2.
+ * of version 2. Version 4 added the Lance full text scans the request
+ * ran as a third optional block, read as zero by an older coordinator.
  */
 public final class LanceFragmentQueryResponse extends ActionResponse {
 
-    /** The wire format's version, the first field the response writes; 2 added the profile block, 3 the take columns block. */
-    public static final int WIRE_VERSION = 3;
+    /**
+     * The wire format's version, the first field the response writes; 2
+     * added the profile block, 3 the take columns block, 4 the full text
+     * scans block.
+     */
+    public static final int WIRE_VERSION = 4;
 
     /**
      * What one executor spent on a request: the query phase (from the
      * request reaching the executor to the page being collected, the
      * count and the aggregations included) and the fetch phase (the
-     * rows behind the hits materialised) in wall milliseconds, and the
+     * rows behind the hits materialised) in wall milliseconds, the
      * {@code _rowaddr IN (...)} take scans the request issued on the
      * executor, how many row addresses they carried, how many columns
      * they projected summed over the scans, and their wall time summed,
-     * whichever phase issued them. The first five figures travel in the
-     * version 2 block and the columns in the version 3 block, so a
-     * response from an executor of an older plugin version reads as
-     * {@link #NONE} or with zero columns.
+     * whichever phase issued them, and the Lance full text scans the
+     * request ran on the executor (the hits scans of its full text
+     * Weights and the count-only scans behind {@code hits.total}). The
+     * first five figures travel in the version 2 block, the columns in
+     * the version 3 block and the full text scans in the version 4
+     * block, so a response from an executor of an older plugin version
+     * reads as {@link #NONE} or with the later figures at zero.
      */
-    public record Profile(long queryMillis, long fetchMillis, long takeCount, long takeRows, long takeMillis, long takeColumns)
-        implements
-            Writeable {
+    public record Profile(long queryMillis, long fetchMillis, long takeCount, long takeRows, long takeMillis, long takeColumns,
+        long ftsScans) implements Writeable {
 
         /** What an executor that does not report timings stands for: every figure zero. */
-        public static final Profile NONE = new Profile(0L, 0L, 0L, 0L, 0L, 0L);
+        public static final Profile NONE = new Profile(0L, 0L, 0L, 0L, 0L, 0L, 0L);
 
-        /** The version 2 block: the five figures before the take columns existed; {@code takeColumns} stays zero. */
+        /** The version 2 block: the five figures before the take columns existed; {@code takeColumns} and {@code ftsScans} stay zero. */
         public Profile(StreamInput in) throws IOException {
-            this(in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), 0L);
+            this(in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), 0L, 0L);
         }
 
         /** The version 2 block: the five figures before the take columns existed. */
@@ -123,7 +130,12 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
 
         /** This profile with {@code takeColumns} in place of its own, for the version 3 block read after the version 2 one. */
         public Profile withTakeColumns(long takeColumns) {
-            return new Profile(queryMillis, fetchMillis, takeCount, takeRows, takeMillis, takeColumns);
+            return new Profile(queryMillis, fetchMillis, takeCount, takeRows, takeMillis, takeColumns, ftsScans);
+        }
+
+        /** This profile with {@code ftsScans} in place of its own, for the version 4 block read after the version 3 one. */
+        public Profile withFtsScans(long ftsScans) {
+            return new Profile(queryMillis, fetchMillis, takeCount, takeRows, takeMillis, takeColumns, ftsScans);
         }
 
         /** The figures of this and {@code other} added, for the responses one node returned to one request. */
@@ -134,7 +146,8 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
                 takeCount + other.takeCount,
                 takeRows + other.takeRows,
                 takeMillis + other.takeMillis,
-                takeColumns + other.takeColumns
+                takeColumns + other.takeColumns,
+                ftsScans + other.ftsScans
             );
         }
     }
@@ -238,7 +251,8 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         this.aggregations = in.readBoolean() ? InternalAggregations.readFrom(in) : null;
         this.terminatedEarly = in.readOptionalBoolean();
         Profile timings = reader.block(2, Profile::new, Profile.NONE);
-        this.profile = timings.withTakeColumns(reader.block(3, StreamInput::readVLong, 0L));
+        this.profile = timings.withTakeColumns(reader.block(3, StreamInput::readVLong, 0L))
+            .withFtsScans(reader.block(4, StreamInput::readVLong, 0L));
         reader.finish();
     }
 
@@ -261,10 +275,12 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         }
         out.writeOptionalBoolean(terminatedEarly);
         // An older coordinator that steps over the timings still merges
-        // the hits and aggregations correctly, so both blocks are
-        // optional: the version 2 timings, then the version 3 columns.
+        // the hits and aggregations correctly, so every block is
+        // optional: the version 2 timings, then the version 3 columns,
+        // then the version 4 full text scans.
         WireVersion.writeBlock(out, false, profile);
         WireVersion.writeBlock(out, false, columns -> columns.writeVLong(profile.takeColumns()));
+        WireVersion.writeBlock(out, false, scans -> scans.writeVLong(profile.ftsScans()));
     }
 
     public long matched() {
