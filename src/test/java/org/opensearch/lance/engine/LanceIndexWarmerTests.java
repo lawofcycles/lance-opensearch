@@ -66,6 +66,13 @@ public class LanceIndexWarmerTests extends OpenSearchTestCase {
         allocator = new RootAllocator(Long.MAX_VALUE);
         cache = new LanceWarmCache(allocator, 64L * 1024 * 1024, 64, true);
         executor = Executors.newSingleThreadExecutor();
+        // The gate's in flight count, active scan count and retained
+        // pool are static. A test class that ran earlier in this JVM
+        // and admitted a ticketless scan without ending the request
+        // (a fetch take through a leaf reader, for one) leaves the
+        // count at one, and the pool then neither samples the probe's
+        // admission nor credits it. Start from the defaults.
+        ScanAdmissionTestSupport.reset();
         // No Session is installed here, so the gate would read a shard
         // share of zero and judge the full text probe on the host's
         // memory; a share the fixture's document set fits makes the
