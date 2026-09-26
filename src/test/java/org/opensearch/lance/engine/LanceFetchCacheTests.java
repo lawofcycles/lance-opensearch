@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.lucene.index.FieldInfo;
@@ -100,19 +101,20 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
         assertEquals("the large cell is not stored, the small one is", 1, cache.count());
         assertNull("a row with an unheld cell is not served", table.lookup(address(0, 1), List.of("id", "body")));
         assertArrayEquals(new Object[] { 1L }, table.lookup(address(0, 1), List.of("id")));
-        assertEquals("the key and the entry weigh with the value", 48L + 32L + 24L, cache.weight());
+        assertEquals("the key and the entry weigh with the value", 96L + 32L + 24L, cache.weight());
     }
 
     public void testEvictionAtTheLimitCountsAndKeepsTheWeightUnderIt() {
-        // Each Long cell weighs 48 (key) + 32 (entry) + 24 (value) = 104.
-        LanceFetchCache cache = new LanceFetchCache(104L * 10, 1024L, true, TimeValue.ZERO);
+        // Each Long cell weighs 96 (key and its index node) + 32 (entry) + 24 (value) = 152.
+        LanceFetchCache cache = new LanceFetchCache(152L * 10, 1024L, true, TimeValue.ZERO);
         LanceFetchCache.Table table = cache.table("uuid", 1L);
         for (int i = 0; i < 25; i++) {
             table.put(address(0, i), List.of("id"), new Object[] { (long) i });
         }
-        assertTrue("the weight stays at or under the limit: " + cache.weight(), cache.weight() <= 104L * 10);
+        assertTrue("the weight stays at or under the limit: " + cache.weight(), cache.weight() <= 152L * 10);
         assertEquals(10, cache.count());
         assertEquals(15L, cache.stats().evictions());
+        assertEquals("the evicted keys left the version index with the store", 10, cache.indexedCount("uuid", 1L));
     }
 
     public void testAPartialRowIsNotServedAndItsHeldCellsCountAsHits() {
@@ -145,7 +147,27 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
         assertEquals("every column counts as a hit", 3L, cache.hitCount());
         assertEquals(1L, cache.rowsServedCount());
         assertSame("a projection of one column is missing too", LanceFetchCache.MISSING_ROW, table.lookup(address(2, 9), List.of("body")));
-        assertEquals("the negative entries weigh their key and entry alone", 3L * (48L + 32L), cache.weight());
+        assertEquals("the negative entries weigh their key and entry alone", 3L * (96L + 32L), cache.weight());
+    }
+
+    public void testANegativeRowWithAnAbsentColumnIsNotServed() {
+        LanceFetchCache cache = cache();
+        LanceFetchCache.Table table = cache.table("uuid", 1L);
+        // A request that projected the key alone recorded the row missing
+        // under that column only; a wider request looks the others up first.
+        table.putMissing(address(2, 9), List.of("id"));
+        assertNull(
+            "a column absent before the negative entry: the row is taken",
+            table.lookup(address(2, 9), List.of("body", "id", "rating"))
+        );
+        assertEquals(0L, cache.rowsServedCount());
+        assertEquals("body missed, id hit, rating not looked at", 1L, cache.hitCount());
+        assertEquals(1L, cache.missCount());
+        // The take records the row missing under every column; the next
+        // lookup is served.
+        table.putMissing(address(2, 9), COLUMNS);
+        assertSame(LanceFetchCache.MISSING_ROW, table.lookup(address(2, 9), List.of("body", "id", "rating")));
+        assertEquals(1L, cache.rowsServedCount());
     }
 
     public void testInvalidatingAVersionDropsItsEntriesOnly() {
@@ -157,17 +179,74 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
         v2.put(address(0, 1), COLUMNS, new Object[] { 1L, "a", 1L });
         other.put(address(0, 1), COLUMNS, new Object[] { 1L, "a", 1L });
         assertEquals(9, cache.count());
+        assertEquals(3, cache.indexedVersions());
         assertEquals(3, cache.invalidate("uuid", 1L));
         assertEquals(6, cache.count());
+        assertEquals(0, cache.indexedCount("uuid", 1L));
+        assertEquals(2, cache.indexedVersions());
         assertNull(v1.lookup(address(0, 1), COLUMNS));
         assertNotNull(v2.lookup(address(0, 1), COLUMNS));
         assertNotNull(other.lookup(address(0, 1), COLUMNS));
         assertEquals(0, cache.invalidate("uuid", 1L));
         assertEquals(3, cache.invalidateIndexes(List.of("uuid")));
         assertEquals(3, cache.count());
+        assertEquals(1, cache.indexedVersions());
         assertNotNull(other.lookup(address(0, 1), COLUMNS));
         assertEquals(0, cache.invalidateIndexes(List.of()));
         assertEquals(6L, cache.stats().invalidations());
+    }
+
+    public void testInvalidatingOneOfManyVersionsTouchesThatVersionAlone() {
+        LanceFetchCache cache = new LanceFetchCache(64L * 1024 * 1024, 1024L, true, TimeValue.ZERO);
+        for (long version = 1; version <= 3; version++) {
+            LanceFetchCache.Table table = cache.table("uuid", version);
+            for (int i = 0; i < 1000; i++) {
+                table.put(address(i / 100, i % 100), List.of("id"), new Object[] { (long) i });
+            }
+            assertEquals(1000, cache.indexedCount("uuid", version));
+        }
+        assertEquals(3000, cache.count());
+        assertEquals(3, cache.indexedVersions());
+
+        assertEquals(1000, cache.invalidate("uuid", 2L));
+        assertEquals(2000, cache.count());
+        assertEquals("the dropped version left the index", 0, cache.indexedCount("uuid", 2L));
+        assertEquals(2, cache.indexedVersions());
+        assertEquals(1000, cache.indexedCount("uuid", 1L));
+        assertEquals(1000, cache.indexedCount("uuid", 3L));
+        for (int i = 0; i < 1000; i++) {
+            long rowAddress = address(i / 100, i % 100);
+            assertArrayEquals(new Object[] { (long) i }, cache.table("uuid", 1L).lookup(rowAddress, List.of("id")));
+            assertArrayEquals(new Object[] { (long) i }, cache.table("uuid", 3L).lookup(rowAddress, List.of("id")));
+            assertNull(cache.table("uuid", 2L).lookup(rowAddress, List.of("id")));
+        }
+        assertEquals(1000L, cache.stats().invalidations());
+    }
+
+    public void testTheVersionIndexFollowsEveryWayAnEntryLeaves() {
+        // Ten Long cells fit: 152 each.
+        LanceFetchCache cache = new LanceFetchCache(152L * 10, 1024L, true, TimeValue.ZERO);
+        LanceFetchCache.Table v1 = cache.table("uuid", 1L);
+        LanceFetchCache.Table v2 = cache.table("uuid", 2L);
+        for (int i = 0; i < 10; i++) {
+            v1.put(address(0, i), List.of("id"), new Object[] { (long) i });
+        }
+        assertEquals(10, cache.indexedCount("uuid", 1L));
+        // The eleventh entry, of another version, evicts the least
+        // recently used one of the first: the index lets it go too.
+        v2.put(address(0, 0), List.of("id"), new Object[] { 0L });
+        assertEquals(10, cache.count());
+        assertEquals(1L, cache.stats().evictions());
+        assertEquals(9, cache.indexedCount("uuid", 1L));
+        assertEquals(1, cache.indexedCount("uuid", 2L));
+        // Storing a cell again replaces it and files it once.
+        v2.put(address(0, 0), List.of("id"), new Object[] { 7L });
+        assertEquals(1, cache.indexedCount("uuid", 2L));
+        assertArrayEquals(new Object[] { 7L }, v2.lookup(address(0, 0), List.of("id")));
+        // Turning the cache off empties the index with the store.
+        cache.setEnabled(false);
+        assertEquals(0, cache.count());
+        assertEquals(0, cache.indexedVersions());
     }
 
     public void testDisablingDropsEveryEntryAndCountsNothing() {
@@ -195,18 +274,22 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
         assertEquals(3, cache.count());
     }
 
-    public void testExpireDropsAnAgedEntryAsAnEvictionAndAMiss() throws Exception {
-        LanceFetchCache cache = new LanceFetchCache(1024L * 1024, 1024L, true, TimeValue.timeValueMillis(1));
+    public void testExpireDropsAnAgedEntryAsAnEvictionAndAMiss() {
+        AtomicLong nanos = new AtomicLong(1_000_000_000L);
+        LanceFetchCache cache = new LanceFetchCache(1024L * 1024, 1024L, true, TimeValue.timeValueMillis(1), nanos::get);
         LanceFetchCache.Table table = cache.table("uuid", 1L);
         table.put(address(0, 1), List.of("id"), new Object[] { 1L });
-        Thread.sleep(5);
+        nanos.addAndGet(TimeValue.timeValueMillis(1).nanos());
+        assertNotNull("an entry exactly as old as the expiry stays", table.lookup(address(0, 1), List.of("id")));
+        nanos.addAndGet(1L);
         assertNull(table.lookup(address(0, 1), List.of("id")));
         assertEquals(1L, cache.stats().evictions());
         assertEquals(1L, cache.stats().misses());
         assertEquals(0, cache.count());
+        assertEquals("the expired entry left the version index", 0, cache.indexedCount("uuid", 1L));
         cache.setExpire(TimeValue.ZERO);
         table.put(address(0, 1), List.of("id"), new Object[] { 1L });
-        Thread.sleep(5);
+        nanos.addAndGet(TimeValue.timeValueHours(1).nanos());
         assertNotNull("without an expiry the entry stays", table.lookup(address(0, 1), List.of("id")));
     }
 
@@ -218,8 +301,8 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
         table.lookup(address(0, 2), List.of("id"));
         table.skipped(3);
         LanceNodeStats.FetchCacheStats stats = cache.stats();
-        assertEquals(new LanceNodeStats.FetchCacheStats(true, 104L, 4096L, 1, 1L, 1L, 0L, 0L, 3L, 1L), stats);
-        assertEquals("LanceFetchCache[entries=1, bytes=104, limit=4096]", cache.toString());
+        assertEquals(new LanceNodeStats.FetchCacheStats(true, 152L, 4096L, 1, 1L, 1L, 0L, 0L, 3L, 1L), stats);
+        assertEquals("LanceFetchCache[entries=1, bytes=152, limit=4096]", cache.toString());
     }
 
     /**

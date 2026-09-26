@@ -12,8 +12,10 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.LongAdder;
-import java.util.function.Predicate;
+import java.util.function.LongSupplier;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -76,9 +78,12 @@ import org.opensearch.lance.stats.LanceNodeStats;
  * long text column or a wide struct takes the room it uses and the
  * eviction keeps the budget honest. A cell above
  * {@code lance.fetch_cache.max_entry_size} is not stored; its row is
- * then taken on every request. The cache is per node: two data nodes
- * that execute the same fragment (after the node list changed) each
- * take and hold their own copy.
+ * then taken on every request. Next to the store, the cache keeps the
+ * keys of every {@code (index uuid, version)} it holds
+ * ({@link #keysByVersion}), so dropping a version or an index touches
+ * that version's entries alone and never walks the store. The cache is
+ * per node: two data nodes that execute the same fragment (after the
+ * node list changed) each take and hold their own copy.
  */
 public final class LanceFetchCache implements ClusterStateListener {
 
@@ -99,36 +104,46 @@ public final class LanceFetchCache implements ClusterStateListener {
 
         /**
          * The heap the key costs: the record with two longs and two
-         * references. The strings are shared with the snapshot key and
-         * the schema, so they are not counted again.
+         * references, and the node that files it in
+         * {@link #keysByVersion}. The strings are shared with the
+         * snapshot key and the schema, so they are not counted again.
          */
         static long weight() {
-            return 48L;
+            return 48L + 48L;
         }
+
+        /** The table version this cell belongs to, under which {@link #keysByVersion} files it. */
+        TableVersion tableVersion() {
+            return new TableVersion(indexUuid, version);
+        }
+    }
+
+    /** One table version: what a snapshot closes and what an index deletion drops, version by version. */
+    record TableVersion(String indexUuid, long version) {
     }
 
     /**
      * One held cell: the decoded value (null for an Arrow null), the
-     * estimate of its heap, and when it was stored, for
-     * {@code lance.fetch_cache.expire}. {@link #MISSING} stands for a
-     * row the take did not return.
+     * estimate of its heap, and when it was stored on the cache's clock,
+     * for {@code lance.fetch_cache.expire}. {@link #MISSING} stands for
+     * a row the take did not return.
      */
     static final class Entry {
         static final Entry MISSING = new Entry(null, 0L, 0L, true);
 
         final Object value;
         final long bytes;
-        final long storedAtMillis;
+        final long storedAtNanos;
         final boolean missing;
 
-        Entry(Object value, long bytes, long storedAtMillis) {
-            this(value, bytes, storedAtMillis, false);
+        Entry(Object value, long bytes, long storedAtNanos) {
+            this(value, bytes, storedAtNanos, false);
         }
 
-        private Entry(Object value, long bytes, long storedAtMillis, boolean missing) {
+        private Entry(Object value, long bytes, long storedAtNanos, boolean missing) {
             this.value = value;
             this.bytes = bytes;
-            this.storedAtMillis = storedAtMillis;
+            this.storedAtNanos = storedAtNanos;
             this.missing = missing;
         }
 
@@ -167,8 +182,11 @@ public final class LanceFetchCache implements ClusterStateListener {
          * {@link #MISSING_ROW} when the cache knows the take did not
          * return the row; null when at least one column is not held (a
          * miss, per column). Every column looked up counts as a hit or
-         * a miss; a row found whole or found missing counts as served.
-         * Null when the cache is disabled, without counting.
+         * a miss; a row found whole or found missing counts as served,
+         * a row with an absent column does not, even when a later
+         * column says the row is missing: that row is taken whole and
+         * the take records it missing under every column. Null when the
+         * cache is disabled, without counting.
          */
         public Object[] lookup(long rowAddress, List<String> columns) {
             if (!enabled || columns.isEmpty()) {
@@ -183,6 +201,9 @@ public final class LanceFetchCache implements ClusterStateListener {
                     continue;
                 }
                 if (entry.missing) {
+                    if (absent > 0) {
+                        return null;
+                    }
                     // The row was not in the table at this version, so no
                     // column of it is: the columns not looked at yet are
                     // hits as well.
@@ -209,7 +230,7 @@ public final class LanceFetchCache implements ClusterStateListener {
             if (!enabled) {
                 return;
             }
-            long now = System.currentTimeMillis();
+            long now = clock.getAsLong();
             for (int c = 0; c < columns.size() && c < row.length; c++) {
                 long bytes = weightOf(row[c]);
                 if (bytes > maxEntryBytes) {
@@ -221,7 +242,7 @@ public final class LanceFetchCache implements ClusterStateListener {
                     );
                     continue;
                 }
-                cache.put(new Key(indexUuid, version, rowAddress, columns.get(c)), new Entry(row[c], bytes, now));
+                store(new Key(indexUuid, version, rowAddress, columns.get(c)), new Entry(row[c], bytes, now));
             }
         }
 
@@ -231,7 +252,7 @@ public final class LanceFetchCache implements ClusterStateListener {
                 return;
             }
             for (String column : columns) {
-                cache.put(new Key(indexUuid, version, rowAddress, column), Entry.MISSING);
+                store(new Key(indexUuid, version, rowAddress, column), Entry.MISSING);
             }
         }
 
@@ -249,10 +270,19 @@ public final class LanceFetchCache implements ClusterStateListener {
     }
 
     private final Cache<Key, Entry> cache;
+    /**
+     * The keys held, filed under their table version, kept in step with
+     * the store: {@link #store} files a key before it goes in, and the
+     * store's removal listener unfiles it when it leaves for any reason
+     * but a replacement (the same key, filed already). Dropping a version
+     * takes its set out and invalidates those keys alone.
+     */
+    private final ConcurrentMap<TableVersion, Set<Key>> keysByVersion = new ConcurrentHashMap<>();
     private final long limitBytes;
     private final long maxEntryBytes;
+    private final LongSupplier clock;
     private volatile boolean enabled;
-    private volatile long expireMillis;
+    private volatile long expireNanos;
     private final LongAdder hits = new LongAdder();
     private final LongAdder misses = new LongAdder();
     private final LongAdder evictions = new LongAdder();
@@ -267,19 +297,55 @@ public final class LanceFetchCache implements ClusterStateListener {
      * @param expire        the initial {@code lance.fetch_cache.expire}; zero or null for none
      */
     public LanceFetchCache(long limitBytes, long maxEntryBytes, boolean enabled, TimeValue expire) {
+        this(limitBytes, maxEntryBytes, enabled, expire, System::nanoTime);
+    }
+
+    /**
+     * A cache that reads the age of its entries off {@code clock}, a
+     * monotonic nanosecond source, so a test can age an entry without
+     * waiting.
+     */
+    LanceFetchCache(long limitBytes, long maxEntryBytes, boolean enabled, TimeValue expire, LongSupplier clock) {
         this.limitBytes = limitBytes;
         this.maxEntryBytes = maxEntryBytes;
         this.enabled = enabled;
-        this.expireMillis = expire == null ? 0L : expire.millis();
+        this.expireNanos = expire == null ? 0L : expire.nanos();
+        this.clock = clock;
         this.cache = CacheBuilder.<Key, Entry>builder()
             .setMaximumWeight(limitBytes)
             .weigher((key, entry) -> Key.weight() + entry.weight())
             .removalListener(notification -> {
-                if (notification.getRemovalReason() == RemovalReason.EVICTED) {
+                RemovalReason reason = notification.getRemovalReason();
+                if (reason == RemovalReason.REPLACED) {
+                    return;
+                }
+                if (reason == RemovalReason.EVICTED) {
                     evictions.increment();
                 }
+                unfile(notification.getKey());
             })
             .build();
+    }
+
+    /** Files {@code key} under its version, then stores it. */
+    private void store(Key key, Entry entry) {
+        // The set is filled inside the map's compute so the unfiling of
+        // a concurrent removal, which drops an emptied set, cannot slip
+        // between fetching the set and adding to it.
+        keysByVersion.compute(key.tableVersion(), (version, keys) -> {
+            Set<Key> set = keys == null ? ConcurrentHashMap.newKeySet() : keys;
+            set.add(key);
+            return set;
+        });
+        cache.put(key, entry);
+    }
+
+    /** Takes {@code key} out of its version's set, and the set out of the map when it is the last. */
+    private void unfile(Key key) {
+        keysByVersion.computeIfPresent(key.tableVersion(), (version, keys) -> {
+            keys.remove(key);
+            return keys.isEmpty() ? null : keys;
+        });
     }
 
     /** The view of the table version {@code key} names. */
@@ -307,13 +373,13 @@ public final class LanceFetchCache implements ClusterStateListener {
 
     /** Applies {@code lance.fetch_cache.expire}; zero keeps entries until their version is dropped or they are evicted. */
     public void setExpire(TimeValue expire) {
-        this.expireMillis = expire == null ? 0L : expire.millis();
+        this.expireNanos = expire == null ? 0L : expire.nanos();
     }
 
     /** The entry under {@code key}, or null; an expired entry is dropped and counts as a miss and an eviction. */
     Entry get(Key key) {
         Entry entry = cache.get(key);
-        if (entry != null && expireMillis > 0L && !entry.missing && System.currentTimeMillis() - entry.storedAtMillis > expireMillis) {
+        if (entry != null && expireNanos > 0L && !entry.missing && clock.getAsLong() - entry.storedAtNanos > expireNanos) {
             cache.invalidate(key, entry);
             evictions.increment();
             entry = null;
@@ -385,9 +451,11 @@ public final class LanceFetchCache implements ClusterStateListener {
      * Drops every entry of {@code indexUuid} at {@code version} and
      * returns how many were dropped; each counts as an invalidation. The
      * snapshot cache calls this when the snapshot of that version closes.
+     * The cost is the number of entries of that version, not the size of
+     * the cache.
      */
     public int invalidate(String indexUuid, long version) {
-        return invalidateMatching(key -> key.indexUuid().equals(indexUuid) && key.version() == version);
+        return invalidateVersion(new TableVersion(indexUuid, version));
     }
 
     /**
@@ -399,23 +467,50 @@ public final class LanceFetchCache implements ClusterStateListener {
             return 0;
         }
         Set<String> uuids = Set.copyOf(indexUuids);
-        return invalidateMatching(key -> uuids.contains(key.indexUuid()));
-    }
-
-    private int invalidateMatching(Predicate<Key> matches) {
-        // The keys are collected before anything is invalidated: the
-        // cache's key iteration is undefined under a concurrent mutation.
-        List<Key> matching = new ArrayList<>();
-        for (Key key : cache.keys()) {
-            if (matches.test(key)) {
-                matching.add(key);
+        // The versions are collected before anything is invalidated: the
+        // map's key iteration is weakly consistent under a mutation.
+        List<TableVersion> matching = new ArrayList<>();
+        for (TableVersion tableVersion : keysByVersion.keySet()) {
+            if (uuids.contains(tableVersion.indexUuid())) {
+                matching.add(tableVersion);
             }
         }
-        for (Key key : matching) {
-            cache.invalidate(key);
+        int dropped = 0;
+        for (TableVersion tableVersion : matching) {
+            dropped += invalidateVersion(tableVersion);
         }
-        invalidations.add(matching.size());
-        return matching.size();
+        return dropped;
+    }
+
+    /**
+     * Takes the version's set out of the index, then invalidates the
+     * keys it held. The removal listener finds no set to unfile them
+     * from, and a put of the same version that lands meanwhile files a
+     * new set, which its own version drop or the eviction takes care of.
+     */
+    private int invalidateVersion(TableVersion tableVersion) {
+        Set<Key> keys = keysByVersion.remove(tableVersion);
+        if (keys == null) {
+            return 0;
+        }
+        int dropped = 0;
+        for (Key key : keys) {
+            cache.invalidate(key);
+            dropped++;
+        }
+        invalidations.add(dropped);
+        return dropped;
+    }
+
+    /** The keys the index files under {@code indexUuid} at {@code version}: how many entries a drop of that version touches. */
+    int indexedCount(String indexUuid, long version) {
+        Set<Key> keys = keysByVersion.get(new TableVersion(indexUuid, version));
+        return keys == null ? 0 : keys.size();
+    }
+
+    /** How many table versions the index files keys under. */
+    int indexedVersions() {
+        return keysByVersion.size();
     }
 
     /** Drops the entries of every index that left the cluster state. */
