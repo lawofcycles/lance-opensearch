@@ -64,7 +64,10 @@ import org.opensearch.transport.client.Client;
  * a preflight, and a {@code PutMapping} is sent only when the merged
  * mapping is not the current one. Then the shard is refreshed, which is
  * where the engine swaps its reader to the new version, and the snapshots
- * of the version left behind are retired. A pinned index
+ * of the version left behind are retired. The planner's table statistics
+ * of the version about to be served are collected in the background
+ * from the first check and from every move, so the requests this node
+ * coordinates find them. A pinned index
  * ({@code index.lance.version}) never advances and is not tracked. A
  * {@code node_local} index only has its reader advanced; its mapping is
  * maintained by the build action from the clones.
@@ -163,6 +166,8 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         volatile Scheduler.Cancellable task;
         /** Whether a check has derived the mapping since the shard started; guarded by the entry's monitor. */
         boolean derivedOnce;
+        /** Whether a check has started the table statistics collection since the shard started; guarded by the entry's monitor. */
+        boolean statisticsRequested;
 
         Tracked(TrackedShard shard) {
             this.shard = shard;
@@ -360,6 +365,9 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         long served = nodeLocal ? nodeLocalServedVersion(indexName, shard) : shard.servedVersion();
         long target;
         boolean moved;
+        // The table URI as Lance spells it, the key the statistics cache
+        // and the coordinator's lookup share.
+        String tableKey;
         RestAttachAction.Derivation derivation = null;
         // One open of the latest manifest answers both questions: the
         // latest version for a latest following index, and the version
@@ -367,6 +375,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         // table's refs, readable from any checkout).
         try (Dataset latest = LanceRegistry.openDataset(table, storageOptions)) {
             long latestVersion = latest.version();
+            tableKey = latest.uri();
             if (tag == null) {
                 target = latestVersion;
                 moved = target > served;
@@ -414,6 +423,22 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             } else {
                 LOG.info("tag {} on table {} now points at version {} (serving {}), refreshing {}", tag, table, target, served, indexName);
             }
+        }
+        // The planner's statistics of the version the shard is about to
+        // serve, collected on the generic pool ahead of the requests that
+        // plan against it. The engine's reader open starts the same
+        // collection when it builds the version's snapshot; this call is
+        // what starts it when the snapshot cache is disabled, and it is a
+        // no-op when the version is held or already being collected.
+        if (warmCache != null && (moved || !entry.statisticsRequested)) {
+            entry.statisticsRequested = true;
+            long statisticsVersion = target;
+            warmCache.tableStatistics()
+                .prefetch(
+                    tableKey,
+                    statisticsVersion,
+                    () -> LanceRegistry.openDataset(table, storageOptions, Optional.of(statisticsVersion))
+                );
         }
         boolean mappingChanged = false;
         String mappingError = null;

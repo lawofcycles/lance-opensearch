@@ -13,6 +13,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 import org.apache.arrow.memory.RootAllocator;
@@ -147,6 +148,70 @@ public class TableStatisticsCacheTests extends OpenSearchTestCase {
         assertNotNull("the first lookup after the prefetch hits", cache.lookup(tableUri, version, openerAt(version)));
         assertEquals(1L, cache.hitCount());
         assertEquals(0L, cache.missCount());
+    }
+
+    public void testCollectIfAbsentOpensTheTableOnceAndSkipsAHeldOrPendingVersion() {
+        DeferredExecutor executor = new DeferredExecutor();
+        TableStatisticsCache cache = new TableStatisticsCache(TableStatisticsCache.DEFAULT_MAX_ENTRIES, executor);
+        long version;
+        String tableUri;
+        try (Dataset dataset = open()) {
+            version = dataset.version();
+            tableUri = dataset.uri();
+        }
+        AtomicInteger opens = new AtomicInteger();
+        Supplier<Dataset> counting = () -> {
+            opens.incrementAndGet();
+            return open();
+        };
+
+        // The caller knows the table, not the version: nothing is
+        // opened on its thread and nothing is pending until the open
+        // on the executor has answered the version.
+        cache.collectIfAbsent(uri, counting);
+        assertEquals(0, opens.get());
+        assertEquals(0, cache.pendingCount());
+        assertEquals("one task was queued", 1, executor.queued.size());
+        executor.runAll();
+        assertEquals("the open that answered the version served the collection", 1, opens.get());
+        assertEquals(0, cache.pendingCount());
+        assertEquals(1L, cache.collectCount());
+        assertEquals("a collection started ahead of the plans is not a plan without statistics", 0L, cache.missCount());
+        assertNotNull(cache.peek(tableUri, version));
+
+        // The version is held: the open answers it and nothing is collected.
+        cache.collectIfAbsent(uri, counting);
+        executor.runAll();
+        assertEquals(2, opens.get());
+        assertEquals(1L, cache.collectCount());
+        assertEquals(1, cache.size());
+
+        // The version is pending under a lookup's collection when the
+        // open answers it: nothing is collected twice. The open runs
+        // first here, while the lookup's collection is still queued.
+        deleteRow(1);
+        long next;
+        try (Dataset dataset = open()) {
+            next = dataset.version();
+        }
+        assertNull(cache.lookup(tableUri, next, openerAt(next)));
+        assertEquals(1, cache.pendingCount());
+        cache.collectIfAbsent(uri, counting);
+        assertEquals("the lookup's collection and the open are queued", 2, executor.queued.size());
+        executor.queued.pollLast().run();
+        assertEquals(3, opens.get());
+        assertEquals("the open found the version pending and collected nothing", 1L, cache.collectCount());
+        assertEquals(1, cache.pendingCount());
+        executor.runAll();
+        assertEquals(2L, cache.collectCount());
+        assertEquals(0, cache.pendingCount());
+        assertEquals(199L, cache.peek(tableUri, next).rowCount());
+
+        // An open that fails is a failed collection: counted, nothing stored.
+        cache.collectIfAbsent(uri, () -> { throw new IllegalStateException("table gone"); });
+        executor.runAll();
+        assertEquals(1L, cache.failureCount());
+        assertEquals(2, cache.size());
     }
 
     public void testAFailedCollectionLeavesTheKeyFreeForTheNextLookup() {
