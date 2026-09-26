@@ -26,8 +26,12 @@ import org.opensearch.action.ActionType;
 import org.opensearch.action.admin.indices.create.CreateIndexAction;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.delete.DeleteIndexAction;
+import org.opensearch.action.admin.indices.mapping.get.GetMappingsAction;
+import org.opensearch.action.admin.indices.mapping.get.GetMappingsRequest;
+import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.action.admin.indices.mapping.put.PutMappingAction;
 import org.opensearch.action.admin.indices.mapping.put.PutMappingRequest;
+import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.common.settings.MockSecureSettings;
 import org.opensearch.common.settings.Settings;
@@ -420,6 +424,59 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         assertTrue(service.stats().mappingErrors().isEmpty());
     }
 
+    public void testDriftDetectionThatCannotReadTheMappingCountsAsAFailure() throws Exception {
+        // The drift detector reads the mapping's field meta on every
+        // derivation. When that read fails the check still completes
+        // (the reader advances, the derived mapping is compared), but
+        // the drift of that version goes undetected, which the stats
+        // count as a failure of the check.
+        String tableUri = writeTable("driftread");
+        FakeShard shard = FakeShard.overTable("driftread", tableUri, Settings.EMPTY);
+        LanceIndexFreshnessService.Tracked entry = service.track(shard);
+        client.failing = GetMappingsAction.NAME;
+
+        LanceIndexFreshnessService.Outcome outcome = service.check(entry);
+        assertTrue("the check itself completes", outcome.checked());
+        assertFalse(outcome.mappingChanged());
+        assertEquals(1, client.count(GetMappingsAction.NAME));
+        assertEquals("the unreadable mapping is a failure", 1, service.stats().failures());
+
+        // A check that derives nothing does not run the detector, so no
+        // further failure; the next derivation runs it again.
+        client.failing = null;
+        service.check(entry);
+        assertEquals(1, service.stats().failures());
+        LanceTableFactory.appendRows(tableUri, 6, 2);
+        service.check(entry);
+        assertEquals(2, client.count(GetMappingsAction.NAME));
+        assertEquals(1, service.stats().failures());
+    }
+
+    public void testDriftDetectionThatCannotMarkADroppedFieldCountsAsAFailure() throws Exception {
+        // The mapping names a field whose Lance field id the table no
+        // longer has: a drop. The detector sends one PutMapping to mark
+        // it lance_dropped; when the cluster manager refuses it, the
+        // stale name stays unmarked and the stats count the failure.
+        String tableUri = writeTable("driftmark");
+        FakeShard shard = FakeShard.overTable("driftmark", tableUri, Settings.EMPTY);
+        LanceIndexFreshnessService.Tracked entry = service.track(shard);
+        client.mappingSource = Map.of(
+            "properties",
+            Map.of("gone", Map.of("type", "long", "meta", Map.of("lance_field_id", "999", "lance_arrow_type", "Int(64, true)")))
+        );
+        client.failing = PutMappingAction.NAME;
+
+        LanceIndexFreshnessService.Outcome outcome = service.check(entry);
+        assertTrue(outcome.checked());
+        assertFalse("the check's own mapping comparison found nothing to send", outcome.mappingChanged());
+        assertNull("the refused update is the detector's, not the derivation's", outcome.mappingError());
+        assertEquals("the detector sent the one PutMapping", 1, client.count(PutMappingAction.NAME));
+        PutMappingRequest sent = (PutMappingRequest) client.requests(PutMappingAction.NAME).get(0);
+        assertTrue("the update marks the stale name: " + sent.source(), sent.source().contains("\"lance_dropped\":\"true\""));
+        assertEquals(1, service.stats().failures());
+        assertTrue("the detector's refusal is not a refused derivation", service.stats().mappingErrors().isEmpty());
+    }
+
     private static String writeTable(String hint) throws Exception {
         Path dir = createTempDir();
         String name = "demo-" + hint.toLowerCase(Locale.ROOT) + "-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
@@ -518,17 +575,24 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         }
     }
 
-    /** A no-op client that records the requests it receives, and fails the one action named in {@link #failing}. */
+    /**
+     * A no-op client that records the requests it receives, fails the one
+     * action named in {@link #failing}, and answers a mapping read with
+     * {@link #mappingSource} (an empty mapping when null) so the drift
+     * detector sees a real response instead of the no-op's null.
+     */
     private static final class RecordingClient extends NoOpClient {
         private final List<String> actionNames = new CopyOnWriteArrayList<>();
         private final List<ActionRequest> requests = new CopyOnWriteArrayList<>();
         volatile String failing;
+        volatile Map<String, Object> mappingSource;
 
         RecordingClient(ThreadPool threadPool) {
             super(threadPool);
         }
 
         @Override
+        @SuppressWarnings("unchecked")
         protected <Request extends ActionRequest, Response extends ActionResponse> void doExecute(
             ActionType<Response> action,
             Request request,
@@ -538,6 +602,12 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
             requests.add(request);
             if (action.name().equals(failing)) {
                 listener.onFailure(new IllegalStateException(action.name() + " refused: delete refused by the test client"));
+                return;
+            }
+            if (action.name().equals(GetMappingsAction.NAME)) {
+                String index = ((GetMappingsRequest) request).indices()[0];
+                Map<String, Object> source = mappingSource == null ? Map.of() : mappingSource;
+                listener.onResponse((Response) new GetMappingsResponse(Map.of(index, new MappingMetadata("_doc", source))));
                 return;
             }
             super.doExecute(action, request, listener);

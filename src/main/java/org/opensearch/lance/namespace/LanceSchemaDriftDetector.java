@@ -44,13 +44,22 @@ final class LanceSchemaDriftDetector {
     private static final Logger LOG = LogManager.getLogger(LanceSchemaDriftDetector.class);
 
     private final Client client;
+    /**
+     * Run once for every mapping read or mapping update the detection
+     * could not complete. Such a failure leaves the drift check for
+     * that version undone (a rename or drop is not marked, an override
+     * is not moved) while the freshness check proceeds, so the owner
+     * counts it among the check's failures.
+     */
+    private final Runnable onFailure;
     // Track rename warnings so a table that renamed the same field is not
     // logged on every check. Keyed by "indexName:fieldId:oldName->newName" so
     // the same rename fires once, but a later re-rename still warns.
     private final Set<String> warnedRenamed = ConcurrentHashMap.newKeySet();
 
-    LanceSchemaDriftDetector(Client client) {
+    LanceSchemaDriftDetector(Client client, Runnable onFailure) {
         this.client = client;
+        this.onFailure = onFailure;
     }
 
     /**
@@ -96,7 +105,12 @@ final class LanceSchemaDriftDetector {
         try {
             mappingFieldIds = readMappingFieldIds(indexName);
         } catch (Exception e) {
-            LOG.debug("could not inspect mapping meta for {}: {}", indexName, e.getMessage());
+            onFailure.run();
+            LOG.warn(
+                "could not inspect mapping meta for {}; overrides are not followed across schema drift this check: {}",
+                indexName,
+                e.getMessage()
+            );
             return stored;
         }
         Map<String, LanceField> lanceFieldsByName = new LinkedHashMap<>();
@@ -153,6 +167,7 @@ final class LanceSchemaDriftDetector {
             LOG.info("rewrote index.lance.overrides of {} after a Lance schema change: {}", indexName, rewritten.toJson());
             return rewritten;
         } catch (Exception e) {
+            onFailure.run();
             LOG.warn("could not persist rewritten overrides for {}: {}", indexName, e.getMessage());
             return stored;
         }
@@ -186,7 +201,8 @@ final class LanceSchemaDriftDetector {
         try {
             mappingFieldIds = readMappingFieldIds(indexName);
         } catch (Exception e) {
-            LOG.debug("could not inspect mapping meta for {}: {}", indexName, e.getMessage());
+            onFailure.run();
+            LOG.warn("could not inspect mapping meta for {}; schema drift is not detected this check: {}", indexName, e.getMessage());
             return;
         }
         if (mappingFieldIds.isEmpty()) {
@@ -315,10 +331,11 @@ final class LanceSchemaDriftDetector {
 
     /**
      * Persist {@code meta.lance_dropped = "true"} on each supplied field
-     * name via PutMapping. Silently no-ops when the underlying mapping
-     * update fails — the WARN log entries in the caller are the source of
-     * truth, this is a best-effort assist so custom Lance mappers can
-     * reject queries at the query builder layer.
+     * name via PutMapping. When the mapping update fails the stale names
+     * stay unmarked until a later check succeeds: the WARN entries the
+     * caller logged name the drift, and the failure is counted, but the
+     * custom Lance mappers cannot reject queries against the stale names
+     * at the query builder layer in the meantime.
      */
     private void markFieldsDropped(String indexName, Set<String> droppedNames, Map<Integer, MappingFieldInfo> mappingFieldIds) {
         try {
@@ -363,7 +380,8 @@ final class LanceSchemaDriftDetector {
                 .execute()
                 .actionGet();
         } catch (Exception e) {
-            LOG.debug("could not update lance_dropped meta on {}: {}", indexName, e.getMessage());
+            onFailure.run();
+            LOG.warn("could not mark {} as lance_dropped in the mapping of {}: {}", droppedNames, indexName, e.getMessage());
         }
     }
 
