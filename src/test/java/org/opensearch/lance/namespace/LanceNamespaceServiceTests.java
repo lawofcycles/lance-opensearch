@@ -15,6 +15,7 @@ import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.lance.namespace.model.DescribeTableResponse;
@@ -35,6 +36,7 @@ import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.client.NoOpClient;
+import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.threadpool.ThreadPoolStats;
@@ -87,6 +89,46 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
 
     public void testCadenceReturnsConstructorValue() {
         assertEquals(TimeValue.timeValueHours(1), service.cadence());
+    }
+
+    public void testCloseStopsTheScheduledPoll() throws Exception {
+        // The service schedules its poll at construction. Closing it
+        // cancels the schedule, so a plugin instance replaced within one
+        // JVM does not keep polling next to its successor.
+        AtomicInteger cycles = new AtomicInteger();
+        AtomicReference<Scheduler.Cancellable> scheduled = new AtomicReference<>();
+        ThreadPool counting = new TestThreadPool(getTestName() + "-counting") {
+            @Override
+            public Scheduler.Cancellable scheduleWithFixedDelay(Runnable command, TimeValue interval, String executor) {
+                Scheduler.Cancellable task = super.scheduleWithFixedDelay(() -> {
+                    cycles.incrementAndGet();
+                    command.run();
+                }, interval, executor);
+                scheduled.set(task);
+                return task;
+            }
+        };
+        try {
+            LanceNamespaceService polling = new LanceNamespaceService(
+                client,
+                clusterService,
+                counting,
+                TimeValue.timeValueMillis(20),
+                1_000_000L
+            );
+            assertNotNull("the poll was scheduled on the thread pool", scheduled.get());
+            assertBusy(() -> assertTrue("the poll fires at its cadence", cycles.get() >= 2));
+            polling.close();
+            assertTrue("close cancelled the schedule", scheduled.get().isCancelled());
+            // A cycle that was already running when the schedule was
+            // cancelled finishes; after that none fires.
+            Thread.sleep(100L);
+            int after = cycles.get();
+            Thread.sleep(200L);
+            assertEquals("no cycle fires after close", after, cycles.get());
+        } finally {
+            ThreadPool.terminate(counting, 30L, TimeUnit.SECONDS);
+        }
     }
 
     public void testNamespacesStartsEmpty() {

@@ -5,6 +5,7 @@
 
 package org.opensearch.lance.namespace;
 
+import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -27,6 +28,7 @@ import org.opensearch.action.admin.indices.create.CreateIndexResponse;
 import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.ClusterStateListener;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
@@ -40,6 +42,7 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.rest.RestAttachAction;
+import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 
@@ -60,7 +63,7 @@ import org.opensearch.transport.client.Client;
  * Iceberg REST, Polaris and Unity implementations for those catalog
  * servers, all built by {@link LanceNamespaceFactory}.
  */
-public final class LanceNamespaceService {
+public final class LanceNamespaceService implements Closeable {
 
     private static final Logger LOG = LogManager.getLogger(LanceNamespaceService.class);
 
@@ -115,6 +118,10 @@ public final class LanceNamespaceService {
     private final ThreadPool threadPool;
     /** Fragment path snapshot cache to retire from on index deletion, or {@code null}. */
     private final LanceWarmCache warmCache;
+    /** The scheduled poll, cancelled by {@link #close}. */
+    private final Scheduler.Cancellable pollTask;
+    /** The applier listener as registered, so {@link #close} can take it off the cluster service again. */
+    private final ClusterStateListener stateListener = this::onClusterStateChanged;
 
     public LanceNamespaceService(
         Client client,
@@ -180,8 +187,27 @@ public final class LanceNamespaceService {
         // builds handles itself on the generic pool. addListener
         // returns immediately; the listener body reads whatever state
         // is current when the applier fires.
-        clusterService.addListener(this::onClusterStateChanged);
-        threadPool.scheduleWithFixedDelay(this::poll, cadence, ThreadPool.Names.GENERIC);
+        clusterService.addListener(stateListener);
+        this.pollTask = threadPool.scheduleWithFixedDelay(this::poll, cadence, ThreadPool.Names.GENERIC);
+    }
+
+    /**
+     * Stops the scheduled poll, takes the applier listener off the
+     * cluster service and closes every namespace handle this node built.
+     * A handle close waits for the poll or preview call that may still be
+     * inside it. The plugin calls this when the node closes it, before
+     * the snapshot cache the poll retires from goes away.
+     */
+    @Override
+    public void close() {
+        pollTask.cancel();
+        clusterService.removeListener(stateListener);
+        for (String name : new ArrayList<>(namespaceCache.keySet())) {
+            LanceNamespaceHandle handle = namespaceCache.remove(name);
+            if (handle != null) {
+                closeQuietly(name, handle);
+            }
+        }
     }
 
     /**
