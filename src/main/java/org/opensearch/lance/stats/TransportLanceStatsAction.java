@@ -56,14 +56,15 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
      * Reflective handle on {@code IndexService.getReaderWrapper()}, the
      * same accessor the fragment query action resolves, held separately
      * so this action does not depend on the dispatch package's
-     * internals. A DLS/FLS reader wrapper hides columns from the
-     * request; Lance's {@code describeIndices} metadata and the
-     * mapping's rename entries do not pass through the wrapper, so the
-     * per-column index type report and the renamed field list are
-     * skipped whenever a wrapper is installed. Unlike the query path,
+     * internals. A DLS/FLS reader wrapper hides rows and columns from
+     * the request; the reader's {@code numDocs}, the table's row count,
+     * Lance's {@code describeIndices} metadata and the mapping's rename
+     * entries do not pass through the wrapper, so the row counts, the
+     * per-column index type report and the renamed field list are all
+     * withheld whenever a wrapper is installed. Unlike the query path,
      * stats must not refuse to load when the accessor is missing:
      * {@code null} here just means "cannot tell", which is treated as
-     * "wrapper present" and omits the report.
+     * "wrapper present" and withholds the figures.
      */
     private static final Method INDEX_SERVICE_GET_READER_WRAPPER = resolveReaderWrapperAccessor();
 
@@ -83,7 +84,7 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
      * Whether {@code indexService} has a reader wrapper installed (a
      * security plugin's DLS/FLS wrapper). Answers {@code true} when the
      * accessor is unavailable or throws, so the caller errs on the side
-     * of not revealing column metadata.
+     * of not revealing row counts and column metadata.
      */
     private static boolean hasReaderWrapper(IndexService indexService) {
         if (INDEX_SERVICE_GET_READER_WRAPPER == null) {
@@ -154,6 +155,8 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
      * {@link LanceDirectoryReader} behind a searcher acquired and released
      * here. A shard that is not started, or closes while the searcher is
      * being acquired, is left out rather than failing the node's stats.
+     * A shard whose index has a reader wrapper installed is reported
+     * with its counts withheld ({@link LanceNodeStats.IndexReaderStats#withheld}).
      */
     private List<LanceNodeStats.IndexReaderStats> indexReaderStats() {
         List<LanceNodeStats.IndexReaderStats> stats = new ArrayList<>();
@@ -171,21 +174,24 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
                     if (reader == null) {
                         continue;
                     }
-                    // Count through the searcher's reader chain, not the
-                    // Lance reader underneath it: a DLS / FLS wrapper the
-                    // index interposes filters through liveDocs, and the
-                    // caller's stats must not count rows the wrapper
-                    // hides. Only the table's rows outside a cut reader
-                    // have no wrapped figure; that one comes from Lance.
-                    //
+                    // Under a DLS / FLS reader wrapper the report carries
+                    // no row count, no index type and no rename for this
+                    // index: the reader's numDocs and the table's rows
+                    // are counted outside the wrapper, and Lance's
+                    // describeIndices metadata and the mapping's rename
+                    // entries name columns the wrapper may hide. Only
+                    // the Lucene bound flag, a property of the table's
+                    // size class, is reported.
+                    if (hasReaderWrapper(indexService)) {
+                        stats.add(LanceNodeStats.IndexReaderStats.withheld(shard.shardId().getIndexName(), reader.luceneBoundExceeded()));
+                        continue;
+                    }
                     // A table with nested columns inflates numDocs with
                     // one hidden child doc per nested element. The visible
-                    // parents are counted through the wrapped searcher with
-                    // the non nested filter (parents carry _primary_term
-                    // doc values, child docs do not), so a wrapper that
-                    // hides rows subtracts them from both figures; tables
-                    // without nested fields keep the plain numDocs and pay
-                    // for no count.
+                    // parents are counted with the non nested filter
+                    // (parents carry _primary_term doc values, child docs
+                    // do not); tables without nested fields keep the plain
+                    // numDocs and pay for no count.
                     long numDocs = searcher.getIndexReader().numDocs();
                     long shardReaderRows;
                     long nestedDocs;
@@ -199,32 +205,19 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
                     long rows = reader.luceneBoundExceeded() ? reader.tableRows() : shardReaderRows;
                     // One describeIndices on the reader's already-open
                     // dataset per index per stats call (indexes are
-                    // single-shard, so per shard is per index). Skipped
-                    // when a DLS/FLS reader wrapper is installed: the
-                    // Lance metadata does not pass through the wrapper,
-                    // and the report must not reveal column names the
-                    // wrapper hides. A describeIndices failure likewise
-                    // leaves the map empty rather than dropping the
-                    // reader's row figures.
-                    //
-                    // The mapping's rename entries are skipped for the
-                    // same reason: each one names the Lance source
-                    // column of a field the wrapper may hide.
-                    boolean wrapped = hasReaderWrapper(indexService);
+                    // single-shard, so per shard is per index). A
+                    // describeIndices failure leaves the map empty rather
+                    // than dropping the reader's row figures.
                     Map<String, List<String>> indexTypes;
-                    List<LanceMappingMeta.RenamedField> renamedFields;
-                    if (wrapped) {
+                    try {
+                        indexTypes = reader.columnIndexTypes();
+                    } catch (Exception e) {
+                        LOGGER.debug("lance.stats: describeIndices failed for {}: {}", shard.shardId(), e.toString());
                         indexTypes = Map.of();
-                        renamedFields = List.of();
-                    } else {
-                        try {
-                            indexTypes = reader.columnIndexTypes();
-                        } catch (Exception e) {
-                            LOGGER.debug("lance.stats: describeIndices failed for {}: {}", shard.shardId(), e.toString());
-                            indexTypes = Map.of();
-                        }
-                        renamedFields = LanceMappingMeta.renamedFields(indexService.getMetadata().mapping());
                     }
+                    List<LanceMappingMeta.RenamedField> renamedFields = LanceMappingMeta.renamedFields(
+                        indexService.getMetadata().mapping()
+                    );
                     stats.add(
                         new LanceNodeStats.IndexReaderStats(
                             shard.shardId().getIndexName(),
