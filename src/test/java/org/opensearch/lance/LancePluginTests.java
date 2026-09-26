@@ -5,9 +5,21 @@
 
 package org.opensearch.lance;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
+
+import org.opensearch.cluster.ClusterStateListener;
+import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
+import org.opensearch.common.util.concurrent.ThreadContext;
+import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.env.Environment;
+import org.opensearch.env.NodeEnvironment;
+import org.opensearch.env.TestEnvironment;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
@@ -20,10 +32,25 @@ import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.lance.query.LanceMultiMatchQueryBuilder;
 import org.opensearch.plugins.SearchPlugin.QuerySpec;
 import org.opensearch.test.OpenSearchTestCase;
+import org.opensearch.test.client.NoOpClient;
+import org.opensearch.threadpool.ExecutorBuilder;
+import org.opensearch.threadpool.TestThreadPool;
+import org.opensearch.threadpool.ThreadPool;
 
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
+/**
+ * The plugin's registrations (queries, actions, mapper, settings) and its
+ * lifecycle. Thread leak checking is off at the suite level because the
+ * lifecycle test installs a Lance session, whose native runtime threads
+ * cannot be shut down from Java.
+ */
+@ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class LancePluginTests extends OpenSearchTestCase {
 
     private LancePlugin plugin;
@@ -196,5 +223,64 @@ public class LancePluginTests extends OpenSearchTestCase {
                 .flatMap(builder -> builder.getRegisteredSettings().stream())
                 .anyMatch(s -> s.getKey().equals("thread_pool." + LanceIndexWarmer.THREAD_POOL + ".queue_size"))
         );
+    }
+
+    public void testCloseTakesEveryClusterStateListenerOffAgain() throws Exception {
+        // A node restart within one JVM (the test framework) builds a new
+        // plugin instance against a cluster service that outlives the
+        // old one. Every listener createComponents registers has to come
+        // off in close, or the closed instance's caches keep receiving
+        // state events.
+        Settings settings = Settings.builder().put("path.home", createTempDir()).build();
+        Set<Setting<?>> nodeSettings = new HashSet<>(ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
+        for (Setting<?> setting : plugin.getSettings()) {
+            if (setting.hasNodeScope()) {
+                nodeSettings.add(setting);
+            }
+        }
+        ThreadPool threadPool = new TestThreadPool(getTestName(), plugin.getExecutorBuilders(settings).toArray(new ExecutorBuilder<?>[0]));
+        AtomicInteger listeners = new AtomicInteger();
+        ClusterService clusterService = new ClusterService(settings, new ClusterSettings(settings, nodeSettings), threadPool) {
+            @Override
+            public void addListener(ClusterStateListener listener) {
+                listeners.incrementAndGet();
+                super.addListener(listener);
+            }
+
+            @Override
+            public void removeListener(ClusterStateListener listener) {
+                listeners.decrementAndGet();
+                super.removeListener(listener);
+            }
+        };
+        Environment environment = TestEnvironment.newEnvironment(settings);
+        try (
+            NoOpClient client = new NoOpClient(threadPool);
+            NodeEnvironment nodeEnvironment = newNodeEnvironment();
+            ClusterService ignored = clusterService
+        ) {
+            for (int round = 0; round < 2; round++) {
+                LancePlugin instance = new LancePlugin();
+                Collection<Object> components = instance.createComponents(
+                    client,
+                    clusterService,
+                    threadPool,
+                    null,
+                    null,
+                    NamedXContentRegistry.EMPTY,
+                    environment,
+                    nodeEnvironment,
+                    new NamedWriteableRegistry(List.of()),
+                    new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY)),
+                    () -> null
+                );
+                assertFalse(components.isEmpty());
+                assertTrue("round " + round + ": createComponents registered listeners", listeners.get() > 0);
+                instance.close();
+                assertEquals("round " + round + ": close took every listener off again", 0, listeners.get());
+            }
+        } finally {
+            ThreadPool.terminate(threadPool, 30L, TimeUnit.SECONDS);
+        }
     }
 }

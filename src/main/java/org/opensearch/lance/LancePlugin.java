@@ -15,8 +15,10 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.IndexWriter;
 import org.lance.Session;
+import org.opensearch.cluster.ClusterStateListener;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Setting;
@@ -1091,6 +1093,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     /** Served manifest version of every open Lance engine on this node, published by the engines. */
     private final LanceServedVersions servedVersions = new LanceServedVersions();
     private org.opensearch.threadpool.ThreadPool threadPool;
+    /** The node's cluster service, kept so {@link #close} can take the listeners registered in createComponents off it. */
+    private volatile ClusterService clusterService;
     private AllowedTableRoots allowedTableRoots;
     private LanceDispatchActionFilter dispatchActionFilter;
     private LanceCreateIndexActionFilter createIndexActionFilter;
@@ -1171,6 +1175,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Supplier<org.opensearch.repositories.RepositoriesService> repositoriesServiceSupplier
     ) {
         this.threadPool = threadPool;
+        this.clusterService = clusterService;
         TimeValue cadence = NAMESPACE_POLL_CADENCE_SETTING.get(environment.settings());
         long builderMaxRows = BUILDER_MAX_ROWS_SETTING.get(environment.settings());
         this.allowedTableRoots = new AllowedTableRoots(ALLOWED_TABLE_ROOTS_SETTING.get(environment.settings()));
@@ -1435,51 +1440,94 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LOGGER.info("lance_native circuit breaker poll interval updated to [{}]", newInterval);
     }
 
+    /**
+     * Closes what {@link #createComponents} built, in this order.
+     * <ol>
+     * <li>The background loops stop: the circuit breaker sampler, the
+     * namespace poll (with the namespace handles), the freshness checks
+     * and the warm-ups (which waits for a warm-up inside a Lance scan).
+     * Nothing starts new work against the caches from here on.</li>
+     * <li>The cluster state listeners come off the cluster service: the
+     * fetch cache, the request cache, the local clones and the warmer.
+     * A restart within one JVM (the test framework) would otherwise
+     * leave them attached to a cluster service the next plugin instance
+     * shares, and its state events would reach the closed instance.</li>
+     * <li>The request cache and the fetch cache drop their entries, and
+     * the node wide clone resolution point is unset.</li>
+     * <li>The snapshot cache closes: it waits for the leases requests
+     * still hold, closes every dataset, then the table statistics and
+     * the off heap column store.</li>
+     * <li>The shared Lance session is released, last, because the
+     * datasets closed above were opened against it.</li>
+     * </ol>
+     */
     @Override
     public void close() throws IOException {
-        // Cancel the polling loop before releasing the Session so the
-        // sampler can never observe a half-closed Session on its way
-        // out.
+        // 1. Background loops.
         Cancellable task = circuitBreakerPollTask;
         if (task != null) {
             task.cancel();
             circuitBreakerPollTask = null;
         }
-        // Stop the freshness checks before the caches they retire from
-        // and the session they open tables through go away.
+        LanceNamespaceService namespaces = namespaceService;
+        if (namespaces != null) {
+            namespaces.close();
+            namespaceService = null;
+        }
         LanceIndexFreshnessService freshness = freshnessService;
         if (freshness != null) {
             freshness.close();
             freshnessService = null;
         }
-        // Stop the warm-ups before their snapshots close under them.
         LanceIndexWarmer warmer = indexWarmer;
         if (warmer != null) {
             warmer.close();
-            indexWarmer = null;
         }
-        // Drop the node-wide clone resolution point so a test-framework
-        // restart within the same JVM does not resolve reads onto a
-        // previous node's clone directories.
-        if (localClones != null) {
+        // 2. Cluster state listeners.
+        ClusterService cluster = clusterService;
+        LanceRequestCache requests = requestCache;
+        LanceFetchCache fetches = fetchCache;
+        LanceLocalClones clones = localClones;
+        if (cluster != null) {
+            removeListener(cluster, fetches);
+            removeListener(cluster, requests);
+            removeListener(cluster, clones);
+            removeListener(cluster, warmer);
+            clusterService = null;
+        }
+        indexWarmer = null;
+        // 3. The coordinator's and the data nodes' heap caches, and the
+        // clone resolution point.
+        if (requests != null) {
+            requests.close();
+            requestCache = null;
+        }
+        if (fetches != null) {
+            fetches.close();
+            fetchCache = null;
+        }
+        if (clones != null) {
             LanceLocalClones.setInstance(null);
             localClones = null;
         }
-        // Close every cached snapshot (their datasets) and the column
-        // cache allocator before the Session goes away.
+        // 4. The snapshot cache: every dataset and the column store.
         LanceWarmCache cache = warmCache;
         if (cache != null) {
             ScanAdmission.setTableStatistics(null);
             cache.close();
             warmCache = null;
         }
-        // Release the shared native Session so a test-framework restart
-        // within the same JVM doesn't accumulate stale Session handles.
-        // Existing Dataset handles keep their own Arc reference to the
-        // underlying native session, so this call is safe even if some
-        // shards are still open at the moment of shutdown.
+        // 5. The shared native session. Dataset handles that are still
+        // open keep their own reference to the native session, so this
+        // is safe when a shard is still open at shutdown.
         LanceRegistry.closeSession();
         super.close();
+    }
+
+    private static void removeListener(ClusterService clusterService, ClusterStateListener listener) {
+        if (listener != null) {
+            clusterService.removeListener(listener);
+        }
     }
 
     @Override

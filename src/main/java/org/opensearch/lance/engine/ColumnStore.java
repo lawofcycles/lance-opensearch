@@ -304,7 +304,7 @@ public final class ColumnStore implements Closeable {
             hits.incrementAndGet();
             return new Loaded<>(found, Collections.emptyMap());
         }
-        Object lock = loadLocks.computeIfAbsent(snapshot.indexUuid() + '/' + snapshot.version() + '/' + column, k -> new Object());
+        Object lock = loadLocks.computeIfAbsent(loadLockPrefix(snapshot) + column, k -> new Object());
         synchronized (lock) {
             boolean handedOut = false;
             try {
@@ -875,7 +875,11 @@ public final class ColumnStore implements Closeable {
         return rounded;
     }
 
-    /** Drop every column of {@code snapshot}. Called when the snapshot closes, so nothing pins them. */
+    /**
+     * Drop every column of {@code snapshot}, and the load monitors of its
+     * columns: the snapshot closed, so nothing pins the columns and no
+     * request is inside a load of them.
+     */
     synchronized void dropSnapshot(SnapshotKey snapshot) {
         Iterator<Map.Entry<ColumnKey, StoreEntry>> it = columns.entrySet().iterator();
         while (it.hasNext()) {
@@ -885,6 +889,18 @@ public final class ColumnStore implements Closeable {
                 entry.getValue().close();
             }
         }
+        String prefix = loadLockPrefix(snapshot);
+        loadLocks.keySet().removeIf(key -> key.startsWith(prefix));
+    }
+
+    /** The part of a load monitor's key that names the snapshot; the column follows it. */
+    private static String loadLockPrefix(SnapshotKey snapshot) {
+        return snapshot.indexUuid() + '/' + snapshot.version() + '/';
+    }
+
+    /** Number of (snapshot, column) load monitors held, for tests. */
+    int loadLockCount() {
+        return loadLocks.size();
     }
 
     /** Off-heap bytes currently held, as the child allocator accounts them. */

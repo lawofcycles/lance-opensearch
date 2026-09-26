@@ -10,11 +10,17 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.lance.Dataset;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
@@ -353,5 +359,175 @@ public class LanceWarmCacheTests extends OpenSearchTestCase {
         assertTrue(snapshot.isClosed());
         assertEquals(0, cache.snapshotCount());
         cache = null;
+    }
+
+    public void testCloseWaitsForTheLeasesBeforeClosingTheDatasets() throws Exception {
+        // A request in the middle of a scan holds a lease. The close of
+        // the cache (the plugin closing with the node) must not pull the
+        // dataset from under it: it waits for the release, then closes.
+        Snapshot idle;
+        try (Lease lease = acquire(UUID_B, Optional.empty())) {
+            idle = lease.snapshot();
+        }
+        Lease held = acquire(UUID_A, Optional.empty());
+        Snapshot snapshot = held.snapshot();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread closer = new Thread(() -> {
+            try {
+                cache.close(30_000L);
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        }, getTestName() + "-closer");
+        closer.start();
+        assertBusy(() -> assertEquals("close has begun and retired what it will close", 0, cache.snapshotCount()));
+        assertTrue("close is waiting for the lease", closer.isAlive());
+        assertTrue("close retires what it will close", snapshot.isRetired());
+        assertTrue("a snapshot nobody holds waits with the rest", idle.isRetired());
+        assertFalse("the held snapshot's dataset stays open while the lease is out", snapshot.isClosed());
+        assertFalse(snapshot.dataset().getFragments().isEmpty());
+        IllegalStateException refused = expectThrows(IllegalStateException.class, () -> acquire(UUID_A, Optional.of(snapshot.version())));
+        assertTrue(refused.getMessage(), refused.getMessage().contains("closed"));
+
+        held.release();
+        closer.join(TimeUnit.SECONDS.toMillis(30));
+        assertFalse("close returned once the lease was released", closer.isAlive());
+        assertNull(failure.get());
+        assertTrue(snapshot.isClosed());
+        assertTrue(idle.isClosed());
+        assertEquals(2L, cache.snapshotCloseCount());
+        cache = null;
+    }
+
+    public void testCloseGivesUpOnALeaseAfterTheWait() throws Exception {
+        Lease held = acquire(UUID_A, Optional.empty());
+        Snapshot snapshot = held.snapshot();
+        long started = System.nanoTime();
+        cache.close(200L);
+        long waitedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+        assertTrue("close waited for the lease: " + waitedMillis + " ms", waitedMillis >= 200L);
+        assertTrue("the wait ran out and the dataset was closed under the request", snapshot.isClosed());
+        assertEquals("the lease is still counted", 1, snapshot.refCount());
+        held.release();
+        assertEquals(0, snapshot.refCount());
+        assertEquals("the release after the forced close does not close the snapshot a second time", 1L, cache.snapshotCloseCount());
+        cache = null;
+    }
+
+    public void testCloseDuringABuildRefusesTheSnapshotAndClosesItsDataset() throws Exception {
+        // An acquire that passed the guard at its top is building a
+        // snapshot when close() runs. close() empties the map and closes
+        // only what it took out, so the build must not be filed after it:
+        // nothing would close that dataset. The acquire is refused and
+        // closes what it built.
+        CountDownLatch built = new CountDownLatch(1);
+        CountDownLatch closeReturned = new CountDownLatch(1);
+        cache.beforePublish(() -> {
+            built.countDown();
+            try {
+                assertTrue(closeReturned.await(30, TimeUnit.SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(e);
+            }
+        });
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        AtomicReference<IllegalStateException> refused = new AtomicReference<>();
+        Thread acquirer = new Thread(() -> {
+            try (Lease lease = acquire(UUID_A, Optional.empty())) {
+                failure.set(new AssertionError("a lease was handed out after close: " + lease.snapshot().key()));
+            } catch (IllegalStateException e) {
+                refused.set(e);
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        }, getTestName() + "-acquirer");
+        acquirer.start();
+        assertTrue("the build reached the publish", built.await(30, TimeUnit.SECONDS));
+        assertEquals(1L, cache.snapshotBuildCount());
+        cache.close();
+        closeReturned.countDown();
+        acquirer.join(TimeUnit.SECONDS.toMillis(30));
+        assertFalse(acquirer.isAlive());
+        assertNull(failure.get());
+        assertNotNull("the acquire was refused", refused.get());
+        assertTrue(refused.get().getMessage(), refused.get().getMessage().contains("closed"));
+        assertEquals("the built snapshot was not filed", 0, cache.snapshotCount());
+        assertEquals("the dataset the build opened was closed", 1L, cache.snapshotCloseCount());
+        assertEquals(0, cache.buildLockCount());
+        cache = null;
+    }
+
+    public void testADeferredFetchDropSparesAReplacementSnapshotOfTheSameKey() throws Exception {
+        // The drop of a closed snapshot's fetch cache entries runs on the
+        // generic pool. Between its schedule and its run, a request can
+        // build a new snapshot for the same (index uuid, version) and
+        // fill the cache through it; those cells are the replacement's.
+        cache.close();
+        List<Runnable> deferred = new CopyOnWriteArrayList<>();
+        LanceFetchCache fetchCache = new LanceFetchCache(1024L * 1024, 256L * 1024, true, TimeValue.ZERO);
+        cache = new LanceWarmCache(allocator, 64L * 1024 * 1024, 64, true, deferred::add, fetchCache);
+        long version = latestVersion();
+        Snapshot old;
+        try (Lease lease = acquire(UUID_A, Optional.of(version))) {
+            old = lease.snapshot();
+        }
+        // The statistics collection the build scheduled is not the drop.
+        deferred.clear();
+        cache.retire(UUID_A, version + 1);
+        assertTrue(old.isClosed());
+        assertEquals("the drop of the closed snapshot's entries was deferred", 1, deferred.size());
+        Runnable drop = deferred.remove(0);
+
+        Snapshot replacement;
+        try (Lease lease = acquire(UUID_A, Optional.of(version))) {
+            replacement = lease.snapshot();
+            assertNotSame(old, replacement);
+            assertEquals(old.key(), replacement.key());
+            replacement.fetchTable().put(7L, List.of("id"), new Object[] { 7L });
+            drop.run();
+            assertArrayEquals(
+                "the deferred drop leaves the replacement's cell in place",
+                new Object[] { 7L },
+                replacement.fetchTable().lookup(7L, List.of("id"))
+            );
+        }
+        assertEquals(1, fetchCache.indexedCount(UUID_A, version));
+        assertEquals("nothing was counted as invalidated", 0L, fetchCache.stats().invalidations());
+
+        // With no snapshot left under the key, the drop takes the cells.
+        deferred.clear();
+        cache.retire(UUID_A, version + 1);
+        assertTrue(replacement.isClosed());
+        for (Runnable runnable : deferred) {
+            runnable.run();
+        }
+        assertNull(replacement.fetchTable().lookup(7L, List.of("id")));
+        assertEquals(0, fetchCache.indexedCount(UUID_A, version));
+        assertEquals(1L, fetchCache.stats().invalidations());
+    }
+
+    public void testBuildAndLoadMonitorsLeaveWithTheSnapshot() throws Exception {
+        // Both maps of monitors would otherwise keep one entry per
+        // (index uuid, version) (and per column) a node has ever read.
+        assertEquals(0, cache.buildLockCount());
+        assertEquals(0, cache.columnStore().loadLockCount());
+        Snapshot snapshot;
+        try (Lease lease = acquire(UUID_A, Optional.empty())) {
+            snapshot = lease.snapshot();
+            assertEquals("the build monitor leaves with the build", 0, cache.buildLockCount());
+            Map<Integer, Integer> fragmentRows = new HashMap<>();
+            for (LanceWarmCache.FragmentMeta meta : snapshot.fragments()) {
+                fragmentRows.put(meta.id(), meta.physicalRows());
+            }
+            Map<Integer, CachedColumn> rating = cache.columnStore()
+                .acquire(snapshot.key(), snapshot.dataset(), "rating", false, fragmentRows, FragmentGroupScan.SEQUENTIAL, null);
+            cache.columnStore().unpin(rating.values());
+            assertEquals("a load monitor stays for the snapshot's next load of the column", 1, cache.columnStore().loadLockCount());
+        }
+        cache.retire(UUID_A, snapshot.version() + 1);
+        assertTrue(snapshot.isClosed());
+        assertEquals(0, cache.buildLockCount());
+        assertEquals("the load monitors of a closed snapshot go with its columns", 0, cache.columnStore().loadLockCount());
     }
 }
