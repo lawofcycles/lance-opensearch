@@ -98,7 +98,8 @@ final class FragmentHitsPages {
      * {@link FieldDoc}s, in response order. {@code collected} is the
      * match count the collection itself established, or {@code null}
      * when the caller counts through {@code PlanExecutor.computeMatched}
-     * (no {@code min_score} or {@code terminate_after} on the request).
+     * (no {@code min_score} or {@code terminate_after} on the request,
+     * and the caller did not ask the page's collector to count).
      * {@code terminatedEarly} is {@code null} without
      * {@code terminate_after}, else whether the bound stopped the
      * collection.
@@ -189,6 +190,17 @@ final class FragmentHitsPages {
      * a {@link TotalHitCountCollector} for {@code size: 0}, both of which
      * see only the documents the knobs let through. Without knobs a
      * {@code size: 0} request collects nothing here.
+     *
+     * <p>{@code countHits} asks the same of a page without knobs: the
+     * top docs collector counts under the request's
+     * {@code track_total_hits} threshold and its total is the page's
+     * {@link CollectedPage#collected}. The caller sets it when the hits
+     * query is a {@code post_filter} conjunction under a bound, whose
+     * count the executor would otherwise establish with a second pass
+     * over the same conjunction ({@code IndexSearcher.count}) reading
+     * every row; the collector stops counting at the bound. A
+     * {@code size: 0} request collects nothing here whatever the flag
+     * says, and its count stays with the caller.
      */
     static CollectedPage viaIndexSearcher(
         LanceFragmentIndexSearcher searcher,
@@ -199,7 +211,8 @@ final class FragmentHitsPages {
         int size,
         boolean trackScores,
         CollectorKnobs knobs,
-        int trackTotalHitsUpTo
+        int trackTotalHitsUpTo,
+        boolean countHits
     ) throws IOException {
         if (size <= 0 && !knobs.any()) {
             return CollectedPage.EMPTY;
@@ -216,7 +229,8 @@ final class FragmentHitsPages {
             }
             return new CollectedPage(new ScoreDoc[0], new TotalHits(count, TotalHits.Relation.EQUAL_TO), terminatedEarly);
         }
-        int threshold = knobs.any() ? totalHitsThreshold(trackTotalHitsUpTo) : TOTAL_HITS_THRESHOLD;
+        boolean counting = knobs.any() || countHits;
+        int threshold = counting ? totalHitsThreshold(trackTotalHitsUpTo) : TOTAL_HITS_THRESHOLD;
         int numHits = cappedNumHits(searcher, size);
         FieldDoc cursor = after == null ? null : pinnedCursor(searcher, after);
         Sort sort = sortAndFormats == null ? null : sortAndFormats.sort.rewrite(searcher);
@@ -242,7 +256,7 @@ final class FragmentHitsPages {
                 populateScores(topDocs.scoreDocs, searcher, sharedWeight);
             }
         }
-        return new CollectedPage(topDocs.scoreDocs, knobs.any() ? topDocs.totalHits : null, terminatedEarly);
+        return new CollectedPage(topDocs.scoreDocs, counting ? topDocs.totalHits : null, terminatedEarly);
     }
 
     /**
@@ -278,7 +292,7 @@ final class FragmentHitsPages {
         if (size <= 0) {
             // A count only request collapses nothing; the plain path
             // counts it (or collects nothing without knobs).
-            return viaIndexSearcher(searcher, query, sharedWeight, sortAndFormats, after, size, false, knobs, trackTotalHitsUpTo);
+            return viaIndexSearcher(searcher, query, sharedWeight, sortAndFormats, after, size, false, knobs, trackTotalHitsUpTo, false);
         }
         int numHits = cappedNumHits(searcher, size);
         FieldDoc cursor = after == null ? null : pinnedCursor(searcher, after);

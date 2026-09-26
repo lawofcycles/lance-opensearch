@@ -544,4 +544,89 @@ public class LanceHitShapeIT extends LanceRestTestCase {
             );
         }
     }
+
+    public void testPostFilterPageWithAggregationsCountsUnderTheBound() throws Exception {
+        // Two fragments of 10,000 rows: category is c0 for 5,000 of them
+        // (i % 3 == 0 and not i % 4 == 3). The post_filter narrows the
+        // hits and hits.total to those rows; the aggregation sees every
+        // row of the query. The count is the page collector's: under a
+        // bound below the matches it stops at the bound and the response
+        // reads gte at the bound, under a bound above them it is exact.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(2, 10_000, "postfiltercount")) {
+            String indexName = fixture.indexName();
+            String nodeId = localNodeId();
+            String envelope = "\"post_filter\":{\"term\":{\"category\":\"c0\"}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}";
+            String matchAll = "\"query\":{\"match_all\":{}}";
+
+            // The default bound over 5,000 matches: exact.
+            String exact = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":10,\"profile\":true," + matchAll + "," + envelope + "}")
+            );
+            assertEquals(exact, 10, hitsOf(exact).size());
+            assertEquals(exact, 5_000, extractIntPath(exact, "hits", "total", "value"));
+            assertEquals(exact, "eq", stringPath(exact, "hits", "total", "relation"));
+            assertUnfilteredCategoryBuckets(exact);
+
+            // A bound below the matches: gte at the bound.
+            String bounded = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":10,\"track_total_hits\":100," + matchAll + "," + envelope + "}")
+            );
+            assertEquals(bounded, 10, hitsOf(bounded).size());
+            assertEquals(bounded, 100, extractIntPath(bounded, "hits", "total", "value"));
+            assertEquals(bounded, "gte", stringPath(bounded, "hits", "total", "relation"));
+            assertUnfilteredCategoryBuckets(bounded);
+
+            // track_total_hits: true and false keep their contract.
+            String accurate = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":10,\"track_total_hits\":true," + matchAll + "," + envelope + "}")
+            );
+            assertEquals(accurate, 5_000, extractIntPath(accurate, "hits", "total", "value"));
+            assertEquals(accurate, "eq", stringPath(accurate, "hits", "total", "relation"));
+            String untracked = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":10,\"track_total_hits\":false," + matchAll + "," + envelope + "}")
+            );
+            assertEquals(untracked, 10, hitsOf(untracked).size());
+            assertFalse("no hits.total: " + untracked, untracked.contains("\"total\":{"));
+            assertUnfilteredCategoryBuckets(untracked);
+
+            // Every hit of the page is a c0 row.
+            for (Map<String, Object> hit : hitsOf(bounded)) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> source = (Map<String, Object>) hit.get("_source");
+                assertEquals(bounded, "c0", source.get("category"));
+            }
+
+            // The same envelope over a full text query: the one Lance scan
+            // of the query serves the page, the aggregation and the count,
+            // so the profile reports one full text scan under the bound.
+            String fts = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":10,\"profile\":true,\"track_total_hits\":100,\"query\":{\"match\":{\"body\":\"hello\"}}," + envelope + "}"
+                )
+            );
+            assertEquals(fts, 10, hitsOf(fts).size());
+            assertEquals(fts, 100, extractIntPath(fts, "hits", "total", "value"));
+            assertEquals(fts, "gte", stringPath(fts, "hits", "total", "relation"));
+            assertEquals(fts, 1, extractIntPath(fts, "profile", "lance", "nodes", nodeId, "query", "fts_scans"));
+            assertUnfilteredCategoryBuckets(fts);
+        }
+    }
+
+    /** The category terms of {@code body} count every row of the query, untouched by the post_filter: 5,000 each of c0, c1, c2. */
+    private static void assertUnfilteredCategoryBuckets(String body) {
+        for (int bucket = 0; bucket < 3; bucket++) {
+            assertEquals(body, "c" + bucket, stringPath(body, "aggregations", "c", "buckets", String.valueOf(bucket), "key"));
+            assertEquals(body, 5_000, extractIntPath(body, "aggregations", "c", "buckets", String.valueOf(bucket), "doc_count"));
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String localNodeId() throws Exception {
+        Map<String, Object> nodes = (Map<String, Object>) parseJson(readAll(client().performRequest(new Request("GET", "/_nodes")))).get(
+            "nodes"
+        );
+        assertEquals("single node cluster", 1, nodes.size());
+        return nodes.keySet().iterator().next();
+    }
 }

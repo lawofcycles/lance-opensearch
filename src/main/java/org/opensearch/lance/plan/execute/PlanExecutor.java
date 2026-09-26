@@ -392,7 +392,13 @@ public final class PlanExecutor {
      * {@link QueryBuilder}. We cannot express those in Lance SQL, so
      * we ask Lucene through
      * {@link org.apache.lucene.search.IndexSearcher#count(Query)}
-     * and report the exact number.
+     * and report the exact number. A post_filter page under a
+     * {@code track_total_hits} bound does not reach this: the fragment
+     * executor takes its count from the page's collector, which counted
+     * the conjunction up to the bound while it gathered the page. With
+     * {@code track_total_hits: true}, under a reader wrapper, with
+     * {@code collapse} or as a {@code size: 0} request the post_filter
+     * conjunction is counted here.
      *
      * <p>The {@code hasSecurityWrapper} flag overrides every
      * Lance-side fast path. A non-null reader wrapper on

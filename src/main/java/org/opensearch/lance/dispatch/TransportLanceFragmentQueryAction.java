@@ -894,6 +894,26 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 if (request.postFilter() != null) {
                     hitsQuery = applyPostFilter(prebuilt == null ? query : prebuilt, request, qsc);
                 }
+                // The count of a post_filter conjunction under a
+                // track_total_hits bound is the number of rows the
+                // conjunction's scorer yields up to the bound, which the
+                // page's collector counts anyway while it gathers the
+                // page and stops at. So the page collector is asked to
+                // count and computeMatched, which would run the
+                // conjunction a second time through IndexSearcher.count
+                // over every row, is skipped. track_total_hits: true
+                // keeps that count only pass: its TotalHitCountCollector
+                // is cheaper per row than the top docs collector counting
+                // every row would be, and the page collection stops at
+                // its own threshold. Not under a reader wrapper, where
+                // computeMatched counts through the wrapped liveDocs; a
+                // size 0 request has no page collector and a collapsed
+                // page keeps its own collector, so both count in
+                // computeMatched as before.
+                boolean countFromPage = request.postFilter() != null
+                    && !hasSecurityWrapper
+                    && request.trackTotalHitsUpTo() != SearchContext.TRACK_TOTAL_HITS_DISABLED
+                    && request.trackTotalHitsUpTo() != SearchContext.TRACK_TOTAL_HITS_ACCURATE;
                 // "explain": true explains every hit against the request's
                 // query (not the post_filter conjunction, as on the shard
                 // path); through the prebuilt Weight when there is one,
@@ -994,7 +1014,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         request.firstPassSize(),
                         request.trackScores(),
                         knobs,
-                        request.trackTotalHitsUpTo()
+                        request.trackTotalHitsUpTo(),
+                        countFromPage
                     );
                     if (!rescorers.isEmpty()) {
                         page = FragmentHitsPages.rescore(page, rescorers, searcher, request.size());
@@ -1048,7 +1069,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         // min_score or terminate_after: the count is what
                         // the hits collection saw through the knobs; the
                         // Lance side counts and the Weight's hit count do
-                        // not know the score threshold or the bound.
+                        // not know the score threshold or the bound. A
+                        // post_filter page: the collector counted the
+                        // conjunction up to the bound (see countFromPage).
                         matched = request.trackTotalHitsUpTo() == SearchContext.TRACK_TOTAL_HITS_DISABLED
                             ? MatchedCount.NOT_TRACKED
                             : new MatchedCount(
