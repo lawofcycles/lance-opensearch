@@ -119,6 +119,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | `LanceFragmentQueryResponse` | 1 | Base: matched, matched is lower bound, fragment count, hits, row addresses, aggregations, terminated early |
 | | 2 | Block, optional: the executor's profile (query and fetch phase milliseconds, take scans, rows addressed, take milliseconds; five counters, fallback zero) |
 | | 3 | Block, optional: the columns the executor's take scans projected, summed over the scans (one counter, fallback zero) |
+| | 4 | Block, optional: the Lance full text scans the request ran on the executor (one counter, fallback zero) |
 | `LanceNodeStats` | 1 | Base: every figure of the node stats but the pruned fragment counter and the admission source, then the freshness stats |
 | | 2 | Block, optional: pruned fragment counter (fallback zero) |
 | | 3 | Block, optional: source of the last admission decision (`request` or `warm_up`; fallback `none`) |
