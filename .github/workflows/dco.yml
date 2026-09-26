@@ -26,8 +26,10 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
+          # A merge commit GitHub writes for "Update branch" has no trailer
+          # and is not a contribution; only single parent commits are checked.
           commits=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/commits" --paginate \
-            --jq '.[] | {sha: .sha, message: .commit.message}')
+            --jq '.[] | select(.parents | length < 2) | {sha: .sha, message: .commit.message}')
           total=$(jq -s 'length' <<< "$commits")
           missing=$(jq -r '
             select(
