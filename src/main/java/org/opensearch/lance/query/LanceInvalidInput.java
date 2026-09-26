@@ -25,23 +25,38 @@ import java.util.Objects;
  * report so the client sees Lance's message with the status the
  * criterion below assigns.
  *
- * <p>{@code LanceIndexBuilder} classifies a failed index build with the
- * same idea (an {@code IllegalArgumentException} is Lance refusing the
- * input), but it looks at the exception it caught directly; a scan
+ * <p>{@code LanceIndexBuilder} classifies a failed index build through
+ * {@link #isInvalidInput} on the exception it caught directly; a scan
  * failure arrives wrapped, so {@link #find} additionally walks the
- * cause chain, and only accepts an {@code IllegalArgumentException} that
- * Lance produced.
+ * cause chain. Both accept only an {@code IllegalArgumentException}
+ * that Lance produced.
+ *
+ * <p>The criterion rests on two conventions of the Lance Java SDK the
+ * plugin has no contract over, {@link #INVALID_INPUT_PREFIX} and
+ * {@link #LANCE_PACKAGE}. {@code LanceInvalidInputTests} raises real
+ * invalid input through the bundled SDK and checks both against it, so
+ * an SDK upgrade that changes either wording or package fails that
+ * test instead of silently answering 500 for a client mistake.
+ * {@code docs/design/lance-error-mapping.md} records the rule.
  */
 public final class LanceInvalidInput {
 
     /**
-     * Display prefix of Lance's {@code Error::InvalidInput}; the JNI
-     * layer forwards it as the exception message.
+     * Display prefix of Lance's {@code Error::InvalidInput}
+     * ({@code "Invalid user input: {source}, {location}"} in
+     * lance-core's error type); the JNI layer forwards the display form
+     * as the exception message. Depends on the Lance SDK's wording: on
+     * an SDK upgrade, run {@code LanceInvalidInputTests}.
      */
-    private static final String INVALID_INPUT_PREFIX = "Invalid user input";
+    public static final String INVALID_INPUT_PREFIX = "Invalid user input";
 
-    /** Package of the Lance Java SDK, whose native methods throw the JNI exception. */
-    private static final String LANCE_PACKAGE = "org.lance.";
+    /**
+     * Package of the Lance Java SDK; the native methods of its classes
+     * are the frames the JNI exception is thrown from. Depends on the
+     * SDK's package name: on an SDK upgrade, run
+     * {@code LanceInvalidInputTests}.
+     */
+    public static final String LANCE_PACKAGE = "org.lance.";
 
     /** Bound on the cause chain walk, in case a chain is cyclic. */
     private static final int MAX_DEPTH = 10;
