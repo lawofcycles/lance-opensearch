@@ -269,7 +269,7 @@ The same shape works on `POST /_lance/namespace`; every table auto-surfaced unde
 
 Values must be strings. The plugin does not enumerate a fixed allowlist; whatever keys Lance's Rust `object_store` recognises for the URI scheme reach it verbatim. When `storage_options` is omitted, Lance falls back to its normal environment-variable path (`AWS_*` / `GCS_*` / `AZURE_*`).
 
-Options are persisted as `index.lance.storage_options.<key>` on the created index, so a single node can address two buckets with different credentials at the same time. They are stored in plain index settings; treat them the way you would treat any other index setting.
+Options are persisted as `index.lance.storage_options.<key>` on the created index, so a single node can address two buckets with different credentials at the same time. The credential keys (any name containing `secret`, `password`, `token`, `key`, `authorization` or `credential`) are withheld from `GET /<index>/_settings` and the cluster state API; region, endpoint and `allow_http` stay visible. `GET /<index>` and a snapshot of the index still carry every option, credentials included ([limitations.md](limitations.md#storage-and-credentials)).
 
 ## 5. Verify: run the query shapes
 

@@ -193,6 +193,64 @@ public class LanceAttachIT extends LanceRestTestCase {
         }
     }
 
+    public void testAttachWithholdsCredentialStorageOptionsFromSettingsAndClusterState() throws Exception {
+        // The credential entries of storage_options are filtered out of
+        // every settings view a REST caller gets, while region stays and
+        // the shard, which reads the cluster state directly, still opens
+        // the table. Local filesystem tables ignore object store
+        // credentials, so the values here are placeholders.
+        String suffix = "attachcred-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String accessKey = "AKIAFILTERME" + randomAlphaOfLength(6);
+        String secretKey = "SECRETFILTERME" + randomAlphaOfLength(12);
+        String sessionToken = "TOKENFILTERME" + randomAlphaOfLength(12);
+        try {
+            Response attach = postJson(
+                "/_lance/attach",
+                "{\"table\":\""
+                    + tableUri
+                    + "\",\"storage_options\":{\"aws_access_key_id\":\""
+                    + accessKey
+                    + "\",\"aws_secret_access_key\":\""
+                    + secretKey
+                    + "\",\"aws_session_token\":\""
+                    + sessionToken
+                    + "\",\"aws_region\":\"us-east-1\"}}"
+            );
+            assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+
+            // GET /<index> is not in this list: OpenSearch's
+            // TransportGetIndexAction applies the settings filter to its
+            // defaults block only and writes the index settings as they
+            // are in the cluster state.
+            String[] views = {
+                "/" + indexName + "/_settings",
+                "/" + indexName + "/_settings?flat_settings=true",
+                "/_cluster/state/metadata/" + indexName };
+            for (String view : views) {
+                String body = readAll(client().performRequest(new Request("GET", view)));
+                assertTrue(view + " must keep aws_region: " + body, body.contains("us-east-1"));
+                assertFalse(view + " must not name aws_access_key_id: " + body, body.contains("aws_access_key_id"));
+                assertFalse(view + " must not name aws_secret_access_key: " + body, body.contains("aws_secret_access_key"));
+                assertFalse(view + " must not name aws_session_token: " + body, body.contains("aws_session_token"));
+                assertFalse(view + " must not carry the access key: " + body, body.contains(accessKey));
+                assertFalse(view + " must not carry the secret: " + body, body.contains(secretKey));
+                assertFalse(view + " must not carry the session token: " + body, body.contains(sessionToken));
+            }
+
+            Response search = postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}");
+            assertEquals("expected 4 hits", 4, extractIntPath(readAll(search), "hits", "total", "value"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void testAttachOmittingStorageOptionsPersistsNothing() throws Exception {
         // Absent storage_options must not seed any
         // index.lance.storage_options.* setting; callers use the absence

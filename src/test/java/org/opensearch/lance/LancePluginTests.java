@@ -6,9 +6,12 @@
 package org.opensearch.lance;
 
 import org.opensearch.common.settings.Setting;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
+import org.opensearch.lance.namespace.LanceNamespaceMetadata;
 import org.opensearch.lance.query.LanceFtsBoolQueryBuilder;
 import org.opensearch.lance.query.LanceFtsBoostQueryBuilder;
 import org.opensearch.lance.query.LanceKnnQueryBuilder;
@@ -78,6 +81,55 @@ public class LancePluginTests extends OpenSearchTestCase {
         assertTrue(settingKeys.contains(LanceEngineFactory.TAG_SETTING));
         assertTrue(settingKeys.contains("lance.namespace.poll_cadence"));
         assertTrue(settingKeys.contains("lance.builder.max_rows"));
+    }
+
+    public void testSettingsFilterWithholdsCredentialStorageOptions() {
+        // The patterns the plugin hands OpenSearch are the ones the
+        // namespace listing redacts by, so a credential key that one
+        // hides the other hides too. Region, endpoint and allow_http
+        // stay, and settings outside the storage_options group are
+        // untouched.
+        List<String> patterns = plugin.getSettingsFilter();
+        assertEquals(StorageOptions.SENSITIVE_INDEX_SETTING_PATTERNS, patterns);
+        for (String pattern : patterns) {
+            assertTrue(pattern, SettingsFilter.isValidPattern(pattern));
+        }
+        Settings raw = Settings.builder()
+            .put("index.lance.table", "s3://bucket/demo.lance")
+            .put(StorageOptions.INDEX_SETTING_PREFIX + "aws_access_key_id", "AKID")
+            .put(StorageOptions.INDEX_SETTING_PREFIX + "aws_secret_access_key", "SECRET")
+            .put(StorageOptions.INDEX_SETTING_PREFIX + "aws_session_token", "TOKEN")
+            .put(StorageOptions.INDEX_SETTING_PREFIX + "AWS_SECRET_ACCESS_KEY", "UPPER")
+            .put(StorageOptions.INDEX_SETTING_PREFIX + "gcs_service_account_key", "GCS")
+            .put(StorageOptions.INDEX_SETTING_PREFIX + "azure_storage_sas_token", "SAS")
+            .put(StorageOptions.INDEX_SETTING_PREFIX + "header.Authorization", "Bearer x")
+            .put(StorageOptions.INDEX_SETTING_PREFIX + "credential", "id:secret")
+            .put(StorageOptions.INDEX_SETTING_PREFIX + "aws_region", "us-east-1")
+            .put(StorageOptions.INDEX_SETTING_PREFIX + "aws_endpoint", "https://s3.example")
+            .put(StorageOptions.INDEX_SETTING_PREFIX + "allow_http", "true")
+            .build();
+        Settings filtered = new SettingsFilter(patterns).filter(raw);
+        Set<String> kept = filtered.keySet();
+        assertEquals(
+            kept.toString(),
+            Set.of(
+                "index.lance.table",
+                StorageOptions.INDEX_SETTING_PREFIX + "aws_region",
+                StorageOptions.INDEX_SETTING_PREFIX + "aws_endpoint",
+                StorageOptions.INDEX_SETTING_PREFIX + "allow_http"
+            ),
+            kept
+        );
+        for (String key : raw.keySet()) {
+            if (key.startsWith(StorageOptions.INDEX_SETTING_PREFIX)) {
+                String option = key.substring(StorageOptions.INDEX_SETTING_PREFIX.length());
+                assertEquals(
+                    "filter and redaction must agree on " + option,
+                    LanceNamespaceMetadata.Entry.isSensitiveConfigKey(option),
+                    kept.contains(key) == false
+                );
+            }
+        }
     }
 
     public void testIndexPlacementSettingAcceptsOnlyKnownValues() {

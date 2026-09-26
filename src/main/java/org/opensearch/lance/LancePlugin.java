@@ -936,6 +936,23 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     }
 
     /**
+     * The credential entries of {@code index.lance.storage_options.*}
+     * are withheld from {@code GET /<index>/_settings} and the cluster
+     * state API through OpenSearch's settings filter. The patterns come
+     * from {@link StorageOptions#SENSITIVE_INDEX_SETTING_PATTERNS}, so
+     * the keys the filter hides are the ones the namespace listing
+     * redacts. Region, endpoint and {@code allow_http} stay visible. The
+     * filter acts on the API output only: the shard reads the values
+     * from the cluster state as before, a snapshot's index metadata
+     * still carries them, and {@code GET /<index>} still shows them
+     * because core applies the filter to that API's defaults block only.
+     */
+    @Override
+    public List<String> getSettingsFilter() {
+        return StorageOptions.SENSITIVE_INDEX_SETTING_PATTERNS;
+    }
+
+    /**
      * Name of the thread pool the coordinator side of the fragment path
      * runs on: the entry of every {@code _search} against a Lance-backed
      * index (resolving the request, enumerating fragments, sending the

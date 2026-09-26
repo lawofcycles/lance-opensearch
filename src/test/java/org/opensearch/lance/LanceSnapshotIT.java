@@ -252,7 +252,9 @@ public class LanceSnapshotIT extends LanceRestTestCase {
         try {
             Response attach = postJson(
                 "/_lance/attach",
-                "{\"table\":\"" + tableUri + "\",\"version\":1,\"storage_options\":{\"aws_region\":\"us-east-1\"}}"
+                "{\"table\":\""
+                    + tableUri
+                    + "\",\"version\":1,\"storage_options\":{\"aws_region\":\"us-east-1\",\"aws_secret_access_key\":\"SECRETFILTERME\"}}"
             );
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
@@ -271,6 +273,10 @@ public class LanceSnapshotIT extends LanceRestTestCase {
             assertEquals(tableUri, extractPath(settings, indexName, "settings", "index", "lance", "table"));
             assertEquals("1", extractPath(settings, indexName, "settings", "index", "lance", "version"));
             assertEquals("us-east-1", extractPath(settings, indexName, "settings", "index", "lance", "storage_options", "aws_region"));
+            // The restored index carries the credential in its metadata
+            // like the original did; the settings API withholds it.
+            assertFalse("restored settings must withhold the secret: " + settings, settings.contains("aws_secret_access_key"));
+            assertFalse("restored settings must withhold the secret value: " + settings, settings.contains("SECRETFILTERME"));
 
             // Version 1 predates the row deletion. Both the shard engine
             // (_count, _stats) and the fragment path behind _search open
