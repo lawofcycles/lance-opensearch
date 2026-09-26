@@ -309,6 +309,20 @@ public class LanceRequestCacheTests extends OpenSearchTestCase {
         assertEquals(1, cache.stats().entries());
     }
 
+    public void testCloseDropsEveryEntry() throws IOException {
+        LanceRequestCache cache = cache();
+        IndexMetadata metadata = indexMetadata("demo", "uuid-1");
+        SearchRequest request = new SearchRequest("demo").source(body("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}"));
+        LanceRequestCache.Lookup miss = begin(cache, request, metadata, node("n1"));
+        assertNull(miss.find(7L));
+        miss.complete(took -> response(42.0d, 200L, false));
+        assertEquals(1, cache.count());
+        cache.close();
+        assertEquals(0, cache.count());
+        assertEquals(0L, cache.weight());
+        assertNull("the answer is gone", begin(cache, request, metadata, node("n1")).find(7L));
+    }
+
     public void testTimedOutAndOversizedAnswersAreNotStored() throws IOException {
         LanceRequestCache small = new LanceRequestCache(1L << 20, 8L, true, TimeValue.ZERO);
         IndexMetadata metadata = indexMetadata("demo", "uuid-1");

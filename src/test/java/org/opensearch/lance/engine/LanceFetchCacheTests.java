@@ -196,6 +196,19 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
         assertEquals(6L, cache.stats().invalidations());
     }
 
+    public void testCloseDropsEveryEntryAndTheVersionIndex() {
+        LanceFetchCache cache = cache();
+        cache.table("uuid", 1L).put(address(0, 1), COLUMNS, new Object[] { 1L, "a", 1L });
+        cache.table("other", 2L).put(address(0, 1), COLUMNS, new Object[] { 1L, "a", 1L });
+        assertEquals(6, cache.count());
+        assertEquals(2, cache.indexedVersions());
+        cache.close();
+        assertEquals(0, cache.count());
+        assertEquals(0L, cache.weight());
+        assertEquals(0, cache.indexedVersions());
+        assertNull(cache.table("uuid", 1L).lookup(address(0, 1), COLUMNS));
+    }
+
     public void testInvalidatingOneOfManyVersionsTouchesThatVersionAlone() {
         LanceFetchCache cache = new LanceFetchCache(64L * 1024 * 1024, 1024L, true, TimeValue.ZERO);
         for (long version = 1; version <= 3; version++) {

@@ -535,6 +535,12 @@ public final class LanceFetchCache implements ClusterStateListener {
         return cache.count();
     }
 
+    /** Drops every entry and the version index; the plugin calls this when the node closes it. */
+    public void close() {
+        cache.invalidateAll();
+        keysByVersion.clear();
+    }
+
     /** Bytes the entries weigh right now. */
     public long weight() {
         return cache.weight();

@@ -630,6 +630,12 @@ public final class LanceRequestCache implements ClusterStateListener {
         return cache.count();
     }
 
+    /** Drops every entry and the reader wrapper answers; the plugin calls this when the node closes it. */
+    public void close() {
+        cache.invalidateAll();
+        readerWrapperByIndex.clear();
+    }
+
     /** Bytes the entries weigh right now. */
     public long weight() {
         return cache.weight();
