@@ -439,9 +439,10 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
         // Interleaved fixture: row i sits in fragment i % 3 at offset
         // i / 3, and "lance" matches every row with a score that grows
         // with i. A reader over fragments 0 and 2 holds ids 0, 3, 6, 9
-        // and 2, 5, 8, 11. With limit 5 the whole-table top 5 is ids
-        // 11..7; the reader keeps 11 (fragment 2, offset 3), 9
-        // (fragment 0, offset 3) and 8 (fragment 2, offset 2).
+        // and 2, 5, 8, 11. A page of 5 asks Lance for the top 20 (the
+        // page times the two executors the fragment counts imply,
+        // times the slack of two); the 12 matches come back short of
+        // that, so every own row is kept and the count is exact.
         Path scratchDir = createTempDir();
         String uri = LanceTableFactory.writeInterleavedTable(scratchDir, "subset-bounded", 3, 4);
         try (LanceDirectoryReader reader = openReader(uri, List.of(0, 2))) {
@@ -451,24 +452,105 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
 
             LanceFtsQuery.LanceFtsWeight top5 = weightOf(searcher, query.withScanLimit(5));
             assertFalse("no scan before the first leaf is scored", top5.complete());
-            assertEquals(List.of(3), docIdsOn(top5, leafOfFragment(reader, 0)));
-            assertEquals(List.of(2, 3), docIdsOn(top5, leafOfFragment(reader, 2)));
-            assertEquals(3L, top5.hitCount());
-            assertFalse("Lance returned exactly limit rows, so matches may be unseen", top5.complete());
+            assertEquals(List.of(0, 1, 2, 3), docIdsOn(top5, leafOfFragment(reader, 0)));
+            assertEquals(List.of(0, 1, 2, 3), docIdsOn(top5, leafOfFragment(reader, 2)));
+            assertEquals(8L, top5.hitCount());
+            assertTrue("Lance returned fewer rows than the limit, so every match was seen", top5.complete());
             assertEquals("one scan", 1, top5.issuedScans().size());
             ScanOptions options = top5.issuedScans().get(0);
             assertFalse("subset reader must not restrict the scan: " + options, options.getFragmentIds().isPresent());
-            assertEquals(Optional.of(5L), options.getLimit());
+            assertEquals(Optional.of(20L), options.getLimit());
             assertTrue(options.isWithRowAddress());
-
-            // A limit above the match count returns every match (12 <
-            // 20), so the count of the reader's rows is exact.
-            LanceFtsQuery.LanceFtsWeight top20 = weightOf(searcher, query.withScanLimit(20));
-            assertEquals(List.of(0, 1, 2, 3), docIdsOn(top20, leafOfFragment(reader, 0)));
-            assertEquals(8L, top20.hitCount());
-            assertTrue(top20.complete());
-            assertFalse(top20.issuedScans().get(0).getFragmentIds().isPresent());
         }
+    }
+
+    public void testBoundedScanOnSubsetReaderWidensUntilItHoldsThePage() throws Exception {
+        // Contiguous fixture with the score falling with the id: the
+        // 90 rows of fragments 0, 1 and 2 hold ids 0..29, 30..59 and
+        // 60..89, and the global top list is filled fragment by
+        // fragment from fragment 0. A reader over fragment 2 alone
+        // asks for a page of 5: the first scan of 30 rows (5 × 3 × 2)
+        // is fragment 0 only, the second of 60 is fragments 0 and 1,
+        // and the third of 120 returns all 90 matches, so the reader's
+        // 30 rows are kept and the count is exact. Keeping the
+        // reader's share of one global top 5 would have returned no
+        // row at all for a page five rows deep.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeContiguousScoreTable(scratchDir, "subset-widen", 3, 30, false);
+        try (LanceDirectoryReader reader = openReader(uri, List.of(2))) {
+            IndexSearcher searcher = new IndexSearcher(reader);
+            LanceFtsQuery.LanceFtsWeight weight = weightOf(searcher, new LanceFtsQuery("body", "lance").withScanLimit(5));
+            List<Integer> docIds = docIdsOn(weight, leafOfFragment(reader, 2));
+            assertEquals(30, docIds.size());
+            assertEquals(30L, weight.hitCount());
+            assertTrue(weight.complete());
+            List<ScanOptions> scans = weight.issuedScans();
+            assertEquals("three widening scans: " + scans, 3, scans.size());
+            assertEquals(Optional.of(30L), scans.get(0).getLimit());
+            assertEquals(Optional.of(60L), scans.get(1).getLimit());
+            assertEquals(Optional.of(120L), scans.get(2).getLimit());
+            for (ScanOptions scan : scans) {
+                assertFalse("no scan carries the fragment restriction: " + scan, scan.getFragmentIds().isPresent());
+            }
+        }
+    }
+
+    public void testBoundedScanOnSubsetReaderFallsBackToRestrictedScanAtTheProbeLimit() throws Exception {
+        // Same fixture and reader as above with the probe cap at one
+        // row, so the first scan of 30 already reaches the cap: it
+        // fills with fragment 0 and holds no row of fragment 2, and
+        // the scan is repeated with the fragment restriction and the
+        // page as limit, which returns the reader's own top 5 (its
+        // lowest ids, 60..64) and fills, so the count is a bound.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeContiguousScoreTable(scratchDir, "subset-restricted", 3, 30, false);
+        int before = LanceFtsQuery.subsetProbeLimit();
+        LanceFtsQuery.setSubsetProbeLimit(1);
+        try (LanceDirectoryReader reader = openReader(uri, List.of(2))) {
+            IndexSearcher searcher = new IndexSearcher(reader);
+            LanceFtsQuery.LanceFtsWeight weight = weightOf(searcher, new LanceFtsQuery("body", "lance").withScanLimit(5));
+            assertEquals(List.of(0, 1, 2, 3, 4), docIdsOn(weight, leafOfFragment(reader, 2)));
+            assertEquals(5L, weight.hitCount());
+            assertFalse("the restricted scan filled its limit", weight.complete());
+            List<ScanOptions> scans = weight.issuedScans();
+            assertEquals("probe then restricted scan: " + scans, 2, scans.size());
+            assertEquals(Optional.of(30L), scans.get(0).getLimit());
+            assertFalse(scans.get(0).getFragmentIds().isPresent());
+            assertEquals(Optional.of(5L), scans.get(1).getLimit());
+            assertEquals(Optional.of(List.of(2)), scans.get(1).getFragmentIds());
+        } finally {
+            LanceFtsQuery.setSubsetProbeLimit(before);
+        }
+    }
+
+    public void testBoundedScanOnFullReaderAsksForThePageOnly() throws Exception {
+        // A reader over every fragment has nothing to filter: one scan
+        // with the page as limit, filled, so the count is a bound.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeContiguousScoreTable(scratchDir, "full-bounded", 3, 30, false);
+        try (LanceDirectoryReader reader = openReader(uri, List.of(0, 1, 2))) {
+            IndexSearcher searcher = new IndexSearcher(reader);
+            LanceFtsQuery.LanceFtsWeight weight = weightOf(searcher, new LanceFtsQuery("body", "lance").withScanLimit(5));
+            assertEquals(List.of(0, 1, 2, 3, 4), docIdsOn(weight, leafOfFragment(reader, 0)));
+            assertEquals(5L, weight.hitCount());
+            assertFalse(weight.complete());
+            assertEquals(1, weight.issuedScans().size());
+            assertEquals(Optional.of(5L), weight.issuedScans().get(0).getLimit());
+            assertFalse(weight.issuedScans().get(0).getFragmentIds().isPresent());
+        }
+    }
+
+    public void testBoundedProbeLimitIsThePageTimesTheExecutorCountTimesTheSlack() {
+        assertEquals("one of three fragments: three executors", 60L, LanceFtsQuery.boundedProbeLimit(10, 1, 3));
+        assertEquals("two of three fragments: two executors", 40L, LanceFtsQuery.boundedProbeLimit(10, 2, 3));
+        assertEquals("62 of 250 fragments: five executors", 100L, LanceFtsQuery.boundedProbeLimit(10, 62, 250));
+        assertEquals("every fragment: the slack alone", 20L, LanceFtsQuery.boundedProbeLimit(10, 3, 3));
+        assertEquals("a page of one on two executors", 4L, LanceFtsQuery.boundedProbeLimit(1, 1, 2));
+        assertEquals(
+            "a fragment count the dataset does not know is treated as the whole table",
+            20L,
+            LanceFtsQuery.boundedProbeLimit(10, 4, 3)
+        );
     }
 
     public void testUnboundedScanOnSubsetReaderProbesWithoutFragmentIds() throws Exception {
