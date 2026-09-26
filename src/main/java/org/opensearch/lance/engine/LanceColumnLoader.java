@@ -1177,7 +1177,7 @@ final class LanceColumnLoader {
             } catch (Exception e) {
                 throw new IOException(e);
             } finally {
-                FetchTakeStats.record(FetchTakeStats.Kind.COLUMN, to - from, 1, System.nanoTime() - start);
+                FetchTakeStats.record(FetchTakeStats.Kind.COLUMN, to - from, 1, System.nanoTime() - start, leaf.takeAccumulator());
             }
         }
     }

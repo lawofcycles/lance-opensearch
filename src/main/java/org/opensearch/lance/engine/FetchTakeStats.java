@@ -31,8 +31,45 @@ import org.opensearch.lance.stats.LanceNodeStats;
  * and one {@link LongAccumulator} around two {@code System.nanoTime()}
  * reads; a request issues a handful of takes, so the cost is well below
  * the JNI call each take already makes.
+ *
+ * <p>The node counters mix every request that runs on the node, so the
+ * search profile of one request reads its takes from an
+ * {@link Accumulator} of its own instead: the fragment executor makes
+ * one per request and hands it to the leaves it opens
+ * ({@link LanceFragmentLeafReader#setTakeAccumulator}), and every take
+ * of those leaves adds to it next to the node counters.
  */
 public final class FetchTakeStats {
+
+    /**
+     * The take scans of one request: how many ran, how many row
+     * addresses they carried and their wall time summed. The slices of
+     * a request take on several threads at once, so the fields are
+     * {@link LongAdder}s.
+     */
+    public static final class Accumulator {
+        private final LongAdder count = new LongAdder();
+        private final LongAdder rows = new LongAdder();
+        private final LongAdder nanos = new LongAdder();
+
+        void record(int rowCount, long elapsedNanos) {
+            count.increment();
+            rows.add(rowCount);
+            nanos.add(elapsedNanos);
+        }
+
+        public long takeCount() {
+            return count.sum();
+        }
+
+        public long takeRows() {
+            return rows.sum();
+        }
+
+        public long takeMillis() {
+            return nanos.sum() / 1_000_000L;
+        }
+    }
 
     /** Which caller issued a take; each has its own scan counter under {@code fetch} in the stats. */
     public enum Kind {
@@ -56,9 +93,14 @@ public final class FetchTakeStats {
      * Records one take scan of {@code kind} that addressed {@code rows}
      * row addresses, projected {@code columns} columns and took
      * {@code nanos} of wall time from the scan's creation to its close,
-     * whether or not it completed.
+     * whether or not it completed, in the node counters and in
+     * {@code perRequest} when the leaf that issued the take serves a
+     * profiled request (null otherwise).
      */
-    static void record(Kind kind, int rows, int columns, long nanos) {
+    static void record(Kind kind, int rows, int columns, long nanos, Accumulator perRequest) {
+        if (perRequest != null) {
+            perRequest.record(rows, nanos);
+        }
         COUNT.increment();
         ROWS.add(rows);
         COLUMNS.add(columns);

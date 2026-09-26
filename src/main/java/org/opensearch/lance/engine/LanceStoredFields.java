@@ -284,7 +284,13 @@ final class LanceStoredFields extends StoredFields {
             } catch (Exception e) {
                 throw new IOException(e);
             } finally {
-                FetchTakeStats.record(FetchTakeStats.Kind.STORED_FIELDS, chunk.size(), takeColumns.size(), System.nanoTime() - start);
+                FetchTakeStats.record(
+                    FetchTakeStats.Kind.STORED_FIELDS,
+                    chunk.size(),
+                    takeColumns.size(),
+                    System.nanoTime() - start,
+                    leaf.takeAccumulator()
+                );
             }
         }
         for (int docId : requested) {

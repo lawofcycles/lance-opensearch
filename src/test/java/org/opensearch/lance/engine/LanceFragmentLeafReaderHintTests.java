@@ -795,6 +795,10 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
     public void testHintedColumnTakeIsCountedInTheFetchStats() throws Exception {
         LanceNodeStats.FetchStats before = FetchTakeStats.snapshot();
         LanceFragmentLeafReader leaf = leaves.get(1);
+        // The request's own accumulator sees the same take; unlike the
+        // node counters it starts at zero and nothing else adds to it.
+        FetchTakeStats.Accumulator takes = new FetchTakeStats.Accumulator();
+        leaf.setTakeAccumulator(takes);
         int[] hint = { 3, 17, 44, 199 };
         leaf.hintMatchedOffsets(hint, false);
         NumericDocValues rating = leaf.getNumericDocValues("rating");
@@ -811,14 +815,21 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
         assertTrue(after.takeMillisTotal() >= before.takeMillisTotal());
         assertTrue(after.takeMaxMillis() >= before.takeMaxMillis());
 
+        assertEquals("the request's accumulator counts the take", 1L, takes.takeCount());
+        assertEquals(hint.length, takes.takeRows());
+        assertTrue(takes.takeMillis() >= 0L);
+
         // The second accessor of the column reuses the taken rows.
         assertTrue(leaf.getNumericDocValues("rating").advanceExact(17));
         assertEquals(after.takeCount(), FetchTakeStats.snapshot().takeCount());
+        assertEquals(1L, takes.takeCount());
     }
 
     public void testStoredFieldsTakeIsCountedInTheFetchStats() throws Exception {
         LanceNodeStats.FetchStats before = FetchTakeStats.snapshot();
         LanceFragmentLeafReader leaf = leaves.get(0);
+        FetchTakeStats.Accumulator takes = new FetchTakeStats.Accumulator();
+        leaf.setTakeAccumulator(takes);
         int[] docIds = { 0, 5, 9 };
         leaf.prefetchRows(docIds);
         LanceNodeStats.FetchStats after = FetchTakeStats.snapshot();
@@ -828,10 +839,14 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
         assertTrue("the take projects the surfaced columns", after.takeColumns() > before.takeColumns());
         assertEquals("no column take ran", before.columnTakes(), after.columnTakes());
 
+        assertEquals("the request's accumulator counts the take", 1L, takes.takeCount());
+        assertEquals(docIds.length, takes.takeRows());
+
         // The rows are held for the request, so prefetching them again
         // issues no take.
         leaf.prefetchRows(docIds);
         assertEquals(after.takeCount(), FetchTakeStats.snapshot().takeCount());
+        assertEquals(1L, takes.takeCount());
     }
 
     /**
