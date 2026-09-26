@@ -1,9 +1,10 @@
 name: Link Checker
 
 on:
+  # Every pull request, not only those that touch a markdown file: the check is
+  # required by branch protection, and a required check that does not run leaves
+  # the pull request blocked. The run takes about ten seconds.
   pull_request:
-    paths:
-      - '**/*.md'
   schedule:
     # Every Monday 03:00 UTC: external links rot without any change in the repository.
     - cron: '0 3 * * 1'
