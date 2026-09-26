@@ -81,8 +81,9 @@ public class LanceDeletionFileIT extends LanceRestTestCase {
 
     /**
      * Every request shape over {@code index} answers {@code live} and
-     * nothing of {@code deleted}, and the sorted page takes its rows
-     * once per fragment with a live row ({@code fragmentsWithRows}).
+     * nothing of {@code deleted}; the sorted page takes its rows once per
+     * fragment with a live row ({@code fragmentsWithRows}) and the
+     * collector page over the same rows is served from the fetch cache.
      */
     private static void assertLiveRows(String index, List<Integer> live, List<Integer> deleted, int fragmentsWithRows) throws Exception {
         int total = live.size();
@@ -105,13 +106,24 @@ public class LanceDeletionFileIT extends LanceRestTestCase {
         );
         assertEquals((long) total, number(statsAfter.get("take_rows")) - number(statsBefore.get("take_rows")));
 
-        // The collector page: the same rows, the same takes.
+        // The collector page: the same rows, now behind the hits in the
+        // node's fetch cache, so it takes nothing and every row is served
+        // from the cache. The live docs of the leaf still decide which
+        // rows are on the page, so a deleted row cannot come back from
+        // the cache.
+        Map<String, Object> cacheBefore = fetchCacheStats();
         String collected = readAll(postJson("/" + index + "/_search", COLLECTOR_PAGE));
+        Map<String, Object> cacheAfter = fetchCacheStats();
         assertEquals(collected, total, extractIntPath(collected, "hits", "total", "value"));
         assertEquals(collected, live, sourceIds(collected));
         Map<String, Object> collectedFetch = profileFetch(collected);
-        assertEquals(collected, (long) fragmentsWithRows, number(collectedFetch.get("take_count")));
-        assertEquals(collected, (long) total, number(collectedFetch.get("take_rows")));
+        assertEquals("the collector page took nothing: " + collected, 0L, number(collectedFetch.get("take_count")));
+        assertEquals(collected, 0L, number(collectedFetch.get("take_rows")));
+        assertEquals(
+            "the fetch cache served every live row: " + cacheAfter,
+            (long) total,
+            number(cacheAfter.get("rows_served")) - number(cacheBefore.get("rows_served"))
+        );
 
         // _count and a value_count over id agree with the page.
         String count = readAll(client().performRequest(new Request("GET", "/" + index + "/_count")));
@@ -204,13 +216,21 @@ public class LanceDeletionFileIT extends LanceRestTestCase {
     /** The {@code fetch} counters of the single data node in {@code GET /_lance/stats}. */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> fetchStats() throws Exception {
+        return statsBlock("fetch");
+    }
+
+    private static Map<String, Object> fetchCacheStats() throws Exception {
+        return statsBlock("fetch_cache");
+    }
+
+    private static Map<String, Object> statsBlock(String name) throws Exception {
         Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
         assertEquals("single node cluster: " + stats, 1, nodes.size());
         Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();
-        Map<String, Object> fetch = (Map<String, Object>) node.get("fetch");
-        assertNotNull("the node stats carry fetch: " + stats, fetch);
-        return fetch;
+        Map<String, Object> block = (Map<String, Object>) node.get(name);
+        assertNotNull("the node stats carry " + name + ": " + stats, block);
+        return block;
     }
 
     private static long number(Object value) {
