@@ -1634,7 +1634,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         assertEquals(0, shape.phraseClauses());
         assertFalse(shape.unbounded());
         assertEquals(10L, shape.boundedScanRows());
-        assertEquals("price >= 50.0", shape.prefilterSql());
+        assertEquals(List.of("price >= 50.0"), shape.prefilterSqls());
         long expected = 2L * NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS) + 10L * 12L * 2L + 200_000_000L * 256L;
         assertEquals(155_200_000_240L, expected);
         CircuitBreakingException rejection = expectThrows(
@@ -1656,7 +1656,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         ScanAdmission.Shape nested = ScanAdmission.classify(lucene, false);
         assertEquals(2, nested.clauses());
         assertTrue(nested.unbounded());
-        assertNull(nested.prefilterSql());
+        assertEquals(List.of(), nested.prefilterSqls());
     }
 
     public void testBoundedMatchPageWithARangePrefilterOverPerf1bIsRefusedOnAFreshNode() {
@@ -1670,14 +1670,14 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         perf1bNode(PERF1B_AVAILABLE_FRESH_NODE);
         LanceFtsQuery bare = new LanceFtsQuery("body", "w000100").withScanLimit(10);
         ScanAdmission.Shape bareShape = ScanAdmission.classify(bare, false);
-        assertNull(bareShape.prefilterSql());
+        assertEquals(List.of(), bareShape.prefilterSqls());
         ScanAdmission.admit("perf1b", PERF1B_ROWS, bareShape);
         long bareEstimate = ScanAdmission.lastEstimateBytes();
         assertEquals(NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS) + 10L * 12L * 2L, bareEstimate);
         ScanAdmission.requestEnded();
 
         ScanAdmission.Shape filtered = ScanAdmission.classify(bare.withScanFilterSql("price >= 100.0"), false);
-        assertEquals("price >= 100.0", filtered.prefilterSql());
+        assertEquals(List.of("price >= 100.0"), filtered.prefilterSqls());
         assertEquals(1, filtered.clauses());
         assertEquals(10L, filtered.boundedScanRows());
         long expected = bareEstimate + 200_000_000L * 256L;
@@ -1686,25 +1686,85 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             CircuitBreakingException.class,
             () -> ScanAdmission.admit("perf1b", PERF1B_ROWS, filtered)
         );
-        assertTrue(rejection.getMessage(), rejection.getMessage().startsWith("[" + ScanAdmission.LABEL + "] fts estimate [96.1gb]"));
-        assertTrue(
-            rejection.getMessage(),
+        // The whole message, as docs/admission.md quotes it.
+        assertEquals(
+            "[lance_admission] fts estimate [96.1gb] exceeds available [81.9gb] minus headroom [8gb] plus [0b] retained by earlier "
+                + "admitted scans: bounded full text page over [perf1b]: inverted index document set of [48.4gb] plus the prefilter "
+                + "[price >= 100.0] materialising 200000000 row addresses over the whole table at [256b] each against an index cache "
+                + "shard of [8gb] plus the hits scan buffers. Drop the scalar filter, attach the table to a node with a larger index "
+                + "cache, or relax lance.admission.bounded_shapes_gated / lance.admission.headroom / lance.admission.enabled.",
             rejection.getMessage()
-                .contains("plus the prefilter [price >= 100.0] materialising 200000000 row addresses over the whole table at [256b] each")
         );
-        assertTrue(rejection.getMessage(), rejection.getMessage().contains("Drop the scalar filter"));
         assertEquals(expected, ScanAdmission.lastEstimateBytes());
         assertEquals(1L, ScanAdmission.rejections());
     }
 
+    public void testTwoFtsLeavesWithDifferentPrefiltersChargeBothPrefilters() {
+        // bool(should [match w000100 + filter price >= 100, match
+        // w000200 + filter category = 'c1']) size 10 left as two Lucene
+        // clauses, each a Lance scan with its own prefilter: two
+        // document sets and two sets of 200M row addresses, about twice
+        // the one leaf page (the hits scan buffers, 240 bytes, are
+        // counted once).
+        perf1bNode(PERF1B_AVAILABLE_FRESH_NODE);
+        LanceFtsQuery priced = new LanceFtsQuery("body", "w000100").withScanLimit(10).withScanFilterSql("price >= 100.0");
+        LanceFtsQuery categorised = new LanceFtsQuery("body", "w000200").withScanLimit(10).withScanFilterSql("category = 'c1'");
+        ScanAdmission.Shape oneLeaf = ScanAdmission.classify(priced, false);
+        long oneLeafEstimate = NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS) + 10L * 12L * 2L + ScanAdmission
+            .ftsPrefilterEstimateBytes(PERF1B_ROWS, oneLeaf.prefilterSqls(), 8 * GB);
+        assertEquals(103_200_000_240L, oneLeafEstimate);
+        BooleanQuery lucene = new BooleanQuery.Builder().add(priced, BooleanClause.Occur.SHOULD)
+            .add(categorised, BooleanClause.Occur.SHOULD)
+            .build();
+        ScanAdmission.Shape twoLeaves = ScanAdmission.classify(lucene, false);
+        assertEquals(2, twoLeaves.clauses());
+        assertFalse(twoLeaves.unbounded());
+        assertEquals(10L, twoLeaves.boundedScanRows());
+        assertEquals(List.of("price >= 100.0", "category = 'c1'"), twoLeaves.prefilterSqls());
+        assertEquals(400_000_000L, ScanAdmission.ftsPrefilterRows(PERF1B_ROWS, twoLeaves.prefilterSqls()));
+        long expected = 2L * NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS) + 10L * 12L * 2L + 2L * 200_000_000L * 256L;
+        assertEquals(206_400_000_240L, expected);
+        assertEquals(2L * oneLeafEstimate - 240L, expected);
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("perf1b", PERF1B_ROWS, twoLeaves)
+        );
+        assertTrue(rejection.getMessage(), rejection.getMessage().startsWith("[" + ScanAdmission.LABEL + "] fts estimate [192.2gb]"));
+        assertTrue(
+            rejection.getMessage(),
+            rejection.getMessage()
+                .contains(
+                    "plus the 2 prefilters [price >= 100.0, category = 'c1'] materialising 400000000 row addresses "
+                        + "over the whole table at [256b] each"
+                )
+        );
+        assertTrue(rejection.getMessage(), rejection.getMessage().contains("Drop the scalar filters, attach"));
+        assertEquals(expected, ScanAdmission.lastEstimateBytes());
+
+        // The same SQL on both leaves is one prefilter: Lance
+        // materialises the same row addresses, charged once.
+        BooleanQuery samePrefilter = new BooleanQuery.Builder().add(priced, BooleanClause.Occur.SHOULD)
+            .add(categorised.withScanFilterSql("price >= 100.0"), BooleanClause.Occur.SHOULD)
+            .build();
+        ScanAdmission.Shape deduplicated = ScanAdmission.classify(samePrefilter, false);
+        assertEquals(List.of("price >= 100.0"), deduplicated.prefilterSqls());
+        assertEquals(200_000_000L, ScanAdmission.ftsPrefilterRows(PERF1B_ROWS, deduplicated.prefilterSqls()));
+        ScanAdmission.requestEnded();
+        expectThrows(CircuitBreakingException.class, () -> ScanAdmission.admit("perf1b", PERF1B_ROWS, deduplicated));
+        assertEquals(
+            2L * NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS) + 240L + 200_000_000L * 256L,
+            ScanAdmission.lastEstimateBytes()
+        );
+    }
+
     public void testFtsPrefilterTermIsTheUnknownShareAtTheFilterScanRowCostAndFitsTheShardShareOnSmallTables() {
         assertEquals(0L, ScanAdmission.ftsPrefilterRows(PERF1B_ROWS, null));
-        assertEquals(0L, ScanAdmission.ftsPrefilterRows(PERF1B_ROWS, ""));
-        assertEquals(200_000_000L, ScanAdmission.ftsPrefilterRows(PERF1B_ROWS, "price >= 100.0"));
+        assertEquals(0L, ScanAdmission.ftsPrefilterRows(PERF1B_ROWS, List.of()));
+        assertEquals(200_000_000L, ScanAdmission.ftsPrefilterRows(PERF1B_ROWS, List.of("price >= 100.0")));
         assertEquals(0L, ScanAdmission.ftsPrefilterEstimateBytes(PERF1B_ROWS, null, 8 * GB));
-        assertEquals(51_200_000_000L, ScanAdmission.ftsPrefilterEstimateBytes(PERF1B_ROWS, "price >= 100.0", 8 * GB));
+        assertEquals(51_200_000_000L, ScanAdmission.ftsPrefilterEstimateBytes(PERF1B_ROWS, List.of("price >= 100.0"), 8 * GB));
         // 20M rows: 4M row addresses at 256 bytes is 1 GB, within the shard share.
-        assertEquals(0L, ScanAdmission.ftsPrefilterEstimateBytes(20_000_000L, "price >= 100.0", 8 * GB));
+        assertEquals(0L, ScanAdmission.ftsPrefilterEstimateBytes(20_000_000L, List.of("price >= 100.0"), 8 * GB));
         // A prefiltered page over a table whose document set fits the
         // shard share is admitted at zero like the bare page.
         ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(8, ByteSizeUnit.GB));

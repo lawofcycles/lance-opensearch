@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -992,33 +993,48 @@ public final class ScanAdmission {
      * positions of its tokens' postings, the columns the clauses
      * search (each column has its own inverted index; the set names the
      * document sets the scan rebuilds, which is what the retained pool
-     * keys the scan's identity on), and the Lance SQL prefilter of the
-     * scan when a {@code bool} was collapsed into one {@link
-     * LanceFtsQuery} with scalar clauses ({@code null} without one;
-     * the first one when several full text scans carry one). Lance
-     * evaluates the prefilter before the inverted index lookup and
-     * materialises the row addresses it selects, which the estimate
-     * charges on top of the document set.
+     * keys the scan's identity on), and the Lance SQL prefilters of
+     * the scans, one per {@link LanceFtsQuery} that carries one (a
+     * {@code bool} collapsed into one Lance scan with scalar clauses),
+     * the same SQL text listed once, in the order the leaves are met
+     * (empty without one). Lance evaluates each prefilter before its
+     * inverted index lookup and materialises the row addresses it
+     * selects, which the estimate charges on top of the document set,
+     * once per distinct prefilter.
      */
     public record Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows, int clauses, int phraseClauses, Set<String> columns,
-        String prefilterSql) {
+        List<String> prefilterSqls) {
 
         /** A query tree without a full-text clause; never gated. */
-        public static final Shape NONE = new Shape(false, false, 0L, 0, 0, Set.of(), null);
+        public static final Shape NONE = new Shape(false, false, 0L, 0, 0, Set.of(), List.of());
 
         public Shape {
             columns = columns == null ? Set.of() : Set.copyOf(columns);
-            prefilterSql = prefilterSql == null || prefilterSql.isEmpty() ? null : prefilterSql;
+            prefilterSqls = distinctPrefilters(prefilterSqls);
         }
 
         /** A shape without a prefilter. */
         public Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows, int clauses, int phraseClauses, Set<String> columns) {
-            this(hasFtsClause, unbounded, boundedScanRows, clauses, phraseClauses, columns, null);
+            this(hasFtsClause, unbounded, boundedScanRows, clauses, phraseClauses, columns, List.of());
         }
 
         /** A shape whose columns are not named, without a prefilter. */
         public Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows, int clauses, int phraseClauses) {
-            this(hasFtsClause, unbounded, boundedScanRows, clauses, phraseClauses, Set.of(), null);
+            this(hasFtsClause, unbounded, boundedScanRows, clauses, phraseClauses, Set.of(), List.of());
+        }
+
+        /** {@code sqls} without nulls, empty strings and repeats, in first met order. */
+        private static List<String> distinctPrefilters(List<String> sqls) {
+            if (sqls == null || sqls.isEmpty()) {
+                return List.of();
+            }
+            Set<String> distinct = new LinkedHashSet<>();
+            for (String sql : sqls) {
+                if (sql != null && sql.isEmpty() == false) {
+                    distinct.add(sql);
+                }
+            }
+            return List.copyOf(distinct);
         }
 
         /** A shape of one non phrase clause (a single {@code match}) whose column is not named. */
@@ -1068,13 +1084,13 @@ public final class ScanAdmission {
         boolean unbounded = trackTotalHitsAccurate;
         long boundedScanRows = 0L;
         Set<String> columns = new HashSet<>();
-        String prefilterSql = null;
+        List<String> prefilterSqls = new ArrayList<>();
         for (LanceFtsQuery fts : found) {
             clauses += leafClauses(fts.fullTextQuery());
             phraseClauses += phraseClauses(fts.fullTextQuery());
             columns.addAll(fts.columns());
-            if (prefilterSql == null) {
-                prefilterSql = fts.scanFilterSql();
+            if (fts.scanFilterSql() != null) {
+                prefilterSqls.add(fts.scanFilterSql());
             }
             if (fts.scanLimit() == LanceFtsQuery.SCAN_LIMIT_UNBOUNDED) {
                 unbounded = true;
@@ -1082,7 +1098,7 @@ public final class ScanAdmission {
                 boundedScanRows = Math.max(boundedScanRows, fts.scanLimit());
             }
         }
-        return new Shape(true, unbounded, unbounded ? 0L : boundedScanRows, Math.max(1, clauses), phraseClauses, columns, prefilterSql);
+        return new Shape(true, unbounded, unbounded ? 0L : boundedScanRows, Math.max(1, clauses), phraseClauses, columns, prefilterSqls);
     }
 
     /**
@@ -1196,42 +1212,43 @@ public final class ScanAdmission {
     }
 
     /**
-     * Rows the SQL prefilter of a full text scan over a table of
-     * {@code rows} rows is expected to select: one row in five
-     * ({@link #FILTER_MATCH_RATIO_UNKNOWN}), zero without a prefilter.
-     * The full text gate judges the table's rows and has no table
+     * Rows the SQL prefilters of the full text scans over a table of
+     * {@code rows} rows are expected to select: one row in five
+     * ({@link #FILTER_MATCH_RATIO_UNKNOWN}) per distinct prefilter,
+     * zero without one. Each {@link LanceFtsQuery} with a prefilter
+     * runs its own scan and materialises its own row addresses, so
+     * two leaves with different prefilters count twice; the same SQL
+     * on two leaves counts once, as {@link Shape} lists it once. The
+     * full text gate judges the table's rows and has no table
      * statistics at hand, so the ratio is the one the filter
      * estimators fall back to for a predicate without a distinct
      * count, which is what a range predicate gets from them as well.
      */
-    static long ftsPrefilterRows(long rows, String prefilterSql) {
-        if (prefilterSql == null || prefilterSql.isEmpty()) {
+    static long ftsPrefilterRows(long rows, List<String> prefilterSqls) {
+        if (prefilterSqls == null || prefilterSqls.isEmpty()) {
             return 0L;
         }
-        return (long) (Math.max(0L, rows) * FILTER_MATCH_RATIO_UNKNOWN);
+        return prefilterSqls.size() * (long) (Math.max(0L, rows) * FILTER_MATCH_RATIO_UNKNOWN);
     }
 
     /**
-     * The row addresses the SQL prefilter of a full text scan
-     * materialises before the inverted index lookup:
+     * The row addresses the SQL prefilters of the full text scans
+     * materialise before their inverted index lookups:
      * {@link #ftsPrefilterRows} times
      * {@link #FILTER_SCAN_BYTES_PER_MATCHING_ROW}, the term the filter
      * scan and the pushed aggregate charge for the same
      * {@code MaterializeIndexExec}; zero without a prefilter and zero
-     * when the set fits {@code shardShareBytes}.
+     * when the whole set fits {@code shardShareBytes}.
      *
-     * <p>Why it is charged: {@code bool(match body w000100, range price
-     * >= 100) size 10} over 1B rows was admitted at the document set
-     * alone, 48.4 GB, the same as the bare {@code match} page that
-     * completed on the same nodes, and killed every node of a 4 node
-     * cluster at a resident set of 128 GB; on 6 nodes the same
-     * request left 0.7 GB of the 89.8 GB available before it. The
-     * difference to the bare page is the prefilter, and 1B rows at one
-     * in five and 256 bytes is 51.2 GB, within the 40 to 60 GB the
-     * two layouts measured beyond the document set.
+     * <p>Why it is charged: the prefilter of {@code bool(match body
+     * w000100, range price >= 100) size 10} over 1B rows selects one
+     * row in five at 256 bytes each, 51.2 GB, on top of the 48.4 GB
+     * document set; a 128 GB node has 88 GB after the headroom, and
+     * the two layouts measured held 40 to 60 GB beyond the document
+     * set for this shape.
      */
-    static long ftsPrefilterEstimateBytes(long rows, String prefilterSql, long shardShareBytes) {
-        long materialised = ftsPrefilterRows(rows, prefilterSql) * FILTER_SCAN_BYTES_PER_MATCHING_ROW;
+    static long ftsPrefilterEstimateBytes(long rows, List<String> prefilterSqls, long shardShareBytes) {
+        long materialised = ftsPrefilterRows(rows, prefilterSqls) * FILTER_SCAN_BYTES_PER_MATCHING_ROW;
         return materialised <= shardShareBytes ? 0L : materialised;
     }
 
@@ -1798,10 +1815,11 @@ public final class ScanAdmission {
      */
     public static void admit(String indexName, long rows, Shape shape, LanceHitsAccounting ticket) {
         long shardShare = shardShareBytes();
-        long prefilter = ftsPrefilterEstimateBytes(rows, shape.prefilterSql(), shardShare);
+        long prefilter = ftsPrefilterEstimateBytes(rows, shape.prefilterSqls(), shardShare);
         long estimate = ftsEstimateBytes(rows, shape.clauses(), shape.phraseClauses(), scanBufferEstimateBytes(rows, shape), shardShare)
             + prefilter;
         int clauses = Math.max(1, shape.clauses());
+        int prefilters = shape.prefilterSqls().size();
         String what = (shape.unbounded() ? "unbounded full text scan" : "bounded full text page")
             + " over ["
             + indexName
@@ -1815,11 +1833,12 @@ public final class ScanAdmission {
                     + "]"
                     + (shape.phraseClauses() > 1 ? " for each of " + shape.phraseClauses() + " phrase clauses" : "")
                 : "")
-            + (shape.prefilterSql() != null
-                ? " plus the prefilter ["
-                    + shape.prefilterSql()
-                    + "] materialising "
-                    + ftsPrefilterRows(rows, shape.prefilterSql())
+            + (prefilters > 0
+                ? " plus the "
+                    + (prefilters > 1 ? prefilters + " prefilters " : "prefilter ")
+                    + shape.prefilterSqls()
+                    + " materialising "
+                    + ftsPrefilterRows(rows, shape.prefilterSqls())
                     + " row addresses over the whole table at ["
                     + NativeMemoryLimit.humanReadable(FILTER_SCAN_BYTES_PER_MATCHING_ROW)
                     + "] each"
@@ -1830,7 +1849,7 @@ public final class ScanAdmission {
         String remedy = shape.unbounded()
             ? "Bound the shape (a top k page without sort or aggregations), attach the table to a node with a larger index cache, "
                 + "or relax lance.admission.headroom / lance.admission.enabled."
-            : (shape.prefilterSql() != null ? "Drop the scalar filter, attach" : "Attach")
+            : (prefilters > 0 ? "Drop the scalar filter" + (prefilters > 1 ? "s" : "") + ", attach" : "Attach")
                 + " the table to a node with a larger index cache, or relax lance.admission.bounded_shapes_gated / "
                 + "lance.admission.headroom / lance.admission.enabled.";
         judge(new Scope(Kind.FTS, indexName, shape.columns()), estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
