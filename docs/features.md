@@ -49,7 +49,6 @@ Distribution over the cluster is automatic: fragments are spread over every data
   - `warehouse` (required): the warehouse whose namespaces are listed, the first level of every table id.
   - `max_namespace_depth`: how many namespace levels below the warehouse the poll descends, default 2.
 
-
   ```json
   POST /_lance/namespace
   {"type": "iceberg", "name": "ice-a", "config": {"endpoint": "https://catalog.example.com", "warehouse": "wh", "auth_token": "..."}}
