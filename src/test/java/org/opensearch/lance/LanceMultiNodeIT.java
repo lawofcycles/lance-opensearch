@@ -227,6 +227,136 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    public void testResultCacheIsPerCoordinatingNodeAndTheClearReachesEveryNode() throws Exception {
+        // The result cache lives on the node that coordinates the request:
+        // a repeat through the same node hits, the same body through
+        // another node misses there and stores its own entry, and the
+        // stock cache clear drops the entries on every node.
+        String suffix = "mn-rcache-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String body = "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            // The host list carries every bound address of every node
+            // (an IPv6 and an IPv4 one per node), so the two clients are
+            // pinned to hosts whose local node ids differ.
+            List<HttpHost> hosts = getClusterHosts();
+            HttpHost firstHost = hosts.get(0);
+            String firstNode;
+            try (RestClient probe = buildClient(restClientSettings(), new HttpHost[] { firstHost })) {
+                firstNode = localNodeId(probe);
+            }
+            HttpHost secondHost = null;
+            String secondNode = null;
+            for (HttpHost candidate : hosts.subList(1, hosts.size())) {
+                try (RestClient probe = buildClient(restClientSettings(), new HttpHost[] { candidate })) {
+                    String nodeId = localNodeId(probe);
+                    if (!nodeId.equals(firstNode)) {
+                        secondHost = candidate;
+                        secondNode = nodeId;
+                        break;
+                    }
+                }
+            }
+            assertNotNull("a second node among " + hosts, secondHost);
+            try (
+                RestClient first = buildClient(restClientSettings(), new HttpHost[] { firstHost });
+                RestClient second = buildClient(restClientSettings(), new HttpHost[] { secondHost })
+            ) {
+
+                Map<String, Object> firstBefore = requestCacheOf(firstNode);
+                Map<String, Object> secondBefore = requestCacheOf(secondNode);
+                assertEquals(
+                    15.0d,
+                    extractDoublePath(readAll(post(first, "/" + indexName + "/_search", body)), "aggregations", "s", "value"),
+                    0.0d
+                );
+                assertEquals(
+                    15.0d,
+                    extractDoublePath(readAll(post(first, "/" + indexName + "/_search", body)), "aggregations", "s", "value"),
+                    0.0d
+                );
+                Map<String, Object> firstAfter = requestCacheOf(firstNode);
+                assertEquals("the repeat through the same node hits", counter(firstBefore, "hits") + 1, counter(firstAfter, "hits"));
+                assertEquals(counter(firstBefore, "misses") + 1, counter(firstAfter, "misses"));
+                assertEquals("the other node saw nothing", secondBefore, requestCacheOf(secondNode));
+
+                assertEquals(
+                    15.0d,
+                    extractDoublePath(readAll(post(second, "/" + indexName + "/_search", body)), "aggregations", "s", "value"),
+                    0.0d
+                );
+                Map<String, Object> secondAfter = requestCacheOf(secondNode);
+                assertEquals(
+                    "the same body through another node misses there",
+                    counter(secondBefore, "misses") + 1,
+                    counter(secondAfter, "misses")
+                );
+                assertEquals(counter(secondBefore, "hits"), counter(secondAfter, "hits"));
+                assertEquals(counter(secondBefore, "entries") + 1, counter(secondAfter, "entries"));
+                assertEquals("the first node's cache is untouched by it", firstAfter, requestCacheOf(firstNode));
+
+                // The clear, sent to one node, reaches the other's cache.
+                Response clear = first.performRequest(new Request("POST", "/" + indexName + "/_cache/clear?request=true"));
+                assertEquals(RestStatus.OK.getStatus(), clear.getStatusLine().getStatusCode());
+                Map<String, Object> firstCleared = requestCacheOf(firstNode);
+                Map<String, Object> secondCleared = requestCacheOf(secondNode);
+                assertEquals(counter(firstAfter, "invalidations") + 1, counter(firstCleared, "invalidations"));
+                assertEquals(counter(secondAfter, "invalidations") + 1, counter(secondCleared, "invalidations"));
+                assertEquals(counter(firstAfter, "entries") - 1, counter(firstCleared, "entries"));
+                assertEquals(counter(secondAfter, "entries") - 1, counter(secondCleared, "entries"));
+                assertEquals(
+                    15.0d,
+                    extractDoublePath(readAll(post(second, "/" + indexName + "/_search", body)), "aggregations", "s", "value"),
+                    0.0d
+                );
+                assertEquals(
+                    "after the clear the body misses",
+                    counter(secondCleared, "misses") + 1,
+                    counter(requestCacheOf(secondNode), "misses")
+                );
+            }
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private static Response post(RestClient client, String path, String body) throws IOException {
+        Request request = new Request("POST", path);
+        request.setJsonEntity(body);
+        return client.performRequest(request);
+    }
+
+    /** The id of the node {@code client} is pinned to. */
+    @SuppressWarnings("unchecked")
+    private static String localNodeId(RestClient client) throws IOException {
+        Map<String, Object> parsed = parse(readAll(client.performRequest(new Request("GET", "/_nodes/_local/http"))));
+        Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
+        assertEquals(1, nodes.size());
+        return nodes.keySet().iterator().next();
+    }
+
+    /** The {@code request_cache} object of {@code nodeId} in {@code GET /_lance/stats}. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> requestCacheOf(String nodeId) throws IOException {
+        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats/" + nodeId))));
+        Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
+        Map<String, Object> node = (Map<String, Object>) nodes.get(nodeId);
+        assertNotNull("stats of " + nodeId + ": " + parsed, node);
+        return (Map<String, Object>) node.get("request_cache");
+    }
+
+    private static long counter(Map<String, Object> block, String key) {
+        return ((Number) block.get(key)).longValue();
+    }
+
     public void testShippedPlanRunsOnEveryNodeAndStatsReportRefinements() throws Exception {
         // The coordinator plans once and ships the per node plan over
         // the transport layer to three executors in separate JVMs. A

@@ -40,6 +40,11 @@ import org.opensearch.core.rest.RestStatus;
  * admitted without them. The metadata warm up's full text probe is
  * judged by the same gate, and the stats report its decision under the
  * {@code warm_up} source.
+ *
+ * <p>Every search opts out of the coordinator result cache
+ * ({@code request_cache=false}): the gate judges a scan on the
+ * executors, and a repeated size 0 body served from the cache would
+ * reach no executor.
  */
 public class LanceAdmissionIT extends LanceRestTestCase {
 
@@ -56,7 +61,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             // block reports the node's available memory (MemAvailable
             // on Linux, which stays positive on a warm node whose page
             // cache has consumed its free pages) next to the 200.
-            String before = readAll(postJson("/" + indexName + "/_search", UNBOUNDED));
+            String before = readAll(postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED));
             assertEquals(8, extractIntPath(before, "hits", "total", "value"));
             Map<String, Object> warm = admissionStats();
             assertTrue(warm.toString(), ((Number) warm.get("available_bytes")).longValue() > 0L);
@@ -64,7 +69,10 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             updateClusterSetting("lance.test.index_cache_shard_share", "\"1b\"");
             updateClusterSetting("lance.admission.headroom", "\"1pb\"");
             try {
-                ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", UNBOUNDED));
+                ResponseException failure = expectThrows(
+                    ResponseException.class,
+                    () -> postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED)
+                );
                 int status = failure.getResponse().getStatusLine().getStatusCode();
                 String body = readAll(failure.getResponse());
                 assertEquals("expected 429, saw " + status + ": " + body, RestStatus.TOO_MANY_REQUESTS.getStatus(), status);
@@ -89,7 +97,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 // through; the rejection count stays where it was.
                 long rejected = rejections(admission, "fts");
                 updateClusterSetting("lance.admission.enabled", "false");
-                String disabled = readAll(postJson("/" + indexName + "/_search", UNBOUNDED));
+                String disabled = readAll(postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED));
                 assertEquals(8, extractIntPath(disabled, "hits", "total", "value"));
                 Map<String, Object> after = admissionStats();
                 assertEquals(after.toString(), false, after.get("enabled"));
@@ -101,7 +109,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             }
 
             // Back at the defaults the unbounded shape answers as before.
-            String restored = readAll(postJson("/" + indexName + "/_search", UNBOUNDED));
+            String restored = readAll(postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED));
             assertEquals(8, extractIntPath(restored, "hits", "total", "value"));
         }
     }
@@ -115,7 +123,10 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             try {
                 // A bounded top-k page rebuilds the same document set,
                 // so it is judged by the same comparison and refused.
-                ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", BOUNDED));
+                ResponseException failure = expectThrows(
+                    ResponseException.class,
+                    () -> postJson("/" + indexName + "/_search?request_cache=false", BOUNDED)
+                );
                 int status = failure.getResponse().getStatusLine().getStatusCode();
                 String body = readAll(failure.getResponse());
                 assertEquals("expected 429, saw " + status + ": " + body, RestStatus.TOO_MANY_REQUESTS.getStatus(), status);
@@ -133,12 +144,12 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 // Opting bounded shapes out restores the pass-through
                 // for the page while the unbounded shape stays gated.
                 updateClusterSetting("lance.admission.bounded_shapes_gated", "false");
-                Response bounded = postJson("/" + indexName + "/_search", BOUNDED);
+                Response bounded = postJson("/" + indexName + "/_search?request_cache=false", BOUNDED);
                 assertEquals(RestStatus.OK.getStatus(), bounded.getStatusLine().getStatusCode());
                 assertEquals(8, extractIntPath(readAll(bounded), "hits", "total", "value"));
                 ResponseException stillGated = expectThrows(
                     ResponseException.class,
-                    () -> postJson("/" + indexName + "/_search", UNBOUNDED)
+                    () -> postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED)
                 );
                 assertEquals(RestStatus.TOO_MANY_REQUESTS.getStatus(), stillGated.getResponse().getStatusLine().getStatusCode());
             } finally {
@@ -148,7 +159,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             }
 
             // Back at the defaults the bounded page answers as before.
-            String restored = readAll(postJson("/" + indexName + "/_search", BOUNDED));
+            String restored = readAll(postJson("/" + indexName + "/_search?request_cache=false", BOUNDED));
             assertEquals(8, extractIntPath(restored, "hits", "total", "value"));
         }
     }
@@ -173,7 +184,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 // own. An admission at a reading above every earlier one
                 // starts the pool over with nothing retained.
                 updateClusterSetting("lance.test.admission_available_memory", "[\"1pb\"]");
-                String fresh = readAll(postJson("/" + indexName + "/_search", UNBOUNDED));
+                String fresh = readAll(postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED));
                 assertEquals(8, extractIntPath(fresh, "hits", "total", "value"));
                 assertEquals(admissionStats().toString(), 0L, ((Number) admissionStats().get("retained_bytes")).longValue());
 
@@ -182,7 +193,10 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 // yet, so the shape is refused and the message says so.
                 updateClusterSetting("lance.test.admission_available_memory", "[\"1000b\"]");
                 updateClusterSetting("lance.admission.headroom", "\"500b\"");
-                ResponseException refused = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", UNBOUNDED));
+                ResponseException refused = expectThrows(
+                    ResponseException.class,
+                    () -> postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED)
+                );
                 String body = readAll(refused.getResponse());
                 assertEquals(body, RestStatus.TOO_MANY_REQUESTS.getStatus(), refused.getResponse().getStatusLine().getStatusCode());
                 assertTrue(body, body.contains("[0b] retained by earlier admitted scans"));
@@ -197,7 +211,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 // estimate. The stats then read 1000 and report the
                 // credit next to it.
                 updateClusterSetting("lance.test.admission_available_memory", "[\"2000b\",\"1000b\"]");
-                String first = readAll(postJson("/" + indexName + "/_search", UNBOUNDED));
+                String first = readAll(postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED));
                 assertEquals(8, extractIntPath(first, "hits", "total", "value"));
                 admission = admissionStats();
                 assertEquals(admission.toString(), rejected, rejections(admission, "fts"));
@@ -209,7 +223,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 // its own, the reading that was refused above, admitted
                 // on the 856 byte credit. Twice, and the pool stands.
                 for (int repeat = 1; repeat <= 2; repeat++) {
-                    String response = readAll(postJson("/" + indexName + "/_search", UNBOUNDED));
+                    String response = readAll(postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED));
                     assertEquals("repeat " + repeat, 8, extractIntPath(response, "hits", "total", "value"));
                     admission = admissionStats();
                     assertEquals(admission.toString(), rejected, rejections(admission, "fts"));
@@ -226,7 +240,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 String filtered = "{\"size\":0,\"query\":{\"term\":{\"id\":3}}}";
                 ResponseException refusedFilter = expectThrows(
                     ResponseException.class,
-                    () -> postJson("/" + indexName + "/_search", filtered)
+                    () -> postJson("/" + indexName + "/_search?request_cache=false", filtered)
                 );
                 String filterBody = readAll(refusedFilter.getResponse());
                 assertEquals(
@@ -256,7 +270,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 updateClusterSetting("lance.admission.headroom", "\"1500b\"");
                 ResponseException refusedAgain = expectThrows(
                     ResponseException.class,
-                    () -> postJson("/" + indexName + "/_search", UNBOUNDED)
+                    () -> postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED)
                 );
                 String bodyAgain = readAll(refusedAgain.getResponse());
                 assertEquals(
@@ -273,7 +287,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             }
 
             // Back at the defaults the unbounded shape answers as before.
-            String restored = readAll(postJson("/" + indexName + "/_search", UNBOUNDED));
+            String restored = readAll(postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED));
             assertEquals(8, extractIntPath(restored, "hits", "total", "value"));
         }
     }
@@ -335,12 +349,29 @@ public class LanceAdmissionIT extends LanceRestTestCase {
 
             // The oracle answers, so the shapes below are served by the
             // paths the gate covers.
-            int bitmapHits = extractIntPath(readAll(postJson("/" + tableName + "/_search", TERM_BITMAP)), "hits", "total", "value");
+            int bitmapHits = extractIntPath(
+                readAll(postJson("/" + tableName + "/_search?request_cache=false", TERM_BITMAP)),
+                "hits",
+                "total",
+                "value"
+            );
             assertTrue("c1 rows: " + bitmapHits, bitmapHits > 0);
-            assertEquals(1, extractIntPath(readAll(postJson("/" + tableName + "/_search", TERM_BTREE)), "hits", "total", "value"));
-            assertEquals(3, extractIntPath(readAll(postJson("/" + tableName + "/_search", KNN)), "hits", "total", "value"));
-            assertEquals(300, extractIntPath(readAll(postJson("/" + tableName + "/_search", TERMS_AGG)), "hits", "total", "value"));
-            assertEquals(300, extractIntPath(readAll(postJson("/" + tableName + "/_search", SORTED_PAGE)), "hits", "total", "value"));
+            assertEquals(
+                1,
+                extractIntPath(readAll(postJson("/" + tableName + "/_search?request_cache=false", TERM_BTREE)), "hits", "total", "value")
+            );
+            assertEquals(
+                3,
+                extractIntPath(readAll(postJson("/" + tableName + "/_search?request_cache=false", KNN)), "hits", "total", "value")
+            );
+            assertEquals(
+                300,
+                extractIntPath(readAll(postJson("/" + tableName + "/_search?request_cache=false", TERMS_AGG)), "hits", "total", "value")
+            );
+            assertEquals(
+                300,
+                extractIntPath(readAll(postJson("/" + tableName + "/_search?request_cache=false", SORTED_PAGE)), "hits", "total", "value")
+            );
             // The estimates below name the indexes and their selectivity
             // out of the table statistics, which are collected in the
             // background once the shard starts and the first request
@@ -395,11 +426,30 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 updateClusterSetting("lance.admission.enabled", "false");
                 assertEquals(
                     bitmapHits,
-                    extractIntPath(readAll(postJson("/" + tableName + "/_search", TERM_BITMAP)), "hits", "total", "value")
+                    extractIntPath(
+                        readAll(postJson("/" + tableName + "/_search?request_cache=false", TERM_BITMAP)),
+                        "hits",
+                        "total",
+                        "value"
+                    )
                 );
-                assertEquals(3, extractIntPath(readAll(postJson("/" + tableName + "/_search", KNN)), "hits", "total", "value"));
-                assertEquals(300, extractIntPath(readAll(postJson("/" + tableName + "/_search", TERMS_AGG)), "hits", "total", "value"));
-                assertEquals(300, extractIntPath(readAll(postJson("/" + tableName + "/_search", SORTED_PAGE)), "hits", "total", "value"));
+                assertEquals(
+                    3,
+                    extractIntPath(readAll(postJson("/" + tableName + "/_search?request_cache=false", KNN)), "hits", "total", "value")
+                );
+                assertEquals(
+                    300,
+                    extractIntPath(readAll(postJson("/" + tableName + "/_search?request_cache=false", TERMS_AGG)), "hits", "total", "value")
+                );
+                assertEquals(
+                    300,
+                    extractIntPath(
+                        readAll(postJson("/" + tableName + "/_search?request_cache=false", SORTED_PAGE)),
+                        "hits",
+                        "total",
+                        "value"
+                    )
+                );
                 Map<String, Object> disabled = admissionStats();
                 assertEquals(disabled.toString(), false, disabled.get("enabled"));
                 assertEquals(disabled.get("rejections").toString(), refused.get("rejections"), disabled.get("rejections"));
@@ -412,12 +462,24 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             // Back at the defaults every shape answers as before.
             assertEquals(
                 bitmapHits,
-                extractIntPath(readAll(postJson("/" + tableName + "/_search", TERM_BITMAP)), "hits", "total", "value")
+                extractIntPath(readAll(postJson("/" + tableName + "/_search?request_cache=false", TERM_BITMAP)), "hits", "total", "value")
             );
-            assertEquals(1, extractIntPath(readAll(postJson("/" + tableName + "/_search", TERM_BTREE)), "hits", "total", "value"));
-            assertEquals(3, extractIntPath(readAll(postJson("/" + tableName + "/_search", KNN)), "hits", "total", "value"));
-            assertEquals(300, extractIntPath(readAll(postJson("/" + tableName + "/_search", TERMS_AGG)), "hits", "total", "value"));
-            assertEquals(300, extractIntPath(readAll(postJson("/" + tableName + "/_search", SORTED_PAGE)), "hits", "total", "value"));
+            assertEquals(
+                1,
+                extractIntPath(readAll(postJson("/" + tableName + "/_search?request_cache=false", TERM_BTREE)), "hits", "total", "value")
+            );
+            assertEquals(
+                3,
+                extractIntPath(readAll(postJson("/" + tableName + "/_search?request_cache=false", KNN)), "hits", "total", "value")
+            );
+            assertEquals(
+                300,
+                extractIntPath(readAll(postJson("/" + tableName + "/_search?request_cache=false", TERMS_AGG)), "hits", "total", "value")
+            );
+            assertEquals(
+                300,
+                extractIntPath(readAll(postJson("/" + tableName + "/_search?request_cache=false", SORTED_PAGE)), "hits", "total", "value")
+            );
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + tableName));
@@ -432,7 +494,10 @@ public class LanceAdmissionIT extends LanceRestTestCase {
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "admissionfilter")) {
             String indexName = fixture.indexName();
             String term = "{\"size\":0,\"query\":{\"term\":{\"id\":3}}}";
-            assertEquals(1, extractIntPath(readAll(postJson("/" + indexName + "/_search", term)), "hits", "total", "value"));
+            assertEquals(
+                1,
+                extractIntPath(readAll(postJson("/" + indexName + "/_search?request_cache=false", term)), "hits", "total", "value")
+            );
             updateClusterSetting("lance.test.index_cache_shard_share", "\"1b\"");
             updateClusterSetting("lance.admission.headroom", "\"1pb\"");
             try {
@@ -465,13 +530,19 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 updateClusterSetting("lance.admission.headroom", null);
                 updateClusterSetting("lance.test.index_cache_shard_share", null);
             }
-            assertEquals(1, extractIntPath(readAll(postJson("/" + indexName + "/_search", term)), "hits", "total", "value"));
+            assertEquals(
+                1,
+                extractIntPath(readAll(postJson("/" + indexName + "/_search?request_cache=false", term)), "hits", "total", "value")
+            );
         }
     }
 
     /** POST {@code body} to the index and assert the 429 of the gate names {@code kind}; the response body. */
     private static String expectAdmissionRefusal(String indexName, String body, String kind) {
-        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", body));
+        ResponseException failure = expectThrows(
+            ResponseException.class,
+            () -> postJson("/" + indexName + "/_search?request_cache=false", body)
+        );
         int status = failure.getResponse().getStatusLine().getStatusCode();
         String response;
         try {
@@ -522,7 +593,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             assertEquals(admission.toString(), "warm_up", admission.get("last_source"));
             assertEquals(admission.toString(), 0L, ((Number) admission.get("last_estimate_bytes")).longValue());
             // A request's decision afterwards is reported as such.
-            Response page = postJson("/" + tableName + "/_search", BOUNDED);
+            Response page = postJson("/" + tableName + "/_search?request_cache=false", BOUNDED);
             assertEquals(readAll(page), RestStatus.OK.getStatus(), page.getStatusLine().getStatusCode());
             Map<String, Object> afterRequest = admissionStats();
             assertEquals(afterRequest.toString(), "fts", afterRequest.get("last_kind"));
