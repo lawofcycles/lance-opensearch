@@ -778,7 +778,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
      * to 5, 3 categories cut to 2): the scan sees every key of its
      * fragments, so a single executor's answer is exact, and the
      * coordinator's reduce of one answer derives no error, as it does
-     * for a single shard. The buckets and the other count match the
+     * for a single shard. The keys, the counts and the other count match the
      * stock search path over the same rows.
      */
     @SuppressWarnings("unchecked")
@@ -806,15 +806,16 @@ public class LanceAggregationIT extends LanceRestTestCase {
                         assertEquals(shape + " bucket " + bucket, 0, ((Number) bucket.get("doc_count_error_upper_bound")).intValue());
                     }
                     // The stock oracle target is two indexes (the Lance
-                    // index and an empty ordinary one), so its reduce
-                    // sees two shard answers and derives an error of its
-                    // own for a cut terms; the buckets and the other
-                    // count are what both paths must agree on.
+                    // index and an empty ordinary one) and the stock
+                    // search slices the Lance shard's three leaves, so
+                    // its reduce derives errors of its own for a cut
+                    // terms; the keys, the counts and the other count are
+                    // what both paths must agree on.
                     Map<String, Object> stock = aggregation(
                         parse(readAll(postJson("/" + LanceRestTestCase.withStockOracle(index) + "/_search?request_cache=false", shape))),
                         shape.contains("\"c\"") ? "c" : "r"
                     );
-                    assertEquals(shape, stock.get("buckets"), terms.get("buckets"));
+                    assertEquals(shape, keysAndCounts(stock), keysAndCounts(terms));
                     assertEquals(shape, stock.get("sum_other_doc_count"), terms.get("sum_other_doc_count"));
                 }
                 assertBusy(() -> assertEquals("every shape took the pushdown", before + shapes.length, pushdownLogLines(index)));
@@ -824,6 +825,16 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 client().performRequest(reset);
             }
         }
+    }
+
+    /** The {@code key} and {@code doc_count} of every bucket of a terms result, in bucket order. */
+    @SuppressWarnings("unchecked")
+    private static List<String> keysAndCounts(Map<String, Object> terms) {
+        List<String> out = new ArrayList<>();
+        for (Map<String, Object> bucket : (List<Map<String, Object>>) terms.get("buckets")) {
+            out.add(bucket.get("key") + "=" + bucket.get("doc_count"));
+        }
+        return out;
     }
 
     public void testSubstraitPushdownAnswersDateHistogramLikeTheAggregators() throws Exception {
