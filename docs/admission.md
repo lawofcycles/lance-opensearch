@@ -39,12 +39,15 @@ One estimator per kind, each a static method of `ScanAdmission` with its coeffic
 
 ### `fts`
 
-A full text scan. The estimate is the sum of three parts; it is zero when one document set fits the shard share.
+A full text scan. The estimate is the sum of four parts; the first three are zero when one document set fits the shard share, the fourth when it fits the shard share on its own.
 
 - The document set rebuild, `rows × 52 bytes`, over whichever fragments the scan keeps, once per full text clause. Lance searches every `match`, `match_phrase` and `multi_match` column of a `lance_fts_bool`, a fused stock `bool` or a `lance_fts_boost` on its own and holds each result while it joins them, so `bool(must [match, match])` counts two document sets.
 - The positions of each `match_phrase` clause's tokens, `rows × 48 bytes` per phrase clause (`PHRASE_POSITION_BYTES_PER_ROW`).
   - Why positions are counted: the phrase `w000000 w000001 size 10` over 1B rows peaked at 103 GB on one 128 GB node and killed every node of a 4 node cluster after being admitted at the document set alone.
 - The hits scan buffers: one row in ten of the table for an unbounded shape, the top-k limit for a bounded page, at 12 bytes per row, doubled.
+- The row addresses the scan's SQL prefilter materialises when a `bool` with scalar `filter` / `must_not` clauses was fused into one Lance scan: one row in five of the table (`FILTER_MATCH_RATIO_UNKNOWN`) at 256 bytes each (`FILTER_SCAN_BYTES_PER_MATCHING_ROW`), the same term `filter_scan` and `aggregate_scan` charge for Lance's `MaterializeIndexExec`. When several full text leaves each carry a prefilter (a `bool` the planner did not fuse), every distinct prefilter SQL is charged once. For `bool(must [match body w000100], filter [range price >= 100]) size 10` over 1B rows on a 128 GB node the 429 message reads
+  `[lance_admission] fts estimate [96.1gb] exceeds available [81.9gb] minus headroom [8gb] plus [0b] retained by earlier admitted scans: bounded full text page over [perf1b]: inverted index document set of [48.4gb] plus the prefilter [price >= 100.0] materialising 200000000 row addresses over the whole table at [256b] each against an index cache shard of [8gb] plus the hits scan buffers. Drop the scalar filter, attach the table to a node with a larger index cache, or relax lance.admission.bounded_shapes_gated / lance.admission.headroom / lance.admission.enabled.`
+  - Where the figure comes from: 1B rows at one in five is 200M row addresses, at 256 bytes 51.2 GB. With the 48.4 GB document set the shape reaches 96.1 GB, above the 88 GB a 128 GB node has after the 8 GB headroom, so it is refused there.
 
 ### `scalar_index`
 

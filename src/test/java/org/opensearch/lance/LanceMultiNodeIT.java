@@ -1297,9 +1297,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // whichever ten the clipped scan kept, the merge lists them
             // by fragment then offset, the same on every request.
             String bare = "{\"size\":10,\"query\":" + tied + "}";
-            Map<String, Object> bareFirst = parse(readAll(postJson("/" + indexName + "/_search", bare)));
+            Map<String, Object> bareFirst = assertFullPage(indexName, "\"size\":10,\"query\":" + tied, 0, 10);
             List<String> bareIds = hitIdsOf(bareFirst);
-            assertEquals(10, bareIds.size());
             List<Double> bareScores = scores(bareFirst);
             for (Double score : bareScores) {
                 assertEquals(bareScores.get(0), score, 1e-6d);
@@ -1327,6 +1326,99 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
         }
+    }
+
+    /**
+     * A bare full text page over a table whose rows all tie in score
+     * holds {@code size} hits from three executors. Every row of the
+     * fixture is the one token {@code lance}, so the 300 rows of the
+     * three fragments, one per data node, share one BM25 score, and
+     * the rows Lance puts into a global top list are whichever tied
+     * rows it reaches first. An executor that kept only its share of
+     * one global top {@code size} would leave the coordinator short
+     * when that list holds rows of other executors' fragments; the
+     * executor has to keep the top {@code size} rows of its own
+     * fragments instead, so the merge always has {@code size} rows to
+     * pick from once that many rows match.
+     */
+    public void testBoundedFtsPageOnThreeNodesIsFullUnderTiedScores() throws Exception {
+        String suffix = "mn-full-page-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 3;
+        int rowsPerFragment = 100;
+        LanceTableFactory.writeContiguousScoreTable(scratchDir, tableName, fragments, rowsPerFragment, true);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String match = "{\"match\":{\"body\":\"lance\"}}";
+        String rangeFiltered = "{\"bool\":{\"must\":[" + match + "],\"filter\":[{\"range\":{\"id\":{\"gte\":250}}}]}}";
+        String termFiltered = "{\"bool\":{\"must\":[" + match + "],\"filter\":[{\"term\":{\"category\":\"c1\"}}]}}";
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+
+            // Every row matches and every score is the same; the page
+            // holds ten of them and the total is exact.
+            Map<String, Object> page = assertFullPage(indexName, "\"size\":10,\"query\":" + match, 0, 10);
+            assertEquals(fragments * rowsPerFragment, extractIntPath(page, "hits", "total", "value"));
+            assertEquals("eq", relation(page));
+            List<Double> pageScores = scores(page);
+            for (Double score : pageScores) {
+                assertEquals(pageScores.get(0), score, 1e-6d);
+            }
+            // The merge lists the tied rows by row address and the same
+            // rows come back on every request.
+            List<String> pageIds = hitIdsOf(page);
+            assertRowAddressAscending(pageIds);
+            for (int i = 0; i < 3; i++) {
+                assertEquals(pageIds, hitIdsOf(assertFullPage(indexName, "\"size\":10,\"query\":" + match, 0, 10)));
+            }
+            // Deeper pages, a page past the tail, and the same shape
+            // with a scalar prefilter that leaves 50 and 100 tied rows.
+            assertFullPage(indexName, "\"from\":5,\"size\":10,\"query\":" + match, 5, 10);
+            assertFullPage(indexName, "\"from\":95,\"size\":50,\"query\":" + match, 95, 50);
+            assertFullPage(indexName, "\"from\":295,\"size\":10,\"query\":" + match, 295, 10);
+            assertFullPage(indexName, "\"size\":3,\"query\":" + match, 0, 3);
+            Map<String, Object> ranged = assertFullPage(indexName, "\"size\":10,\"query\":" + rangeFiltered, 0, 10);
+            assertEquals(50, extractIntPath(ranged, "hits", "total", "value"));
+            assertFullPage(indexName, "\"from\":45,\"size\":10,\"query\":" + rangeFiltered, 45, 10);
+            Map<String, Object> termed = assertFullPage(indexName, "\"size\":10,\"query\":" + termFiltered, 0, 10);
+            assertEquals(100, extractIntPath(termed, "hits", "total", "value"));
+
+            // Every data node received one fragment, or the requests
+            // above never exercised the subset executors.
+            int dataNodes = dataNodeCount();
+            assertEquals("fixture assumes one fragment per data node", fragments, dataNodes);
+            assertBusy(() -> {
+                Map<String, String> assignments = fanOutAssignments(indexName);
+                assertEquals("fragments went to " + assignments, dataNodes, assignments.size());
+                for (Map.Entry<String, String> assignment : assignments.entrySet()) {
+                    assertEquals(
+                        "node " + assignment.getKey() + " got " + assignment.getValue(),
+                        1,
+                        assignment.getValue().split(",").length
+                    );
+                }
+            });
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Run {@code shape} through the fragment path and check that its
+     * page holds {@code min(size, hits.total - from)} hits: a page is
+     * only shorter than {@code size} when the matches run out.
+     */
+    private static Map<String, Object> assertFullPage(String indexName, String shape, int from, int size) throws IOException {
+        Map<String, Object> response = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
+        int total = extractIntPath(response, "hits", "total", "value");
+        assertEquals(shape + " answered " + hitIdsOf(response), Math.max(0, Math.min(size, total - from)), hitList(response).size());
+        return response;
     }
 
     /**

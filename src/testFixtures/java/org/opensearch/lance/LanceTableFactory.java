@@ -1762,6 +1762,111 @@ public final class LanceTableFactory {
         return withLocaleRoot(() -> writeInterleavedTableOnce(parent, name, fragments, rowsPerFragment, true));
     }
 
+    /**
+     * Writes a table of {@code fragments} contiguous fragments of
+     * {@code rowsPerFragment} rows whose {@code lance} scores are
+     * either all equal or fall with the row id, for tests of the
+     * bounded full text page on an executor that holds a subset of
+     * the fragments. Fragment {@code f} holds the rows with global id
+     * {@code f * rowsPerFragment <= i < (f + 1) * rowsPerFragment} at
+     * offset {@code i % rowsPerFragment}. Columns, for a row with
+     * global id {@code i}:
+     * <ul>
+     *   <li>{@code id}: int32, {@code i}</li>
+     *   <li>{@code body}: Utf8 with an INVERTED index. With
+     *       {@code tied} the body of every row is the one token
+     *       {@code lance}, so every row matches {@code lance} with
+     *       the same BM25 score and the whole table is one tie group.
+     *       Without it the body is {@code lance} repeated
+     *       {@code rows - i} times ({@code rows} being the table's row
+     *       count), so the score falls strictly with {@code i}: the
+     *       highest scores sit in fragment 0 and the lowest in the
+     *       last fragment.</li>
+     *   <li>{@code category}: Utf8 without an index, {@code "c" + (i % 3)}</li>
+     * </ul>
+     * The first fragment is written with {@code CREATE}, the rest with
+     * {@code APPEND}; the FTS index is built last so it covers every
+     * fragment. Public because the query package's unit tests and the
+     * multi node IT both need this layout.
+     *
+     * @return absolute URI of the table.
+     */
+    public static String writeContiguousScoreTable(Path parent, String name, int fragments, int rowsPerFragment, boolean tied)
+        throws Exception {
+        return withLocaleRoot(() -> writeContiguousScoreTableOnce(parent, name, fragments, rowsPerFragment, tied));
+    }
+
+    private static String writeContiguousScoreTableOnce(Path parent, String name, int fragments, int rowsPerFragment, boolean tied)
+        throws Exception {
+        Path tablePath = parent.resolve(name + ".lance");
+        String uri = tablePath.toString();
+        Schema schema = new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field(BODY_COLUMN, FieldType.nullable(new ArrowType.Utf8()), null),
+                new Field("category", FieldType.nullable(new ArrowType.Utf8()), null)
+            ),
+            Map.of()
+        );
+        int rows = fragments * rowsPerFragment;
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            for (int fragment = 0; fragment < fragments; fragment++) {
+                byte[] ipcBytes;
+                try (
+                    VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+                    ByteArrayOutputStream out = new ByteArrayOutputStream()
+                ) {
+                    IntVector idVector = (IntVector) root.getVector("id");
+                    VarCharVector bodyVector = (VarCharVector) root.getVector(BODY_COLUMN);
+                    VarCharVector categoryVector = (VarCharVector) root.getVector("category");
+                    idVector.allocateNew(rowsPerFragment);
+                    bodyVector.allocateNew();
+                    categoryVector.allocateNew();
+                    for (int slot = 0; slot < rowsPerFragment; slot++) {
+                        int i = fragment * rowsPerFragment + slot;
+                        idVector.set(slot, i);
+                        String body = tied ? "lance" : "lance" + " lance".repeat(rows - i - 1);
+                        bodyVector.setSafe(slot, body.getBytes(StandardCharsets.UTF_8));
+                        categoryVector.setSafe(slot, ("c" + (i % 3)).getBytes(StandardCharsets.UTF_8));
+                    }
+                    idVector.setValueCount(rowsPerFragment);
+                    bodyVector.setValueCount(rowsPerFragment);
+                    categoryVector.setValueCount(rowsPerFragment);
+                    root.setRowCount(rowsPerFragment);
+                    try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+                        writer.start();
+                        writer.writeBatch();
+                        writer.end();
+                    }
+                    ipcBytes = out.toByteArray();
+                }
+                try (
+                    ByteArrayInputStream in = new ByteArrayInputStream(ipcBytes);
+                    ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+                    ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)
+                ) {
+                    Data.exportArrayStream(allocator, reader, stream);
+                    WriteParams.WriteMode mode = fragment == 0 ? WriteParams.WriteMode.CREATE : WriteParams.WriteMode.APPEND;
+                    WriteParams writeParams = new WriteParams.Builder().withMode(mode).build();
+                    Dataset.create(allocator, stream, uri, writeParams).close();
+                }
+            }
+            try (Dataset dataset = Dataset.open().allocator(allocator).uri(uri).build()) {
+                ScalarIndexParams scalarParams = ScalarIndexParams.create(
+                    "inverted",
+                    "{\"base_tokenizer\":\"simple\",\"language\":\"English\",\"with_position\":true}"
+                );
+                IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+                dataset.createIndex(
+                    IndexOptions.builder(Collections.singletonList(BODY_COLUMN), IndexType.INVERTED, indexParams)
+                        .withIndexName(BODY_COLUMN + "_fts")
+                        .build()
+                );
+            }
+        }
+        return uri;
+    }
+
     private static String writeInterleavedTableOnce(Path parent, String name, int fragments, int rowsPerFragment, boolean withBucket)
         throws Exception {
         Path tablePath = parent.resolve(name + ".lance");

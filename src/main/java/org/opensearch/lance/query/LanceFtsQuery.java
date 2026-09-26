@@ -354,16 +354,34 @@ public final class LanceFtsQuery extends Query {
      *
      * <ul>
      *   <li>Bounded ({@code scanLimit} set, the pure top k shape):
-     *       one scan with {@code limit(scanLimit)} over the table.
-     *       Every executor computes the same global top k and keeps
-     *       its own fragments' rows out of it. The fragments are
-     *       partitioned over the executors, so the per executor
-     *       results are disjoint and their union is exactly the
-     *       global top k; the coordinator's k way merge of those
-     *       lists is the same top k a single executor holding the
-     *       whole table would return. The only slack is a tie in
-     *       score at rank k, where Lance's tie break decides which of
-     *       the tied rows is inside the k rows.</li>
+     *       the executor answers with the top k rows of its own
+     *       fragments, the way a shard of a stock index answers, and
+     *       the coordinator's k way merge of the per executor pages
+     *       is the global top k. The rows come out of a scan with
+     *       {@code limit(L)} over the whole table, {@code L} being
+     *       {@link LanceFtsQuery#boundedProbeLimit} (the page times the
+     *       executor's share of the fragments, times a slack),
+     *       filtered to the reader's fragments: an own row outside
+     *       the global top {@code L} scores at most the {@code L}th
+     *       row, so once {@code k} own rows are inside the top
+     *       {@code L} they are the executor's top k up to ties at the
+     *       {@code L}th score, and a scan that returns fewer than
+     *       {@code L} rows has shown every match of the table. When
+     *       the top {@code L} holds fewer than {@code k} own rows and
+     *       the scan filled up (the matches concentrate on other
+     *       executors' fragments, or the scores tie and Lance's top
+     *       k picked other fragments' rows), the rows are discarded
+     *       and the scan is repeated with the limit doubled, up to
+     *       {@code effectiveSubsetProbeLimit(rows covered)}; past that
+     *       the scan is repeated with {@code limit(k)} and the
+     *       {@code fragmentIds} restriction, which returns the
+     *       executor's own top k directly at the price of the
+     *       {@code _rowid} prefilter read. The executors must not
+     *       each keep their share of one global top k instead: which
+     *       of the rows tied at rank k Lance returns differs between
+     *       executors, and a tied row kept on one executor that is
+     *       not among the fragments of that executor is lost, so the
+     *       union came back short of k.</li>
      *   <li>Unbounded (aggregations, sort by a field, post_filter,
      *       {@code size 0}): a probe scan with
      *       {@code limit(effectiveSubsetProbeLimit(rows covered))}
@@ -578,11 +596,7 @@ public final class LanceFtsQuery extends Query {
             if (scan == null) {
                 return -1L;
             }
-            long total = 0L;
-            for (LanceFragmentHits fragmentHits : scan.hits().values()) {
-                total += fragmentHits.size();
-            }
-            return total;
+            return rowsOf(scan.hits());
         }
 
         /**
@@ -590,9 +604,10 @@ public final class LanceFtsQuery extends Query {
          * fragments, so {@link #hitCount()} is the exact match count.
          * True for an unbounded scan (the probe came back short of its
          * limit, or the restricted scan ran after it filled up) and
-         * for a bounded scan that returned fewer rows than its limit
-         * before any filtering; false for a bounded scan that filled
-         * its limit, and before the scan has run.
+         * for a bounded scan whose last scan returned fewer rows than
+         * its limit before any filtering; false for a bounded scan
+         * whose last scan filled its limit, and before the scan has
+         * run.
          */
         public boolean complete() {
             ShardScan scan = shardScan.get();
@@ -669,19 +684,56 @@ public final class LanceFtsQuery extends Query {
             ScanAdmission.scanStarted();
             try {
                 if (scanLimit != SCAN_LIMIT_UNBOUNDED) {
-                    // Top k over the whole table; each executor keeps its
-                    // share of the same k rows. Lance rejects limit == 0;
-                    // if a caller passed scanLimit == 0 through some other
-                    // route the clip is 1.
-                    long limit = Math.max(1L, (long) scanLimit);
-                    ScanOptions options = newScanOptions().limit(limit).build();
-                    issued.add(options);
-                    long returned = collectHits(dataset, options, keep, hits);
-                    // Lance returns exactly min(limit, matches) rows, so a
-                    // short result means every match of the table, and
-                    // with it every match of the reader's fragments, has
-                    // been seen.
-                    complete = returned < limit;
+                    // Lance rejects limit == 0; if a caller passed
+                    // scanLimit == 0 through some other route the clip
+                    // is 1.
+                    long page = Math.max(1L, (long) scanLimit);
+                    if (keep == null) {
+                        // Top k over the whole table is the reader's top k.
+                        ScanOptions options = newScanOptions().limit(page).build();
+                        issued.add(options);
+                        long returned = collectHits(dataset, options, null, hits);
+                        // Lance returns exactly min(limit, matches) rows,
+                        // so a short result means every match has been
+                        // seen.
+                        complete = returned < page;
+                    } else {
+                        // Top k of the reader's fragments out of a wider
+                        // global top L, widened until it holds k own rows
+                        // or every match; see the class javadoc.
+                        long limit = boundedProbeLimit(page, fragmentIds.size(), dataset.getFragments().size());
+                        long cap = Math.max(limit, effectiveSubsetProbeLimit(subsetRows));
+                        while (true) {
+                            ScanOptions options = newScanOptions().limit(limit).build();
+                            issued.add(options);
+                            long returned = collectHits(dataset, options, keep, hits);
+                            if (returned < limit) {
+                                complete = true;
+                                break;
+                            }
+                            if (rowsOf(hits) >= page) {
+                                complete = false;
+                                break;
+                            }
+                            // Too few own rows among the top L: the rows
+                            // leave the heap before the wider scan
+                            // reserves its own.
+                            accounting.release(heapBytesOf(hits));
+                            hits = new HashMap<>();
+                            if (limit >= cap) {
+                                ScanOptions restricted = restrictToFragmentsUnlessAll(
+                                    newScanOptions().limit(page),
+                                    new ArrayList<>(fragmentIds),
+                                    dataset
+                                ).build();
+                                issued.add(restricted);
+                                long own = collectHits(dataset, restricted, null, hits);
+                                complete = own < page;
+                                break;
+                            }
+                            limit = Math.min(limit * 2L, cap);
+                        }
+                    }
                 } else if (keep == null) {
                     ScanOptions options = newScanOptions().build();
                     issued.add(options);
@@ -814,6 +866,44 @@ public final class LanceFtsQuery extends Query {
             total += fragmentHits.heapBytes();
         }
         return total;
+    }
+
+    /** Rows the hit buffers of {@code hits} hold over every fragment. */
+    static long rowsOf(Map<Integer, LanceFragmentHits> hits) {
+        long total = 0L;
+        for (LanceFragmentHits fragmentHits : hits.values()) {
+            total += fragmentHits.size();
+        }
+        return total;
+    }
+
+    /**
+     * Slack on the first scan of a bounded shape on a subset executor:
+     * the global top {@code page × share} holds {@code page} own rows
+     * on average when the matches spread evenly over the fragments,
+     * and half of the time fewer. Twice that many rows leaves the
+     * first scan short of {@code page} own rows in about one case in
+     * a hundred for a page of ten (the own rows are binomial over the
+     * scanned rows with the executor's share as probability), and a
+     * scan of twice the rows costs the same index lookup and a few
+     * kilobytes more of Arrow batches.
+     */
+    static final int BOUNDED_PROBE_SLACK = 2;
+
+    /**
+     * Rows the first scan of a bounded shape asks Lance for on an
+     * executor that holds {@code ownFragments} of the table's
+     * {@code tableFragments}: the {@code page} times the number of
+     * executors the fragment count implies (the table's fragments
+     * over the executor's, rounded up), times
+     * {@link #BOUNDED_PROBE_SLACK}.
+     */
+    static long boundedProbeLimit(long page, int ownFragments, int tableFragments) {
+        long rows = Math.max(1L, page);
+        long own = Math.max(1L, ownFragments);
+        long table = Math.max(own, tableFragments);
+        long share = (table + own - 1L) / own;
+        return rows * share * BOUNDED_PROBE_SLACK;
     }
 
     @Override
@@ -965,8 +1055,11 @@ public final class LanceFtsQuery extends Query {
      * the fragment id in {@code _rowaddr} ({@link LanceFtsWeight} and
      * the fragment executor's count path explain why the per executor
      * results still merge to the same answer). This method is what
-     * those paths fall back to when an unbounded scan matches more
-     * rows than the probe limit, so the restriction is paid only when
+     * those paths fall back to when the whole table scan has not
+     * supplied the executor's rows within the probe limit: an
+     * unbounded scan that matches more rows than the limit, or a
+     * bounded page whose own rows stay below the page while the
+     * widened scans reach the limit. The restriction is paid only when
      * the alternative would transfer that many rows of other
      * executors' fragments. A Lance-side change that builds the
      * prefilter from the fragment bitmap instead of a row id read
