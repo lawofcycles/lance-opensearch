@@ -5,6 +5,10 @@
 
 package org.opensearch.lance.dispatch;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
@@ -26,11 +30,13 @@ import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.indices.IndicesService;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
@@ -94,14 +100,24 @@ public class LanceRequestCacheTests extends OpenSearchTestCase {
         return new LanceRequestCache(1L << 20, 1L << 16, true, TimeValue.ZERO);
     }
 
+    /**
+     * A node's index services holding no index: the reader wrapper
+     * probe builds a temporary service, which reports no wrapper.
+     */
+    private static IndicesService indicesService() throws IOException {
+        IndicesService service = mock(IndicesService.class);
+        when(service.withTempIndexService(any(), any())).thenReturn(false);
+        return service;
+    }
+
     private static LanceRequestCache.Lookup begin(
         LanceRequestCache cache,
         SearchRequest request,
         IndexMetadata metadata,
         DiscoveryNode... nodes
-    ) {
+    ) throws IOException {
         Index[] concrete = metadata == null ? new Index[0] : new Index[] { metadata.getIndex() };
-        return cache.begin(request, concrete, metadata, List.of(nodes), null, 0L);
+        return cache.begin(request, concrete, metadata, List.of(nodes), indicesService(), 0L);
     }
 
     public void testCanonicalRequestSortsKeysAndKeepsArrayOrder() throws IOException {
@@ -168,17 +184,29 @@ public class LanceRequestCacheTests extends OpenSearchTestCase {
                 new Index[] { new Index("a", "u-a"), new Index("b", "u-b") },
                 null,
                 List.of(node("n1")),
-                null,
+                indicesService(),
                 0L
             )
         );
         assertEquals(3L, cache.stats().skipped());
         assertNotNull(begin(cache, new SearchRequest("demo").source(eligible), metadata, node("n1")));
         assertEquals(3L, cache.stats().skipped());
+        assertNull(
+            "no index services to probe the reader wrapper with counts as a wrapper",
+            cache.begin(
+                new SearchRequest("demo").source(eligible),
+                new Index[] { metadata.getIndex() },
+                metadata,
+                List.of(node("n1")),
+                null,
+                0L
+            )
+        );
+        assertEquals(4L, cache.stats().skipped());
 
         cache.setEnabled(false);
         assertNull("disabled", begin(cache, new SearchRequest("demo").source(eligible), metadata, node("n1")));
-        assertEquals("a disabled cache counts nothing", 3L, cache.stats().skipped());
+        assertEquals("a disabled cache counts nothing", 4L, cache.stats().skipped());
         assertFalse(cache.stats().enabled());
         assertEquals(LanceRequestCache.Skip.DISABLED, cache.explainSkip(eligible, false));
         cache.setEnabled(true);
@@ -232,6 +260,42 @@ public class LanceRequestCacheTests extends OpenSearchTestCase {
         partial.complete(took -> response(1.0d, 1L, true));
         assertEquals("a timed out answer is partial", 0, cache.count());
         assertEquals(1L, cache.stats().skipped());
+    }
+
+    public void testAStoreThatThrowsIsSkippedAndTheAnswerStillReturns() throws IOException {
+        LanceRequestCache cache = cache();
+        IndexMetadata metadata = indexMetadata("demo", "uuid-1");
+        SearchRequest request = new SearchRequest("demo").source(body("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}"));
+        // An aggregation whose serialisation fails: measuring the entry throws.
+        InternalSum unwritable = new InternalSum("s", 1.0d, DocValueFormat.RAW, Map.of()) {
+            @Override
+            protected void doWriteTo(StreamOutput out) throws IOException {
+                throw new IOException("serialisation refused");
+            }
+        };
+        InternalAggregations aggregations = InternalAggregations.from(List.of(unwritable));
+        SearchHits hits = new SearchHits(new SearchHit[0], new TotalHits(3L, TotalHits.Relation.EQUAL_TO), Float.NaN);
+        SearchResponseSections sections = new SearchResponseSections(hits, aggregations, null, false, null, null, 1);
+        SearchResponse computed = new SearchResponse(
+            sections,
+            null,
+            1,
+            1,
+            0,
+            5L,
+            ShardSearchFailure.EMPTY_ARRAY,
+            SearchResponse.Clusters.EMPTY
+        );
+        expectThrows(IllegalStateException.class, () -> LanceRequestCache.aggregationBytes(aggregations));
+
+        LanceRequestCache.Lookup lookup = begin(cache, request, metadata, node("n1"));
+        assertNull(lookup.find(1L));
+        SearchResponse served = lookup.complete(took -> computed);
+        assertSame("the computed answer is returned although the store threw", computed, served);
+        assertEquals(0, cache.count());
+        assertEquals("the failed store counts as a skip", 1L, cache.stats().skipped());
+        assertEquals(1L, cache.stats().misses());
+        assertNull("nothing was stored", begin(cache, request, metadata, node("n1")).find(1L));
     }
 
     public void testExpiredEntriesAreMissesAndCountAsEvictions() throws Exception {

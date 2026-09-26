@@ -7,9 +7,11 @@ package org.opensearch.lance;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
+import org.opensearch.client.ResponseException;
 
 /**
  * The coordinator result cache against the single node test cluster:
@@ -176,12 +178,19 @@ public class LanceRequestCacheIT extends LanceRestTestCase {
                 Map<String, Object> stored = requestCache();
                 readAll(postJson("/" + index + "/_search", SUM));
                 assertEquals("within the age the repeat hits", count(stored, "hits") + 1, count(requestCache(), "hits"));
-                Thread.sleep(1_200L);
-                Map<String, Object> aged = requestCache();
-                readAll(postJson("/" + index + "/_search", SUM));
-                Map<String, Object> after = requestCache();
-                assertEquals("past the age the repeat misses", count(aged, "misses") + 1, count(after, "misses"));
-                assertEquals("the aged entry counts as evicted", count(aged, "evictions") + 1, count(after, "evictions"));
+                // Once the age has passed the repeat misses (and stores
+                // anew); until then it hits and the check tries again.
+                assertBusy(() -> {
+                    try {
+                        Map<String, Object> aged = requestCache();
+                        readAll(postJson("/" + index + "/_search", SUM));
+                        Map<String, Object> after = requestCache();
+                        assertEquals("past the age the repeat misses", count(aged, "misses") + 1, count(after, "misses"));
+                        assertEquals("the aged entry counts as evicted", count(aged, "evictions") + 1, count(after, "evictions"));
+                    } catch (ResponseException e) {
+                        throw new AssertionError("index temporarily unavailable: " + e.getMessage(), e);
+                    }
+                }, 10, TimeUnit.SECONDS);
             } finally {
                 Request reset = new Request("PUT", "/_cluster/settings");
                 reset.setJsonEntity("{\"transient\":{\"lance.request_cache.expire\":null}}");

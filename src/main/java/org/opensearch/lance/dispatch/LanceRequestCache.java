@@ -87,8 +87,8 @@ import org.opensearch.search.builder.SearchSourceBuilder;
  * and the index has no reader wrapper (the security plugin's document
  * and field level security, whose answers differ per user). An answer
  * that timed out is not stored (it is partial), nor is one whose
- * aggregations serialise above {@code lance.request_cache.max_entry_size}.
- * Every other request counts as skipped.
+ * aggregations serialise above {@code lance.request_cache.max_entry_size},
+ * nor one the store threw on. Every other request counts as skipped.
  *
  * <p>The store is OpenSearch's {@link Cache}, weighed by the serialised
  * size of the reduced aggregations plus the key, evicted least recently
@@ -120,7 +120,9 @@ public final class LanceRequestCache implements ClusterStateListener {
         /** The answer was partial (a node did not answer in time). */
         TIMED_OUT("timed_out"),
         /** The answer's aggregations serialise above {@code lance.request_cache.max_entry_size}. */
-        TOO_LARGE("entry above max_entry_size");
+        TOO_LARGE("entry above max_entry_size"),
+        /** Storing the answer threw (its aggregations could not be measured, or the store rejected the entry). */
+        STORE_FAILED("store_failed");
 
         private final String reason;
 
@@ -179,7 +181,10 @@ public final class LanceRequestCache implements ClusterStateListener {
          * The response of this request: the entry {@link #find} returned,
          * rendered with the time this request took, or the response
          * {@code computed} builds, stored under the key {@link #find}
-         * formed when the answer qualifies.
+         * formed when the answer qualifies. Storing is a side effect of
+         * a request that has already succeeded, so a store that throws
+         * is counted as a skip and logged, and the computed response is
+         * returned all the same.
          */
         public SearchResponse complete(LongFunction<SearchResponse> computed) {
             Entry found = hit;
@@ -189,7 +194,17 @@ public final class LanceRequestCache implements ClusterStateListener {
             SearchResponse response = computed.apply(startMillis);
             Key formed = key;
             if (formed != null) {
-                store(formed, response);
+                try {
+                    store(formed, response);
+                } catch (RuntimeException e) {
+                    skipped.increment();
+                    LOGGER.debug(
+                        "lance.request_cache: answer of index [{}] not stored ({}): {}",
+                        indexUuid,
+                        Skip.STORE_FAILED.reason(),
+                        e.toString()
+                    );
+                }
             }
             return response;
         }
@@ -414,7 +429,10 @@ public final class LanceRequestCache implements ClusterStateListener {
 
     private boolean readerWrapperInstalled(IndexMetadata metadata, IndicesService indicesService) {
         if (indicesService == null) {
-            return false;
+            // Without the node's index services the probe cannot run;
+            // like a probe that fails, the answer is the side that never
+            // caches a wrapped answer.
+            return true;
         }
         Boolean known = readerWrapperByIndex.get(metadata.getIndexUUID());
         if (known != null) {
