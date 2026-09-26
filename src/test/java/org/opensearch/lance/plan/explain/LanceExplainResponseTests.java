@@ -328,6 +328,47 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
         }
     }
 
+    public void testMixedPluginVersionAVersion2CoordinatorReadsTodaysAnswerWithoutTheCacheability() throws IOException {
+        // Today's writer, read as a version 2 node does: the base fields
+        // by hand in their version 2 layout, then the walk over the
+        // blocks it does not know. That node has no cacheability field at
+        // all, so the block is stepped over and the stream ends there.
+        LanceExplainResponse today = LanceExplainResponse.fragment(
+            "demo",
+            "logical",
+            "physical",
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, "rating = 5"),
+            "collapse",
+            List.of(FragmentPlanRefiner.Reason.SORT_FIELD_TYPE),
+            NO_DEMAND,
+            LanceExplainResponse.Cacheability.no("size > 0")
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            today.writeTo(out);
+            try (
+                StreamInput raw = out.bytes().streamInput();
+                NamedWriteableAwareStreamInput in = new NamedWriteableAwareStreamInput(raw, REGISTRY)
+            ) {
+                WireVersion.Reader reader = WireVersion.read(in, "LanceExplainResponse", 2, 2);
+                assertEquals(LanceExplainResponse.WIRE_VERSION, reader.marker());
+                assertEquals("demo", in.readString());
+                assertEquals(LanceExplainResponse.Route.FRAGMENT, in.readEnum(LanceExplainResponse.Route.class));
+                assertEquals("logical", in.readOptionalString());
+                assertEquals("physical", in.readOptionalString());
+                assertEquals(today.fragmentPlan(), in.readOptionalWriteable(FragmentPlan::new));
+                assertEquals("collapse", in.readOptionalString());
+                assertEquals(
+                    List.of(FragmentPlanRefiner.Reason.SORT_FIELD_TYPE),
+                    in.readList(input -> input.readEnum(FragmentPlanRefiner.Reason.class))
+                );
+                assertTrue(in.readBoolean());
+                assertEquals(today.traits(), LanceExplainResponse.Traits.read(in));
+                reader.finish();
+                assertEquals("the version 2 reader stepped over the cacheability block", -1, in.read());
+            }
+        }
+    }
+
     /**
      * The stream a version 1 node writes: the route enum had
      * {@code FRAGMENT} and {@code SHARD_PATH}, a reasons list followed
