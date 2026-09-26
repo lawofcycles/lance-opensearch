@@ -51,16 +51,18 @@ import java.util.OptionalLong;
  *
  * @param tableRows live rows of the table
  * @param groups groups the aggregate produces: the product of the key
- *     domains capped at the row count
+ *     domains capped at the row count; a terms key's domain is the
+ *     tightest bound its column's indexes give (a bitmap's distinct
+ *     count, the integer range of a BTree over an integer column)
  * @param mergedGroups group rows one node's parallel scans hand to the
  *     merge: {@code groups}, or the terms top-k retention when a
  *     single level terms ordered by count or by a metric cuts them
  * @param groupsKnown whether every key domain behind {@code groups}
  *     came from the statistics or from the request itself (a bitmap
- *     distinct count, a range or filter count, a date interval) rather
- *     than from Calcite's default share of the rows for a key without
- *     an estimate; a guessed domain grows with the table, so a bound
- *     on the groups is only judged when this is true
+ *     distinct count, a BTree integer range, a range or filter count, a
+ *     date interval) rather than from Calcite's default share of the
+ *     rows for a key without a bound; a guessed domain grows with the
+ *     table, so a bound on the groups is only judged when this is true
  * @param columnsRead distinct table columns the keys, metrics and
  *     filter reference
  * @param bytesPerRow estimated stored bytes per row across those columns
@@ -370,12 +372,21 @@ public record AggregateProfile(double tableRows, double groups, double mergedGro
         return RelOptUtil.InputFinder.bits(expression);
     }
 
-    /** Distinct values of a terms key: the index estimate when there is one, else Calcite's default share of the rows. */
+    /**
+     * Distinct values of a terms key: the tightest bound the statistics
+     * give (a bitmap's distinct count, the integer range of a BTree over
+     * an integer column) when there is one, else Calcite's default share
+     * of the rows.
+     */
     private static double termsDomain(OptionalLong distinct, double rows) {
         return distinct.isPresent() ? Math.min(distinct.getAsLong(), rows) : rows * CostCoefficients.UNKNOWN_KEY_DISTINCT_SHARE;
     }
 
-    /** The distinct estimate of a single column expression, empty for several columns or no estimate. */
+    /**
+     * The distinct value bound of a single column expression
+     * ({@link ColumnStatistics#distinctUpperBound}), empty for several
+     * columns or no bound.
+     */
     private static OptionalLong distinctOf(ImmutableBitSet columns, Optional<TableStatistics> statistics, RelDataType scanRowType) {
         if (statistics.isEmpty() || columns.cardinality() != 1) {
             return OptionalLong.empty();
@@ -386,7 +397,7 @@ public record AggregateProfile(double tableRows, double groups, double mergedGro
         }
         return statistics.get()
             .column(scanRowType.getFieldList().get(column).getName())
-            .map(ColumnStatistics::distinctCount)
+            .map(ColumnStatistics::distinctUpperBound)
             .orElse(OptionalLong.empty());
     }
 

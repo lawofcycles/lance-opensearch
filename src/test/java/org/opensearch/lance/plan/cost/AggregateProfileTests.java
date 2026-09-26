@@ -20,8 +20,9 @@ import java.io.IOException;
 /**
  * {@link AggregateProfile#of}: the quantities the model reads off a
  * translated aggregation tree over the perf table fixture, whose
- * statistics carry a bitmap distinct count for {@code category} and
- * none for the numeric columns.
+ * statistics carry a bitmap distinct count for {@code category}, an
+ * integer range for the BTree over {@code rating} and none for the other
+ * numeric columns.
  */
 public class AggregateProfileTests extends OpenSearchTestCase {
 
@@ -63,13 +64,28 @@ public class AggregateProfileTests extends OpenSearchTestCase {
     }
 
     public void testNumericTermsWithoutADistinctCountTakesCalcitesShare() throws IOException {
-        AggregateProfile p = profile("{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"rating\"}}}}");
+        // price has a BTree whose bounds are floats, which enclose no
+        // finite set of values, so the key's domain is guessed.
+        AggregateProfile p = profile("{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"price\"}}}}");
         assertEquals(1e9 * CostCoefficients.UNKNOWN_KEY_DISTINCT_SHARE, p.groups(), 0.0);
         assertFalse("a guessed domain is not a known group count", p.groupsKnown());
         assertTrue(p.largeGroups());
         assertEquals(100.0, p.mergedGroups(), 0.0);
         assertEquals(1, p.numericKeys());
         assertEquals(0, p.stringKeys());
+        assertEquals(8.0, p.bytesPerRow(), 0.0);
+    }
+
+    public void testIntegerTermsReadsTheBTreeRangeAsItsDomain() throws IOException {
+        // rating holds the integers 1 to 5: the BTree's min and max
+        // bound the key to five values on a billion rows, where the
+        // guess would be a hundred million.
+        AggregateProfile p = profile("{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"rating\"}}}}");
+        assertEquals(PerfTableFixture.RATING_VALUES, p.groups(), 0.0);
+        assertTrue("the BTree range grounds the estimate", p.groupsKnown());
+        assertFalse(p.largeGroups());
+        assertEquals("five groups need no top-k cut", PerfTableFixture.RATING_VALUES, p.mergedGroups(), 0.0);
+        assertEquals(1, p.numericKeys());
         assertEquals(4.0, p.bytesPerRow(), 0.0);
     }
 
@@ -115,9 +131,22 @@ public class AggregateProfileTests extends OpenSearchTestCase {
         assertEquals(1, p.stringKeys());
         assertEquals(1, p.numericKeys());
         assertEquals(1, p.nestedLevels());
+        assertEquals("the levels' domains multiply: 200 categories times 5 ratings", 200 * PerfTableFixture.RATING_VALUES, p.groups(), 0.0);
         assertEquals("a nested tree is not cut per scan", p.groups(), p.mergedGroups(), 0.0);
-        assertFalse("the rating level has no distinct count", p.groupsKnown());
+        assertTrue("both levels are bounded by the statistics", p.groupsKnown());
+        assertFalse("a thousand groups stay under the hash table threshold", p.largeGroups());
         assertEquals(1, p.simpleMetrics());
+    }
+
+    public void testNestedTermsOverAGuessedDomainIsCappedAtTheRows() throws IOException {
+        // price has no bound, so its level is a tenth of the rows and
+        // the product with the 200 categories is capped at the table.
+        AggregateProfile p = profile(
+            "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"p\":{\"terms\":{\"field\":\"price\"}}}}}}"
+        );
+        assertEquals(1e9, p.groups(), 0.0);
+        assertFalse(p.groupsKnown());
+        assertTrue(p.largeGroups());
     }
 
     public void testRangeAndFiltersKeys() throws IOException {
@@ -146,6 +175,8 @@ public class AggregateProfileTests extends OpenSearchTestCase {
         assertEquals(0, p.nestedLevels());
         assertEquals(1, p.stringKeys());
         assertEquals(1, p.numericKeys());
+        assertEquals("the sources' domains multiply", 200 * PerfTableFixture.RATING_VALUES, p.groups(), 0.0);
+        assertTrue(p.groupsKnown());
         assertEquals("composite group rows are not cut per scan", p.groups(), p.mergedGroups(), 0.0);
     }
 

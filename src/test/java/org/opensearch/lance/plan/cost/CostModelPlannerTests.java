@@ -9,6 +9,8 @@ import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.volcano.VolcanoPlanner;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.Filter;
+import org.apache.calcite.rel.core.Project;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.rel.LanceTableScan;
@@ -194,26 +196,96 @@ public class CostModelPlannerTests extends OpenSearchTestCase {
     }
 
     public void testGroupBoundIsNotJudgedOnAGuessedDomain() throws IOException {
-        // rating has a BTree index and no distinct count, so its domain
-        // is Calcite's share of the rows (two million at 20M, a hundred
-        // million at 1B), which no default bound would admit although
-        // the column holds five values. Such an estimate is not judged
-        // against the bound: terms(rating) stays pushed where it
-        // measured faster, under the default bound and under a bound of
-        // one alike, and the executor's bound from the request shape
-        // stands alone. A nested tree over the same key is priced by
-        // the fitted model (the merge of the guessed groups sends it to
-        // the aggregators) and the bound does not enter: the answer is
-        // the same under both bounds.
+        // price has a BTree whose float bounds enclose no finite set of
+        // values, so its domain is Calcite's share of the rows (two
+        // million at 20M, a hundred million at 1B), which no default
+        // bound would admit whatever the column holds. Such an estimate
+        // is not judged against the bound: terms(price) stays pushed
+        // where a numeric key measured faster, under the default bound
+        // and under a bound of one alike, and the executor's bound from
+        // the request shape stands alone. A nested tree over the same
+        // key is priced by the fitted model (the merge of the guessed
+        // groups sends it to the aggregators) and the bound does not
+        // enter: the answer is the same under both bounds.
+        String termsPrice = "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"price\"}}}}";
         for (CostInputs inputs : List.of(PERF20M_ONE_NODE_LOCAL_UNSLICED, PERF20M_ONE_NODE_LOCAL_UNSLICED.withMaxGroups(1L))) {
-            RelNode single = plan(PerfTableFixture.perf20m(), TERMS_RATING, inputs);
-            assertTrue(TERMS_RATING + " stays pushed under " + inputs + ": " + single, single instanceof LanceTableScan);
+            RelNode single = plan(PerfTableFixture.perf20m(), termsPrice, inputs);
+            assertTrue(termsPrice + " stays pushed under " + inputs + ": " + single, single instanceof LanceTableScan);
         }
         String nested =
-            "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\"}}}}}}";
+            "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"p\":{\"terms\":{\"field\":\"price\"}}}}}}";
         RelNode nestedDefault = plan(PerfTableFixture.perf20m(), nested, PERF20M_ONE_NODE_LOCAL_UNSLICED);
         RelNode nestedTight = plan(PerfTableFixture.perf20m(), nested, PERF20M_ONE_NODE_LOCAL_UNSLICED.withMaxGroups(1L));
         assertEquals("the bound does not decide a guessed nested estimate", nestedDefault.getClass(), nestedTight.getClass());
+    }
+
+    public void testGroupBoundJudgesANestedTreeWhoseLevelsTheStatisticsBound() throws IOException {
+        // terms(category) > terms(rating): 200 categories times the five
+        // values the rating BTree bounds, a thousand groups no scan
+        // cuts. A bound of 999 sends the tree to the aggregators, a
+        // bound of 1000 keeps it pushed.
+        String nested =
+            "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\"}}}}}}";
+        RelNode over = plan(PerfTableFixture.perf20m(), nested, PERF20M_ONE_NODE_LOCAL_UNSLICED.withMaxGroups(999L));
+        assertTrue("1000 groups exceed a bound of 999: " + over, over instanceof LuceneAggregateExec);
+        RelNode within = plan(PerfTableFixture.perf20m(), nested, PERF20M_ONE_NODE_LOCAL_UNSLICED.withMaxGroups(1000L));
+        assertTrue("1000 groups fit a bound of 1000: " + within, within instanceof LanceTableScan);
+    }
+
+    public void testMetricLessDateHistogramOnTwentyMillionRowsIsPricedForTheAggregators() throws IOException {
+        // date_histogram month with no metric under it, 20M rows on one
+        // 4xlarge node with eight slices: the model prices the
+        // aggregators at about 74 ms (fixed, one column, the date key
+        // over 2.5 million rows per slice) and the pushed scan at about
+        // 154 ms (fixed, decode, the date key over 2.5 million rows per
+        // scan), so the tree goes to the aggregators. The shape measured
+        // 148 ms pushed and 197 ms on the path this choice sends it to,
+        // which no explain has confirmed; the pair is recorded in the
+        // measurements and kept out of the fit until one does.
+        String body = "{\"size\":0,\"aggs\":{\"h\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}}}";
+        RelNode physical = plan(PerfTableFixture.perf20m(), body, PERF20M_ONE_NODE_LOCAL);
+        logger.info("explain {} perf20m / 1 node / local / 8 slices:\n{}", body, explain(physical));
+        assertTrue("the aggregators win: " + physical, physical instanceof LuceneAggregateExec);
+        LuceneAggregateExec exec = (LuceneAggregateExec) physical;
+        RelNode node = exec.aggregate().getInput();
+        while (node instanceof Project || node instanceof Filter) {
+            node = node.getInput(0);
+        }
+        AggregateProfile shape = AggregateProfile.of(exec.aggregate(), (LanceTableScan) node, physical.getCluster().getMetadataQuery());
+        double lucene = CostModel.luceneAggregateMillis(PERF20M_ONE_NODE_LOCAL, shape);
+        double pushed = CostModel.pushedAggregateMillis(PERF20M_ONE_NODE_LOCAL, shape);
+        assertEquals(74.0, lucene, 1.0);
+        assertEquals(154.0, pushed, 1.0);
+    }
+
+    public void testTwoLevelBucketTreesOverS3StayPushedOnFourNodes() throws IOException {
+        // terms(category) > terms(rating) > avg(price) measured 1.69 s
+        // pushed against 2.86 s through the aggregators on four nodes at
+        // 1B, composite(category, rating) 1.11 s against 1.80 s, and
+        // terms(rating) > max(id) + terms(category) 91 ms against 223 ms
+        // on one node at 20M. The rating level is five values by its
+        // BTree range, so the trees hold a thousand groups and neither
+        // side pays the hash table penalty.
+        String nestedAvg =
+            "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":5},\"aggs\":{\"a\":{\"avg\":{\"field\":\"price\"}}}}}}}}";
+        String composite =
+            "{\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":10,\"sources\":[{\"cat\":{\"terms\":{\"field\":\"category\"}}},{\"rat\":{\"terms\":{\"field\":\"rating\"}}}]}}}}";
+        for (String body : new String[] { nestedAvg, composite }) {
+            RelNode physical = plan(PerfTableFixture.perf1b(), body, PERF1B_FOUR_NODES_S3);
+            logger.info("explain {} perf1b / 4 nodes / S3:\n{}", body, explain(physical));
+            assertTrue(
+                body + " is pushed over S3 on four nodes: " + physical,
+                physical instanceof LanceTableScan && ((LanceTableScan) physical).pushedAggregate().isPresent()
+            );
+        }
+        String ratingThenCategory =
+            "{\"size\":0,\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\"},\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}},\"c\":{\"terms\":{\"field\":\"category\",\"size\":2}}}}}}";
+        RelNode local = plan(PerfTableFixture.perf20m(), ratingThenCategory, PERF20M_ONE_NODE_LOCAL);
+        logger.info("explain {} perf20m / 1 node / local:\n{}", ratingThenCategory, explain(local));
+        assertTrue(
+            ratingThenCategory + " is pushed on one local node: " + local,
+            local instanceof LanceTableScan && ((LanceTableScan) local).pushedAggregate().isPresent()
+        );
     }
 
     public void testCardinalityLosesToTheAggregatorsInBothRegimes() throws IOException {

@@ -241,6 +241,154 @@ public class CostModelTests extends OpenSearchTestCase {
         assertEquals(CostCoefficients.LUCENE_SIMPLE_METRIC_MS_PER_MROW_THREAD * mrowThread, alone, 1e-9);
     }
 
+    public void testTwoLevelBucketTreeOverS3StaysPushedWhenItsGroupsAreBounded() {
+        // terms(category) > terms(rating) > avg(price) on perf1b, 4
+        // nodes on S3, 8 slices: measured 1.69 s pushed vs 2.86 s. The
+        // tree holds 200 x 5 groups when the rating BTree's range bounds
+        // the second level; with the level guessed as a tenth of the
+        // rows the product is capped at the billion rows and both sides
+        // pay the hash table penalty, the pushed side its merge of a
+        // node's share of them as well, which is what kept the tree on
+        // the aggregators.
+        AggregateProfile bounded = nestedTermsAvg(1000, true);
+        AggregateProfile guessed = nestedTermsAvg(1e9, false);
+        CostInputs s3 = new CostInputs(4, StorageKind.OBJECT_STORE, 16, 8, 8);
+        assertTrue(CostModel.pushedAggregateMillis(s3, bounded) < CostModel.luceneAggregateMillis(s3, bounded));
+        assertTrue(CostModel.luceneAggregateMillis(s3, guessed) < CostModel.pushedAggregateMillis(s3, guessed));
+        // The guess adds exactly the two group terms to the pushed side:
+        // the per thread hash table misses over the rows one scan
+        // aggregates, and the merge of a node's row share of group rows
+        // by each of the node's scans; the Lucene side gains its per
+        // node hash table misses alone.
+        double rowsPerNode = 1e9 / s3.nodes();
+        double mrowThread = rowsPerNode / s3.pushdownParallelism() / 1e6;
+        double pushedAdded = CostModel.pushedAggregateMillis(s3, guessed) - CostModel.pushedAggregateMillis(s3, bounded);
+        double expectedPushed = CostCoefficients.PUSHED_LARGE_GROUPS_MS_PER_MROW_THREAD * mrowThread
+            + CostCoefficients.PUSHED_MERGE_MS_PER_MGROUP * (rowsPerNode - 1000) / 1e6 * s3.pushdownParallelism();
+        assertEquals("the guessed groups add " + pushedAdded + " ms to the pushed scan", expectedPushed, pushedAdded, 1e-6);
+        Map<String, Double> pushedTerms = CostModel.pushedAggregateTerms(s3, guessed);
+        assertEquals(
+            CostCoefficients.PUSHED_MERGE_MS_PER_MGROUP * rowsPerNode / 1e6 * s3.pushdownParallelism(),
+            pushedTerms.get("PUSHED_MERGE_MS_PER_MGROUP"),
+            1e-6
+        );
+        assertTrue(
+            "the merge term alone outweighs the whole Lucene side",
+            pushedTerms.get("PUSHED_MERGE_MS_PER_MGROUP") > CostModel.luceneAggregateMillis(s3, guessed)
+        );
+        double luceneAdded = CostModel.luceneAggregateMillis(s3, guessed) - CostModel.luceneAggregateMillis(s3, bounded);
+        assertEquals(
+            "the guessed groups add " + luceneAdded + " ms to the aggregators",
+            CostCoefficients.LUCENE_LARGE_GROUPS_MS_PER_MROW_NODE * rowsPerNode / 1e6,
+            luceneAdded,
+            1e-6
+        );
+        // composite(category, rating) size 10 on the same cluster:
+        // measured 1.11 s pushed vs 1.80 s.
+        AggregateProfile composite = new AggregateProfile(
+            1e9,
+            1000,
+            1000,
+            true,
+            2,
+            6,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            true,
+            0,
+            false,
+            false,
+            false,
+            0,
+            1.0
+        );
+        assertTrue(CostModel.pushedAggregateMillis(s3, composite) < CostModel.luceneAggregateMillis(s3, composite));
+        // terms(rating) > max(id) + terms(category) size 2 on 20M rows,
+        // one 4xlarge node with eight slices: measured 91 ms pushed vs
+        // 223 ms; guessed, the same tree goes to the aggregators.
+        CostInputs local = CostInputs.local(16);
+        AggregateProfile small = new AggregateProfile(
+            2e7,
+            1000,
+            1000,
+            true,
+            3,
+            14,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            false,
+            1,
+            false,
+            false,
+            false,
+            0,
+            1.0
+        );
+        AggregateProfile smallGuessed = new AggregateProfile(
+            2e7,
+            2e7,
+            2e7,
+            false,
+            3,
+            14,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            false,
+            1,
+            false,
+            false,
+            false,
+            0,
+            1.0
+        );
+        assertTrue(CostModel.pushedAggregateMillis(local, small) < CostModel.luceneAggregateMillis(local, small));
+        assertTrue(CostModel.luceneAggregateMillis(local, smallGuessed) < CostModel.pushedAggregateMillis(local, smallGuessed));
+    }
+
+    private static AggregateProfile nestedTermsAvg(double groups, boolean known) {
+        return new AggregateProfile(1e9, groups, groups, known, 3, 14, 1, 1, 1, 0, 0, 0, 0, false, 1, false, false, false, 0, 1.0);
+    }
+
+    public void testTermBreakdownSumsToThePrediction() {
+        AggregateProfile shape = nestedTermsAvg(1000, true);
+        for (CostInputs inputs : List.of(new CostInputs(4, StorageKind.OBJECT_STORE, 16, 8, 8), CostInputs.local(16))) {
+            double pushed = 0.0;
+            for (double term : CostModel.pushedAggregateTerms(inputs, shape).values()) {
+                pushed += term;
+            }
+            assertEquals(CostModel.pushedAggregateMillis(inputs, shape), pushed, 1e-9);
+            double lucene = 0.0;
+            for (double term : CostModel.luceneAggregateTerms(inputs, shape).values()) {
+                lucene += term;
+            }
+            assertEquals(CostModel.luceneAggregateMillis(inputs, shape), lucene, 1e-9);
+        }
+        // Every fitted coefficient of a side is a term of that side.
+        Map<String, Double> pushedTerms = CostModel.pushedAggregateTerms(CostInputs.local(16), shape);
+        Map<String, Double> luceneTerms = CostModel.luceneAggregateTerms(CostInputs.local(16), shape);
+        for (String name : CostCoefficients.fitted().keySet()) {
+            boolean pushedSide = name.startsWith("PUSHED_") || name.startsWith("OBJECT_STORE_");
+            boolean luceneSide = name.startsWith("LUCENE_") || name.equals("OBJECT_STORE_OPEN_MS");
+            assertEquals(name + " on the pushed side", pushedSide, pushedTerms.containsKey(name));
+            assertEquals(name + " on the Lucene side", luceneSide, luceneTerms.containsKey(name));
+        }
+    }
+
     public void testTenMillionDistinctTermsStayPushedOverS3WithSlices() {
         // terms(user_id) size 10 on perf1b, 4 nodes on S3, 8 slices:
         // measured 4.82 s pushed vs 22.7 s; 6 nodes 3.22 s vs 15.1 s.

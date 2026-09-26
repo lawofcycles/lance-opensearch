@@ -100,10 +100,17 @@ public class TableStatisticsCollectorTests extends OpenSearchTestCase {
         assertEquals(FRAGMENTS, btree.coveredFragments());
         assertEquals(FRAGMENTS, btree.totalFragments());
         assertTrue(btree.coversAllFragments());
-        assertFalse("the planner reads nothing from a BTree's statistics, so they are not read", btree.statisticsAvailable());
-        assertEquals(OptionalLong.empty(), btree.indexedRows());
-        assertEquals(OptionalLong.empty(), btree.unindexedRows());
+        assertTrue("the BTree's statistics carry its bounds, so they are read", btree.statisticsAvailable());
+        assertEquals(OptionalLong.of(FRAGMENTS * ROWS_PER_FRAGMENT), btree.indexedRows());
+        assertEquals(OptionalLong.of(0L), btree.unindexedRows());
         assertEquals("a BTree reports no cardinality", OptionalLong.empty(), btree.distinctCount());
+        // rating is (i * 37) % 1000 with every fifth row null. Lance sorts
+        // nulls first when it trains the BTree, so the first page starts
+        // with a null and the statistics report a null smallest value
+        // next to the largest, 999: a column with nulls yields no range.
+        assertEquals("no range without both bounds", OptionalLong.empty(), btree.integerRange());
+        assertEquals(OptionalLong.empty(), statistics.column("rating").get().distinctCount());
+        assertEquals(OptionalLong.empty(), statistics.column("rating").get().distinctUpperBound());
         assertTrue("the manifest records the index size", btree.sizeBytes().isPresent() && btree.sizeBytes().getAsLong() > 0L);
 
         IndexSummary bitmap = onlyIndex(statistics, "category");
@@ -114,7 +121,9 @@ public class TableStatisticsCollectorTests extends OpenSearchTestCase {
         assertEquals(OptionalLong.of(0L), bitmap.unindexedRows());
         // c0, c1, c2 plus the null bitmap (every fourth row is null).
         assertEquals(OptionalLong.of(4L), bitmap.distinctCount());
+        assertEquals("a bitmap has no integer range", OptionalLong.empty(), bitmap.integerRange());
         assertEquals(OptionalLong.of(4L), statistics.column("category").get().distinctCount());
+        assertEquals(OptionalLong.of(4L), statistics.column("category").get().distinctUpperBound());
         assertTrue(statistics.column("category").get().hasIndex(IndexType.BITMAP));
         assertFalse(statistics.column("category").get().hasIndex(IndexType.BTREE));
 
@@ -224,8 +233,13 @@ public class TableStatisticsCollectorTests extends OpenSearchTestCase {
         assertEquals(2, btree.coveredFragments());
         assertEquals(3, btree.totalFragments());
         assertFalse(btree.coversAllFragments());
-        assertEquals("coverage comes from the manifest, not from the unread statistics", OptionalLong.empty(), btree.indexedRows());
-        assertEquals(OptionalLong.empty(), btree.unindexedRows());
+        assertEquals(
+            "coverage comes from the manifest, the row figures from the statistics",
+            OptionalLong.of(ROWS_PER_FRAGMENT),
+            btree.unindexedRows()
+        );
+        assertTrue(btree.indexedRows().isPresent());
+        assertEquals("rating holds nulls, so no smallest value and no range", OptionalLong.empty(), btree.integerRange());
 
         IndexSummary inverted = onlyIndex(statistics, "body");
         assertTrue(inverted.coversAllFragments());
@@ -258,6 +272,7 @@ public class TableStatisticsCollectorTests extends OpenSearchTestCase {
             Optional.of(IndexType.BTREE)
         );
         assertEquals("only a bitmap index yields a cardinality", OptionalLong.empty(), btree.distinctCount());
+        assertEquals("no bounds, no range", OptionalLong.empty(), btree.integerRange());
 
         ParsedStatistics unknownType = TableStatisticsCollector.readStatistics(Map.of("num_indexed_rows", 1), Optional.empty());
         assertEquals(Optional.empty(), unknownType.type());
@@ -289,6 +304,184 @@ public class TableStatisticsCollectorTests extends OpenSearchTestCase {
                 Optional.empty()
             ).distinctCount()
         );
+    }
+
+    public void testIntegerRangeOfABTreeOverAColumnWithoutNulls() throws Exception {
+        // id runs 0 to 299 without a null over three fragments of a
+        // hundred rows, so the BTree reports both bounds and the range is
+        // the row count; rating holds nulls and reports no smallest value.
+        String rangeUri = LanceTableFactory.writeHintFixtureTable(createTempDir(), "range-" + getTestName(), 3, 100);
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            Dataset dataset = Dataset.open().allocator(allocator).uri(rangeUri).build()
+        ) {
+            for (String column : List.of("id", "rating")) {
+                dataset.createIndex(
+                    IndexOptions.builder(
+                        Collections.singletonList(column),
+                        IndexType.BTREE,
+                        IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree")).build()
+                    ).withIndexName(column + "_btree").build()
+                );
+            }
+        }
+        TableStatistics statistics;
+        try (Dataset dataset = LanceRegistry.openDataset(rangeUri, StorageOptions.empty())) {
+            statistics = TableStatisticsCollector.collect(dataset);
+        }
+        IndexSummary id = onlyIndex(statistics, "id");
+        assertTrue(id.statisticsAvailable());
+        assertEquals(OptionalLong.of(300L), id.integerRange());
+        assertEquals(OptionalLong.empty(), id.distinctCount());
+        assertEquals(OptionalLong.of(300L), statistics.column("id").get().distinctUpperBound());
+        assertEquals(
+            "the admission estimate keeps to measured counts",
+            OptionalLong.empty(),
+            statistics.column("id").get().distinctCount()
+        );
+        IndexSummary rating = onlyIndex(statistics, "rating");
+        assertTrue(rating.statisticsAvailable());
+        assertEquals(OptionalLong.empty(), rating.integerRange());
+    }
+
+    public void testIntegerRangeIsReadFromTheBoundsOfAnIntegerColumnsBTree() {
+        // Lance prints the bounds as the values' decimal text.
+        Map<String, Object> rating = Map.of("index_type", "BTree", "indices", List.of(Map.of("min", "1", "max", "5", "num_pages", 3)));
+        ParsedStatistics integer = TableStatisticsCollector.readStatistics(rating, Optional.of(IndexType.BTREE), true);
+        assertEquals(Optional.of(IndexType.BTREE), integer.type());
+        assertEquals("max - min + 1", OptionalLong.of(5L), integer.integerRange());
+        assertEquals("the range is not a cardinality", OptionalLong.empty(), integer.distinctCount());
+        assertEquals(
+            "a string or float column's bounds enclose no finite set of values",
+            OptionalLong.empty(),
+            TableStatisticsCollector.readStatistics(rating, Optional.of(IndexType.BTREE), false).integerRange()
+        );
+        assertEquals(
+            "the two argument form reads no range",
+            OptionalLong.empty(),
+            TableStatisticsCollector.readStatistics(rating, Optional.of(IndexType.BTREE)).integerRange()
+        );
+        // Several deltas: the smallest min and the largest max.
+        ParsedStatistics deltas = TableStatisticsCollector.readStatistics(
+            Map.of("index_type", "BTree", "indices", List.of(Map.of("min", "-3", "max", "4"), Map.of("min", "0", "max", "10"))),
+            Optional.of(IndexType.BTREE),
+            true
+        );
+        assertEquals(OptionalLong.of(14L), deltas.integerRange());
+        // A delta without a bound (all its pages null) leaves the range empty.
+        ParsedStatistics unbounded = TableStatisticsCollector.readStatistics(
+            Map.of("index_type", "BTree", "indices", List.of(Map.of("min", "0", "max", "10"), Map.of("num_pages", 0))),
+            Optional.of(IndexType.BTREE),
+            true
+        );
+        assertEquals(OptionalLong.empty(), unbounded.integerRange());
+        // A column with nulls: Lance sorts nulls first and prints the
+        // first page's null smallest value as NULL.
+        assertEquals(
+            OptionalLong.empty(),
+            TableStatisticsCollector.readStatistics(
+                Map.of("index_type", "BTree", "indices", List.of(Map.of("min", "NULL", "max", "999", "num_pages", 1))),
+                Optional.of(IndexType.BTREE),
+                true
+            ).integerRange()
+        );
+        // Bounds the JSON reader typed as numbers count when whole.
+        assertEquals(
+            OptionalLong.of(101L),
+            TableStatisticsCollector.readStatistics(
+                Map.of("index_type", "BTree", "indices", List.of(Map.of("min", 0, "max", 100L))),
+                Optional.of(IndexType.BTREE),
+                true
+            ).integerRange()
+        );
+        assertEquals(
+            "a fraction is not an integer bound",
+            OptionalLong.empty(),
+            TableStatisticsCollector.readStatistics(
+                Map.of("index_type", "BTree", "indices", List.of(Map.of("min", "0.5", "max", "9.5"))),
+                Optional.of(IndexType.BTREE),
+                true
+            ).integerRange()
+        );
+        assertEquals(
+            "a date text is not an integer bound",
+            OptionalLong.empty(),
+            TableStatisticsCollector.readStatistics(
+                Map.of("index_type", "BTree", "indices", List.of(Map.of("min", "2024-01-01T00:00:00", "max", "2024-12-31T00:00:00"))),
+                Optional.of(IndexType.BTREE),
+                true
+            ).integerRange()
+        );
+        assertEquals(
+            "a range that overflows a long is left empty",
+            OptionalLong.empty(),
+            TableStatisticsCollector.readStatistics(
+                Map.of(
+                    "index_type",
+                    "BTree",
+                    "indices",
+                    List.of(Map.of("min", Long.toString(Long.MIN_VALUE), "max", Long.toString(Long.MAX_VALUE)))
+                ),
+                Optional.of(IndexType.BTREE),
+                true
+            ).integerRange()
+        );
+        assertEquals(
+            "a bitmap's bounds are not read",
+            OptionalLong.empty(),
+            TableStatisticsCollector.readStatistics(
+                Map.of("index_type", "Bitmap", "indices", List.of(Map.of("min", "1", "max", "5", "num_bitmaps", 5))),
+                Optional.of(IndexType.BITMAP),
+                true
+            ).integerRange()
+        );
+        assertTrue(TableStatisticsCollector.readsStatistics(Optional.of(IndexType.BTREE)));
+        assertFalse(TableStatisticsCollector.readsStatistics(Optional.of(IndexType.INVERTED)));
+    }
+
+    public void testDistinctUpperBoundFoldsTheIntegerRangeAndDistinctCountKeepsTheBitmapAlone() {
+        IndexSummary btree = new IndexSummary(
+            "rating_btree",
+            Optional.of(IndexType.BTREE),
+            1,
+            1,
+            OptionalLong.empty(),
+            OptionalLong.empty(),
+            OptionalLong.empty(),
+            OptionalLong.empty(),
+            OptionalLong.empty(),
+            OptionalLong.of(5L),
+            true
+        );
+        IndexSummary bitmap = new IndexSummary(
+            "rating_bitmap",
+            Optional.of(IndexType.BITMAP),
+            1,
+            1,
+            OptionalLong.empty(),
+            OptionalLong.empty(),
+            OptionalLong.empty(),
+            OptionalLong.of(3L),
+            true
+        );
+        ColumnStatistics btreeOnly = new ColumnStatistics("rating", List.of(btree));
+        assertEquals(OptionalLong.empty(), btreeOnly.distinctCount());
+        assertEquals(OptionalLong.of(5L), btreeOnly.distinctUpperBound());
+        ColumnStatistics both = new ColumnStatistics("rating", List.of(btree, bitmap));
+        assertEquals("the bitmap's count is the estimate", OptionalLong.of(3L), both.distinctCount());
+        assertEquals("the smaller of the count and the range", OptionalLong.of(3L), both.distinctUpperBound());
+        IndexSummary wideBitmap = new IndexSummary(
+            "rating_bitmap",
+            Optional.of(IndexType.BITMAP),
+            1,
+            1,
+            OptionalLong.empty(),
+            OptionalLong.empty(),
+            OptionalLong.empty(),
+            OptionalLong.of(9L),
+            true
+        );
+        assertEquals(OptionalLong.of(5L), new ColumnStatistics("rating", List.of(wideBitmap, btree)).distinctUpperBound());
     }
 
     public void testPartitionCountIsTheSmallestNumPartitionsOfAVectorIndexsDeltas() {

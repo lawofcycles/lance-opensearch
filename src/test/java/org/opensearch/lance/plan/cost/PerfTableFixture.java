@@ -33,13 +33,19 @@ import java.util.Set;
 /**
  * A planner model shaped like the perf tables the cost model was fitted
  * on: the perf schema, a bitmap index on {@code category} reporting 200
- * distinct values, BTree indexes on the numeric columns, and a row count
- * and fragment count the test picks. Public so the planner tests outside
- * this package can plan against the same statistics.
+ * distinct values, BTree indexes on the numeric columns (the one on
+ * {@code rating} bounding its values to the range 1 to 5, the one on
+ * {@code id} to the row count, as their {@code min} and {@code max}
+ * report), and a row count and fragment count the test picks. Public so
+ * the planner tests outside this package can plan against the same
+ * statistics.
  */
 public final class PerfTableFixture {
 
     private PerfTableFixture() {}
+
+    /** Distinct values of {@code rating} in the perf tables (1 to 5), the range the BTree statistics bound it to. */
+    static final long RATING_VALUES = 5L;
 
     static final Schema SCHEMA = new Schema(
         List.of(
@@ -58,6 +64,10 @@ public final class PerfTableFixture {
     }
 
     private static IndexSummary index(String name, IndexType type, int fragments, OptionalLong distinct) {
+        return index(name, type, fragments, distinct, OptionalLong.empty());
+    }
+
+    private static IndexSummary index(String name, IndexType type, int fragments, OptionalLong distinct, OptionalLong integerRange) {
         return new IndexSummary(
             name,
             Optional.of(type),
@@ -67,6 +77,8 @@ public final class PerfTableFixture {
             OptionalLong.empty(),
             OptionalLong.of(0L),
             distinct,
+            OptionalLong.empty(),
+            integerRange,
             true
         );
     }
@@ -84,13 +96,19 @@ public final class PerfTableFixture {
                 "category",
                 new ColumnStatistics("category", List.of(index("category_idx", IndexType.BITMAP, fragments, OptionalLong.of(200L)))),
                 "rating",
-                new ColumnStatistics("rating", List.of(index("rating_idx", IndexType.BTREE, fragments, OptionalLong.empty()))),
+                new ColumnStatistics(
+                    "rating",
+                    List.of(index("rating_idx", IndexType.BTREE, fragments, OptionalLong.empty(), OptionalLong.of(RATING_VALUES)))
+                ),
                 "ts",
                 new ColumnStatistics("ts", List.of(index("ts_idx", IndexType.BTREE, fragments, OptionalLong.empty()))),
                 "price",
                 new ColumnStatistics("price", List.of(index("price_idx", IndexType.BTREE, fragments, OptionalLong.empty()))),
                 "id",
-                new ColumnStatistics("id", List.of(index("id_idx", IndexType.BTREE, fragments, OptionalLong.empty())))
+                new ColumnStatistics(
+                    "id",
+                    List.of(index("id_idx", IndexType.BTREE, fragments, OptionalLong.empty(), OptionalLong.of(rows)))
+                )
             ),
             1L,
             Instant.EPOCH
