@@ -309,9 +309,37 @@ bound (see `aggregate_resolution` below).
 What changes cost between an explain answer and the run that follows: the data node count (a node
 joined or left), the storage kind (a table re-registered from a different URI), the four settings
 above, and the table's row count and statistics as the manifest advances. What the model does not
-see at all: the state of the Lance index cache, whether the aggregator path's columns are warm in
-a node's column store (decided on the data node, see `column_store_warm`), and concurrent
-requests (the coefficients are single request latencies).
+see at all: the state of the Lance index cache and concurrent requests (the coefficients are
+single request latencies).
+
+The aggregator path is priced over resident columns. Its coefficients were fitted on warm
+measurements, where the executors' column stores already held the columns the aggregators read, so
+the model assumes that state whatever the store holds when the request arrives, and a column the
+store must first load from the table is not charged. The load is not small: at 1B rows over S3 the
+first `date_histogram` over `ts` and `price` (4 GB per node on four nodes) took 7.1 s against 2.1 s
+once the two columns were resident, and 4.9 s against 1.3 s on six nodes. The model does not
+charge it for two reasons. The coordinator cannot know a node's store: the store is per node,
+columns leave it under memory pressure, and asking every node before each plan would add a round
+trip to every request. And a charge would fix a repeated shape on the pushed scan: the pushed scan
+reads the table itself and never fills the store, so a shape priced cold would be planned pushed on
+every request and the aggregators, faster once warm, would never get the request that warms them
+(`terms(category)` on 20M local rows measured 38 ms through the aggregators against 67 ms pushed; a
+cold charge of the size the 1B loads imply would put the aggregator side above the pushed scan on
+the first request and, the store never warming, on every one after). The
+data node makes the one decision the store can inform, in the other direction: a pushed aggregate
+whose Lucene alternative is cheaper over the columns its store already holds runs through the
+aggregators there (`column_store_warm` under Refinements). The measurements of the cold loads are
+kept in `src/test/resources/cost/measurements.csv` as excluded rows.
+
+The statistics window matters for what explain shows. While the coordinator collects the table
+statistics in the background (5 to 6 s for a 1B row table over S3), every request it plans goes
+without them: a `terms` key over a bitmap indexed column is guessed at a tenth of the rows instead
+of its distinct count, its column at 16 bytes per row instead of 2, and both sides pay the hash
+table term above a million groups, which prices the pushed scan below the aggregators
+(`terms(category)` on four nodes at 1B rows explains as `LanceTableScan` at 5000 ms and
+`LuceneAggregateExec` at 24000 ms in that window, against 780 ms and 350 ms once the statistics are
+in). `plan.statistics.planned_without` in `GET /_lance/stats` counts these requests; a cost printed
+while it is rising is the window's figure, not the table's.
 
 ## Refinements
 

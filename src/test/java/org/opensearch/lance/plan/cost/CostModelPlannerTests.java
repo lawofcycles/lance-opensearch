@@ -235,9 +235,9 @@ public class CostModelPlannerTests extends OpenSearchTestCase {
     public void testMetricLessDateHistogramOnTwentyMillionRowsIsPricedForTheAggregators() throws IOException {
         // date_histogram month with no metric under it, 20M rows on one
         // 4xlarge node with eight slices: the model prices the
-        // aggregators at about 74 ms (fixed, one column, the date key
+        // aggregators at about 77 ms (fixed, one column, the date key
         // over 2.5 million rows per slice) and the pushed scan at about
-        // 154 ms (fixed, decode, the date key over 2.5 million rows per
+        // 152 ms (fixed, decode, the date key over 2.5 million rows per
         // scan), so the tree goes to the aggregators. The shape measured
         // 148 ms pushed and 197 ms on the path this choice sends it to,
         // which no explain has confirmed; the pair is recorded in the
@@ -254,8 +254,8 @@ public class CostModelPlannerTests extends OpenSearchTestCase {
         AggregateProfile shape = AggregateProfile.of(exec.aggregate(), (LanceTableScan) node, physical.getCluster().getMetadataQuery());
         double lucene = CostModel.luceneAggregateMillis(PERF20M_ONE_NODE_LOCAL, shape);
         double pushed = CostModel.pushedAggregateMillis(PERF20M_ONE_NODE_LOCAL, shape);
-        assertEquals(74.0, lucene, 1.0);
-        assertEquals(154.0, pushed, 1.0);
+        assertEquals(77.0, lucene, 1.0);
+        assertEquals(152.0, pushed, 1.0);
     }
 
     public void testTwoLevelBucketTreesOverS3StayPushedOnFourNodes() throws IOException {

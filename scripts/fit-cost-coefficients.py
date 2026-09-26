@@ -4,9 +4,10 @@
 Reads src/test/resources/cost/measurements.csv (one row per measured
 (table, cluster, shape, path, latency)), builds the same per operator
 features CostModel.java computes, fits every coefficient by non negative
-least squares, and prints the coefficient table, the per row residuals and
-the (shape, table, cluster) pairs where the model with the rounded
-coefficients picks the other path than the measurement.
+least squares, and prints the coefficient table, the per row residuals, the
+excluded cold column loads the model does not carry, and the (shape, table,
+cluster) pairs where the model with the rounded coefficients picks the other
+path than the measurement.
 
 The fit is linear in the coefficients (the model is a sum of
 coefficient x quantity terms) and every row is scaled by 1 / measured
@@ -352,6 +353,30 @@ def main():
         f"{within_2x} of {len(log_errors)} rows within a factor of 2."
     )
     out.append("")
+
+    cold_rows = [r for r in rows if r["excluded"] != "0" and "cold run" in r["note"]]
+    if cold_rows:
+        out.append("## Cold column loads")
+        out.append("")
+        out.append(
+            "Excluded Lucene rows measured with the executors' column stores empty, so the aggregators first loaded "
+            "the columns they read. The model prices the aggregator path over resident columns and does not carry "
+            "this cost (see the cost section of docs/query-plan.md for why); the rows record what a load cost. "
+            "The predicted figure is the warm prediction; the difference is the load, over the column bytes one node "
+            "pulled from the object store."
+        )
+        out.append("")
+        out.append("| round | table | cluster | shape | measured | predicted warm | difference | column GB per node | difference per GB |")
+        out.append("|---|---|---|---|---|---|---|---|---|")
+        for row in cold_rows:
+            measured = num(row, "latency_ms")
+            predicted = predict(rounded, row)
+            gb = num(row, "rows") * num(row, "bytes_per_row") * num(row, "scan_passes") / num(row, "nodes") / 1e9
+            out.append(
+                f"| {row['round']} | {row['table']} | {row['cluster']} | {row['shape']} | {format_ms(measured)} | {format_ms(predicted)} "
+                f"| {format_ms(measured - predicted)} | {gb:.2f} | {format_ms((measured - predicted) / gb)} |"
+            )
+        out.append("")
 
     out.append("## Choices")
     out.append("")
