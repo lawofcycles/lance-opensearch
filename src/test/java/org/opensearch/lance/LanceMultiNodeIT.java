@@ -1509,6 +1509,125 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
+     * An exact count over three executors runs the same number of Lance
+     * full text scans on every node as on one node: the page scan and
+     * one count only scan for a page whose scan filled, the page scan
+     * alone when it saw every match, the count only scan alone for
+     * {@code size 0}. Lance rebuilds the inverted index document set
+     * on every scan, so a third scan on a node costs as much as the
+     * page itself. The probe limit of the hits scan has no bearing on
+     * the count: the count only scan of an executor that holds a
+     * proper subset of the fragments is restricted to them up front
+     * rather than probed over the whole table, so the figures hold
+     * with the probe limit below the match count too.
+     *
+     * <p>Fixture: {@link LanceTableFactory#writeInterleavedTable} with
+     * three fragments of 100 rows, one fragment per data node.
+     * {@code lance} matches all 300 rows with a score that grows with
+     * the id and row {@code i} sits in fragment {@code i % 3}, so the
+     * page scan's first probe of 60 rows holds 20 rows of every
+     * executor and the page needs one scan on each; {@code tok137}
+     * matches one row.
+     */
+    public void testExactCountOnThreeNodesRunsThePageScanAndOneCountScanPerNode() throws Exception {
+        String suffix = "mn-exact-count-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 3;
+        int rowsPerFragment = 100;
+        LanceTableFactory.writeInterleavedTable(scratchDir, tableName, fragments, rowsPerFragment);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String manyHits = "{\"match\":{\"body\":\"lance\"}}";
+        String oneHit = "{\"match\":{\"body\":\"tok137\"}}";
+        String exactPage = "{\"size\":10,\"profile\":true,\"track_total_hits\":true,\"query\":" + manyHits + "}";
+        String exactOneHit = "{\"size\":10,\"profile\":true,\"track_total_hits\":true,\"query\":" + oneHit + "}";
+        String exactCountOnly = "{\"size\":0,\"profile\":true,\"track_total_hits\":true,\"query\":" + manyHits + "}";
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+            int dataNodes = dataNodeCount();
+            assertEquals("fixture assumes one fragment per data node", fragments, dataNodes);
+
+            // The default probe limit is above the 300 matches, then a
+            // probe limit below them; the scan counts must not move.
+            for (String probeLimit : new String[] { null, "50" }) {
+                updateClusterSetting("lance.fts.subset_probe_limit", probeLimit);
+
+                // The page scan of ten rows fills on every executor, so
+                // the count only scan follows it: two scans per node.
+                Map<String, Object> page = parse(readAll(postJson("/" + indexName + "/_search", exactPage)));
+                assertEquals(List.of(299, 298, 297, 296, 295, 294, 293, 292, 291, 290), sourceIds(page));
+                assertEquals(fragments * rowsPerFragment, extractIntPath(page, "hits", "total", "value"));
+                assertEquals("eq", relation(page));
+                assertFtsScansOnEveryNode("probe limit " + probeLimit, page, dataNodes, 2L);
+
+                // The page scan saw the one match and came back short of
+                // its limit, so the count is read off it: one scan per node.
+                Map<String, Object> single = parse(readAll(postJson("/" + indexName + "/_search", exactOneHit)));
+                assertEquals(List.of(137), sourceIds(single));
+                assertEquals(1, extractIntPath(single, "hits", "total", "value"));
+                assertEquals("eq", relation(single));
+                assertFtsScansOnEveryNode("probe limit " + probeLimit, single, dataNodes, 1L);
+
+                // No page scan; the count only scan alone, as _count runs
+                // it. request_cache=false keeps the second round off the
+                // coordinator's result cache, which serves a repeated
+                // size 0 body without an executor.
+                Map<String, Object> countOnly = parse(readAll(postJson("/" + indexName + "/_search?request_cache=false", exactCountOnly)));
+                assertEquals(fragments * rowsPerFragment, extractIntPath(countOnly, "hits", "total", "value"));
+                assertEquals("eq", relation(countOnly));
+                assertFtsScansOnEveryNode("probe limit " + probeLimit, countOnly, dataNodes, 1L);
+
+                Map<String, Object> counted = parse(readAll(postJson("/" + indexName + "/_count", "{\"query\":" + manyHits + "}")));
+                assertEquals(fragments * rowsPerFragment, extractIntPath(counted, "count"));
+            }
+
+            // Every data node received one fragment, or the requests
+            // above never exercised the subset executors.
+            assertBusy(() -> {
+                Map<String, String> assignments = fanOutAssignments(indexName);
+                assertEquals("fragments went to " + assignments, dataNodes, assignments.size());
+                for (Map.Entry<String, String> assignment : assignments.entrySet()) {
+                    assertEquals(
+                        "node " + assignment.getKey() + " got " + assignment.getValue(),
+                        1,
+                        assignment.getValue().split(",").length
+                    );
+                }
+            });
+        } finally {
+            try {
+                updateClusterSetting("lance.fts.subset_probe_limit", null);
+            } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Assert that {@code response}'s profile lists {@code nodes}
+     * executors and every one of them reports {@code expected} under
+     * {@code query.fts_scans}.
+     */
+    private static void assertFtsScansOnEveryNode(String label, Map<String, Object> response, int nodes, long expected) {
+        Map<String, Map<String, Object>> byNode = profileNodes(response);
+        assertEquals("every data node executed, " + label + ": " + byNode, nodes, byNode.size());
+        for (Map.Entry<String, Map<String, Object>> node : byNode.entrySet()) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> query = (Map<String, Object>) node.getValue().get("query");
+            assertEquals(
+                "fts_scans on node " + node.getKey() + ", " + label + ": " + byNode,
+                expected,
+                ((Number) query.get("fts_scans")).longValue()
+            );
+        }
+    }
+
+    /**
      * Run {@code shape} through the fragment path and check that its
      * page holds {@code min(size, hits.total - from)} hits: a page is
      * only shorter than {@code size} when the matches run out.
