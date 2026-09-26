@@ -1298,6 +1298,138 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
+     * A fragment with no live row rides the fan out like any other: the
+     * coordinator hands it to a node with the rest, that node answers
+     * without error, and the merged answer is the table's live rows. The
+     * fixture is {@code writeMultiFragmentTable} with a fourth fragment
+     * whose rows are all deleted, so the whole table reader gains a leaf
+     * of {@code maxDoc} 4 and {@code numDocs} 0 and one executor gets a
+     * fragment that yields nothing. Round robin over three nodes puts
+     * fragments 0 and 3 on the first node, so the node with the empty
+     * fragment also has hits to take; the takes across the cluster count
+     * one per fragment with hits, three, and never the empty one. The
+     * stock search action over the one shard is the oracle for the
+     * aggregation and the sorted page, and the explain endpoint plans the
+     * request without a {@code plan_failed} refusal.
+     *
+     * <p>Skipped until the fixture can build the table: on Lance 12.0.0
+     * {@code writeMultiFragmentTableWithEmptyFragment} throws, because
+     * Lance removes a fragment with no live row from every manifest it
+     * commits (see the fixture's javadoc).
+     */
+    @AwaitsFix(bugUrl = "https://github.com/lawofcycles/lance-opensearch/issues/318")
+    public void testFanOutWithAnEmptyFragmentAnswersTheFullTable() throws Exception {
+        String suffix = "mn-empty-fragment-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int rows = 12;
+        int rowsPerFragment = 4;
+        String tableUri = LanceTableFactory.writeMultiFragmentTableWithEmptyFragment(scratchDir, tableName, rows, rowsPerFragment);
+        int fragments = rows / rowsPerFragment + 1;
+        int emptyFragment = fragments - 1;
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals("the empty fragment is attached with the rest", fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+            assertEquals("fixture assumes three data nodes", 3, dataNodeCount());
+
+            // The full page. A per node failure fails the whole request,
+            // so a 200 with every live row means the node holding the
+            // empty fragment ran its part without error.
+            String searched = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":20,\"profile\":true,\"query\":{\"match_all\":{}}}")
+            );
+            Map<String, Object> searchedBody = parse(searched);
+            assertEquals(rows, extractIntPath(searched, "hits", "total", "value"));
+            assertEquals("eq", relation(searchedBody));
+            List<Integer> ids = new ArrayList<>(sourceIds(searchedBody));
+            ids.sort(null);
+            List<Integer> expectedIds = new ArrayList<>();
+            for (int id = 0; id < rows; id++) {
+                expectedIds.add(id);
+            }
+            assertEquals(expectedIds, ids);
+            for (String hitId : hitIdsOf(searchedBody)) {
+                assertFalse("no hit comes from the empty fragment: " + searched, hitId.startsWith(emptyFragment + "-"));
+            }
+            Map<String, Map<String, Object>> nodes = profileNodes(searchedBody);
+            assertEquals("every data node executed: " + searched, 3, nodes.size());
+            long takeCount = 0;
+            long takeRows = 0;
+            for (Map<String, Object> node : nodes.values()) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> fetch = (Map<String, Object>) node.get("fetch");
+                takeCount += ((Number) fetch.get("take_count")).longValue();
+                takeRows += ((Number) fetch.get("take_rows")).longValue();
+            }
+            assertEquals("one take per fragment with hits, none for the empty one: " + searched, fragments - 1, takeCount);
+            assertEquals("the takes addressed every live row: " + searched, rows, takeRows);
+
+            // The same shapes against the whole table reader, whose
+            // leaf for the empty fragment has maxDoc 4 and numDocs 0.
+            assertFragmentPathMatchesStockSearch(indexName, "\"size\":20,\"sort\":[{\"id\":\"desc\"}],\"query\":{\"match_all\":{}}");
+            Map<String, Object> aggregated = assertAggregationsMatchStockSearch(
+                indexName,
+                "\"size\":0,\"aggs\":{\"by_id\":{\"terms\":{\"field\":\"id\",\"size\":50}},\"s\":{\"sum\":{\"field\":\"id\"}}}"
+            );
+            assertEquals(rows, extractIntPath(aggregated, "hits", "total", "value"));
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> buckets = (List<Map<String, Object>>) aggregationOf(aggregated, "by_id").get("buckets");
+            assertEquals("one bucket per live row: " + aggregated, rows, buckets.size());
+            long docCount = 0;
+            for (Map<String, Object> bucket : buckets) {
+                docCount += ((Number) bucket.get("doc_count")).longValue();
+            }
+            assertEquals("the buckets count every live row once: " + aggregated, rows, docCount);
+            assertEquals(66.0d, ((Number) aggregationOf(aggregated, "s").get("value")).doubleValue(), 0.0d);
+
+            // The coordinator logs the fragments it hands to each node:
+            // every fragment went out, the empty one to exactly one node.
+            assertBusy(() -> {
+                Map<String, String> assignments = fanOutAssignments(indexName);
+                assertEquals("fragments went to " + assignments, 3, assignments.size());
+                Set<Integer> fannedOut = new HashSet<>();
+                int emptyFragmentHolders = 0;
+                for (Map.Entry<String, String> assignment : assignments.entrySet()) {
+                    for (String fragment : assignment.getValue().split(",")) {
+                        int id = Integer.parseInt(fragment.trim());
+                        fannedOut.add(id);
+                        if (id == emptyFragment) {
+                            emptyFragmentHolders++;
+                        }
+                    }
+                }
+                Set<Integer> expectedFragments = new HashSet<>();
+                for (int id = 0; id < fragments; id++) {
+                    expectedFragments.add(id);
+                }
+                assertEquals("every fragment was fanned out: " + assignments, expectedFragments, fannedOut);
+                assertEquals("the empty fragment went to one node: " + assignments, 1, emptyFragmentHolders);
+            });
+
+            Request explain = new Request("GET", "/" + indexName + "/_lance/explain");
+            explain.setJsonEntity("{\"size\":20,\"query\":{\"match_all\":{}}}");
+            Response explained = client().performRequest(explain);
+            assertEquals(RestStatus.OK.getStatus(), explained.getStatusLine().getStatusCode());
+            String explainBody = readAll(explained);
+            Map<String, Object> explainParsed = parse(explainBody);
+            assertEquals("route: " + explainBody, "fragment", explainParsed.get("route"));
+            assertNull("the plan met every demand: " + explainBody, explainParsed.get("unplanned"));
+            assertFalse("no plan_failed refusal: " + explainBody, explainBody.contains("plan_failed"));
+            assertTrue(
+                "the fan out width is the data node count: " + explainBody,
+                String.valueOf(explainParsed.get("physical")).contains("FanOutExec(fanOut=[3]")
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
      * Hits with equal scores or equal sort values come back in the same
      * order from three executors as from one reader over the whole
      * table. The oracle is again the stock search action over the one
