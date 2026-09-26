@@ -223,13 +223,13 @@ public class LanceAttachIT extends LanceRestTestCase {
             );
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            // GET /<index> is not in this list: OpenSearch's
-            // TransportGetIndexAction applies the settings filter to its
-            // defaults block only and writes the index settings as they
-            // are in the cluster state.
+            // GET /<index> goes through the plugin's action filter, the
+            // other views through OpenSearch's settings filter.
             String[] views = {
                 "/" + indexName + "/_settings",
                 "/" + indexName + "/_settings?flat_settings=true",
+                "/" + indexName,
+                "/" + indexName + "?flat_settings=true&include_defaults=true",
                 "/_cluster/state/metadata/" + indexName };
             for (String view : views) {
                 String body = readAll(client().performRequest(new Request("GET", view)));
