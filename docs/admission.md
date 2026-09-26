@@ -76,6 +76,8 @@ A `lance_knn` scan. Zero when the probed bytes fit the shard share; zero without
 
 - The vector index's manifest size scaled by `nprobes / partitions`, times two for the read then concatenated copy Lance makes of each partition it loads, plus the refine step's full vector reads (`k × refine_factor × dimension × 4`).
 - The partition count comes from the table statistics the planner collects: `num_partitions` of the index statistics (`Dataset.getIndexStatistics`), the smallest over the index's deltas since a nearest scan probes `nprobes` partitions of each. When the statistics report no count the whole index is taken as probed.
+- The row addresses the scan's SQL prefilter materialises when the `lance_knn` carries a `filter`: one row in five of the table (`FILTER_MATCH_RATIO_UNKNOWN`) at 256 bytes each (`FILTER_SCAN_BYTES_PER_MATCHING_ROW`), the same term `fts` charges for its prefilter, because Lance runs both through `MaterializeIndexExec` before the index lookup. The message names it as `plus the prefilter [price >= 100.0] materialising 200000000 row addresses over the whole table at [256b] each` and the remedy opens with `Drop the scalar filter`.
+  - Where the figure comes from: a `lance_knn` with `k 100, nprobes 200` and `filter range price >= 100` over 1B rows whose statistics carry no vector index is 48 GB of codes loaded twice plus 51.2 GB of row addresses, 99.2 GB, above the 88 GB a 128 GB node has after the headroom; the bare scan is 48 GB and is admitted there.
 
 ### `aggregate_scan`
 
@@ -90,7 +92,12 @@ A pushed aggregate. Zero when the sum fits the shard share.
 
 ### `column_load`
 
-The heap copy of a column the off-heap store had no room for. The request breaker judges it before the allocation (`lance_heap_column:<column>`, see [limitations.md](limitations.md)) and the gate records the charge and the refusal under this kind.
+The scans that read a column into the off-heap column store or into heap when an aggregation or a sort faults it in through the Lucene path, and the heap copy of a column the store had no room for.
+
+- The scans: the read queue plus the batches in flight of each parallel scan (`lance.fragment_path.parallelism` fragment groups), summed over the scans. The read queue is at most 2 GiB and at most the group's rows times the column's row width, the Arrow width plus the 8 byte row address. This is the per scan term of `aggregate_scan`, with nothing materialised. Zero when the sum fits the shard share. Judged before the first scan opens, on the request's ticket, so a refusal is the request's 429: `[lance_admission] column_load estimate [192.2gb] exceeds available [56gb] minus headroom [8gb] plus [0b] retained by earlier admitted scans: column load of [embedding] over [perf1b]: 32 parallel scans over 250000000 rows of [4kb] each (read queue and batches in flight per scan), against an index cache shard of [8gb]. Lower lance.fragment_path.parallelism, spread the table over more data nodes, or relax lance.admission.headroom / lance.admission.enabled.`
+  - Where the figure comes from: a 1024 dimension float32 column is 4104 bytes per row with the row address, so on a 64 vCPU node each of the 32 scans holds its 2 GiB read queue plus 64 batches of 8192 rows, doubled, 6 GiB, 192 GiB over the 32 scans; a node reading 64 GB available has 56 GB after the headroom.
+  - The shard engine's reader carries no request ticket. Its column loads are judged and recorded the same way, but a refusal is logged at WARN and the load runs, because nothing would answer the 429 and the column has to be read.
+- The heap copy: the request breaker judges it before the allocation (`lance_heap_column:<column>`, see [limitations.md](limitations.md)) and the gate records the charge and the refusal under this kind.
 
 ## Retained memory
 
@@ -102,7 +109,7 @@ How the pool is filled:
 
 - When a non zero estimate is admitted with no other gated request in flight, the gate samples `MemAvailable` and the process resident set.
 - When that request's scan completes with no other gated scan running, it adds `MemAvailable` before minus `MemAvailable` after, capped by the resident set growth over the same interval (memory another process took meanwhile is not this process's to reuse).
-- Every gated scan (full text, filter, sorted page, nearest, aggregate) brackets itself so the pool samples its completion.
+- Every gated scan (full text, filter, sorted page, nearest, aggregate, column load) brackets itself so the pool samples its completion.
 - The pool is not credited while a gated request is in flight or a gated scan runs (that memory is in use), nor when the process resident set exceeds `lance.native_memory.limit` plus the JVM heap by more than the pool (something the plugin does not account holds memory).
 
 How the pool is bounded:

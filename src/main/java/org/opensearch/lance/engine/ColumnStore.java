@@ -41,6 +41,8 @@ import org.lance.ipc.ScanOptions;
 import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.lance.LanceCircuitBreaker;
 import org.opensearch.lance.engine.LanceWarmCache.SnapshotKey;
+import org.opensearch.lance.query.LanceHitsAccounting;
+import org.opensearch.lance.query.ScanAdmission;
 
 /**
  * Node-wide off-heap store of columns, one {@link StoreEntry} per
@@ -176,13 +178,16 @@ public final class ColumnStore implements Closeable {
      * group, the groups side by side), and pin every returned column. The
      * caller unpins them through {@link #unpin} when its request ends.
      *
+     * @param ticket the admission ticket of the request the load serves,
+     *        or {@code null} (see {@link ScanAdmission#admitColumnLoad})
      * @return one {@link CachedColumn} per requested fragment, or
      *         {@code null} when the missing fragments do not fit the
      *         budget even after eviction (the caller falls back to a heap
      *         load)
      * @throws org.opensearch.core.common.breaker.CircuitBreakingException
      *         when the {@code lance_native} breaker is at its limit and a
-     *         load would be needed
+     *         load would be needed, or when the admission gate refuses
+     *         the load's scans on {@code ticket}
      */
     public Map<Integer, CachedColumn> acquire(
         SnapshotKey snapshot,
@@ -190,7 +195,8 @@ public final class ColumnStore implements Closeable {
         String column,
         boolean isBoolean,
         Map<Integer, Integer> fragmentRows,
-        FragmentGroupScan groupScan
+        FragmentGroupScan groupScan,
+        LanceHitsAccounting ticket
     ) throws IOException {
         Loaded<CachedColumn, Void> loaded = acquire(
             snapshot,
@@ -207,14 +213,14 @@ public final class ColumnStore implements Closeable {
                 if (!makeRoom(needed)) {
                     return null;
                 }
-                return new Loaded<>(loadNumeric(d, c, isBoolean, missing, scan), Collections.emptyMap());
+                return new Loaded<>(loadNumeric(d, c, isBoolean, missing, scan, ticket), Collections.emptyMap());
             }
         );
         return loaded == null ? null : loaded.stored();
     }
 
     /**
-     * Same as {@link #acquire(SnapshotKey, Dataset, String, boolean, Map, FragmentGroupScan)}
+     * Same as {@link #acquire(SnapshotKey, Dataset, String, boolean, Map, FragmentGroupScan, LanceHitsAccounting)}
      * for a single-valued keyword (Utf8) column: each stored entry holds
      * the fragment's sorted term dictionary and per-row ordinals. The
      * dictionary size is only known after the scan, so when the missing
@@ -237,7 +243,8 @@ public final class ColumnStore implements Closeable {
         String column,
         Map<Integer, Integer> fragmentRows,
         FragmentGroupScan groupScan,
-        KeywordDictionaryBuilder.TermEncoder encoder
+        KeywordDictionaryBuilder.TermEncoder encoder,
+        LanceHitsAccounting ticket
     ) throws IOException {
         Loaded<CachedKeywordColumn, HeapKeyword> loaded = acquire(
             snapshot,
@@ -246,7 +253,7 @@ public final class ColumnStore implements Closeable {
             fragmentRows,
             CachedKeywordColumn.class,
             groupScan,
-            (d, c, missing, scan) -> loadKeyword(d, c, missing, scan, encoder)
+            (d, c, missing, scan) -> loadKeyword(d, c, missing, scan, encoder, ticket)
         );
         return loaded == null ? null : new KeywordLoad(loaded.stored(), loaded.heap());
     }
@@ -261,7 +268,8 @@ public final class ColumnStore implements Closeable {
         String column,
         Map<Integer, Integer> fragmentRows,
         FragmentGroupScan groupScan,
-        KeywordDictionaryBuilder.TermEncoder encoder
+        KeywordDictionaryBuilder.TermEncoder encoder,
+        LanceHitsAccounting ticket
     ) throws IOException {
         Loaded<CachedKeywordArrayColumn, HeapKeywordArray> loaded = acquire(
             snapshot,
@@ -270,7 +278,7 @@ public final class ColumnStore implements Closeable {
             fragmentRows,
             CachedKeywordArrayColumn.class,
             groupScan,
-            (d, c, missing, scan) -> loadKeywordArray(d, c, missing, scan, encoder)
+            (d, c, missing, scan) -> loadKeywordArray(d, c, missing, scan, encoder, ticket)
         );
         return loaded == null ? null : new KeywordArrayLoad(loaded.stored(), loaded.heap());
     }
@@ -440,26 +448,47 @@ public final class ColumnStore implements Closeable {
     }
 
     /**
-     * Scan {@code column} over {@code fragmentIds} through
-     * {@code groupScan} and hand every non-null cell to {@code consumer}.
-     * The groups run side by side, so {@code consumer} is called from
-     * several threads at once; every loader here writes each cell to the
-     * structure of its own fragment and a fragment belongs to exactly one
-     * group, so no two threads touch the same structure.
+     * Scan {@code column} over the fragments of {@code fragmentRows}
+     * (fragment id to physical row count) through {@code groupScan} and
+     * hand every non-null cell to {@code consumer}. The groups run side
+     * by side, so {@code consumer} is called from several threads at
+     * once; every loader here writes each cell to the structure of its
+     * own fragment and a fragment belongs to exactly one group, so no two
+     * threads touch the same structure.
+     *
+     * <p>The groups' scans are judged by the admission gate on
+     * {@code ticket} before the first opens
+     * ({@link ScanAdmission#admitColumnLoad}: the read queue and the
+     * batches in flight of every group over the fragments' rows) and
+     * bracketed as one gated scan so the pool samples what they leave
+     * behind once they are all done.
      */
     private void scan(
         Dataset dataset,
         String column,
-        Iterable<Integer> fragmentIds,
+        Map<Integer, Integer> fragmentRows,
         FragmentGroupScan groupScan,
+        LanceHitsAccounting ticket,
         ScannedCellConsumer consumer
     ) throws IOException {
-        List<Integer> ids = new ArrayList<>();
-        for (int id : fragmentIds) {
-            ids.add(id);
+        List<Integer> ids = new ArrayList<>(fragmentRows.keySet());
+        long rows = 0L;
+        for (int fragmentRowCount : fragmentRows.values()) {
+            rows += fragmentRowCount;
         }
+        List<List<Integer>> groups = FragmentGroupScan.splitContiguous(ids, groupScan.parallelism());
+        ScanAdmission.admitColumnLoad(
+            dataset.uri(),
+            dataset,
+            column,
+            groups.size(),
+            rows,
+            ScanAdmission.columnWidthBytes(dataset.getSchema().getFields(), column) + ScanAdmission.ROW_ADDRESS_BYTES,
+            ticket
+        );
+        ScanAdmission.scanStarted();
         try {
-            groupScan.run(ids, group -> {
+            groupScan.runGroups(groups, group -> {
                 scanGroup(dataset, column, group, groupScan.cancellation(), consumer);
                 return null;
             });
@@ -469,6 +498,8 @@ public final class ColumnStore implements Closeable {
             throw e;
         } catch (Exception e) {
             throw new IOException(e);
+        } finally {
+            ScanAdmission.scanFinished();
         }
     }
 
@@ -521,7 +552,8 @@ public final class ColumnStore implements Closeable {
         String column,
         boolean isBoolean,
         Map<Integer, Integer> missing,
-        FragmentGroupScan groupScan
+        FragmentGroupScan groupScan,
+        LanceHitsAccounting ticket
     ) throws IOException {
         Map<Integer, FieldVector> vectors = new HashMap<>(missing.size() * 2);
         boolean success = false;
@@ -540,7 +572,7 @@ public final class ColumnStore implements Closeable {
                     vectors.put(entry.getKey(), v);
                 }
             }
-            scan(dataset, column, missing.keySet(), groupScan, (fragmentId, offset, source, row) -> {
+            scan(dataset, column, missing, groupScan, ticket, (fragmentId, offset, source, row) -> {
                 FieldVector target = vectors.get(fragmentId);
                 if (target == null) {
                     return;
@@ -580,7 +612,8 @@ public final class ColumnStore implements Closeable {
         String column,
         Map<Integer, Integer> missing,
         FragmentGroupScan groupScan,
-        KeywordDictionaryBuilder.TermEncoder encoder
+        KeywordDictionaryBuilder.TermEncoder encoder,
+        LanceHitsAccounting ticket
     ) throws IOException {
         Map<Integer, int[]> idsByFragment = new HashMap<>(missing.size() * 2);
         Map<Integer, KeywordDictionaryBuilder> builders = new HashMap<>(missing.size() * 2);
@@ -590,7 +623,7 @@ public final class ColumnStore implements Closeable {
             idsByFragment.put(entry.getKey(), ids);
             builders.put(entry.getKey(), new KeywordDictionaryBuilder(encoder));
         }
-        scan(dataset, column, missing.keySet(), groupScan, (fragmentId, offset, source, row) -> {
+        scan(dataset, column, missing, groupScan, ticket, (fragmentId, offset, source, row) -> {
             int[] ids = idsByFragment.get(fragmentId);
             if (ids != null) {
                 ids[offset] = builders.get(fragmentId).intern((VarCharVector) source, row);
@@ -683,7 +716,8 @@ public final class ColumnStore implements Closeable {
         String column,
         Map<Integer, Integer> missing,
         FragmentGroupScan groupScan,
-        KeywordDictionaryBuilder.TermEncoder encoder
+        KeywordDictionaryBuilder.TermEncoder encoder,
+        LanceHitsAccounting ticket
     ) throws IOException {
         Map<Integer, int[][]> rowsByFragment = new HashMap<>(missing.size() * 2);
         Map<Integer, KeywordDictionaryBuilder> builders = new HashMap<>(missing.size() * 2);
@@ -691,7 +725,7 @@ public final class ColumnStore implements Closeable {
             rowsByFragment.put(entry.getKey(), new int[entry.getValue()][]);
             builders.put(entry.getKey(), new KeywordDictionaryBuilder(encoder));
         }
-        scan(dataset, column, missing.keySet(), groupScan, (fragmentId, offset, source, row) -> {
+        scan(dataset, column, missing, groupScan, ticket, (fragmentId, offset, source, row) -> {
             int[][] rows = rowsByFragment.get(fragmentId);
             if (rows != null) {
                 ListVector list = (ListVector) source;

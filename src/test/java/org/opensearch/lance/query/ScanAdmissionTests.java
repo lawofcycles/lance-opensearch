@@ -21,6 +21,8 @@ import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
 
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
@@ -41,6 +43,7 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.plan.metadata.ColumnStatistics;
 import org.opensearch.lance.plan.metadata.TableStatistics;
 import org.opensearch.lance.plan.metadata.TableStatisticsCache;
+import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.OpenSearchTestCase;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
@@ -735,7 +738,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
 
             // The nearest scan on embedding is admitted and leaves 700
             // bytes behind.
-            ScanAdmission.admitVectorSearch("demo", dataset, "embedding", 3, 1, 0, 8, null);
+            ScanAdmission.admitVectorSearch("demo", dataset, "embedding", null, 3, 1, 0, 8, null);
             assertEquals(embeddingEstimate, ScanAdmission.lastEstimateBytes());
             ScanAdmission.scanStarted();
             available[0] -= 700L;
@@ -762,7 +765,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             available[0] = 1000L + otherEstimate - 100L;
             CircuitBreakingException refused = expectThrows(
                 CircuitBreakingException.class,
-                () -> ScanAdmission.admitVectorSearch("demo", dataset, "embedding_other", 3, 1, 0, 8, null)
+                () -> ScanAdmission.admitVectorSearch("demo", dataset, "embedding_other", null, 3, 1, 0, 8, null)
             );
             assertTrue(refused.getMessage(), refused.getMessage().contains("nearest scan on [embedding_other]"));
             assertTrue(refused.getMessage(), refused.getMessage().contains("[0b] retained by earlier admitted scans"));
@@ -772,7 +775,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             // The scan on embedding again, 100 bytes short on the reading
             // as well: the memory it left is credited and admits it.
             available[0] = 1000L + embeddingEstimate - 100L;
-            ScanAdmission.admitVectorSearch("demo", dataset, "embedding", 3, 1, 0, 8, null);
+            ScanAdmission.admitVectorSearch("demo", dataset, "embedding", null, 3, 1, 0, 8, null);
             assertEquals(1L, ScanAdmission.rejections());
             ScanAdmission.requestEnded();
         }
@@ -1273,7 +1276,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             assertTrue(index.sizeBytes().isPresent());
             CircuitBreakingException refused = expectThrows(
                 CircuitBreakingException.class,
-                () -> ScanAdmission.admitVectorSearch("demo", dataset, "embedding", 3, 1, 0, 8, null)
+                () -> ScanAdmission.admitVectorSearch("demo", dataset, "embedding", null, 3, 1, 0, 8, null)
             );
             String message = refused.getMessage();
             assertTrue(message, message.contains("ivf_pq index [embedding_ivf]"));
@@ -1900,6 +1903,206 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         assertEquals(ScanAdmission.OTHER_COLUMN_BYTES_PER_ROW, ScanAdmission.columnWidthBytes(List.of(vector), "missing"));
     }
 
+    // ---- the knn prefilter ----
+
+    public void testKnnWithARangePrefilterOverPerf1bIsRefusedOnAFreshNode() {
+        // lance_knn(embedding, k 100, nprobes 200) with filter range
+        // price >= 100 over perf1b, whose statistics carry no vector
+        // index: the whole table's codes are taken as probed, 24 bytes
+        // per row loaded twice, 48 GB, which a fresh 128 GB node admits
+        // (88 GB after the headroom). The prefilter materialises one row
+        // in five of the table at 256 bytes, 51.2 GB, the term the full
+        // text gate charges for the same MaterializeIndexExec: 99.2 GB
+        // together, refused on the same node.
+        perf1bNode(PERF1B_AVAILABLE_FRESH_NODE);
+        long vectorEstimate = ScanAdmission.vectorIndexEstimateBytes(OptionalLong.empty(), PERF1B_ROWS, 200, 0L, 100, 0, 1024, 8 * GB);
+        assertEquals(48_000_000_000L, vectorEstimate);
+        ScanAdmission.admitVectorSearch("perf1b", perf1bStatistics(), "embedding", null, 100, 200, 0, 1024, null);
+        assertEquals("the bare knn is judged on the partition load alone", vectorEstimate, ScanAdmission.lastEstimateBytes());
+        assertEquals(0L, ScanAdmission.rejections());
+        ScanAdmission.requestEnded();
+
+        long prefilter = ScanAdmission.ftsPrefilterEstimateBytes(PERF1B_ROWS, List.of("price >= 100.0"), 8 * GB);
+        assertEquals(51_200_000_000L, prefilter);
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admitVectorSearch("perf1b", perf1bStatistics(), "embedding", "price >= 100.0", 100, 200, 0, 1024, null)
+        );
+        String message = rejection.getMessage();
+        assertTrue(message, message.startsWith("[" + ScanAdmission.LABEL + "] vector_index estimate"));
+        assertTrue(message, message.contains("nearest scan on [embedding] over [perf1b]"));
+        assertTrue(message, message.contains("probed with nprobes 200 over an unknown partition count"));
+        assertTrue(
+            message,
+            message.contains(
+                "loaded twice while its partitions are concatenated plus the prefilter [price >= 100.0] materialising 200000000 "
+                    + "row addresses over the whole table at [256b] each, against an index cache shard of [8gb]"
+            )
+        );
+        assertTrue(message, message.contains("Drop the scalar filter, lower nprobes"));
+        assertEquals(vectorEstimate + prefilter, ScanAdmission.lastEstimateBytes());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.VECTOR_INDEX));
+        assertEquals(vectorEstimate + prefilter, rejection.getBytesWanted());
+
+        // An empty prefilter is no prefilter, and on a small table the
+        // prefilter's row addresses fit the shard share: the same
+        // estimate as the bare scan.
+        ScanAdmission.admitVectorSearch("perf1b", perf1bStatistics(), "embedding", "", 100, 200, 0, 1024, null);
+        assertEquals(vectorEstimate, ScanAdmission.lastEstimateBytes());
+        ScanAdmission.requestEnded();
+        assertEquals(0L, ScanAdmission.ftsPrefilterEstimateBytes(20_000_000L, List.of("price >= 100.0"), 8 * GB));
+    }
+
+    // ---- the column load ----
+
+    public void testColumnLoadEstimateIsTheReadQueueAndBatchesOfEveryParallelScan() {
+        // The per scan term of the pushed aggregate, nothing materialised.
+        long width = ScanAdmission.UTF8_COLUMN_BYTES_PER_ROW + ScanAdmission.ROW_ADDRESS_BYTES;
+        assertEquals(
+            ScanAdmission.aggregateScanEstimateBytes(8, PERF1B_NODE_ROWS, 0L, width, 16, 8 * GB),
+            ScanAdmission.columnLoadEstimateBytes(8, PERF1B_NODE_ROWS, width, 16, 8 * GB)
+        );
+        // A 1024 dimension float32 embedding is 4096 bytes wide, 4104
+        // with the row address.
+        Field embedding = new Field(
+            "embedding",
+            FieldType.nullable(new ArrowType.FixedSizeList(1024)),
+            List.of(new Field("item", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)), null))
+        );
+        long embeddingWidth = ScanAdmission.columnWidthBytes(List.of(embedding), "embedding") + ScanAdmission.ROW_ADDRESS_BYTES;
+        assertEquals(4104L, embeddingWidth);
+        // 250M rows of it on a 64 vCPU node (32 fragment groups, batch
+        // readahead 64): every scan's read queue is at its 2 GiB cap
+        // (7.8M rows of 4104 bytes is 32 GB) and 64 batches of 8192 rows
+        // are in flight, doubled: 6 GiB per scan, 192 GiB over the 32.
+        long perScan = ScanAdmission.IO_BUFFER_BYTES_PER_SCAN + (long) (64 * ScanAdmission.SCAN_BATCH_ROWS * embeddingWidth
+            * ScanAdmission.SCAN_BUFFER_FACTOR);
+        assertEquals(6_450_839_552L, perScan);
+        assertEquals(perScan * 32, ScanAdmission.columnLoadEstimateBytes(32, PERF1B_NODE_ROWS, embeddingWidth, 64, 8 * GB));
+        // 16 rows of a 4 byte rating in 2 scans: 96 bytes of reads and 6
+        // MB of batches, within the shard share.
+        assertEquals(0L, ScanAdmission.columnLoadEstimateBytes(2, 16L, 12L, 16, 8 * GB));
+        assertEquals(6_291_648L, ScanAdmission.columnLoadEstimateBytes(2, 16L, 12L, 16, 1L));
+    }
+
+    public void testEmbeddingColumnLoadOverPerf1bIsRefusedOnA64GbReadingAndASmallLoadIsAdmitted() {
+        // The 1024 dimension embedding of perf1b loaded on a 64 vCPU
+        // node reading 64 GB available: 32 scans at 6 GiB each, 192 GiB,
+        // against 56 GiB after the headroom. Refused as the request's
+        // 429 on its ticket, and counted once in flight.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setHeadroom(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setAvailableMemoryOverride(List.of("64gb"));
+        ScanAdmission.setResidentSetProbeForTests(() -> -1L);
+        long embeddingWidth = 1024L * ScanAdmission.FLOAT32_BYTES + ScanAdmission.ROW_ADDRESS_BYTES;
+        long expected = ScanAdmission.columnLoadEstimateBytes(32, PERF1B_NODE_ROWS, embeddingWidth, 64, 8 * GB);
+        assertEquals(206_426_865_664L, expected);
+        LanceHitsAccounting ticket = LanceHitsAccounting.unlimited();
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admitColumnLoad("perf1b", "perf1b", "embedding", 32, PERF1B_NODE_ROWS, embeddingWidth, 64, ticket)
+        );
+        String message = rejection.getMessage();
+        assertTrue(message, message.startsWith("[" + ScanAdmission.LABEL + "] column_load estimate [192.2gb] exceeds available [56gb]"));
+        assertTrue(
+            message,
+            message.contains(
+                "column load of [embedding] over [perf1b]: 32 parallel scans over 250000000 rows of [4kb] each "
+                    + "(read queue and batches in flight per scan), against an index cache shard of [8gb]"
+            )
+        );
+        assertTrue(message, message.contains("Lower lance.fragment_path.parallelism"));
+        assertEquals(expected, ScanAdmission.lastEstimateBytes());
+        assertEquals("column_load", ScanAdmission.lastKind());
+        assertEquals("request", ScanAdmission.lastSource());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.COLUMN_LOAD));
+        assertEquals("a refused load is not in flight", 0, ScanAdmission.inFlightForTests());
+
+        // The same load on the 4xlarge (8 groups, readahead 16) is 24
+        // GiB and fits the same reading.
+        long fourXlarge = ScanAdmission.columnLoadEstimateBytes(8, PERF1B_NODE_ROWS, embeddingWidth, 16, 8 * GB);
+        assertEquals(25_786_580_992L, fourXlarge);
+        ScanAdmission.admitColumnLoad("perf1b", "perf1b", "embedding", 8, PERF1B_NODE_ROWS, embeddingWidth, 16, ticket);
+        assertEquals(fourXlarge, ScanAdmission.lastEstimateBytes());
+        assertEquals(1, ScanAdmission.inFlightForTests());
+        // The scans bracket themselves; the pool samples what the load
+        // left behind under the load's identity, credited once the
+        // request has ended.
+        ScanAdmission.scanStarted();
+        ScanAdmission.setAvailableMemoryOverride(List.of("63gb"));
+        ScanAdmission.scanFinished();
+        assertEquals("column_load:perf1b:embedding", ScanAdmission.retainedScope());
+        assertEquals("nothing is credited while the request is in flight", 0L, ScanAdmission.retainedCreditBytes());
+        ticket.close();
+        assertEquals(0, ScanAdmission.inFlightForTests());
+        assertEquals(GB, ScanAdmission.retainedCreditBytes());
+
+        // A small table's column load fits the shard share: estimate
+        // zero, admitted, recorded, nothing in flight.
+        LanceHitsAccounting other = LanceHitsAccounting.unlimited();
+        ScanAdmission.admitColumnLoad("demo", "demo", "rating", 2, 16L, 12L, 16, other);
+        assertEquals(0L, ScanAdmission.lastEstimateBytes());
+        assertEquals("column_load", ScanAdmission.lastKind());
+        assertEquals(0, ScanAdmission.inFlightForTests());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.COLUMN_LOAD));
+        other.close();
+    }
+
+    public void testColumnLoadWithoutATicketIsRecordedAndLoggedNotThrown() throws Exception {
+        // A reader no request accounting reaches (the shard engine's):
+        // the decision is recorded and the refusal counted, nothing is
+        // thrown and nothing is counted in flight, and the refusal is
+        // the one WARN line that says the load runs anyway.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setHeadroom(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setAvailableMemoryOverride(List.of("64gb"));
+        ScanAdmission.setResidentSetProbeForTests(() -> -1L);
+        long embeddingWidth = 1024L * ScanAdmission.FLOAT32_BYTES + ScanAdmission.ROW_ADDRESS_BYTES;
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(ScanAdmission.class))) {
+            appender.addExpectation(
+                new MockLogAppender.SeenEventExpectation(
+                    "the refused ticketless load is warned with the figures and runs",
+                    ScanAdmission.class.getName(),
+                    Level.WARN,
+                    "[lance_admission] column_load estimate [192.2gb] exceeds available [56gb] minus headroom [8gb] plus [0b] "
+                        + "retained by earlier admitted scans: column load of [embedding] over [perf1b]: 32 parallel scans over "
+                        + PERF1B_NODE_ROWS
+                        + " rows of [4kb] each (read queue and batches in flight per scan), against an index cache shard of [8gb]. "
+                        + "Lower lance.fragment_path.parallelism, spread the table over more data nodes, or relax "
+                        + "lance.admission.headroom / lance.admission.enabled.; the load runs anyway because the reader carries "
+                        + "no request to refuse"
+                )
+            );
+            ScanAdmission.admitColumnLoad("perf1b", "perf1b", "embedding", 32, PERF1B_NODE_ROWS, embeddingWidth, 64, null);
+            appender.assertAllExpectationsMatched();
+        }
+        assertEquals(206_426_865_664L, ScanAdmission.lastEstimateBytes());
+        assertEquals("column_load", ScanAdmission.lastKind());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.COLUMN_LOAD));
+        assertEquals(0, ScanAdmission.inFlightForTests());
+        // An admitted ticketless load is recorded and not counted, and
+        // not logged either; nor is one the disabled gate does not judge.
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(ScanAdmission.class))) {
+            appender.addExpectation(
+                new MockLogAppender.UnseenEventExpectation(
+                    "an admitted or unjudged load is not warned",
+                    ScanAdmission.class.getName(),
+                    Level.WARN,
+                    "*the load runs anyway*"
+                )
+            );
+            ScanAdmission.admitColumnLoad("perf1b", "perf1b", "embedding", 8, PERF1B_NODE_ROWS, embeddingWidth, 16, null);
+            assertEquals(25_786_580_992L, ScanAdmission.lastEstimateBytes());
+            assertEquals(0, ScanAdmission.inFlightForTests());
+            assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.COLUMN_LOAD));
+            // A disabled gate records nothing.
+            ScanAdmission.setEnabled(false);
+            ScanAdmission.admitColumnLoad("perf1b", "perf1b", "embedding", 32, PERF1B_NODE_ROWS, embeddingWidth, 64, null);
+            assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.COLUMN_LOAD));
+            appender.assertAllExpectationsMatched();
+        }
+    }
+
     // ---- the per kind counters and the request ticket ----
 
     public void testRejectionsAreCountedPerKindAndTheLastKindIsRecorded() {
@@ -1927,7 +2130,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         // Without statistics the vector index has no size and no rows to
         // estimate from: the estimate is zero and the scan is admitted,
         // the decision recorded under its kind.
-        ScanAdmission.admitVectorSearch("demo", null, "embedding", 10, 200, 0, 128, null);
+        ScanAdmission.admitVectorSearch("demo", (Dataset) null, "embedding", null, 10, 200, 0, 128, null);
         assertEquals("vector_index", ScanAdmission.lastKind());
         assertEquals(0L, ScanAdmission.lastEstimateBytes());
         expectThrows(

@@ -45,6 +45,8 @@ import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
+import org.lance.Dataset;
+import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.common.breaker.CircuitBreaker;
@@ -54,7 +56,13 @@ import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.cache.query.DisabledQueryCache;
+import org.opensearch.lance.LanceOverrides;
+import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.LanceTableFactory;
+import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceCancellation;
+import org.opensearch.lance.engine.LanceDirectoryReader;
+import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.script.ScriptModule;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.aggregations.BucketCollector;
@@ -63,6 +71,8 @@ import org.opensearch.search.aggregations.LeafBucketCollector;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.test.IndexSettingsModule;
 import org.opensearch.test.OpenSearchTestCase;
+
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 /**
  * {@link LanceFragmentIndexSearcher} against a {@link LanceFragmentSearchContext}
@@ -78,6 +88,7 @@ import org.opensearch.test.OpenSearchTestCase;
  * refuses the slice tasks leaves the whole search to the calling
  * thread.
  */
+@ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
 
     private static final int TOTAL = 5;
@@ -138,6 +149,52 @@ public class LanceFragmentIndexSearcherTests extends OpenSearchTestCase {
             TopDocs top = searcher.search(MatchAllDocsQuery.INSTANCE, 3, new Sort(new SortField("n", SortField.Type.LONG, true)));
             assertEquals(TOTAL, top.totalHits.value());
             assertEquals(3, top.scoreDocs.length);
+        }
+    }
+
+    public void testSearcherHandsItsAccountingToTheLanceReaderBehindTheWrapper() throws Exception {
+        // The fragment path opens a LanceDirectoryReader, wraps it in an
+        // OpenSearchDirectoryReader and builds the searcher over the
+        // wrapper. The searcher has to find the Lance reader through
+        // the FilterDirectoryReader chain and hand it the accounting
+        // the gate counts the request on; otherwise every column load
+        // of the request would be judged without a ticket and never
+        // answer a 429.
+        String uri = LanceTableFactory.writeHintFixtureTable(createTempDir(), "ticket-" + getTestName(), 2, 100);
+        Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty());
+        LanceDirectoryReader lanceReader = LanceDirectoryReader.openForFragments(
+            new ByteBuffersDirectory(),
+            null,
+            dataset,
+            "",
+            LancePrimaryKeyType.NONE,
+            LanceOverrides.EMPTY,
+            List.of(0, 1)
+        );
+        try (
+            DirectoryReader wrapped = OpenSearchDirectoryReader.wrap(lanceReader, shardId);
+            LanceFragmentSearchContext context = newContext()
+        ) {
+            assertSame(lanceReader, LanceDirectoryReader.unwrap(wrapped));
+            assertNull("nothing is attached before the searcher is built", lanceReader.admissionTicket());
+            LanceFragmentIndexSearcher searcher = newSearcher(wrapped, context, null);
+            assertNotNull(searcher.hitsAccounting());
+            assertSame(
+                "the reader's column cache judges on the searcher's accounting",
+                searcher.hitsAccounting(),
+                lanceReader.admissionTicket()
+            );
+        }
+    }
+
+    public void testReaderWithoutALanceReaderBehindItGetsNoTicket() throws IOException {
+        // A plain Lucene reader hides no Lance reader: the searcher
+        // builds and searches, and has nothing to attach to.
+        try (DirectoryReader reader = DirectoryReader.open(dir); LanceFragmentSearchContext context = newContext()) {
+            assertNull(LanceDirectoryReader.unwrap(reader));
+            LanceFragmentIndexSearcher searcher = newSearcher(reader, context, null);
+            assertNotNull(searcher.hitsAccounting());
+            assertEquals(TOTAL, searcher.count(MatchAllDocsQuery.INSTANCE));
         }
     }
 
