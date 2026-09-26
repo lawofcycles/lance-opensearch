@@ -32,6 +32,7 @@ import org.opensearch.index.shard.IndexShard;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.dispatch.LanceCoordinatorThreads;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.engine.LanceServedVersions;
@@ -333,6 +334,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
      * once. Counts and logs a failure, then rethrows it.
      */
     Outcome check(Tracked entry) {
+        assert LanceCoordinatorThreads.notOnCoordinator() : LanceCoordinatorThreads.message("freshness check");
         synchronized (entry) {
             checks.increment();
             lastCheckMillis = System.currentTimeMillis();
