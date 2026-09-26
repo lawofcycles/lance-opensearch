@@ -90,6 +90,15 @@ public final class LanceNamespaceService {
      * retried on every poll; success removes it.
      */
     private final Map<String, String> unavailable = new ConcurrentHashMap<>();
+    /**
+     * Registration names whose last poll listed the catalog but could
+     * not list one of its subnamespaces, mapped to that failure. The
+     * tables below the refused subnamespace are not surfaced. An entry
+     * here surfaces as {@code "status": "partial"} in the GET listing
+     * and is retried on every poll; a poll that walks every namespace
+     * removes it.
+     */
+    private final Map<String, String> partial = new ConcurrentHashMap<>();
     /** Names whose initialise failure has been warned about, so the retry loop logs once. */
     private final Set<String> warnedInitFailure = ConcurrentHashMap.newKeySet();
     /** "name:index" pairs whose catalog location fell outside the allowlist, warned once. */
@@ -258,6 +267,7 @@ public final class LanceNamespaceService {
             }
         }
         unavailable.keySet().removeIf(name -> !desired.contains(name));
+        partial.keySet().removeIf(name -> !desired.contains(name));
         warnedInitFailure.removeIf(name -> !desired.contains(name));
     }
 
@@ -373,7 +383,7 @@ public final class LanceNamespaceService {
         try {
             for (LanceCatalogEnumerator.CatalogTable table : handle.call(
                 namespace -> LanceCatalogEnumerator.enumerateTables(namespace, entry)
-            )) {
+            ).tables()) {
                 names.add(table.name());
             }
         } catch (LanceNamespaceHandle.ReleasedException e) {
@@ -399,7 +409,8 @@ public final class LanceNamespaceService {
                     entry.type(),
                     path,
                     entry.redactedConfig(),
-                    unavailable.get(entry.name())
+                    unavailable.get(entry.name()),
+                    partial.get(entry.name())
                 )
             );
         }
@@ -409,10 +420,19 @@ public final class LanceNamespaceService {
     /**
      * What one catalog listing cycle did: the indexes whose CreateIndex
      * was issued (and, for a manual poll, acknowledged), the tables that
-     * were left alone with the reason, and the registrations whose
-     * listing failed with the error.
+     * were left alone with the reason, the registrations whose listing
+     * failed with the error, and the registrations whose listing
+     * succeeded but could not descend into one of their subnamespaces,
+     * with that failure.
      */
-    public record PollReport(List<String> surfaced, List<SkippedTable> skipped, Map<String, String> unavailable) {
+    public record PollReport(List<String> surfaced, List<SkippedTable> skipped, Map<String, String> unavailable, Map<
+        String,
+        String> partial) {
+
+        /** A report without partial listings, the shape of the previous wire version. */
+        public PollReport(List<String> surfaced, List<SkippedTable> skipped, Map<String, String> unavailable) {
+            this(surfaced, skipped, unavailable, Map.of());
+        }
 
         /** A catalog table the cycle did not surface: the index name it would have taken and why. */
         public record SkippedTable(String namespace, String table, String index, String reason) {
@@ -424,6 +444,7 @@ public final class LanceNamespaceService {
         final List<String> surfaced = new ArrayList<>();
         final List<PollReport.SkippedTable> skipped = new ArrayList<>();
         final Map<String, String> unavailable = new LinkedHashMap<>();
+        final Map<String, String> partial = new LinkedHashMap<>();
         final List<PendingCreate> creates = new ArrayList<>();
 
         record PendingCreate(String namespace, String table, String index, PlainActionFuture<CreateIndexResponse> future) {
@@ -483,12 +504,26 @@ public final class LanceNamespaceService {
                     continue;
                 }
                 try {
-                    for (LanceCatalogEnumerator.CatalogTable table : handle.call(
+                    LanceCatalogEnumerator.Enumeration listed = handle.call(
                         namespace -> LanceCatalogEnumerator.enumerateTables(namespace, entry)
-                    )) {
+                    );
+                    for (LanceCatalogEnumerator.CatalogTable table : listed.tables()) {
                         syncCatalogTable(state, entry, handle, table, report);
                     }
                     unavailable.remove(entry.name());
+                    if (listed.firstNamespacesFailure() == null) {
+                        partial.remove(entry.name());
+                    } else {
+                        // The catalog answered, but a subnamespace refused
+                        // its listing (credentials that do not cover it,
+                        // a database the endpoint cannot reach): the
+                        // tables below it stay hidden until a poll walks
+                        // it, so the registration shows as partial.
+                        String message = listed.firstNamespacesFailure().getMessage();
+                        partial.put(entry.name(), message);
+                        report.partial.put(entry.name(), message);
+                        LOG.warn("namespace poll of {} could not list every subnamespace: {}", entry.name(), message);
+                    }
                 } catch (LanceNamespaceHandle.ReleasedException e) {
                     // The registration was removed after this cycle read the
                     // metadata; there is nothing to report against it.
@@ -499,6 +534,7 @@ public final class LanceNamespaceService {
                     // registration unavailable until a poll succeeds again.
                     String message = e.getMessage() == null ? e.toString() : e.getMessage();
                     unavailable.put(entry.name(), message);
+                    partial.remove(entry.name());
                     report.unavailable.put(entry.name(), message);
                     LOG.warn("namespace poll failed for {}", entry.name(), e);
                 }
@@ -510,7 +546,12 @@ public final class LanceNamespaceService {
                     report.surfaced.add(pending.index());
                 }
             }
-            return new PollReport(List.copyOf(report.surfaced), List.copyOf(report.skipped), Map.copyOf(report.unavailable));
+            return new PollReport(
+                List.copyOf(report.surfaced),
+                List.copyOf(report.skipped),
+                Map.copyOf(report.unavailable),
+                Map.copyOf(report.partial)
+            );
         }
     }
 

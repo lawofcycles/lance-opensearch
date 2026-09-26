@@ -80,16 +80,25 @@ public class LanceNamespaceListSerializationTests extends OpenSearchTestCase {
         LanceNamespaceListResponse response = LanceNamespaceListResponse.namespaces(
             List.of(
                 new LanceNamespaceListResponse.NamespaceInfo("/data/a", "directory", "/data/a", Map.of(), null),
-                new LanceNamespaceListResponse.NamespaceInfo("cat", "rest", null, Map.of("uri", "http://x"), "connection refused")
+                new LanceNamespaceListResponse.NamespaceInfo("cat", "rest", null, Map.of("uri", "http://x"), "connection refused"),
+                new LanceNamespaceListResponse.NamespaceInfo(
+                    "glue",
+                    "glue",
+                    null,
+                    Map.of("region", "ap-northeast-1"),
+                    null,
+                    "namespace listing below [restricted] failed: AccessDenied"
+                )
             )
         );
         XContentBuilder builder = JsonXContent.contentBuilder();
         response.toXContent(builder, ToXContent.EMPTY_PARAMS);
         String json = builder.toString();
         assertTrue(json, json.contains("\"status\":\"available\""));
-        assertTrue(json, json.contains("\"status\":\"unavailable\""));
-        assertTrue(json, json.contains("\"error\":\"connection refused\""));
+        assertTrue(json, json.contains("\"status\":\"unavailable\",\"error\":\"connection refused\""));
+        assertTrue(json, json.contains("\"status\":\"partial\",\"error\":\"namespace listing below [restricted] failed: AccessDenied\""));
         assertTrue(json, json.contains("\"path\":\"/data/a\""));
+        assertEquals(response.namespaces(), roundTrip(response).namespaces());
     }
 
     public void testTablesResponseRoundTrip() throws Exception {
