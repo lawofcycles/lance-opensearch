@@ -1,4 +1,4 @@
-# OpenSearch Lance
+# Lance OpenSearch
 
 OpenSearch plugin that surfaces [Lance](https://github.com/lancedb/lance) tables as OpenSearch indexes, without copying data.
 

@@ -1,7 +1,7 @@
-Contributing to OpenSearch Lance
+Contributing to Lance OpenSearch
 ================================
 
-OpenSearch Lance is a community project that is built and maintained by people just like **you**. We're glad you're interested in helping out. There are several different ways you can do it, but before we talk about that, let's talk about how to get started.
+Lance OpenSearch is a community project that is built and maintained by people just like **you**. We're glad you're interested in helping out. There are several different ways you can do it, but before we talk about that, let's talk about how to get started.
 
 ## Table of Contents:
 - [First Things First](#first-things-first)
@@ -45,7 +45,7 @@ Because this plugin reads Lance tables, please also include the Arrow schema of 
 
 ### Feature Requests
 
-If you've thought of a way that OpenSearch Lance could be better, we want to hear about it. We track feature requests using GitHub, so please feel free to open an issue which describes the feature you would like to see, why you need it, and how it should work.
+If you've thought of a way that Lance OpenSearch could be better, we want to hear about it. We track feature requests using GitHub, so please feel free to open an issue which describes the feature you would like to see, why you need it, and how it should work.
 
 ### Documentation Changes
 
@@ -59,7 +59,7 @@ Once you've opened an issue, check out our [Developer Guide](./DEVELOPER_GUIDE.m
 
 ## Developer Certificate of Origin
 
-OpenSearch Lance is an open source product released under the Apache 2.0 license (see either [the Apache site](https://www.apache.org/licenses/LICENSE-2.0) or the [LICENSE.txt file](./LICENSE.txt)). The Apache 2.0 license allows you to freely use, modify, distribute, and sell your own products that include Apache 2.0 licensed software.
+Lance OpenSearch is an open source product released under the Apache 2.0 license (see either [the Apache site](https://www.apache.org/licenses/LICENSE-2.0) or the [LICENSE.txt file](./LICENSE.txt)). The Apache 2.0 license allows you to freely use, modify, distribute, and sell your own products that include Apache 2.0 licensed software.
 
 We respect intellectual property rights of others and we want to make sure all incoming contributions are correctly attributed and licensed. A Developer Certificate of Origin (DCO) is a lightweight mechanism to do that.
 
@@ -93,7 +93,7 @@ By making a contribution to this project, I certify that:
     consistent with this project or the open source license(s)
     involved.
  ```
-We require that every contribution to OpenSearch Lance is signed with a Developer Certificate of Origin. Additionally, please use your real name. We do not accept anonymous contributors nor those utilizing pseudonyms.
+We require that every contribution to Lance OpenSearch is signed with a Developer Certificate of Origin. Additionally, please use your real name. We do not accept anonymous contributors nor those utilizing pseudonyms.
 
 Each commit must include a DCO which looks like this
 
