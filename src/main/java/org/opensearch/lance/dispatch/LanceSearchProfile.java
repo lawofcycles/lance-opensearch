@@ -30,7 +30,7 @@ import org.opensearch.transport.TransportResponseHandler;
  *     "nodes": {
  *       "&lt;node id&gt;": {
  *         "query": {"millis": 12},
- *         "fetch": {"millis": 3, "take_count": 4, "take_rows": 47, "take_millis": 9}
+ *         "fetch": {"millis": 3, "take_count": 4, "take_rows": 47, "take_columns": 8, "take_millis": 9}
  *       }
  *     }
  *   }
@@ -41,7 +41,9 @@ import org.opensearch.transport.TransportResponseHandler;
  * the count and the aggregations included), {@code fetch.millis} its
  * fetch phase (the rows behind the hits materialised), and the
  * {@code take_*} figures the {@code _rowaddr IN (...)} take scans the
- * request issued on that node, whichever phase issued them
+ * request issued on that node, whichever phase issued them: how many,
+ * the row addresses they carried, the columns they projected summed
+ * over the scans, and their wall time
  * ({@link LanceFragmentQueryResponse.Profile}). A node that answered
  * several requests of the same search (several fragment groups, several
  * targets) reports the sum. A request answered from the result cache
@@ -156,6 +158,7 @@ final class LanceSearchProfile {
                     builder.field("millis", figures.fetchMillis());
                     builder.field("take_count", figures.takeCount());
                     builder.field("take_rows", figures.takeRows());
+                    builder.field("take_columns", figures.takeColumns());
                     builder.field("take_millis", figures.takeMillis());
                     builder.endObject();
                     builder.endObject();

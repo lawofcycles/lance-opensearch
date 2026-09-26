@@ -1090,7 +1090,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     (fetchEnd - fetchStart) / 1_000_000L,
                     takes.takeCount(),
                     takes.takeRows(),
-                    takes.takeMillis()
+                    takes.takeMillis(),
+                    takes.takeColumns()
                 );
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debug(

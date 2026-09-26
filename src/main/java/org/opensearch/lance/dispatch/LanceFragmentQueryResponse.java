@@ -77,12 +77,14 @@ import org.opensearch.search.aggregations.InternalAggregations;
  * previous plugin version read it during a rolling upgrade. Version 1
  * laid out every field but the profile, which version 2 added as an
  * optional block: an older coordinator steps over it and shows no
- * timings for the node.
+ * timings for the node. Version 3 added the columns the take scans
+ * projected as a second optional block, read as zero by a coordinator
+ * of version 2.
  */
 public final class LanceFragmentQueryResponse extends ActionResponse {
 
-    /** The wire format's version, the first field the response writes; 2 added the profile block. */
-    public static final int WIRE_VERSION = 2;
+    /** The wire format's version, the first field the response writes; 2 added the profile block, 3 the take columns block. */
+    public static final int WIRE_VERSION = 3;
 
     /**
      * What one executor spent on a request: the query phase (from the
@@ -90,20 +92,26 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
      * count and the aggregations included) and the fetch phase (the
      * rows behind the hits materialised) in wall milliseconds, and the
      * {@code _rowaddr IN (...)} take scans the request issued on the
-     * executor, how many row addresses they carried and their wall time
-     * summed, whichever phase issued them. Travels in the version 2
-     * block, so a response from an executor of an older plugin version
-     * reads as {@link #NONE}.
+     * executor, how many row addresses they carried, how many columns
+     * they projected summed over the scans, and their wall time summed,
+     * whichever phase issued them. The first five figures travel in the
+     * version 2 block and the columns in the version 3 block, so a
+     * response from an executor of an older plugin version reads as
+     * {@link #NONE} or with zero columns.
      */
-    public record Profile(long queryMillis, long fetchMillis, long takeCount, long takeRows, long takeMillis) implements Writeable {
+    public record Profile(long queryMillis, long fetchMillis, long takeCount, long takeRows, long takeMillis, long takeColumns)
+        implements
+            Writeable {
 
         /** What an executor that does not report timings stands for: every figure zero. */
-        public static final Profile NONE = new Profile(0L, 0L, 0L, 0L, 0L);
+        public static final Profile NONE = new Profile(0L, 0L, 0L, 0L, 0L, 0L);
 
+        /** The version 2 block: the five figures before the take columns existed; {@code takeColumns} stays zero. */
         public Profile(StreamInput in) throws IOException {
-            this(in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong());
+            this(in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), 0L);
         }
 
+        /** The version 2 block: the five figures before the take columns existed. */
         @Override
         public void writeTo(StreamOutput out) throws IOException {
             out.writeVLong(queryMillis);
@@ -113,6 +121,11 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
             out.writeVLong(takeMillis);
         }
 
+        /** This profile with {@code takeColumns} in place of its own, for the version 3 block read after the version 2 one. */
+        public Profile withTakeColumns(long takeColumns) {
+            return new Profile(queryMillis, fetchMillis, takeCount, takeRows, takeMillis, takeColumns);
+        }
+
         /** The figures of this and {@code other} added, for the responses one node returned to one request. */
         public Profile plus(Profile other) {
             return new Profile(
@@ -120,7 +133,8 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
                 fetchMillis + other.fetchMillis,
                 takeCount + other.takeCount,
                 takeRows + other.takeRows,
-                takeMillis + other.takeMillis
+                takeMillis + other.takeMillis,
+                takeColumns + other.takeColumns
             );
         }
     }
@@ -223,7 +237,8 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         }
         this.aggregations = in.readBoolean() ? InternalAggregations.readFrom(in) : null;
         this.terminatedEarly = in.readOptionalBoolean();
-        this.profile = reader.block(2, Profile::new, Profile.NONE);
+        Profile timings = reader.block(2, Profile::new, Profile.NONE);
+        this.profile = timings.withTakeColumns(reader.block(3, StreamInput::readVLong, 0L));
         reader.finish();
     }
 
@@ -246,8 +261,10 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         }
         out.writeOptionalBoolean(terminatedEarly);
         // An older coordinator that steps over the timings still merges
-        // the hits and aggregations correctly, so the block is optional.
+        // the hits and aggregations correctly, so both blocks are
+        // optional: the version 2 timings, then the version 3 columns.
         WireVersion.writeBlock(out, false, profile);
+        WireVersion.writeBlock(out, false, columns -> columns.writeVLong(profile.takeColumns()));
     }
 
     public long matched() {

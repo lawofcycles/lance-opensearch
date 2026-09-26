@@ -242,6 +242,7 @@ public class LanceStoredFieldsTests extends OpenSearchTestCase {
                 assertEquals("one take", before.takeCount() + 1, after.takeCount());
                 assertEquals("the take projects the key only", before.takeColumns() + 1, after.takeColumns());
                 assertEquals(1L, takes.takeCount());
+                assertEquals("the accumulator counts the projected columns", 1L, takes.takeColumns());
                 Collected id = new Collected(true, false);
                 leaf.materialiseStoredFields(7, id);
                 assertEquals("7", id.id());

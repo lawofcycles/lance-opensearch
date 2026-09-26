@@ -43,18 +43,21 @@ public final class FetchTakeStats {
 
     /**
      * The take scans of one request: how many ran, how many row
-     * addresses they carried and their wall time summed. The slices of
-     * a request take on several threads at once, so the fields are
+     * addresses they carried, how many columns they projected summed
+     * over the scans, and their wall time summed. The slices of a
+     * request take on several threads at once, so the fields are
      * {@link LongAdder}s.
      */
     public static final class Accumulator {
         private final LongAdder count = new LongAdder();
         private final LongAdder rows = new LongAdder();
+        private final LongAdder columns = new LongAdder();
         private final LongAdder nanos = new LongAdder();
 
-        void record(int rowCount, long elapsedNanos) {
+        void record(int rowCount, int columnCount, long elapsedNanos) {
             count.increment();
             rows.add(rowCount);
+            columns.add(columnCount);
             nanos.add(elapsedNanos);
         }
 
@@ -64,6 +67,11 @@ public final class FetchTakeStats {
 
         public long takeRows() {
             return rows.sum();
+        }
+
+        /** Columns the scans projected, summed over the scans; per scan this is the width of one take. */
+        public long takeColumns() {
+            return columns.sum();
         }
 
         public long takeMillis() {
@@ -99,7 +107,7 @@ public final class FetchTakeStats {
      */
     static void record(Kind kind, int rows, int columns, long nanos, Accumulator perRequest) {
         if (perRequest != null) {
-            perRequest.record(rows, nanos);
+            perRequest.record(rows, columns, nanos);
         }
         COUNT.increment();
         ROWS.add(rows);
