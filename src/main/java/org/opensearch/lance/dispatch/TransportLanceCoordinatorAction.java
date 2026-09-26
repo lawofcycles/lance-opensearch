@@ -214,23 +214,28 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
     /**
      * How the per-node requests of one coordinator request leave the
-     * node: as child requests of {@code task} (so the task manager
+     * node: as child requests of the policy's task (so the task manager
      * cancels the executors when the coordinator task is cancelled)
-     * with {@code timeout} as the transport timeout of each. A null
-     * {@code task} (no task registered for the request) sends plain
-     * requests; a null {@code timeout} means none.
+     * with the policy's timeout as the transport timeout of each. A null
+     * task (no task registered for the request) sends plain requests; a
+     * null timeout means none. Under {@code profile: true} every response
+     * is recorded in the request's {@link LanceSearchProfile} under the
+     * node it came from before the fan-out sees it.
      */
-    private FragmentFanOut.Sender sender(CancellableTask task, TimeValue timeout) {
+    private FragmentFanOut.Sender sender(FanOutPolicy policy) {
+        CancellableTask task = policy.task();
+        TimeValue timeout = policy.timeout();
         TransportRequestOptions options = timeout == null
             ? TransportRequestOptions.EMPTY
             : TransportRequestOptions.builder().withTimeout(timeout).build();
-        return (node, request, handler) -> {
+        FragmentFanOut.Sender sender = (node, request, handler) -> {
             if (task != null) {
                 transportService.sendChildRequest(node, LanceFragmentQueryAction.NAME, request, task, options, handler);
             } else {
                 transportService.sendRequest(node, LanceFragmentQueryAction.NAME, request, options, handler);
             }
         };
+        return policy.profile() == null ? sender : policy.profile().observing(sender);
     }
 
     /**
@@ -299,7 +304,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // a target is resolved or a table opened; the explain endpoint
         // reports the same message under route unsupported.
         SearchRequestToRel.checkEnvelopeSupported(source);
-        FanOutPolicy policy = new FanOutPolicy(task, resolveTimeout(source), resolveAllowPartialSearchResults(searchRequest));
+        // profile: true asks for the executors' timings per node; the
+        // profile gathers them from the responses as they arrive and is
+        // rendered under profile.lance once the answer is complete.
+        LanceSearchProfile profile = source != null && source.profile() ? new LanceSearchProfile() : null;
+        FanOutPolicy policy = new FanOutPolicy(task, resolveTimeout(source), resolveAllowPartialSearchResults(searchRequest), profile);
 
         QueryBuilder query = rewriteAtCoordinator(source == null ? null : source.query(), start);
         QueryBuilder postFilter = source == null ? null : source.postFilter();
@@ -583,11 +592,16 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         if (index >= targets.size()) {
             // The cached answer when the lookup found one (the fan-out
             // was skipped), else the merge, stored when it qualifies.
+            SearchResponse response;
             if (cacheLookup != null) {
-                listener.onResponse(cacheLookup.complete(merged::buildResponse));
+                response = cacheLookup.complete(merged::buildResponse);
             } else {
-                listener.onResponse(merged.buildResponse(startMillis));
+                response = merged.buildResponse(startMillis);
             }
+            if (policy.profile() != null) {
+                response = policy.profile().attachTo(response, cacheLookup != null && cacheLookup.isHit());
+            }
+            listener.onResponse(response);
             return;
         }
         IndexTarget target = targets.get(index);
@@ -834,7 +848,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             }
             return fragmentRequest(target, observedVersion, spec, fragmentsForNode);
         },
-            sender(policy.task(), policy.timeout()),
+            sender(policy),
             threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL),
             // The generic pool, not lance_coordinator: its queue is
             // unbounded, so the log line and the cancel of a node that
@@ -947,7 +961,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             new PlanExecutor.FanOutContext(
                 groups,
                 group -> fragmentRequest(target, observedVersion, spec, group.fragmentIds()),
-                sender(policy.task(), policy.timeout()),
+                sender(policy),
                 threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL),
                 threadPool.generic(),
                 incompleteNodeListener(target, policy),
@@ -1084,7 +1098,14 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * transport timeout of each (null for none), and whether a node that
      * did not answer leaves the request with partial results or fails it.
      */
-    private record FanOutPolicy(CancellableTask task, TimeValue timeout, boolean allowPartialSearchResults) {
+    /**
+     * How one coordinator request fans out: its task, the transport
+     * timeout of every per-node request, whether a node that did not
+     * answer leaves a partial answer or fails the request, and the
+     * profile gathering the executors' timings when the body carried
+     * {@code profile: true} (null otherwise).
+     */
+    private record FanOutPolicy(CancellableTask task, TimeValue timeout, boolean allowPartialSearchResults, LanceSearchProfile profile) {
     }
 
     /**

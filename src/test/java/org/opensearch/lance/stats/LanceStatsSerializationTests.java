@@ -126,7 +126,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 0L,
                 1_700_000_000_000L,
                 Map.of("perf", "Mapper for [body] conflicts with existing mapper")
-            )
+            ),
+            new LanceNodeStats.FetchStats(11L, 1_234L, 33L, 456L, 78L, 8L, 3L)
         ).withRequestCache(new LanceNodeStats.RequestCacheStats(true, 2048L, 1_048_576L, 3, 11L, 4L, 1L, 2L, 6L));
     }
 
@@ -212,6 +213,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"freshness\":{\"tracked\":2,\"checks\":40,\"moves\":3,\"mapping_updates\":1,\"mapping_unchanged\":2,"
                     + "\"rebuilds\":1,\"failures\":0,\"last_check_millis\":1700000000000,"
                     + "\"mapping_errors\":{\"perf\":\"Mapper for [body] conflicts with existing mapper\"}},"
+                    + "\"fetch\":{\"take_count\":11,\"take_rows\":1234,\"take_columns\":33,\"take_millis_total\":456,"
+                    + "\"take_max_millis\":78,\"stored_fields_takes\":8,\"column_takes\":3},"
                     + "\"indices\":{\"big\":{\"rows\":3000000000,\"shard_reader_rows\":2000000000,\"nested_docs\":0,"
                     + "\"lucene_bound_exceeded\":true,\"index_types\":{},"
                     + "\"renamed_fields\":[{\"from\":\"ts\",\"to\":\"event_ts\",\"lance_field_id\":1}]},"
@@ -305,6 +308,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             assertEquals("fts:s3://bucket/perf.lance:body", restored.admissionRetainedScope());
             assertEquals(sample().freshness(), restored.freshness());
             assertEquals(sample().requestCache(), restored.requestCache());
+            assertEquals(sample().fetch(), restored.fetch());
             assertEquals("the reader consumed the block", -1, in.read());
         }
     }
@@ -324,6 +328,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     LanceNodeStats.RequestCacheStats.NONE,
                     asVersion1.requestCache()
                 );
+                assertEquals("the fetch counters it does not know fall back to zero", LanceNodeStats.FetchStats.NONE, asVersion1.fetch());
                 assertEquals(sample().planExecuted(), asVersion1.planExecuted());
                 assertEquals(
                     "the freshness counters are base fields; the refused updates are not",
@@ -413,11 +418,30 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals(2, asVersion6.planStatisticsPending());
                 assertEquals(sample().freshness(), asVersion6.freshness());
                 assertEquals(
-                    "the block it does not know is stepped over",
+                    "the blocks it does not know are stepped over",
                     LanceNodeStats.RequestCacheStats.NONE,
                     asVersion6.requestCache()
                 );
                 assertFalse(asVersion6.requestCache().enabled());
+                assertEquals(LanceNodeStats.FetchStats.NONE, asVersion6.fetch());
+                assertEquals("the reader consumed the blocks", -1, in.read());
+            }
+        }
+    }
+
+    public void testMixedPluginVersionAVersion7CoordinatorReadsTodaysStatsWithoutTheFetchCounters() throws Exception {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            sample().writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceNodeStats asVersion7 = LanceNodeStats.read(in, 7);
+                assertEquals(9L, asVersion7.planPrunedFragments());
+                assertEquals("warm_up", asVersion7.admissionLastSource());
+                assertEquals(sample().freshness(), asVersion7.freshness());
+                assertEquals(2, asVersion7.planStatisticsPending());
+                assertEquals(4L, asVersion7.planStatisticsPlannedWithout());
+                assertEquals("fts:s3://bucket/perf.lance:body", asVersion7.admissionRetainedScope());
+                assertEquals("the blocks version 7 knows are read", sample().requestCache(), asVersion7.requestCache());
+                assertEquals("the block it does not know is stepped over", LanceNodeStats.FetchStats.NONE, asVersion7.fetch());
                 assertEquals("the reader consumed the blocks", -1, in.read());
             }
         }
@@ -436,8 +460,12 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             // measured by writing them again on their own. Version 2 is
             // the pruned counter, 3 the admission source, 4 the mapping
             // errors, 5 the statistics progress counters, 6 the retained
-            // pool's scope, 7 the result cache, in that order.
+            // pool's scope, 7 the result cache, 8 the fetch take counters,
+            // in that order.
             int trailing = 0;
+            if (marker < 8) {
+                trailing += blockSize(stats.fetch());
+            }
             if (marker < 7) {
                 trailing += blockSize(stats.requestCache());
             }
@@ -561,7 +589,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
 
     public void testMixedPluginVersionTodaysCoordinatorReadsAVersion6NodesStats() throws Exception {
         // The stream a version 6 data node writes: every block up to the
-        // retained scope, no result cache block.
+        // retained scope, no result cache and no fetch counter block.
         BytesReference version6 = asWrittenByVersion(sample(), 6);
         try (StreamInput in = version6.streamInput()) {
             LanceNodeStats restored = new LanceNodeStats(in);
@@ -571,6 +599,25 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             assertEquals(2, restored.planStatisticsPending());
             assertEquals("fts:s3://bucket/perf.lance:body", restored.admissionRetainedScope());
             assertEquals("the result cache falls back to none", LanceNodeStats.RequestCacheStats.NONE, restored.requestCache());
+            assertEquals("the fetch counters fall back to zero", LanceNodeStats.FetchStats.NONE, restored.fetch());
+            assertEquals(-1, in.read());
+        }
+    }
+
+    public void testMixedPluginVersionTodaysCoordinatorReadsAVersion7NodesStats() throws Exception {
+        // The stream a version 7 data node writes: every block up to the
+        // result cache, no fetch counter block.
+        BytesReference version7 = asWrittenByVersion(sample(), 7);
+        try (StreamInput in = version7.streamInput()) {
+            LanceNodeStats restored = new LanceNodeStats(in);
+            assertEquals(9L, restored.planPrunedFragments());
+            assertEquals("warm_up", restored.admissionLastSource());
+            assertEquals(sample().freshness(), restored.freshness());
+            assertEquals(2, restored.planStatisticsPending());
+            assertEquals(4L, restored.planStatisticsPlannedWithout());
+            assertEquals("fts:s3://bucket/perf.lance:body", restored.admissionRetainedScope());
+            assertEquals(sample().requestCache(), restored.requestCache());
+            assertEquals("the fetch counters fall back to zero", LanceNodeStats.FetchStats.NONE, restored.fetch());
             assertEquals(-1, in.read());
         }
     }

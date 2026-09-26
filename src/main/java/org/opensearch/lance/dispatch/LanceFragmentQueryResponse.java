@@ -12,6 +12,7 @@ import java.util.List;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.lance.WireVersion;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.aggregations.InternalAggregations;
@@ -59,6 +60,11 @@ import org.opensearch.search.aggregations.InternalAggregations;
  *       — the same reduction path the shard fan-out uses. May be
  *       {@code null} for hits-only requests where no aggregations
  *       were requested.</li>
+ *   <li>{@link #profile()} — how long the executor spent on the query
+ *       phase and on the fetch phase, and the take scans the request
+ *       issued ({@link Profile}). The coordinator renders them per
+ *       node under {@code profile.lance} when the request carried
+ *       {@code profile: true}.</li>
  * </ul>
  *
  * <p>{@link SearchHit} is already {@link org.opensearch.core.common.io.stream.Writeable
@@ -68,12 +74,56 @@ import org.opensearch.search.aggregations.InternalAggregations;
  *
  * <p>The response opens with {@link #WIRE_VERSION} (see
  * {@link WireVersion}), whose block framing lets a coordinator of the
- * previous plugin version read it during a rolling upgrade.
+ * previous plugin version read it during a rolling upgrade. Version 1
+ * laid out every field but the profile, which version 2 added as an
+ * optional block: an older coordinator steps over it and shows no
+ * timings for the node.
  */
 public final class LanceFragmentQueryResponse extends ActionResponse {
 
-    /** The wire format's version, the first field the response writes. */
-    public static final int WIRE_VERSION = 1;
+    /** The wire format's version, the first field the response writes; 2 added the profile block. */
+    public static final int WIRE_VERSION = 2;
+
+    /**
+     * What one executor spent on a request: the query phase (from the
+     * request reaching the executor to the page being collected, the
+     * count and the aggregations included) and the fetch phase (the
+     * rows behind the hits materialised) in wall milliseconds, and the
+     * {@code _rowaddr IN (...)} take scans the request issued on the
+     * executor, how many row addresses they carried and their wall time
+     * summed, whichever phase issued them. Travels in the version 2
+     * block, so a response from an executor of an older plugin version
+     * reads as {@link #NONE}.
+     */
+    public record Profile(long queryMillis, long fetchMillis, long takeCount, long takeRows, long takeMillis) implements Writeable {
+
+        /** What an executor that does not report timings stands for: every figure zero. */
+        public static final Profile NONE = new Profile(0L, 0L, 0L, 0L, 0L);
+
+        public Profile(StreamInput in) throws IOException {
+            this(in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong());
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeVLong(queryMillis);
+            out.writeVLong(fetchMillis);
+            out.writeVLong(takeCount);
+            out.writeVLong(takeRows);
+            out.writeVLong(takeMillis);
+        }
+
+        /** The figures of this and {@code other} added, for the responses one node returned to one request. */
+        public Profile plus(Profile other) {
+            return new Profile(
+                queryMillis + other.queryMillis,
+                fetchMillis + other.fetchMillis,
+                takeCount + other.takeCount,
+                takeRows + other.takeRows,
+                takeMillis + other.takeMillis
+            );
+        }
+    }
 
     private final long matched;
     private final boolean matchedIsLowerBound;
@@ -89,6 +139,8 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
      * executor into the response.
      */
     private final Boolean terminatedEarly;
+    /** The executor's timings and take counts; {@link Profile#NONE} from an executor that reports none. */
+    private final Profile profile;
 
     /** A response of a request without {@code terminate_after}: {@link #terminatedEarly()} is {@code null}. */
     public LanceFragmentQueryResponse(
@@ -102,6 +154,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         this(matched, matchedIsLowerBound, fragmentCount, hits, rowAddrs, aggregations, null);
     }
 
+    /** A response without timings: {@link #profile()} is {@link Profile#NONE}. */
     public LanceFragmentQueryResponse(
         long matched,
         boolean matchedIsLowerBound,
@@ -110,6 +163,19 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         long[] rowAddrs,
         InternalAggregations aggregations,
         Boolean terminatedEarly
+    ) {
+        this(matched, matchedIsLowerBound, fragmentCount, hits, rowAddrs, aggregations, terminatedEarly, Profile.NONE);
+    }
+
+    public LanceFragmentQueryResponse(
+        long matched,
+        boolean matchedIsLowerBound,
+        int fragmentCount,
+        List<SearchHit> hits,
+        long[] rowAddrs,
+        InternalAggregations aggregations,
+        Boolean terminatedEarly,
+        Profile profile
     ) {
         if (rowAddrs.length != hits.size()) {
             throw new IllegalArgumentException("rowAddrs has " + rowAddrs.length + " entries for " + hits.size() + " hits");
@@ -121,11 +187,27 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         this.rowAddrs = rowAddrs.clone();
         this.aggregations = aggregations;
         this.terminatedEarly = terminatedEarly;
+        this.profile = profile == null ? Profile.NONE : profile;
     }
 
     public LanceFragmentQueryResponse(StreamInput in) throws IOException {
+        this(in, WIRE_VERSION);
+    }
+
+    /**
+     * Reads the response as a coordinator whose plugin is at wire
+     * version {@code asVersion} would: the blocks of later versions are
+     * stepped over as {@link WireVersion.Reader} describes. The
+     * transport reads with {@link #WIRE_VERSION}; the mixed version
+     * tests read with the versions before it.
+     */
+    static LanceFragmentQueryResponse read(StreamInput in, int asVersion) throws IOException {
+        return new LanceFragmentQueryResponse(in, asVersion);
+    }
+
+    private LanceFragmentQueryResponse(StreamInput in, int asVersion) throws IOException {
         super(in);
-        WireVersion.Reader reader = WireVersion.read(in, "LanceFragmentQueryResponse", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceFragmentQueryResponse", asVersion);
         this.matched = in.readVLong();
         this.matchedIsLowerBound = in.readBoolean();
         this.fragmentCount = in.readVInt();
@@ -141,6 +223,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         }
         this.aggregations = in.readBoolean() ? InternalAggregations.readFrom(in) : null;
         this.terminatedEarly = in.readOptionalBoolean();
+        this.profile = reader.block(2, Profile::new, Profile.NONE);
         reader.finish();
     }
 
@@ -162,6 +245,9 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
             aggregations.writeTo(out);
         }
         out.writeOptionalBoolean(terminatedEarly);
+        // An older coordinator that steps over the timings still merges
+        // the hits and aggregations correctly, so the block is optional.
+        WireVersion.writeBlock(out, false, profile);
     }
 
     public long matched() {
@@ -212,5 +298,14 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
      */
     public Boolean terminatedEarly() {
         return terminatedEarly;
+    }
+
+    /**
+     * The executor's query and fetch phase timings and the take scans
+     * of the request; {@link Profile#NONE} from an executor of a plugin
+     * version that does not report them.
+     */
+    public Profile profile() {
+        return profile;
     }
 }

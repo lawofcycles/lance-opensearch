@@ -1054,9 +1054,6 @@ public final class SearchRequestToRel {
         if (source.slice() != null) {
             throw unsupported("slice");
         }
-        if (source.profile()) {
-            throw unsupported("profile");
-        }
         if (lanceShape || hits) {
             // Aggregations were refused above; a hits request has no
             // further envelope to check.

@@ -135,6 +135,14 @@ public final class LanceFragmentLeafReader extends LeafReader {
      */
     private final LanceColumnLoader loader;
     /**
+     * The take accumulator of the request this leaf serves, read by the
+     * stored fields and the column loader at every take; null for a leaf
+     * no request claimed (the shard engine's, a test's). Volatile
+     * because the executor attaches it on the request thread and the
+     * slices take on the search pool.
+     */
+    private volatile FetchTakeStats.Accumulator takeAccumulator;
+    /**
      * Doc values over the loader's columns (hinted numeric, keyword and
      * keyword array, geo_point); see {@link LanceDocValues}. The
      * {@code getXxxDocValues} overrides dispatch on the column kind and
@@ -395,6 +403,24 @@ public final class LanceFragmentLeafReader extends LeafReader {
     /** The {@link LanceShardColumnCache} attached to this leaf, or {@code null}; for tests that read its counters. */
     LanceShardColumnCache shardColumnCache() {
         return loader.shardColumnCache();
+    }
+
+    /**
+     * Attach the take accumulator of the request this leaf serves: every
+     * {@code _rowaddr IN (...)} take scan the leaf's stored fields and
+     * column loader issue from then on adds to it next to the node's
+     * {@link FetchTakeStats} counters, so the request's search profile
+     * can report its own takes. The fragment executor calls this on the
+     * leaves it opens for one request; a leaf of the shard engine, which
+     * serves many requests, keeps none.
+     */
+    public void setTakeAccumulator(FetchTakeStats.Accumulator accumulator) {
+        this.takeAccumulator = accumulator;
+    }
+
+    /** The take accumulator of the request this leaf serves, or {@code null}. */
+    FetchTakeStats.Accumulator takeAccumulator() {
+        return takeAccumulator;
     }
 
     /** Publish sink for {@link LanceShardColumnCache#loadBooleanColumn}; see {@link LanceColumnLoader#publishBooleanColumn}. */

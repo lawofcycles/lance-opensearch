@@ -52,6 +52,7 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceHintingWeight;
 import org.opensearch.lance.query.LanceKnnQuery;
+import org.opensearch.lance.stats.LanceNodeStats;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -789,6 +790,63 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
         assertNotNull(viaBulk.bulkScorer());
         expectThrows(IllegalStateException.class, () -> viaBulk.get(Long.MAX_VALUE));
         expectThrows(IllegalStateException.class, viaBulk::bulkScorer);
+    }
+
+    public void testHintedColumnTakeIsCountedInTheFetchStats() throws Exception {
+        LanceNodeStats.FetchStats before = FetchTakeStats.snapshot();
+        LanceFragmentLeafReader leaf = leaves.get(1);
+        // The request's own accumulator sees the same take; unlike the
+        // node counters it starts at zero and nothing else adds to it.
+        FetchTakeStats.Accumulator takes = new FetchTakeStats.Accumulator();
+        leaf.setTakeAccumulator(takes);
+        int[] hint = { 3, 17, 44, 199 };
+        leaf.hintMatchedOffsets(hint, false);
+        NumericDocValues rating = leaf.getNumericDocValues("rating");
+        assertTrue(rating.advanceExact(3));
+        LanceNodeStats.FetchStats after = FetchTakeStats.snapshot();
+        // One take of one column for the four hinted rows; the counters
+        // are node wide, so other tests in the JVM may have moved them
+        // as well, and the deltas are lower bounds.
+        assertEquals("one column take", before.columnTakes() + 1, after.columnTakes());
+        assertEquals("the take is counted once", before.takeCount() + 1, after.takeCount());
+        assertEquals("the hinted rows are the rows addressed", before.takeRows() + hint.length, after.takeRows());
+        assertEquals("one column projected", before.takeColumns() + 1, after.takeColumns());
+        assertEquals("no stored fields take ran", before.storedFieldsTakes(), after.storedFieldsTakes());
+        assertTrue(after.takeMillisTotal() >= before.takeMillisTotal());
+        assertTrue(after.takeMaxMillis() >= before.takeMaxMillis());
+
+        assertEquals("the request's accumulator counts the take", 1L, takes.takeCount());
+        assertEquals(hint.length, takes.takeRows());
+        assertTrue(takes.takeMillis() >= 0L);
+
+        // The second accessor of the column reuses the taken rows.
+        assertTrue(leaf.getNumericDocValues("rating").advanceExact(17));
+        assertEquals(after.takeCount(), FetchTakeStats.snapshot().takeCount());
+        assertEquals(1L, takes.takeCount());
+    }
+
+    public void testStoredFieldsTakeIsCountedInTheFetchStats() throws Exception {
+        LanceNodeStats.FetchStats before = FetchTakeStats.snapshot();
+        LanceFragmentLeafReader leaf = leaves.get(0);
+        FetchTakeStats.Accumulator takes = new FetchTakeStats.Accumulator();
+        leaf.setTakeAccumulator(takes);
+        int[] docIds = { 0, 5, 9 };
+        leaf.prefetchRows(docIds);
+        LanceNodeStats.FetchStats after = FetchTakeStats.snapshot();
+        assertEquals("one stored fields take", before.storedFieldsTakes() + 1, after.storedFieldsTakes());
+        assertEquals(before.takeCount() + 1, after.takeCount());
+        assertEquals(before.takeRows() + docIds.length, after.takeRows());
+        assertTrue("the take projects the surfaced columns", after.takeColumns() > before.takeColumns());
+        assertEquals("no column take ran", before.columnTakes(), after.columnTakes());
+
+        assertEquals("the request's accumulator counts the take", 1L, takes.takeCount());
+        assertEquals(docIds.length, takes.takeRows());
+
+        // The rows are held for the request, so prefetching them again
+        // issues no take.
+        leaf.prefetchRows(docIds);
+        assertEquals(after.takeCount(), FetchTakeStats.snapshot().takeCount());
+        assertEquals(1L, takes.takeCount());
     }
 
     /**

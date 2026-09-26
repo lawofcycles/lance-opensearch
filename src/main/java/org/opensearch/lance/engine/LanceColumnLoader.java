@@ -1138,7 +1138,8 @@ final class LanceColumnLoader {
      * offsets, not to the fragment's row count. {@link #filterSql} is
      * not layered in for the same reason as in {@code prefetchRows}:
      * the offsets come from a scan that already applied whatever
-     * predicate the query carries.
+     * predicate the query carries. Every scan is counted and timed in
+     * {@link FetchTakeStats} under {@link FetchTakeStats.Kind#COLUMN}.
      */
     private void takeHintedRows(String column, int[] sortedOffsets, TakenCellConsumer consumer) throws IOException {
         for (int from = 0; from < sortedOffsets.length; from += LanceStoredFields.TAKE_CHUNK) {
@@ -1157,6 +1158,7 @@ final class LanceColumnLoader {
                 .filter(sql.toString())
                 .withRowAddress(true)
                 .build();
+            long start = System.nanoTime();
             try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -1174,6 +1176,8 @@ final class LanceColumnLoader {
                 throw e;
             } catch (Exception e) {
                 throw new IOException(e);
+            } finally {
+                FetchTakeStats.record(FetchTakeStats.Kind.COLUMN, to - from, 1, System.nanoTime() - start, leaf.takeAccumulator());
             }
         }
     }

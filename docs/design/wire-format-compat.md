@@ -54,8 +54,8 @@ critical only while a filter is set, because an older data node that ignored the
 without the predicate and answer wrongly, and marks its pruning block optional, because an older
 node that scans the pruned fragments too still answers correctly. `LanceNodeStats` marks its
 pruned fragment counter, its admission source, its refused mapping updates, its statistics
-progress counters, its retained pool identity and its result cache figures optional, because an
-older coordinator merely shows the stats without them.
+progress counters, its retained pool identity, its result cache figures and its fetch take counters
+optional, because an older coordinator merely shows the stats without them.
 
 A block is decoded from a stream of its own bytes, so a parser that leaves bytes of the block
 unread fails the message with `<Message> wire version block [n] left k bytes unread` rather than
@@ -116,6 +116,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 3 | Block, optional: whether the result cache would serve the body and the reason when not (optional `cacheable`, `reason`; fallback absent) |
 | `LanceFragmentQueryRequest` | 1 | Base: table URI, index name, storage options, pinned version, the fragment plan, optional query and post filter, sorts, search after, size, aggregations, fragment ids, track scores, track total hits up to, min score, terminate after, hit projection, rescores, collapse |
 | `LanceFragmentQueryResponse` | 1 | Base: matched, matched is lower bound, fragment count, hits, row addresses, aggregations, terminated early |
+| | 2 | Block, optional: the executor's profile (query and fetch phase milliseconds, take scans, rows addressed, take milliseconds; five counters, fallback zero) |
 | `LanceNodeStats` | 1 | Base: every figure of the node stats but the pruned fragment counter and the admission source, then the freshness stats |
 | | 2 | Block, optional: pruned fragment counter (fallback zero) |
 | | 3 | Block, optional: source of the last admission decision (`request` or `warm_up`; fallback `none`) |
@@ -123,6 +124,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 5 | Block, optional: statistics collections pending and plans made without statistics (two counters; fallback zero) |
 | | 6 | Block, optional: identity of the scans the admission gate's retained pool was filled by (`kind:table:columns`; fallback `none`) |
 | | 7 | Block, optional: the coordinator result cache's figures (enabled, size, limit, entries, hits, misses, evictions, invalidations, skipped; fallback disabled and zero) |
+| | 8 | Block, optional: the fetch take counters (scans, rows addressed, columns projected, milliseconds total and maximum, scans per caller; seven counters, fallback zero) |
 | `LanceStatsNodeRequest` | 1 | Base: nothing after the marker |
 | `LanceRequestCacheClearNodeRequest` | 1 | Base: the index uuids whose result cache entries the node drops |
 | `LanceRequestCacheClearNodeResponse` | 1 | Base: how many entries the node dropped |

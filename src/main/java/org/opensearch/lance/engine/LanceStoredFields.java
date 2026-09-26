@@ -61,7 +61,8 @@ import org.opensearch.lance.engine.LanceFragmentSchema.NumericPrecision;
  * {@code _source} as JSON in schema order through
  * {@link XContentBuilder}. The take projects only the surfaced columns
  * plus the primary key, so the cost of a page is proportional to
- * {@code size}, not to the fragment's row count.
+ * {@code size}, not to the fragment's row count. Every take scan is
+ * counted and timed in {@link FetchTakeStats}.
  *
  * <p>Owns the request scoped rows taken so far and the decoding of
  * take batches (scalars, structs, nested arrays, geo points, binary).
@@ -257,6 +258,10 @@ final class LanceStoredFields extends StoredFields {
                 .filter(sql.toString())
                 .withRowAddress(true)
                 .build();
+            // Timed from the scan's creation to its close, decoding
+            // included: that is the wall time the request spends on
+            // this take, and what the node's fetch counters report.
+            long start = System.nanoTime();
             try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
@@ -278,6 +283,14 @@ final class LanceStoredFields extends StoredFields {
                 throw e;
             } catch (Exception e) {
                 throw new IOException(e);
+            } finally {
+                FetchTakeStats.record(
+                    FetchTakeStats.Kind.STORED_FIELDS,
+                    chunk.size(),
+                    takeColumns.size(),
+                    System.nanoTime() - start,
+                    leaf.takeAccumulator()
+                );
             }
         }
         for (int docId : requested) {

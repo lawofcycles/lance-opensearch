@@ -68,11 +68,13 @@ import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.execute.LanceAggregateResults;
 import org.opensearch.lance.engine.ColumnStore;
+import org.opensearch.lance.engine.FetchTakeStats;
 import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.lance.engine.FragmentGroupScan;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
+import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
@@ -637,6 +639,13 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         int fragmentCount,
         List<Integer> effectiveFragmentIds
     ) throws Exception {
+        // The response's profile: the query phase runs from here to the
+        // page being collected, the fetch phase is the materialisation of
+        // the hits, and the take scans of both phases add to one
+        // accumulator of this request (the node counters of
+        // FetchTakeStats mix concurrent requests).
+        long queryStart = System.nanoTime();
+        FetchTakeStats.Accumulator takes = new FetchTakeStats.Accumulator();
         ShardId shardId = new ShardId(indexMetadata.getIndex(), 0);
         Dataset dataset = snapshot.dataset();
         FragmentPlan planned = request.plan();
@@ -685,7 +694,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // the scalar filter.
                 planned.scalarFilterSql(),
                 readerWrapper,
-                cancellation
+                cancellation,
+                takes
             )
         ) {
             MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
@@ -1050,12 +1060,21 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         );
                     }
                 }
+                long fetchStart = System.nanoTime();
                 FragmentHitsPages.HitsPage hits = FragmentHitsPages.materialise(
                     searchContext,
                     fetchPhase,
                     searcher.getIndexReader(),
                     page.scoreDocs(),
                     sortAndFormats
+                );
+                long fetchEnd = System.nanoTime();
+                LanceFragmentQueryResponse.Profile profile = new LanceFragmentQueryResponse.Profile(
+                    (fetchStart - queryStart) / 1_000_000L,
+                    (fetchEnd - fetchStart) / 1_000_000L,
+                    takes.takeCount(),
+                    takes.takeRows(),
+                    takes.takeMillis()
                 );
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debug(
@@ -1077,7 +1096,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     hits.hits(),
                     hits.rowAddrs(),
                     aggregations,
-                    terminatedEarly
+                    terminatedEarly,
+                    profile
                 );
             }
         }
@@ -1804,7 +1824,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         List<Integer> effectiveFragmentIds,
         String filterSql,
         CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper,
-        LanceCancellation cancellation
+        LanceCancellation cancellation,
+        FetchTakeStats.Accumulator takes
     ) throws IOException {
         // Column loads of this reader (the store's and the heap
         // fallback's) scan the node's fragments in up to
@@ -1829,6 +1850,15 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         );
         OpenSearchDirectoryReader wrapped = null;
         try {
+            // The leaves are this request's own, so the take scans they
+            // issue are this request's takes, attached before any
+            // wrapper hides the Lance leaf.
+            for (LeafReaderContext leaf : lanceReader.leaves()) {
+                LanceFragmentLeafReader lanceLeaf = LanceFragmentLeafReader.unwrap(leaf.reader());
+                if (lanceLeaf != null) {
+                    lanceLeaf.setTakeAccumulator(takes);
+                }
+            }
             wrapped = OpenSearchDirectoryReader.wrap(lanceReader, shardId);
             if (readerWrapper == null) {
                 return wrapped;

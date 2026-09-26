@@ -15,6 +15,7 @@ import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.lance.LanceCircuitBreaker;
 import org.opensearch.lance.NativeMemoryLimit.IndexCacheSizing;
 import org.opensearch.lance.engine.ColumnStore;
+import org.opensearch.lance.engine.FetchTakeStats;
 import org.opensearch.lance.engine.HeapFallbackStats;
 import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.engine.LanceLocalClones;
@@ -47,6 +48,10 @@ import org.opensearch.lance.query.LanceFtsQuery;
  * {@code freshness} reads the node's {@code LanceIndexFreshnessService}
  * counters: the checks of the Lance backed shards this node holds.
  * {@code request_cache} reads the coordinator result cache's figures.
+ * {@code fetch} reads {@link FetchTakeStats}: the take scans the
+ * fragment executors issued for the rows behind hits and for the
+ * columns of small hit sets, how many rows and columns they asked for
+ * and how long they took.
  */
 public final class LanceStatsCollector {
 
@@ -239,7 +244,8 @@ public final class LanceStatsCollector {
                 FragmentPlanRefiner.refinementCounts(),
                 FragmentPlanRefiner.executedCounts(),
                 FragmentPlanRefiner.prunedFragments(),
-                freshnessStats
+                freshnessStats,
+                FetchTakeStats.snapshot()
             ).withRequestCache(requestCacheStats);
         }
         ColumnStore store = warmCache.columnStore();
@@ -283,7 +289,8 @@ public final class LanceStatsCollector {
             FragmentPlanRefiner.refinementCounts(),
             FragmentPlanRefiner.executedCounts(),
             FragmentPlanRefiner.prunedFragments(),
-            freshnessStats
+            freshnessStats,
+            FetchTakeStats.snapshot()
         ).withRequestCache(requestCacheStats);
     }
 }

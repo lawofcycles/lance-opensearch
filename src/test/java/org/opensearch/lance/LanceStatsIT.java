@@ -267,6 +267,98 @@ public class LanceStatsIT extends LanceRestTestCase {
         }
     }
 
+    public void testFetchTakesAreCountedForHitsAndNotForAggregations() throws Exception {
+        // Two fragments of 10,000 rows: the token sp7 matches i % 625 == 7,
+        // 16 rows per fragment, below the reader's sparse ratio, so a sort
+        // over its hits takes the sort column for those rows instead of
+        // loading the whole column.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(2, 10_000, "fetch")) {
+            String index = fixture.indexName();
+            Map<String, Object> before = fetch(nodeStats());
+            for (String key : List.of(
+                "take_count",
+                "take_rows",
+                "take_columns",
+                "take_millis_total",
+                "take_max_millis",
+                "stored_fields_takes",
+                "column_takes"
+            )) {
+                assertTrue("fetch reports " + key + ": " + before, before.containsKey(key));
+            }
+
+            // A page of ten hits: the rows behind the hits are taken once
+            // per leaf that holds a hit, and the takes address the ten rows.
+            String page = readAll(postJson("/" + index + "/_search", "{\"size\":10,\"query\":{\"match_all\":{}}}"));
+            @SuppressWarnings("unchecked")
+            Map<String, Object> pageHits = (Map<String, Object>) parse(page).get("hits");
+            assertEquals(page, 10, ((List<?>) pageHits.get("hits")).size());
+            Map<String, Object> afterPage = fetch(nodeStats());
+            long storedFieldsTakes = number(afterPage.get("stored_fields_takes")) - number(before.get("stored_fields_takes"));
+            assertTrue("the page took its rows: " + afterPage, storedFieldsTakes >= 1);
+            assertEquals("no column take for an unsorted match_all page", before.get("column_takes"), afterPage.get("column_takes"));
+            assertEquals(
+                "every take is counted once",
+                storedFieldsTakes,
+                number(afterPage.get("take_count")) - number(before.get("take_count"))
+            );
+            assertEquals("the takes addressed the ten hits", 10, number(afterPage.get("take_rows")) - number(before.get("take_rows")));
+            assertTrue(
+                "each take projects the surfaced columns",
+                number(afterPage.get("take_columns")) > number(before.get("take_columns"))
+            );
+            assertTrue(number(afterPage.get("take_millis_total")) >= number(before.get("take_millis_total")));
+            assertTrue(number(afterPage.get("take_max_millis")) >= number(before.get("take_max_millis")));
+
+            // A sort over the sparse full text hit set takes the sort column
+            // for the 32 hits (one take per leaf) next to the stored fields
+            // take of the page.
+            String sorted = readAll(
+                postJson(
+                    "/" + index + "/_search",
+                    "{\"size\":5,\"query\":{\"match\":{\"body\":\"sp7\"}},\"sort\":[{\"rating\":\"desc\"}],\"track_total_hits\":true}"
+                )
+            );
+            assertEquals(sorted, 32, extractIntPath(sorted, "hits", "total", "value"));
+            Map<String, Object> afterSorted = fetch(nodeStats());
+            logger.info("fetch stats after a page of ten and a sorted page over 32 sparse hits: {}", afterSorted);
+            assertTrue(
+                "the page took its rows",
+                number(afterSorted.get("stored_fields_takes")) > number(afterPage.get("stored_fields_takes"))
+            );
+            assertEquals(
+                "the sort column was taken once per leaf",
+                2,
+                number(afterSorted.get("column_takes")) - number(afterPage.get("column_takes"))
+            );
+            assertEquals(
+                "the column takes addressed the hits, the stored fields takes the page",
+                32 + 5,
+                number(afterSorted.get("take_rows")) - number(afterPage.get("take_rows"))
+            );
+
+            // An aggregation without hits renders no row, so it issues no
+            // take.
+            String sum = readAll(
+                postJson(
+                    "/" + index + "/_search",
+                    "{\"size\":0,\"track_total_hits\":true,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}"
+                )
+            );
+            assertEquals(20_000, extractIntPath(sum, "hits", "total", "value"));
+            Map<String, Object> afterSum = fetch(nodeStats());
+            assertEquals("a size 0 aggregation takes nothing", afterSorted.get("take_count"), afterSum.get("take_count"));
+            assertEquals(afterSorted.get("take_rows"), afterSum.get("take_rows"));
+            assertEquals(afterSorted.get("stored_fields_takes"), afterSum.get("stored_fields_takes"));
+            assertEquals(afterSorted.get("column_takes"), afterSum.get("column_takes"));
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> fetch(Map<String, Object> node) {
+        return (Map<String, Object>) node.get("fetch");
+    }
+
     /** Wait for the warm-up entry of {@code index} to reach {@code state} and return it. */
     private static Map<String, Object> awaitWarmUp(String index, String state) throws Exception {
         assertBusy(() -> {
