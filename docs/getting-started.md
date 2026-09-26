@@ -811,7 +811,8 @@ curl -sS localhost:9200/_lance/stats?pretty
           "vector_index" : 0,
           "filter_scan" : 0,
           "aggregate_scan" : 0,
-          "column_load" : 0
+          "column_load" : 0,
+          "fetch_take" : 0
         }
       },
       "warm_up" : {
@@ -932,7 +933,7 @@ lance.admission.headroom: 8gb              # default; available memory kept out 
 lance.admission.bounded_shapes_gated: true # default; false admits bounded full text pages ungated and judges a bounded filter page on its limit
 ```
 
-The 429 message names the kind of scan (`fts`, `scalar_index`, `vector_index`, `filter_scan`, `aggregate_scan`, `column_load`), the estimate, the available memory, the headroom and what to relax. `GET /_lance/stats` reports the decisions under `admission`, with one rejection counter per kind. The estimates are a model whose coefficients are pinned to the measurements the project has; a 429 on a table whose scan does not fit the node is the intended answer, and the shapes that never scan (`GET /_doc`, `_count` without a filter, `match_all` pages) are never gated.
+The 429 message names the kind of scan (`fts`, `scalar_index`, `vector_index`, `filter_scan`, `aggregate_scan`, `column_load`, `fetch_take`), the estimate, the available memory, the headroom and what to relax. `GET /_lance/stats` reports the decisions under `admission`, with one rejection counter per kind. The estimates are a model whose coefficients are pinned to the measurements the project has; a 429 on a table whose scan does not fit the node is the intended answer. `_count` without a filter never scans and is never gated; the take that reads the rows of a page (`GET /_doc`, a `match_all` page) is judged as `fetch_take`, at estimate zero for any page whose rows fit the index cache shard share.
 
 ### Aggregations: where they run
 
