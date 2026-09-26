@@ -61,17 +61,59 @@ public final class ColumnStatistics {
      *     share of the index it loads is at most {@code nprobes} over
      *     the smallest count); empty for a scalar index and when the
      *     statistics report no count
+     * @param integerRange for a BTree over an integer column, the number
+     *     of integers from the smallest to the largest indexed value
+     *     ({@code max - min + 1} over the deltas' {@code min} and
+     *     {@code max}), an upper bound on the column's distinct values
+     *     that a terms key over the column cannot exceed; empty for every
+     *     other index, for a BTree over a column of any other type (a
+     *     string or a float between two bounds has no finite count), for
+     *     a column that holds nulls (Lance sorts nulls first when it
+     *     trains the index, so the statistics report no smallest value)
+     *     and when the range overflows a long. Not an estimate: a sparse
+     *     column (five status codes between 200 and 599) has far fewer
+     *     values than its range, so the figure bounds a group count from
+     *     above and is not read where an undercount is unsafe (the
+     *     admission gate's selectivity)
      * @param statisticsAvailable whether {@code getIndexStatistics} was
      *     read and answered for this index; the collector reads it for
-     *     bitmap and vector indexes only, so this is false for every
-     *     other type and leaves the row, distinct and partition figures
-     *     empty
+     *     bitmap, BTree and vector indexes only, so this is false for
+     *     every other type and leaves the row, distinct, range and
+     *     partition figures empty
      */
     public record IndexSummary(String name, Optional<IndexType> type, int coveredFragments, int totalFragments, OptionalLong sizeBytes,
         OptionalLong indexedRows, OptionalLong unindexedRows, OptionalLong distinctCount, OptionalLong partitions,
-        boolean statisticsAvailable) {
+        OptionalLong integerRange, boolean statisticsAvailable) {
 
-        /** A summary whose statistics report no partition count (every scalar index, a vector index without one). */
+        /** A summary whose statistics report no integer range (every index but a BTree over an integer column). */
+        public IndexSummary(
+            String name,
+            Optional<IndexType> type,
+            int coveredFragments,
+            int totalFragments,
+            OptionalLong sizeBytes,
+            OptionalLong indexedRows,
+            OptionalLong unindexedRows,
+            OptionalLong distinctCount,
+            OptionalLong partitions,
+            boolean statisticsAvailable
+        ) {
+            this(
+                name,
+                type,
+                coveredFragments,
+                totalFragments,
+                sizeBytes,
+                indexedRows,
+                unindexedRows,
+                distinctCount,
+                partitions,
+                OptionalLong.empty(),
+                statisticsAvailable
+            );
+        }
+
+        /** A summary whose statistics report neither a partition count nor an integer range (a bitmap, an inverted index, a zone map). */
         public IndexSummary(
             String name,
             Optional<IndexType> type,
@@ -156,13 +198,40 @@ public final class ColumnStatistics {
      * The smallest distinct value estimate any index over the column
      * reports, empty when none does. Several indexes over one column
      * each bound the cardinality from above, so the smallest bound is
-     * the tightest.
+     * the tightest. Only the counts an index measured (a bitmap's
+     * {@code num_bitmaps}) enter here, not the integer range of a
+     * BTree: the admission gate divides by this figure to size the rows
+     * an equality selects, and a range wider than the values it holds
+     * would make that share too small. {@link #distinctUpperBound}
+     * adds the range for the callers a bound serves.
      */
     public OptionalLong distinctCount() {
         OptionalLong best = OptionalLong.empty();
         for (IndexSummary index : indexes) {
             if (index.distinctCount().isPresent() && (best.isEmpty() || index.distinctCount().getAsLong() < best.getAsLong())) {
                 best = index.distinctCount();
+            }
+        }
+        return best;
+    }
+
+    /**
+     * The tightest upper bound on the column's distinct values any index
+     * gives: the smallest of {@link #distinctCount} and the integer
+     * ranges of the BTree indexes over an integer column
+     * ({@link IndexSummary#integerRange}), empty when neither exists.
+     * The planner's group estimate of a terms key reads this: the groups
+     * a key produces cannot exceed its values, and a bound that is too
+     * wide only makes the estimate cautious, where the guess it replaces
+     * (a share of the table's rows) grows with the table and puts every
+     * large table's nested tree above the hash table threshold whatever
+     * the column holds.
+     */
+    public OptionalLong distinctUpperBound() {
+        OptionalLong best = distinctCount();
+        for (IndexSummary index : indexes) {
+            if (index.integerRange().isPresent() && (best.isEmpty() || index.integerRange().getAsLong() < best.getAsLong())) {
+                best = index.integerRange();
             }
         }
         return best;

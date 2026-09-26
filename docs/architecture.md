@@ -438,7 +438,8 @@ for the scan, `lance.fragment_path.slices` for the aggregators) with one coeffic
 group key and metric, the object store transfer of the columns the scan reads (per node, not per
 thread, because it is bandwidth bound), a hash table penalty above a million groups, and the
 executor's merge of its parallel scans' group rows. The quantities come from the tree and the
-table statistics (rows, the bitmap distinct count of a terms key, the Arrow type widths of the
+table statistics (rows, the bitmap distinct count or the BTree integer range of a terms key, the
+Arrow type widths of the
 columns read); the run's inputs (nodes, storage kind, CPUs, the four settings) come from the caller
 as `plan/cost/CostInputs`, so the coordinator's plan sees the cluster and a data node's plan sees
 one local node. The aggregation routing settings are cost inputs, not gates in front of the
@@ -446,7 +447,8 @@ planner: `lance.aggregation.pushdown: false`, and a statistics based estimate of
 the executor would hold above `lance.aggregation.pushdown_max_groups`, make the pushed scan's cost
 infinite, so the Volcano planner implements the aggregate through the Lucene operator and explain
 shows that as a cost decision with nothing `unplanned`. The estimate is judged only when every key
-domain is known (a bitmap distinct count, a date interval, a range or filter count); a key without
+domain is known (a bitmap distinct count, a BTree integer range, a date interval, a range or filter
+count); a key without
 statistics is guessed as a share of the rows, which would put any large table over the bound, so
 such a tree is left to the executor's own bound. The pushdown rule carries no shape predicate of its own: every
 aggregate the translator accepts is offered to the Substrait producer, and a tree with a
@@ -475,13 +477,20 @@ The statistics the planner reads come from Lance table metadata, not from scanni
 manifest version a node collects, from a dataset it opens for the purpose, the fragment list with
 each fragment's live row count and data file count (`getFragmentStatistics`), the physical rows
 behind them (the difference is the deleted row count), the indexes on the table with their type,
-fragment coverage and size (`getIndexes`), and for each bitmap and vector index the figures Lance's
-`getIndexStatistics` reports (indexed and unindexed rows; for a bitmap the number of bitmaps, which
-is the column's distinct value estimate; for an IVF index the partition count the admission gate
-scales its estimate with). `getIndexStatistics` is not called for the other index types (BTree,
-inverted, zone map, and the rest): nothing the planner or the admission gate reads is in their
-answer, and Lance assembles it from the index files, which on a table of ten billion rows takes
-minutes for an inverted index. Zone maps (`getZonemapStats`) are read lazily on the first request for a column and
+fragment coverage and size (`getIndexes`), and for each bitmap, BTree and vector index the figures
+Lance's `getIndexStatistics` reports (indexed and unindexed rows; for a bitmap the number of
+bitmaps, which is the column's distinct value estimate; for a BTree its smallest and largest value,
+which over an integer column bound the distinct values from above by `max - min + 1`, the figure
+the planner's group estimate of a `terms` key reads while the admission gate's selectivity keeps to
+the bitmap count, since a sparse column has far fewer values than its range; a column that holds
+nulls reports no smallest value, Lance sorting nulls first when it trains the index, and keeps the
+planner's guess; for an IVF index the
+partition count the admission gate scales its estimate with). `getIndexStatistics` is not called
+for the other index types (inverted, zone map, bloom filter and the rest): nothing the planner or
+the admission gate reads is in their answer, and Lance assembles it from the index files, which on
+a table of ten billion rows takes minutes for an inverted index. A BTree answers from its page
+lookup, one row per page of the index, the same read a filter on the column makes and the index
+cache keeps afterwards. Zone maps (`getZonemapStats`) are read lazily on the first request for a column and
 memoised with the version. The result is cached per `(table URI, manifest version)`; the entry
 goes when the snapshot cache closes that version, and a table that follows its manifest keeps at
 most the current and the previous version.

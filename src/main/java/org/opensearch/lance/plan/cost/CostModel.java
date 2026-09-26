@@ -43,6 +43,9 @@ import static org.opensearch.lance.plan.cost.CostCoefficients.PUSHED_STRING_KEY_
 
 import org.opensearch.lance.plan.rel.PushedOperation.PushedFilter;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 /**
  * Predicted latency in milliseconds of the two physical forms of an
  * aggregation tree, from the shape's {@link AggregateProfile} and the
@@ -51,6 +54,8 @@ import org.opensearch.lance.plan.rel.PushedOperation.PushedFilter;
  * fitted to the measured warm latencies of the aggregation shapes and
  * {@code scripts/fit-cost-coefficients.py} computes exactly these
  * formulas, so the fit report and this class agree by construction.
+ * {@link #pushedAggregateTerms} and {@link #luceneAggregateTerms} hand
+ * out the terms one by one for the tests that pin a term's weight.
  *
  * <p>Both formulas share the fixed costs of a request and, over an
  * object store table, the store's open latency. Rows are charged per
@@ -95,6 +100,22 @@ public final class CostModel {
 
     /** Predicted milliseconds of the Lance dataset scan carrying the aggregate. */
     public static double pushedAggregateMillis(CostInputs inputs, AggregateProfile shape) {
+        return sum(pushedAggregateTerms(inputs, shape));
+    }
+
+    /** Predicted milliseconds of the Lucene aggregators over the fragment leaf readers. */
+    public static double luceneAggregateMillis(CostInputs inputs, AggregateProfile shape) {
+        return sum(luceneAggregateTerms(inputs, shape));
+    }
+
+    /**
+     * The terms of {@link #pushedAggregateMillis}, each coefficient's
+     * name mapped to the milliseconds it contributes, in the order the
+     * fit script prints them; the sum is the prediction. For the tests
+     * that pin a term's contribution and for reading which term decides
+     * a choice; the explain endpoint prints the sum only.
+     */
+    public static Map<String, Double> pushedAggregateTerms(CostInputs inputs, AggregateProfile shape) {
         double objectStore = inputs.storage() == StorageKind.OBJECT_STORE ? 1.0 : 0.0;
         double rowsPerNode = shape.tableRows() / inputs.nodes();
         double mrowThread = rowsPerNode / inputs.pushdownParallelism() / 1e6;
@@ -107,29 +128,51 @@ public final class CostModel {
             ? Math.min(shape.cardinalityDistinct(), mrowThread * 1e6) * inputs.pushdownParallelism() / 1e6
             : 0.0;
 
-        double millis = PUSHED_FIXED_MS;
-        millis += OBJECT_STORE_OPEN_MS * objectStore;
-        millis += OBJECT_STORE_READ_MS_PER_GB_PER_NODE * gigabytesPerNode * objectStore;
-        millis += PUSHED_DECODE_MS_PER_MROW_THREAD_PER_8_BYTES * mrowThread * shape.bytesPerRow() / 8.0 * shape.scanPasses();
-        millis += PUSHED_STRING_KEY_MS_PER_MROW_THREAD * aggregated * shape.stringKeys();
-        millis += PUSHED_NUMERIC_KEY_MS_PER_MROW_THREAD * aggregated * shape.numericKeys();
-        millis += PUSHED_DATE_KEY_MS_PER_MROW_THREAD * aggregated * shape.dateKeys();
-        millis += PUSHED_RANGE_KEY_MS_PER_MROW_THREAD * aggregated * shape.rangeKeys();
-        millis += PUSHED_FILTERS_KEY_MS_PER_MROW_THREAD * aggregated * shape.filterKeys();
-        millis += PUSHED_COMPOSITE_DATE_KEY_MS_PER_MROW_THREAD * aggregated * shape.compositeDateKeys();
-        millis += PUSHED_EXTENDED_STATS_MS_PER_MROW_THREAD * aggregated * (shape.extendedStats() ? 1 : 0);
-        millis += PUSHED_PERCENTILES_MS_PER_MROW_THREAD * aggregated * (shape.percentiles() ? 1 : 0);
-        millis += PUSHED_LARGE_GROUPS_MS_PER_MROW_THREAD * aggregated * (shape.largeGroups() ? 1 : 0);
-        millis += PUSHED_FILTER_EVAL_MS_PER_MROW_THREAD * mrowThread * (shape.filtered() ? 1 : 0);
-        millis += PUSHED_FILTER_MATCH_MS_PER_MROW * mrowTable * selectivity * (shape.filtered() ? 1 : 0);
-        millis += PUSHED_MERGE_MS_PER_MGROUP * mergedMgroups * inputs.pushdownParallelism();
-        millis += PUSHED_CARDINALITY_HASH_MS_PER_MROW_THREAD * aggregated * (shape.cardinality() ? 1 : 0);
-        millis += PUSHED_CARDINALITY_MS_PER_MVALUE * sketchMvalues;
-        return millis;
+        Map<String, Double> terms = new LinkedHashMap<>();
+        terms.put("PUSHED_FIXED_MS", PUSHED_FIXED_MS);
+        terms.put("OBJECT_STORE_OPEN_MS", OBJECT_STORE_OPEN_MS * objectStore);
+        terms.put("OBJECT_STORE_READ_MS_PER_GB_PER_NODE", OBJECT_STORE_READ_MS_PER_GB_PER_NODE * gigabytesPerNode * objectStore);
+        terms.put(
+            "PUSHED_DECODE_MS_PER_MROW_THREAD_PER_8_BYTES",
+            PUSHED_DECODE_MS_PER_MROW_THREAD_PER_8_BYTES * mrowThread * shape.bytesPerRow() / 8.0 * shape.scanPasses()
+        );
+        terms.put("PUSHED_STRING_KEY_MS_PER_MROW_THREAD", PUSHED_STRING_KEY_MS_PER_MROW_THREAD * aggregated * shape.stringKeys());
+        terms.put("PUSHED_NUMERIC_KEY_MS_PER_MROW_THREAD", PUSHED_NUMERIC_KEY_MS_PER_MROW_THREAD * aggregated * shape.numericKeys());
+        terms.put("PUSHED_DATE_KEY_MS_PER_MROW_THREAD", PUSHED_DATE_KEY_MS_PER_MROW_THREAD * aggregated * shape.dateKeys());
+        terms.put("PUSHED_RANGE_KEY_MS_PER_MROW_THREAD", PUSHED_RANGE_KEY_MS_PER_MROW_THREAD * aggregated * shape.rangeKeys());
+        terms.put("PUSHED_FILTERS_KEY_MS_PER_MROW_THREAD", PUSHED_FILTERS_KEY_MS_PER_MROW_THREAD * aggregated * shape.filterKeys());
+        terms.put(
+            "PUSHED_COMPOSITE_DATE_KEY_MS_PER_MROW_THREAD",
+            PUSHED_COMPOSITE_DATE_KEY_MS_PER_MROW_THREAD * aggregated * shape.compositeDateKeys()
+        );
+        terms.put(
+            "PUSHED_EXTENDED_STATS_MS_PER_MROW_THREAD",
+            PUSHED_EXTENDED_STATS_MS_PER_MROW_THREAD * aggregated * (shape.extendedStats() ? 1 : 0)
+        );
+        terms.put(
+            "PUSHED_PERCENTILES_MS_PER_MROW_THREAD",
+            PUSHED_PERCENTILES_MS_PER_MROW_THREAD * aggregated * (shape.percentiles() ? 1 : 0)
+        );
+        terms.put(
+            "PUSHED_LARGE_GROUPS_MS_PER_MROW_THREAD",
+            PUSHED_LARGE_GROUPS_MS_PER_MROW_THREAD * aggregated * (shape.largeGroups() ? 1 : 0)
+        );
+        terms.put("PUSHED_FILTER_EVAL_MS_PER_MROW_THREAD", PUSHED_FILTER_EVAL_MS_PER_MROW_THREAD * mrowThread * (shape.filtered() ? 1 : 0));
+        terms.put(
+            "PUSHED_FILTER_MATCH_MS_PER_MROW",
+            PUSHED_FILTER_MATCH_MS_PER_MROW * mrowTable * selectivity * (shape.filtered() ? 1 : 0)
+        );
+        terms.put("PUSHED_MERGE_MS_PER_MGROUP", PUSHED_MERGE_MS_PER_MGROUP * mergedMgroups * inputs.pushdownParallelism());
+        terms.put(
+            "PUSHED_CARDINALITY_HASH_MS_PER_MROW_THREAD",
+            PUSHED_CARDINALITY_HASH_MS_PER_MROW_THREAD * aggregated * (shape.cardinality() ? 1 : 0)
+        );
+        terms.put("PUSHED_CARDINALITY_MS_PER_MVALUE", PUSHED_CARDINALITY_MS_PER_MVALUE * sketchMvalues);
+        return terms;
     }
 
-    /** Predicted milliseconds of the Lucene aggregators over the fragment leaf readers. */
-    public static double luceneAggregateMillis(CostInputs inputs, AggregateProfile shape) {
+    /** The terms of {@link #luceneAggregateMillis}, as {@link #pushedAggregateTerms} lays out the pushed side's. */
+    public static Map<String, Double> luceneAggregateTerms(CostInputs inputs, AggregateProfile shape) {
         double objectStore = inputs.storage() == StorageKind.OBJECT_STORE ? 1.0 : 0.0;
         double rowsPerNode = shape.tableRows() / inputs.nodes();
         double mrowNode = rowsPerNode / 1e6;
@@ -138,22 +181,49 @@ public final class CostModel {
         double aggregated = mrowThread * selectivity;
         int termsKeys = shape.composite() ? 0 : shape.numericKeys();
 
-        double millis = LUCENE_FIXED_MS;
-        millis += OBJECT_STORE_OPEN_MS * objectStore;
-        millis += LUCENE_COLUMN_MS_PER_MROW_THREAD * aggregated * shape.columnsRead();
-        millis += LUCENE_NUMERIC_KEY_MS_PER_MROW_THREAD * aggregated * termsKeys;
-        millis += LUCENE_DATE_KEY_MS_PER_MROW_THREAD * aggregated * shape.dateKeys();
-        millis += LUCENE_RANGE_KEY_MS_PER_MROW_THREAD * aggregated * shape.rangeKeys();
-        millis += LUCENE_FILTERS_KEY_MS_PER_MROW_THREAD * aggregated * shape.filterKeys();
-        millis += LUCENE_COMPOSITE_SOURCE_MS_PER_MROW_THREAD * aggregated * shape.compositeSources();
-        millis += LUCENE_NESTED_LEVEL_MS_PER_MROW_THREAD * aggregated * shape.nestedLevels();
-        millis += LUCENE_SIMPLE_METRIC_MS_PER_MROW_THREAD * aggregated * shape.simpleMetrics();
-        millis += LUCENE_BUCKET_METRIC_MS_PER_MROW_THREAD * aggregated * shape.bucketedMetrics();
-        millis += LUCENE_EXTENDED_STATS_MS_PER_MROW_THREAD * aggregated * (shape.extendedStats() ? 1 : 0);
-        millis += LUCENE_PERCENTILES_MS_PER_MROW_THREAD * aggregated * (shape.percentiles() ? 1 : 0);
-        millis += LUCENE_CARDINALITY_MS_PER_MROW_THREAD * aggregated * (shape.cardinalityHashesEveryRow() ? 1 : 0);
-        millis += LUCENE_LARGE_GROUPS_MS_PER_MROW_NODE * mrowNode * selectivity * (shape.largeGroups() ? 1 : 0);
-        millis += LUCENE_FILTER_EVAL_MS_PER_MROW_THREAD * mrowThread * (shape.filtered() ? 1 : 0);
+        Map<String, Double> terms = new LinkedHashMap<>();
+        terms.put("LUCENE_FIXED_MS", LUCENE_FIXED_MS);
+        terms.put("OBJECT_STORE_OPEN_MS", OBJECT_STORE_OPEN_MS * objectStore);
+        terms.put("LUCENE_COLUMN_MS_PER_MROW_THREAD", LUCENE_COLUMN_MS_PER_MROW_THREAD * aggregated * shape.columnsRead());
+        terms.put("LUCENE_NUMERIC_KEY_MS_PER_MROW_THREAD", LUCENE_NUMERIC_KEY_MS_PER_MROW_THREAD * aggregated * termsKeys);
+        terms.put("LUCENE_DATE_KEY_MS_PER_MROW_THREAD", LUCENE_DATE_KEY_MS_PER_MROW_THREAD * aggregated * shape.dateKeys());
+        terms.put("LUCENE_RANGE_KEY_MS_PER_MROW_THREAD", LUCENE_RANGE_KEY_MS_PER_MROW_THREAD * aggregated * shape.rangeKeys());
+        terms.put("LUCENE_FILTERS_KEY_MS_PER_MROW_THREAD", LUCENE_FILTERS_KEY_MS_PER_MROW_THREAD * aggregated * shape.filterKeys());
+        terms.put(
+            "LUCENE_COMPOSITE_SOURCE_MS_PER_MROW_THREAD",
+            LUCENE_COMPOSITE_SOURCE_MS_PER_MROW_THREAD * aggregated * shape.compositeSources()
+        );
+        terms.put("LUCENE_NESTED_LEVEL_MS_PER_MROW_THREAD", LUCENE_NESTED_LEVEL_MS_PER_MROW_THREAD * aggregated * shape.nestedLevels());
+        terms.put("LUCENE_SIMPLE_METRIC_MS_PER_MROW_THREAD", LUCENE_SIMPLE_METRIC_MS_PER_MROW_THREAD * aggregated * shape.simpleMetrics());
+        terms.put(
+            "LUCENE_BUCKET_METRIC_MS_PER_MROW_THREAD",
+            LUCENE_BUCKET_METRIC_MS_PER_MROW_THREAD * aggregated * shape.bucketedMetrics()
+        );
+        terms.put(
+            "LUCENE_EXTENDED_STATS_MS_PER_MROW_THREAD",
+            LUCENE_EXTENDED_STATS_MS_PER_MROW_THREAD * aggregated * (shape.extendedStats() ? 1 : 0)
+        );
+        terms.put(
+            "LUCENE_PERCENTILES_MS_PER_MROW_THREAD",
+            LUCENE_PERCENTILES_MS_PER_MROW_THREAD * aggregated * (shape.percentiles() ? 1 : 0)
+        );
+        terms.put(
+            "LUCENE_CARDINALITY_MS_PER_MROW_THREAD",
+            LUCENE_CARDINALITY_MS_PER_MROW_THREAD * aggregated * (shape.cardinalityHashesEveryRow() ? 1 : 0)
+        );
+        terms.put(
+            "LUCENE_LARGE_GROUPS_MS_PER_MROW_NODE",
+            LUCENE_LARGE_GROUPS_MS_PER_MROW_NODE * mrowNode * selectivity * (shape.largeGroups() ? 1 : 0)
+        );
+        terms.put("LUCENE_FILTER_EVAL_MS_PER_MROW_THREAD", LUCENE_FILTER_EVAL_MS_PER_MROW_THREAD * mrowThread * (shape.filtered() ? 1 : 0));
+        return terms;
+    }
+
+    private static double sum(Map<String, Double> terms) {
+        double millis = 0.0;
+        for (double term : terms.values()) {
+            millis += term;
+        }
         return millis;
     }
 

@@ -253,8 +253,21 @@ carries the whole charge.
 
 The quantities come from the tree and from the table statistics the planner collects once per
 manifest version from Lance metadata (rows, deleted rows, the bitmap distinct count of a terms
-key, the Arrow type widths of the columns read; `GET /_lance/stats` reports the cache under
-`plan.statistics`). The collection runs in the background, not on the request: the first request
+key, the value range of a BTree over an integer column, the Arrow type widths of the columns read;
+`GET /_lance/stats` reports the cache under `plan.statistics`). The group count of a tree is the
+product of its levels' domains capped at the row count: a `terms` key's domain is the tightest
+bound its column's indexes give, the distinct count of a bitmap index or, for an integer column
+with a BTree, the number of integers between the index's smallest and largest value (five for a
+rating held as 1 to 5, whatever the row count; a column with nulls reports no smallest value and
+keeps the guess below); a date histogram's domain is its interval over an
+assumed ten year span; a range or filters key counts its bands. A `terms` key over a column with
+neither bound is guessed as a tenth of the rows, Calcite's default, and a tree with such a key is
+priced with the guess but not judged against `lance.aggregation.pushdown_max_groups` (below). The
+group count decides two terms on each side: the hash table penalty above a million groups, and on
+the pushed side the merge of the group rows every parallel scan returns, so a two level tree whose
+second level is guessed on a billion rows is priced as a billion groups, which sends it to the
+aggregators although it holds a thousand; the BTree range is what keeps that tree pushed where it
+measured faster. The collection runs in the background, not on the request: the first request
 that plans against a version the node has not collected yet plans without statistics (the row
 count from the fragment metadata, the model's defaults for every other figure, no zone map
 pruning) and starts the collection; the requests after it read the entry. A node holding the
@@ -278,7 +291,8 @@ The two aggregation routing settings are cost inputs, not gates in front of the 
 ...}]` never appears in a winning plan, so explain shows the `LuceneAggregateExec` alternative
 with nothing `unplanned`). `lance.aggregation.pushdown_max_groups` is applied when the planner
 can estimate the group rows the executor would hold from the statistics (every key domain known:
-a bitmap distinct count, a date interval, a range or filter count, cut to the `shard_size`
+a bitmap distinct count, a BTree value range over an integer column, a date interval, a range or
+filter count, cut to the `shard_size`
 retention of a single count or metric ordered `terms` level): an estimate above the bound prices
 the pushed scan as infinite too. A key without statistics leaves the tree to the executor's own
 bound (see `aggregate_resolution` below).
