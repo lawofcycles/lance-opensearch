@@ -21,6 +21,8 @@ import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
 
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
@@ -41,6 +43,7 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.plan.metadata.ColumnStatistics;
 import org.opensearch.lance.plan.metadata.TableStatistics;
 import org.opensearch.lance.plan.metadata.TableStatisticsCache;
+import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.OpenSearchTestCase;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
@@ -2045,29 +2048,59 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         other.close();
     }
 
-    public void testColumnLoadWithoutATicketIsRecordedAndLoggedNotThrown() {
+    public void testColumnLoadWithoutATicketIsRecordedAndLoggedNotThrown() throws Exception {
         // A reader no request accounting reaches (the shard engine's):
         // the decision is recorded and the refusal counted, nothing is
-        // thrown and nothing is counted in flight.
+        // thrown and nothing is counted in flight, and the refusal is
+        // the one WARN line that says the load runs anyway.
         ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(8, ByteSizeUnit.GB));
         ScanAdmission.setHeadroom(new ByteSizeValue(8, ByteSizeUnit.GB));
         ScanAdmission.setAvailableMemoryOverride(List.of("64gb"));
         ScanAdmission.setResidentSetProbeForTests(() -> -1L);
         long embeddingWidth = 1024L * ScanAdmission.FLOAT32_BYTES + ScanAdmission.ROW_ADDRESS_BYTES;
-        ScanAdmission.admitColumnLoad("perf1b", "perf1b", "embedding", 32, PERF1B_NODE_ROWS, embeddingWidth, 64, null);
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(ScanAdmission.class))) {
+            appender.addExpectation(
+                new MockLogAppender.SeenEventExpectation(
+                    "the refused ticketless load is warned with the figures and runs",
+                    ScanAdmission.class.getName(),
+                    Level.WARN,
+                    "[lance_admission] column_load estimate [192.2gb] exceeds available [56gb] minus headroom [8gb] plus [0b] "
+                        + "retained by earlier admitted scans: column load of [embedding] over [perf1b]: 32 parallel scans over "
+                        + PERF1B_NODE_ROWS
+                        + " rows of [4kb] each (read queue and batches in flight per scan), against an index cache shard of [8gb]. "
+                        + "Lower lance.fragment_path.parallelism, spread the table over more data nodes, or relax "
+                        + "lance.admission.headroom / lance.admission.enabled.; the load runs anyway because the reader carries "
+                        + "no request to refuse"
+                )
+            );
+            ScanAdmission.admitColumnLoad("perf1b", "perf1b", "embedding", 32, PERF1B_NODE_ROWS, embeddingWidth, 64, null);
+            appender.assertAllExpectationsMatched();
+        }
         assertEquals(206_426_865_664L, ScanAdmission.lastEstimateBytes());
         assertEquals("column_load", ScanAdmission.lastKind());
         assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.COLUMN_LOAD));
         assertEquals(0, ScanAdmission.inFlightForTests());
-        // An admitted ticketless load is recorded and not counted either.
-        ScanAdmission.admitColumnLoad("perf1b", "perf1b", "embedding", 8, PERF1B_NODE_ROWS, embeddingWidth, 16, null);
-        assertEquals(25_786_580_992L, ScanAdmission.lastEstimateBytes());
-        assertEquals(0, ScanAdmission.inFlightForTests());
-        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.COLUMN_LOAD));
-        // A disabled gate records nothing.
-        ScanAdmission.setEnabled(false);
-        ScanAdmission.admitColumnLoad("perf1b", "perf1b", "embedding", 32, PERF1B_NODE_ROWS, embeddingWidth, 64, null);
-        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.COLUMN_LOAD));
+        // An admitted ticketless load is recorded and not counted, and
+        // not logged either; nor is one the disabled gate does not judge.
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(ScanAdmission.class))) {
+            appender.addExpectation(
+                new MockLogAppender.UnseenEventExpectation(
+                    "an admitted or unjudged load is not warned",
+                    ScanAdmission.class.getName(),
+                    Level.WARN,
+                    "*the load runs anyway*"
+                )
+            );
+            ScanAdmission.admitColumnLoad("perf1b", "perf1b", "embedding", 8, PERF1B_NODE_ROWS, embeddingWidth, 16, null);
+            assertEquals(25_786_580_992L, ScanAdmission.lastEstimateBytes());
+            assertEquals(0, ScanAdmission.inFlightForTests());
+            assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.COLUMN_LOAD));
+            // A disabled gate records nothing.
+            ScanAdmission.setEnabled(false);
+            ScanAdmission.admitColumnLoad("perf1b", "perf1b", "embedding", 32, PERF1B_NODE_ROWS, embeddingWidth, 64, null);
+            assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.COLUMN_LOAD));
+            appender.assertAllExpectationsMatched();
+        }
     }
 
     // ---- the per kind counters and the request ticket ----

@@ -759,6 +759,15 @@ public final class LanceDirectoryReader extends DirectoryReader {
     }
 
     /**
+     * The admission ticket {@link #attachAdmissionTicket} handed the
+     * reader's column cache, or {@code null} when none was attached or
+     * the reader has no column cache. For tests of the wiring.
+     */
+    public LanceHitsAccounting admissionTicket() {
+        return columnCache == null ? null : columnCache.admissionTicket();
+    }
+
+    /**
      * Manifest-recorded data file byte total of the fragments this reader
      * exposes. {@link DataFileSizes#NONE} for readers opened through
      * {@link #openForFragments}.
