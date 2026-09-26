@@ -321,6 +321,7 @@ public class LanceStatsIT extends LanceRestTestCase {
             );
             assertEquals(sorted, 32, extractIntPath(sorted, "hits", "total", "value"));
             Map<String, Object> afterSorted = fetch(nodeStats());
+            logger.info("fetch stats after a page of ten and a sorted page over 32 sparse hits: {}", afterSorted);
             assertTrue(
                 "the page took its rows",
                 number(afterSorted.get("stored_fields_takes")) > number(afterPage.get("stored_fields_takes"))
