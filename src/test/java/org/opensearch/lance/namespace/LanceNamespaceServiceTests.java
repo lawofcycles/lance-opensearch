@@ -7,6 +7,7 @@ package org.opensearch.lance.namespace;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -408,6 +409,59 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
                     Map.of("endpoint", "http://catalog.example:8181", "warehouse", "wh")
                 )
             );
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+    }
+
+    public void testPollReportsASubnamespaceItCouldNotListAsPartial() throws Exception {
+        // The catalog answers the walk but refuses to list the children
+        // of one namespace (credentials that do not cover it). The tables
+        // the walk did reach still surface, and the poll names the
+        // refusal under partial and in the GET listing instead of
+        // treating the namespace as an empty leaf; a later poll that
+        // walks every namespace clears it.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.namespaceTree = Map.of("wh", Set.of("wh.ns1", "wh.ns2"), "wh.ns1", Set.of("wh.ns1.sub"));
+        recording.tableTree = Map.of("wh.ns1", Set.of("top"), "wh.ns1.sub", Set.of("nested"));
+        recording.refusedNamespaceListings = Set.of("wh.ns2");
+        LanceNamespaceFactory.setInstantiatorForTests(type -> recording);
+        try {
+            LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
+                new LanceNamespaceMetadata.Entry(
+                    "walk-cat",
+                    LanceNamespaceMetadata.Entry.TYPE_ICEBERG,
+                    null,
+                    StorageOptions.empty(),
+                    Map.of("endpoint", "http://catalog.example:8181", "warehouse", "wh")
+                )
+            );
+            ClusterState state = ClusterState.builder(clusterService.state())
+                .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
+                .build();
+            ClusterServiceUtils.setState(clusterService, state);
+
+            LanceNamespaceService.PollReport report = service.pollNow(null);
+            assertTrue("the catalog itself listed: " + report, report.unavailable().isEmpty());
+            assertEquals("the refusal is reported against the registration: " + report, Set.of("walk-cat"), report.partial().keySet());
+            String message = report.partial().get("walk-cat");
+            assertTrue("the message names the refused namespace: " + message, message.contains("[wh, ns2]"));
+            assertTrue("the message carries the catalog's error: " + message, message.contains("AccessDeniedException"));
+            // The tables the walk reached went through the cycle (the stub
+            // gives them no location, so they land in skipped).
+            Set<String> reached = new HashSet<>();
+            for (LanceNamespaceService.PollReport.SkippedTable skipped : report.skipped()) {
+                reached.add(skipped.table());
+            }
+            assertEquals(Set.of("top", "nested"), reached);
+            LanceNamespaceListResponse.NamespaceInfo info = service.namespaceInfos().get(0);
+            assertNull("partial is not unavailable", info.error());
+            assertEquals(message, info.partial());
+
+            recording.refusedNamespaceListings = Set.of();
+            LanceNamespaceService.PollReport recovered = service.pollNow(null);
+            assertTrue("a full walk clears the partial listing: " + recovered, recovered.partial().isEmpty());
+            assertNull(service.namespaceInfos().get(0).partial());
         } finally {
             LanceNamespaceFactory.resetInstantiatorForTests();
         }

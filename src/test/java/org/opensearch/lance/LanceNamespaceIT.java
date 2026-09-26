@@ -172,6 +172,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             assertTrue("surfaced is a list: " + body, parsed.get("surfaced") instanceof List<?>);
             assertTrue("skipped is a list: " + body, parsed.get("skipped") instanceof List<?>);
             assertTrue("unavailable is an object: " + body, parsed.get("unavailable") instanceof java.util.Map<?, ?>);
+            assertTrue("partial is an object: " + body, parsed.get("partial") instanceof java.util.Map<?, ?>);
             assertFalse("an existing index of the table is not a skip: " + body, body.contains("\"index\":\"" + first + "\""));
             Response health = client().performRequest(
                 new Request("GET", "/_cluster/health/" + second + "?wait_for_status=yellow&timeout=30s")
@@ -180,7 +181,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
 
             // A registration nobody knows: nothing to list, nothing done.
             String unknown = readAll(postJson("/_lance/namespace/_poll?name=/no-such-registration-" + suffix, ""));
-            assertEquals("{\"surfaced\":[],\"skipped\":[],\"unavailable\":{}}", unknown);
+            assertEquals("{\"surfaced\":[],\"skipped\":[],\"unavailable\":{},\"partial\":{}}", unknown);
         } finally {
             for (String index : List.of(first, second)) {
                 try {
