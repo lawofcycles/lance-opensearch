@@ -29,6 +29,8 @@ import java.util.regex.Pattern;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryVisitor;
@@ -132,6 +134,8 @@ import org.opensearch.secure_sm.AccessController;
  */
 public final class ScanAdmission {
 
+    private static final Logger LOGGER = LogManager.getLogger(ScanAdmission.class);
+
     /** Label the 429 is reported under, and the prefix of its message. */
     public static final String LABEL = "lance_admission";
 
@@ -154,7 +158,7 @@ public final class ScanAdmission {
         FILTER_SCAN("filter_scan", "filter scan"),
         /** The parallel scans of a pushed aggregate. */
         AGGREGATE_SCAN("aggregate_scan", "aggregate scan"),
-        /** The heap copy of a column the off-heap store had no room for. */
+        /** The parallel scans that read a column into the off-heap store or into heap, and the heap copy when the store had no room. */
         COLUMN_LOAD("column_load", "column load");
 
         private final String key;
@@ -1453,6 +1457,32 @@ public final class ScanAdmission {
         return Math.max(0L, groups) * (GROUP_STATE_BASE_BYTES + GROUP_STATE_BYTES_PER_METRIC * Math.max(0, metrics)) * Math.max(1, scans);
     }
 
+    /**
+     * The {@link Kind#COLUMN_LOAD} estimate: {@code scans} parallel
+     * Lance scans (the {@code lance.fragment_path.parallelism} fragment
+     * groups of one column load) over {@code scannedRows} physical rows
+     * in total, each streaming rows of {@code rowWidthBytes} (the
+     * column's Arrow width plus the row address): per scan the queued
+     * reads, {@code min(IO_BUFFER_BYTES_PER_SCAN, groupRows ×
+     * rowWidthBytes)}, plus the decoded batches in flight,
+     * {@code batchReadahead × SCAN_BATCH_ROWS × rowWidthBytes ×
+     * SCAN_BUFFER_FACTOR}; the per scan term of
+     * {@link #aggregateScanEstimateBytes} with nothing materialised (the
+     * store's scans carry no filter; the top level filter a heap scan
+     * carries is not in this term). Zero when the sum fits
+     * {@code shardShareBytes}, as for a filter scan.
+     *
+     * <p>Why it is charged: the column store and the heap loaders open
+     * one scan per fragment group side by side, so a node whose
+     * parallelism is 32 holds up to 32 read queues of 2 GiB while a
+     * column of a large table loads, and neither the request breaker
+     * (which sees the heap arrays) nor the store's allocator (which sees
+     * the stored vectors) accounts for those buffers.
+     */
+    static long columnLoadEstimateBytes(int scans, long scannedRows, long rowWidthBytes, int batchReadahead, long shardShareBytes) {
+        return aggregateScanEstimateBytes(scans, scannedRows, 0L, rowWidthBytes, batchReadahead, shardShareBytes);
+    }
+
     /** Lance's {@code batch_readahead} default: the compute CPU count, which is what the JVM sees as available processors. */
     static int batchReadahead() {
         return NativeMemoryLimit.availableCpus();
@@ -2016,17 +2046,77 @@ public final class ScanAdmission {
 
     /**
      * Gate the nearest scan of {@code column} over {@code dataset}: the
-     * {@link Kind#VECTOR_INDEX} load of the partitions it probes.
-     * {@code nprobes} and {@code refineFactor} are the query's (0 for
-     * Lance's defaults), {@code dimension} the vector column's. The
-     * partition count comes from the table statistics
+     * {@link Kind#VECTOR_INDEX} load of the partitions it probes, plus
+     * the row addresses its SQL prefilter {@code filterSql} materialises
+     * ({@code null} or empty without one). {@code nprobes} and
+     * {@code refineFactor} are the query's (0 for Lance's defaults),
+     * {@code dimension} the vector column's. The partition count comes
+     * from the table statistics
      * ({@link ColumnStatistics.IndexSummary#partitions}); when they
      * report none the whole index is taken as probed.
+     *
+     * <p>The prefilter runs through Lance's {@code MaterializeIndexExec}
+     * before the partitions are probed, the same operator the full text
+     * prefilter runs through, so it is charged the same term the full
+     * text gate charges ({@link #ftsPrefilterEstimateBytes}: one row in
+     * five of the table's rows at {@link #FILTER_SCAN_BYTES_PER_MATCHING_ROW}),
+     * over the rows the statistics report; zero without statistics, as
+     * the partition load is.
      */
     public static void admitVectorSearch(
         String indexName,
         Dataset dataset,
         String column,
+        String filterSql,
+        int k,
+        int nprobes,
+        int refineFactor,
+        int dimension,
+        LanceHitsAccounting ticket
+    ) {
+        if (!enabled) {
+            return;
+        }
+        admitVectorSearch(
+            indexName,
+            dataset == null ? indexName : dataset.uri(),
+            statisticsOf(dataset),
+            column,
+            filterSql,
+            k,
+            nprobes,
+            refineFactor,
+            dimension,
+            ticket
+        );
+    }
+
+    /**
+     * {@link #admitVectorSearch(String, Dataset, String, String, int, int, int, int, LanceHitsAccounting)}
+     * with the table's {@code statistics} given, so a test can judge a
+     * shape against hand built statistics on any host. The index name
+     * stands for the table in the scan's identity.
+     */
+    static void admitVectorSearch(
+        String indexName,
+        Optional<TableStatistics> statistics,
+        String column,
+        String filterSql,
+        int k,
+        int nprobes,
+        int refineFactor,
+        int dimension,
+        LanceHitsAccounting ticket
+    ) {
+        admitVectorSearch(indexName, indexName, statistics, column, filterSql, k, nprobes, refineFactor, dimension, ticket);
+    }
+
+    private static void admitVectorSearch(
+        String indexName,
+        String table,
+        Optional<TableStatistics> statistics,
+        String column,
+        String filterSql,
         int k,
         int nprobes,
         int refineFactor,
@@ -2037,13 +2127,14 @@ public final class ScanAdmission {
             return;
         }
         long shardShare = shardShareBytes();
-        Optional<TableStatistics> statistics = statisticsOf(dataset);
         Optional<ColumnStatistics.IndexSummary> index = statistics.flatMap(s -> vectorIndexFor(column, s));
         long tableRows = tableRows(statistics);
         OptionalLong size = index.isPresent() ? index.get().sizeBytes() : OptionalLong.empty();
         long partitions = index.isPresent() ? index.get().partitions().orElse(0L) : 0L;
         int probes = nprobes > 0 ? nprobes : 1;
-        long estimate = vectorIndexEstimateBytes(size, tableRows, probes, partitions, k, refineFactor, dimension, shardShare);
+        List<String> prefilters = filterSql == null || filterSql.isEmpty() ? List.of() : List.of(filterSql);
+        long prefilter = ftsPrefilterEstimateBytes(tableRows, prefilters, shardShare);
+        long estimate = vectorIndexEstimateBytes(size, tableRows, probes, partitions, k, refineFactor, dimension, shardShare) + prefilter;
         String what = "nearest scan on ["
             + column
             + "] over ["
@@ -2055,12 +2146,22 @@ public final class ScanAdmission {
             + "] probed with nprobes "
             + probes
             + (partitions > 0L ? " over " + partitions + " partitions" : " over an unknown partition count")
-            + ", loaded twice while its partitions are concatenated, against an index cache shard of ["
+            + ", loaded twice while its partitions are concatenated"
+            + (prefilters.isEmpty()
+                ? ""
+                : " plus the prefilter "
+                    + prefilters
+                    + " materialising "
+                    + ftsPrefilterRows(tableRows, prefilters)
+                    + " row addresses over the whole table at ["
+                    + NativeMemoryLimit.humanReadable(FILTER_SCAN_BYTES_PER_MATCHING_ROW)
+                    + "] each")
+            + ", against an index cache shard of ["
             + NativeMemoryLimit.humanReadable(shardShare)
             + "]";
-        String remedy = "Lower nprobes, attach the table to a node with a larger index cache, or relax lance.admission.headroom / "
+        String remedy = (prefilters.isEmpty() ? "Lower" : "Drop the scalar filter, lower")
+            + " nprobes, attach the table to a node with a larger index cache, or relax lance.admission.headroom / "
             + "lance.admission.enabled.";
-        String table = dataset == null ? indexName : dataset.uri();
         judge(
             new Scope(Kind.VECTOR_INDEX, table, column == null ? Set.of() : Set.of(column)),
             estimate,
@@ -2234,6 +2335,100 @@ public final class ScanAdmission {
     }
 
     /**
+     * Gate the {@code scans} parallel scans that load {@code column} of
+     * {@code dataset} into the off-heap column store or into heap: the
+     * {@link Kind#COLUMN_LOAD} estimate of {@code scannedRows} physical
+     * rows of {@code rowWidthBytes} each (the column's Arrow width plus
+     * the row address, see {@link #columnWidthBytes(List, String)} and
+     * {@link #ROW_ADDRESS_BYTES}). The scans stream into buffers the
+     * request breaker and the store already bound, so there is no heap
+     * term.
+     *
+     * <p>With {@code ticket} (the request's {@link LanceHitsAccounting},
+     * which the fragment path's searcher attaches to its reader) a
+     * refusal is thrown as the request's 429 and an admitted non zero
+     * estimate counts the request in flight once, as every other path
+     * does. Without one the load belongs to a request the gate never
+     * sees the end of (the shard engine's reader, which carries no
+     * accounting): the decision is recorded and a refusal is counted
+     * under the kind and logged at WARN, but the load proceeds and
+     * nothing is counted in flight, because skipping the load would
+     * leave the column unread and a count on the calling thread would
+     * never be released.
+     */
+    public static void admitColumnLoad(
+        String indexName,
+        Dataset dataset,
+        String column,
+        int scans,
+        long scannedRows,
+        long rowWidthBytes,
+        LanceHitsAccounting ticket
+    ) {
+        admitColumnLoad(
+            indexName,
+            dataset == null ? indexName : dataset.uri(),
+            column,
+            scans,
+            scannedRows,
+            rowWidthBytes,
+            batchReadahead(),
+            ticket
+        );
+    }
+
+    /**
+     * {@link #admitColumnLoad(String, Dataset, String, int, long, long, LanceHitsAccounting)}
+     * with the scans' {@code batchReadahead} given and {@code table}
+     * naming the table in the scan's identity, so a test can judge a
+     * shape on any host.
+     */
+    static void admitColumnLoad(
+        String indexName,
+        String table,
+        String column,
+        int scans,
+        long scannedRows,
+        long rowWidthBytes,
+        int batchReadahead,
+        LanceHitsAccounting ticket
+    ) {
+        if (!enabled) {
+            return;
+        }
+        long shardShare = shardShareBytes();
+        int count = Math.max(1, scans);
+        long estimate = columnLoadEstimateBytes(count, scannedRows, rowWidthBytes, batchReadahead, shardShare);
+        String what = "column load of ["
+            + column
+            + "] over ["
+            + indexName
+            + "]: "
+            + count
+            + " parallel scans over "
+            + Math.max(0L, scannedRows)
+            + " rows of ["
+            + NativeMemoryLimit.humanReadable(rowWidthBytes)
+            + "] each (read queue and batches in flight per scan), against an index cache shard of ["
+            + NativeMemoryLimit.humanReadable(shardShare)
+            + "]";
+        String remedy = "Lower lance.fragment_path.parallelism, spread the table over more data nodes, or relax "
+            + "lance.admission.headroom / lance.admission.enabled.";
+        Scope scope = new Scope(Kind.COLUMN_LOAD, table, column == null ? Set.of() : Set.of(column));
+        if (ticket != null) {
+            judge(scope, estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
+            return;
+        }
+        Decision decision = judge(scope, Source.REQUEST, estimate, 0L, Long.MAX_VALUE, null, false);
+        if (!decision.admitted()) {
+            LOGGER.warn(
+                "{}; the load runs anyway because the reader carries no request to refuse",
+                rejection(Kind.COLUMN_LOAD, decision, Long.MAX_VALUE, headroomBytes, what, remedy).getMessage()
+            );
+        }
+    }
+
+    /**
      * Record a {@link Kind#COLUMN_LOAD}: the heap copy of a column the
      * off-heap store could not hold is charged to the request breaker
      * before it is allocated ({@code LanceShardColumnCache.chargeHeap}),
@@ -2276,7 +2471,7 @@ public final class ScanAdmission {
             shardShare
         );
         Scope scope = new Scope(Kind.FTS, indexName, column == null ? Set.of() : Set.of(column));
-        return judge(scope, Source.WARM_UP, estimate, 0L, Long.MAX_VALUE, null);
+        return judge(scope, Source.WARM_UP, estimate, 0L, Long.MAX_VALUE, null, true);
     }
 
     /**
@@ -2293,7 +2488,7 @@ public final class ScanAdmission {
         String remedy,
         LanceHitsAccounting ticket
     ) {
-        Decision decision = judge(scope, Source.REQUEST, estimateBytes, heapEstimateBytes, heapAvailableBytes, ticket);
+        Decision decision = judge(scope, Source.REQUEST, estimateBytes, heapEstimateBytes, heapAvailableBytes, ticket, true);
         if (!decision.admitted()) {
             throw rejection(scope.kind(), decision, heapAvailableBytes, headroomBytes, what, remedy);
         }
@@ -2304,8 +2499,10 @@ public final class ScanAdmission {
      * the credit the pool grants a scan of {@code scope} (nothing unless
      * the pool was filled by scans of that identity), decide, record the
      * estimate, kind and source, count a refusal under the kind, and
-     * count an admitted non zero estimate in flight. Returns the
-     * decision; the caller answers a refusal as its source requires.
+     * when {@code countAdmitted} is set count an admitted non zero
+     * estimate in flight (on {@code ticket}, or on the calling thread
+     * without one). Returns the decision; the caller answers a refusal
+     * as its source requires.
      */
     private static Decision judge(
         Scope scope,
@@ -2313,7 +2510,8 @@ public final class ScanAdmission {
         long estimateBytes,
         long heapEstimateBytes,
         long heapAvailableBytes,
-        LanceHitsAccounting ticket
+        LanceHitsAccounting ticket,
+        boolean countAdmitted
     ) {
         Kind kind = scope.kind();
         long availableNow = readAvailableMemoryNow();
@@ -2326,7 +2524,7 @@ public final class ScanAdmission {
             REJECTIONS.get(kind).incrementAndGet();
             return decision;
         }
-        if (decision.estimateBytes() > 0L) {
+        if (countAdmitted && decision.estimateBytes() > 0L) {
             countInFlight(scope, availableNow, decision.estimateBytes(), ticket);
         }
         return decision;

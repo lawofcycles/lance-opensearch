@@ -291,7 +291,8 @@ public final class LanceKnnQuery extends Query {
             // index into native memory. Refuse to start it if the
             // breaker has already tripped so we do not push the cache
             // past its budget mid-query, and refuse it with 429 when the
-            // admission gate's estimate of the partition loads does not
+            // admission gate's estimate of the partition loads, plus the
+            // row addresses the prefilter below materialises, does not
             // fit the node's available memory (the loads of an index
             // heavier than the cache shard land outside every breaker).
             LanceCircuitBreaker.checkAndTrip("lance_knn_query");
@@ -299,6 +300,7 @@ public final class LanceKnnQuery extends Query {
                 leaf.dataset().uri(),
                 leaf.dataset(),
                 column,
+                scanFilterSql,
                 k,
                 nprobes == null ? 0 : nprobes,
                 refineFactor == null ? 0 : refineFactor,

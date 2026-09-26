@@ -298,7 +298,7 @@ public class LanceWarmCacheTests extends OpenSearchTestCase {
                 fragmentRows.put(meta.id(), meta.physicalRows());
             }
             Map<Integer, CachedColumn> rating = cache.columnStore()
-                .acquire(replacement.key(), replacement.dataset(), "rating", false, fragmentRows, FragmentGroupScan.SEQUENTIAL);
+                .acquire(replacement.key(), replacement.dataset(), "rating", false, fragmentRows, FragmentGroupScan.SEQUENTIAL, null);
             assertNotNull(rating);
             cache.columnStore().unpin(rating.values());
         }

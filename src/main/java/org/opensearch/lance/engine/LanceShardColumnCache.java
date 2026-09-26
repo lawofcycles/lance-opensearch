@@ -35,6 +35,7 @@ import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.tasks.TaskCancelledException;
+import org.opensearch.lance.query.LanceHitsAccounting;
 import org.opensearch.lance.query.ScanAdmission;
 
 /**
@@ -140,6 +141,16 @@ public final class LanceShardColumnCache {
     private final Map<String, Boolean> loadedKeywordArrayColumns = new ConcurrentHashMap<>();
     /** Lance scans this cache ran itself for heap loads (not the store's), for tests that count scans per path. */
     private final AtomicLong heapScans = new AtomicLong();
+    /**
+     * The request's admission ticket, attached by the fragment path's
+     * searcher once it owns the request's {@link LanceHitsAccounting}
+     * ({@link #attachAdmissionTicket}); {@code null} for a reader no
+     * request accounting reaches (the shard engine's, tests). Every
+     * column scan of this reader, the heap loads here and the store's,
+     * is judged by {@link ScanAdmission#admitColumnLoad} on it before it
+     * opens.
+     */
+    private volatile LanceHitsAccounting admissionTicket;
 
     /**
      * Build a cache scoped to {@code leaves} against {@code dataset}
@@ -207,6 +218,22 @@ public final class LanceShardColumnCache {
     /** The request breaker heap column loads of this reader are charged to. */
     CircuitBreaker requestBreaker() {
         return requestBreaker;
+    }
+
+    /**
+     * Hand this reader the admission ticket of the request it serves,
+     * so a column scan refused by the gate is the request's 429 and an
+     * admitted one counts the request in flight once with its other
+     * gated paths. Called by the fragment path's searcher as soon as
+     * it is built; the column loads run later, during collection.
+     */
+    void attachAdmissionTicket(LanceHitsAccounting ticket) {
+        this.admissionTicket = ticket;
+    }
+
+    /** The admission ticket attached to this reader, or {@code null}; for tests. */
+    LanceHitsAccounting admissionTicket() {
+        return admissionTicket;
     }
 
     /** Bytes this reader currently has charged to the request breaker for heap columns, for tests and stats. */
@@ -338,7 +365,15 @@ public final class LanceShardColumnCache {
             return false;
         }
         Map<Integer, Integer> fragmentRows = allFragmentRows();
-        Map<Integer, CachedColumn> columns = columnStore.acquire(snapshotKey, dataset, name, isBoolean, fragmentRows, groupScan);
+        Map<Integer, CachedColumn> columns = columnStore.acquire(
+            snapshotKey,
+            dataset,
+            name,
+            isBoolean,
+            fragmentRows,
+            groupScan,
+            admissionTicket
+        );
         if (columns == null) {
             LOGGER.debug(
                 "column cache budget exhausted; loading [{}] of {} into heap for this request ({} fragments)",
@@ -374,7 +409,8 @@ public final class LanceShardColumnCache {
             name,
             isBoolean,
             Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc()),
-            groupScan.sequential()
+            groupScan.sequential(),
+            admissionTicket
         );
         if (columns == null) {
             LOGGER.debug(
@@ -468,7 +504,8 @@ public final class LanceShardColumnCache {
             name,
             allFragmentRows(),
             groupScan,
-            encoderFor(name)
+            encoderFor(name),
+            admissionTicket
         );
         if (load == null) {
             LOGGER.debug(
@@ -494,7 +531,8 @@ public final class LanceShardColumnCache {
             name,
             allFragmentRows(),
             groupScan,
-            encoderFor(name)
+            encoderFor(name),
+            admissionTicket
         );
         if (load == null) {
             LOGGER.debug(
@@ -526,7 +564,8 @@ public final class LanceShardColumnCache {
             name,
             Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc()),
             groupScan.sequential(),
-            encoderFor(name)
+            encoderFor(name),
+            admissionTicket
         );
         if (load == null) {
             LOGGER.debug(
@@ -552,7 +591,8 @@ public final class LanceShardColumnCache {
             name,
             Collections.singletonMap(leaf.fragmentId(), leaf.maxDoc()),
             groupScan.sequential(),
-            encoderFor(name)
+            encoderFor(name),
+            admissionTicket
         );
         if (load == null) {
             LOGGER.debug(
@@ -686,6 +726,12 @@ public final class LanceShardColumnCache {
      * the reader is dropped before it reaches {@code consumer}: it should
      * not occur because the scan is scoped by fragment ids, but the guard
      * keeps an unexpected batch from throwing.
+     *
+     * <p>The groups' scans are judged by the admission gate before the
+     * first opens ({@link ScanAdmission#admitColumnLoad}: the read queue
+     * and the batches in flight of every group, over the reader's
+     * physical rows) and bracketed as one gated scan so the pool samples
+     * what they leave behind once they are all done.
      */
     private void scanHeap(String name, HeapCellConsumer consumer) throws IOException {
         List<Integer> fragmentIds = new ArrayList<>(leavesByFragmentId.keySet());
@@ -693,8 +739,23 @@ public final class LanceShardColumnCache {
             return;
         }
         Collections.sort(fragmentIds);
+        List<List<Integer>> groups = FragmentGroupScan.splitContiguous(fragmentIds, groupScan.parallelism());
+        long rows = 0L;
+        for (LanceFragmentLeafReader leaf : leavesByFragmentId.values()) {
+            rows += leaf.maxDoc();
+        }
+        ScanAdmission.admitColumnLoad(
+            dataset.uri(),
+            dataset,
+            name,
+            groups.size(),
+            rows,
+            ScanAdmission.columnWidthBytes(dataset.getSchema().getFields(), name) + ScanAdmission.ROW_ADDRESS_BYTES,
+            admissionTicket
+        );
+        ScanAdmission.scanStarted();
         try {
-            groupScan.run(fragmentIds, group -> {
+            groupScan.runGroups(groups, group -> {
                 scanHeapGroup(name, group, consumer);
                 return null;
             });
@@ -702,6 +763,8 @@ public final class LanceShardColumnCache {
             throw e;
         } catch (Exception e) {
             throw new IOException(e);
+        } finally {
+            ScanAdmission.scanFinished();
         }
     }
 

@@ -32,6 +32,7 @@ import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
+import org.opensearch.lance.query.LanceHitsAccounting;
 
 /** DirectoryReader whose leaves are Lance fragments. */
 public final class LanceDirectoryReader extends DirectoryReader {
@@ -741,6 +742,29 @@ public final class LanceDirectoryReader extends DirectoryReader {
             return lanceReader;
         }
         return null;
+    }
+
+    /**
+     * Hand the reader's column cache the admission ticket of the request
+     * it serves ({@link LanceShardColumnCache#attachAdmissionTicket}), so
+     * the column scans the request's aggregations and sorts fault in are
+     * judged as paths of that request. The fragment path's searcher calls
+     * this once it owns the request's {@link LanceHitsAccounting}; a
+     * reader without a column cache ignores it.
+     */
+    public void attachAdmissionTicket(LanceHitsAccounting ticket) {
+        if (columnCache != null) {
+            columnCache.attachAdmissionTicket(ticket);
+        }
+    }
+
+    /**
+     * The admission ticket {@link #attachAdmissionTicket} handed the
+     * reader's column cache, or {@code null} when none was attached or
+     * the reader has no column cache. For tests of the wiring.
+     */
+    public LanceHitsAccounting admissionTicket() {
+        return columnCache == null ? null : columnCache.admissionTicket();
     }
 
     /**

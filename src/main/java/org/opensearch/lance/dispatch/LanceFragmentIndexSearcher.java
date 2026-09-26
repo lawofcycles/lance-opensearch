@@ -25,6 +25,7 @@ import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.cache.query.DisabledQueryCache;
 import org.opensearch.lance.engine.LanceCancellation;
+import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.query.LanceHitsAccounting;
 import org.opensearch.search.internal.ContextIndexSearcher;
 
@@ -97,7 +98,10 @@ import org.opensearch.search.internal.ContextIndexSearcher;
  * that one instance. The accounting is registered with the search
  * context as a releasable, so the bytes go back to the breaker when
  * the executor closes the context at the end of the request, after
- * the hits, aggregation and count phases that used the Weights.
+ * the hits, aggregation and count phases that used the Weights. The
+ * same instance is handed to the reader's column cache, so the column
+ * scans the aggregators and sorts fault in are judged by the admission
+ * gate as paths of this request.
  *
  * <p>The searcher also hands the Lance Weights the request's
  * {@link LanceCancellation} (from the search context), so their scans
@@ -145,6 +149,16 @@ final class LanceFragmentIndexSearcher extends ContextIndexSearcher implements L
         this.fragmentContext = searchContext;
         this.hitsAccounting = new LanceHitsAccounting(requestBreaker);
         searchContext.addReleasable(hitsAccounting);
+        // The column scans the aggregators and sorts fault in through
+        // the reader are judged by the admission gate as paths of this
+        // request: hand the reader the accounting the gate counts the
+        // request on. A reader wrapper that is not a FilterDirectoryReader
+        // hides the Lance reader; its column loads are then judged
+        // without a ticket.
+        LanceDirectoryReader lanceReader = LanceDirectoryReader.unwrap(reader);
+        if (lanceReader != null) {
+            lanceReader.attachAdmissionTicket(hitsAccounting);
+        }
     }
 
     @Override
