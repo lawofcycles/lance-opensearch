@@ -165,6 +165,12 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * fan-out and the reduce of the gathered responses.
      */
     private final PlanExecutor planExecutor;
+    /**
+     * This node's result cache: the reduced answer of a {@code size: 0}
+     * request against one index, keyed on the table version the fan-out
+     * read, served again while the table stays at that version.
+     */
+    private final LanceRequestCache requestCache;
 
     /**
      * Requests that reach this action over the transport layer (a
@@ -184,7 +190,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         ScriptService scriptService,
         NodeClient client,
         LanceWarmCache warmCache,
-        IndicesService indicesService
+        IndicesService indicesService,
+        LanceRequestCache requestCache
     ) {
         super(LanceCoordinatorAction.NAME, transportService, actionFilters, SearchRequest::new, LancePlugin.LANCE_COORDINATOR_THREAD_POOL);
         this.transportService = transportService;
@@ -202,6 +209,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         this.plannerFactory = new LancePlannerFactory(nativeBudgetBytes, Runtime.getRuntime().maxMemory());
         this.tableStatistics = warmCache.tableStatistics();
         this.planExecutor = new PlanExecutor(plannerFactory);
+        this.requestCache = requestCache;
     }
 
     /**
@@ -355,6 +363,20 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         List<DiscoveryNode> nodeList = new ArrayList<>(dataNodes);
         nodeList.sort(Comparator.comparing(DiscoveryNode::getId));
 
+        // The result cache lookup of this request, or null when the
+        // request is not cached (hits requested, several targets, opted
+        // out, reader wrapper, cache off). The key needs the table
+        // version, which fanOutForTarget reads; the lookup completes
+        // once the merge (or the hit) is at hand.
+        LanceRequestCache.Lookup cacheLookup = requestCache.begin(
+            searchRequest,
+            concrete,
+            targets.size() == 1 ? clusterService.state().metadata().index(targets.get(0).index()) : null,
+            nodeList,
+            indicesService,
+            start
+        );
+
         // Per-index fan-out results, collected sequentially. The plan
         // is derived per target inside runIndexLoop, against the
         // target's own schema; the spec built here carries no plan yet.
@@ -391,7 +413,17 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             trackTotalHitsUpTo,
             collapse == null ? null : collapse.getField()
         );
-        runIndexLoop(targets, 0, nodeList, spec, policy, merged, start, expandingListener(searchRequest, collapse, policy, listener));
+        runIndexLoop(
+            targets,
+            0,
+            nodeList,
+            spec,
+            policy,
+            merged,
+            start,
+            cacheLookup,
+            expandingListener(searchRequest, collapse, policy, listener)
+        );
     }
 
     /**
@@ -545,10 +577,17 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         FanOutPolicy policy,
         MergeReducer merged,
         long startMillis,
+        LanceRequestCache.Lookup cacheLookup,
         ActionListener<SearchResponse> listener
     ) {
         if (index >= targets.size()) {
-            listener.onResponse(merged.buildResponse(startMillis));
+            // The cached answer when the lookup found one (the fan-out
+            // was skipped), else the merge, stored when it qualifies.
+            if (cacheLookup != null) {
+                listener.onResponse(cacheLookup.complete(merged::buildResponse));
+            } else {
+                listener.onResponse(merged.buildResponse(startMillis));
+            }
             return;
         }
         IndexTarget target = targets.get(index);
@@ -559,8 +598,9 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 spec,
                 policy,
                 merged,
+                cacheLookup,
                 ActionListener.wrap(
-                    v -> runIndexLoop(targets, index + 1, nodeList, spec, policy, merged, startMillis, listener),
+                    v -> runIndexLoop(targets, index + 1, nodeList, spec, policy, merged, startMillis, cacheLookup, listener),
                     listener::onFailure
                 )
             );
@@ -588,6 +628,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         FragmentQuerySpec baseSpec,
         FanOutPolicy policy,
         MergeReducer merged,
+        LanceRequestCache.Lookup cacheLookup,
         ActionListener<Void> done
     ) throws Exception {
         List<Integer> allFragmentIds;
@@ -613,6 +654,15 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         long tableRows = 0L;
         try (Dataset dataset = LanceRegistry.openDataset(target.tableUri(), target.storageOptions(), target.pinnedVersionOrEmpty())) {
             observedVersion = dataset.version();
+            // The result cache is keyed on this version: an entry means
+            // the same body already ran against the same manifest on the
+            // same node list, so nothing is planned or sent and the merge
+            // stays empty (runIndexLoop renders the entry).
+            if (cacheLookup != null && cacheLookup.find(observedVersion) != null) {
+                LOGGER.debug("lance.dispatch: index [{}] version {} answered from the result cache", target.indexName(), observedVersion);
+                done.onResponse(null);
+                return;
+            }
             arrowSchema = dataset.getSchema();
             allFragmentIds = new ArrayList<>(dataset.getFragments().size());
             allFragmentRows = new ArrayList<>(dataset.getFragments().size());
@@ -946,7 +996,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             String primaryKeyField = indexMetadata.getSettings().get("index.lance.primary_key_field", "");
             targets.add(
                 new IndexTarget(
-                    index.getName(),
+                    index,
                     tableUri,
                     storageOptions,
                     pinnedVersion,
@@ -1008,10 +1058,14 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * are the fields on which stock full text clauses rewrite to Lance
      * FTS clauses ({@link StockTextQueryRewriter}).
      */
-    private record IndexTarget(String indexName, String tableUri, StorageOptions storageOptions, long pinnedVersion, Map<
+    private record IndexTarget(Index index, String tableUri, StorageOptions storageOptions, long pinnedVersion, Map<
         String,
         LinkedHashMap<String, String>> multiFields, Map<String, String> renamedFields, String primaryKeyField, Set<
             String> sqlExcludedColumns, Set<String> dateOverrideColumns, Map<String, String> lanceTextColumns) {
+
+        String indexName() {
+            return index.getName();
+        }
 
         Optional<Long> pinnedVersionOrEmpty() {
             return pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();

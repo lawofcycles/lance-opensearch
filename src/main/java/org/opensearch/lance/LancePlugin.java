@@ -6,6 +6,7 @@
 package org.opensearch.lance;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Supplier;
@@ -24,6 +25,7 @@ import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
@@ -33,8 +35,12 @@ import org.opensearch.indices.breaker.BreakerSettings;
 import org.opensearch.lance.attach.LanceAttachAction;
 import org.opensearch.lance.attach.TransportLanceAttachAction;
 import org.opensearch.lance.execute.LanceAggregateResults;
+import org.opensearch.lance.dispatch.LanceClearCacheActionFilter;
 import org.opensearch.lance.dispatch.LanceDispatchActionFilter;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
+import org.opensearch.lance.dispatch.LanceRequestCache;
+import org.opensearch.lance.dispatch.LanceRequestCacheClearAction;
+import org.opensearch.lance.dispatch.TransportLanceRequestCacheClearAction;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.engine.LanceLocalClones;
@@ -396,6 +402,54 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         0.0,
         0.95,
         Setting.Property.NodeScope
+    );
+
+    /**
+     * Whether the coordinator keeps the reduced answer of every
+     * {@code size: 0} request against a single Lance backed index, keyed
+     * on the table version it was computed from, and answers the same
+     * request again from that entry while the table stays at that
+     * version ({@link LanceRequestCache}). Dynamic: turning it off drops
+     * every entry.
+     */
+    public static final Setting<Boolean> REQUEST_CACHE_ENABLED_SETTING = Setting.boolSetting(
+        "lance.request_cache.enabled",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * How much heap the coordinator result cache may hold, as a byte size
+     * or a percentage of the heap; the same default as
+     * {@code indices.requests.cache.size}. Static, node scope.
+     */
+    public static final Setting<ByteSizeValue> REQUEST_CACHE_SIZE_SETTING = Setting.memorySizeSetting(
+        "lance.request_cache.size",
+        "1%",
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * The largest answer the coordinator result cache stores, measured as
+     * the serialised size of the reduced aggregations. Static, node scope.
+     */
+    public static final Setting<ByteSizeValue> REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING = Setting.byteSizeSetting(
+        "lance.request_cache.max_entry_size",
+        new ByteSizeValue(1, ByteSizeUnit.MB),
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How long an entry of the coordinator result cache is served after
+     * it was stored; zero (the default) keeps it until the table moves to
+     * another version or the cache evicts it. Dynamic.
+     */
+    public static final Setting<TimeValue> REQUEST_CACHE_EXPIRE_SETTING = Setting.positiveTimeSetting(
+        "lance.request_cache.expire",
+        TimeValue.ZERO,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
     );
 
     /**
@@ -802,6 +856,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             CACHE_ENABLED_SETTING,
             CACHE_MAX_SNAPSHOTS_SETTING,
             CACHE_COLUMN_SHARE_SETTING,
+            REQUEST_CACHE_ENABLED_SETTING,
+            REQUEST_CACHE_SIZE_SETTING,
+            REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING,
+            REQUEST_CACHE_EXPIRE_SETTING,
             FTS_SUBSET_PROBE_LIMIT_SETTING,
             FTS_SUBSET_PROBE_RATIO_SETTING,
             FTS_SUBSET_PROBE_MIN_ROWS_SETTING,
@@ -964,6 +1022,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     private AllowedTableRoots allowedTableRoots;
     private LanceDispatchActionFilter dispatchActionFilter;
     private LanceCreateIndexActionFilter createIndexActionFilter;
+    private LanceClearCacheActionFilter clearCacheActionFilter;
+    private volatile LanceRequestCache requestCache;
     private volatile LanceWarmCache warmCache;
     private volatile LanceLocalClones localClones;
     private volatile LanceIndexWarmer indexWarmer;
@@ -1100,6 +1160,19 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
                 TEST_STATISTICS_COLLECT_DELAY_SETTING,
                 delay -> warmCache.tableStatistics().setCollectDelayMillis(delay.millis())
             );
+        // The coordinator's result cache for size 0 requests, keyed on
+        // the table version; it listens to cluster state so an index
+        // deletion drops its entries, and the transport actions read it
+        // through injection.
+        this.requestCache = new LanceRequestCache(
+            REQUEST_CACHE_SIZE_SETTING.get(environment.settings()).getBytes(),
+            REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING.get(environment.settings()).getBytes(),
+            REQUEST_CACHE_ENABLED_SETTING.get(environment.settings()),
+            REQUEST_CACHE_EXPIRE_SETTING.get(environment.settings())
+        );
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(REQUEST_CACHE_ENABLED_SETTING, requestCache::setEnabled);
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(REQUEST_CACHE_EXPIRE_SETTING, requestCache::setExpire);
+        clusterService.addListener(requestCache);
         // Node-local shallow clones for indexes attached with
         // index.lance.index_placement = node_local. The service owns the
         // clone directories under the node's first data path, resolves
@@ -1132,7 +1205,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LanceStatsCollector statsCollector = new LanceStatsCollector(warmCache, () -> {
             Session session = LanceRegistry.currentSession();
             return session == null || session.isClosed() ? 0L : session.sizeBytes();
-        }, LanceRegistry::indexCacheSizing, indexWarmer, localClones::cloneStats, freshnessService::stats);
+        }, LanceRegistry::indexCacheSizing, indexWarmer, localClones::cloneStats, freshnessService::stats, requestCache::stats);
 
         // Prime the circuit-breaker helper with the current cluster
         // settings and start the polling loop that keeps its accounting
@@ -1193,6 +1266,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // answer a shape yet (highlighter, suggest, collapse, ...).
         this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client, threadPool);
         this.createIndexActionFilter = new LanceCreateIndexActionFilter(threadPool);
+        // POST /<index>/_cache/clear names Lance backed indexes too: the
+        // filter drops their entries from every node's result cache
+        // before the stock action clears the shard caches.
+        this.clearCacheActionFilter = new LanceClearCacheActionFilter(clusterService, indexNameExpressionResolver, client);
 
         namespaceService = new LanceNamespaceService(
             client,
@@ -1211,7 +1288,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // The components are injected into the plugin's transport
         // actions (attach, build_indexes, namespace list / update / poll,
         // index sync, fragment query).
-        return List.of(namespaceService, freshnessService, allowedTableRoots, warmCache, statsCollector, localClones);
+        return List.of(namespaceService, freshnessService, allowedTableRoots, warmCache, statsCollector, localClones, requestCache);
     }
 
     /**
@@ -1310,18 +1387,20 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // filter is always present when the search machinery starts
         // routing through it; the null guard exists purely for the
         // test framework's out-of-order invocations.
+        List<ActionFilter> filters = new ArrayList<>(3);
         LanceDispatchActionFilter dispatch = dispatchActionFilter;
+        if (dispatch != null) {
+            filters.add(dispatch);
+        }
         LanceCreateIndexActionFilter guard = createIndexActionFilter;
-        if (dispatch == null && guard == null) {
-            return List.of();
+        if (guard != null) {
+            filters.add(guard);
         }
-        if (guard == null) {
-            return List.of(dispatch);
+        LanceClearCacheActionFilter clear = clearCacheActionFilter;
+        if (clear != null) {
+            filters.add(clear);
         }
-        if (dispatch == null) {
-            return List.of(guard);
-        }
-        return List.of(dispatch, guard);
+        return List.copyOf(filters);
     }
 
     @Override
@@ -1352,7 +1431,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             new ActionHandler<>(LanceBuildIndexesNodesAction.INSTANCE, TransportLanceBuildIndexesNodesAction.class),
             new ActionHandler<>(LanceRefsAction.INSTANCE, TransportLanceRefsAction.class),
             new ActionHandler<>(LanceStatsAction.INSTANCE, TransportLanceStatsAction.class),
-            new ActionHandler<>(LanceExplainAction.INSTANCE, TransportLanceExplainAction.class)
+            new ActionHandler<>(LanceExplainAction.INSTANCE, TransportLanceExplainAction.class),
+            new ActionHandler<>(LanceRequestCacheClearAction.INSTANCE, TransportLanceRequestCacheClearAction.class)
         );
     }
 

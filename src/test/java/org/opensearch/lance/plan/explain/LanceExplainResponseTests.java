@@ -99,7 +99,8 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
             plan,
             null,
             List.of(FragmentPlanRefiner.Reason.SORT_FIELD_TYPE),
-            NO_DEMAND
+            NO_DEMAND,
+            LanceExplainResponse.Cacheability.no("size > 0")
         );
         assertEquals(response, roundTrip(response));
         assertEquals(LanceExplainResponse.Route.FRAGMENT, response.route());
@@ -109,6 +110,8 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
         assertEquals("fragment", json.get("route"));
         assertTrue(json.get("physical").toString().startsWith("MergeExec("));
         assertFalse("nothing unplanned", json.containsKey("unplanned"));
+        assertEquals(false, json.get("cacheable"));
+        assertEquals("size > 0", json.get("cacheable_reason"));
         assertEquals(List.of("sort_field_type"), json.get("refinements_possible"));
         Map<String, Object> fragmentPlan = object(json, "fragment_plan");
         assertEquals("PUSHED_SCAN", fragmentPlan.get("kind"));
@@ -129,10 +132,21 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
             null,
             new FragmentPlan.Aggregate(new byte[] { 1, 2, 3 }, 1, List.of(new FragmentPlan.MetricSlot("s", MetricSpec.Kind.SUM)))
         );
-        LanceExplainResponse response = LanceExplainResponse.fragment("demo", "logical", "physical", plan, null, List.of(), NO_DEMAND);
+        LanceExplainResponse response = LanceExplainResponse.fragment(
+            "demo",
+            "logical",
+            "physical",
+            plan,
+            null,
+            List.of(),
+            NO_DEMAND,
+            LanceExplainResponse.Cacheability.YES
+        );
         assertEquals(response, roundTrip(response));
         Map<String, Object> json = json(response);
         assertEquals(List.of(), json.get("refinements_possible"));
+        assertEquals(true, json.get("cacheable"));
+        assertFalse("a cacheable body carries no reason: " + json, json.containsKey("cacheable_reason"));
         Map<String, Object> fragmentPlan = object(json, "fragment_plan");
         assertEquals("PUSHED_SCAN", fragmentPlan.get("kind"));
         assertFalse(fragmentPlan.containsKey("filter_sql"));
@@ -154,7 +168,8 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
             "sort type [_geo_distance]",
             // Given out of order: the response sorts the reasons.
             List.of(FragmentPlanRefiner.Reason.SORT_FIELD_TYPE, FragmentPlanRefiner.Reason.SECURITY_WRAPPER),
-            NO_DEMAND
+            NO_DEMAND,
+            LanceExplainResponse.Cacheability.no("dls")
         );
         assertEquals(response, roundTrip(response));
         Map<String, Object> json = json(response);
@@ -206,7 +221,8 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
             FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, null),
             null,
             List.of(),
-            traits
+            traits,
+            LanceExplainResponse.Cacheability.YES
         );
         LanceExplainResponse read = roundTrip(response);
         assertEquals(response, read);
@@ -237,9 +253,11 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
         assertEquals(response, roundTrip(response));
         assertEquals(LanceExplainResponse.Route.FRAGMENT, response.route());
         assertNull(response.fragmentPlan());
+        assertNull("nothing runs, so nothing is cached", response.cacheability());
         Map<String, Object> json = json(response);
         assertEquals("fragment", json.get("route"));
         assertFalse("nothing ships: " + json, json.containsKey("fragment_plan"));
+        assertFalse("nothing runs: " + json, json.containsKey("cacheable"));
         assertTrue(json.get("unplanned").toString().startsWith("plan_failed"));
         assertEquals(List.of(), json.get("refinements_possible"));
         Map<String, Object> traitsJson = object(json, "traits");
@@ -274,6 +292,39 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
                 assertEquals(response, new LanceExplainResponse(in));
                 assertEquals("the reader consumed the block", -1, in.read());
             }
+        }
+    }
+
+    public void testMixedPluginVersionAVersion2AnswerHasNoCacheability() throws IOException {
+        // The stream a version 2 node writes: today's base fields and no
+        // block; the cacheability falls back to absent.
+        LanceExplainResponse today = LanceExplainResponse.fragment(
+            "demo",
+            "logical",
+            "physical",
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, null),
+            null,
+            List.of(),
+            NO_DEMAND,
+            LanceExplainResponse.Cacheability.YES
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput(); BytesStreamOutput written = new BytesStreamOutput()) {
+            today.writeTo(written);
+            int blockBytes;
+            try (BytesStreamOutput block = new BytesStreamOutput()) {
+                WireVersion.writeBlock(block, false, o -> o.writeOptionalWriteable(LanceExplainResponse.Cacheability.YES));
+                blockBytes = block.bytes().length();
+            }
+            try (StreamInput in = written.bytes().streamInput()) {
+                assertEquals(LanceExplainResponse.WIRE_VERSION, in.readVInt());
+                byte[] rest = in.readAllBytes();
+                out.writeVInt(2);
+                out.writeBytes(rest, 0, rest.length - blockBytes);
+            }
+            LanceExplainResponse asVersion2 = read(out);
+            assertNull(asVersion2.cacheability());
+            assertEquals(today.fragmentPlan(), asVersion2.fragmentPlan());
+            assertEquals(today.traits(), asVersion2.traits());
         }
     }
 
@@ -343,18 +394,16 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
                 NO_DEMAND
             );
             LanceExplainResponse response = read(out);
-            assertEquals(
-                LanceExplainResponse.fragment(
-                    "demo",
-                    "logical",
-                    "physical",
-                    plan,
-                    "collapse",
-                    List.of(FragmentPlanRefiner.Reason.SORT_FIELD_TYPE),
-                    NO_DEMAND
-                ),
-                response
-            );
+            assertEquals("demo", response.index());
+            assertEquals(LanceExplainResponse.Route.FRAGMENT, response.route());
+            assertEquals("logical", response.logical());
+            assertEquals("physical", response.physical());
+            assertEquals(plan, response.fragmentPlan());
+            assertEquals("collapse", response.unplanned());
+            assertEquals(List.of(FragmentPlanRefiner.Reason.SORT_FIELD_TYPE), response.refinementsPossible());
+            assertEquals(NO_DEMAND, response.traits());
+            assertNull("a version 1 answer has no cacheability", response.cacheability());
+            assertFalse("nothing rendered for it: " + json(response), json(response).containsKey("cacheable"));
         }
     }
 
