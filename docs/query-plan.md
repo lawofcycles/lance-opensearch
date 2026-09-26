@@ -511,7 +511,7 @@ nobody: the data node logs it and executes it. `LanceExplainResponse` travels fr
 planned the explain body to the node that received the REST call when they differ.
 
 Both streams open with an integer `WIRE_VERSION` (`FragmentPlan.WIRE_VERSION` is `3` today,
-`LanceExplainResponse.WIRE_VERSION` is `2`), written first and read first through the
+`LanceExplainResponse.WIRE_VERSION` is `3`), written first and read first through the
 `WireVersion` helper. The marker is followed by the fields the message had at version 1, inline,
 and then by one block per later version: a flag and the fields that version added as a length
 prefixed byte array. A reader of a newer plugin version takes a fallback for every block an older
