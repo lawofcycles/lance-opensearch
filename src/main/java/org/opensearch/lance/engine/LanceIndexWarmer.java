@@ -70,7 +70,10 @@ import org.opensearch.lance.query.ScanAdmission;
  * the namespace poll surfacing a table, or this node applying its first
  * cluster state after a restart). Every data node warms its own Session
  * cache, since the fragment path fans out to every data node. Deleting
- * the index cancels a pending or running warm-up.
+ * the index cancels a pending or running warm-up. The same trigger
+ * starts the collection of the planner's table statistics on every data
+ * node, under every mode: each node plans the requests it coordinates
+ * from its own statistics cache.
  *
  * <p>Execution: one task per table on the {@link #THREAD_POOL} pool,
  * which has a single thread, so tables warm one after another and the
@@ -340,8 +343,9 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
 
     /**
      * Queue the warm-up of {@code metadata}'s table under the current
-     * mode. Under {@link Mode#NONE} the index is recorded as skipped so
-     * the stats show the attach was seen, and nothing runs.
+     * mode, and start collecting the planner's table statistics whatever
+     * the mode. Under {@link Mode#NONE} the index is recorded as skipped
+     * so the stats show the attach was seen, and no warm-up runs.
      */
     public void schedule(IndexMetadata metadata) {
         Task task = new Task(metadata, mode);
@@ -349,6 +353,7 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
         if (previous != null) {
             previous.cancelled.set(true);
         }
+        collectTableStatistics(task);
         if (task.mode == Mode.NONE) {
             task.finish(State.SKIPPED);
             return;
@@ -360,6 +365,28 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
             task.finish(State.FAILED);
             LOGGER.warn("warm-up of [{}] (table {}) not started: {}", task.indexName, task.table, e.getMessage());
         }
+    }
+
+    /**
+     * Start collecting the planner's table statistics of the version the
+     * index reads, on the node's generic pool. Every data node
+     * coordinates requests and plans them from its own statistics cache,
+     * and without this only the node that holds the shard collects them
+     * before its first request (when its shard opens); the others would
+     * plan their first request of the table without statistics. The
+     * table is opened on the generic pool, never on the applier thread
+     * this is called from. Under a mode that warms, the snapshot the
+     * warm-up builds starts the same collection; whichever comes second
+     * finds the version held or pending and does nothing.
+     */
+    private void collectTableStatistics(Task task) {
+        warmCache.tableStatistics().collectIfAbsent(task.table, () -> {
+            Optional<Long> version = task.pinnedVersion;
+            if (version.isEmpty() && task.tag != null) {
+                version = Optional.of(LanceRegistry.resolveTagVersion(task.table, task.storageOptions, task.tag));
+            }
+            return LanceRegistry.openDataset(task.table, task.storageOptions, version);
+        });
     }
 
     private void run(Task task) {

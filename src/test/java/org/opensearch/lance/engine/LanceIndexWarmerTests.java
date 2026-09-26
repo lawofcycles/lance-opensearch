@@ -45,7 +45,8 @@ import org.opensearch.test.OpenSearchTestCase;
  * {@link LanceIndexWarmer} against a local table carrying one index of
  * every kind it knows: the scans it issues load without error under both
  * modes, the status it publishes names every index, {@code none}
- * records a skipped table without touching it, and the full text probe
+ * records a skipped table without building its snapshot while the
+ * planner's statistics are still collected, and the full text probe
  * is skipped with a WARN when the admission gate does not admit it and
  * credited to the gate's retained pool when it is.
  */
@@ -164,13 +165,24 @@ public class LanceIndexWarmerTests extends OpenSearchTestCase {
         assertTrue(after.indexes().isEmpty());
     }
 
-    public void testNoneModeRecordsASkippedTableAndOpensNothing() throws Exception {
+    public void testNoneModeRecordsASkippedTableOpensNoSnapshotAndStillCollectsTheStatistics() throws Exception {
         LanceIndexWarmer warmer = new LanceIndexWarmer(cache, executor, Mode.NONE);
+        assertEquals(0, cache.tableStatistics().size());
         warmer.schedule(indexMetadata("warm-none"));
         TableStatus status = awaitFinished(warmer, "warm-none");
         assertEquals(State.SKIPPED, status.state());
         assertTrue(status.indexes().isEmpty());
-        assertEquals(0L, cache.datasetOpenCount());
+        assertEquals("no snapshot is built for a request that has not come", 0L, cache.datasetOpenCount());
+        assertEquals(0, cache.snapshotCount());
+        // The statistics cache of this test collects on the calling
+        // thread: the table's current version is held when schedule
+        // returns, so a request this node coordinates plans with it.
+        assertEquals("the planner's statistics are collected whatever the mode", 1, cache.tableStatistics().size());
+        assertEquals(1L, cache.tableStatistics().collectCount());
+        assertEquals(0L, cache.tableStatistics().missCount());
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            assertNotNull(cache.tableStatistics().peek(dataset.uri(), dataset.version()));
+        }
         warmer.close();
     }
 

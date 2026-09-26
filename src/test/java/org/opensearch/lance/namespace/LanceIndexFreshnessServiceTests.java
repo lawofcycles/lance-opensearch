@@ -17,6 +17,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
@@ -48,6 +49,8 @@ import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceServedVersions;
+import org.opensearch.lance.engine.LanceWarmCache;
+import org.opensearch.lance.plan.metadata.TableStatisticsCache;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.client.NoOpClient;
@@ -475,6 +478,54 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         assertTrue("the update marks the stale name: " + sent.source(), sent.source().contains("\"lance_dropped\":\"true\""));
         assertEquals(1, service.stats().failures());
         assertTrue("the detector's refusal is not a refused derivation", service.stats().mappingErrors().isEmpty());
+    }
+
+    public void testCheckCollectsTheStatisticsOfTheVersionItServesOnTheFirstCheckAndOnAMove() throws Exception {
+        String tableUri = writeTable("statistics");
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            LanceWarmCache warmCache = new LanceWarmCache(allocator, 64L * 1024 * 1024, 8, true)
+        ) {
+            // The warm cache of this test collects on the calling thread,
+            // so the entry is there when the check returns.
+            LanceIndexFreshnessService withCache = new LanceIndexFreshnessService(
+                client,
+                threadPool,
+                TimeValue.timeValueHours(1),
+                warmCache,
+                new LanceServedVersions()
+            );
+            try {
+                TableStatisticsCache statistics = warmCache.tableStatistics();
+                FakeShard shard = FakeShard.overTable("statistics", tableUri, Settings.EMPTY);
+                LanceIndexFreshnessService.Tracked entry = withCache.track(shard);
+                String key;
+                try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
+                    key = dataset.uri();
+                }
+                long first = shard.servedVersion();
+                assertNull(statistics.peek(key, first));
+
+                LanceIndexFreshnessService.Outcome outcome = withCache.check(entry);
+                assertFalse(outcome.moved());
+                assertNotNull("the first check collected the served version's statistics", statistics.peek(key, first));
+                assertEquals(1L, statistics.collectCount());
+                assertEquals("a collection ahead of the plans is not a plan without statistics", 0L, statistics.missCount());
+
+                // Standing still starts nothing more.
+                withCache.check(entry);
+                assertEquals(1L, statistics.collectCount());
+
+                LanceTableFactory.appendRows(tableUri, 6, 4);
+                LanceIndexFreshnessService.Outcome moved = withCache.check(entry);
+                assertTrue(moved.moved());
+                assertNotNull("the move collected the target version's statistics", statistics.peek(key, moved.targetVersion()));
+                assertEquals(10L, statistics.peek(key, moved.targetVersion()).rowCount());
+                assertEquals(2L, statistics.collectCount());
+            } finally {
+                withCache.close();
+            }
+        }
     }
 
     private static String writeTable(String hint) throws Exception {

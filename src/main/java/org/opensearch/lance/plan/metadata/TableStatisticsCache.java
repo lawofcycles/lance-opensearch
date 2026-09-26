@@ -41,11 +41,16 @@ import java.util.function.Supplier;
  * collection takes minutes (Lance assembles the index statistics from
  * the index files), which is why it must not sit on the request's
  * thread. {@link #prefetch} starts the same collection without a
- * lookup, so a node that holds the table's shard can have the entry
- * ready before the first request (the freshness check calls it when the
- * shard starts and when the manifest advances). A key is collected once
- * at a time: a second lookup or prefetch of a key whose collection is
- * running starts nothing.
+ * lookup, for a caller that knows the version: the warm cache when it
+ * builds a version's snapshot, and the freshness check of the node
+ * that holds the shard when the shard starts and when the manifest
+ * advances. {@link #collectIfAbsent} opens the table on the executor
+ * first and collects the version it opened, for a caller that knows the
+ * table only: every data node when the index appears in the cluster
+ * state, so that a node which merely coordinates has the statistics
+ * before its first request rather than after it. A key is collected
+ * once at a time: a second lookup, prefetch or collectIfAbsent of a key
+ * whose collection is running starts nothing.
  *
  * <p>Bounds: {@link #release} drops the entry of a version whose warm
  * cache snapshot closed; inserting a version of a table keeps at most
@@ -87,9 +92,10 @@ public final class TableStatisticsCache {
 
     /**
      * A cache whose collections run on the calling thread of
-     * {@link #lookup} or {@link #prefetch}. For tests without a thread
-     * pool: {@code lookup} still answers {@code null} on the miss that
-     * started the collection, and the next lookup hits.
+     * {@link #lookup}, {@link #prefetch} or {@link #collectIfAbsent}.
+     * For tests without a thread pool: {@code lookup} still answers
+     * {@code null} on the miss that started the collection, and the next
+     * lookup hits.
      */
     public TableStatisticsCache() {
         this(DEFAULT_MAX_ENTRIES, Runnable::run);
@@ -153,20 +159,53 @@ public final class TableStatisticsCache {
         return true;
     }
 
+    /**
+     * Open the table through {@code opener} on the executor and collect
+     * the statistics of the version it opened, unless the cache holds
+     * them or is collecting them. For a caller that knows the table but
+     * not the version it reads: a data node that saw the index appear in
+     * the cluster state has not opened the table, and must not open it
+     * on the applier thread, so the open, the version and the collection
+     * all happen on the executor and the one dataset serves both. The
+     * key counts as pending from the moment the open returns, not while
+     * the table is being opened. {@code tableUri} names the table in the
+     * log when the open fails.
+     */
+    public void collectIfAbsent(String tableUri, Supplier<Dataset> opener) {
+        try {
+            executor.execute(() -> collectOpened(tableUri, opener));
+        } catch (RejectedExecutionException e) {
+            LOGGER.warn("table statistics of {} not collected: {}", tableUri, e.getMessage());
+        }
+    }
+
+    private void collectOpened(String tableUri, Supplier<Dataset> opener) {
+        try (Dataset dataset = opener.get()) {
+            Key key = new Key(dataset.uri(), dataset.version());
+            if (lookup(key) != null || pending.putIfAbsent(key, Boolean.TRUE) != null) {
+                return;
+            }
+            try {
+                waitCollectDelay();
+                collectFrom(key, dataset);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOGGER.debug("table statistics collection of {} interrupted", key);
+            } finally {
+                pending.remove(key);
+            }
+        } catch (RuntimeException e) {
+            failures.incrementAndGet();
+            LOGGER.warn("table statistics of {} could not be collected; requests plan without them", tableUri, e);
+        }
+    }
+
     private void collect(Key key, Supplier<Dataset> opener) {
         try {
-            long delay = collectDelayMillis;
-            if (delay > 0L) {
-                Thread.sleep(delay);
-            }
-            long startNanos = System.nanoTime();
-            TableStatistics collected;
+            waitCollectDelay();
             try (Dataset dataset = opener.get()) {
-                collected = TableStatisticsCollector.collect(dataset);
+                collectFrom(key, dataset);
             }
-            collectMillisTotal.addAndGet(wholeMillis(System.nanoTime() - startNanos));
-            collects.incrementAndGet();
-            put(key, collected);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             LOGGER.debug("table statistics collection of {} interrupted", key);
@@ -183,6 +222,27 @@ public final class TableStatisticsCache {
         } finally {
             pending.remove(key);
         }
+    }
+
+    /** The test hook's wait before a collection reads the table; nothing on a real node. */
+    private void waitCollectDelay() throws InterruptedException {
+        long delay = collectDelayMillis;
+        if (delay > 0L) {
+            Thread.sleep(delay);
+        }
+    }
+
+    /**
+     * Read the statistics of {@code key} from {@code dataset}, which is
+     * open at the key's version, and store them; the caller holds the
+     * key in {@code pending}.
+     */
+    private void collectFrom(Key key, Dataset dataset) {
+        long startNanos = System.nanoTime();
+        TableStatistics collected = TableStatisticsCollector.collect(dataset);
+        collectMillisTotal.addAndGet(wholeMillis(System.nanoTime() - startNanos));
+        collects.incrementAndGet();
+        put(key, collected);
     }
 
     /**
