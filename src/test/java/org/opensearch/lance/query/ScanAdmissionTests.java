@@ -2103,6 +2103,145 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         }
     }
 
+    // ---- the fetch take ----
+
+    /** The columns of a table whose page take the tests judge: a text body, a 1024 dimension embedding and an int key. */
+    private static List<Field> fetchTakeFields() {
+        return List.of(
+            new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+            new Field("body", FieldType.nullable(new ArrowType.Utf8()), null),
+            new Field(
+                "embedding",
+                FieldType.nullable(new ArrowType.FixedSizeList(1024)),
+                List.of(new Field("item", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)), null))
+            )
+        );
+    }
+
+    public void testFetchTakeEstimateIsTheChunkRowsAtTheProjectedWidthDoubled() {
+        List<Field> fields = fetchTakeFields();
+        // body 32 + embedding 4096 + the row address 8.
+        assertEquals(4136L, ScanAdmission.fetchTakeRowWidthBytes(fields, List.of("body", "embedding")));
+        // id 4 + body 32 + embedding 4096 + 8.
+        assertEquals(4140L, ScanAdmission.fetchTakeRowWidthBytes(fields, List.of("id", "body", "embedding")));
+        // A column the schema does not name is taken at the default width.
+        assertEquals(ScanAdmission.OTHER_COLUMN_BYTES_PER_ROW + 8L, ScanAdmission.fetchTakeRowWidthBytes(fields, List.of("missing")));
+        assertEquals("nothing projected is the row address alone", 8L, ScanAdmission.fetchTakeRowWidthBytes(fields, List.of()));
+        // 1M rows of body and embedding: 8.27 GB, above a 1 GB share.
+        assertEquals(8_272_000_000L, ScanAdmission.fetchTakeEstimateBytes(1_000_000L, 4136L, GB));
+        // The same page at a shard share that holds it is zero, as is a
+        // 10 row page of 3 columns on a small table at the default
+        // share.
+        assertEquals(0L, ScanAdmission.fetchTakeEstimateBytes(1_000_000L, 4136L, 16 * GB));
+        assertEquals(0L, ScanAdmission.fetchTakeEstimateBytes(10L, 4140L, 8 * GB));
+        assertEquals(82_800L, ScanAdmission.fetchTakeEstimateBytes(10L, 4140L, 1L));
+    }
+
+    public void testMillionRowFetchTakeIsRefusedOnAnEightGbReadingAndASmallPageIsAdmittedAtZero() {
+        // index.max_result_window raised to a million rows, the page
+        // rendering body and the 1024 dimension embedding on a node
+        // reading 8 GB available with the default 8 GB headroom and a 1
+        // GB index cache shard: 8.27 GB of batches against nothing left,
+        // refused as the request's 429 on its ticket.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.GB));
+        ScanAdmission.setAvailableMemoryOverride(List.of("8gb"));
+        ScanAdmission.setResidentSetProbeForTests(() -> -1L);
+        List<Field> fields = fetchTakeFields();
+        List<String> columns = List.of("body", "embedding");
+        LanceHitsAccounting ticket = LanceHitsAccounting.unlimited();
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admitFetchTake("perf1b", "perf1b", fields, columns, 1_000_000L, ticket)
+        );
+        String message = rejection.getMessage();
+        assertTrue(message, message.startsWith("[" + ScanAdmission.LABEL + "] fetch_take estimate [7.7gb] exceeds available [0b]"));
+        assertTrue(
+            message,
+            message.contains(
+                "fetch take over [perf1b]: taking 1000000 rows of 2 columns for the page at [4kb] per row "
+                    + "(the columns' Arrow widths plus the row address), doubled for the batches in flight, against an index cache "
+                    + "shard of [1gb]"
+            )
+        );
+        assertTrue(message, message.contains("Narrow _source or fields, or lower size, or relax lance.admission.headroom"));
+        assertEquals(8_272_000_000L, rejection.getBytesWanted());
+        assertEquals(8_272_000_000L, ScanAdmission.lastEstimateBytes());
+        assertEquals("fetch_take", ScanAdmission.lastKind());
+        assertEquals("request", ScanAdmission.lastSource());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FETCH_TAKE));
+        assertEquals(0L, ScanAdmission.rejections(ScanAdmission.Kind.COLUMN_LOAD));
+        assertEquals("a refused take is not in flight", 0, ScanAdmission.inFlightForTests());
+
+        // The same take on a node reading 64 GB is admitted, counted
+        // once in flight on the ticket, and its identity is the table
+        // and the columns taken; the pool samples what the take leaves
+        // behind, credited once the request has ended.
+        ScanAdmission.setAvailableMemoryOverride(List.of("64gb"));
+        ScanAdmission.admitFetchTake("perf1b", "perf1b", fields, columns, 1_000_000L, ticket);
+        assertEquals(8_272_000_000L, ScanAdmission.lastEstimateBytes());
+        assertEquals(1, ScanAdmission.inFlightForTests());
+        ScanAdmission.scanStarted();
+        ScanAdmission.setAvailableMemoryOverride(List.of("63gb"));
+        ScanAdmission.scanFinished();
+        assertEquals("fetch_take:perf1b:body,embedding", ScanAdmission.retainedScope());
+        assertEquals("nothing is credited while the request is in flight", 0L, ScanAdmission.retainedCreditBytes());
+        ticket.close();
+        assertEquals(0, ScanAdmission.inFlightForTests());
+        assertEquals(GB, ScanAdmission.retainedCreditBytes());
+
+        // A 10 row page of 3 columns on a small table fits the 8 GB
+        // shard share of a default node: estimate zero, admitted,
+        // recorded under the kind, nothing in flight and no rejection.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(8, ByteSizeUnit.GB));
+        LanceHitsAccounting other = LanceHitsAccounting.unlimited();
+        ScanAdmission.admitFetchTake("demo", "demo", fields, List.of("id", "body", "embedding"), 10L, other);
+        assertEquals(0L, ScanAdmission.lastEstimateBytes());
+        assertEquals("fetch_take", ScanAdmission.lastKind());
+        assertEquals(0, ScanAdmission.inFlightForTests());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FETCH_TAKE));
+        other.close();
+
+        // A disabled gate judges nothing.
+        ScanAdmission.setEnabled(false);
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setAvailableMemoryOverride(List.of("0b"));
+        ScanAdmission.admitFetchTake("perf1b", "perf1b", fields, columns, 1_000_000L, null);
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FETCH_TAKE));
+    }
+
+    public void testFetchTakeOfAChunkTheCacheServedInPartIsJudgedOnTheColumnsItStillTakes() {
+        // Under a one byte share every estimate counts in full, so the
+        // recorded estimate shows the columns judged: a 4096 row chunk
+        // projecting body and embedding is 4136 bytes per row doubled,
+        // and the same chunk taking body alone is 40 per row doubled.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setHeadroom(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setMemoryProbeForTests(() -> 100 * GB);
+        ScanAdmission.setResidentSetProbeForTests(() -> -1L);
+        List<Field> fields = fetchTakeFields();
+        LanceHitsAccounting ticket = LanceHitsAccounting.unlimited();
+        ScanAdmission.admitFetchTake("demo", "demo", fields, List.of("body", "embedding"), 4096L, ticket);
+        assertEquals(4096L * 4136L * 2L, ScanAdmission.lastEstimateBytes());
+        ScanAdmission.admitFetchTake("demo", "demo", fields, List.of("body"), 4096L, ticket);
+        assertEquals(4096L * 40L * 2L, ScanAdmission.lastEstimateBytes());
+        assertEquals("fetch_take", ScanAdmission.lastKind());
+        assertEquals(0L, ScanAdmission.rejections(ScanAdmission.Kind.FETCH_TAKE));
+        assertEquals("two paths of one request count once", 1, ScanAdmission.inFlightForTests());
+        ticket.close();
+        assertEquals(0, ScanAdmission.inFlightForTests());
+
+        // Without a ticket a refusal is still thrown: the take is the
+        // request's own work, so there is no load to let run.
+        ScanAdmission.setMemoryProbeForTests(() -> 8 * GB);
+        CircuitBreakingException refused = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admitFetchTake("demo", "demo", fields, List.of("body"), 4096L, null)
+        );
+        assertTrue(refused.getMessage(), refused.getMessage().startsWith("[" + ScanAdmission.LABEL + "] fetch_take estimate [320kb]"));
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FETCH_TAKE));
+        assertEquals(0, ScanAdmission.inFlightForTests());
+    }
+
     // ---- the per kind counters and the request ticket ----
 
     public void testRejectionsAreCountedPerKindAndTheLastKindIsRecorded() {
@@ -2111,7 +2250,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         assertEquals("none", ScanAdmission.lastKind());
         Map<String, Long> zero = ScanAdmission.rejectionsByKind();
         assertEquals(
-            List.of("fts", "scalar_index", "vector_index", "filter_scan", "aggregate_scan", "column_load"),
+            List.of("fts", "scalar_index", "vector_index", "filter_scan", "aggregate_scan", "column_load", "fetch_take"),
             List.copyOf(zero.keySet())
         );
         for (long count : zero.values()) {
@@ -2141,6 +2280,15 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         ScanAdmission.recordColumnLoad(4096L, true);
         assertEquals("column_load", ScanAdmission.lastKind());
         assertEquals(4096L, ScanAdmission.lastEstimateBytes());
+        // A take of a thousand rows of one column the schema does not
+        // name: 24 bytes per row doubled, above a one byte share.
+        CircuitBreakingException take = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admitFetchTake("demo", "demo", List.of(), List.of("body"), 1_000L, null)
+        );
+        assertTrue(take.getMessage(), take.getMessage().startsWith("[" + ScanAdmission.LABEL + "] fetch_take estimate"));
+        assertEquals("fetch_take", ScanAdmission.lastKind());
+        assertEquals(48_000L, ScanAdmission.lastEstimateBytes());
         Map<String, Long> counts = ScanAdmission.rejectionsByKind();
         assertEquals(1L, (long) counts.get("fts"));
         assertEquals(0L, (long) counts.get("scalar_index"));
@@ -2148,7 +2296,8 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         assertEquals(1L, (long) counts.get("filter_scan"));
         assertEquals(1L, (long) counts.get("aggregate_scan"));
         assertEquals(1L, (long) counts.get("column_load"));
-        assertEquals(4L, ScanAdmission.rejections());
+        assertEquals(1L, (long) counts.get("fetch_take"));
+        assertEquals(5L, ScanAdmission.rejections());
         // No statistics installed and no dataset: the sorted page is
         // judged on its rows alone, and a disabled gate admits it.
         expectThrows(
@@ -2158,7 +2307,8 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         ScanAdmission.setEnabled(false);
         ScanAdmission.admitExecutorFilterScan("demo", null, "", 1_000L, 10L, 16L, "sorted page scan");
         ScanAdmission.admitFilterScan("demo", null, "rating = 5", 1_000L, 2, 0L, 8L, Long.MAX_VALUE, null);
-        assertEquals(5L, ScanAdmission.rejections());
+        ScanAdmission.admitFetchTake("demo", "demo", List.of(), List.of("body"), 1_000L, null);
+        assertEquals(6L, ScanAdmission.rejections());
     }
 
     public void testOneRequestWithTwoAdmittedPathsCountsOnceInFlight() {

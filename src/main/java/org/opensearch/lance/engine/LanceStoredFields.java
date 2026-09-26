@@ -51,6 +51,8 @@ import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceFragmentSchema.ColumnKind;
 import org.opensearch.lance.engine.LanceFragmentSchema.NumericPrecision;
 import org.opensearch.lance.engine.LanceFragmentSchema.TakeProjection;
+import org.opensearch.lance.query.LanceHitsAccounting;
+import org.opensearch.lance.query.ScanAdmission;
 
 /**
  * The stored fields path of one {@link LanceFragmentLeafReader}:
@@ -68,7 +70,11 @@ import org.opensearch.lance.engine.LanceFragmentSchema.TakeProjection;
  * plus the primary key for {@code _id}), so the cost of a page is
  * proportional to {@code size} and to the columns asked for, not to
  * the fragment's row count or the table's width. Every take scan is
- * counted and timed in {@link FetchTakeStats}. On a leaf the fragment
+ * judged by the admission gate before it opens
+ * ({@link ScanAdmission#admitFetchTake}: the chunk's rows at the
+ * projected columns' widths, refused as the request's 429 when the
+ * node cannot hold them) and counted and timed in
+ * {@link FetchTakeStats}. On a leaf the fragment
  * hits phase marked eligible, the rows go through the node's
  * {@link LanceFetchCache} first: a row whose projected cells the cache
  * holds from an earlier request is rendered without a take, and every
@@ -296,6 +302,13 @@ final class LanceStoredFields extends StoredFields {
      * take, and a row with any column absent is taken whole. Every row
      * the take returns is written back per column, and a row the take
      * did not return is written as a negative entry.
+     *
+     * <p>Each chunk's take is judged by {@link ScanAdmission#admitFetchTake}
+     * before its scan opens, on the rows left after the cache lookup and
+     * the columns the take projects, and bracketed with
+     * {@link ScanAdmission#scanStarted} and {@link ScanAdmission#scanFinished}.
+     * A chunk the cache served whole opens no scan and is not judged. A
+     * refusal is thrown as the request's 429.
      */
     void prefetchRows(int[] docIds) throws IOException {
         // One projection per take: the executor sets it before the
@@ -346,6 +359,13 @@ final class LanceStoredFields extends StoredFields {
             }
             return;
         }
+        // The take is judged as a path of the request that owns this
+        // reader, on the ticket the fragment path's searcher handed the
+        // reader's column cache; a leaf without one (the shard engine's
+        // reader, a test) is judged without a ticket and refused the
+        // same way.
+        LanceShardColumnCache columnCache = leaf.shardColumnCache();
+        LanceHitsAccounting ticket = columnCache == null ? null : columnCache.admissionTicket();
         for (int from = 0; from < addresses.size(); from += TAKE_CHUNK) {
             List<Long> chunk = addresses.subList(from, Math.min(from + TAKE_CHUNK, addresses.size()));
             StringBuilder sql = new StringBuilder(chunk.size() * 12 + 16).append("_rowaddr IN (");
@@ -361,6 +381,12 @@ final class LanceStoredFields extends StoredFields {
                 .filter(sql.toString())
                 .withRowAddress(true)
                 .build();
+            // Judged before the scan opens, on the rows this chunk takes
+            // and the columns it projects (a row the fetch cache served
+            // is not in the chunk); bracketed as one gated scan so the
+            // pool samples what the take leaves behind.
+            ScanAdmission.admitFetchTake(dataset.uri(), dataset, takeColumns, chunk.size(), ticket);
+            ScanAdmission.scanStarted();
             // Timed from the scan's creation to its close, decoding
             // included: that is the wall time the request spends on
             // this take, and what the node's fetch counters report.
@@ -391,6 +417,7 @@ final class LanceStoredFields extends StoredFields {
             } catch (Exception e) {
                 throw new IOException(e);
             } finally {
+                ScanAdmission.scanFinished();
                 long elapsed = System.nanoTime() - start;
                 FetchTakeStats.record(FetchTakeStats.Kind.STORED_FIELDS, chunk.size(), takeColumns.size(), elapsed, leaf.takeAccumulator());
                 // Off by default; a debug logger on this class names the

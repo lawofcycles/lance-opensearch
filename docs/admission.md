@@ -31,7 +31,7 @@ The two `lance.test.*` settings are described under [Tables above the Lucene doc
 - A request that runs several gated paths (a filter under a knn, a filtered aggregate) is judged per path in order and counts once in flight.
 - A 429 on a table whose scan does not fit the node is the designed outcome. The coefficients are a model, fitted to measurements as they come in.
 
-What Lance allocates that the breakers do not see: an inverted index document set or the matching pages of a BTree that do not fit one index cache shard, the IVF partitions a nearest scan probes, the row addresses a filtered scan materialises, and the read queue and decoded batches of every scan.
+What Lance allocates that the breakers do not see: an inverted index document set or the matching pages of a BTree that do not fit one index cache shard, the IVF partitions a nearest scan probes, the row addresses a filtered scan materialises, the read queue and decoded batches of every scan, and the batches of the take that reads a page's rows.
 
 ## Estimators
 
@@ -99,6 +99,16 @@ The scans that read a column into the off-heap column store or into heap when an
   - The shard engine's reader carries no request ticket. Its column loads are judged and recorded the same way, but a refusal is logged at WARN and the load runs, because nothing would answer the 429 and the column has to be read.
 - The heap copy: the request breaker judges it before the allocation (`lance_heap_column:<column>`, see [limitations.md](limitations.md)) and the gate records the charge and the refusal under this kind.
 
+### `fetch_take`
+
+The take by row address that reads the projected columns of a page's hits (`_rowaddr IN (...)`, one scan per chunk of at most 4096 hits per fragment). Zero when the chunk's batches fit the shard share.
+
+- The estimate is the chunk's rows times the row width, doubled for the batches in flight. The row width is the sum of the projected columns' Arrow widths (32 bytes for a string, `dimension × 4` for a float32 vector, the numeric type's width) plus the 8 byte row address. The projection is what the request renders: the surfaced columns its `_source` filter and `fields` keep, plus the primary key for `_id`. A row the fetch cache serves is not in the chunk, so a page served from the cache opens no take and is not judged.
+- Lance answers the predicate as a take, so nothing is materialised beyond the rows asked for and no read queue fills ahead of them. The heap copy of the decoded rows is not in the estimate; the heap the fetch cache keeps of them is bounded by `lance.fetch_cache.size`.
+- Judged before the chunk's scan opens, on the request's ticket, so a refusal is the request's 429. A page of a million rows (`index.max_result_window` raised, or a deep `search_after`) rendering a text body and a 1024 dimension embedding on a node reading 8 GB available with the default headroom reads: `[lance_admission] fetch_take estimate [7.7gb] exceeds available [0b] minus headroom [8gb] plus [0b] retained by earlier admitted scans: fetch take over [perf1b]: taking 1000000 rows of 2 columns for the page at [4kb] per row (the columns' Arrow widths plus the row address), doubled for the batches in flight, against an index cache shard of [1gb]. Narrow _source or fields, or lower size, or relax lance.admission.headroom / lance.admission.enabled.`
+  - Where the figure comes from: a Utf8 body at 32 bytes, a 1024 dimension float32 embedding at 4096 bytes and the row address at 8 bytes are 4136 bytes per row; a million rows doubled are 8.27 GB, above a 1 GB shard share, against nothing left after the headroom.
+- The shard engine's reader (a `GET /<index>/_doc/<id>`) takes one row through the same path without a request ticket; a refusal is thrown all the same, because the take is the request's own work.
+
 ## Retained memory
 
 The gate keeps a per node pool of retained memory under the identity of the scan that left it, and credits that pool to the next scan of the same identity. An admitted scan leaves memory in the process after it completes: the posting lists and per partition document row ids Lance admits to its index cache next to the refused entry, and the pages the native allocator keeps after the entry is dropped. `MemAvailable` therefore reads lower after the scan than before it, while the next scan that loads the same index needs that much less fresh memory.
@@ -109,7 +119,7 @@ How the pool is filled:
 
 - When a non zero estimate is admitted with no other gated request in flight, the gate samples `MemAvailable` and the process resident set.
 - When that request's scan completes with no other gated scan running, it adds `MemAvailable` before minus `MemAvailable` after, capped by the resident set growth over the same interval (memory another process took meanwhile is not this process's to reuse).
-- Every gated scan (full text, filter, sorted page, nearest, aggregate, column load) brackets itself so the pool samples its completion.
+- Every gated scan (full text, filter, sorted page, nearest, aggregate, column load, fetch take) brackets itself so the pool samples its completion.
 - The pool is not credited while a gated request is in flight or a gated scan runs (that memory is in use), nor when the process resident set exceeds `lance.native_memory.limit` plus the JVM heap by more than the pool (something the plugin does not account holds memory).
 
 How the pool is bounded:

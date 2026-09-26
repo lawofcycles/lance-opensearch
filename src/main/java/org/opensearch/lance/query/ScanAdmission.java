@@ -159,7 +159,9 @@ public final class ScanAdmission {
         /** The parallel scans of a pushed aggregate. */
         AGGREGATE_SCAN("aggregate_scan", "aggregate scan"),
         /** The parallel scans that read a column into the off-heap store or into heap, and the heap copy when the store had no room. */
-        COLUMN_LOAD("column_load", "column load");
+        COLUMN_LOAD("column_load", "column load"),
+        /** The take by row address that reads the projected columns of the hits a page renders, one scan per chunk of hits. */
+        FETCH_TAKE("fetch_take", "fetch take");
 
         private final String key;
         private final String description;
@@ -1483,6 +1485,43 @@ public final class ScanAdmission {
         return aggregateScanEstimateBytes(scans, scannedRows, 0L, rowWidthBytes, batchReadahead, shardShareBytes);
     }
 
+    /**
+     * The {@link Kind#FETCH_TAKE} estimate: one take by row address of
+     * {@code rows} hits streaming rows of {@code rowWidthBytes} (the
+     * projected columns' Arrow widths plus the row address, see
+     * {@link #fetchTakeRowWidthBytes}), {@code rows × rowWidthBytes ×
+     * SCAN_BUFFER_FACTOR} for the decoded batches Lance and the C data
+     * interface hold while the plugin drains the take. Lance answers
+     * the {@code _rowaddr IN (...)} predicate as a take, so nothing is
+     * materialised beyond the rows asked for and no read queue fills
+     * ahead of them. Zero when the batches fit {@code shardShareBytes},
+     * as for a filter scan.
+     *
+     * <p>The heap copy of the decoded rows is not in this term: the
+     * gate judges what Lance allocates natively, and the heap the fetch
+     * cache keeps of those rows is bounded by {@code lance.fetch_cache.size}.
+     */
+    static long fetchTakeEstimateBytes(long rows, long rowWidthBytes, long shardShareBytes) {
+        long total = (long) (Math.max(0L, rows) * Math.max(1L, rowWidthBytes) * SCAN_BUFFER_FACTOR);
+        return total <= shardShareBytes ? 0L : total;
+    }
+
+    /**
+     * Bytes one row of a take that projects {@code columns} occupies in
+     * its Arrow batches: the sum of {@link #columnWidthBytes(List, String)}
+     * over the columns plus {@link #ROW_ADDRESS_BYTES} for the
+     * {@code _rowaddr} the take carries with every row.
+     */
+    static long fetchTakeRowWidthBytes(List<Field> fields, List<String> columns) {
+        long width = ROW_ADDRESS_BYTES;
+        if (columns != null) {
+            for (String column : columns) {
+                width += columnWidthBytes(fields, column);
+            }
+        }
+        return width;
+    }
+
     /** Lance's {@code batch_readahead} default: the compute CPU count, which is what the JVM sees as available processors. */
     static int batchReadahead() {
         return NativeMemoryLimit.availableCpus();
@@ -2443,6 +2482,78 @@ public final class ScanAdmission {
         if (refused) {
             REJECTIONS.get(Kind.COLUMN_LOAD).incrementAndGet();
         }
+    }
+
+    /**
+     * Gate one take by row address of {@code chunkRows} hits projecting
+     * {@code takeColumns} of {@code dataset}, the scan the stored
+     * fields path opens for each chunk of a page's hits: the
+     * {@link Kind#FETCH_TAKE} estimate of the chunk's rows at the
+     * columns' Arrow widths plus the row address, read from the
+     * dataset's schema. No heap term. The scan's identity for the
+     * retained pool is the table and the columns taken, so a repeat of
+     * a page with the same projection is credited what the earlier one
+     * left behind.
+     *
+     * <p>A refusal is thrown as the request's 429 whether or not
+     * {@code ticket} (the request's {@link LanceHitsAccounting}, which
+     * the fragment path's searcher attaches to its reader) is present:
+     * the take is the request's own work, and a page whose rows cannot
+     * be read is not a page the request can answer. With the ticket an
+     * admitted non zero estimate counts the request in flight once with
+     * its other gated paths; without one (the shard engine's reader
+     * serving a single document) it counts on the calling thread until
+     * {@link #requestEnded()} runs there.
+     */
+    public static void admitFetchTake(
+        String indexName,
+        Dataset dataset,
+        List<String> takeColumns,
+        int chunkRows,
+        LanceHitsAccounting ticket
+    ) {
+        if (!enabled) {
+            return;
+        }
+        admitFetchTake(indexName, dataset.uri(), dataset.getSchema().getFields(), takeColumns, chunkRows, ticket);
+    }
+
+    /**
+     * {@link #admitFetchTake(String, Dataset, List, int, LanceHitsAccounting)}
+     * with the schema's {@code fields} given and {@code table} naming the
+     * table in the scan's identity, so a test can judge a shape without
+     * a dataset.
+     */
+    static void admitFetchTake(
+        String indexName,
+        String table,
+        List<Field> fields,
+        List<String> takeColumns,
+        long chunkRows,
+        LanceHitsAccounting ticket
+    ) {
+        if (!enabled) {
+            return;
+        }
+        long shardShare = shardShareBytes();
+        long rowWidthBytes = fetchTakeRowWidthBytes(fields, takeColumns);
+        long estimate = fetchTakeEstimateBytes(chunkRows, rowWidthBytes, shardShare);
+        int columns = takeColumns == null ? 0 : takeColumns.size();
+        String what = "fetch take over ["
+            + indexName
+            + "]: taking "
+            + Math.max(0L, chunkRows)
+            + " rows of "
+            + columns
+            + " columns for the page at ["
+            + NativeMemoryLimit.humanReadable(rowWidthBytes)
+            + "] per row (the columns' Arrow widths plus the row address), doubled for the batches in flight, against an index cache "
+            + "shard of ["
+            + NativeMemoryLimit.humanReadable(shardShare)
+            + "]";
+        String remedy = "Narrow _source or fields, or lower size, or relax lance.admission.headroom / lance.admission.enabled.";
+        Scope scope = new Scope(Kind.FETCH_TAKE, table, takeColumns == null ? Set.of() : new HashSet<>(takeColumns));
+        judge(scope, estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
     }
 
     /**
