@@ -143,7 +143,7 @@ public final class ScanAdmission {
      * and the changelog use.
      */
     public enum Kind {
-        /** A full text scan over an inverted index (the document set rebuild plus the hits scan buffers). */
+        /** A full text scan over an inverted index (the document set rebuild, the row addresses of its SQL prefilter, plus the hits scan buffers). */
         FTS("fts", "full text scan"),
         /** The load of a scalar index (BTree pages, bitmaps, a zone map) that answers a filter. */
         SCALAR_INDEX("scalar_index", "scalar index load"),
@@ -989,24 +989,36 @@ public final class ScanAdmission {
      * clause of a Lance boolean or boost query: Lance runs one search
      * per clause, each over the whole index, and joins their results)
      * how many of those clauses are phrases, each of which reads the
-     * positions of its tokens' postings, and the columns the clauses
+     * positions of its tokens' postings, the columns the clauses
      * search (each column has its own inverted index; the set names the
      * document sets the scan rebuilds, which is what the retained pool
-     * keys the scan's identity on).
+     * keys the scan's identity on), and the Lance SQL prefilter of the
+     * scan when a {@code bool} was collapsed into one {@link
+     * LanceFtsQuery} with scalar clauses ({@code null} without one;
+     * the first one when several full text scans carry one). Lance
+     * evaluates the prefilter before the inverted index lookup and
+     * materialises the row addresses it selects, which the estimate
+     * charges on top of the document set.
      */
-    public record Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows, int clauses, int phraseClauses, Set<
-        String> columns) {
+    public record Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows, int clauses, int phraseClauses, Set<String> columns,
+        String prefilterSql) {
 
         /** A query tree without a full-text clause; never gated. */
-        public static final Shape NONE = new Shape(false, false, 0L, 0, 0, Set.of());
+        public static final Shape NONE = new Shape(false, false, 0L, 0, 0, Set.of(), null);
 
         public Shape {
             columns = columns == null ? Set.of() : Set.copyOf(columns);
+            prefilterSql = prefilterSql == null || prefilterSql.isEmpty() ? null : prefilterSql;
         }
 
-        /** A shape whose columns are not named. */
+        /** A shape without a prefilter. */
+        public Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows, int clauses, int phraseClauses, Set<String> columns) {
+            this(hasFtsClause, unbounded, boundedScanRows, clauses, phraseClauses, columns, null);
+        }
+
+        /** A shape whose columns are not named, without a prefilter. */
         public Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows, int clauses, int phraseClauses) {
-            this(hasFtsClause, unbounded, boundedScanRows, clauses, phraseClauses, Set.of());
+            this(hasFtsClause, unbounded, boundedScanRows, clauses, phraseClauses, Set.of(), null);
         }
 
         /** A shape of one non phrase clause (a single {@code match}) whose column is not named. */
@@ -1056,17 +1068,21 @@ public final class ScanAdmission {
         boolean unbounded = trackTotalHitsAccurate;
         long boundedScanRows = 0L;
         Set<String> columns = new HashSet<>();
+        String prefilterSql = null;
         for (LanceFtsQuery fts : found) {
             clauses += leafClauses(fts.fullTextQuery());
             phraseClauses += phraseClauses(fts.fullTextQuery());
             columns.addAll(fts.columns());
+            if (prefilterSql == null) {
+                prefilterSql = fts.scanFilterSql();
+            }
             if (fts.scanLimit() == LanceFtsQuery.SCAN_LIMIT_UNBOUNDED) {
                 unbounded = true;
             } else {
                 boundedScanRows = Math.max(boundedScanRows, fts.scanLimit());
             }
         }
-        return new Shape(true, unbounded, unbounded ? 0L : boundedScanRows, Math.max(1, clauses), phraseClauses, columns);
+        return new Shape(true, unbounded, unbounded ? 0L : boundedScanRows, Math.max(1, clauses), phraseClauses, columns, prefilterSql);
     }
 
     /**
@@ -1177,6 +1193,46 @@ public final class ScanAdmission {
         }
         long positions = Math.max(0, phraseClauses) * Math.max(0L, rows) * PHRASE_POSITION_BYTES_PER_ROW;
         return entry * Math.max(1, clauses) + positions + Math.max(0L, scanBufferBytes);
+    }
+
+    /**
+     * Rows the SQL prefilter of a full text scan over a table of
+     * {@code rows} rows is expected to select: one row in five
+     * ({@link #FILTER_MATCH_RATIO_UNKNOWN}), zero without a prefilter.
+     * The full text gate judges the table's rows and has no table
+     * statistics at hand, so the ratio is the one the filter
+     * estimators fall back to for a predicate without a distinct
+     * count, which is what a range predicate gets from them as well.
+     */
+    static long ftsPrefilterRows(long rows, String prefilterSql) {
+        if (prefilterSql == null || prefilterSql.isEmpty()) {
+            return 0L;
+        }
+        return (long) (Math.max(0L, rows) * FILTER_MATCH_RATIO_UNKNOWN);
+    }
+
+    /**
+     * The row addresses the SQL prefilter of a full text scan
+     * materialises before the inverted index lookup:
+     * {@link #ftsPrefilterRows} times
+     * {@link #FILTER_SCAN_BYTES_PER_MATCHING_ROW}, the term the filter
+     * scan and the pushed aggregate charge for the same
+     * {@code MaterializeIndexExec}; zero without a prefilter and zero
+     * when the set fits {@code shardShareBytes}.
+     *
+     * <p>Why it is charged: {@code bool(match body w000100, range price
+     * >= 100) size 10} over 1B rows was admitted at the document set
+     * alone, 48.4 GB, the same as the bare {@code match} page that
+     * completed on the same nodes, and killed every node of a 4 node
+     * cluster at a resident set of 128 GB; on 6 nodes the same
+     * request left 0.7 GB of the 89.8 GB available before it. The
+     * difference to the bare page is the prefilter, and 1B rows at one
+     * in five and 256 bytes is 51.2 GB, within the 40 to 60 GB the
+     * two layouts measured beyond the document set.
+     */
+    static long ftsPrefilterEstimateBytes(long rows, String prefilterSql, long shardShareBytes) {
+        long materialised = ftsPrefilterRows(rows, prefilterSql) * FILTER_SCAN_BYTES_PER_MATCHING_ROW;
+        return materialised <= shardShareBytes ? 0L : materialised;
     }
 
     /**
@@ -1742,7 +1798,9 @@ public final class ScanAdmission {
      */
     public static void admit(String indexName, long rows, Shape shape, LanceHitsAccounting ticket) {
         long shardShare = shardShareBytes();
-        long estimate = ftsEstimateBytes(rows, shape.clauses(), shape.phraseClauses(), scanBufferEstimateBytes(rows, shape), shardShare);
+        long prefilter = ftsPrefilterEstimateBytes(rows, shape.prefilterSql(), shardShare);
+        long estimate = ftsEstimateBytes(rows, shape.clauses(), shape.phraseClauses(), scanBufferEstimateBytes(rows, shape), shardShare)
+            + prefilter;
         int clauses = Math.max(1, shape.clauses());
         String what = (shape.unbounded() ? "unbounded full text scan" : "bounded full text page")
             + " over ["
@@ -1757,13 +1815,23 @@ public final class ScanAdmission {
                     + "]"
                     + (shape.phraseClauses() > 1 ? " for each of " + shape.phraseClauses() + " phrase clauses" : "")
                 : "")
+            + (shape.prefilterSql() != null
+                ? " plus the prefilter ["
+                    + shape.prefilterSql()
+                    + "] materialising "
+                    + ftsPrefilterRows(rows, shape.prefilterSql())
+                    + " row addresses over the whole table at ["
+                    + NativeMemoryLimit.humanReadable(FILTER_SCAN_BYTES_PER_MATCHING_ROW)
+                    + "] each"
+                : "")
             + " against an index cache shard of ["
             + NativeMemoryLimit.humanReadable(shardShare)
             + "] plus the hits scan buffers";
         String remedy = shape.unbounded()
             ? "Bound the shape (a top k page without sort or aggregations), attach the table to a node with a larger index cache, "
                 + "or relax lance.admission.headroom / lance.admission.enabled."
-            : "Attach the table to a node with a larger index cache, or relax lance.admission.bounded_shapes_gated / "
+            : (shape.prefilterSql() != null ? "Drop the scalar filter, attach" : "Attach")
+                + " the table to a node with a larger index cache, or relax lance.admission.bounded_shapes_gated / "
                 + "lance.admission.headroom / lance.admission.enabled.";
         judge(new Scope(Kind.FTS, indexName, shape.columns()), estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
     }

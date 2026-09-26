@@ -39,12 +39,14 @@ One estimator per kind, each a static method of `ScanAdmission` with its coeffic
 
 ### `fts`
 
-A full text scan. The estimate is the sum of three parts; it is zero when one document set fits the shard share.
+A full text scan. The estimate is the sum of four parts; the first three are zero when one document set fits the shard share, the fourth when it fits the shard share on its own.
 
 - The document set rebuild, `rows × 52 bytes`, over whichever fragments the scan keeps, once per full text clause. Lance searches every `match`, `match_phrase` and `multi_match` column of a `lance_fts_bool`, a fused stock `bool` or a `lance_fts_boost` on its own and holds each result while it joins them, so `bool(must [match, match])` counts two document sets.
 - The positions of each `match_phrase` clause's tokens, `rows × 48 bytes` per phrase clause (`PHRASE_POSITION_BYTES_PER_ROW`).
   - Why positions are counted: the phrase `w000000 w000001 size 10` over 1B rows peaked at 103 GB on one 128 GB node and killed every node of a 4 node cluster after being admitted at the document set alone.
 - The hits scan buffers: one row in ten of the table for an unbounded shape, the top-k limit for a bounded page, at 12 bytes per row, doubled.
+- The row addresses the scan's SQL prefilter materialises when a `bool` with scalar `filter` / `must_not` clauses was fused into one Lance scan: one row in five of the table (`FILTER_MATCH_RATIO_UNKNOWN`) at 256 bytes each (`FILTER_SCAN_BYTES_PER_MATCHING_ROW`), the same term `filter_scan` and `aggregate_scan` charge for Lance's `MaterializeIndexExec`. The 429 message names the prefilter (`plus the prefilter [price >= 100.0] materialising 200000000 row addresses`).
+  - Why the prefilter is counted: `bool(match body w000100, range price >= 100) size 10` over 1B rows was admitted at the 48.4 GB of the bare `match` page, which completed on the same nodes, and killed every node of a 4 node cluster (resident set 128 GB); on 6 nodes it ran down to 0.7 GB of the 89.8 GB available. 1B rows at one in five and 256 bytes is 51.2 GB, which refuses the shape on a 128 GB node.
 
 ### `scalar_index`
 

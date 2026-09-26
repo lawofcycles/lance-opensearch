@@ -1618,7 +1618,9 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         // bool(must [match w000100, match w000200], filter range price
         // >= 50) size 10, fused into one Lance boolean query with a
         // prefilter: two clauses, each searched over the whole index,
-        // 104 GB of document sets against 88 GB after the headroom.
+        // 104 GB of document sets, plus the 200M row addresses the
+        // prefilter materialises at 256 bytes, against 88 GB after the
+        // headroom.
         perf1bNode(PERF1B_AVAILABLE_FRESH_NODE);
         FullTextQuery fused = FullTextQuery.booleanQuery(
             List.of(
@@ -1632,23 +1634,87 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         assertEquals(0, shape.phraseClauses());
         assertFalse(shape.unbounded());
         assertEquals(10L, shape.boundedScanRows());
-        long expected = 2L * NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS) + 10L * 12L * 2L;
-        assertEquals(104_000_000_240L, expected);
+        assertEquals("price >= 50.0", shape.prefilterSql());
+        long expected = 2L * NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS) + 10L * 12L * 2L + 200_000_000L * 256L;
+        assertEquals(155_200_000_240L, expected);
         CircuitBreakingException rejection = expectThrows(
             CircuitBreakingException.class,
             () -> ScanAdmission.admit("perf1b", PERF1B_ROWS, shape)
         );
         assertTrue(rejection.getMessage(), rejection.getMessage().contains("rebuilt for each of 2 full text clauses"));
+        assertTrue(
+            rejection.getMessage(),
+            rejection.getMessage().contains("plus the prefilter [price >= 50.0] materialising 200000000 row addresses")
+        );
         assertEquals(expected, ScanAdmission.lastEstimateBytes());
         // The same two clauses spelled as two Lucene clauses (the shape
         // the resolver leaves under dis_max or a nested bool) count the
-        // same, unbounded there.
+        // same, unbounded there and without a prefilter.
         BooleanQuery lucene = new BooleanQuery.Builder().add(new LanceFtsQuery("body", "w000100"), BooleanClause.Occur.MUST)
             .add(new LanceFtsQuery("body", "w000200"), BooleanClause.Occur.MUST)
             .build();
         ScanAdmission.Shape nested = ScanAdmission.classify(lucene, false);
         assertEquals(2, nested.clauses());
         assertTrue(nested.unbounded());
+        assertNull(nested.prefilterSql());
+    }
+
+    public void testBoundedMatchPageWithARangePrefilterOverPerf1bIsRefusedOnAFreshNode() {
+        // bool(must [match w000100], filter range price >= 100) size
+        // 10: the document set of the bare match page, 48.4 GB, which
+        // completed six times on the 4 node cluster, plus the 200M row
+        // addresses the prefilter materialises at 256 bytes, 51.2 GB,
+        // against 88 GB after the headroom. Admitted at the document
+        // set alone the shape killed every node of the 4 node cluster
+        // and three of six.
+        perf1bNode(PERF1B_AVAILABLE_FRESH_NODE);
+        LanceFtsQuery bare = new LanceFtsQuery("body", "w000100").withScanLimit(10);
+        ScanAdmission.Shape bareShape = ScanAdmission.classify(bare, false);
+        assertNull(bareShape.prefilterSql());
+        ScanAdmission.admit("perf1b", PERF1B_ROWS, bareShape);
+        long bareEstimate = ScanAdmission.lastEstimateBytes();
+        assertEquals(NativeMemoryLimit.invertedIndexEntryEstimateBytes(PERF1B_ROWS) + 10L * 12L * 2L, bareEstimate);
+        ScanAdmission.requestEnded();
+
+        ScanAdmission.Shape filtered = ScanAdmission.classify(bare.withScanFilterSql("price >= 100.0"), false);
+        assertEquals("price >= 100.0", filtered.prefilterSql());
+        assertEquals(1, filtered.clauses());
+        assertEquals(10L, filtered.boundedScanRows());
+        long expected = bareEstimate + 200_000_000L * 256L;
+        assertEquals(103_200_000_240L, expected);
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("perf1b", PERF1B_ROWS, filtered)
+        );
+        assertTrue(rejection.getMessage(), rejection.getMessage().startsWith("[" + ScanAdmission.LABEL + "] fts estimate [96.1gb]"));
+        assertTrue(
+            rejection.getMessage(),
+            rejection.getMessage()
+                .contains("plus the prefilter [price >= 100.0] materialising 200000000 row addresses over the whole table at [256b] each")
+        );
+        assertTrue(rejection.getMessage(), rejection.getMessage().contains("Drop the scalar filter"));
+        assertEquals(expected, ScanAdmission.lastEstimateBytes());
+        assertEquals(1L, ScanAdmission.rejections());
+    }
+
+    public void testFtsPrefilterTermIsTheUnknownShareAtTheFilterScanRowCostAndFitsTheShardShareOnSmallTables() {
+        assertEquals(0L, ScanAdmission.ftsPrefilterRows(PERF1B_ROWS, null));
+        assertEquals(0L, ScanAdmission.ftsPrefilterRows(PERF1B_ROWS, ""));
+        assertEquals(200_000_000L, ScanAdmission.ftsPrefilterRows(PERF1B_ROWS, "price >= 100.0"));
+        assertEquals(0L, ScanAdmission.ftsPrefilterEstimateBytes(PERF1B_ROWS, null, 8 * GB));
+        assertEquals(51_200_000_000L, ScanAdmission.ftsPrefilterEstimateBytes(PERF1B_ROWS, "price >= 100.0", 8 * GB));
+        // 20M rows: 4M row addresses at 256 bytes is 1 GB, within the shard share.
+        assertEquals(0L, ScanAdmission.ftsPrefilterEstimateBytes(20_000_000L, "price >= 100.0", 8 * GB));
+        // A prefiltered page over a table whose document set fits the
+        // shard share is admitted at zero like the bare page.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setAvailableMemoryOverride(List.of("0b"));
+        ScanAdmission.Shape small = ScanAdmission.classify(
+            new LanceFtsQuery("body", "hello").withScanLimit(10).withScanFilterSql("price >= 100.0"),
+            false
+        );
+        ScanAdmission.admit("demo", 20_000_000L, small);
+        assertEquals(0L, ScanAdmission.lastEstimateBytes());
     }
 
     public void testBoolOfTwoPhrasesChargesThePositionsOfEachPhrase() {
