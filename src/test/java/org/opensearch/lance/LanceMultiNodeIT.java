@@ -2726,6 +2726,117 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    /**
+     * The fetch cache is per data node and holds the rows of the
+     * fragments that node executed: after a page over every row, each
+     * of the three nodes holds the cells of its own fragments' rows and
+     * none of the others', and the repeat of the page is served on every
+     * node without a take, whichever node coordinates it (the fragments
+     * are assigned by a round robin over the node ids, so a fragment's
+     * rows are always fetched on the same node).
+     */
+    public void testFetchCacheHoldsEachNodesOwnRowsAndServesTheRepeatOnEveryNode() throws Exception {
+        String suffix = "mn-fcache-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int rows = 24;
+        int fragments = 12;
+        int columns = 3;
+        String tableUri = LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, rows, rows / fragments);
+        String indexName = tableName;
+        try {
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals("fixture assumes several fragments per data node", 3, dataNodeCount());
+            Map<String, Map<String, Object>> before = fetchCacheByNode();
+            assertEquals(3, before.size());
+
+            String body = "{\"size\":" + rows + ",\"profile\":true,\"sort\":[{\"id\":\"desc\"}],\"query\":{\"match_all\":{}}}";
+            Map<String, Object> first = parse(readAll(postJson("/" + indexName + "/_search", body)));
+            List<Integer> expectedIds = new ArrayList<>();
+            for (int id = rows - 1; id >= 0; id--) {
+                expectedIds.add(id);
+            }
+            assertEquals(expectedIds, sourceIds(first));
+            long firstTakes = 0L;
+            for (Map<String, Object> node : profileNodes(first).values()) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> fetch = (Map<String, Object>) node.get("fetch");
+                firstTakes += ((Number) fetch.get("take_count")).longValue();
+            }
+            assertEquals("one take per leaf on the first page", fragments, firstTakes);
+            Map<String, Map<String, Object>> afterFirst = fetchCacheByNode();
+            long entries = 0L;
+            for (Map.Entry<String, Map<String, Object>> node : afterFirst.entrySet()) {
+                long nodeEntries = counter(node.getValue(), "entries") - counter(before.get(node.getKey()), "entries");
+                assertEquals(
+                    "each node holds the cells of its own fragments' rows: " + afterFirst,
+                    (long) (rows / 3) * columns,
+                    nodeEntries
+                );
+                assertEquals(0L, counter(node.getValue(), "hits") - counter(before.get(node.getKey()), "hits"));
+                entries += nodeEntries;
+            }
+            assertEquals("the nodes together hold every cell once", (long) rows * columns, entries);
+
+            // The repeat, coordinated by another node: every executor
+            // finds its rows and takes nothing.
+            List<HttpHost> hosts = getClusterHosts();
+            String coordinator = localNodeId(client());
+            HttpHost otherHost = null;
+            for (HttpHost candidate : hosts) {
+                try (RestClient probe = buildClient(restClientSettings(), new HttpHost[] { candidate })) {
+                    if (!localNodeId(probe).equals(coordinator)) {
+                        otherHost = candidate;
+                        break;
+                    }
+                }
+            }
+            assertNotNull("another node among " + hosts, otherHost);
+            Map<String, Object> second;
+            try (RestClient other = buildClient(restClientSettings(), new HttpHost[] { otherHost })) {
+                second = parse(readAll(post(other, "/" + indexName + "/_search", body)));
+            }
+            assertEquals(expectedIds, sourceIds(second));
+            assertEquals(hitList(first), hitList(second));
+            assertEquals("every data node executed: " + second, 3, profileNodes(second).size());
+            for (Map<String, Object> node : profileNodes(second).values()) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> fetch = (Map<String, Object>) node.get("fetch");
+                assertEquals("the repeat takes nothing: " + second, 0L, ((Number) fetch.get("take_count")).longValue());
+            }
+            Map<String, Map<String, Object>> afterSecond = fetchCacheByNode();
+            for (Map.Entry<String, Map<String, Object>> node : afterSecond.entrySet()) {
+                Map<String, Object> was = afterFirst.get(node.getKey());
+                assertEquals(
+                    "each node served its own rows: " + afterSecond,
+                    rows / 3,
+                    counter(node.getValue(), "rows_served") - counter(was, "rows_served")
+                );
+                assertEquals((long) (rows / 3) * columns, counter(node.getValue(), "hits") - counter(was, "hits"));
+                assertEquals("nothing new was stored", counter(was, "entries"), counter(node.getValue(), "entries"));
+            }
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** The {@code fetch_cache} object of every node in {@code GET /_lance/stats}, keyed by node id. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Map<String, Object>> fetchCacheByNode() throws IOException {
+        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
+        Map<String, Map<String, Object>> byNode = new HashMap<>();
+        for (Map.Entry<String, Object> node : nodes.entrySet()) {
+            Map<String, Object> block = (Map<String, Object>) ((Map<String, Object>) node.getValue()).get("fetch_cache");
+            assertNotNull("fetch_cache block of " + node.getKey() + ": " + parsed, block);
+            byNode.put(node.getKey(), block);
+        }
+        return byNode;
+    }
+
     /** The {@code profile.lance.nodes} object of a fragment path response, node id to its figures. */
     @SuppressWarnings("unchecked")
     private static Map<String, Map<String, Object>> profileNodes(Map<String, Object> response) {

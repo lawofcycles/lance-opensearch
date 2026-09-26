@@ -14,14 +14,16 @@ import org.opensearch.action.support.nodes.TransportNodesAction;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.lance.engine.LanceFetchCache;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 /**
  * Serves {@link LanceRequestCacheClearAction}: every node drops the
  * entries of the named indexes from its {@link LanceRequestCache} and
- * answers how many it dropped. The per node work walks the cache's keys
- * once and runs on the management pool, off the transport worker.
+ * its {@link LanceFetchCache} and answers how many it dropped. The per
+ * node work walks each cache's keys once and runs on the management
+ * pool, off the transport worker.
  */
 public final class TransportLanceRequestCacheClearAction extends TransportNodesAction<
     LanceRequestCacheClearRequest,
@@ -30,6 +32,7 @@ public final class TransportLanceRequestCacheClearAction extends TransportNodesA
     LanceRequestCacheClearNodeResponse> {
 
     private final LanceRequestCache requestCache;
+    private final LanceFetchCache fetchCache;
 
     @Inject
     public TransportLanceRequestCacheClearAction(
@@ -37,7 +40,8 @@ public final class TransportLanceRequestCacheClearAction extends TransportNodesA
         ClusterService clusterService,
         TransportService transportService,
         ActionFilters actionFilters,
-        LanceRequestCache requestCache
+        LanceRequestCache requestCache,
+        LanceFetchCache fetchCache
     ) {
         super(
             LanceRequestCacheClearAction.NAME,
@@ -51,6 +55,7 @@ public final class TransportLanceRequestCacheClearAction extends TransportNodesA
             LanceRequestCacheClearNodeResponse.class
         );
         this.requestCache = requestCache;
+        this.fetchCache = fetchCache;
     }
 
     @Override
@@ -74,6 +79,7 @@ public final class TransportLanceRequestCacheClearAction extends TransportNodesA
 
     @Override
     protected LanceRequestCacheClearNodeResponse nodeOperation(LanceRequestCacheClearNodeRequest request) {
-        return new LanceRequestCacheClearNodeResponse(clusterService.localNode(), requestCache.invalidateIndexes(request.indexUuids()));
+        int dropped = requestCache.invalidateIndexes(request.indexUuids()) + fetchCache.invalidateIndexes(request.indexUuids());
+        return new LanceRequestCacheClearNodeResponse(clusterService.localNode(), dropped);
     }
 }

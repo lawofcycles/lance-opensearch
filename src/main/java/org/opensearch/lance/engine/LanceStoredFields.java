@@ -68,7 +68,11 @@ import org.opensearch.lance.engine.LanceFragmentSchema.TakeProjection;
  * plus the primary key for {@code _id}), so the cost of a page is
  * proportional to {@code size} and to the columns asked for, not to
  * the fragment's row count or the table's width. Every take scan is
- * counted and timed in {@link FetchTakeStats}.
+ * counted and timed in {@link FetchTakeStats}. On a leaf the fragment
+ * hits phase marked eligible, the rows go through the node's
+ * {@link LanceFetchCache} first: a row whose projected cells the cache
+ * holds from an earlier request is rendered without a take, and every
+ * row a take returns is written back per cell.
  *
  * <p>Owns the request scoped rows taken so far and the decoding of
  * take batches (scalars, structs, nested arrays, geo points, binary).
@@ -151,6 +155,24 @@ final class LanceStoredFields extends StoredFields {
      */
     private volatile TakeProjection projection;
     /**
+     * The node's fetch cache seen from the table version this leaf
+     * reads, or null when the node runs without one or the leaf was not
+     * opened over a snapshot. Set once by the reader that opens the leaf
+     * ({@link #setFetchCache}); whether this leaf may use it is decided
+     * per request by {@link #fetchCacheEligible}.
+     */
+    private volatile LanceFetchCache.Table fetchTable;
+    /**
+     * Whether the rows this leaf takes may be read from and written to
+     * {@link #fetchTable}: {@code TRUE} once the fragment hits phase has
+     * seen that only the plugin's own and OpenSearch's readers sit above
+     * this leaf, {@code FALSE} when a foreign reader wrapper (the security
+     * plugin's document and field level security) does, and null while
+     * nobody decided (the shard engine's reader, a test), which uses the
+     * cache neither way. See {@link #setFetchCacheEligible}.
+     */
+    private volatile Boolean fetchCacheEligible;
+    /**
      * Top-level Struct column names with at least one surfaced child.
      * The row take projects the whole struct under the parent name;
      * {@link #decodeTakeValue} turns it into a nested map so
@@ -203,6 +225,35 @@ final class LanceStoredFields extends StoredFields {
         return projection;
     }
 
+    /**
+     * Attach the node's fetch cache seen from the table version this
+     * leaf reads. The reader that opens the leaf over a snapshot calls
+     * this once; the rows this leaf takes are then read from and written
+     * to the cache as soon as {@link #setFetchCacheEligible} allows it.
+     */
+    void setFetchCache(LanceFetchCache.Table table) {
+        this.fetchTable = table;
+    }
+
+    /** The fetch cache view attached to this leaf, or null; for tests. */
+    LanceFetchCache.Table fetchCache() {
+        return fetchTable;
+    }
+
+    /**
+     * Decide whether this leaf's rows may go through the fetch cache. The
+     * fragment hits phase passes {@code true} when the request's reader
+     * chain above this leaf holds only the plugin's own and OpenSearch's
+     * readers, and {@code false} when another plugin's reader wrapper
+     * sits above it: the security plugin's document and field level
+     * security hides fields after the row is rendered, so a row it
+     * rendered for one user must not be handed to the next from the
+     * cache. The rows of an ineligible leaf are counted as skipped.
+     */
+    void setFetchCacheEligible(boolean eligible) {
+        this.fetchCacheEligible = eligible;
+    }
+
     @Override
     public void document(int docID, StoredFieldVisitor visitor) throws IOException {
         materialiseStoredFields(docID, visitor);
@@ -236,27 +287,54 @@ final class LanceStoredFields extends StoredFields {
      * were produced by a scan that already applied it (or by Lucene
      * iteration the caller chose), so re-applying it could only drop
      * rows the caller has decided to return.
+     *
+     * <p>When the leaf is eligible for the node's fetch cache (see
+     * {@link #setFetchCacheEligible}) every requested row is looked up
+     * first, per projected column: a row whose every column the cache
+     * holds is rendered from the cache and left out of the take, a row
+     * the cache knows the table did not have is marked missing without a
+     * take, and a row with any column absent is taken whole. Every row
+     * the take returns is written back per column, and a row the take
+     * did not return is written as a negative entry.
      */
     void prefetchRows(int[] docIds) throws IOException {
-        List<Long> addresses = new ArrayList<>(docIds.length);
-        Set<Integer> requested = new HashSet<>();
-        for (int docId : docIds) {
-            if (takenRows.containsKey(docId) || !requested.add(docId)) {
-                continue;
-            }
-            // Doc ids address rows through the layout (identity without
-            // nested columns); only parent docs reach here, because hits
-            // are parents.
-            addresses.add(((long) fragmentId << 32) | (leaf.rowOf(docId) & 0xFFFFFFFFL));
-        }
-        if (addresses.isEmpty()) {
-            return;
-        }
         // One projection per take: the executor sets it before the
         // request's first take, so every row of this request follows
         // the same column order as the rendering reads it back with.
         TakeProjection projection = this.projection;
         List<String> takeColumns = projection.columns();
+        LanceFetchCache.Table cache = this.fetchTable;
+        Boolean eligible = this.fetchCacheEligible;
+        boolean useCache = cache != null && Boolean.TRUE.equals(eligible) && !takeColumns.isEmpty();
+        List<Long> addresses = new ArrayList<>(docIds.length);
+        Set<Integer> requested = new HashSet<>();
+        int fresh = 0;
+        for (int docId : docIds) {
+            if (takenRows.containsKey(docId) || !requested.add(docId)) {
+                continue;
+            }
+            fresh++;
+            // Doc ids address rows through the layout (identity without
+            // nested columns); only parent docs reach here, because hits
+            // are parents.
+            long address = ((long) fragmentId << 32) | (leaf.rowOf(docId) & 0xFFFFFFFFL);
+            if (useCache) {
+                Object[] cached = cache.lookup(address, takeColumns);
+                if (cached != null) {
+                    takenRows.put(docId, cached);
+                    continue;
+                }
+            }
+            addresses.add(address);
+        }
+        if (cache != null && Boolean.FALSE.equals(eligible) && fresh > 0) {
+            // A reader wrapper sits above this leaf for this request: the
+            // rows are taken as before and neither read nor stored.
+            cache.skipped(fresh);
+        }
+        if (addresses.isEmpty()) {
+            return;
+        }
         if (takeColumns.isEmpty()) {
             // Nothing to project (a PK-less table whose columns are all
             // unsurfaced, or a request that renders neither _id from a
@@ -296,12 +374,16 @@ final class LanceStoredFields extends StoredFields {
                         vectors[c] = root.getVector(takeColumns.get(c));
                     }
                     for (int i = 0; i < root.getRowCount(); i++) {
-                        int offset = (int) (rowAddr.get(i) & 0xFFFFFFFFL);
+                        long address = rowAddr.get(i);
+                        int offset = (int) (address & 0xFFFFFFFFL);
                         Object[] row = new Object[vectors.length];
                         for (int c = 0; c < vectors.length; c++) {
                             row[c] = decodeTakeValue(takeColumns.get(c), vectors[c], i);
                         }
                         takenRows.put(leaf.docOfRow(offset), row);
+                        if (useCache) {
+                            cache.put(address, takeColumns, row);
+                        }
                     }
                 }
             } catch (IOException e) {
@@ -329,7 +411,11 @@ final class LanceStoredFields extends StoredFields {
             }
         }
         for (int docId : requested) {
-            takenRows.putIfAbsent(docId, MISSING_ROW);
+            if (takenRows.putIfAbsent(docId, MISSING_ROW) == null && useCache) {
+                // The take did not return the row: remember that too, so
+                // the next request does not take it again either.
+                cache.putMissing(((long) fragmentId << 32) | (leaf.rowOf(docId) & 0xFFFFFFFFL), takeColumns);
+            }
         }
     }
 

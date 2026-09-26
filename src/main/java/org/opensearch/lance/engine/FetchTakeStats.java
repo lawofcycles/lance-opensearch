@@ -17,10 +17,10 @@ import org.opensearch.lance.stats.LanceNodeStats;
  * {@link LanceStoredFields#TAKE_CHUNK} doc ids) and the sort or
  * aggregation column of a small full text or vector hit set
  * ({@code LanceColumnLoader.takeHintedRows}, one scan per chunk and
- * column). Nothing the plugin caches serves these rows, so every request
- * pays for its takes; the counters say how many scans ran, how many
- * rows and columns they asked for and how long they took, so the share
- * of a request the takes account for can be read off
+ * column). A row the node's {@link LanceFetchCache} holds is not taken,
+ * so the counters say how many scans the requests still paid for, how
+ * many rows and columns they asked for and how long they took, and the
+ * share of a request the takes account for can be read off
  * {@code GET /_lance/stats} ({@code fetch}) next to the request's
  * {@code took}.
  *

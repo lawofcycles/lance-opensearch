@@ -57,7 +57,12 @@ import org.opensearch.lance.plan.metadata.TableStatisticsCache;
  *
  * <p>Numeric and boolean column data lives next to the snapshots in a
  * {@link ColumnStore}, off-heap, keyed by the same snapshot key, so it
- * disappears with the snapshot.
+ * disappears with the snapshot. The rows behind hits live in the node's
+ * {@link LanceFetchCache}, in heap, keyed per cell on the same
+ * {@code (index uuid, version)} plus the row address and the column;
+ * each snapshot hands its leaves the cache's view of its version
+ * ({@link Snapshot#fetchTable()}) and its entries go when the snapshot
+ * closes.
  *
  * <p>Lifecycle: {@link #acquire} hands out a {@link Lease} that holds a
  * reference on the snapshot until {@link Lease#release()}. A snapshot is
@@ -250,6 +255,8 @@ public final class LanceWarmCache implements Closeable {
         private final LanceFragmentSchema schema;
         private final LanceDirectoryReader.DataFileSizes dataFileSizes;
         private final boolean cached;
+        /** The fetch cache seen from this version, or null when the node has no fetch cache. */
+        private final LanceFetchCache.Table fetchTable;
         private final AtomicInteger refCount = new AtomicInteger();
         private final AtomicBoolean retired = new AtomicBoolean();
         private final AtomicBoolean closed = new AtomicBoolean();
@@ -262,7 +269,8 @@ public final class LanceWarmCache implements Closeable {
             Set<String> ftsColumns,
             LanceFragmentSchema schema,
             LanceDirectoryReader.DataFileSizes dataFileSizes,
-            boolean cached
+            boolean cached,
+            LanceFetchCache.Table fetchTable
         ) {
             this.key = key;
             this.dataset = dataset;
@@ -276,11 +284,22 @@ public final class LanceWarmCache implements Closeable {
             this.schema = schema;
             this.dataFileSizes = dataFileSizes;
             this.cached = cached;
+            this.fetchTable = fetchTable;
             this.lastAccessNanos = System.nanoTime();
         }
 
         public SnapshotKey key() {
             return key;
+        }
+
+        /**
+         * The node's fetch cache seen from this version (the rows behind
+         * hits, per cell), or null when the node runs without one. The
+         * fragment path's leaves read and write it; see
+         * {@link LanceFetchCache}.
+         */
+        public LanceFetchCache.Table fetchTable() {
+            return fetchTable;
         }
 
         /** Lance version this snapshot reads. */
@@ -382,6 +401,8 @@ public final class LanceWarmCache implements Closeable {
 
     private final ColumnStore columnStore;
     private final TableStatisticsCache tableStatistics;
+    /** The node's cache of the rows behind hits, whose entries of a version go when its snapshot closes; null without one. */
+    private final LanceFetchCache fetchCache;
     private final int maxSnapshots;
     private volatile boolean enabled;
     /** Guarded by {@code this}. */
@@ -419,8 +440,26 @@ public final class LanceWarmCache implements Closeable {
         boolean enabled,
         Executor statisticsExecutor
     ) {
+        this(allocator, columnLimitBytes, maxSnapshots, enabled, statisticsExecutor, null);
+    }
+
+    /**
+     * @param fetchCache the node's cache of the rows behind hits, whose
+     *                   entries of a version are dropped when that
+     *                   version's snapshot closes, or null when the node
+     *                   runs without one; see {@link LanceFetchCache}
+     */
+    public LanceWarmCache(
+        BufferAllocator allocator,
+        long columnLimitBytes,
+        int maxSnapshots,
+        boolean enabled,
+        Executor statisticsExecutor,
+        LanceFetchCache fetchCache
+    ) {
         this.columnStore = new ColumnStore(allocator, columnLimitBytes);
         this.tableStatistics = new TableStatisticsCache(TableStatisticsCache.DEFAULT_MAX_ENTRIES, statisticsExecutor);
+        this.fetchCache = fetchCache;
         this.maxSnapshots = Math.max(1, maxSnapshots);
         this.enabled = enabled;
     }
@@ -611,7 +650,16 @@ public final class LanceWarmCache implements Closeable {
             );
         }
         LOGGER.debug("built snapshot {} with {} fragments", key, fragments.size());
-        return new Snapshot(key, dataset, fragments, ftsColumns, schema, LanceDirectoryReader.sumDataFileSizes(lanceFragments), cached);
+        return new Snapshot(
+            key,
+            dataset,
+            fragments,
+            ftsColumns,
+            schema,
+            LanceDirectoryReader.sumDataFileSizes(lanceFragments),
+            cached,
+            fetchCache == null ? null : fetchCache.table(key)
+        );
     }
 
     /** Take a reference on the cached snapshot for {@code key}, or return {@code null} when there is none usable. */
@@ -695,10 +743,31 @@ public final class LanceWarmCache implements Closeable {
         if (snapshot.cached && !keyServedByAnother(snapshot)) {
             columnStore.dropSnapshot(snapshot.key);
             releaseTableStatistics(snapshot);
+            releaseFetchEntries(snapshot);
         }
         snapshot.closeNow();
         snapshotCloses.incrementAndGet();
         LOGGER.debug("closed snapshot {}", snapshot.key);
+    }
+
+    /**
+     * Drop the rows the fetch cache holds of the version this snapshot
+     * read: the version was retired (the table moved on, the index was
+     * deleted) or evicted, so no request will key on it again and its
+     * cells only take room from the versions that are served.
+     */
+    private void releaseFetchEntries(Snapshot snapshot) {
+        if (fetchCache == null) {
+            return;
+        }
+        try {
+            int dropped = fetchCache.invalidate(snapshot.key.indexUuid(), snapshot.version());
+            if (dropped > 0) {
+                LOGGER.debug("dropped {} fetch cache entries of snapshot {}", dropped, snapshot.key);
+            }
+        } catch (RuntimeException e) {
+            LOGGER.debug("could not drop the fetch cache entries of snapshot {}", snapshot.key, e);
+        }
     }
 
     /**

@@ -441,6 +441,26 @@ public final class LanceFragmentLeafReader extends LeafReader {
         return storedFields.takeProjection();
     }
 
+    /**
+     * Attach the node's fetch cache seen from this leaf's table version;
+     * see {@link LanceStoredFields#setFetchCache}. The reader that opens
+     * the leaf over a snapshot calls this once.
+     */
+    void setFetchCache(LanceFetchCache.Table table) {
+        storedFields.setFetchCache(table);
+    }
+
+    /**
+     * Decide whether the rows this leaf takes go through the node's
+     * fetch cache; see {@link LanceStoredFields#setFetchCacheEligible}.
+     * The fragment hits phase calls this with the answer of
+     * {@link #wrappedOnlyByOwnReaders} for the leaf's reader chain
+     * before it prefetches the page's rows.
+     */
+    public void setFetchCacheEligible(boolean eligible) {
+        storedFields.setFetchCacheEligible(eligible);
+    }
+
     /** Publish sink for {@link LanceShardColumnCache#loadBooleanColumn}; see {@link LanceColumnLoader#publishBooleanColumn}. */
     void publishBooleanColumn(String name, long[] values, FixedBitSet presence) {
         loader.publishBooleanColumn(name, values, presence);
