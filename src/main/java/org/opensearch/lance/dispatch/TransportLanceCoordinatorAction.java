@@ -54,6 +54,7 @@ import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.execute.FragmentFanOut;
 import org.opensearch.lance.plan.execute.FragmentPlan;
+import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
 import org.opensearch.lance.plan.execute.MergeReducer;
 import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.lance.plan.execute.RequestPlanner;
@@ -731,6 +732,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 try {
                     statistics.readZoneMaps(dataset, QueryToRex.referencedFields(baseSpec.executionShape().query()));
                 } catch (RuntimeException e) {
+                    FragmentPlanRefiner.recordZoneMapFailure();
                     LOGGER.warn("lance.dispatch: zone maps of [{}] unavailable, planning without pruning", target.indexName(), e);
                 }
             }
