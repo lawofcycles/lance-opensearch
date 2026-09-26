@@ -54,8 +54,9 @@ critical only while a filter is set, because an older data node that ignored the
 without the predicate and answer wrongly, and marks its pruning block optional, because an older
 node that scans the pruned fragments too still answers correctly. `LanceNodeStats` marks its
 pruned fragment counter, its admission source, its refused mapping updates, its statistics
-progress counters, its retained pool identity, its result cache figures and its fetch take counters
-optional, because an older coordinator merely shows the stats without them.
+progress counters, its retained pool identity, its result cache figures, its fetch take counters
+and its fetch cache figures optional, because an older coordinator merely shows the stats without
+them.
 
 A block is decoded from a stream of its own bytes, so a parser that leaves bytes of the block
 unread fails the message with `<Message> wire version block [n] left k bytes unread` rather than
@@ -126,6 +127,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 6 | Block, optional: identity of the scans the admission gate's retained pool was filled by (`kind:table:columns`; fallback `none`) |
 | | 7 | Block, optional: the coordinator result cache's figures (enabled, size, limit, entries, hits, misses, evictions, invalidations, skipped; fallback disabled and zero) |
 | | 8 | Block, optional: the fetch take counters (scans, rows addressed, columns projected, milliseconds total and maximum, scans per caller; seven counters, fallback zero) |
+| | 9 | Block, optional: the fetch cache's figures (enabled, size, limit, entries, hits, misses, evictions, invalidations, skipped, rows served; fallback disabled and zero) |
 | `LanceStatsNodeRequest` | 1 | Base: nothing after the marker |
 | `LanceRequestCacheClearNodeRequest` | 1 | Base: the index uuids whose result cache entries the node drops |
 | `LanceRequestCacheClearNodeResponse` | 1 | Base: how many entries the node dropped |
