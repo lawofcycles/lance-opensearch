@@ -163,6 +163,9 @@ public class LanceProfileIT extends LanceRestTestCase {
     public void testTakeProjectsThePrimaryKeyOnATableWithADeclaredKey() throws Exception {
         // The struct table: id is the declared primary key, meta a struct
         // of region, score and flags, so the full take is two columns.
+        // The three requests read the same six rows, so the fetch cache
+        // is turned off for the test: with it on, the second and third
+        // requests would find their cells and take nothing.
         String suffix = "profilepk-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -170,6 +173,9 @@ public class LanceProfileIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String index = tableName;
         try {
+            Request off = new Request("PUT", "/_cluster/settings");
+            off.setJsonEntity("{\"transient\":{\"lance.fetch_cache.enabled\":false}}");
+            client().performRequest(off);
             Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             String nodeId = localNodeId();
@@ -205,6 +211,11 @@ public class LanceProfileIT extends LanceRestTestCase {
             assertEquals("meta and the key: " + child, 2L, number(childFetch.get("take_columns")));
             assertEquals(child, Map.of("meta", Map.of("region", "east")), hitsOf(child).get(0).get("_source"));
         } finally {
+            try {
+                Request on = new Request("PUT", "/_cluster/settings");
+                on.setJsonEntity("{\"transient\":{\"lance.fetch_cache.enabled\":null}}");
+                client().performRequest(on);
+            } catch (Exception ignored) {}
             try {
                 client().performRequest(new Request("DELETE", "/" + index));
             } catch (Exception ignored) {}

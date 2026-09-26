@@ -25,6 +25,7 @@ import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.ReaderUtil;
 import org.apache.lucene.search.CollectorManager;
@@ -528,6 +529,15 @@ final class FragmentHitsPages {
      * (which should not happen on this path; every leaf the fragment
      * dispatch reader exposes is Lance-backed) are skipped and fall
      * back to the per-doc path.
+     *
+     * <p>Before a leaf takes, it is told whether its rows may go through
+     * the node's fetch cache: yes when only the plugin's own and
+     * OpenSearch's readers sit above it, no when another plugin's reader
+     * wrapper does ({@link LanceFragmentLeafReader#wrappedOnlyByOwnReaders}).
+     * The security plugin wraps every request's reader, the admin's
+     * included, so on a cluster running it no request reads or writes
+     * the cache and a field its field level security hides for one user
+     * is never handed to another from the cache.
      */
     private static void prefetchHitRows(IndexReader reader, ScoreDoc[] scoreDocs, FragmentGroupScan groupScan) throws IOException {
         if (scoreDocs.length == 0) {
@@ -543,10 +553,12 @@ final class FragmentHitsPages {
         try {
             groupScan.run(new ArrayList<>(docsByLeaf.keySet()), group -> {
                 for (int leafIndex : group) {
-                    LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(leaves.get(leafIndex).reader());
+                    LeafReader wrapped = leaves.get(leafIndex).reader();
+                    LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(wrapped);
                     if (lance == null) {
                         continue;
                     }
+                    lance.setFetchCacheEligible(LanceFragmentLeafReader.wrappedOnlyByOwnReaders(wrapped));
                     List<Integer> docs = docsByLeaf.get(leafIndex);
                     int[] docIds = new int[docs.size()];
                     for (int i = 0; i < docIds.length; i++) {

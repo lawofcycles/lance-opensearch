@@ -45,6 +45,7 @@ import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.engine.LanceServedVersions;
+import org.opensearch.lance.engine.LanceFetchCache;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.index.LanceBuildIndexesAction;
 import org.opensearch.lance.index.LanceBuildIndexesNodesAction;
@@ -447,6 +448,54 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      */
     public static final Setting<TimeValue> REQUEST_CACHE_EXPIRE_SETTING = Setting.positiveTimeSetting(
         "lance.request_cache.expire",
+        TimeValue.ZERO,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Whether every data node keeps the cells of the rows it took for the
+     * hits of a page, keyed on the table version, the row address and
+     * the column, and renders a row whose cells it holds without a take
+     * ({@link LanceFetchCache}). Dynamic: turning it off drops every
+     * entry.
+     */
+    public static final Setting<Boolean> FETCH_CACHE_ENABLED_SETTING = Setting.boolSetting(
+        "lance.fetch_cache.enabled",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * How much heap the fetch cache may hold, as a byte size or a
+     * percentage of the heap; the same default as
+     * {@code indices.requests.cache.size}. Static, node scope.
+     */
+    public static final Setting<ByteSizeValue> FETCH_CACHE_SIZE_SETTING = Setting.memorySizeSetting(
+        "lance.fetch_cache.size",
+        "1%",
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * The heaviest cell the fetch cache stores, as the estimate of the
+     * decoded value's heap; a larger cell (a long text, a wide struct)
+     * is taken on every request. Static, node scope.
+     */
+    public static final Setting<ByteSizeValue> FETCH_CACHE_MAX_ENTRY_SIZE_SETTING = Setting.byteSizeSetting(
+        "lance.fetch_cache.max_entry_size",
+        new ByteSizeValue(256, ByteSizeUnit.KB),
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How long a cell of the fetch cache is served after it was stored;
+     * zero (the default) keeps it until its table version's snapshot
+     * closes, its index is deleted or the cache evicts it. Dynamic.
+     */
+    public static final Setting<TimeValue> FETCH_CACHE_EXPIRE_SETTING = Setting.positiveTimeSetting(
+        "lance.fetch_cache.expire",
         TimeValue.ZERO,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
@@ -860,6 +909,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             REQUEST_CACHE_SIZE_SETTING,
             REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING,
             REQUEST_CACHE_EXPIRE_SETTING,
+            FETCH_CACHE_ENABLED_SETTING,
+            FETCH_CACHE_SIZE_SETTING,
+            FETCH_CACHE_MAX_ENTRY_SIZE_SETTING,
+            FETCH_CACHE_EXPIRE_SETTING,
             FTS_SUBSET_PROBE_LIMIT_SETTING,
             FTS_SUBSET_PROBE_RATIO_SETTING,
             FTS_SUBSET_PROBE_MIN_ROWS_SETTING,
@@ -1024,6 +1077,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     private LanceCreateIndexActionFilter createIndexActionFilter;
     private LanceClearCacheActionFilter clearCacheActionFilter;
     private volatile LanceRequestCache requestCache;
+    private volatile LanceFetchCache fetchCache;
     private volatile LanceWarmCache warmCache;
     private volatile LanceLocalClones localClones;
     private volatile LanceIndexWarmer indexWarmer;
@@ -1143,6 +1197,19 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             cpus
         );
 
+        // The data nodes' cache of the rows behind hits, per cell, keyed
+        // on the table version; the snapshot cache below drops a
+        // version's entries when its snapshot closes, and it listens to
+        // cluster state so an index deletion drops the index's entries.
+        this.fetchCache = new LanceFetchCache(
+            FETCH_CACHE_SIZE_SETTING.get(environment.settings()).getBytes(),
+            FETCH_CACHE_MAX_ENTRY_SIZE_SETTING.get(environment.settings()).getBytes(),
+            FETCH_CACHE_ENABLED_SETTING.get(environment.settings()),
+            FETCH_CACHE_EXPIRE_SETTING.get(environment.settings())
+        );
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(FETCH_CACHE_ENABLED_SETTING, fetchCache::setEnabled);
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(FETCH_CACHE_EXPIRE_SETTING, fetchCache::setExpire);
+        clusterService.addListener(fetchCache);
         // Node scoped snapshot and column cache for the fragment path.
         // Created before the transport actions so Guice can inject it
         // into TransportLanceFragmentQueryAction.
@@ -1151,7 +1218,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             columnCacheBytes,
             CACHE_MAX_SNAPSHOTS_SETTING.get(environment.settings()),
             CACHE_ENABLED_SETTING.get(environment.settings()),
-            threadPool.executor(ThreadPool.Names.GENERIC)
+            threadPool.executor(ThreadPool.Names.GENERIC),
+            fetchCache
         );
         clusterService.getClusterSettings().addSettingsUpdateConsumer(CACHE_ENABLED_SETTING, warmCache::setEnabled);
         warmCache.tableStatistics().setCollectDelayMillis(TEST_STATISTICS_COLLECT_DELAY_SETTING.get(environment.settings()).millis());
@@ -1205,7 +1273,14 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LanceStatsCollector statsCollector = new LanceStatsCollector(warmCache, () -> {
             Session session = LanceRegistry.currentSession();
             return session == null || session.isClosed() ? 0L : session.sizeBytes();
-        }, LanceRegistry::indexCacheSizing, indexWarmer, localClones::cloneStats, freshnessService::stats, requestCache::stats);
+        },
+            LanceRegistry::indexCacheSizing,
+            indexWarmer,
+            localClones::cloneStats,
+            freshnessService::stats,
+            requestCache::stats,
+            fetchCache::stats
+        );
 
         // Prime the circuit-breaker helper with the current cluster
         // settings and start the polling loop that keeps its accounting
@@ -1288,7 +1363,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // The components are injected into the plugin's transport
         // actions (attach, build_indexes, namespace list / update / poll,
         // index sync, fragment query).
-        return List.of(namespaceService, freshnessService, allowedTableRoots, warmCache, statsCollector, localClones, requestCache);
+        return List.of(
+            namespaceService,
+            freshnessService,
+            allowedTableRoots,
+            warmCache,
+            statsCollector,
+            localClones,
+            requestCache,
+            fetchCache
+        );
     }
 
     /**

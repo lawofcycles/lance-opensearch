@@ -34,7 +34,7 @@ import org.opensearch.lance.query.ScanAdmission;
  * <p>Rendered as the {@code snapshots}, {@code column_store},
  * {@code request_cache}, {@code native_memory}, {@code fts},
  * {@code admission}, {@code warm_up}, {@code plan}, {@code freshness},
- * {@code fetch} and {@code indices} objects of one node in
+ * {@code fetch}, {@code fetch_cache} and {@code indices} objects of one node in
  * {@code GET /_lance/stats}. {@code request_cache}
  * is the coordinator result cache ({@link RequestCacheStats}); {@code admission} carries the admission
  * gate's settings in force, its rejections per kind, the estimate,
@@ -60,6 +60,8 @@ import org.opensearch.lance.query.ScanAdmission;
  * {@code fetch} the take scans the node's fragment executors issued for
  * the rows behind hits and for the sort or aggregation columns of small
  * hit sets ({@link FetchStats});
+ * {@code fetch_cache} the node's cache of the rows behind hits
+ * ({@link FetchCacheStats});
  * {@code indices} the shard reader of every Lance-backed shard the node
  * hosts.
  *
@@ -81,7 +83,9 @@ import org.opensearch.lance.query.ScanAdmission;
  * version 7 added the coordinator result cache's figures
  * ({@code request_cache}), shown as disabled with zero counters by an
  * older coordinator; version 8 added the fetch take counters, shown as
- * zero by an older coordinator.
+ * zero by an older coordinator; version 9 added the fetch cache's
+ * figures ({@code fetch_cache}), shown as disabled with zero counters by
+ * an older coordinator.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
@@ -92,9 +96,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * freshness checks, 5 the pending statistics collections and the
      * plans made without statistics, 6 the identity of the scans the
      * retained pool was filled by, 7 the result cache figures, 8 the fetch
-     * take counters.
+     * take counters, 9 the fetch cache figures.
      */
-    public static final int WIRE_VERSION = 8;
+    public static final int WIRE_VERSION = 9;
 
     private final boolean cacheEnabled;
     private final int snapshotCount;
@@ -177,6 +181,57 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     /** The coordinator result cache of this node ({@link RequestCacheStats}); {@link RequestCacheStats#NONE} from an older node. */
     private final RequestCacheStats requestCache;
     private final FetchStats fetch;
+    /** The fetch cache of this node ({@link FetchCacheStats}); {@link FetchCacheStats#NONE} from an older node. */
+    private final FetchCacheStats fetchCache;
+
+    /**
+     * The fetch cache's figures: whether it is enabled, the bytes it
+     * holds against its limit, the entries (one per cell), and since the
+     * node started the cells served from it ({@code hits}), the cells
+     * looked up and not held ({@code misses}), the entries dropped for
+     * room or age ({@code evictions}), the entries dropped because their
+     * table version's snapshot closed, their index was deleted or its
+     * cache was cleared ({@code invalidations}), the rows not cached
+     * because their index has a reader wrapper ({@code skipped}) and the
+     * rows rendered without a take because every projected cell was
+     * held ({@code rowsServed}). Travels in the version 9 block of
+     * {@link LanceNodeStats}.
+     */
+    public record FetchCacheStats(boolean enabled, long sizeBytes, long limitBytes, int entries, long hits, long misses, long evictions,
+        long invalidations, long skipped, long rowsServed) implements Writeable {
+
+        /** What an older node stands for: disabled, nothing held, nothing counted. */
+        public static final FetchCacheStats NONE = new FetchCacheStats(false, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L);
+
+        public FetchCacheStats(StreamInput in) throws IOException {
+            this(
+                in.readBoolean(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readVInt(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readVLong()
+            );
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeBoolean(enabled);
+            out.writeVLong(sizeBytes);
+            out.writeVLong(limitBytes);
+            out.writeVInt(entries);
+            out.writeVLong(hits);
+            out.writeVLong(misses);
+            out.writeVLong(evictions);
+            out.writeVLong(invalidations);
+            out.writeVLong(skipped);
+            out.writeVLong(rowsServed);
+        }
+    }
 
     /**
      * The coordinator result cache's figures: whether it is enabled, the
@@ -731,14 +786,20 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.freshness = freshness == null ? FreshnessStats.NONE : freshness;
         this.requestCache = RequestCacheStats.NONE;
         this.fetch = fetch == null ? FetchStats.NONE : fetch;
+        this.fetchCache = FetchCacheStats.NONE;
     }
 
     /** A copy carrying {@code requestCache} as the result cache figures ({@link RequestCacheStats#NONE} for null). */
     public LanceNodeStats withRequestCache(RequestCacheStats requestCache) {
-        return new LanceNodeStats(this, requestCache == null ? RequestCacheStats.NONE : requestCache);
+        return new LanceNodeStats(this, requestCache == null ? RequestCacheStats.NONE : requestCache, this.fetchCache);
     }
 
-    private LanceNodeStats(LanceNodeStats copy, RequestCacheStats requestCache) {
+    /** A copy carrying {@code fetchCache} as the fetch cache figures ({@link FetchCacheStats#NONE} for null). */
+    public LanceNodeStats withFetchCache(FetchCacheStats fetchCache) {
+        return new LanceNodeStats(this, this.requestCache, fetchCache == null ? FetchCacheStats.NONE : fetchCache);
+    }
+
+    private LanceNodeStats(LanceNodeStats copy, RequestCacheStats requestCache, FetchCacheStats fetchCache) {
         this.cacheEnabled = copy.cacheEnabled;
         this.snapshotCount = copy.snapshotCount;
         this.retiredSnapshotCount = copy.retiredSnapshotCount;
@@ -781,6 +842,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.freshness = copy.freshness;
         this.fetch = copy.fetch;
         this.requestCache = requestCache;
+        this.fetchCache = fetchCache;
     }
 
     /**
@@ -869,6 +931,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.admissionRetainedScope = reader.block(6, StreamInput::readString, "none");
         this.requestCache = reader.block(7, RequestCacheStats::new, RequestCacheStats.NONE);
         this.fetch = reader.block(8, FetchStats::new, FetchStats.NONE);
+        this.fetchCache = reader.block(9, FetchCacheStats::new, FetchCacheStats.NONE);
         reader.finish();
     }
 
@@ -956,6 +1019,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         // Likewise for the fetch take counters: an older coordinator
         // shows the stats without them.
         WireVersion.writeBlock(out, false, fetch);
+        // Likewise for the fetch cache: an older coordinator shows the
+        // node without it.
+        WireVersion.writeBlock(out, false, fetchCache);
     }
 
     @Override
@@ -1079,6 +1145,19 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.field("column_takes", fetch.columnTakes());
         builder.endObject();
 
+        builder.startObject("fetch_cache");
+        builder.field("enabled", fetchCache.enabled());
+        builder.field("size_bytes", fetchCache.sizeBytes());
+        builder.field("limit_bytes", fetchCache.limitBytes());
+        builder.field("entries", fetchCache.entries());
+        builder.field("hits", fetchCache.hits());
+        builder.field("misses", fetchCache.misses());
+        builder.field("evictions", fetchCache.evictions());
+        builder.field("invalidations", fetchCache.invalidations());
+        builder.field("skipped", fetchCache.skipped());
+        builder.field("rows_served", fetchCache.rowsServed());
+        builder.endObject();
+
         builder.startObject("indices");
         for (IndexReaderStats index : indices) {
             builder.startObject(index.index());
@@ -1169,6 +1248,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     /** The take scans this node's fragment executors issued since it started. */
     public FetchStats fetch() {
         return fetch;
+    }
+
+    /** The fetch cache of this node; {@link FetchCacheStats#NONE} from a node that does not report it. */
+    public FetchCacheStats fetchCache() {
+        return fetchCache;
     }
 
     public boolean cacheEnabled() {
@@ -1386,7 +1470,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && planPrunedFragments == other.planPrunedFragments
             && freshness.equals(other.freshness)
             && requestCache.equals(other.requestCache)
-            && fetch.equals(other.fetch);
+            && fetch.equals(other.fetch)
+            && fetchCache.equals(other.fetchCache);
     }
 
     @Override
@@ -1433,7 +1518,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             planPrunedFragments,
             freshness,
             requestCache,
-            fetch
+            fetch,
+            fetchCache
         );
     }
 }

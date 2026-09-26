@@ -51,7 +51,8 @@ import org.opensearch.lance.query.LanceFtsQuery;
  * {@code fetch} reads {@link FetchTakeStats}: the take scans the
  * fragment executors issued for the rows behind hits and for the
  * columns of small hit sets, how many rows and columns they asked for
- * and how long they took.
+ * and how long they took. {@code fetch_cache} reads the node's cache of
+ * the rows behind hits ({@code LanceFetchCache}).
  */
 public final class LanceStatsCollector {
 
@@ -62,6 +63,7 @@ public final class LanceStatsCollector {
     private final Supplier<Map<String, LanceLocalClones.CloneStat>> localClones;
     private final Supplier<LanceNodeStats.FreshnessStats> freshness;
     private final Supplier<LanceNodeStats.RequestCacheStats> requestCache;
+    private final Supplier<LanceNodeStats.FetchCacheStats> fetchCache;
 
     /**
      * @param warmCache        the node's snapshot cache, or {@code null}
@@ -142,6 +144,25 @@ public final class LanceStatsCollector {
         Supplier<LanceNodeStats.FreshnessStats> freshness,
         Supplier<LanceNodeStats.RequestCacheStats> requestCache
     ) {
+        this(warmCache, sessionBytes, indexCacheSizing, indexWarmer, localClones, freshness, requestCache, null);
+    }
+
+    /**
+     * @param fetchCache reads this node's fetch cache figures, or
+     *                   {@code null} when the plugin created no cache (the
+     *                   {@code fetch_cache} block then reads disabled with
+     *                   zero counters)
+     */
+    public LanceStatsCollector(
+        LanceWarmCache warmCache,
+        LongSupplier sessionBytes,
+        Supplier<IndexCacheSizing> indexCacheSizing,
+        LanceIndexWarmer indexWarmer,
+        Supplier<Map<String, LanceLocalClones.CloneStat>> localClones,
+        Supplier<LanceNodeStats.FreshnessStats> freshness,
+        Supplier<LanceNodeStats.RequestCacheStats> requestCache,
+        Supplier<LanceNodeStats.FetchCacheStats> fetchCache
+    ) {
         this.warmCache = warmCache;
         this.sessionBytes = sessionBytes;
         this.indexCacheSizing = indexCacheSizing;
@@ -149,6 +170,7 @@ public final class LanceStatsCollector {
         this.localClones = localClones;
         this.freshness = freshness;
         this.requestCache = requestCache;
+        this.fetchCache = fetchCache;
     }
 
     /** The node's cache figures with no index block; {@link #collect(List)} adds the shard readers. */
@@ -203,6 +225,7 @@ public final class LanceStatsCollector {
         LanceNodeStats.RequestCacheStats requestCacheStats = requestCache == null
             ? LanceNodeStats.RequestCacheStats.NONE
             : requestCache.get();
+        LanceNodeStats.FetchCacheStats fetchCacheStats = fetchCache == null ? LanceNodeStats.FetchCacheStats.NONE : fetchCache.get();
         if (warmCache == null) {
             return new LanceNodeStats(
                 false,
@@ -246,7 +269,7 @@ public final class LanceStatsCollector {
                 FragmentPlanRefiner.prunedFragments(),
                 freshnessStats,
                 FetchTakeStats.snapshot()
-            ).withRequestCache(requestCacheStats);
+            ).withRequestCache(requestCacheStats).withFetchCache(fetchCacheStats);
         }
         ColumnStore store = warmCache.columnStore();
         return new LanceNodeStats(
@@ -291,6 +314,6 @@ public final class LanceStatsCollector {
             FragmentPlanRefiner.prunedFragments(),
             freshnessStats,
             FetchTakeStats.snapshot()
-        ).withRequestCache(requestCacheStats);
+        ).withRequestCache(requestCacheStats).withFetchCache(fetchCacheStats);
     }
 }

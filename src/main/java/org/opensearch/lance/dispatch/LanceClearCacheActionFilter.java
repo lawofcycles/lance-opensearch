@@ -30,10 +30,11 @@ import org.opensearch.transport.client.Client;
 
 /**
  * ActionFilter that gives {@code POST /<index>/_cache/clear} an effect
- * on the coordinator result cache. The stock
+ * on the coordinator result cache and the data nodes' fetch cache. The stock
  * {@code TransportClearIndicesCacheAction} clears the caches of the
  * shards, and the result cache ({@link LanceRequestCache}) sits on the
- * coordinating nodes, keyed by index uuid, out of its reach. When the
+ * coordinating nodes, keyed by index uuid, out of its reach, as does the
+ * fetch cache ({@code LanceFetchCache}) on the data nodes. When the
  * request asks for the request cache (`request=true`, or no cache named,
  * which the stock action reads as every cache) and names a Lance backed
  * index, this filter fans a {@link LanceRequestCacheClearAction} out to

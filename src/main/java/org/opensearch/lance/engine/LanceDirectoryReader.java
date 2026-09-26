@@ -483,6 +483,10 @@ public final class LanceDirectoryReader extends DirectoryReader {
             meta.resolveLiveDocs(dataset);
             meta.resolveNestedLayout(dataset, snapshot.schema());
             LanceFragmentLeafReader raw = new LanceFragmentLeafReader(dataset, meta.id(), meta, snapshot.schema(), filterSql);
+            // The rows behind the hits of this leaf may come from, and go
+            // to, the node's fetch cache under this snapshot's version;
+            // the hits phase decides per request whether they do.
+            raw.setFetchCache(snapshot.fetchTable());
             rawLeaves.add(raw);
             leaves.add(LanceSequentialLeafReader.wrap(raw));
         }

@@ -259,7 +259,7 @@ Notes per row:
 
 ### Hit shape
 
-- `_source` and `_id` are synthesised on the fly from Lance rows, taken per request with one `_rowaddr IN (...)` scan per leaf that holds a hit; the leaves of one executor are taken side by side, up to `lance.fragment_path.parallelism` at a time. Nothing caches them; `GET /_lance/stats` counts and times the takes under `fetch` (see [Cache statistics](#cache-statistics)). The body's `_source` element (`false`, an includes list, an includes / excludes object) is applied by OpenSearch's stock `FetchSourcePhase` over the synthesised source.
+- `_source` and `_id` are synthesised on the fly from Lance rows, taken per request with one `_rowaddr IN (...)` scan per leaf that holds a hit; the leaves of one executor are taken side by side, up to `lance.fragment_path.parallelism` at a time. Each data node keeps the cells it took in its [fetch cache](#fetch-cache), so a row the node fetched for an earlier request is rendered without a take while the table stays at its version; `GET /_lance/stats` counts and times the takes under `fetch` and the cache under `fetch_cache` (see [Cache statistics](#cache-statistics)). The body's `_source` element (`false`, an includes list, an includes / excludes object) is applied by OpenSearch's stock `FetchSourcePhase` over the synthesised source.
   - The take reads only the columns the body renders. `_source: false` without `fields` reads the primary key column alone, and nothing at all on a table without a declared key or under `stored_fields: _none_`. An includes list reads the columns its patterns match plus the key; an excludes list drops the columns its patterns name. `fields` adds the columns its patterns match whatever the `_source` filter says; `docvalue_fields` adds none, because it reads doc values. A struct or nested column is read whole when any of its children is asked for, and the fetch phase filters the children. Without a `_source` element every surfaced column is read.
 - `stored_fields`, `docvalue_fields`, `fields` and `"explain": true` are rendered by the same stock fetch sub phases an ordinary index runs, over the executor's fragment readers.
   - `stored_fields: _none_` returns hits without `_id` or `_source`; a named `stored_fields` list yields `_id` (and `_source` when named), since the fragment readers store nothing else.
@@ -299,7 +299,7 @@ Notes per row:
 - `_count` runs on the fragment path (it is a `_search` with `size: 0` and `track_total_hits: true`), so it reads the same manifest version and takes the same count paths as `_search`; for a scalar filter that is one native Lance count over the node's fragments, for an FTS query one count-only Lance scan over the inverted index.
 - `"profile": true` renders `profile.lance.nodes.<node id>` with what each executor spent on the request. The fragment path runs no shard, so the stock `profile.shards` is not rendered. An answer served from the result cache ran on no executor and reports `profile.lance.cached: true` instead.
   - `query.millis` is the time to collect the page, the count and the aggregations. `fetch.millis` is the time to materialise the rows behind the hits.
-  - `fetch.take_count`, `fetch.take_rows`, `fetch.take_columns` and `fetch.take_millis` count the `_rowaddr IN (...)` take scans the request issued on that node in either phase: the stored fields of a page are taken in the fetch phase, the sort column of a sparse full text or vector hit set in the query phase. `take_columns` is the number of columns the scans projected, summed over the scans; divided by `take_count` it is the width of one take, which the body's `_source` and `fields` decide (see [Hit shape](#hit-shape)). A `size: 0` request reports zero takes. The same takes are counted node wide under `fetch` in `GET /_lance/stats`.
+  - `fetch.take_count`, `fetch.take_rows`, `fetch.take_columns` and `fetch.take_millis` count the `_rowaddr IN (...)` take scans the request issued on that node in either phase: the stored fields of a page are taken in the fetch phase, the sort column of a sparse full text or vector hit set in the query phase. `take_columns` is the number of columns the scans projected, summed over the scans; divided by `take_count` it is the width of one take, which the body's `_source` and `fields` decide (see [Hit shape](#hit-shape)). A `size: 0` request reports zero takes, and so does a page whose rows the node's [fetch cache](#fetch-cache) held. The same takes are counted node wide under `fetch` in `GET /_lance/stats`.
 
 ### Timeout and cancellation
 
@@ -487,7 +487,7 @@ Test settings, all node scope and dynamic; do not change them on a real node:
 - `warm_up`: `mode` (current `lance.attach.warm_indexes`) and `tables`, one entry per Lance-backed index the node has seen since it started: `index`, `table`, `version` (the manifest the warm-up read), `mode` (the one it ran under), `state` (`pending`, `running`, `done`, `failed`, `skipped`, `cancelled`), `started_at`, `seconds` and `indexes` (per Lance index: `name`, `type`, `column`, `state`, `seconds`, `detail`). See [Index warm-up](#index-warm-up).
 - `indices`: one object per Lance-backed shard the node hosts, keyed by index name: `rows` (live rows of the table version the shard reader was opened over), `shard_reader_rows` (live rows the shard reader holds, what `{index}/_stats` counts as `docs.count`) and `lucene_bound_exceeded` (true when the two differ because the table is above the Lucene document bound).
 - `freshness`: the node's checks of the Lance-backed shards it holds (`tracked`, `checks`, `moves`, `mapping_updates`, `mapping_unchanged`, `rebuilds`, `failures`, `last_check_millis`, `mapping_errors`). See [Attach and namespace surface](#attach-and-namespace-surface).
-- `fetch`: the `_rowaddr IN (...)` take scans the node's fragment executors issued since it started. No cache serves these scans. `take_millis_total` against the `took` of the requests a node served over the same interval is the share of the request time the takes account for; a `size: 0` aggregation issues none.
+- `fetch`: the `_rowaddr IN (...)` take scans the node's fragment executors issued since it started. A row the node's fetch cache held is not taken and not counted here. `take_millis_total` against the `took` of the requests a node served over the same interval is the share of the request time the takes account for; a `size: 0` aggregation issues none.
   - `take_count`: scans issued.
   - `take_rows`: row addresses the scans carried.
   - `take_columns`: columns the scans projected, summed over the scans.
@@ -495,6 +495,11 @@ Test settings, all node scope and dynamic; do not change them on a real node:
   - `take_max_millis`: the longest single scan.
   - `stored_fields_takes`: scans for the rows behind the hits of a page, for `_id` and `_source`. One per leaf that holds a hit, per 4096 hits.
   - `column_takes`: scans for the sort or aggregation column of a small full text or vector hit set. One per leaf and column.
+- `fetch_cache`: the node's cache of the rows behind hits (see [Fetch cache](#fetch-cache)): `enabled` (current `lance.fetch_cache.enabled`), `size_bytes` (what the entries weigh), `limit_bytes` (`lance.fetch_cache.size` in bytes), `entries` (one per cell held), and the counters since the node started. A node whose plugin version predates the cache reports it disabled with zero counters.
+  - `hits`: cells looked up and held. `misses`: cells looked up and not held. A page of ten rows over three columns looks up thirty cells.
+  - `rows_served`: rows rendered without a take because every projected cell was held.
+  - `evictions`: entries dropped for room or because `lance.fetch_cache.expire` passed. `invalidations`: entries dropped because their table version's snapshot closed, their index was deleted or `POST /{index}/_cache/clear` named it.
+  - `skipped`: rows taken without the cache because a reader wrapper (the security plugin's document and field level security) sits on their index.
 
 ## Result cache
 
@@ -524,6 +529,27 @@ Test settings, all node scope and dynamic; do not change them on a real node:
 | `lance.request_cache.size` | node | `1%` of the heap, the default of `indices.requests.cache.size` | no | a byte size or a percentage |
 | `lance.request_cache.max_entry_size` | node | `1mb` | no | measured as the serialised size of the reduced aggregations |
 | `lance.request_cache.expire` | node | none: entries stay until their version moves on or they are evicted | yes | set a duration to age entries out |
+
+## Fetch cache
+
+- Every data node keeps the cells of the rows it took for the hits of a page (`_id`, `_source`, `fields`), one entry per `(index uuid, manifest version, row address, column)`, in heap. A page whose rows the node took for an earlier request renders them from the cache and issues no `_rowaddr IN (...)` take for them: a dashboard refresh, a step back in a pagination or the same search again costs no storage round trip for its rows.
+  - On object storage a take is a round trip of tens of milliseconds and the fetch phase of a `size: 10` page can be more than half of `took`; that share goes on every page after the first.
+  - Nothing in the response marks a served row; `fetch.take_count` in `profile.lance` reads zero for the node and `fetch_cache.rows_served` in `GET /_lance/stats` moves.
+- A Lance fragment is immutable and every write is a new manifest version, so a cell at one version never changes: an entry is valid for as long as its version exists and there is no freshness to reason about. An append, a deletion or a compaction makes the next request key on the new version and take its rows again; the entries of the version that was retired are dropped when its snapshot closes (see [Snapshot and column cache](#snapshot-and-column-cache)), and a deleted index's entries when the deletion reaches the cluster state.
+- The key is per column because every request projects its own columns (see [Hit shape](#hit-shape)).
+  - A row whose every projected cell is held is served. A row with some cells held (a request with `_source: false` left the key alone, a later one asks for every column) is taken whole, and the take writes every cell back, so the next request for those columns is served.
+  - A row the take did not return is held as a negative entry and is not taken again at that version.
+  - A cell heavier than `lance.fetch_cache.max_entry_size` (the estimate of its decoded heap: two bytes a character for a string, the length of a binary, the elements of a struct or a keyword array) is not stored, and its row is taken on every request.
+- An index with a reader wrapper installed (the security plugin's document and field level security) is never read from or written to the cache, and its rows count as `skipped`. The wrapper hides fields after a row is rendered, so a cached row would carry what one user must not see to the next; the executor decides per leaf from the reader chain the request runs under, and the security plugin wraps every request, so on a cluster running it no Lance backed index uses the cache.
+- The cache is per data node and holds the rows of the fragments that node executed. The coordinator assigns fragments to the data nodes by a round robin over the sorted node ids, so a fragment's rows are fetched on the same node request after request while the node list stays the same; a node joining or leaving moves fragments to nodes that have not seen their rows.
+  - Entries leave the cache least recently used at `lance.fetch_cache.size`, after `lance.fetch_cache.expire` when that is set, when their version's snapshot closes, when their index is deleted, when `POST /{index}/_cache/clear` with `request=true` or no cache named drops the index's entries on every node (the same fan out as the [result cache](#result-cache)), and when `lance.fetch_cache.enabled` is set to `false`.
+
+| setting | scope | default | dynamic | effect |
+|---|---|---|---|---|
+| `lance.fetch_cache.enabled` | node | `true` | yes | `false` drops every entry and caches nothing |
+| `lance.fetch_cache.size` | node | `1%` of the heap | no | a byte size or a percentage; the entries are weighed by an estimate of the heap the key and the decoded value cost |
+| `lance.fetch_cache.max_entry_size` | node | `256kb` | no | the heaviest cell stored |
+| `lance.fetch_cache.expire` | node | none: entries stay until their version is dropped or they are evicted | yes | set a duration to age entries out |
 
 ## Index warm-up
 
