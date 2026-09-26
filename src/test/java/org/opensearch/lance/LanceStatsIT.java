@@ -399,6 +399,28 @@ public class LanceStatsIT extends LanceRestTestCase {
         return (Map<String, Object>) node.get("warm_up");
     }
 
+    public void testFailureCountersAreReportedPerNode() throws Exception {
+        // The counters of the paths that fail or fall back without a
+        // mark in the response are present on every node, zero until one
+        // of those paths fails: a clone resolution (which fails its
+        // request), a table statistics collection, a zone map read.
+        Map<String, Object> node = nodeStats();
+        @SuppressWarnings("unchecked")
+        Map<String, Object> plan = (Map<String, Object>) node.get("plan");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> statistics = (Map<String, Object>) plan.get("statistics");
+        assertTrue("plan.statistics.failures is reported: " + statistics, statistics.containsKey("failures"));
+        assertTrue(statistics.toString(), number(statistics.get("failures")) >= 0);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> pruned = (Map<String, Object>) plan.get("pruned");
+        assertTrue("plan.pruned.zone_map_failures is reported: " + pruned, pruned.containsKey("zone_map_failures"));
+        assertTrue(pruned.toString(), number(pruned.get("zone_map_failures")) >= 0);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> localClones = (Map<String, Object>) node.get("local_clones");
+        assertTrue("local_clones.resolution_failures is reported: " + localClones, localClones.containsKey("resolution_failures"));
+        assertTrue(localClones.toString(), number(localClones.get("resolution_failures")) >= 0);
+    }
+
     public void testStatsEnvelopeAndNodeFilter() throws Exception {
         String body = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
         Map<String, Object> parsed = parse(body);

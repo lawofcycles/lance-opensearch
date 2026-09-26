@@ -132,7 +132,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             ),
             new LanceNodeStats.FetchStats(11L, 1_234L, 33L, 456L, 78L, 8L, 3L)
         ).withRequestCache(new LanceNodeStats.RequestCacheStats(true, 2048L, 1_048_576L, 3, 11L, 4L, 1L, 2L, 6L))
-            .withFetchCache(new LanceNodeStats.FetchCacheStats(true, 8192L, 2_097_152L, 40, 120L, 30L, 5L, 9L, 7L, 25L));
+            .withFetchCache(new LanceNodeStats.FetchCacheStats(true, 8192L, 2_097_152L, 40, 120L, 30L, 5L, 9L, 7L, 25L))
+            .withFailures(new LanceNodeStats.FailureCounters(3L, Map.of("cloned", 3L), 2L, 1L));
     }
 
     /** The admission rejections in the gate's key order, one per kind. */
@@ -211,9 +212,10 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"indexes\":[{\"name\":\"rating_idx\",\"type\":\"BTree\",\"column\":\"rating\",\"state\":\"done\",\"seconds\":0.4},"
                     + "{\"name\":\"body_idx\",\"type\":\"Inverted\",\"column\":\"body\",\"state\":\"failed\",\"seconds\":1.25,"
                     + "\"detail\":\"boom\"}]}]},"
-                    + "\"plan\":{\"statistics\":{\"tables\":5,\"collect_millis_total\":123,\"pending\":2,\"planned_without\":4},"
+                    + "\"plan\":{\"statistics\":{\"tables\":5,\"collect_millis_total\":123,\"pending\":2,\"planned_without\":4,"
+                    + "\"failures\":2},"
                     + "\"refinements\":{\"security_wrapper\":2,\"sort_field_type\":0,\"aggregate_resolution\":1},"
-                    + "\"executed\":{\"pushed_scan\":7,\"lucene\":4},\"pruned\":{\"fragments\":9}},"
+                    + "\"executed\":{\"pushed_scan\":7,\"lucene\":4},\"pruned\":{\"fragments\":9,\"zone_map_failures\":1}},"
                     + "\"freshness\":{\"tracked\":2,\"checks\":40,\"moves\":3,\"mapping_updates\":1,\"mapping_unchanged\":2,"
                     + "\"rebuilds\":1,\"failures\":0,\"last_check_millis\":1700000000000,"
                     + "\"mapping_errors\":{\"perf\":\"Mapper for [body] conflicts with existing mapper\"}},"
@@ -226,7 +228,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"renamed_fields\":[{\"from\":\"ts\",\"to\":\"event_ts\",\"lance_field_id\":1}]},"
                     + "\"small\":{\"rows\":120,\"shard_reader_rows\":120,\"nested_docs\":14,\"lucene_bound_exceeded\":false,"
                     + "\"index_types\":{\"rating\":[\"BTree\",\"Bitmap\"]}}},"
-                    + "\"local_clones\":{\"cloned\":{\"local_clone_bytes\":4321,\"source_version\":9}}}",
+                    + "\"local_clones\":{\"resolution_failures\":3,"
+                    + "\"cloned\":{\"local_clone_bytes\":4321,\"source_version\":9,\"resolution_failures\":3}}}",
                 builder.toString()
             );
         }
@@ -273,7 +276,13 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                         + "\"column_load\":0}},\"warm_up\":{\"mode\":\"metadata\""
                 )
             );
-            assertTrue(json, json.endsWith("\"local_clones\":{\"cloned\":{\"local_clone_bytes\":4321,\"source_version\":9}}}}}"));
+            assertTrue(
+                json,
+                json.endsWith(
+                    "\"local_clones\":{\"resolution_failures\":3,"
+                        + "\"cloned\":{\"local_clone_bytes\":4321,\"source_version\":9,\"resolution_failures\":3}}}}}"
+                )
+            );
         }
     }
 
@@ -297,7 +306,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceNodeStats.WIRE_VERSION, in.readVInt());
             }
         }
-        // The stream a version 10 data node would return: today's fields
+        // The stream a version 11 data node would return: today's fields
         // and one optional block this coordinator steps over.
         BytesReference newer = WireVersionTestSupport.asNextVersion(
             sample(),
@@ -316,6 +325,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             assertEquals(sample().requestCache(), restored.requestCache());
             assertEquals(sample().fetch(), restored.fetch());
             assertEquals(sample().fetchCache(), restored.fetchCache());
+            assertEquals(sample().failures(), restored.failures());
             assertEquals("the reader consumed the block", -1, in.read());
         }
     }
@@ -471,6 +481,25 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals("the blocks version 8 knows are read", sample().fetch(), asVersion8.fetch());
                 assertEquals("the block it does not know is stepped over", LanceNodeStats.FetchCacheStats.NONE, asVersion8.fetchCache());
                 assertFalse(asVersion8.fetchCache().enabled());
+                assertEquals(LanceNodeStats.FailureCounters.NONE, asVersion8.failures());
+                assertEquals("the reader consumed the blocks", -1, in.read());
+            }
+        }
+    }
+
+    public void testMixedPluginVersionAVersion9CoordinatorReadsTodaysStatsWithoutTheFailureCounters() throws Exception {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            sample().writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceNodeStats asVersion9 = LanceNodeStats.read(in, 9);
+                assertEquals(9L, asVersion9.planPrunedFragments());
+                assertEquals(sample().freshness(), asVersion9.freshness());
+                assertEquals(sample().requestCache(), asVersion9.requestCache());
+                assertEquals(sample().fetch(), asVersion9.fetch());
+                assertEquals("the blocks version 9 knows are read", sample().fetchCache(), asVersion9.fetchCache());
+                assertEquals("the block it does not know is stepped over", LanceNodeStats.FailureCounters.NONE, asVersion9.failures());
+                assertEquals(0L, asVersion9.failures().cloneResolutionFailures());
+                assertEquals(Map.of(), asVersion9.failures().cloneResolutionFailuresByIndex());
                 assertEquals("the reader consumed the blocks", -1, in.read());
             }
         }
@@ -490,8 +519,11 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             // the pruned counter, 3 the admission source, 4 the mapping
             // errors, 5 the statistics progress counters, 6 the retained
             // pool's scope, 7 the result cache, 8 the fetch take counters,
-            // 9 the fetch cache, in that order.
+            // 9 the fetch cache, 10 the failure counters, in that order.
             int trailing = 0;
+            if (marker < 10) {
+                trailing += blockSize(stats.failures());
+            }
             if (marker < 9) {
                 trailing += blockSize(stats.fetchCache());
             }
@@ -666,6 +698,23 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             assertEquals(sample().requestCache(), restored.requestCache());
             assertEquals(sample().fetch(), restored.fetch());
             assertEquals("the fetch cache falls back to none", LanceNodeStats.FetchCacheStats.NONE, restored.fetchCache());
+            assertEquals(LanceNodeStats.FailureCounters.NONE, restored.failures());
+            assertEquals(-1, in.read());
+        }
+    }
+
+    public void testMixedPluginVersionTodaysCoordinatorReadsAVersion9NodesStats() throws Exception {
+        // The stream a version 9 data node writes: every block up to the
+        // fetch cache, no failure counter block.
+        BytesReference version9 = asWrittenByVersion(sample(), 9);
+        try (StreamInput in = version9.streamInput()) {
+            LanceNodeStats restored = new LanceNodeStats(in);
+            assertEquals(9L, restored.planPrunedFragments());
+            assertEquals(sample().freshness(), restored.freshness());
+            assertEquals(sample().requestCache(), restored.requestCache());
+            assertEquals(sample().fetch(), restored.fetch());
+            assertEquals(sample().fetchCache(), restored.fetchCache());
+            assertEquals("the failure counters fall back to zero", LanceNodeStats.FailureCounters.NONE, restored.failures());
             assertEquals(-1, in.read());
         }
     }
@@ -830,12 +879,15 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 );
                 // A lookup of a version the cache does not hold is a plan
                 // without statistics, counted as such (the collection it
-                // starts fails here: there is no such version to open).
+                // starts fails here: there is no such version to open),
+                // and the failed collection is counted on its own.
+                assertEquals(0L, collector.collect().failures().tableStatisticsFailures());
                 assertNull(
                     cache.tableStatistics().lookup(tableUri, version + 1, () -> { throw new IllegalStateException("no such version"); })
                 );
                 assertEquals(1L, collector.collect().planStatisticsPlannedWithout());
                 assertEquals(0, collector.collect().planStatisticsPending());
+                assertEquals("the collection that threw is counted", 1L, collector.collect().failures().tableStatisticsFailures());
                 cache.retire("uuid", version + 1);
             }
             assertEquals("the entry went with its snapshot", 0, collector.collect().planStatisticsTables());

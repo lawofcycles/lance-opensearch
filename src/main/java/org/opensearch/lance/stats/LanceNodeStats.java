@@ -45,14 +45,16 @@ import org.opensearch.lance.query.ScanAdmission;
  * {@link LanceWarmUpStatus} per Lance-backed index the node has seen
  * since it started; {@code plan.statistics} the planner's table
  * statistics cache (entries held, milliseconds spent collecting, the
- * collections queued or running, and how many plans were made without
- * statistics because their version was not collected yet);
+ * collections queued or running, how many plans were made without
+ * statistics because their version was not collected yet, and how many
+ * collections failed);
  * {@code plan.refinements} how often the fragment executor moved a
  * pushed operation of a shipped plan to the Lucene side, per reason;
  * {@code plan.executed} how many fragment requests the Lance scan and
  * Lucene each answered; {@code plan.pruned} how many fragments the
  * executor left out of its scans because the shipped plan's zone map
- * pruning excluded them;
+ * pruning excluded them, and how many requests this node coordinated
+ * without pruning because their zone maps could not be read;
  * {@code freshness} the node's checks of the Lance backed shards it
  * holds against their tables ({@link FreshnessStats}), with the mapping
  * updates the cluster manager refused per index under
@@ -85,7 +87,10 @@ import org.opensearch.lance.query.ScanAdmission;
  * older coordinator; version 8 added the fetch take counters, shown as
  * zero by an older coordinator; version 9 added the fetch cache's
  * figures ({@code fetch_cache}), shown as disabled with zero counters by
- * an older coordinator.
+ * an older coordinator; version 10 added the failure counters of the
+ * paths that fall back or fail without a mark in the response (the
+ * node-local clone resolutions, the table statistics collections and the
+ * zone map reads that failed), shown as zero by an older coordinator.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
@@ -96,9 +101,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * freshness checks, 5 the pending statistics collections and the
      * plans made without statistics, 6 the identity of the scans the
      * retained pool was filled by, 7 the result cache figures, 8 the fetch
-     * take counters, 9 the fetch cache figures.
+     * take counters, 9 the fetch cache figures, 10 the failure counters.
      */
-    public static final int WIRE_VERSION = 9;
+    public static final int WIRE_VERSION = 10;
 
     private final boolean cacheEnabled;
     private final int snapshotCount;
@@ -183,6 +188,49 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     private final FetchStats fetch;
     /** The fetch cache of this node ({@link FetchCacheStats}); {@link FetchCacheStats#NONE} from an older node. */
     private final FetchCacheStats fetchCache;
+    /** The failure counters of this node ({@link FailureCounters}); {@link FailureCounters#NONE} from an older node. */
+    private final FailureCounters failures;
+
+    /**
+     * How often the paths that answer without a mark in the response
+     * failed on this node since it started: the reads of a
+     * {@code node_local} index whose clone could not be resolved
+     * ({@code cloneResolutionFailures}, each of which failed its request,
+     * over every index and per index name), the table statistics
+     * collections that threw ({@code tableStatisticsFailures}, the
+     * requests planned without statistics) and the requests this node
+     * coordinated whose zone maps could not be read
+     * ({@code zoneMapFailures}, the requests planned without fragment
+     * pruning). Rendered as {@code local_clones.resolution_failures} and
+     * {@code local_clones.<index>.resolution_failures},
+     * {@code plan.statistics.failures} and
+     * {@code plan.pruned.zone_map_failures}. Travels in the version 10
+     * block of {@link LanceNodeStats}.
+     */
+    public record FailureCounters(long cloneResolutionFailures, Map<String, Long> cloneResolutionFailuresByIndex,
+        long tableStatisticsFailures, long zoneMapFailures) implements Writeable {
+
+        /** What an older node stands for: nothing counted. */
+        public static final FailureCounters NONE = new FailureCounters(0L, Map.of(), 0L, 0L);
+
+        public FailureCounters {
+            cloneResolutionFailuresByIndex = cloneResolutionFailuresByIndex == null
+                ? Map.of()
+                : Collections.unmodifiableMap(new LinkedHashMap<>(cloneResolutionFailuresByIndex));
+        }
+
+        public FailureCounters(StreamInput in) throws IOException {
+            this(in.readVLong(), in.readOrderedMap(StreamInput::readString, StreamInput::readVLong), in.readVLong(), in.readVLong());
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeVLong(cloneResolutionFailures);
+            out.writeMap(cloneResolutionFailuresByIndex, StreamOutput::writeString, StreamOutput::writeVLong);
+            out.writeVLong(tableStatisticsFailures);
+            out.writeVLong(zoneMapFailures);
+        }
+    }
 
     /**
      * The fetch cache's figures: whether it is enabled, the bytes it
@@ -787,19 +835,25 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.requestCache = RequestCacheStats.NONE;
         this.fetch = fetch == null ? FetchStats.NONE : fetch;
         this.fetchCache = FetchCacheStats.NONE;
+        this.failures = FailureCounters.NONE;
     }
 
     /** A copy carrying {@code requestCache} as the result cache figures ({@link RequestCacheStats#NONE} for null). */
     public LanceNodeStats withRequestCache(RequestCacheStats requestCache) {
-        return new LanceNodeStats(this, requestCache == null ? RequestCacheStats.NONE : requestCache, this.fetchCache);
+        return new LanceNodeStats(this, requestCache == null ? RequestCacheStats.NONE : requestCache, this.fetchCache, this.failures);
     }
 
     /** A copy carrying {@code fetchCache} as the fetch cache figures ({@link FetchCacheStats#NONE} for null). */
     public LanceNodeStats withFetchCache(FetchCacheStats fetchCache) {
-        return new LanceNodeStats(this, this.requestCache, fetchCache == null ? FetchCacheStats.NONE : fetchCache);
+        return new LanceNodeStats(this, this.requestCache, fetchCache == null ? FetchCacheStats.NONE : fetchCache, this.failures);
     }
 
-    private LanceNodeStats(LanceNodeStats copy, RequestCacheStats requestCache, FetchCacheStats fetchCache) {
+    /** A copy carrying {@code failures} as the failure counters ({@link FailureCounters#NONE} for null). */
+    public LanceNodeStats withFailures(FailureCounters failures) {
+        return new LanceNodeStats(this, this.requestCache, this.fetchCache, failures == null ? FailureCounters.NONE : failures);
+    }
+
+    private LanceNodeStats(LanceNodeStats copy, RequestCacheStats requestCache, FetchCacheStats fetchCache, FailureCounters failures) {
         this.cacheEnabled = copy.cacheEnabled;
         this.snapshotCount = copy.snapshotCount;
         this.retiredSnapshotCount = copy.retiredSnapshotCount;
@@ -843,6 +897,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.fetch = copy.fetch;
         this.requestCache = requestCache;
         this.fetchCache = fetchCache;
+        this.failures = failures;
     }
 
     /**
@@ -932,6 +987,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.requestCache = reader.block(7, RequestCacheStats::new, RequestCacheStats.NONE);
         this.fetch = reader.block(8, FetchStats::new, FetchStats.NONE);
         this.fetchCache = reader.block(9, FetchCacheStats::new, FetchCacheStats.NONE);
+        this.failures = reader.block(10, FailureCounters::new, FailureCounters.NONE);
         reader.finish();
     }
 
@@ -1022,6 +1078,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         // Likewise for the fetch cache: an older coordinator shows the
         // node without it.
         WireVersion.writeBlock(out, false, fetchCache);
+        // Likewise for the failure counters: an older coordinator shows
+        // the node without them.
+        WireVersion.writeBlock(out, false, failures);
     }
 
     @Override
@@ -1103,6 +1162,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.field("collect_millis_total", planStatisticsCollectMillisTotal);
         builder.field("pending", planStatisticsPending);
         builder.field("planned_without", planStatisticsPlannedWithout);
+        builder.field("failures", failures.tableStatisticsFailures());
         builder.endObject();
         builder.startObject("refinements");
         for (Map.Entry<String, Long> refinement : planRefinements.entrySet()) {
@@ -1116,6 +1176,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.endObject();
         builder.startObject("pruned");
         builder.field("fragments", planPrunedFragments);
+        builder.field("zone_map_failures", failures.zoneMapFailures());
         builder.endObject();
         builder.endObject();
 
@@ -1186,10 +1247,22 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.endObject();
 
         builder.startObject("local_clones");
+        builder.field("resolution_failures", failures.cloneResolutionFailures());
+        Map<String, Long> unlistedFailures = new LinkedHashMap<>(failures.cloneResolutionFailuresByIndex());
         for (LocalCloneStats clone : localClones) {
             builder.startObject(clone.index());
             builder.field("local_clone_bytes", clone.bytes());
             builder.field("source_version", clone.sourceVersion());
+            Long cloneFailures = unlistedFailures.remove(clone.index());
+            builder.field("resolution_failures", cloneFailures == null ? 0L : cloneFailures);
+            builder.endObject();
+        }
+        // An index whose clone never came to exist on this node (every
+        // resolution failed before the directory was written) has no
+        // clone entry; its failures are still shown under its name.
+        for (Map.Entry<String, Long> unlisted : unlistedFailures.entrySet()) {
+            builder.startObject(unlisted.getKey());
+            builder.field("resolution_failures", unlisted.getValue());
             builder.endObject();
         }
         builder.endObject();
@@ -1198,6 +1271,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
     public List<LocalCloneStats> localClones() {
         return localClones;
+    }
+
+    /** The failure counters of this node; {@link FailureCounters#NONE} from a node that does not report them. */
+    public FailureCounters failures() {
+        return failures;
     }
 
     /** Planner table statistics entries this node holds, one per (table URI, manifest version). */
@@ -1471,7 +1549,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && freshness.equals(other.freshness)
             && requestCache.equals(other.requestCache)
             && fetch.equals(other.fetch)
-            && fetchCache.equals(other.fetchCache);
+            && fetchCache.equals(other.fetchCache)
+            && failures.equals(other.failures);
     }
 
     @Override
@@ -1519,7 +1598,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             freshness,
             requestCache,
             fetch,
-            fetchCache
+            fetchCache,
+            failures
         );
     }
 }
