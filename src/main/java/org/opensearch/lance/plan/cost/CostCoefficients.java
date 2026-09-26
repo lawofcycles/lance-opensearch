@@ -32,7 +32,7 @@ public final class CostCoefficients {
     // ---- both paths ------------------------------------------------------
 
     /** Request latency an object store adds for opening the table and its fragments. */
-    public static final double OBJECT_STORE_OPEN_MS = 74;
+    public static final double OBJECT_STORE_OPEN_MS = 77;
 
     // ---- pushed scan (Lance dataset scan with the aggregate inside) --------
 
@@ -45,9 +45,9 @@ public final class CostCoefficients {
     /** Hashing a string group key. */
     public static final double PUSHED_STRING_KEY_MS_PER_MROW_THREAD = 17;
     /** Hashing a numeric group key. */
-    public static final double PUSHED_NUMERIC_KEY_MS_PER_MROW_THREAD = 1.8;
+    public static final double PUSHED_NUMERIC_KEY_MS_PER_MROW_THREAD = 1.6;
     /** Truncating a timestamp to a histogram bucket and hashing it. */
-    public static final double PUSHED_DATE_KEY_MS_PER_MROW_THREAD = 45;
+    public static final double PUSHED_DATE_KEY_MS_PER_MROW_THREAD = 44;
     /** Evaluating the range bands of a range key. */
     public static final double PUSHED_RANGE_KEY_MS_PER_MROW_THREAD = 18;
     /** Evaluating the predicates of a filters key. */
@@ -55,13 +55,13 @@ public final class CostCoefficients {
     /** A composite date histogram source. */
     public static final double PUSHED_COMPOSITE_DATE_KEY_MS_PER_MROW_THREAD = 100;
     /** The sums of squares an extended_stats adds over a stats. */
-    public static final double PUSHED_EXTENDED_STATS_MS_PER_MROW_THREAD = 0.89;
+    public static final double PUSHED_EXTENDED_STATS_MS_PER_MROW_THREAD = 1;
     /** The bin counts of a percentiles, on top of its second scan pass. */
-    public static final double PUSHED_PERCENTILES_MS_PER_MROW_THREAD = 17;
+    public static final double PUSHED_PERCENTILES_MS_PER_MROW_THREAD = 18;
     /** Hash table misses once the groups exceed {@link #LARGE_GROUPS}. */
-    public static final double PUSHED_LARGE_GROUPS_MS_PER_MROW_THREAD = 100;
+    public static final double PUSHED_LARGE_GROUPS_MS_PER_MROW_THREAD = 98;
     /** Evaluating a query filter inside the scan, over every row. */
-    public static final double PUSHED_FILTER_EVAL_MS_PER_MROW_THREAD = 12;
+    public static final double PUSHED_FILTER_EVAL_MS_PER_MROW_THREAD = 11;
     /**
      * Materialising the row address set the filter's scalar index
      * answers with, per million matching rows of the whole table: the
@@ -70,7 +70,7 @@ public final class CostCoefficients {
      * The 1B filtered aggregate measured 7.0 s on one node, 4.3 s on
      * four and 3.8 s on six, a floor the per thread terms cannot reach.
      */
-    public static final double PUSHED_FILTER_MATCH_MS_PER_MROW = 17;
+    public static final double PUSHED_FILTER_MATCH_MS_PER_MROW = 16;
     /** Merging the group rows the parallel scans of one node return, per million rows merged. */
     public static final double PUSHED_MERGE_MS_PER_MGROUP = 460;
     /** Hashing every row's value into the HyperLogLog++ sketch, the same work as a string group key. */
@@ -81,23 +81,23 @@ public final class CostCoefficients {
     // ---- Lucene aggregator path (leaf readers over the warm column store) --
 
     /** Fixed cost of an aggregator request: transport, reader open, reply. */
-    public static final double LUCENE_FIXED_MS = 18;
+    public static final double LUCENE_FIXED_MS = 19;
     /** Reading one column from the off heap column store; a keyword terms key costs nothing beyond this. */
-    public static final double LUCENE_COLUMN_MS_PER_MROW_THREAD = 8.3;
+    public static final double LUCENE_COLUMN_MS_PER_MROW_THREAD = 8.2;
     /** Hashing a numeric terms key. */
     public static final double LUCENE_NUMERIC_KEY_MS_PER_MROW_THREAD = 17;
     /** Rounding a timestamp to a histogram bucket. */
-    public static final double LUCENE_DATE_KEY_MS_PER_MROW_THREAD = 14;
+    public static final double LUCENE_DATE_KEY_MS_PER_MROW_THREAD = 15;
     /** Placing a value in its range band. */
     public static final double LUCENE_RANGE_KEY_MS_PER_MROW_THREAD = 26;
     /** Evaluating the filters of a filters key. */
-    public static final double LUCENE_FILTERS_KEY_MS_PER_MROW_THREAD = 31;
+    public static final double LUCENE_FILTERS_KEY_MS_PER_MROW_THREAD = 32;
     /** One source of a composite aggregation. */
     public static final double LUCENE_COMPOSITE_SOURCE_MS_PER_MROW_THREAD = 18;
     /** One nested bucket level below the first. */
-    public static final double LUCENE_NESTED_LEVEL_MS_PER_MROW_THREAD = 17;
+    public static final double LUCENE_NESTED_LEVEL_MS_PER_MROW_THREAD = 16;
     /** One sum / avg / min / max / value_count / stats metric. */
-    public static final double LUCENE_SIMPLE_METRIC_MS_PER_MROW_THREAD = 3.6;
+    public static final double LUCENE_SIMPLE_METRIC_MS_PER_MROW_THREAD = 3.8;
     /**
      * One simple metric collected under a bucket key, on top of the
      * metric's own cost: the bucket aggregator hands every row to the

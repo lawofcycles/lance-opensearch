@@ -160,6 +160,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      */
     private final TableStatisticsCache tableStatistics;
     /**
+     * This node's snapshot cache, opened through for the table a
+     * fan-out enumerates fragments from so the open is counted in
+     * {@code snapshots.dataset_open_count} of {@code GET /_lance/stats}
+     * next to the executors' snapshot builds.
+     */
+    private final LanceWarmCache warmCache;
+    /**
      * Runs the coordinator plan: the {@code MergeExec (FanOutExec
      * (per node plan))} tree built per target executes as the per-node
      * fan-out and the reduce of the gathered responses.
@@ -208,6 +215,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         );
         this.plannerFactory = new LancePlannerFactory(nativeBudgetBytes, Runtime.getRuntime().maxMemory());
         this.tableStatistics = warmCache.tableStatistics();
+        this.warmCache = warmCache;
         this.planExecutor = new PlanExecutor(plannerFactory);
         this.requestCache = requestCache;
     }
@@ -666,13 +674,28 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         Schema arrowSchema;
         TableStatistics statistics = null;
         long tableRows = 0L;
-        try (Dataset dataset = LanceRegistry.openDataset(target.tableUri(), target.storageOptions(), target.pinnedVersionOrEmpty())) {
+        // An index pinned to a version names the version the fan-out
+        // would read, so the result cache is asked before the table is
+        // opened and a hit opens nothing. An index that follows the
+        // table has to open it to learn the version, one manifest read
+        // that is the whole of the hit path's latency over an object
+        // store; an index that follows a tag already paid that read in
+        // resolvePinnedVersion, where the tag was resolved, and is
+        // looked up here like a pinned one.
+        Optional<Long> pinned = target.pinnedVersionOrEmpty();
+        if (cacheLookup != null && pinned.isPresent() && cacheLookup.find(pinned.get()) != null) {
+            LOGGER.debug("lance.dispatch: index [{}] pinned version {} answered from the result cache", target.indexName(), pinned.get());
+            done.onResponse(null);
+            return;
+        }
+        try (Dataset dataset = warmCache.openDataset(target.tableUri(), target.storageOptions(), pinned)) {
             observedVersion = dataset.version();
             // The result cache is keyed on this version: an entry means
             // the same body already ran against the same manifest on the
             // same node list, so nothing is planned or sent and the merge
-            // stays empty (runIndexLoop renders the entry).
-            if (cacheLookup != null && cacheLookup.find(observedVersion) != null) {
+            // stays empty (runIndexLoop renders the entry). A pinned
+            // index was looked up above, under the same version.
+            if (cacheLookup != null && pinned.isEmpty() && cacheLookup.find(observedVersion) != null) {
                 LOGGER.debug("lance.dispatch: index [{}] version {} answered from the result cache", target.indexName(), observedVersion);
                 done.onResponse(null);
                 return;

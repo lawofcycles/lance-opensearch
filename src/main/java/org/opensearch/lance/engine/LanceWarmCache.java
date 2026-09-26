@@ -578,7 +578,16 @@ public final class LanceWarmCache implements Closeable {
         }
     }
 
-    private Dataset openDataset(String tableUri, StorageOptions storageOptions, Optional<Long> version) {
+    /**
+     * Open {@code tableUri} at {@code version} (the latest manifest when
+     * empty) and count it in {@link #datasetOpenCount()}. The snapshot
+     * builds open through here, and so does the coordinator's fan-out
+     * for the table it enumerates fragments from, so the counter is
+     * every open a request pays on this node; the opens elsewhere (the
+     * statistics collection, the freshness poll, the tag resolution,
+     * attach) are not counted.
+     */
+    public Dataset openDataset(String tableUri, StorageOptions storageOptions, Optional<Long> version) {
         datasetOpens.incrementAndGet();
         return LanceRegistry.openDataset(tableUri, storageOptions, version);
     }
@@ -823,7 +832,12 @@ public final class LanceWarmCache implements Closeable {
         return snapshots.get(key);
     }
 
-    /** Times the cache opened a dataset (snapshot builds and latest-version resolution). */
+    /**
+     * Times a dataset was opened for a request on this node: the
+     * snapshot builds and latest-version resolutions of the cache, and
+     * the coordinator's fan-out open of the table it enumerates
+     * fragments from (see {@link #openDataset}).
+     */
     public long datasetOpenCount() {
         return datasetOpens.get();
     }
