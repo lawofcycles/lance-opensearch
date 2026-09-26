@@ -102,7 +102,7 @@ Build everything, including the precommit checks and all three test suites, exac
 
 The plugin declares that version in its `plugin-descriptor.properties`, so the zip only installs into an OpenSearch distribution of the same version. The jars the zip bundles are the same for every `opensearch.version`; in particular the test classpaths are forced to the bundled httpclient5 / httpcore5 versions rather than the ones that OpenSearch release's `opensearch-rest-client` asks for, see the Apache HttpClient 5 section of [`docs/dependencies.md`](docs/dependencies.md).
 
-The CI runs `./gradlew build` in three lanes, one per OpenSearch version: `3.8.0` (the release the plugin is built for) and the `3.9.0-SNAPSHOT` and `3.10.0-SNAPSHOT` snapshots of the next two minors. Only the `build (3.8.0)` check is required for a pull request to merge. The two snapshot lanes are informational (`continue-on-error`), so a failure there points at an API drift in the upcoming OpenSearch version and is worth reading, but it does not block the pull request.
+The CI runs `./gradlew build` against `3.8.0` (the release the plugin is built for) on every pull request and every push to `main`; `build (3.8.0)` is the check a pull request needs to merge. The `3.9.0-SNAPSHOT` and `3.10.0-SNAPSHOT` lanes build against the next two minors once a week (Monday 03:00 UTC) and on manual dispatch of the `snapshot` workflow (`gh workflow run snapshot`). They are informational (`continue-on-error`), so a failure there points at an API drift in the upcoming OpenSearch version and is worth reading, but it never blocks a pull request.
 
 ## Run the plugin in a local cluster
 

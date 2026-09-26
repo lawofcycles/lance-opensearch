@@ -1,25 +1,23 @@
-name: build
+name: snapshot
 
+# The next two OpenSearch minors, weekly and on demand. A failure here
+# points at an API drift in an upcoming OpenSearch and is worth reading;
+# it never blocks a pull request.
 on:
-  pull_request:
-  push:
-    branches: [main]
-
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
 
 jobs:
   build:
-    # The release lane: the OpenSearch version the plugin declares. This is
-    # the required check of a pull request. The snapshot lanes live in
-    # snapshot.yml and run weekly.
     name: build (${{ matrix.opensearch }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
+      fail-fast: false
       matrix:
-        opensearch: ['3.8.0']
+        opensearch: ['3.9.0-SNAPSHOT', '3.10.0-SNAPSHOT']
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -30,10 +28,7 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          # Only the main build writes the dependency cache; a pull request
-          # reads it. Otherwise every run of every branch adds an entry and
-          # the 10 GB cache evicts the ones main needs.
-          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+          cache-read-only: true
 
       - name: Build, precommit, unit, integTest, multiNodeIntegTest
         run: ./gradlew --no-daemon --console=plain build -Dopensearch.version=${{ matrix.opensearch }}
