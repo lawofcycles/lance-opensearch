@@ -79,6 +79,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             "warm_up",
             6_442_450_944L,
             268_435_456L,
+            "fts:s3://bucket/perf.lance:body",
             "metadata",
             List.of(
                 new LanceWarmUpStatus(
@@ -194,7 +195,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"index_cache_capacity\":17179869183,\"index_cache_shards\":2,\"index_cache_shard_share\":8589934591},"
                     + "\"fts\":{\"subset_probe_limit\":1000000},"
                     + "\"admission\":{\"enabled\":true,\"headroom_bytes\":8589934592,\"available_bytes\":6442450944,"
-                    + "\"retained_bytes\":268435456,\"last_estimate_bytes\":832,\"last_kind\":\"fts\",\"last_source\":\"warm_up\","
+                    + "\"retained_bytes\":268435456,\"retained_scope\":\"fts:s3://bucket/perf.lance:body\","
+                    + "\"last_estimate_bytes\":832,\"last_kind\":\"fts\",\"last_source\":\"warm_up\","
                     + "\"rejections\":{\"fts\":7,\"scalar_index\":0,\"vector_index\":0,\"filter_scan\":1,\"aggregate_scan\":0,"
                     + "\"column_load\":0}},"
                     + "\"warm_up\":{\"mode\":\"metadata\",\"tables\":[{\"index\":\"perf\",\"table\":\"s3://bucket/perf.lance\","
@@ -284,7 +286,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceNodeStats.WIRE_VERSION, in.readVInt());
             }
         }
-        // The stream a version 6 data node would return: today's fields
+        // The stream a version 7 data node would return: today's fields
         // and one optional block this coordinator steps over.
         BytesReference newer = WireVersionTestSupport.asNextVersion(
             sample(),
@@ -298,6 +300,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             assertEquals("warm_up", restored.admissionLastSource());
             assertEquals(2, restored.planStatisticsPending());
             assertEquals(4L, restored.planStatisticsPlannedWithout());
+            assertEquals("fts:s3://bucket/perf.lance:body", restored.admissionRetainedScope());
             assertEquals(sample().freshness(), restored.freshness());
             assertEquals("the reader consumed the block", -1, in.read());
         }
@@ -312,6 +315,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals("the source the older coordinator does not know falls back to none", "none", asVersion1.admissionLastSource());
                 assertEquals("the progress counters it does not know fall back to zero", 0, asVersion1.planStatisticsPending());
                 assertEquals(0L, asVersion1.planStatisticsPlannedWithout());
+                assertEquals("the retained scope it does not know falls back to none", "none", asVersion1.admissionRetainedScope());
                 assertEquals(sample().planExecuted(), asVersion1.planExecuted());
                 assertEquals(
                     "the freshness counters are base fields; the refused updates are not",
@@ -369,6 +373,24 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals("the blocks version 4 knows are read", sample().freshness(), asVersion4.freshness());
                 assertEquals("the block it does not know is stepped over", 0, asVersion4.planStatisticsPending());
                 assertEquals(0L, asVersion4.planStatisticsPlannedWithout());
+                assertEquals("none", asVersion4.admissionRetainedScope());
+                assertEquals("the reader consumed the blocks", -1, in.read());
+            }
+        }
+    }
+
+    public void testMixedPluginVersionAVersion5CoordinatorReadsTodaysStatsWithoutTheRetainedScope() throws Exception {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            sample().writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceNodeStats asVersion5 = LanceNodeStats.read(in, 5);
+                assertEquals(9L, asVersion5.planPrunedFragments());
+                assertEquals("warm_up", asVersion5.admissionLastSource());
+                assertEquals(sample().freshness(), asVersion5.freshness());
+                assertEquals("the blocks version 5 knows are read", 2, asVersion5.planStatisticsPending());
+                assertEquals(4L, asVersion5.planStatisticsPlannedWithout());
+                assertEquals("the retained bytes are a base field", 268_435_456L, asVersion5.admissionRetainedBytes());
+                assertEquals("the block it does not know is stepped over", "none", asVersion5.admissionRetainedScope());
                 assertEquals("the reader consumed the blocks", -1, in.read());
             }
         }
@@ -386,8 +408,12 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             // length prefix and the bytes of that length; their sizes are
             // measured by writing them again on their own. Version 2 is
             // the pruned counter, 3 the admission source, 4 the mapping
-            // errors, 5 the statistics progress counters, in that order.
+            // errors, 5 the statistics progress counters, 6 the retained
+            // pool's scope, in that order.
             int trailing = 0;
+            if (marker < 6) {
+                trailing += blockSize(o -> o.writeString(stats.admissionRetainedScope()));
+            }
             if (marker < 5) {
                 trailing += blockSize(o -> {
                     o.writeVInt(stats.planStatisticsPending());
@@ -480,6 +506,24 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             assertEquals(sample().freshness(), restored.freshness());
             assertEquals("the progress counters fall back to zero", 0, restored.planStatisticsPending());
             assertEquals(0L, restored.planStatisticsPlannedWithout());
+            assertEquals("none", restored.admissionRetainedScope());
+            assertEquals(-1, in.read());
+        }
+    }
+
+    public void testMixedPluginVersionTodaysCoordinatorReadsAVersion5NodesStats() throws Exception {
+        // The stream a version 5 data node writes: every block up to the
+        // progress counters, no retained scope block.
+        BytesReference version5 = asWrittenByVersion(sample(), 5);
+        try (StreamInput in = version5.streamInput()) {
+            LanceNodeStats restored = new LanceNodeStats(in);
+            assertEquals(9L, restored.planPrunedFragments());
+            assertEquals("warm_up", restored.admissionLastSource());
+            assertEquals(sample().freshness(), restored.freshness());
+            assertEquals(2, restored.planStatisticsPending());
+            assertEquals(4L, restored.planStatisticsPlannedWithout());
+            assertEquals(268_435_456L, restored.admissionRetainedBytes());
+            assertEquals("the retained scope falls back to none", "none", restored.admissionRetainedScope());
             assertEquals(-1, in.read());
         }
     }

@@ -38,7 +38,7 @@ import org.opensearch.lance.query.ScanAdmission;
  * gate's settings in force, its rejections per kind, the estimate,
  * kind and source (a request or the warm up) of its last decision, the
  * node's available memory and the memory earlier admitted scans
- * retained;
+ * retained together with the identity of the scans it is credited to;
  * {@code warm_up} carries the mode in force and one
  * {@link LanceWarmUpStatus} per Lance-backed index the node has seen
  * since it started; {@code plan.statistics} the planner's table
@@ -70,7 +70,9 @@ import org.opensearch.lance.query.ScanAdmission;
  * version 4 added the freshness service's refused mapping updates per
  * index as another such block, shown as empty by an older coordinator;
  * version 5 added the statistics collections pending and the plans
- * made without statistics, shown as zero by an older coordinator.
+ * made without statistics, shown as zero by an older coordinator;
+ * version 6 added the identity of the scans that filled the admission
+ * gate's retained pool, shown as {@code none} by an older coordinator.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
@@ -79,9 +81,10 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * read; 2 added the pruned fragment counter, 3 the source of the
      * last admission decision, 4 the refused mapping updates of the
      * freshness checks, 5 the pending statistics collections and the
-     * plans made without statistics.
+     * plans made without statistics, 6 the identity of the scans the
+     * retained pool was filled by.
      */
-    public static final int WIRE_VERSION = 5;
+    public static final int WIRE_VERSION = 6;
 
     private final boolean cacheEnabled;
     private final int snapshotCount;
@@ -120,6 +123,13 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     private final String admissionLastSource;
     private final long admissionAvailableBytes;
     private final long admissionRetainedBytes;
+    /**
+     * Identity of the scans that filled the retained pool
+     * ({@code kind:table:columns}, the only scans {@code admissionRetainedBytes}
+     * is credited to), {@code none} before the first admission and from a
+     * node that does not report it.
+     */
+    private final String admissionRetainedScope;
 
     private final String warmUpMode;
     private final List<LanceWarmUpStatus> warmUps;
@@ -361,6 +371,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             0L,
             0L,
             "none",
+            "none",
             List.of(),
             List.of(),
             List.of(),
@@ -400,6 +411,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         String admissionLastSource,
         long admissionAvailableBytes,
         long admissionRetainedBytes,
+        String admissionRetainedScope,
         String warmUpMode,
         List<LanceWarmUpStatus> warmUps,
         List<IndexReaderStats> indices,
@@ -438,6 +450,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             admissionLastSource,
             admissionAvailableBytes,
             admissionRetainedBytes,
+            admissionRetainedScope,
             warmUpMode,
             warmUps,
             indices,
@@ -481,6 +494,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         String admissionLastSource,
         long admissionAvailableBytes,
         long admissionRetainedBytes,
+        String admissionRetainedScope,
         String warmUpMode,
         List<LanceWarmUpStatus> warmUps,
         List<IndexReaderStats> indices,
@@ -521,6 +535,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.admissionLastSource = admissionLastSource;
         this.admissionAvailableBytes = admissionAvailableBytes;
         this.admissionRetainedBytes = admissionRetainedBytes;
+        this.admissionRetainedScope = admissionRetainedScope == null ? "none" : admissionRetainedScope;
         this.warmUpMode = warmUpMode;
         this.warmUps = List.copyOf(warmUps);
         this.indices = List.copyOf(indices);
@@ -618,6 +633,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         StatisticsProgress progress = reader.block(5, StatisticsProgress::new, StatisticsProgress.NONE);
         this.planStatisticsPending = progress.pending();
         this.planStatisticsPlannedWithout = progress.plannedWithout();
+        this.admissionRetainedScope = reader.block(6, StreamInput::readString, "none");
         reader.finish();
     }
 
@@ -696,6 +712,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         );
         // Likewise for the collection progress counters.
         WireVersion.writeBlock(out, false, new StatisticsProgress(planStatisticsPending, planStatisticsPlannedWithout));
+        // Likewise for the retained pool's identity: an older coordinator
+        // shows the retained bytes without the scans they belong to.
+        WireVersion.writeBlock(out, false, o -> o.writeString(admissionRetainedScope));
     }
 
     @Override
@@ -739,6 +758,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.field("headroom_bytes", ScanAdmission.headroomBytes());
         builder.field("available_bytes", admissionAvailableBytes);
         builder.field("retained_bytes", admissionRetainedBytes);
+        builder.field("retained_scope", admissionRetainedScope);
         builder.field("last_estimate_bytes", admissionLastEstimateBytes);
         builder.field("last_kind", admissionLastKind);
         builder.field("last_source", admissionLastSource);
@@ -1009,11 +1029,24 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
     /**
      * Memory earlier admitted scans left in the process that the node's
-     * next admission decision adds to the available memory (zero while a
-     * gated request is in flight or a gated scan runs).
+     * next admission decision on a scan of {@link #admissionRetainedScope()}
+     * adds to the available memory (zero while a gated request is in
+     * flight or a gated scan runs; a scan of any other identity is
+     * credited nothing).
      */
     public long admissionRetainedBytes() {
         return admissionRetainedBytes;
+    }
+
+    /**
+     * Identity of the scans that filled the retained pool, as
+     * {@code kind:table:columns}: the only scans
+     * {@link #admissionRetainedBytes()} is credited to. {@code none}
+     * before the first admission and from a node whose plugin version
+     * does not report it.
+     */
+    public String admissionRetainedScope() {
+        return admissionRetainedScope;
     }
 
     /** Value of {@code lance.attach.warm_indexes} on the node. */
@@ -1066,6 +1099,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && admissionLastSource.equals(other.admissionLastSource)
             && admissionAvailableBytes == other.admissionAvailableBytes
             && admissionRetainedBytes == other.admissionRetainedBytes
+            && admissionRetainedScope.equals(other.admissionRetainedScope)
             && warmUpMode.equals(other.warmUpMode)
             && warmUps.equals(other.warmUps)
             && indices.equals(other.indices)
@@ -1110,6 +1144,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             admissionLastSource,
             admissionAvailableBytes,
             admissionRetainedBytes,
+            admissionRetainedScope,
             warmUpMode,
             warmUps,
             indices,
