@@ -14,6 +14,7 @@ import java.util.Locale;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.rest.RestStatus;
 
 /**
@@ -260,8 +261,10 @@ public class LanceNamespaceIT extends LanceRestTestCase {
 
             client().performRequest(new Request("DELETE", "/" + indexName));
 
-            // Longer than the 1s poll cadence, shorter than the 3s grace.
-            Thread.sleep(1_500);
+            // A poll cycle inside the grace skips the table and says why.
+            String polled = readAll(postJson("/_lance/namespace/_poll?name=" + scratchDir.toString(), ""));
+            assertTrue("expected the table skipped within the grace: " + polled, polled.contains("\"index\":\"" + indexName + "\""));
+            assertTrue(polled, polled.contains("deleted within lance.namespace.resurface_guard_grace"));
             ResponseException stillGone = expectThrows(
                 ResponseException.class,
                 () -> client().performRequest(new Request("GET", "/" + indexName))
@@ -272,8 +275,17 @@ public class LanceNamespaceIT extends LanceRestTestCase {
                 stillGone.getResponse().getStatusLine().getStatusCode()
             );
 
-            // After the grace expires the next poll recreates the index.
-            Thread.sleep(4_000);
+            // After the grace expires the next scheduled poll (cadence 1s)
+            // recreates the index. A fixed sleep between checks, not the
+            // doubling one, so the check lands within a quarter second of
+            // the poll that recreates it.
+            assertBusyWithFixedSleepTime(() -> {
+                try {
+                    client().performRequest(new Request("GET", "/" + indexName));
+                } catch (ResponseException e) {
+                    throw new AssertionError("index not resurfaced yet: " + e.getMessage(), e);
+                }
+            }, TimeValue.timeValueSeconds(10), TimeValue.timeValueMillis(250));
             Response recovered = client().performRequest(
                 new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s")
             );
@@ -306,7 +318,13 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             postJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s"));
             client().performRequest(new Request("DELETE", "/" + indexName));
-            Thread.sleep(3_000);
+            // A poll cycle right after the delete recreates the index; the
+            // manual cycle waits for the create it issued before answering.
+            // The scheduled cycle (1s here) may recreate it first, in which
+            // case the trigger finds the index and reports nothing; either
+            // way the index exists when the trigger returns.
+            String polled = readAll(postJson("/_lance/namespace/_poll?name=" + scratchDir.toString(), ""));
+            assertFalse("grace=0 disables the guard: " + polled, polled.contains("deleted within lance.namespace.resurface_guard_grace"));
             Response recovered = client().performRequest(
                 new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s")
             );
