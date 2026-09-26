@@ -794,6 +794,11 @@ curl -sS localhost:9200/_lance/stats?pretty
         },
         "executed" : { "pushed_scan" : 6, "lucene" : 51 },
         "pruned" : { "fragments" : 0 }
+      },
+      "fetch" : {
+        "take_count" : 57, "take_rows" : 570, "take_columns" : 342,
+        "take_millis_total" : 121, "take_max_millis" : 9,
+        "stored_fields_takes" : 51, "column_takes" : 6
       }
     }
   }
@@ -811,6 +816,7 @@ How to read it:
 - `native_memory.index_cache_capacity`, `index_cache_shards` and `index_cache_shard_share` are the index cache the plugin handed Lance at startup and the shard layout Lance derives from it (see "Cap Lance's native memory footprint"). `index_cache_shard_share` is the heaviest entry the cache admits; a table whose inverted index is heavier than it (about 52 bytes per row per full-text column) is reloaded on every full-text query.
 - `warm_up` is the index warm-up of the section below: `mode` is the value of `lance.attach.warm_indexes` on the node, and `tables` has one entry per Lance-backed index the node has seen since it started, with the table, the manifest version the warm-up read, the mode it ran under, its `state` (`pending`, `running`, `done`, `failed`, `skipped` for mode `none`, `cancelled` when the index was deleted first), when it started, how long it took, and one entry per Lance index (`name`, `type`, `column`, `state`, `seconds`, and a `detail` when it failed or was skipped). A table whose entry stays `running` for minutes on an object store is reading its indexes page by page; the INFO log shows one line per index as it finishes.
 - `plan` is what the node did with the plans the coordinator shipped: `refinements` counts, per reason, the pushed operations the node moved to the Lucene side, and `executed` counts the fragment requests the Lance scan answered against the ones Lucene's collector and aggregators answered. "Aggregations: where they run" below explains the four reasons. `statistics` is the planner's table statistics cache on the node: `tables` (table versions held), `collect_millis_total` (time spent collecting them), `pending` (collections running in the background right now) and `planned_without` (requests the node planned without statistics because their version was not collected yet; the first request against a freshly attached table on a node that only coordinates is one, and on a table of billions of rows `pending` stays at one for the minutes the collection takes while the requests keep answering).
+- `fetch` counts the `_rowaddr IN (...)` take scans the node ran for the rows behind hits (`stored_fields_takes`, one per leaf that holds a hit of a page) and for the sort or aggregation column of a small full-text or vector hit set (`column_takes`), with the rows and columns they asked for and their wall time. Nothing caches these rows, so every page pays for its own takes; `take_millis_total` set against the `took` of the requests the node served over the same interval says how much of the request time the fetch is.
 
 The endpoint is read only. With the security plugin, grant `cluster:monitor/lance/stats`.
 
