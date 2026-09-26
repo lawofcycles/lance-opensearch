@@ -13,7 +13,9 @@ import org.lance.Dataset;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.query.LanceFtsQuery;
+import org.opensearch.lance.query.LanceHitsAccounting;
 import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -81,25 +83,39 @@ public class FtsSubsetCountTests extends OpenSearchTestCase {
         }
     }
 
-    public void testExactCountProbesAndFallsBackWhenTheProbeFills() throws Exception {
+    public void testExactCountOnASubsetExecutorIsOneScanRestrictedToItsFragments() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
-            // Default probe limit: twelve matches come back short of
-            // it, the executors count their own rows.
-            assertCount(TOTAL, 4L, count(dataset, NODE_A, 0L));
-            assertCount(TOTAL, 8L, count(dataset, NODE_B, 0L));
-
+            // The scan is restricted to the executor's fragments, so
+            // Lance returns the executor's rows only and scanned equals
+            // own, and it runs once whatever the probe limit in force:
+            // the count keeps no rows, so the probe has nothing to cap,
+            // and a probe that filled would cost a second scan.
             int before = LanceFtsQuery.subsetProbeLimit();
-            LanceFtsQuery.setSubsetProbeLimit(5);
-            try {
-                // Twelve matches fill a probe of five, so the count
-                // comes from the restricted scan and is still exact;
-                // that scan returns the executor's rows only.
-                assertCount(4L, 4L, count(dataset, NODE_A, 0L));
-                assertCount(8L, 8L, count(dataset, NODE_B, 0L));
-            } finally {
-                LanceFtsQuery.setSubsetProbeLimit(before);
+            for (int probeLimit : new int[] { before, 5 }) {
+                LanceFtsQuery.setSubsetProbeLimit(probeLimit);
+                try {
+                    assertCount(4L, 4L, countOnce(dataset, NODE_A));
+                    assertCount(8L, 8L, countOnce(dataset, NODE_B));
+                } finally {
+                    LanceFtsQuery.setSubsetProbeLimit(before);
+                }
             }
         }
+    }
+
+    /** The exact count of {@code fragmentIds}, asserting that it ran one Lance scan. */
+    private static PlanExecutor.FtsHitCount countOnce(Dataset dataset, List<Integer> fragmentIds) throws Exception {
+        LanceHitsAccounting accounting = LanceHitsAccounting.unlimited();
+        PlanExecutor.FtsHitCount counted = PlanExecutor.countFtsHitsDirectly(
+            dataset,
+            new LanceFtsQuery("body", "lance"),
+            fragmentIds,
+            0L,
+            LanceCancellation.NONE,
+            accounting
+        );
+        assertEquals("one scan for the exact count of " + fragmentIds, 1L, accounting.ftsScans());
+        return counted;
     }
 
     public void testFullCoverageCountIsUnchanged() throws Exception {
