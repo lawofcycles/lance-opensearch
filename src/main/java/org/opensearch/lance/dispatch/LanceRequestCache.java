@@ -18,6 +18,7 @@ import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.LongFunction;
+import java.util.function.LongSupplier;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -189,7 +190,7 @@ public final class LanceRequestCache implements ClusterStateListener {
         public SearchResponse complete(LongFunction<SearchResponse> computed) {
             Entry found = hit;
             if (found != null) {
-                return found.toResponse(System.currentTimeMillis() - startMillis);
+                return found.toResponse(clock.getAsLong() - startMillis);
             }
             SearchResponse response = computed.apply(startMillis);
             Key formed = key;
@@ -299,6 +300,9 @@ public final class LanceRequestCache implements ClusterStateListener {
      */
     private final Map<String, Boolean> readerWrapperByIndex = new ConcurrentHashMap<>();
 
+    /** The wall clock in milliseconds: {@code System.currentTimeMillis} outside tests. */
+    private final LongSupplier clock;
+
     /**
      * @param limitBytes the most the entries may weigh together
      * @param maxEntryBytes the largest serialised aggregations block stored
@@ -306,10 +310,19 @@ public final class LanceRequestCache implements ClusterStateListener {
      * @param expire the initial {@code lance.request_cache.expire}; zero for none
      */
     public LanceRequestCache(long limitBytes, long maxEntryBytes, boolean enabled, TimeValue expire) {
+        this(limitBytes, maxEntryBytes, enabled, expire, System::currentTimeMillis);
+    }
+
+    /**
+     * A cache reading the time from {@code clock} (milliseconds), for
+     * tests that move the clock instead of waiting for an entry to expire.
+     */
+    LanceRequestCache(long limitBytes, long maxEntryBytes, boolean enabled, TimeValue expire, LongSupplier clock) {
         this.limitBytes = limitBytes;
         this.maxEntryBytes = maxEntryBytes;
         this.enabled = enabled;
         this.expireMillis = expire == null ? 0L : expire.millis();
+        this.clock = clock;
         this.cache = CacheBuilder.<Key, Entry>builder()
             .setMaximumWeight(limitBytes)
             .weigher((key, entry) -> key.weight() + entry.bytes())
@@ -507,7 +520,7 @@ public final class LanceRequestCache implements ClusterStateListener {
     /** The entry under {@code key}, or null; an expired entry is dropped and counts as a miss. */
     Entry get(Key key) {
         Entry entry = cache.get(key);
-        if (entry != null && expireMillis > 0L && System.currentTimeMillis() - entry.storedAtMillis > expireMillis) {
+        if (entry != null && expireMillis > 0L && clock.getAsLong() - entry.storedAtMillis > expireMillis) {
             cache.invalidate(key, entry);
             evictions.increment();
             entry = null;
@@ -547,7 +560,7 @@ public final class LanceRequestCache implements ClusterStateListener {
             hits.getMaxScore(),
             response.isTerminatedEarly(),
             bytes,
-            System.currentTimeMillis()
+            clock.getAsLong()
         );
         cache.put(key, entry);
         return null;
