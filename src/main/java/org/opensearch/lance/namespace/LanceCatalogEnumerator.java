@@ -41,6 +41,24 @@ final class LanceCatalogEnumerator {
     }
 
     /**
+     * What one enumeration found: the tables, and the first failure of a
+     * subnamespace listing during the walk, or {@code null} when every
+     * namespace the walk reached listed its children. A catalog that
+     * refuses a subnamespace (a Glue database or Iceberg namespace the
+     * credentials do not cover) hides the tables below it, so the
+     * failure is carried out for the poll to report instead of the
+     * tables silently going missing.
+     */
+    record Enumeration(List<CatalogTable> tables, Exception firstNamespacesFailure) {
+    }
+
+    /** Failures the walk records on the way: the first table listing refusal and the first subnamespace listing refusal. */
+    private static final class WalkFailures {
+        Exception firstTables;
+        Exception firstNamespaces;
+    }
+
+    /**
      * Config key naming the warehouse (Iceberg REST) or catalog
      * (Polaris) the table walk starts from. Its dot-separated segments
      * become the leading levels of every namespace and table id the
@@ -74,19 +92,19 @@ final class LanceCatalogEnumerator {
      * root shapes in turn and finally walks the namespace tree
      * depth-first, bounded by {@code max_namespace_depth}.
      */
-    static List<CatalogTable> enumerateTables(LanceNamespace handle, LanceNamespaceMetadata.Entry entry) throws Exception {
+    static Enumeration enumerateTables(LanceNamespace handle, LanceNamespaceMetadata.Entry entry) throws Exception {
         List<String> root = walkRoot(entry);
         int maxDepth = maxNamespaceDepth(entry);
         Exception rootListingFailure = null;
         if (root.isEmpty()) {
             try {
-                return tablesAt(handle.listTables(new ListTablesRequest()), root);
+                return new Enumeration(tablesAt(handle.listTables(new ListTablesRequest()), root), null);
             } catch (Exception noIdFailure) {
                 rootListingFailure = noIdFailure;
             }
         }
         try {
-            return tablesAt(handle.listTables(new ListTablesRequest().id(root)), root);
+            return new Enumeration(tablesAt(handle.listTables(new ListTablesRequest().id(root)), root), null);
         } catch (Exception explicitIdFailure) {
             if (rootListingFailure == null) {
                 rootListingFailure = explicitIdFailure;
@@ -95,24 +113,24 @@ final class LanceCatalogEnumerator {
         List<CatalogTable> tables = new ArrayList<>();
         Set<List<String>> visited = new HashSet<>();
         visited.add(root);
-        Exception[] firstTablesFailure = new Exception[1];
+        WalkFailures failures = new WalkFailures();
         try {
-            walkNamespaces(handle, root, maxDepth, visited, tables, firstTablesFailure);
+            walkNamespaces(handle, root, maxDepth, visited, tables, failures);
         } catch (Exception walkFailure) {
             // Neither root shape works and the walk cannot start; report
             // the root failure, which names the catalog's own error
             // rather than the fallback's.
             throw rootListingFailure;
         }
-        if (tables.isEmpty() && firstTablesFailure[0] != null) {
+        if (tables.isEmpty() && failures.firstTables != null) {
             // Every namespace the walk reached refused its table listing.
             // An empty catalog answers empty listings instead, so this is
             // a real failure (revoked table permissions, wrong warehouse)
             // and the registration should show as unavailable rather than
             // silently surfacing nothing.
-            throw firstTablesFailure[0];
+            throw failures.firstTables;
         }
-        return tables;
+        return new Enumeration(tables, failures.firstNamespaces);
     }
 
     /**
@@ -124,7 +142,8 @@ final class LanceCatalogEnumerator {
      * the tables live one level further down. The first such refusal is
      * recorded so the caller can tell an empty catalog from one that
      * refused everything. A child that cannot list its own namespaces
-     * is treated as a leaf.
+     * is treated as a leaf, and the first such refusal is recorded too:
+     * the tables below it stay hidden, which the poll reports.
      */
     private static void walkNamespaces(
         LanceNamespace handle,
@@ -132,7 +151,7 @@ final class LanceCatalogEnumerator {
         int remainingDepth,
         Set<List<String>> visited,
         List<CatalogTable> tables,
-        Exception[] firstTablesFailure
+        WalkFailures failures
     ) throws Exception {
         if (remainingDepth <= 0) {
             return;
@@ -152,16 +171,26 @@ final class LanceCatalogEnumerator {
             try {
                 tables.addAll(tablesAt(handle.listTables(new ListTablesRequest().id(childId)), childId));
             } catch (Exception tablesFailure) {
-                if (firstTablesFailure[0] == null) {
-                    firstTablesFailure[0] = tablesFailure;
+                if (failures.firstTables == null) {
+                    failures.firstTables = tablesFailure;
                 }
                 LOG.debug("table listing at {} failed; descending: {}", childId, tablesFailure.getMessage());
             }
             if (remainingDepth > 1) {
                 try {
-                    walkNamespaces(handle, childId, remainingDepth - 1, visited, tables, firstTablesFailure);
+                    walkNamespaces(handle, childId, remainingDepth - 1, visited, tables, failures);
                 } catch (Exception childWalkFailure) {
-                    LOG.debug("namespace listing below {} failed; treating it as a leaf: {}", childId, childWalkFailure.getMessage());
+                    if (failures.firstNamespaces == null) {
+                        failures.firstNamespaces = new IllegalStateException(
+                            "namespace listing below " + childId + " failed: " + childWalkFailure.getMessage(),
+                            childWalkFailure
+                        );
+                    }
+                    LOG.warn(
+                        "namespace listing below {} failed; treating it as a leaf, its tables are not surfaced: {}",
+                        childId,
+                        childWalkFailure.getMessage()
+                    );
                 }
             }
         }

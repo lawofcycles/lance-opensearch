@@ -25,7 +25,7 @@ public class LanceBuildIndexesStatusTests extends OpenSearchTestCase {
     }
 
     public void testInvalidInputOnlyIsBadRequest() {
-        Failed tokenizer = Failed.of("text", new IllegalArgumentException("unknown base tokenizer x"));
+        Failed tokenizer = Failed.of("text", new IllegalArgumentException("Invalid user input: unknown base tokenizer x"));
         assertTrue(tokenizer.invalidInput());
         assertEquals(RestStatus.BAD_REQUEST, TransportLanceBuildIndexesAction.statusOf(List.of(tokenizer)));
         assertEquals(RestStatus.BAD_REQUEST, TransportLanceBuildIndexesAction.statusOf(List.of(tokenizer, tokenizer)));
@@ -37,9 +37,18 @@ public class LanceBuildIndexesStatusTests extends OpenSearchTestCase {
         assertEquals(RestStatus.INTERNAL_SERVER_ERROR, TransportLanceBuildIndexesAction.statusOf(List.of(io)));
     }
 
+    public void testIllegalArgumentFromPluginCodeIsInternalServerError() {
+        // The classification is LanceInvalidInput's: an
+        // IllegalArgumentException the plugin's own code raised inside a
+        // build is a bug, not the caller's mistake.
+        Failed bug = Failed.of("rating", new IllegalArgumentException("unknown scalar index type [btree2]"));
+        assertFalse(bug.invalidInput());
+        assertEquals(RestStatus.INTERNAL_SERVER_ERROR, TransportLanceBuildIndexesAction.statusOf(List.of(bug)));
+    }
+
     public void testMixedFailuresStayInternalServerError() {
         Failed io = Failed.of("rating", new IOException("LanceError(IO): Permission denied (os error 13)"));
-        Failed tokenizer = Failed.of("text", new IllegalArgumentException("unknown base tokenizer x"));
+        Failed tokenizer = Failed.of("text", new IllegalArgumentException("Invalid user input: unknown base tokenizer x"));
         assertEquals(RestStatus.INTERNAL_SERVER_ERROR, TransportLanceBuildIndexesAction.statusOf(List.of(tokenizer, io)));
     }
 

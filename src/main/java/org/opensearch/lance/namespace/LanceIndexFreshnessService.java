@@ -230,7 +230,10 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         this.cadence = cadence;
         this.warmCache = warmCache;
         this.servedVersions = servedVersions;
-        this.driftDetector = new LanceSchemaDriftDetector(client);
+        // A drift detection step that could not read or update the
+        // mapping leaves the check's outcome intact but the drift
+        // unrecorded; it counts as a failure of the check in the stats.
+        this.driftDetector = new LanceSchemaDriftDetector(client, failures::increment);
     }
 
     @Override

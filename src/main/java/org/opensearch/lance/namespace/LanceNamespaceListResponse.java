@@ -26,7 +26,8 @@ import org.opensearch.core.xcontent.XContentBuilder;
  *       identifier: one object per registration with its name, type,
  *       path (directory only), redacted config, and an availability
  *       status ({@code unavailable} entries carry the initialise or
- *       poll error).</li>
+ *       poll error, {@code partial} entries the subnamespace listing
+ *       failure of the last poll).</li>
  *   <li>{@code {"name": "...", "tables": [...]}} when the identifier
  *       names a registration.</li>
  *   <li>{@code {"registered": false, "name": "..."}} with status 404
@@ -40,7 +41,9 @@ public final class LanceNamespaceListResponse extends ActionResponse implements 
      * One registration in the root listing. {@code config} arrives
      * already redacted — the transport response never carries raw
      * secret values. {@code error} is {@code null} while the catalog
-     * handle is healthy.
+     * handle is healthy; {@code partial} is {@code null} unless the
+     * last poll listed the catalog but could not descend into one of
+     * its subnamespaces, and then carries that failure.
      */
     public static final class NamespaceInfo implements Writeable {
 
@@ -49,13 +52,19 @@ public final class LanceNamespaceListResponse extends ActionResponse implements 
         private final String path;
         private final Map<String, String> config;
         private final String error;
+        private final String partial;
 
         public NamespaceInfo(String name, String type, String path, Map<String, String> config, String error) {
+            this(name, type, path, config, error, null);
+        }
+
+        public NamespaceInfo(String name, String type, String path, Map<String, String> config, String error, String partial) {
             this.name = Objects.requireNonNull(name, "name");
             this.type = Objects.requireNonNull(type, "type");
             this.path = path;
             this.config = Map.copyOf(config);
             this.error = error;
+            this.partial = partial;
         }
 
         public NamespaceInfo(StreamInput in) throws IOException {
@@ -64,6 +73,7 @@ public final class LanceNamespaceListResponse extends ActionResponse implements 
             this.path = in.readOptionalString();
             this.config = in.readMap(StreamInput::readString, StreamInput::readString);
             this.error = in.readOptionalString();
+            this.partial = in.readOptionalString();
         }
 
         @Override
@@ -73,6 +83,7 @@ public final class LanceNamespaceListResponse extends ActionResponse implements 
             out.writeOptionalString(path);
             out.writeMap(config, StreamOutput::writeString, StreamOutput::writeString);
             out.writeOptionalString(error);
+            out.writeOptionalString(partial);
         }
 
         public String name() {
@@ -95,6 +106,11 @@ public final class LanceNamespaceListResponse extends ActionResponse implements 
             return error;
         }
 
+        /** The subnamespace listing failure of the last poll, or {@code null} when the walk reached every namespace. */
+        public String partial() {
+            return partial;
+        }
+
         XContentBuilder toXContent(XContentBuilder builder) throws IOException {
             builder.startObject();
             builder.field("name", name);
@@ -103,9 +119,14 @@ public final class LanceNamespaceListResponse extends ActionResponse implements 
                 builder.field("path", path);
             }
             builder.field("config", config);
-            builder.field("status", error == null ? "available" : "unavailable");
             if (error != null) {
+                builder.field("status", "unavailable");
                 builder.field("error", error);
+            } else if (partial != null) {
+                builder.field("status", "partial");
+                builder.field("error", partial);
+            } else {
+                builder.field("status", "available");
             }
             return builder.endObject();
         }
@@ -118,12 +139,13 @@ public final class LanceNamespaceListResponse extends ActionResponse implements 
                 && type.equals(other.type)
                 && Objects.equals(path, other.path)
                 && config.equals(other.config)
-                && Objects.equals(error, other.error);
+                && Objects.equals(error, other.error)
+                && Objects.equals(partial, other.partial);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(name, type, path, config, error);
+            return Objects.hash(name, type, path, config, error, partial);
         }
     }
 

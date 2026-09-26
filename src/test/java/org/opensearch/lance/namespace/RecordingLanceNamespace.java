@@ -77,6 +77,8 @@ class RecordingLanceNamespace implements LanceNamespace, AutoCloseable {
     Map<String, Set<String>> namespaceTree;
     /** Tree mode: tables per exact namespace id (dot-joined); other ids reject the listing. */
     Map<String, Set<String>> tableTree;
+    /** Tree mode: parent ids (dot-joined) whose {@code listNamespaces} throws, the way a catalog refuses a namespace the credentials do not cover. */
+    Set<String> refusedNamespaceListings = Set.of();
     final List<List<String>> listTablesIds = new CopyOnWriteArrayList<>();
     final List<List<String>> listNamespacesIds = new CopyOnWriteArrayList<>();
 
@@ -154,6 +156,11 @@ class RecordingLanceNamespace implements LanceNamespace, AutoCloseable {
     @Override
     public ListNamespacesResponse listNamespaces(ListNamespacesRequest request) {
         listNamespacesIds.add(request.getId() == null ? List.of() : List.copyOf(request.getId()));
+        if (refusedNamespaceListings.contains(joined(request.getId()))) {
+            throw new IllegalStateException(
+                "AccessDeniedException: not authorized to list namespaces under [" + joined(request.getId()) + "]"
+            );
+        }
         if (namespaceTree != null) {
             Set<String> children = namespaceTree.get(joined(request.getId()));
             return new ListNamespacesResponse().namespaces(children == null ? Set.of() : children);

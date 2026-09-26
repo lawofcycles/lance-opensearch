@@ -21,13 +21,14 @@ import org.opensearch.lance.WireVersion;
  * Response for {@link LanceNamespacePollAction}: the cycle's
  * {@link LanceNamespaceService.PollReport}. Rendered as
  * {@code {"surfaced": [index, ...], "skipped": [{"namespace", "table",
- * "index", "reason"}, ...], "unavailable": {"name": "error", ...}}}.
+ * "index", "reason"}, ...], "unavailable": {"name": "error", ...},
+ * "partial": {"name": "error", ...}}}.
  * Opens with {@link #WIRE_VERSION} (see {@link WireVersion}).
  */
 public final class LanceNamespacePollResponse extends ActionResponse implements ToXContentObject {
 
-    /** The wire format's version, the first field the response writes. */
-    public static final int WIRE_VERSION = 1;
+    /** The wire format's version, the first field the response writes; 2 added the partial listings. */
+    public static final int WIRE_VERSION = 2;
 
     private final LanceNamespaceService.PollReport report;
 
@@ -52,7 +53,12 @@ public final class LanceNamespacePollResponse extends ActionResponse implements 
             );
         }
         Map<String, String> unavailable = in.readOrderedMap(StreamInput::readString, StreamInput::readString);
-        this.report = new LanceNamespaceService.PollReport(surfaced, skipped, unavailable);
+        Map<String, String> partial = reader.block(
+            2,
+            block -> block.readOrderedMap(StreamInput::readString, StreamInput::readString),
+            Map.of()
+        );
+        this.report = new LanceNamespaceService.PollReport(surfaced, skipped, unavailable, partial);
         reader.finish();
     }
 
@@ -68,6 +74,10 @@ public final class LanceNamespacePollResponse extends ActionResponse implements 
             out.writeString(skipped.reason());
         }
         out.writeMap(report.unavailable(), StreamOutput::writeString, StreamOutput::writeString);
+        // A caller of the previous version reads the report without the
+        // partial listings; the cycle itself ran the same, so the block
+        // is never critical.
+        WireVersion.writeBlock(out, false, o -> o.writeMap(report.partial(), StreamOutput::writeString, StreamOutput::writeString));
     }
 
     public LanceNamespaceService.PollReport report() {
@@ -94,6 +104,11 @@ public final class LanceNamespacePollResponse extends ActionResponse implements 
         builder.endArray();
         builder.startObject("unavailable");
         for (Map.Entry<String, String> entry : report.unavailable().entrySet()) {
+            builder.field(entry.getKey(), entry.getValue());
+        }
+        builder.endObject();
+        builder.startObject("partial");
+        for (Map.Entry<String, String> entry : report.partial().entrySet()) {
             builder.field(entry.getKey(), entry.getValue());
         }
         builder.endObject();
