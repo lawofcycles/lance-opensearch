@@ -1,6 +1,8 @@
 # Aggregation pushdown
 
-A `size: 0` request whose query is `match_all` or a scalar filter and whose aggregation tree has one of the shapes below runs inside the Lance scan. The plugin builds a Substrait `AggregateRel` through the Calcite planner (`LanceSubstraitProducer`) and hands it to `ScanOptions.substraitAggregate`; Lance evaluates the group by and the metrics through the DataFusion aggregate kernel it ships (`datafusion_physical_expr::aggregate`). That kernel is SIMD-optimized and reads Lance's columnar data files directly, so no JVM aggregator or per-document collection sits between the fragment and the aggregate.
+A `size: 0` request whose query is `match_all` or a scalar filter and whose aggregation tree has one of the shapes below runs inside the Lance scan. The plugin builds a Substrait `AggregateRel` through the Calcite planner (`LanceSubstraitProducer`) and hands it to `ScanOptions.substraitAggregate`; Lance evaluates the group by and the metrics through the DataFusion aggregate kernel it ships (`datafusion_physical_expr::aggregate`).
+
+That kernel is SIMD-optimized and reads Lance's columnar data files directly, so no JVM aggregator or per-document collection sits between the fragment and the aggregate.
 
 Every other tree runs through OpenSearch's stock aggregators over the fragment leaves ([features.md](features.md#aggregations)); the planner chooses between the two forms by cost ([query-plan.md](query-plan.md#cost)).
 
