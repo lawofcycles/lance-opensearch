@@ -34,6 +34,7 @@ import org.opensearch.lance.plan.rel.physical.FanOutExec;
 import org.opensearch.lance.plan.rel.physical.MergeExec;
 import org.opensearch.lance.query.ScanAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
+import org.opensearch.lance.query.LanceHitsAccounting;
 import org.opensearch.lance.query.LanceScanFilter;
 import org.opensearch.search.approximate.ApproximateScoreQuery;
 import org.opensearch.search.internal.ContextIndexSearcher;
@@ -365,16 +366,25 @@ public final class PlanExecutor {
      *
      * <p>A bare {@link LanceFtsQuery} is counted from the Weight the
      * caller built for the request when that Weight's scan has run
-     * (hits or aggregations were collected) and either was unbounded
-     * or returned fewer rows than its {@code scanLimit}, since then
-     * the scan saw every match. Otherwise the count comes from a
-     * dedicated Lance scan that yields no payload columns
-     * ({@link #countFtsHitsDirectly}), limited to
-     * {@code trackTotalHitsUpTo + 1} rows unless the request asked for
-     * an accurate total: reaching the limit proves there are more than
-     * {@code trackTotalHitsUpTo} matches, which is all the
-     * {@code gte} relation needs, and stops the scan from walking a
-     * posting list whose length is what makes large FTS results slow.
+     * (hits or aggregations were collected) and the rows it returned
+     * settle the count: the scan was unbounded or came back short of
+     * its {@code scanLimit}, so it saw every match and the count is
+     * exact; or it filled a limit above the request's
+     * {@code trackTotalHitsUpTo} bound, which proves more than the
+     * bound match, and the executor reports the rows it holds as a
+     * lower bound. The fragment executor widens a bounded page's scan
+     * to {@code max(size, bound + 1)} rows so the second case covers
+     * every bounded page and the page and its count come from one
+     * scan. Otherwise (the scan has not run, or it filled a limit
+     * below the bound) the count comes from a dedicated Lance scan
+     * that yields no payload columns ({@link #countFtsHitsDirectly}),
+     * limited to {@code trackTotalHitsUpTo + 1} rows unless the
+     * request asked for an accurate total: reaching the limit proves
+     * there are more than {@code trackTotalHitsUpTo} matches, which is
+     * all the {@code gte} relation needs, and stops the scan from
+     * walking a posting list whose length is what makes large FTS
+     * results slow. Every Lance full text scan run here is counted on
+     * the request's {@link LanceHitsAccounting} for the profile.
      *
      * <p>For every other scoring shape (knn, a bool mixing FTS with
      * other scoring clauses, post_filter over any query) the
@@ -489,12 +499,29 @@ public final class PlanExecutor {
                 if (scanned >= 0 && ftsWeight.complete()) {
                     return MatchedCount.exact(scanned);
                 }
+                // A bounded scan that filled a limit above the bound
+                // holds at least limit rows of this executor's
+                // fragments (the whole table scan kept every returned
+                // row, a subset executor's scan widened until it held
+                // limit own rows), so more than the bound match here
+                // and the coordinator answers gte from the rows kept.
+                // The executor sets the limit to max(size, bound + 1)
+                // for a bounded page, which is what makes this the
+                // usual way out for a page and keeps the count-only
+                // scan below for the shapes whose scan did not run.
+                if (scanned >= 0
+                    && upTo != SearchContext.TRACK_TOTAL_HITS_ACCURATE
+                    && ftsWeight.scanLimit() != LanceFtsQuery.SCAN_LIMIT_UNBOUNDED
+                    && ftsWeight.scanLimit() > upTo) {
+                    return new MatchedCount(scanned, true);
+                }
             }
+            LanceHitsAccounting accounting = LanceHitsAccounting.of(searcher);
             if (upTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
-                return MatchedCount.exact(countFtsHitsDirectly(dataset, fts, fragmentIds, 0L, cancellation).own());
+                return MatchedCount.exact(countFtsHitsDirectly(dataset, fts, fragmentIds, 0L, cancellation, accounting).own());
             }
             long limit = (long) upTo + 1L;
-            FtsHitCount counted = countFtsHitsDirectly(dataset, fts, fragmentIds, limit, cancellation);
+            FtsHitCount counted = countFtsHitsDirectly(dataset, fts, fragmentIds, limit, cancellation, accounting);
             // The bound is judged on the rows Lance returned before the
             // fragment filter. On a subset executor the own share of a
             // filled scan is a fraction of the limit and says nothing
@@ -731,23 +758,28 @@ public final class PlanExecutor {
      */
     public static FtsHitCount countFtsHitsDirectly(Dataset dataset, LanceFtsQuery fts, List<Integer> fragmentIds, long limit)
         throws Exception {
-        return countFtsHitsDirectly(dataset, fts, fragmentIds, limit, LanceCancellation.NONE);
+        return countFtsHitsDirectly(dataset, fts, fragmentIds, limit, LanceCancellation.NONE, LanceHitsAccounting.unlimited());
     }
 
-    /** {@link #countFtsHitsDirectly(Dataset, LanceFtsQuery, List, long)} whose scans stop once {@code cancellation} reports a cancelled task. */
+    /**
+     * {@link #countFtsHitsDirectly(Dataset, LanceFtsQuery, List, long)} whose
+     * scans stop once {@code cancellation} reports a cancelled task and
+     * are counted on {@code accounting}, the request's, for the profile.
+     */
     public static FtsHitCount countFtsHitsDirectly(
         Dataset dataset,
         LanceFtsQuery fts,
         List<Integer> fragmentIds,
         long limit,
-        LanceCancellation cancellation
+        LanceCancellation cancellation,
+        LanceHitsAccounting accounting
     ) throws Exception {
         // The admission gate credits memory earlier scans left behind
         // only while no full text scan runs; a count-only scan reloads
         // the inverted index the same way the hits scan does.
         ScanAdmission.scanStarted();
         try {
-            return countFtsHitsDirectlyUnguarded(dataset, fts, fragmentIds, limit, cancellation);
+            return countFtsHitsDirectlyUnguarded(dataset, fts, fragmentIds, limit, cancellation, accounting);
         } finally {
             ScanAdmission.scanFinished();
         }
@@ -758,7 +790,8 @@ public final class PlanExecutor {
         LanceFtsQuery fts,
         List<Integer> fragmentIds,
         long limit,
-        LanceCancellation cancellation
+        LanceCancellation cancellation,
+        LanceHitsAccounting accounting
     ) throws Exception {
         boolean subset = fragmentIds != null && !LanceFtsQuery.coversAllFragments(fragmentIds, dataset);
         if (!subset) {
@@ -766,11 +799,12 @@ public final class PlanExecutor {
             if (limit > 0) {
                 builder = builder.limit(limit);
             }
+            accounting.ftsScanIssued();
             return FtsHitCount.whole(countRows(dataset, builder.build(), cancellation));
         }
         Set<Integer> own = new HashSet<>(fragmentIds);
         if (limit > 0) {
-            return countOwnRows(dataset, rowAddressScan(fts).limit(limit).build(), own, cancellation);
+            return countOwnRows(dataset, rowAddressScan(fts).limit(limit).build(), own, cancellation, accounting);
         }
         long subsetRows = 0L;
         for (Fragment fragment : dataset.getFragments()) {
@@ -779,10 +813,11 @@ public final class PlanExecutor {
             }
         }
         long probeLimit = LanceFtsQuery.effectiveSubsetProbeLimit(subsetRows);
-        FtsHitCount probe = countOwnRows(dataset, rowAddressScan(fts).limit(probeLimit).build(), own, cancellation);
+        FtsHitCount probe = countOwnRows(dataset, rowAddressScan(fts).limit(probeLimit).build(), own, cancellation, accounting);
         if (probe.scanned() < probeLimit) {
             return probe;
         }
+        accounting.ftsScanIssued();
         return FtsHitCount.whole(
             countRows(dataset, LanceFtsQuery.restrictToFragmentsUnlessAll(countOnlyScan(fts), fragmentIds, dataset).build(), cancellation)
         );
@@ -835,10 +870,16 @@ public final class PlanExecutor {
      * Read {@code options} against {@code dataset} and count the rows
      * whose fragment id is in {@code own} next to every row returned.
      */
-    private static FtsHitCount countOwnRows(Dataset dataset, ScanOptions options, Set<Integer> own, LanceCancellation cancellation)
-        throws Exception {
+    private static FtsHitCount countOwnRows(
+        Dataset dataset,
+        ScanOptions options,
+        Set<Integer> own,
+        LanceCancellation cancellation,
+        LanceHitsAccounting accounting
+    ) throws Exception {
         long scanned = 0L;
         long kept = 0L;
+        accounting.ftsScanIssued();
         try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
             while (reader.loadNextBatch()) {
                 cancellation.checkCancelled();
