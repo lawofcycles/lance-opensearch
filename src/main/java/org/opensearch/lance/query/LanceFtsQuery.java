@@ -1071,21 +1071,28 @@ public final class LanceFtsQuery extends Query {
      * plan pylance gets ({@code PreFilterSource::None}) and the lookup
      * runs from the index alone.
      *
-     * <p>Because of that cost the FTS paths avoid the restriction even
-     * for a proper subset: the hits scan and the count scan run over
-     * the whole table and keep the rows of the executor's fragments by
-     * the fragment id in {@code _rowaddr} ({@link LanceFtsWeight} and
-     * the fragment executor's count path explain why the per executor
-     * results still merge to the same answer). This method is what
-     * those paths fall back to when the whole table scan has not
-     * supplied the executor's rows within the probe limit: an
-     * unbounded scan that matches more rows than the limit, or a
-     * bounded page whose own rows stay below the page while the
-     * widened scans reach the limit. The restriction is paid only when
-     * the alternative would transfer that many rows of other
-     * executors' fragments. A Lance-side change that builds the
-     * prefilter from the fragment bitmap instead of a row id read
-     * would make the restricted scan an index-only lookup as well.
+     * <p>Because of that cost the FTS paths that can bound their scan
+     * avoid the restriction even for a proper subset: the hits scan
+     * and the bounded count scan run over the whole table and keep
+     * the rows of the executor's fragments by the fragment id in
+     * {@code _rowaddr} ({@link LanceFtsWeight} and the fragment
+     * executor's count path explain why the per executor results
+     * still merge to the same answer). The hits scan falls back to
+     * this method when the whole table scan has not supplied the
+     * executor's rows within the probe limit: an unbounded scan that
+     * matches more rows than the limit, or a bounded page whose own
+     * rows stay below the page while the widened scans reach the
+     * limit. The restriction is paid there only when the alternative
+     * would transfer that many rows of other executors' fragments.
+     * The exact count scan ({@code track_total_hits: true},
+     * {@code _count}) takes the restriction up front instead: it
+     * keeps no rows, so the probe limit has no heap to protect, and a
+     * probe that fills costs a second scan of the inverted index,
+     * which Lance rebuilds the document set for again; the prefilter
+     * read is bounded by the rows the executor covers, the extra scan
+     * is not. A Lance-side change that builds the prefilter from the
+     * fragment bitmap instead of a row id read would make the
+     * restricted scan an index-only lookup as well.
      */
     public static ScanOptions.Builder restrictToFragmentsUnlessAll(
         ScanOptions.Builder builder,

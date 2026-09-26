@@ -713,35 +713,43 @@ public final class PlanExecutor {
      * dataset that is the whole scan, and Lance answers it from the
      * inverted index alone.
      *
-     * <p>A proper subset (one executor of a multi node fan out) is
-     * not passed to Lance either, because a fragment list makes Lance
-     * read {@code _rowid} over the listed fragments as a prefilter
-     * (see {@link LanceFtsQuery#restrictToFragmentsUnlessAll}).
-     * Instead the scan runs over the whole table with
-     * {@code withRowAddress(true)} and the rows whose fragment id
-     * (upper 32 bits of {@code _rowaddr}) is in {@code fragmentIds}
-     * are counted here, next to the number of rows Lance returned
-     * before that filter:
+     * <p>A proper subset (one executor of a multi node fan out) runs
+     * one scan either way; which one depends on {@code limit}:
      * <ul>
      *   <li>{@code limit > 0} (the {@code track_total_hits} bound,
-     *       passed as {@code upTo + 1}): one scan with that limit.
-     *       Every executor sees the same {@code min(total, upTo + 1)}
-     *       rows and counts its own fragments' share. The caller
-     *       compares {@link FtsHitCount#scanned()} with the limit to
-     *       decide whether the share is exact or a lower bound: when
-     *       the scan filled its limit the table has more than
+     *       passed as {@code upTo + 1}): the scan runs over the whole
+     *       table with {@code withRowAddress(true)} and that limit,
+     *       and the rows whose fragment id (upper 32 bits of
+     *       {@code _rowaddr}) is in {@code fragmentIds} are counted
+     *       here, next to the number of rows Lance returned before
+     *       that filter. Every executor sees the same
+     *       {@code min(total, upTo + 1)} rows and counts its own
+     *       fragments' share. The caller compares
+     *       {@link FtsHitCount#scanned()} with the limit to decide
+     *       whether the share is exact or a lower bound: when the
+     *       scan filled its limit the table has more than
      *       {@code upTo} matches and every executor reports a lower
      *       bound, whatever its share. The shares themselves need
      *       not sum to {@code upTo + 1}, since a tie in score at the
-     *       limit lets each executor's scan pick a different row.</li>
-     *   <li>{@code limit == 0} ({@code track_total_hits: true}): a
-     *       probe scan with {@code limit(effectiveSubsetProbeLimit)}
-     *       for the rows the executor's fragments hold. When it
-     *       comes back short every match has been seen and the
-     *       executor's share is the exact count. When it fills up the
-     *       probe is discarded and the count-only scan above runs with
-     *       the {@code fragmentIds} restriction, paying the prefilter
-     *       read for that one shape.</li>
+     *       limit lets each executor's scan pick a different row. The
+     *       fragment list is not passed to Lance because it makes
+     *       Lance read {@code _rowid} over the listed fragments as a
+     *       prefilter (see
+     *       {@link LanceFtsQuery#restrictToFragmentsUnlessAll}), and
+     *       the bound caps what the whole table scan can return.</li>
+     *   <li>{@code limit == 0} ({@code track_total_hits: true} and
+     *       {@code _count}): the count-only scan above with the
+     *       {@code fragmentIds} restriction. The prefilter read it
+     *       pays grows with the rows the executor covers (about 21 ns
+     *       per row) and nothing else; a whole table scan would
+     *       receive every match of the table, and stopping it at a
+     *       probe limit to bound that cost means a second scan of the
+     *       inverted index whenever the probe fills, which Lance
+     *       charges the whole document set rebuild for again. One
+     *       restricted scan is the cheaper of the two on every table
+     *       whose match count is not known in advance, and it keeps
+     *       the exact count at one scan per executor however many
+     *       nodes the table is spread over.</li>
      * </ul>
      *
      * <p>A prefilter carried by {@code fts} (the scalar clauses of a
@@ -801,20 +809,9 @@ public final class PlanExecutor {
             }
             return FtsHitCount.whole(countFtsRows(dataset, builder.build(), cancellation, accounting));
         }
-        Set<Integer> own = new HashSet<>(fragmentIds);
         if (limit > 0) {
+            Set<Integer> own = new HashSet<>(fragmentIds);
             return countOwnRows(dataset, rowAddressScan(fts).limit(limit).build(), own, cancellation, accounting);
-        }
-        long subsetRows = 0L;
-        for (Fragment fragment : dataset.getFragments()) {
-            if (own.contains(fragment.getId())) {
-                subsetRows += fragment.countRows();
-            }
-        }
-        long probeLimit = LanceFtsQuery.effectiveSubsetProbeLimit(subsetRows);
-        FtsHitCount probe = countOwnRows(dataset, rowAddressScan(fts).limit(probeLimit).build(), own, cancellation, accounting);
-        if (probe.scanned() < probeLimit) {
-            return probe;
         }
         return FtsHitCount.whole(
             countFtsRows(
