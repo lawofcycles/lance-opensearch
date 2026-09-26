@@ -502,14 +502,17 @@ The collection never runs on a request's thread. A plan that finds no entry for 
 (`TableStatisticsCache.lookup`) starts the collection on the node's generic pool and goes on
 without statistics: the row count comes from the fragment metadata, the cost model uses its
 defaults where a figure is missing, no fragment is pruned, and the admission gate's estimators use
-their per row constants. The plans that follow read the entry. A node that holds the table's shard
-starts the collection earlier, when it builds the snapshot of a version (at attach, when the
-namespace poll surfaces the table, and when the freshness check follows the manifest to a new
-version), so on that node the statistics are usually ready before the first request; a node that
-only coordinates collects on its first request of the version. Statistics are not shipped between
+their per row constants. The plans that follow read the entry. Every data node starts the
+collection of an attached table's current version when the index appears in the cluster state
+(attach, the namespace poll surfacing the table, the node's first cluster state after a restart),
+so the statistics are usually ready on every node before its first request. The node that holds
+the table's shard starts it again when the freshness check follows the manifest to a new version,
+and every node when it builds the snapshot of a version; a node that only coordinates collects a
+new version on its first request of that version. Statistics are not shipped between
 nodes. The cache is per node and `GET /_lance/stats` reports it under `plan.statistics`: `tables`
-(entries held), `collect_millis_total` (time spent collecting), `pending` (collections queued or
-running) and `planned_without` (plans made without statistics since the node started). The Calcite
+(entries held), `collect_millis_total` (time spent collecting), `pending` (collections started and
+not finished; zero also on a node that has started none) and `planned_without` (plans made without
+statistics since the node started). The Calcite
 side reads the statistics through `LanceTable.getStatistic()` (row count) and through Lance's own
 `RowCount` and `DistinctRowCount` metadata handlers for the scan, chained in front of Calcite's
 defaults.
