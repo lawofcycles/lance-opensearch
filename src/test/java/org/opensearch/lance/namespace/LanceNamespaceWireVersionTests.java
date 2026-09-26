@@ -13,6 +13,7 @@ import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.tasks.TaskId;
@@ -142,7 +143,8 @@ public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
         LanceNamespaceService.PollReport report = new LanceNamespaceService.PollReport(
             List.of("demo"),
             List.of(new LanceNamespaceService.PollReport.SkippedTable("ns", "t", "ns_t", "no key")),
-            Map.of("broken", "boom")
+            Map.of("broken", "boom"),
+            Map.of("glue", "namespace listing below [glue, restricted] failed: AccessDenied")
         );
         LanceNamespacePollResponse original = new LanceNamespacePollResponse(report);
         try (BytesStreamOutput out = new BytesStreamOutput()) {
@@ -156,7 +158,31 @@ public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
         }
         Writeable prelude = WireVersionTestSupport.NO_PRELUDE;
         assertEquals(report, ((LanceNamespacePollResponse) readNextVersion(original, prelude, LanceNamespacePollResponse::new)).report());
-        assertRefusesCritical("LanceNamespacePollResponse", original, prelude, LanceNamespacePollResponse::new);
+        assertRefusesCritical(
+            "LanceNamespacePollResponse",
+            LanceNamespacePollResponse.WIRE_VERSION,
+            original,
+            prelude,
+            LanceNamespacePollResponse::new
+        );
+    }
+
+    public void testPollResponseOfAVersion1NodeCarriesNoPartialListings() throws Exception {
+        // The stream a node of the previous plugin version writes: the
+        // base fields with marker 1 and no block.
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            WireVersion.write(out, 1);
+            out.writeStringCollection(List.of("demo"));
+            out.writeVInt(0);
+            out.writeMap(Map.of("broken", "boom"), StreamOutput::writeString, StreamOutput::writeString);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceNamespaceService.PollReport restored = new LanceNamespacePollResponse(in).report();
+                assertEquals(List.of("demo"), restored.surfaced());
+                assertEquals(Map.of("broken", "boom"), restored.unavailable());
+                assertEquals(Map.of(), restored.partial());
+                assertEquals(-1, in.read());
+            }
+        }
     }
 
     public void testUpdateRequest() throws Exception {

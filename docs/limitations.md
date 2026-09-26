@@ -10,7 +10,7 @@ Every `_search` over a Lance backed target runs on the fragment executors. A bod
 - `highlight`: refused, ``search body carries a `highlight` clause which needs full-text APIs Lance does not surface.`` Highlighting needs term positions in the stored text, which the Lance Java SDK does not expose. A body carrying both elements is refused for its `suggest`.
 - `inner_hits` on a `nested` query: refused, `[inner_hits] on the nested query [path=...] is not supported for Lance-backed indices`, by the dispatch filter before the coordinator runs, since neither the fragment executor nor the shard engine materialises the block. `inner_hits` under `collapse` is served ([features.md](features.md#query-shapes)).
 
-A request Lance refuses as invalid input (for example `lance_match_phrase` on an FTS index built without `with_position: true`) answers 400 `illegal_argument_exception` with Lance's message.
+A request Lance refuses as invalid input (for example `lance_match_phrase` on an FTS index built without `with_position: true`) answers 400 `illegal_argument_exception` with Lance's message; [design/lance-error-mapping.md](design/lance-error-mapping.md) records how Lance's exceptions map onto the status.
 
 ## Query types the field types refuse
 

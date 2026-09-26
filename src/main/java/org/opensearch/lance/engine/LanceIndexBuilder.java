@@ -41,6 +41,7 @@ import org.lance.index.vector.VectorIndexParams;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceOverrides;
+import org.opensearch.lance.query.LanceInvalidInput;
 import org.opensearch.lance.rest.RestAttachAction;
 
 /**
@@ -107,19 +108,16 @@ public final class LanceIndexBuilder {
 
     /**
      * A column whose build threw. {@link #reason()} carries Lance's
-     * message. {@link #invalidInput()} is true when Lance's JNI mapped the
-     * error to {@link IllegalArgumentException} (unknown tokenizer,
-     * malformed index params), which the caller can answer as a client
-     * error rather than a server one.
+     * message. {@link #invalidInput()} is true when
+     * {@link LanceInvalidInput#isInvalidInput} recognises the cause as
+     * Lance refusing the input (unknown tokenizer, malformed index
+     * params), which the caller can answer as a client error rather
+     * than a server one.
      */
     public record Failed(String column, String reason, boolean invalidInput) {
         public static Failed of(String column, Exception cause) {
-            return new Failed(column, messageOf(cause), isInvalidInput(cause));
+            return new Failed(column, messageOf(cause), LanceInvalidInput.isInvalidInput(cause));
         }
-    }
-
-    private static boolean isInvalidInput(Exception cause) {
-        return cause instanceof IllegalArgumentException;
     }
 
     private static String messageOf(Exception e) {
@@ -799,7 +797,9 @@ public final class LanceIndexBuilder {
                 for (Built built : entry.getValue()) {
                     names.add(built.column());
                 }
-                result.addFailed(new Failed(entry.getKey(), "optimize of " + names + " failed: " + messageOf(e), isInvalidInput(e)));
+                result.addFailed(
+                    new Failed(entry.getKey(), "optimize of " + names + " failed: " + messageOf(e), LanceInvalidInput.isInvalidInput(e))
+                );
             }
         }
         return result;

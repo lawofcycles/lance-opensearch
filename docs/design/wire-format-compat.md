@@ -138,6 +138,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 2 | Block, optional: the message of the mapping update the check sent and the cluster manager refused (optional string; fallback absent) |
 | `LanceNamespacePollRequest` | 1 | Base: optional namespace name |
 | `LanceNamespacePollResponse` | 1 | Base: surfaced indexes, skipped tables, unavailable namespaces |
+| | 2 | Block, optional: the registrations whose listing could not descend into a subnamespace, name to message (fallback empty) |
 | `LanceNamespaceUpdateRequest` | 1 | Base: operation, name, optional type, optional root URI, storage options, config, overrides JSON |
 | `LanceNamespaceUpdateResponse` | 1 | Base: changed |
 | `LanceAttachRequest` | 1 | Base: table, optional index name, optional pinned version, optional tag, storage options, overrides JSON, optional index placement, async derive |
