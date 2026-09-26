@@ -45,6 +45,9 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' -H 'Content-Type: ap
 
 - Run it for the first time, with a sample table and every query shape: [docs/getting-started.md](docs/getting-started.md).
 - What it can and cannot do: [docs/features.md](docs/features.md) and [docs/limitations.md](docs/limitations.md).
+- Mapping overrides and index types: [docs/mapping-overrides.md](docs/mapping-overrides.md).
+- Aggregation pushdown: [docs/aggregations.md](docs/aggregations.md).
+- Admission control for native scans: [docs/admission.md](docs/admission.md).
 - How a request is executed, and the explain endpoint: [docs/query-plan.md](docs/query-plan.md).
 - How the plugin is put together: [docs/architecture.md](docs/architecture.md).
 - What the plugin zip bundles and why: [docs/dependencies.md](docs/dependencies.md).
