@@ -6,11 +6,14 @@
 package org.opensearch.lance.dispatch;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
+import org.opensearch.index.mapper.SourceFieldMapper;
+import org.opensearch.lance.engine.LanceFragmentSchema;
 import org.opensearch.search.fetch.StoredFieldsContext;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.search.fetch.subphase.FieldAndFormat;
@@ -64,5 +67,43 @@ public record HitProjection(FetchSourceContext fetchSource, StoredFieldsContext 
     /** Whether the body asked for anything beyond the default {@code _id} and full {@code _source}. */
     public boolean isEmpty() {
         return fetchSource == null && storedFields == null && docValueFields.isEmpty() && fetchFields.isEmpty() && !explain;
+    }
+
+    /**
+     * The columns the fragment reader's row take has to project so the
+     * stock fetch phase renders this projection, following the rules
+     * {@code FetchPhase.createStoredFieldsVisitor} applies to a body.
+     *
+     * <p>{@code stored_fields: _none_} reads no stored field, so no
+     * column is taken. Otherwise {@code _id} is always rendered. The
+     * {@code _source} bytes are loaded when the body asks for
+     * {@code _source} (no {@code _source} element and no
+     * {@code stored_fields} list, {@code _source: true}, an includes or
+     * excludes filter, or {@code _source} named in {@code stored_fields})
+     * or when it carries {@code fields}, which reads the unfiltered
+     * source. The filter narrows the take to the columns it keeps, and
+     * the {@code fields} patterns add theirs; {@code docvalue_fields}
+     * add none, because the doc values phase reads the fragment
+     * reader's doc values and never the source.
+     */
+    public LanceFragmentSchema.TakeProjection takeProjection(LanceFragmentSchema schema) {
+        if (storedFields != null && storedFields.fetchFields() == false) {
+            return schema.takeProjection(false, List.of(), List.of(), List.of());
+        }
+        FetchSourceContext source = fetchSource;
+        if (storedFields != null && storedFields.fieldNames() != null && storedFields.fieldNames().contains(SourceFieldMapper.NAME)) {
+            FetchSourceContext named = source == null ? FetchSourceContext.FETCH_SOURCE : source;
+            source = new FetchSourceContext(true, named.includes(), named.excludes());
+        } else if (source == null && storedFields == null) {
+            source = FetchSourceContext.FETCH_SOURCE;
+        }
+        List<String> fieldPatterns = new ArrayList<>(fetchFields.size());
+        for (FieldAndFormat field : fetchFields) {
+            fieldPatterns.add(field.field);
+        }
+        boolean renderSource = source != null && source.fetchSource();
+        List<String> includes = renderSource && source.includes().length > 0 ? List.of(source.includes()) : renderSource ? null : List.of();
+        List<String> excludes = renderSource ? List.of(source.excludes()) : List.of();
+        return schema.takeProjection(true, includes, excludes, fieldPatterns);
     }
 }

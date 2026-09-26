@@ -39,6 +39,7 @@ import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.query.ScanAdmission;
 import org.opensearch.lance.query.LanceFtsQuery;
+import org.opensearch.lance.query.ScanAdmissionTestSupport;
 import org.opensearch.test.OpenSearchTestCase;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
@@ -646,6 +647,9 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
     }
 
     public void testCollectorWithoutACacheReportsZeroCacheFigures() {
+        // The retained pool is static: a test class that admitted a scan
+        // earlier in this JVM would otherwise show up as retained bytes.
+        ScanAdmissionTestSupport.reset();
         LanceNodeStats stats = new LanceStatsCollector(null, () -> 42L, () -> null).collect();
         assertFalse(stats.cacheEnabled());
         assertEquals(0, stats.snapshotCount());

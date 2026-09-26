@@ -2600,6 +2600,145 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
+     * The rows behind a page are taken once per leaf that holds a hit,
+     * the leaves of one executor side by side, and the take projects the
+     * columns the body renders. Twelve fragments of two rows over three
+     * data nodes, so every executor holds several leaves; a sorted page
+     * of every row touches every leaf, and {@code profile.lance} reports
+     * one take per fragment summed over the nodes, whatever the fan out
+     * assigned to each node. Without a {@code _source} element the take
+     * projects the three surfaced columns ({@code id}, {@code body},
+     * {@code title}; the vector column is not surfaced and the table
+     * declares no primary key); with {@code _source: false} it projects
+     * nothing and issues no take.
+     *
+     * <p>The take counts come out the same whether an executor takes its
+     * leaves one after the other or side by side, so the side by side
+     * part is pinned through the cluster log: a debug logger on
+     * {@code LanceStoredFields} names the thread of every take, and with
+     * {@code lance.fragment_path.parallelism} raised to 4 (the default is
+     * half the processors, 1 on a small CI runner) the takes of this
+     * table run on more threads than there are data nodes. An executor
+     * that takes its leaves one after the other uses exactly one thread,
+     * the request's own, so the count would be the node count.
+     */
+    public void testPageTakesOnePerLeafAndProjectsTheRenderedColumnsAcrossThreeNodes() throws Exception {
+        String suffix = "mn-take-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int rows = 24;
+        int fragments = 12;
+        String tableUri = LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, rows, rows / fragments);
+        String indexName = tableName;
+        try {
+            updateClusterSetting("logger.org.opensearch.lance.engine.LanceStoredFields", "DEBUG");
+            updateClusterSetting("lance.fragment_path.parallelism", "4");
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            assertEquals("fixture assumes several fragments per data node", 3, dataNodeCount());
+
+            String sorted = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":" + rows + ",\"profile\":true,\"sort\":[{\"id\":\"desc\"}],\"query\":{\"match_all\":{}}}"
+                )
+            );
+            Map<String, Object> sortedBody = parse(sorted);
+            assertEquals(rows, extractIntPath(sorted, "hits", "total", "value"));
+            List<Integer> expectedIds = new ArrayList<>();
+            for (int id = rows - 1; id >= 0; id--) {
+                expectedIds.add(id);
+            }
+            assertEquals(expectedIds, sourceIds(sortedBody));
+            Map<String, Map<String, Object>> sortedNodes = profileNodes(sortedBody);
+            assertEquals("every data node executed: " + sorted, 3, sortedNodes.size());
+            long takeCount = 0;
+            long takeRows = 0;
+            long takeColumns = 0;
+            for (Map<String, Object> node : sortedNodes.values()) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> fetch = (Map<String, Object>) node.get("fetch");
+                long nodeTakes = ((Number) fetch.get("take_count")).longValue();
+                assertTrue("a node with hits takes at least once: " + sorted, nodeTakes >= 1L);
+                takeCount += nodeTakes;
+                takeRows += ((Number) fetch.get("take_rows")).longValue();
+                takeColumns += ((Number) fetch.get("take_columns")).longValue();
+            }
+            assertEquals("one take per leaf with hits, every fragment has hits: " + sorted, fragments, takeCount);
+            assertEquals("the takes addressed every row: " + sorted, rows, takeRows);
+            assertEquals("every take projected id, body and title: " + sorted, 3L * fragments, takeColumns);
+
+            // The log names the thread of each take; a thread name
+            // carries its node, so the distinct names over the cluster
+            // count one per node for executors that take their leaves one
+            // after the other, and more once any executor took side by
+            // side. The log is flushed asynchronously, hence assertBusy.
+            String tableMarker = tableName + ".lance";
+            assertBusy(() -> {
+                Set<String> takeThreads = new HashSet<>();
+                Set<String> takeNodes = new HashSet<>();
+                for (String line : clusterLogLines()) {
+                    if (!line.contains("lance.fetch: take of") || !line.contains(tableMarker)) {
+                        continue;
+                    }
+                    int at = line.indexOf(" on thread [");
+                    // A thread name has brackets of its own
+                    // (opensearch[node][pool][T#n]), so the name ends at
+                    // the bracket the elapsed time follows.
+                    int close = at < 0 ? -1 : line.indexOf("] in ", at);
+                    assertTrue("unexpected take log line shape: " + line, at >= 0 && close > at);
+                    takeThreads.add(line.substring(at + " on thread [".length(), close));
+                    takeNodes.add(loggingNodeName(line));
+                }
+                assertEquals("every data node logged its takes: " + takeNodes, 3, takeNodes.size());
+                assertTrue(
+                    "an executor took its leaves side by side, so the takes ran on more threads than nodes: " + takeThreads,
+                    takeThreads.size() > 3
+                );
+            });
+
+            String noSource = readAll(
+                postJson(
+                    "/" + indexName + "/_search",
+                    "{\"size\":" + rows + ",\"profile\":true,\"_source\":false,\"sort\":[{\"id\":\"desc\"}],\"query\":{\"match_all\":{}}}"
+                )
+            );
+            Map<String, Object> noSourceBody = parse(noSource);
+            assertEquals(rows, hitIdsOf(noSourceBody).size());
+            assertEquals("the first hit is the last row of the last fragment: " + noSource, "11-1", hitIdsOf(noSourceBody).get(0));
+            for (Map<String, Object> node : profileNodes(noSourceBody).values()) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> fetch = (Map<String, Object>) node.get("fetch");
+                assertEquals("no column to take on a table without a key: " + noSource, 0L, ((Number) fetch.get("take_count")).longValue());
+                assertEquals(0L, ((Number) fetch.get("take_columns")).longValue());
+            }
+        } finally {
+            try {
+                updateClusterSetting("logger.org.opensearch.lance.engine.LanceStoredFields", null);
+            } catch (Exception ignored) {}
+            try {
+                updateClusterSetting("lance.fragment_path.parallelism", null);
+            } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** The {@code profile.lance.nodes} object of a fragment path response, node id to its figures. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Map<String, Object>> profileNodes(Map<String, Object> response) {
+        Map<String, Object> profile = (Map<String, Object>) response.get("profile");
+        assertNotNull("the response carries a profile: " + response, profile);
+        Map<String, Object> lance = (Map<String, Object>) profile.get("lance");
+        assertNotNull("the profile carries the lance object: " + response, lance);
+        Map<String, Map<String, Object>> nodes = (Map<String, Map<String, Object>>) lance.get("nodes");
+        assertNotNull("the profile carries the nodes: " + response, nodes);
+        return nodes;
+    }
+
+    /**
      * The fragment lists the coordinator logged per node for
      * {@code indexName}, keyed by node id, from the cluster logs. The
      * same assignment is logged on every request, so the map holds one

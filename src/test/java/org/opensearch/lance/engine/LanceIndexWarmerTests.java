@@ -37,6 +37,7 @@ import org.opensearch.lance.engine.LanceIndexWarmer.Mode;
 import org.opensearch.lance.engine.LanceIndexWarmer.State;
 import org.opensearch.lance.engine.LanceIndexWarmer.TableStatus;
 import org.opensearch.lance.query.ScanAdmission;
+import org.opensearch.lance.query.ScanAdmissionTestSupport;
 import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -74,9 +75,9 @@ public class LanceIndexWarmerTests extends OpenSearchTestCase {
 
     @Override
     public void tearDown() throws Exception {
-        ScanAdmission.setIndexCacheShardShareOverride(ByteSizeValue.ZERO);
-        ScanAdmission.setAvailableMemoryOverride(List.of());
-        ScanAdmission.setHeadroom(ScanAdmission.DEFAULT_HEADROOM);
+        // The admitted probe leaves its estimate in the gate's static
+        // retained pool; the next test class of this JVM must not see it.
+        ScanAdmissionTestSupport.reset();
         if (executor != null) {
             executor.shutdownNow();
             executor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS);

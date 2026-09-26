@@ -54,6 +54,7 @@ import org.lance.ipc.ColumnOrdering;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.opensearch.core.tasks.TaskCancelledException;
+import org.opensearch.lance.engine.FragmentGroupScan;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.lance.query.ScanAdmission;
@@ -448,10 +449,11 @@ final class FragmentHitsPages {
 
     /**
      * Render the hits of a collected page: one Lance take per leaf for
-     * the rows behind the page ({@link #prefetchHitRows}), the fetch
-     * phase over the page's doc ids, then the score and, for a sorted
-     * page, the sort values of every hit from its {@link ScoreDoc} (a
-     * {@code _score} clause's value becoming the hit's score), as
+     * the rows behind the page ({@link #prefetchHitRows}, the leaves
+     * side by side through {@code groupScan}), the fetch phase over the
+     * page's doc ids, then the score and, for a sorted page, the sort
+     * values of every hit from its {@link ScoreDoc} (a {@code _score}
+     * clause's value becoming the hit's score), as
      * {@code SearchPhaseController} stamps them on the stock search path. The
      * row address of every hit rides along for the coordinator.
      */
@@ -460,12 +462,13 @@ final class FragmentHitsPages {
         FragmentFetchPhase fetchPhase,
         IndexReader reader,
         ScoreDoc[] scoreDocs,
-        SortAndFormats sortAndFormats
+        SortAndFormats sortAndFormats,
+        FragmentGroupScan groupScan
     ) throws IOException {
         if (scoreDocs.length == 0) {
             return HitsPage.EMPTY;
         }
-        prefetchHitRows(reader, scoreDocs);
+        prefetchHitRows(reader, scoreDocs, groupScan);
         int[] docIds = new int[scoreDocs.length];
         for (int i = 0; i < scoreDocs.length; i++) {
             docIds[i] = scoreDocs[i].doc;
@@ -509,12 +512,24 @@ final class FragmentHitsPages {
      * would fall back to a single-row take per hit ({@code size} JNI
      * round trips instead of one per leaf touched).
      *
+     * <p>The leaves take side by side: a sorted or scored page spreads
+     * its hits over many fragments, and on object storage one take
+     * costs tens of milliseconds of latency whatever it reads, so ten
+     * leaves taken one after the other cost ten round trips. The leaves
+     * with hits are cut into up to {@code groupScan}'s parallelism
+     * groups of adjacent leaves, the groups run on its executor with
+     * the calling thread taking its share, and the takes of one group
+     * run in leaf order (see {@link FragmentGroupScan}). Each leaf's
+     * take writes only that leaf's rows, so the groups share nothing.
+     * The first failure is thrown once every started group has
+     * finished; a cancelled request starts no further group.
+     *
      * <p>Leaves that do not unwrap to a {@link LanceFragmentLeafReader}
      * (which should not happen on this path; every leaf the fragment
      * dispatch reader exposes is Lance-backed) are skipped and fall
      * back to the per-doc path.
      */
-    private static void prefetchHitRows(IndexReader reader, ScoreDoc[] scoreDocs) throws IOException {
+    private static void prefetchHitRows(IndexReader reader, ScoreDoc[] scoreDocs, FragmentGroupScan groupScan) throws IOException {
         if (scoreDocs.length == 0) {
             return;
         }
@@ -525,17 +540,31 @@ final class FragmentHitsPages {
             int localDoc = scoreDoc.doc - leaves.get(leafIndex).docBase;
             docsByLeaf.computeIfAbsent(leafIndex, k -> new ArrayList<>()).add(localDoc);
         }
-        for (Map.Entry<Integer, List<Integer>> entry : docsByLeaf.entrySet()) {
-            LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(leaves.get(entry.getKey()).reader());
-            if (lance == null) {
-                continue;
-            }
-            List<Integer> docs = entry.getValue();
-            int[] docIds = new int[docs.size()];
-            for (int i = 0; i < docIds.length; i++) {
-                docIds[i] = docs.get(i);
-            }
-            lance.prefetchRows(docIds);
+        try {
+            groupScan.run(new ArrayList<>(docsByLeaf.keySet()), group -> {
+                for (int leafIndex : group) {
+                    LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(leaves.get(leafIndex).reader());
+                    if (lance == null) {
+                        continue;
+                    }
+                    List<Integer> docs = docsByLeaf.get(leafIndex);
+                    int[] docIds = new int[docs.size()];
+                    for (int i = 0; i < docIds.length; i++) {
+                        docIds[i] = docs.get(i);
+                    }
+                    lance.prefetchRows(docIds);
+                }
+                return null;
+            });
+        } catch (IOException | RuntimeException e) {
+            throw e;
+        } catch (InterruptedException e) {
+            // The wait for a started group was interrupted: keep the
+            // interrupt bit for the search thread's own checks.
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted while taking the rows behind the page", e);
+        } catch (Exception e) {
+            throw new IOException(e);
         }
     }
 
