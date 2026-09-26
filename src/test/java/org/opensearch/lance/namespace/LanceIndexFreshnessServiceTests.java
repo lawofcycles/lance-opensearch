@@ -340,9 +340,9 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         assertTrue(service.stats().mappingErrors().isEmpty());
     }
 
-    public void testACheckWithNothingToApplyClearsTheRefusedMappingUpdate() throws Exception {
-        String tableUri = writeTable("nothingtoapply");
-        FakeShard shard = FakeShard.overTable("nothingtoapply", tableUri, Settings.EMPTY);
+    public void testRefusedMappingUpdateStaysUntilAnUpdateIsAcknowledged() throws Exception {
+        String tableUri = writeTable("ackclears");
+        FakeShard shard = FakeShard.overTable("ackclears", tableUri, Settings.EMPTY);
         LanceIndexFreshnessService.Tracked entry = service.track(shard);
         service.check(entry);
 
@@ -352,15 +352,70 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         }
         LanceIndexFreshnessService.Outcome refused = service.check(entry);
         assertNotNull(refused.mappingError());
+        assertEquals(Map.of("ackclears", refused.mappingError()), service.stats().mappingErrors());
+
+        // The table stands still: the next checks derive nothing (the
+        // mapping was derived once already) and have nothing to apply.
+        // The mapping the index should have is still the refused one,
+        // so the refusal stays for as many checks as it takes.
+        for (int i = 0; i < 3; i++) {
+            LanceIndexFreshnessService.Outcome idle = service.check(entry);
+            assertFalse(idle.moved());
+            assertFalse(idle.mappingChanged());
+            assertNull(idle.mappingError());
+            assertEquals(
+                "the refusal survives an idle check",
+                Map.of("ackclears", refused.mappingError()),
+                service.stats().mappingErrors()
+            );
+        }
+        assertEquals("no second PutMapping was sent", 1, client.count(PutMappingAction.NAME));
+
+        // An acknowledged update for the index clears it.
+        client.failing = null;
+        try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
+            dataset.addColumns(List.of(new Field("rank", FieldType.nullable(new ArrowType.Int(64, true)), null)));
+        }
+        LanceIndexFreshnessService.Outcome applied = service.check(entry);
+        assertTrue(applied.moved());
+        assertTrue(applied.mappingChanged());
+        assertNull(applied.mappingError());
+        assertEquals(2, client.count(PutMappingAction.NAME));
+        assertTrue(service.stats().mappingErrors().isEmpty());
+    }
+
+    public void testRefusedMappingUpdateStaysUntilALaterVersionAppliesCleanly() throws Exception {
+        String tableUri = writeTable("laterclears");
+        FakeShard shard = FakeShard.overTable("laterclears", tableUri, Settings.EMPTY);
+        LanceIndexFreshnessService.Tracked entry = service.track(shard);
+        service.check(entry);
+
+        client.failing = PutMappingAction.NAME;
+        try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
+            dataset.addColumns(List.of(new Field("score", FieldType.nullable(new ArrowType.Int(64, true)), null)));
+        }
+        LanceIndexFreshnessService.Outcome refused = service.check(entry);
+        assertNotNull(refused.mappingError());
+        long refusedVersion = refused.targetVersion();
         assertEquals(1, service.stats().mappingErrors().size());
 
-        // The table stands still, so the next check derives nothing
-        // (the mapping was derived once already) and has nothing to
-        // apply: the refusal recorded before no longer stands.
+        // Idle checks at the refused version keep the entry.
         LanceIndexFreshnessService.Outcome idle = service.check(entry);
         assertFalse(idle.moved());
-        assertFalse(idle.mappingChanged());
-        assertNull(idle.mappingError());
+        assertEquals(refusedVersion, idle.targetVersion());
+        assertEquals(1, service.stats().mappingErrors().size());
+
+        // A later version whose derived mapping is already in place (the
+        // shard stand-in took the mapping when it compared it, the way an
+        // operator's own PutMapping would put it there) supersedes the
+        // refused derivation: nothing to send, and the refusal is gone.
+        client.failing = null;
+        LanceTableFactory.appendRows(tableUri, 6, 2);
+        LanceIndexFreshnessService.Outcome later = service.check(entry);
+        assertTrue(later.moved());
+        assertTrue(later.targetVersion() > refusedVersion);
+        assertFalse(later.mappingChanged());
+        assertNull(later.mappingError());
         assertEquals("no second PutMapping was sent", 1, client.count(PutMappingAction.NAME));
         assertTrue(service.stats().mappingErrors().isEmpty());
     }

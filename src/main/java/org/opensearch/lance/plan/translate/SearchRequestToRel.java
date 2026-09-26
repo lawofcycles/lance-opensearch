@@ -875,12 +875,19 @@ public final class SearchRequestToRel {
                 relBuilder.push(LogicalFilter.create(relBuilder.build(), predicate));
             }
             RelNode input = relBuilder.build();
+            // The node carries the Lance columns the scan reads: for a
+            // field in the analyzer mode that is its derived tokens
+            // column, not the field the clause names.
+            List<String> columns = new ArrayList<>();
+            for (String field : ((LanceFtsQueryBuilder) fts.ftsClause()).referencedFields()) {
+                columns.add(model.lanceTextColumn(field));
+            }
             return new LanceFtsMatch(
                 input.getCluster(),
                 input.getCluster().traitSetOf(Convention.NONE),
                 input,
                 ftsKindOf(fts.ftsClause()),
-                List.copyOf(((LanceFtsQueryBuilder) fts.ftsClause()).referencedFields()),
+                columns,
                 fts.ftsClause()
             );
         }

@@ -8,7 +8,6 @@ package org.opensearch.lance;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -128,23 +127,39 @@ public final class LanceMappingMeta {
      * @param mapping the index's mapping metadata, nullable
      */
     public static Set<String> lanceTextFields(MappingMetadata mapping) {
+        return lanceTextColumns(mapping).keySet();
+    }
+
+    /**
+     * The top-level {@code lance_text} fields of the mapping, in mapping
+     * order, each with the Lance column its term and full text queries
+     * run against: the field's {@code tokens_column} when the field is
+     * in the analyzer mode (the derived tokens column the backfill
+     * wrote), otherwise the field's own name. The planner prints these
+     * columns on the pushed full text scan, so the explain output names
+     * the column the scan reads rather than the field it was asked for.
+     *
+     * @param mapping the index's mapping metadata, nullable
+     */
+    public static Map<String, String> lanceTextColumns(MappingMetadata mapping) {
         if (mapping == null) {
-            return Set.of();
+            return Map.of();
         }
         Map<String, Object> source = mapping.sourceAsMap();
         Object properties = source == null ? null : source.get("properties");
         if (!(properties instanceof Map<?, ?> propsMap)) {
-            return Set.of();
+            return Map.of();
         }
-        Set<String> fields = new LinkedHashSet<>();
+        Map<String, String> columns = new LinkedHashMap<>();
         for (Map.Entry<?, ?> entry : propsMap.entrySet()) {
             if (entry.getKey() instanceof String name
                 && entry.getValue() instanceof Map<?, ?> field
                 && "lance_text".equals(field.get("type"))) {
-                fields.add(name);
+                Object tokensColumn = field.get("tokens_column");
+                columns.put(name, tokensColumn instanceof String column && !column.isEmpty() ? column : name);
             }
         }
-        return fields;
+        return columns;
     }
 
     private static Integer parseFieldId(Object raw) {

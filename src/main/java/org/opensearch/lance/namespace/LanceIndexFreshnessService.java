@@ -81,8 +81,12 @@ import org.opensearch.transport.client.Client;
  * shard unregisters itself and the new shard registers when it starts.
  * Any other refusal of the {@code PutMapping} leaves the index on the
  * mapping it has; the message is kept per index and reported by
- * {@link #stats()} and by the outcome of the check, until a later check
- * applies a mapping or finds the mapping unchanged.
+ * {@link #stats()} and by the outcome of the check, until a mapping
+ * update for the index is acknowledged (or the index is rebuilt) or a
+ * check at another version than the refused one finds its mapping in
+ * place. A check that has nothing to derive (the version stood still)
+ * leaves the entry alone: the refused mapping is still the one the
+ * index should have.
  */
 public final class LanceIndexFreshnessService implements IndexEventListener, Closeable {
 
@@ -188,14 +192,23 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
     /** Indexes whose `wait` uncovered fragment policy has been explained once. */
     private final Set<String> warnedWaitPolicy = ConcurrentHashMap.newKeySet();
     /**
-     * The message of the last mapping update the cluster manager refused,
-     * per index, kept until a later check applies a mapping or finds
-     * nothing to apply, or until the shard leaves this node. Reported
-     * under {@code freshness.mapping_errors} of {@code GET /_lance/stats},
+     * The last mapping update the cluster manager refused, per index:
+     * the version the refused derivation targeted and the refusal
+     * message. Kept until a mapping update for the index is
+     * acknowledged (or the index is rebuilt), until a check at another
+     * version finds the derived mapping already in place, or until the
+     * shard leaves this node. A check that derives nothing (the version
+     * stood still) keeps the entry: the refused mapping is still the one
+     * the index should have. Reported under
+     * {@code freshness.mapping_errors} of {@code GET /_lance/stats},
      * because a refused update otherwise leaves the index serving the
      * stale mapping with nothing but a WARN line to say so.
      */
-    private final Map<String, String> mappingErrors = new ConcurrentHashMap<>();
+    private final Map<String, RefusedMapping> mappingErrors = new ConcurrentHashMap<>();
+
+    /** A refused mapping update: the version its derivation targeted and the cluster manager's message. */
+    private record RefusedMapping(long version, String message) {
+    }
 
     private final LongAdder checks = new LongAdder();
     private final LongAdder moves = new LongAdder();
@@ -399,12 +412,11 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         }
         boolean mappingChanged = false;
         String mappingError = null;
-        if (derivation == null) {
-            // Nothing to derive this check: the version did not move and
-            // the mapping was derived once already, so there is nothing
-            // to apply and a refusal recorded earlier no longer stands.
-            mappingErrors.remove(indexName);
-        } else {
+        // Nothing to derive this check (the version did not move and the
+        // mapping was derived once already): a refusal recorded earlier
+        // still stands, because the mapping the index should have has
+        // not changed and the update that failed has not been retried.
+        if (derivation != null) {
             if ("wait".equals(settings.get(UNCOVERED_FRAGMENT_POLICY_SETTING, "immediate"))) {
                 // `wait` is accepted but converges with the immediate
                 // branch: the plugin never writes to a user table, so
@@ -418,9 +430,21 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             switch (comparison) {
                 case UNCHANGED -> {
                     mappingUnchanged.increment();
-                    mappingErrors.remove(indexName);
+                    // The mapping derived at this version is the one the
+                    // index has. That clears a refusal only when it was
+                    // recorded at another version: the index no longer
+                    // wants the mapping the refused update carried. At
+                    // the refused version itself the refused update was
+                    // not applied, so the refusal stands.
+                    RefusedMapping refused = mappingErrors.get(indexName);
+                    if (refused != null && refused.version() != target) {
+                        mappingErrors.remove(indexName);
+                    }
                 }
                 case TYPE_CONFLICT -> {
+                    // The rebuild creates the index with the derived
+                    // mapping: the mapping is applied, the way an
+                    // acknowledged update applies it.
                     mappingErrors.remove(indexName);
                     rebuild(indexName, table, storageOptions, derivation, settings, target, "preflight merge refused the type change");
                     return new Outcome(indexName, true, null, moved, served, target, true, true, null);
@@ -447,10 +471,11 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                         }
                         failures.increment();
                         // The index keeps serving the mapping it has; the
-                        // refusal stays visible in the stats until a later
-                        // check applies a mapping.
+                        // refusal stays visible in the stats until an
+                        // update for the index is acknowledged or a
+                        // later version's mapping is found in place.
                         mappingError = message;
-                        mappingErrors.put(indexName, message);
+                        mappingErrors.put(indexName, new RefusedMapping(target, message));
                         LOG.warn("mapping re-derivation failed for {} at version {}: {}", indexName, target, message);
                     }
                 }
@@ -548,6 +573,10 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
 
     /** This node's counters for {@code GET /_lance/stats}, with the mapping updates still refused per index. */
     public LanceNodeStats.FreshnessStats stats() {
+        Map<String, String> errors = new TreeMap<>();
+        for (Map.Entry<String, RefusedMapping> entry : mappingErrors.entrySet()) {
+            errors.put(entry.getKey(), entry.getValue().message());
+        }
         return new LanceNodeStats.FreshnessStats(
             tracked.size(),
             checks.sum(),
@@ -557,7 +586,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             rebuilds.sum(),
             failures.sum(),
             lastCheckMillis,
-            new TreeMap<>(mappingErrors)
+            errors
         );
     }
 

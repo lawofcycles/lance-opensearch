@@ -63,15 +63,24 @@ public final class LanceSchemas {
      * primary key column {@code ids} queries resolve against (empty
      * when the index declared none), the integer columns the attach
      * overrode as {@code date} (their epoch-millis literals accept the
-     * ISO-8601 strings the override serves), and the table / schema
-     * pair the {@code RelBuilder} resolves against. {@code multiFields}
-     * maps a base column to its declared sub-fields
-     * ({@code body -> {raw: keyword}}), empty when the attach declared
-     * none.
+     * ISO-8601 strings the override serves), the Lance column each
+     * {@code lance_text} field's full text queries run against (the
+     * derived tokens column of a field in the analyzer mode, otherwise
+     * the field itself; a field absent from the map runs against its own
+     * name), and the table / schema pair the {@code RelBuilder} resolves
+     * against. {@code multiFields} maps a base column to its declared
+     * sub-fields ({@code body -> {raw: keyword}}), empty when the attach
+     * declared none.
      */
     public record IndexModel(String indexName, Schema arrowSchema, Map<String, LinkedHashMap<String, String>> multiFields, Map<
         String,
-        String> renamedFields, String primaryKeyField, Set<String> dateOverrideColumns, LanceTable table, LanceSchema schema) {
+        String> renamedFields, String primaryKeyField, Set<String> dateOverrideColumns, Map<String, String> lanceTextColumns,
+        LanceTable table, LanceSchema schema) {
+
+        /** The Lance column a full text clause on {@code field} reads: its tokens column in the analyzer mode, else the field. */
+        public String lanceTextColumn(String field) {
+            return lanceTextColumns.getOrDefault(field, field);
+        }
     }
 
     /**
@@ -122,7 +131,35 @@ public final class LanceSchemas {
         Set<String> dateOverrideColumns,
         LongSupplier rowCount
     ) {
-        return model(indexName, arrowSchema, multiFields, renamedFields, primaryKeyField, dateOverrideColumns, rowCount, null);
+        return model(indexName, arrowSchema, multiFields, renamedFields, primaryKeyField, dateOverrideColumns, Map.of(), rowCount);
+    }
+
+    /**
+     * {@link #model(String, Schema, Map, Map, String, Set, LongSupplier)}
+     * with the Lance column each {@code lance_text} field reads
+     * ({@code LanceMappingMeta.lanceTextColumns}).
+     */
+    public static IndexModel model(
+        String indexName,
+        Schema arrowSchema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        Map<String, String> renamedFields,
+        String primaryKeyField,
+        Set<String> dateOverrideColumns,
+        Map<String, String> lanceTextColumns,
+        LongSupplier rowCount
+    ) {
+        return model(
+            indexName,
+            arrowSchema,
+            multiFields,
+            renamedFields,
+            primaryKeyField,
+            dateOverrideColumns,
+            lanceTextColumns,
+            rowCount,
+            null
+        );
     }
 
     /**
@@ -139,6 +176,24 @@ public final class LanceSchemas {
         Set<String> dateOverrideColumns,
         TableStatistics statistics
     ) {
+        return model(indexName, arrowSchema, multiFields, renamedFields, primaryKeyField, dateOverrideColumns, Map.of(), statistics);
+    }
+
+    /**
+     * {@link #model(String, Schema, Map, Map, String, Set, TableStatistics)}
+     * with the Lance column each {@code lance_text} field reads
+     * ({@code LanceMappingMeta.lanceTextColumns}).
+     */
+    public static IndexModel model(
+        String indexName,
+        Schema arrowSchema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        Map<String, String> renamedFields,
+        String primaryKeyField,
+        Set<String> dateOverrideColumns,
+        Map<String, String> lanceTextColumns,
+        TableStatistics statistics
+    ) {
         return model(
             indexName,
             arrowSchema,
@@ -146,6 +201,7 @@ public final class LanceSchemas {
             renamedFields,
             primaryKeyField,
             dateOverrideColumns,
+            lanceTextColumns,
             statistics::rowCount,
             () -> statistics
         );
@@ -158,6 +214,7 @@ public final class LanceSchemas {
         Map<String, String> renamedFields,
         String primaryKeyField,
         Set<String> dateOverrideColumns,
+        Map<String, String> lanceTextColumns,
         LongSupplier rowCount,
         Supplier<TableStatistics> statistics
     ) {
@@ -169,6 +226,7 @@ public final class LanceSchemas {
             renamedFields,
             primaryKeyField,
             dateOverrideColumns,
+            lanceTextColumns,
             table,
             new LanceSchema(Map.of(indexName, table))
         );
@@ -227,6 +285,7 @@ public final class LanceSchemas {
         for (LanceMappingMeta.RenamedField renamed : LanceMappingMeta.renamedFields(indexMetadata.mapping())) {
             renamedFields.put(renamed.from(), renamed.to());
         }
+        Map<String, String> lanceTextColumns = LanceMappingMeta.lanceTextColumns(indexMetadata.mapping());
         try (
             LanceWarmCache.Lease lease = warmCache.acquire(
                 indexMetadata.getIndexUUID(),
@@ -260,7 +319,16 @@ public final class LanceSchemas {
                 } catch (RuntimeException e) {
                     LOGGER.warn("zone maps of [{}] unavailable, planning without pruning", indexName, e);
                 }
-                return model(indexName, arrowSchema, multiFields, renamedFields, pkField, overrides.dateColumns().keySet(), statistics);
+                return model(
+                    indexName,
+                    arrowSchema,
+                    multiFields,
+                    renamedFields,
+                    pkField,
+                    overrides.dateColumns().keySet(),
+                    lanceTextColumns,
+                    statistics
+                );
             }
             // The statistics are being collected in the background:
             // this plan reads the fragment row counts instead.
@@ -270,7 +338,16 @@ public final class LanceSchemas {
                 rows += fragmentRows;
             }
             final long total = rows;
-            return model(indexName, arrowSchema, multiFields, renamedFields, pkField, overrides.dateColumns().keySet(), () -> total);
+            return model(
+                indexName,
+                arrowSchema,
+                multiFields,
+                renamedFields,
+                pkField,
+                overrides.dateColumns().keySet(),
+                lanceTextColumns,
+                () -> total
+            );
         }
     }
 }
