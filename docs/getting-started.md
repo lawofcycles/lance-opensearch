@@ -723,6 +723,7 @@ curl -sS localhost:9200/_lance/stats?pretty
         "headroom_bytes" : 8589934592,
         "available_bytes" : 98784247808,
         "retained_bytes" : 0,
+        "retained_scope" : "none",
         "last_estimate_bytes" : 0,
         "last_kind" : "none",
         "rejections" : {

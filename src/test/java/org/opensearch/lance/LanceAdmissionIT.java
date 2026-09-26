@@ -215,7 +215,30 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                     assertEquals(admission.toString(), rejected, rejections(admission, "fts"));
                     assertEquals(admission.toString(), 1000L, ((Number) admission.get("available_bytes")).longValue());
                     assertEquals(admission.toString(), estimate, ((Number) admission.get("retained_bytes")).longValue());
+                    assertEquals(admission.toString(), "fts:" + indexName + ":body", admission.get("retained_scope"));
                 }
+
+                // A scan of another identity at the same reading, a
+                // filter scan over the same table, is credited nothing:
+                // it does not reuse what the full text scan left, so the
+                // 429 names a zero credit, and the pool stands for the
+                // full text scan.
+                String filtered = "{\"size\":0,\"query\":{\"term\":{\"id\":3}}}";
+                ResponseException refusedFilter = expectThrows(
+                    ResponseException.class,
+                    () -> postJson("/" + indexName + "/_search", filtered)
+                );
+                String filterBody = readAll(refusedFilter.getResponse());
+                assertEquals(
+                    filterBody,
+                    RestStatus.TOO_MANY_REQUESTS.getStatus(),
+                    refusedFilter.getResponse().getStatusLine().getStatusCode()
+                );
+                assertTrue(filterBody, filterBody.contains("filter_scan estimate"));
+                assertTrue(filterBody, filterBody.contains("[0b] retained by earlier admitted scans"));
+                admission = admissionStats();
+                assertEquals(admission.toString(), estimate, ((Number) admission.get("retained_bytes")).longValue());
+                assertEquals(admission.toString(), "fts:" + indexName + ":body", admission.get("retained_scope"));
 
                 // Recovery decays the credit: 300 of the 1000 bytes come
                 // back and 556 remain credited; all of it back and nothing
