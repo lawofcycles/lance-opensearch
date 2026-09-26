@@ -11,7 +11,6 @@ import java.util.Collections;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
@@ -431,22 +430,13 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
         /**
          * True for config keys whose value must never appear in logs,
          * listings, or {@code toString}: anything whose name contains
-         * {@code secret}, {@code password}, {@code token}, {@code key},
-         * {@code authorization} or {@code credential} (case-insensitive).
-         * {@code authorization} covers the {@code header.Authorization}
-         * property the REST catalog client reads its bearer credential
-         * from; {@code credential} covers the Iceberg REST client's
-         * {@code credential} property (an OAuth client id and secret
-         * pair), which none of the other substrings match.
+         * one of {@link StorageOptions#SENSITIVE_KEY_WORDS}
+         * (case-insensitive). The same words drive the settings filter
+         * on {@code index.lance.storage_options.*}, so what is redacted
+         * here is what the settings APIs withhold.
          */
         public static boolean isSensitiveConfigKey(String key) {
-            String lower = key.toLowerCase(Locale.ROOT);
-            return lower.contains("secret")
-                || lower.contains("password")
-                || lower.contains("token")
-                || lower.contains("key")
-                || lower.contains("authorization")
-                || lower.contains("credential");
+            return StorageOptions.isSensitiveKey(key);
         }
 
         /** The config map with every sensitive value replaced by {@code ***}. */

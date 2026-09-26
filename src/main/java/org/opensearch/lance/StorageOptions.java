@@ -6,8 +6,11 @@
 package org.opensearch.lance;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
@@ -35,6 +38,58 @@ public final class StorageOptions {
 
     /** Index-settings prefix under which entries are persisted. */
     public static final String INDEX_SETTING_PREFIX = "index.lance.storage_options.";
+
+    /**
+     * The words that mark a storage option or namespace config key as a
+     * credential, matched case-insensitively as substrings of the key
+     * name. {@code authorization} covers the {@code header.Authorization}
+     * property the REST catalog client reads its bearer credential from;
+     * {@code credential} covers the Iceberg REST client's
+     * {@code credential} property (an OAuth client id and secret pair),
+     * which none of the other substrings match. {@link #isSensitiveKey}
+     * and {@link #SENSITIVE_INDEX_SETTING_PATTERNS} are both derived from
+     * this one list so the redaction in logs and listings and the filter
+     * on the settings APIs cannot drift apart.
+     */
+    public static final List<String> SENSITIVE_KEY_WORDS = List.of("secret", "password", "token", "key", "authorization", "credential");
+
+    /**
+     * Glob patterns for OpenSearch's {@code SettingsFilter} that remove
+     * the credential entries of {@link #INDEX_SETTING_PREFIX} from the
+     * settings and cluster state APIs. Three patterns per word of
+     * {@link #SENSITIVE_KEY_WORDS}: lower case ({@code aws_secret_access_key}),
+     * upper case ({@code AWS_SECRET_ACCESS_KEY}) and capitalised
+     * ({@code header.Authorization}). The filter matches
+     * case-sensitively, so a key that spells the word in another mix of
+     * cases ({@code aws_SeCrEt_access_key}) is not filtered; Lance's
+     * object store does not recognise such a key either.
+     */
+    public static final List<String> SENSITIVE_INDEX_SETTING_PATTERNS = sensitiveIndexSettingPatterns();
+
+    private static List<String> sensitiveIndexSettingPatterns() {
+        List<String> patterns = new ArrayList<>(SENSITIVE_KEY_WORDS.size() * 3);
+        for (String word : SENSITIVE_KEY_WORDS) {
+            patterns.add(INDEX_SETTING_PREFIX + "*" + word + "*");
+            patterns.add(INDEX_SETTING_PREFIX + "*" + word.toUpperCase(Locale.ROOT) + "*");
+            patterns.add(INDEX_SETTING_PREFIX + "*" + word.substring(0, 1).toUpperCase(Locale.ROOT) + word.substring(1) + "*");
+        }
+        return Collections.unmodifiableList(patterns);
+    }
+
+    /**
+     * True for keys whose value must never appear in logs, listings,
+     * {@code toString} or the settings APIs: any key whose name contains
+     * one of {@link #SENSITIVE_KEY_WORDS}, case-insensitively.
+     */
+    public static boolean isSensitiveKey(String key) {
+        String lower = key.toLowerCase(Locale.ROOT);
+        for (String word : SENSITIVE_KEY_WORDS) {
+            if (lower.contains(word)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     private static final StorageOptions EMPTY = new StorageOptions(Collections.emptyMap());
 
@@ -190,10 +245,10 @@ public final class StorageOptions {
 
     /**
      * Human-readable representation with credential-like values redacted.
-     * Anything whose key contains "secret", "key", "password", or "token"
-     * (case-insensitive) is shown as {@code ***REDACTED***}. Used for
-     * exception messages and log lines that might otherwise leak
-     * credentials to shard-failed responses.
+     * Anything whose key {@link #isSensitiveKey} classifies as sensitive
+     * is shown as {@code ***REDACTED***}. Used for exception messages
+     * and log lines that might otherwise leak credentials to
+     * shard-failed responses.
      */
     @Override
     public String toString() {
@@ -207,17 +262,9 @@ public final class StorageOptions {
                 sb.append(", ");
             }
             first = false;
-            sb.append(entry.getKey()).append("=").append(redactedValue(entry.getKey(), entry.getValue()));
+            sb.append(entry.getKey()).append("=").append(isSensitiveKey(entry.getKey()) ? "***REDACTED***" : entry.getValue());
         }
         sb.append("}");
         return sb.toString();
-    }
-
-    private static String redactedValue(String key, String value) {
-        String lower = key.toLowerCase(java.util.Locale.ROOT);
-        if (lower.contains("secret") || lower.contains("password") || lower.contains("token") || lower.equals("aws_access_key_id")) {
-            return "***REDACTED***";
-        }
-        return value;
     }
 }

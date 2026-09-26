@@ -100,7 +100,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 )
             ),
             List.of(
-                new LanceNodeStats.IndexReaderStats(
+                LanceNodeStats.IndexReaderStats.counted(
                     "big",
                     3_000_000_000L,
                     2_000_000_000L,
@@ -109,7 +109,16 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     Map.of(),
                     List.of(new LanceMappingMeta.RenamedField("ts", "event_ts", 1))
                 ),
-                new LanceNodeStats.IndexReaderStats("small", 120L, 120L, 14L, false, Map.of("rating", List.of("BTree", "Bitmap")))
+                LanceNodeStats.IndexReaderStats.counted(
+                    "small",
+                    120L,
+                    120L,
+                    14L,
+                    false,
+                    Map.of("rating", List.of("BTree", "Bitmap")),
+                    List.of()
+                ),
+                LanceNodeStats.IndexReaderStats.withheld("wrapped", false)
             ),
             List.of(new LanceNodeStats.LocalCloneStats("cloned", 4321L, 9L)),
             5,
@@ -227,7 +236,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"lucene_bound_exceeded\":true,\"index_types\":{},"
                     + "\"renamed_fields\":[{\"from\":\"ts\",\"to\":\"event_ts\",\"lance_field_id\":1}]},"
                     + "\"small\":{\"rows\":120,\"shard_reader_rows\":120,\"nested_docs\":14,\"lucene_bound_exceeded\":false,"
-                    + "\"index_types\":{\"rating\":[\"BTree\",\"Bitmap\"]}}},"
+                    + "\"index_types\":{\"rating\":[\"BTree\",\"Bitmap\"]}},"
+                    + "\"wrapped\":{\"lucene_bound_exceeded\":false}},"
                     + "\"local_clones\":{\"resolution_failures\":3,"
                     + "\"cloned\":{\"local_clone_bytes\":4321,\"source_version\":9,\"resolution_failures\":3}}}",
                 builder.toString()
@@ -306,7 +316,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceNodeStats.WIRE_VERSION, in.readVInt());
             }
         }
-        // The stream a version 11 data node would return: today's fields
+        // The stream a version 12 data node would return: today's fields
         // and one optional block this coordinator steps over.
         BytesReference newer = WireVersionTestSupport.asNextVersion(
             sample(),
@@ -326,6 +336,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             assertEquals(sample().fetch(), restored.fetch());
             assertEquals(sample().fetchCache(), restored.fetchCache());
             assertEquals(sample().failures(), restored.failures());
+            assertEquals(sample().indices(), restored.indices());
             assertEquals("the reader consumed the block", -1, in.read());
         }
     }
@@ -500,9 +511,53 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals("the block it does not know is stepped over", LanceNodeStats.FailureCounters.NONE, asVersion9.failures());
                 assertEquals(0L, asVersion9.failures().cloneResolutionFailures());
                 assertEquals(Map.of(), asVersion9.failures().cloneResolutionFailuresByIndex());
+                assertEquals(unflagged(sample().indices()), asVersion9.indices());
                 assertEquals("the reader consumed the blocks", -1, in.read());
             }
         }
+    }
+
+    public void testMixedPluginVersionAVersion10CoordinatorReadsTodaysStatsWithoutTheWithheldFlag() throws Exception {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            sample().writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceNodeStats asVersion10 = LanceNodeStats.read(in, 10);
+                assertEquals(9L, asVersion10.planPrunedFragments());
+                assertEquals(sample().freshness(), asVersion10.freshness());
+                assertEquals(sample().requestCache(), asVersion10.requestCache());
+                assertEquals(sample().fetch(), asVersion10.fetch());
+                assertEquals(sample().fetchCache(), asVersion10.fetchCache());
+                assertEquals("the blocks version 10 knows are read", sample().failures(), asVersion10.failures());
+                // The base layout carries the wrapped index with zero
+                // counts; the flag in the block it does not know is
+                // stepped over, so it shows the index with its zeros.
+                assertEquals("the block it does not know is stepped over", unflagged(sample().indices()), asVersion10.indices());
+                LanceNodeStats.IndexReaderStats wrapped = asVersion10.indices().get(2);
+                assertEquals("wrapped", wrapped.index());
+                assertFalse(wrapped.rowsWithheld());
+                assertEquals(0L, wrapped.rows());
+                assertEquals(0L, wrapped.shardReaderRows());
+                assertEquals(Map.of(), wrapped.indexTypes());
+                assertEquals("the reader consumed the blocks", -1, in.read());
+            }
+        }
+    }
+
+    /** {@code indices} as a coordinator before version 11 reads them: the withheld entries with their zero counts and no flag. */
+    private static List<LanceNodeStats.IndexReaderStats> unflagged(List<LanceNodeStats.IndexReaderStats> indices) {
+        return indices.stream()
+            .map(
+                index -> LanceNodeStats.IndexReaderStats.counted(
+                    index.index(),
+                    index.rows(),
+                    index.shardReaderRows(),
+                    index.nestedDocs(),
+                    index.luceneBoundExceeded(),
+                    index.indexTypes(),
+                    index.renamedFields()
+                )
+            )
+            .toList();
     }
 
     /**
@@ -519,8 +574,12 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             // the pruned counter, 3 the admission source, 4 the mapping
             // errors, 5 the statistics progress counters, 6 the retained
             // pool's scope, 7 the result cache, 8 the fetch take counters,
-            // 9 the fetch cache, 10 the failure counters, in that order.
+            // 9 the fetch cache, 10 the failure counters, 11 the indexes
+            // whose counts are withheld, in that order.
             int trailing = 0;
+            if (marker < 11) {
+                trailing += blockSize(o -> o.writeStringCollection(rowsWithheldIndices(stats)));
+            }
             if (marker < 10) {
                 trailing += blockSize(stats.failures());
             }
@@ -569,6 +628,15 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             WireVersion.writeBlock(out, false, fields);
             return out.bytes().length();
         }
+    }
+
+    /** The names the version 11 block carries: the indexes of {@code stats} whose counts are withheld. */
+    private static List<String> rowsWithheldIndices(LanceNodeStats stats) {
+        return stats.indices()
+            .stream()
+            .filter(LanceNodeStats.IndexReaderStats::rowsWithheld)
+            .map(LanceNodeStats.IndexReaderStats::index)
+            .toList();
     }
 
     public void testMixedPluginVersionTodaysCoordinatorReadsAVersion1NodesStats() throws Exception {
@@ -715,8 +783,66 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             assertEquals(sample().fetch(), restored.fetch());
             assertEquals(sample().fetchCache(), restored.fetchCache());
             assertEquals("the failure counters fall back to zero", LanceNodeStats.FailureCounters.NONE, restored.failures());
+            assertEquals(unflagged(sample().indices()), restored.indices());
             assertEquals(-1, in.read());
         }
+    }
+
+    public void testMixedPluginVersionTodaysCoordinatorReadsAVersion10NodesStats() throws Exception {
+        // The stream a version 10 data node writes: every block up to the
+        // failure counters, no withheld block. Such a node never
+        // withholds, so every index it lists reads with the flag off.
+        BytesReference version10 = asWrittenByVersion(sample(), 10);
+        try (StreamInput in = version10.streamInput()) {
+            LanceNodeStats restored = new LanceNodeStats(in);
+            assertEquals(9L, restored.planPrunedFragments());
+            assertEquals(sample().freshness(), restored.freshness());
+            assertEquals(sample().requestCache(), restored.requestCache());
+            assertEquals(sample().fetch(), restored.fetch());
+            assertEquals(sample().fetchCache(), restored.fetchCache());
+            assertEquals(sample().failures(), restored.failures());
+            assertEquals("the withheld flag falls back to false", unflagged(sample().indices()), restored.indices());
+            assertFalse(restored.indices().stream().anyMatch(LanceNodeStats.IndexReaderStats::rowsWithheld));
+            assertEquals(-1, in.read());
+        }
+    }
+
+    public void testWithheldIndexReaderStatsRejectsCounts() {
+        // A withheld entry that carries what the wrapper hides is a
+        // programming error, not something to zero out silently.
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new LanceNodeStats.IndexReaderStats("wrapped", 5L, 4L, 1L, true, Map.of(), List.of(), true)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("wrapped"));
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> new LanceNodeStats.IndexReaderStats("wrapped", 0L, 0L, 0L, true, Map.of("rating", List.of("BTree")), List.of(), true)
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> new LanceNodeStats.IndexReaderStats(
+                "wrapped",
+                0L,
+                0L,
+                0L,
+                true,
+                Map.of(),
+                List.of(new LanceMappingMeta.RenamedField("a", "b", 1)),
+                true
+            )
+        );
+    }
+
+    public void testWithheldIndexReaderStatsCarryNoCounts() {
+        LanceNodeStats.IndexReaderStats withheld = LanceNodeStats.IndexReaderStats.withheld("wrapped", true);
+        assertTrue(withheld.rowsWithheld());
+        assertEquals(0L, withheld.rows());
+        assertEquals(0L, withheld.shardReaderRows());
+        assertEquals(0L, withheld.nestedDocs());
+        assertTrue(withheld.luceneBoundExceeded());
+        assertEquals(Map.of(), withheld.indexTypes());
+        assertEquals(List.of(), withheld.renamedFields());
     }
 
     public void testNodeRequestStreamOpensWithTheWireVersionAndANewerOptionalBlockIsSteppedOver() throws Exception {

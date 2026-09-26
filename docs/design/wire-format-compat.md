@@ -130,6 +130,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 8 | Block, optional: the fetch take counters (scans, rows addressed, columns projected, milliseconds total and maximum, scans per caller; seven counters, fallback zero) |
 | | 9 | Block, optional: the fetch cache's figures (enabled, size, limit, entries, hits, misses, evictions, invalidations, skipped, rows served; fallback disabled and zero) |
 | | 10 | Block, optional: the failure counters (node-local clone resolutions failed, over every index and per index name; table statistics collections failed; zone map reads failed; fallback zero and empty) |
+| | 11 | Block, optional: the names of the indexes whose row counts are withheld because a reader wrapper is installed; the base layout carries such an index with zero counts (fallback empty, no index withheld) |
 | `LanceStatsNodeRequest` | 1 | Base: nothing after the marker |
 | `LanceRequestCacheClearNodeRequest` | 1 | Base: the index uuids whose result cache entries the node drops |
 | `LanceRequestCacheClearNodeResponse` | 1 | Base: how many entries the node dropped |

@@ -8,10 +8,12 @@ package org.opensearch.lance.stats;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -90,7 +92,11 @@ import org.opensearch.lance.query.ScanAdmission;
  * an older coordinator; version 10 added the failure counters of the
  * paths that fall back or fail without a mark in the response (the
  * node-local clone resolutions, the table statistics collections and the
- * zone map reads that failed), shown as zero by an older coordinator.
+ * zone map reads that failed), shown as zero by an older coordinator;
+ * version 11 added the names of the indexes whose row counts are
+ * withheld because a reader wrapper is installed
+ * ({@link IndexReaderStats#rowsWithheld()}), shown by an older
+ * coordinator as indexes with zero rows.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
@@ -101,9 +107,10 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * freshness checks, 5 the pending statistics collections and the
      * plans made without statistics, 6 the identity of the scans the
      * retained pool was filled by, 7 the result cache figures, 8 the fetch
-     * take counters, 9 the fetch cache figures, 10 the failure counters.
+     * take counters, 9 the fetch cache figures, 10 the failure counters,
+     * 11 the indexes whose row counts are withheld.
      */
-    public static final int WIRE_VERSION = 10;
+    public static final int WIRE_VERSION = 11;
 
     private final boolean cacheEnabled;
     private final int snapshotCount;
@@ -475,22 +482,60 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * field id lives on under a new name), so operators learn which
      * field names their clients must move to. {@code _stats} counts the
      * reader's docs.
+     *
+     * <p>{@code rowsWithheld} is true when the index has a reader
+     * wrapper installed (a security plugin's document and field level
+     * security). The table's rows and the reader's {@code numDocs} are
+     * counted outside the wrapper, and the Lance index metadata and the
+     * mapping's rename entries name columns it may hide, so such an
+     * entry carries no row counts, no index types and no renames: the
+     * counts are zero and the report shows the index with
+     * {@code lucene_bound_exceeded} alone. The flag travels in the
+     * version 11 block of {@link LanceNodeStats}; the counts of the base
+     * layout stay zero for an older coordinator.
      */
     public record IndexReaderStats(String index, long rows, long shardReaderRows, long nestedDocs, boolean luceneBoundExceeded, Map<
         String,
-        List<String>> indexTypes, List<LanceMappingMeta.RenamedField> renamedFields) implements Writeable {
+        List<String>> indexTypes, List<LanceMappingMeta.RenamedField> renamedFields, boolean rowsWithheld) implements Writeable {
 
-        public IndexReaderStats(
+        /**
+         * Rejects a withheld entry that carries a count, an index type
+         * or a rename: such an entry would emit through the version 11
+         * block what the wrapper hides. Entries are built through
+         * {@link #withheld(String, boolean)} and
+         * {@link #counted(String, long, long, long, boolean, Map, List)}.
+         */
+        public IndexReaderStats {
+            if (rowsWithheld
+                && (rows != 0L || shardReaderRows != 0L || nestedDocs != 0L || !indexTypes.isEmpty() || !renamedFields.isEmpty())) {
+                throw new IllegalArgumentException(
+                    "a withheld IndexReaderStats carries no rows, index types or renamed fields: index=" + index
+                );
+            }
+        }
+
+        /**
+         * The entry of a wrapped index: {@code rowsWithheld} true, the
+         * counts zero, no index types and no renames.
+         */
+        public static IndexReaderStats withheld(String index, boolean luceneBoundExceeded) {
+            return new IndexReaderStats(index, 0L, 0L, 0L, luceneBoundExceeded, Map.of(), List.of(), true);
+        }
+
+        /** The entry of an unwrapped index, with the counts, index types and renames it reports. */
+        public static IndexReaderStats counted(
             String index,
             long rows,
             long shardReaderRows,
             long nestedDocs,
             boolean luceneBoundExceeded,
-            Map<String, List<String>> indexTypes
+            Map<String, List<String>> indexTypes,
+            List<LanceMappingMeta.RenamedField> renamedFields
         ) {
-            this(index, rows, shardReaderRows, nestedDocs, luceneBoundExceeded, indexTypes, List.of());
+            return new IndexReaderStats(index, rows, shardReaderRows, nestedDocs, luceneBoundExceeded, indexTypes, renamedFields, false);
         }
 
+        /** Reads the base layout, which carries no flag: the entry of an unwrapped index. */
         public IndexReaderStats(StreamInput in) throws IOException {
             this(
                 in.readString(),
@@ -499,8 +544,14 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
                 in.readVLong(),
                 in.readBoolean(),
                 in.readMap(StreamInput::readString, StreamInput::readStringList),
-                in.readList(LanceMappingMeta.RenamedField::new)
+                in.readList(LanceMappingMeta.RenamedField::new),
+                false
             );
+        }
+
+        /** This entry with {@code rowsWithheld} set, as the version 11 block marks it. */
+        IndexReaderStats asWithheld() {
+            return withheld(index, luceneBoundExceeded);
         }
 
         @Override
@@ -968,7 +1019,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             read.add(new LanceWarmUpStatus(in));
         }
         this.warmUps = List.copyOf(read);
-        this.indices = in.readList(IndexReaderStats::new);
+        List<IndexReaderStats> readIndices = in.readList(IndexReaderStats::new);
         this.localClones = in.readList(LocalCloneStats::new);
         this.planStatisticsTables = in.readVInt();
         this.planStatisticsCollectMillisTotal = in.readVLong();
@@ -988,7 +1039,37 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.fetch = reader.block(8, FetchStats::new, FetchStats.NONE);
         this.fetchCache = reader.block(9, FetchCacheStats::new, FetchCacheStats.NONE);
         this.failures = reader.block(10, FailureCounters::new, FailureCounters.NONE);
+        List<String> withheld = reader.block(11, StreamInput::readStringList, List.of());
+        this.indices = withRowsWithheld(readIndices, withheld);
         reader.finish();
+    }
+
+    /**
+     * {@code indices} with {@link IndexReaderStats#rowsWithheld()} set on
+     * the entries the version 11 block names; the base layout carries
+     * the entries without the flag.
+     */
+    private static List<IndexReaderStats> withRowsWithheld(List<IndexReaderStats> indices, List<String> withheld) {
+        if (withheld.isEmpty()) {
+            return List.copyOf(indices);
+        }
+        Set<String> names = new HashSet<>(withheld);
+        List<IndexReaderStats> flagged = new ArrayList<>(indices.size());
+        for (IndexReaderStats index : indices) {
+            flagged.add(names.contains(index.index()) ? index.asWithheld() : index);
+        }
+        return List.copyOf(flagged);
+    }
+
+    /** The names of the indexes whose row counts are withheld, the version 11 block. */
+    private List<String> rowsWithheldIndices() {
+        List<String> names = new ArrayList<>();
+        for (IndexReaderStats index : indices) {
+            if (index.rowsWithheld()) {
+                names.add(index.index());
+            }
+        }
+        return names;
     }
 
     /**
@@ -1081,6 +1162,10 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         // Likewise for the failure counters: an older coordinator shows
         // the node without them.
         WireVersion.writeBlock(out, false, failures);
+        // Likewise for the indexes whose row counts are withheld: an
+        // older coordinator shows them with the zero counts the base
+        // layout carries, never with the counts themselves.
+        WireVersion.writeBlock(out, false, o -> o.writeStringCollection(rowsWithheldIndices()));
     }
 
     @Override
@@ -1222,15 +1307,21 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.startObject("indices");
         for (IndexReaderStats index : indices) {
             builder.startObject(index.index());
-            builder.field("rows", index.rows());
-            builder.field("shard_reader_rows", index.shardReaderRows());
-            builder.field("nested_docs", index.nestedDocs());
-            builder.field("lucene_bound_exceeded", index.luceneBoundExceeded());
-            builder.startObject("index_types");
-            for (Map.Entry<String, List<String>> column : index.indexTypes().entrySet()) {
-                builder.field(column.getKey(), column.getValue());
+            // A wrapped index shows no figure a reader wrapper does not
+            // filter: the fields are left out, not zeroed.
+            if (!index.rowsWithheld()) {
+                builder.field("rows", index.rows());
+                builder.field("shard_reader_rows", index.shardReaderRows());
+                builder.field("nested_docs", index.nestedDocs());
             }
-            builder.endObject();
+            builder.field("lucene_bound_exceeded", index.luceneBoundExceeded());
+            if (!index.rowsWithheld()) {
+                builder.startObject("index_types");
+                for (Map.Entry<String, List<String>> column : index.indexTypes().entrySet()) {
+                    builder.field(column.getKey(), column.getValue());
+                }
+                builder.endObject();
+            }
             if (!index.renamedFields().isEmpty()) {
                 builder.startArray("renamed_fields");
                 for (LanceMappingMeta.RenamedField renamed : index.renamedFields()) {

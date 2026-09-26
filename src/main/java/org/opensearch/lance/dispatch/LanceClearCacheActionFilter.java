@@ -62,10 +62,14 @@ public final class LanceClearCacheActionFilter implements ActionFilter {
         this.client = client;
     }
 
+    /**
+     * After the security plugin's filter ({@code Integer.MIN_VALUE}),
+     * which authorises the stock clear request the fan out below
+     * follows, and before {@code LanceGetIndexActionFilter}
+     * ({@code Integer.MIN_VALUE + 101}).
+     */
     @Override
     public int order() {
-        // After the security plugin's filter (Integer.MIN_VALUE), which
-        // authorises the stock clear request the fan out below follows.
         return Integer.MIN_VALUE + 100;
     }
 

@@ -37,6 +37,7 @@ import org.opensearch.lance.attach.TransportLanceAttachAction;
 import org.opensearch.lance.execute.LanceAggregateResults;
 import org.opensearch.lance.dispatch.LanceClearCacheActionFilter;
 import org.opensearch.lance.dispatch.LanceDispatchActionFilter;
+import org.opensearch.lance.dispatch.LanceGetIndexActionFilter;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.dispatch.LanceRequestCache;
 import org.opensearch.lance.dispatch.LanceRequestCacheClearAction;
@@ -936,6 +937,24 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     }
 
     /**
+     * The credential entries of {@code index.lance.storage_options.*}
+     * are withheld from {@code GET /<index>/_settings} and the cluster
+     * state API through OpenSearch's settings filter. The patterns come
+     * from {@link StorageOptions#SENSITIVE_INDEX_SETTING_PATTERNS}, so
+     * the keys the filter hides are the ones the namespace listing
+     * redacts. Region, endpoint and {@code allow_http} stay visible. The
+     * filter acts on the API output only: the shard reads the values
+     * from the cluster state as before, and a snapshot's index metadata
+     * still carries them. {@code GET /<index>} is covered by
+     * {@link LanceGetIndexActionFilter}, because core applies this
+     * filter to that API's defaults block only.
+     */
+    @Override
+    public List<String> getSettingsFilter() {
+        return StorageOptions.SENSITIVE_INDEX_SETTING_PATTERNS;
+    }
+
+    /**
      * Name of the thread pool the coordinator side of the fragment path
      * runs on: the entry of every {@code _search} against a Lance-backed
      * index (resolving the request, enumerating fragments, sending the
@@ -1471,7 +1490,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // filter is always present when the search machinery starts
         // routing through it; the null guard exists purely for the
         // test framework's out-of-order invocations.
-        List<ActionFilter> filters = new ArrayList<>(3);
+        List<ActionFilter> filters = new ArrayList<>(4);
         LanceDispatchActionFilter dispatch = dispatchActionFilter;
         if (dispatch != null) {
             filters.add(dispatch);
@@ -1484,6 +1503,12 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         if (clear != null) {
             filters.add(clear);
         }
+        // GET /<index> writes each index's settings as they are in the
+        // cluster state; the settings filter registered through
+        // getSettingsFilter does not reach that view, so this filter
+        // applies the same patterns to the response. It holds no node
+        // state and needs no createComponents.
+        filters.add(new LanceGetIndexActionFilter());
         return List.copyOf(filters);
     }
 
