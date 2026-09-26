@@ -70,6 +70,7 @@ public class LanceFetchCacheIT extends LanceRestTestCase {
             assertEquals(count(afterFirst, "rows_served") + 10L, count(afterSecond, "rows_served"));
             assertEquals(count(takesAfterFirst, "take_count"), count(fetch(), "take_count"));
             logger.info("--> fetch cache took: first {} ms, second {} ms", extractIntPath(first, "took"), extractIntPath(second, "took"));
+            logger.info("--> profile of the repeat: {}", parseJson(second).get("profile"));
             logger.info("--> fetch cache stats after the repeat: {}", afterSecond);
 
             // A page over other rows that renders the key alone stores
