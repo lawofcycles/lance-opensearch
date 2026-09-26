@@ -666,13 +666,25 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         Schema arrowSchema;
         TableStatistics statistics = null;
         long tableRows = 0L;
-        try (Dataset dataset = LanceRegistry.openDataset(target.tableUri(), target.storageOptions(), target.pinnedVersionOrEmpty())) {
+        // An index pinned to a version (index.lance.version, or a tag
+        // resolved above) names the version the fan-out would read, so
+        // the result cache is asked before the table is opened: a hit
+        // costs no manifest read, which over an object store is the
+        // whole of the hit path's latency.
+        Optional<Long> pinned = target.pinnedVersionOrEmpty();
+        if (cacheLookup != null && pinned.isPresent() && cacheLookup.find(pinned.get()) != null) {
+            LOGGER.debug("lance.dispatch: index [{}] pinned version {} answered from the result cache", target.indexName(), pinned.get());
+            done.onResponse(null);
+            return;
+        }
+        try (Dataset dataset = LanceRegistry.openDataset(target.tableUri(), target.storageOptions(), pinned)) {
             observedVersion = dataset.version();
             // The result cache is keyed on this version: an entry means
             // the same body already ran against the same manifest on the
             // same node list, so nothing is planned or sent and the merge
-            // stays empty (runIndexLoop renders the entry).
-            if (cacheLookup != null && cacheLookup.find(observedVersion) != null) {
+            // stays empty (runIndexLoop renders the entry). A pinned
+            // index was looked up above, under the same version.
+            if (cacheLookup != null && pinned.isEmpty() && cacheLookup.find(observedVersion) != null) {
                 LOGGER.debug("lance.dispatch: index [{}] version {} answered from the result cache", target.indexName(), observedVersion);
                 done.onResponse(null);
                 return;

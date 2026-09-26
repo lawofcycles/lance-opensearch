@@ -770,6 +770,55 @@ public class LanceAggregationIT extends LanceRestTestCase {
         }
     }
 
+    /**
+     * A pushed {@code terms} answered by one executor reports a
+     * {@code doc_count_error_upper_bound} of 0, whether the executor's
+     * groups fit under {@code shard_size} (3 categories, default
+     * {@code shard_size} 25) or were cut to it (480 distinct ratings cut
+     * to 5, 3 categories cut to 2): the scan sees every key of its
+     * fragments, so a single executor's answer is exact, and the
+     * coordinator's reduce of one answer derives no error, as it does
+     * for a single shard. The answers match the stock search path over
+     * the same rows.
+     */
+    @SuppressWarnings("unchecked")
+    public void testPushedTermsOnOneExecutorReportsNoDocCountError() throws Exception {
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "pushed-bound")) {
+            String index = fixture.indexName();
+            String[] shapes = new String[] {
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"show_term_doc_count_error\":true}}}}",
+                "{\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"size\":2,\"shard_size\":2,\"show_term_doc_count_error\":true}}}}",
+                "{\"size\":0,\"aggs\":{\"r\":{\"terms\":{\"field\":\"rating\",\"size\":5,\"shard_size\":5,\"show_term_doc_count_error\":true}}}}" };
+            int[] expectedBuckets = new int[] { 3, 2, 5 };
+            Request debug = new Request("PUT", "/_cluster/settings");
+            debug.setJsonEntity("{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":\"DEBUG\"}}");
+            client().performRequest(debug);
+            try {
+                long before = pushdownLogLines(index);
+                for (int i = 0; i < shapes.length; i++) {
+                    String shape = shapes[i];
+                    Map<String, Object> pushed = parse(readAll(postJson("/" + index + "/_search?request_cache=false", shape)));
+                    Map<String, Object> terms = aggregation(pushed, shape.contains("\"c\"") ? "c" : "r");
+                    List<Map<String, Object>> buckets = (List<Map<String, Object>>) terms.get("buckets");
+                    assertEquals(shape, expectedBuckets[i], buckets.size());
+                    assertEquals(shape, 0, ((Number) terms.get("doc_count_error_upper_bound")).intValue());
+                    for (Map<String, Object> bucket : buckets) {
+                        assertEquals(shape + " bucket " + bucket, 0, ((Number) bucket.get("doc_count_error_upper_bound")).intValue());
+                    }
+                    Map<String, Object> stock = parse(
+                        readAll(postJson("/" + LanceRestTestCase.withStockOracle(index) + "/_search?request_cache=false", shape))
+                    );
+                    assertEquals(shape, stock.get("aggregations"), pushed.get("aggregations"));
+                }
+                assertBusy(() -> assertEquals("every shape took the pushdown", before + shapes.length, pushdownLogLines(index)));
+            } finally {
+                Request reset = new Request("PUT", "/_cluster/settings");
+                reset.setJsonEntity("{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":null}}");
+                client().performRequest(reset);
+            }
+        }
+    }
+
     public void testSubstraitPushdownAnswersDateHistogramLikeTheAggregators() throws Exception {
         // The dated fixture has six rows with a timestamp[us] column and
         // an even / odd keyword category: fixed_interval and

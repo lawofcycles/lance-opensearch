@@ -334,6 +334,73 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         return client.performRequest(request);
     }
 
+    public void testResultCacheHitOnThreeNodesAnswersWithoutFanningOut() throws Exception {
+        // A hit is answered by the coordinating node alone: no per node
+        // request leaves it and its took stays in the single digit
+        // milliseconds however many data nodes the miss fanned out to.
+        // The following index reads the table's version before the
+        // lookup; the pinned index knows it from its settings and is
+        // looked up before the table is opened.
+        String suffix = "mn-rchit-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        long version = LanceTableFactory.currentVersion(tableUri);
+        String following = tableName;
+        String pinnedIndex = tableName + "-pinned";
+        String body = "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+        try {
+            assertEquals(
+                RestStatus.OK.getStatus(),
+                postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}").getStatusLine().getStatusCode()
+            );
+            assertEquals(
+                RestStatus.OK.getStatus(),
+                postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + pinnedIndex + "\",\"version\":" + version + "}")
+                    .getStatusLine()
+                    .getStatusCode()
+            );
+            HttpHost host = getClusterHosts().get(0);
+            try (RestClient pinned = buildClient(restClientSettings(), new HttpHost[] { host })) {
+                String nodeId = localNodeId(pinned);
+                for (String indexName : new String[] { following, pinnedIndex }) {
+                    Map<String, Object> before = requestCacheOf(nodeId);
+                    long executedBefore = LanceRestTestCase.fragmentRequestsExecuted();
+                    String miss = readAll(post(pinned, "/" + indexName + "/_search", body));
+                    assertEquals(15.0d, extractDoublePath(miss, "aggregations", "s", "value"), 0.0d);
+                    long executedAfterMiss = LanceRestTestCase.fragmentRequestsExecuted();
+                    assertTrue("the miss fanned out: " + executedBefore + " -> " + executedAfterMiss, executedAfterMiss > executedBefore);
+                    assertEquals(counter(before, "misses") + 1, counter(requestCacheOf(nodeId), "misses"));
+
+                    int repeats = 5;
+                    long fastest = Long.MAX_VALUE;
+                    for (int i = 0; i < repeats; i++) {
+                        String hit = readAll(post(pinned, "/" + indexName + "/_search", body));
+                        assertEquals(15.0d, extractDoublePath(hit, "aggregations", "s", "value"), 0.0d);
+                        fastest = Math.min(fastest, extractIntPath(hit, "took"));
+                    }
+                    Map<String, Object> after = requestCacheOf(nodeId);
+                    assertEquals(indexName + ": every repeat hits", counter(before, "hits") + repeats, counter(after, "hits"));
+                    assertEquals(indexName + ": nothing else missed", counter(before, "misses") + 1, counter(after, "misses"));
+                    assertEquals(
+                        indexName + ": a hit sends no per node request",
+                        executedAfterMiss,
+                        LanceRestTestCase.fragmentRequestsExecuted()
+                    );
+                    logger.info("--> {}: fastest of {} result cache hits took {} ms", indexName, repeats, fastest);
+                    assertTrue(indexName + ": a hit is answered by the coordinator alone, fastest took " + fastest + " ms", fastest <= 10L);
+                }
+            }
+        } finally {
+            for (String indexName : new String[] { following, pinnedIndex }) {
+                try {
+                    client().performRequest(new Request("DELETE", "/" + indexName));
+                } catch (Exception ignored) {}
+            }
+        }
+    }
+
     /** The id of the node {@code client} is pinned to. */
     @SuppressWarnings("unchecked")
     private static String localNodeId(RestClient client) throws IOException {
