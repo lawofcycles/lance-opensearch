@@ -625,8 +625,9 @@ public final class LanceFtsQuery extends Query {
          * {@link #SCAN_LIMIT_UNBOUNDED} or the most rows its bounded
          * scan returns. When a bounded scan is not {@link #complete()}
          * it returned that many rows, so {@link #hitCount()} is at
-         * least the limit and the executor's matches number more than
-         * the limit; the count path reads the limit off here to decide
+         * least the limit, and together with {@link #complete()} being
+         * false the executor's own matches are shown to exceed the
+         * limit; the count path reads the limit off here to decide
          * whether that proves a {@code track_total_hits} bound was
          * passed.
          */
@@ -833,8 +834,8 @@ public final class LanceFtsQuery extends Query {
         private long collectHits(Dataset dataset, ScanOptions options, Set<Integer> keep, Map<Integer, LanceFragmentHits> into)
             throws IOException {
             long returned = 0L;
-            accounting.ftsScanIssued();
             try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+                accounting.ftsScanIssued();
                 while (reader.loadNextBatch()) {
                     cancellation.checkCancelled();
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();

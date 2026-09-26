@@ -799,8 +799,7 @@ public final class PlanExecutor {
             if (limit > 0) {
                 builder = builder.limit(limit);
             }
-            accounting.ftsScanIssued();
-            return FtsHitCount.whole(countRows(dataset, builder.build(), cancellation));
+            return FtsHitCount.whole(countFtsRows(dataset, builder.build(), cancellation, accounting));
         }
         Set<Integer> own = new HashSet<>(fragmentIds);
         if (limit > 0) {
@@ -817,9 +816,13 @@ public final class PlanExecutor {
         if (probe.scanned() < probeLimit) {
             return probe;
         }
-        accounting.ftsScanIssued();
         return FtsHitCount.whole(
-            countRows(dataset, LanceFtsQuery.restrictToFragmentsUnlessAll(countOnlyScan(fts), fragmentIds, dataset).build(), cancellation)
+            countFtsRows(
+                dataset,
+                LanceFtsQuery.restrictToFragmentsUnlessAll(countOnlyScan(fts), fragmentIds, dataset).build(),
+                cancellation,
+                accounting
+            )
         );
     }
 
@@ -843,6 +846,24 @@ public final class PlanExecutor {
     private static long countRows(Dataset dataset, ScanOptions options, LanceCancellation cancellation) throws Exception {
         long total = 0L;
         try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+                cancellation.checkCancelled();
+                total += reader.getVectorSchemaRoot().getRowCount();
+            }
+        }
+        return total;
+    }
+
+    /**
+     * {@link #countRows} for a full text scan: the scan is counted in
+     * {@code accounting} once Lance has opened it, so a scan that fails
+     * to open is not reported.
+     */
+    private static long countFtsRows(Dataset dataset, ScanOptions options, LanceCancellation cancellation, LanceHitsAccounting accounting)
+        throws Exception {
+        long total = 0L;
+        try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+            accounting.ftsScanIssued();
             while (reader.loadNextBatch()) {
                 cancellation.checkCancelled();
                 total += reader.getVectorSchemaRoot().getRowCount();
@@ -879,8 +900,8 @@ public final class PlanExecutor {
     ) throws Exception {
         long scanned = 0L;
         long kept = 0L;
-        accounting.ftsScanIssued();
         try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+            accounting.ftsScanIssued();
             while (reader.loadNextBatch()) {
                 cancellation.checkCancelled();
                 VectorSchemaRoot root = reader.getVectorSchemaRoot();

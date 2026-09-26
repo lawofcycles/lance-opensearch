@@ -323,6 +323,16 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             assertEquals(6, extractIntPath(wide, "hits", "total", "value"));
             assertEquals("eq", totalRelation(wide));
 
+            // The size 2 page under the bound is served by the widened
+            // hits scan alone: the profile of the executor reports one
+            // full text scan, no count only scan.
+            String profiled = readAll(
+                postJson("/" + indexName + "/_search", "{\"size\":2,\"track_total_hits\":3,\"profile\":true,\"query\":" + hello + "}")
+            );
+            assertEquals(3, extractIntPath(profiled, "hits", "total", "value"));
+            assertEquals("gte", totalRelation(profiled));
+            assertEquals("one scan served the page and the bound: " + profiled, 1L, ftsScans(profiled));
+
             // With the aggregation the buckets themselves are unaffected
             // by the bound: six hello rows, one bucket each.
             String aggBounded = readAll(
@@ -352,6 +362,30 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             Map<String, Object> total = (Map<String, Object>) ((Map<String, Object>) map.get("hits")).get("total");
             return (String) total.get("relation");
         }
+    }
+
+    /**
+     * {@code profile.lance.nodes.<node>.query.fts_scans} summed over the
+     * data nodes of {@code searchBody}: the Lance full text scans the
+     * request ran.
+     */
+    @SuppressWarnings("unchecked")
+    private static long ftsScans(String searchBody) {
+        Map<String, Object> profile = (Map<String, Object>) parseJson(searchBody).get("profile");
+        assertNotNull("the response carries a profile: " + searchBody, profile);
+        Map<String, Object> lance = (Map<String, Object>) profile.get("lance");
+        assertNotNull("the profile carries the lance object: " + searchBody, lance);
+        Map<String, Object> nodes = (Map<String, Object>) lance.get("nodes");
+        assertNotNull("the profile carries the nodes: " + searchBody, nodes);
+        long scans = 0L;
+        for (Object node : nodes.values()) {
+            Map<String, Object> query = (Map<String, Object>) ((Map<String, Object>) node).get("query");
+            assertNotNull("the node profile carries query: " + searchBody, query);
+            Object count = query.get("fts_scans");
+            assertNotNull("the query profile carries fts_scans: " + searchBody, count);
+            scans += ((Number) count).longValue();
+        }
+        return scans;
     }
 
     public void testLanceMatchWithScalarFilterMatchesLuceneComposition() throws Exception {
