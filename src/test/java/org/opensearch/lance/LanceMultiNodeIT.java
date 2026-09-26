@@ -3038,6 +3038,109 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
+    /**
+     * When the table behind an index moves to a new version, the
+     * freshness check of the node holding the shard tells every data node
+     * to collect the new version's statistics, so a request coordinated
+     * by one of the other nodes is planned with them from the first one.
+     * The served version is not in the cluster state and the check runs
+     * on the holder only, so without the broadcast the other nodes would
+     * collect on their first request of the new version and plan that
+     * one without statistics. Nothing but the broadcast collects on the
+     * other nodes between the append and the request: the warm-up runs
+     * when an index appears, not when its table moves.
+     */
+    public void testEveryDataNodeCollectsTheStatisticsWhenTheTableMoves() throws Exception {
+        String suffix = "mn-stats-move-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 6);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        try {
+            assertEquals("fixture assumes every node coordinates and executes", 3, dataNodeCount());
+            assertBusy(() -> {
+                for (Map.Entry<String, Map<String, Long>> node : planStatisticsByNode().entrySet()) {
+                    assertEquals("nothing pending on " + node.getKey(), 0L, node.getValue().get("pending").longValue());
+                }
+            }, 60, TimeUnit.SECONDS);
+            Map<String, Map<String, Long>> beforeAttach = planStatisticsByNode();
+
+            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=30s"));
+            String holder = readAll(client().performRequest(new Request("GET", "/_cat/shards/" + indexName + "?h=node"))).trim();
+            assertFalse("_cat/shards names the node holding the shard", holder.isEmpty());
+
+            // Every node holds the attached version before the move.
+            assertBusy(() -> assertEveryNodeCollectedSince(beforeAttach), 60, TimeUnit.SECONDS);
+            Map<String, Map<String, Long>> attached = planStatisticsByNode();
+
+            // The append moves the table; the holder's scheduled check
+            // (1s cadence) follows it and broadcasts the new version.
+            LanceTableFactory.appendRows(tableUri, 6, 4);
+            assertBusy(() -> assertEveryNodeCollectedSince(attached), 30, TimeUnit.SECONDS);
+            Map<String, Map<String, Long>> moved = planStatisticsByNode();
+            for (Map.Entry<String, Map<String, Long>> node : moved.entrySet()) {
+                assertEquals(
+                    "no plan was made without statistics on " + node.getKey() + ": " + moved,
+                    attached.get(node.getKey()).get("planned_without"),
+                    node.getValue().get("planned_without")
+                );
+            }
+
+            // A request coordinated by a node that does not hold the
+            // shard reads the new version's statistics: its counter of
+            // plans made without them stands still.
+            HttpHost otherHost = null;
+            String otherName = null;
+            for (HttpHost candidate : getClusterHosts()) {
+                try (RestClient probe = buildClient(restClientSettings(), new HttpHost[] { candidate })) {
+                    String name = localNodeName(probe);
+                    if (!name.equals(holder)) {
+                        otherHost = candidate;
+                        otherName = name;
+                        break;
+                    }
+                }
+            }
+            assertNotNull("a node other than the holder [" + holder + "] among " + getClusterHosts(), otherHost);
+            String body = "{\"size\":0,\"track_total_hits\":true,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
+            try (RestClient other = buildClient(restClientSettings(), new HttpHost[] { otherHost })) {
+                String response = readAll(post(other, "/" + indexName + "/_search?request_cache=false", body));
+                assertEquals("the request reads the moved table: " + response, 10, extractIntPath(response, "hits", "total", "value"));
+                assertEquals("sum(0..9): " + response, 45, extractIntPath(response, "aggregations", "s", "value"));
+            }
+            Map<String, Map<String, Long>> after = planStatisticsByNode();
+            assertEquals(
+                "the coordinator [" + otherName + "] planned with the statistics: " + after,
+                moved.get(otherName).get("planned_without"),
+                after.get(otherName).get("planned_without")
+            );
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Every node's collect time grew since {@code before} (a counter
+     * that grows with every collection) and nothing is pending on it.
+     */
+    private static void assertEveryNodeCollectedSince(Map<String, Map<String, Long>> before) throws IOException {
+        Map<String, Map<String, Long>> now = planStatisticsByNode();
+        for (Map.Entry<String, Map<String, Long>> node : now.entrySet()) {
+            Map<String, Long> was = before.get(node.getKey());
+            assertNotNull("node " + node.getKey() + " was there before: " + before, was);
+            assertTrue(
+                "node " + node.getKey() + " collected the statistics: before " + was + ", now " + node.getValue(),
+                node.getValue().get("collect_millis_total") > was.get("collect_millis_total")
+            );
+            assertEquals("nothing pending on " + node.getKey() + ": " + now, 0L, node.getValue().get("pending").longValue());
+        }
+    }
+
     /** The {@code plan.statistics} counters of every node in {@code GET /_lance/stats}, keyed by node name. */
     @SuppressWarnings("unchecked")
     private static Map<String, Map<String, Long>> planStatisticsByNode() throws IOException {
